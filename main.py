@@ -13,9 +13,9 @@ app = FastAPI()
 LINE_CHANNEL_SECRET = os.environ["LINE_CHANNEL_SECRET"]
 LINE_CHANNEL_ACCESS_TOKEN = os.environ["LINE_CHANNEL_ACCESS_TOKEN"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
-KINTONE_SUBDOMAIN = os.environ.get("KINTONE_SUBDOMAIN", "")
-KINTONE_APP_ID = os.environ.get("KINTONE_APP_ID", "")
-KINTONE_API_TOKEN = os.environ.get("KINTONE_API_TOKEN", "")
+KINTONE_SUBDOMAIN = os.environ["KINTONE_SUBDOMAIN"]
+KINTONE_APP_ID = os.environ["KINTONE_APP_ID"]
+KINTONE_API_TOKEN = os.environ["KINTONE_API_TOKEN"]
 
 REPLY_URL = "https://api.line.me/v2/bot/message/reply"
 
@@ -98,25 +98,22 @@ LINEで承っております。
 ━━━━━━━━━━━━━━━」
 
 【kintone登録について】
-以下の9項目がすべて揃ったら、通常の返信メッセージの末尾に
+以下の5項目がすべて揃ったら、通常の返信メッセージの末尾に
 以下の形式でデータを出力してください。ユーザーには見えません。
 
 [KINTONE_RECORD]
 {
-  "債権者名": "（値）",
+  "業者名": "（債権者名の値）",
   "借入時期": "（値）",
   "最終返済日": "（値）",
-  "裁判所書類": "（値）",
-  "信用情報確認": "（値）",
-  "氏名": "（値）",
-  "住所": "（値）",
-  "生年月日": "（値）",
-  "債務認知経緯": "（値）"
+  "裁判所書類": "（裁判所からの書類の有無の値）",
+  "信用情報確認": "（信用情報から知ったかどうかの値）",
+  "ステータス": "問い合わせ"
 }
 [/KINTONE_RECORD]
 
-9項目：債権者名・借入時期・最終返済日・裁判所からの書類の有無・
-信用情報から知ったかどうか・お名前・ご住所・生年月日・債務を知った経緯"""
+5項目：債権者名・借入時期・最終返済日・裁判所からの書類の有無・信用情報から知ったかどうか
+ステータスは常に「問い合わせ」で固定してください。"""
 
 # ユーザーIDごとの会話履歴を保持
 conversation_histories: dict[str, list] = {}
@@ -200,7 +197,7 @@ async def webhook(request: Request):
 
         # kintoneデータが含まれていれば登録・除去
         clean_reply, kintone_record = extract_kintone_record(claude_reply)
-        if kintone_record and KINTONE_SUBDOMAIN and KINTONE_APP_ID and KINTONE_API_TOKEN:
+        if kintone_record:
             await post_to_kintone(kintone_record)
 
         async with httpx.AsyncClient() as client:
