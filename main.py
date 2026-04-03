@@ -98,8 +98,8 @@ LINEで承っております。
 ━━━━━━━━━━━━━━━」
 
 【kintone登録について】
-以下の5項目がすべて揃ったら、通常の返信メッセージの末尾に
-以下の形式でデータを出力してください。ユーザーには見えません。
+
+■第1段階：以下の5項目がすべて揃ったら、返信メッセージの末尾に出力してください。ユーザーには見えません。
 
 [KINTONE_RECORD]
 {
@@ -111,10 +111,23 @@ LINEで承っております。
 }
 [/KINTONE_RECORD]
 
-5項目：債権者名・借入時期・最終返済日・裁判所からの書類の有無・信用情報から知ったかどうか"""
+5項目：債権者名・借入時期・最終返済日・裁判所からの書類の有無・信用情報から知ったかどうか
+
+■第2段階：お名前・ご住所・生年月日の3項目がすべて揃ったら、返信メッセージの末尾に出力してください。ユーザーには見えません。
+
+[KINTONE_UPDATE]
+{
+  "顧客名": "（お名前の値）",
+  "住所": "（ご住所の値）",
+  "生年月日": "（生年月日の値）"
+}
+[/KINTONE_UPDATE]"""
 
 # ユーザーIDごとの会話履歴を保持
 conversation_histories: dict[str, list] = {}
+
+# ユーザーIDごとのkintoneレコードIDを保持
+kintone_record_ids: dict[str, str] = {}
 
 
 def verify_signature(body: bytes, signature: str) -> bool:
@@ -125,7 +138,8 @@ def verify_signature(body: bytes, signature: str) -> bool:
     return hmac.compare_digest(expected, signature)
 
 
-async def post_to_kintone(record: dict) -> None:
+async def post_to_kintone(record: dict) -> str:
+    """レコードを新規作成し、レコードIDを返す"""
     url = f"https://{KINTONE_SUBDOMAIN}.cybozu.com/k/v1/record.json"
     headers = {
         "X-Cybozu-API-Token": KINTONE_API_TOKEN,
@@ -137,19 +151,35 @@ async def post_to_kintone(record: dict) -> None:
     async with httpx.AsyncClient() as client:
         response = await client.post(url, headers=headers, json=body)
         response.raise_for_status()
+        return response.json()["id"]
 
 
-def extract_kintone_record(text: str) -> tuple[str, dict | None]:
-    """返答からkintoneデータを抽出し、マーカーを除去したテキストを返す"""
-    pattern = r"\[KINTONE_RECORD\](.*?)\[/KINTONE_RECORD\]"
+async def update_kintone_record(record_id: str, fields: dict) -> None:
+    """既存レコードを更新する"""
+    url = f"https://{KINTONE_SUBDOMAIN}.cybozu.com/k/v1/record.json"
+    headers = {
+        "X-Cybozu-API-Token": KINTONE_API_TOKEN,
+        "Content-Type": "application/json",
+    }
+    record_fields = {key: {"value": value} for key, value in fields.items()}
+    body = {"app": KINTONE_APP_ID, "id": record_id, "record": record_fields}
+
+    async with httpx.AsyncClient() as client:
+        response = await client.put(url, headers=headers, json=body)
+        response.raise_for_status()
+
+
+def extract_marker(text: str, tag: str) -> tuple[str, dict | None]:
+    """指定タグのデータを抽出し、マーカーを除去したテキストを返す"""
+    pattern = rf"\[{tag}\](.*?)\[/{tag}\]"
     match = re.search(pattern, text, re.DOTALL)
     if not match:
         return text, None
 
     clean_text = re.sub(pattern, "", text, flags=re.DOTALL).strip()
     try:
-        record = json.loads(match.group(1).strip())
-        return clean_text, record
+        data = json.loads(match.group(1).strip())
+        return clean_text, data
     except json.JSONDecodeError:
         return clean_text, None
 
@@ -193,13 +223,21 @@ async def webhook(request: Request):
 
         claude_reply = await ask_claude(user_id, user_text)
 
-        # kintoneデータが含まれていれば登録・除去
-        clean_reply, kintone_record = extract_kintone_record(claude_reply)
+        # 第1段階：レコード新規作成
+        clean_reply, kintone_record = extract_marker(claude_reply, "KINTONE_RECORD")
         if kintone_record:
             kintone_record["LINEユーザーID"] = user_id
             kintone_record["status"] = "問い合わせ"
             kintone_record["業者名"] = kintone_record.get("問い合わせ業者名", "")
-            await post_to_kintone(kintone_record)
+            record_id = await post_to_kintone(kintone_record)
+            kintone_record_ids[user_id] = record_id
+            claude_reply = clean_reply
+
+        # 第2段階：既存レコードを更新
+        clean_reply2, update_fields = extract_marker(claude_reply, "KINTONE_UPDATE")
+        if update_fields and user_id in kintone_record_ids:
+            await update_kintone_record(kintone_record_ids[user_id], update_fields)
+            claude_reply = clean_reply2
 
         async with httpx.AsyncClient() as client:
             await client.post(
@@ -207,7 +245,7 @@ async def webhook(request: Request):
                 headers={"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"},
                 json={
                     "replyToken": reply_token,
-                    "messages": [{"type": "text", "text": clean_reply}],
+                    "messages": [{"type": "text", "text": claude_reply}],
                 },
             )
 
