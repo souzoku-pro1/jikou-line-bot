@@ -1,4 +1,6 @@
 import os
+import re
+import json
 import hmac
 import hashlib
 import base64
@@ -11,6 +13,9 @@ app = FastAPI()
 LINE_CHANNEL_SECRET = os.environ["LINE_CHANNEL_SECRET"]
 LINE_CHANNEL_ACCESS_TOKEN = os.environ["LINE_CHANNEL_ACCESS_TOKEN"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
+KINTONE_SUBDOMAIN = os.environ["KINTONE_SUBDOMAIN"]
+KINTONE_APP_ID = os.environ["KINTONE_APP_ID"]
+KINTONE_API_TOKEN = os.environ["KINTONE_API_TOKEN"]
 
 REPLY_URL = "https://api.line.me/v2/bot/message/reply"
 
@@ -54,7 +59,7 @@ LINEで承っております。
 
 【回答に対するClaudeの判定ロジック】
 
-④で1または2と答えた場合は以下を返信してください：
+④で1または2と答えた場合：
 「裁判所からの書類が届いているとのことですね。
 現在も訴訟・支払督促の手続きが
 進行中かどうかによって対応が異なります。
@@ -65,7 +70,7 @@ LINEで承っております。
 詳しくは担当弁護士が確認いたしますので
 引き続き情報をお知らせください。」
 
-④で4と答えた場合は以下の追加質問をしてください：
+④で4と答えた場合：追加質問
 「承知しました。
 今回の債務について
 信用情報（CICやJICCなど）を
@@ -90,7 +95,28 @@ LINEで承っております。
 ・裁判所から訴状・支払督促が届いた
 ・信用情報を確認して知った
 ・その他
-━━━━━━━━━━━━━━━」"""
+━━━━━━━━━━━━━━━」
+
+【kintone登録について】
+以下の9項目がすべて揃ったら、通常の返信メッセージの末尾に
+以下の形式でデータを出力してください。ユーザーには見えません。
+
+[KINTONE_RECORD]
+{
+  "債権者名": "（値）",
+  "借入時期": "（値）",
+  "最終返済日": "（値）",
+  "裁判所書類": "（値）",
+  "信用情報確認": "（値）",
+  "氏名": "（値）",
+  "住所": "（値）",
+  "生年月日": "（値）",
+  "債務認知経緯": "（値）"
+}
+[/KINTONE_RECORD]
+
+9項目：債権者名・借入時期・最終返済日・裁判所からの書類の有無・
+信用情報から知ったかどうか・お名前・ご住所・生年月日・債務を知った経緯"""
 
 # ユーザーIDごとの会話履歴を保持
 conversation_histories: dict[str, list] = {}
@@ -102,6 +128,35 @@ def verify_signature(body: bytes, signature: str) -> bool:
     ).digest()
     expected = base64.b64encode(hash).decode("utf-8")
     return hmac.compare_digest(expected, signature)
+
+
+async def post_to_kintone(record: dict) -> None:
+    url = f"https://{KINTONE_SUBDOMAIN}.cybozu.com/k/v1/record.json"
+    headers = {
+        "X-Cybozu-API-Token": KINTONE_API_TOKEN,
+        "Content-Type": "application/json",
+    }
+    fields = {key: {"value": value} for key, value in record.items()}
+    body = {"app": KINTONE_APP_ID, "record": fields}
+
+    async with httpx.AsyncClient() as client:
+        response = await client.post(url, headers=headers, json=body)
+        response.raise_for_status()
+
+
+def extract_kintone_record(text: str) -> tuple[str, dict | None]:
+    """返答からkintoneデータを抽出し、マーカーを除去したテキストを返す"""
+    pattern = r"\[KINTONE_RECORD\](.*?)\[/KINTONE_RECORD\]"
+    match = re.search(pattern, text, re.DOTALL)
+    if not match:
+        return text, None
+
+    clean_text = re.sub(pattern, "", text, flags=re.DOTALL).strip()
+    try:
+        record = json.loads(match.group(1).strip())
+        return clean_text, record
+    except json.JSONDecodeError:
+        return clean_text, None
 
 
 async def ask_claude(user_id: str, user_message: str) -> str:
@@ -143,13 +198,18 @@ async def webhook(request: Request):
 
         claude_reply = await ask_claude(user_id, user_text)
 
+        # kintoneデータが含まれていれば登録・除去
+        clean_reply, kintone_record = extract_kintone_record(claude_reply)
+        if kintone_record:
+            await post_to_kintone(kintone_record)
+
         async with httpx.AsyncClient() as client:
             await client.post(
                 REPLY_URL,
                 headers={"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"},
                 json={
                     "replyToken": reply_token,
-                    "messages": [{"type": "text", "text": claude_reply}],
+                    "messages": [{"type": "text", "text": clean_reply}],
                 },
             )
 
