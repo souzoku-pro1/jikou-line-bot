@@ -133,6 +133,9 @@ conversation_histories: dict[str, list] = {}
 # ユーザーIDごとのkintoneレコードIDを保持
 kintone_record_ids: dict[str, str] = {}
 
+# ユーザーIDごとの業者名を保持（第2段階更新で使用）
+user_business_names: dict[str, str] = {}
+
 
 def verify_signature(body: bytes, signature: str) -> bool:
     hash = hmac.new(
@@ -248,6 +251,7 @@ async def webhook(request: Request):
             kintone_record["LINEユーザーID"] = user_id
             kintone_record["status"] = "問い合わせ"
             kintone_record["業者名"] = kintone_record.get("問い合わせ業者名", "")
+            user_business_names[user_id] = kintone_record["業者名"]
             record_id = await post_to_kintone(kintone_record)
             kintone_record_ids[user_id] = record_id
             claude_reply = clean_reply
@@ -258,6 +262,7 @@ async def webhook(request: Request):
             print(f"[DEBUG] KINTONE_UPDATE detected: {update_fields}")
             print(f"[DEBUG] stored record_id for user: {kintone_record_ids.get(user_id)!r}")
         if update_fields and user_id in kintone_record_ids:
+            update_fields["業者名"] = user_business_names.get(user_id, "")
             await update_kintone_record(kintone_record_ids[user_id], update_fields)
             claude_reply = clean_reply2
 
