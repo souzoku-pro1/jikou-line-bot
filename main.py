@@ -168,8 +168,13 @@ async def update_kintone_record(record_id: str, fields: dict) -> None:
     record_fields = {key: {"value": value} for key, value in fields.items()}
     body = {"app": KINTONE_APP_ID, "id": record_id, "record": record_fields}
 
+    print(f"[DEBUG] update_kintone_record url: {url}")
+    print(f"[DEBUG] update_kintone_record body: {json.dumps(body, ensure_ascii=False)}")
+
     async with httpx.AsyncClient() as client:
         response = await client.put(url, headers=headers, json=body)
+        print(f"[DEBUG] update_kintone_record status: {response.status_code}")
+        print(f"[DEBUG] update_kintone_record response: {response.text}")
         response.raise_for_status()
 
 
