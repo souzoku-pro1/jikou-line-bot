@@ -13,9 +13,9 @@ app = FastAPI()
 LINE_CHANNEL_SECRET = os.environ["LINE_CHANNEL_SECRET"]
 LINE_CHANNEL_ACCESS_TOKEN = os.environ["LINE_CHANNEL_ACCESS_TOKEN"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
-KINTONE_SUBDOMAIN = os.environ["KINTONE_SUBDOMAIN"]
-KINTONE_APP_ID = os.environ["KINTONE_APP_ID"]
-KINTONE_API_TOKEN = os.environ["KINTONE_API_TOKEN"]
+KINTONE_SUBDOMAIN = os.environ.get("KINTONE_SUBDOMAIN", "")
+KINTONE_APP_ID = os.environ.get("KINTONE_APP_ID", "")
+KINTONE_API_TOKEN = os.environ.get("KINTONE_API_TOKEN", "")
 
 REPLY_URL = "https://api.line.me/v2/bot/message/reply"
 
@@ -200,7 +200,7 @@ async def webhook(request: Request):
 
         # kintoneデータが含まれていれば登録・除去
         clean_reply, kintone_record = extract_kintone_record(claude_reply)
-        if kintone_record:
+        if kintone_record and KINTONE_SUBDOMAIN and KINTONE_APP_ID and KINTONE_API_TOKEN:
             await post_to_kintone(kintone_record)
 
         async with httpx.AsyncClient() as client:
