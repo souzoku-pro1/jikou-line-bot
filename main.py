@@ -258,6 +258,7 @@ async def webhook(request: Request):
             print(f"[DEBUG] KINTONE_UPDATE detected: {update_fields}")
             print(f"[DEBUG] stored record_id for user: {kintone_record_ids.get(user_id)!r}")
         if update_fields and user_id in kintone_record_ids:
+            update_fields.pop("顧客名", None)  # ルックアップフィールドは直接書き込み不可
             await update_kintone_record(kintone_record_ids[user_id], update_fields)
             claude_reply = clean_reply2
 
