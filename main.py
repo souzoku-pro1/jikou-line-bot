@@ -16,6 +16,28 @@ REPLY_URL = "https://api.line.me/v2/bot/message/reply"
 
 claude_client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
 
+SYSTEM_PROMPT = """あなたは時効援用専門の法律事務所のアシスタントです。
+以下の情報を順番に聞いてください。
+
+1. お名前
+2. ご住所
+3. 生年月日
+4. 借入先の業者名
+5. 借入時期
+6. 最終返済日
+7. 借入金額
+8. 債務を知った経緯（通知・訴訟・信用情報・その他）
+9. 10年以内に訴訟を起こされたか
+10. 過去10年で住民票と居住地に違いがあったか
+11. 業者への電話をしたか
+12. アンケートや書面を送ったか
+
+一度に全部聞かずに1つずつ順番に聞いてください。
+全部集まったら「確認中です」と返してください。"""
+
+# ユーザーIDごとの会話履歴を保持
+conversation_histories: dict[str, list] = {}
+
 
 def verify_signature(body: bytes, signature: str) -> bool:
     hash = hmac.new(
@@ -25,13 +47,21 @@ def verify_signature(body: bytes, signature: str) -> bool:
     return hmac.compare_digest(expected, signature)
 
 
-async def ask_claude(user_message: str) -> str:
+async def ask_claude(user_id: str, user_message: str) -> str:
+    history = conversation_histories.setdefault(user_id, [])
+    history.append({"role": "user", "content": user_message})
+
     response = await claude_client.messages.create(
         model="claude-sonnet-4-20250514",
         max_tokens=1024,
-        messages=[{"role": "user", "content": user_message}],
+        system=SYSTEM_PROMPT,
+        messages=history,
     )
-    return response.content[0].text
+
+    reply_text = response.content[0].text
+    history.append({"role": "assistant", "content": reply_text})
+
+    return reply_text
 
 
 @app.post("/webhook")
@@ -51,9 +81,10 @@ async def webhook(request: Request):
             continue
 
         reply_token = event["replyToken"]
+        user_id = event["source"]["userId"]
         user_text = event["message"]["text"]
 
-        claude_reply = await ask_claude(user_text)
+        claude_reply = await ask_claude(user_id, user_text)
 
         async with httpx.AsyncClient() as client:
             await client.post(
