@@ -168,13 +168,23 @@ async def update_kintone_record(record_id: str, fields: dict) -> None:
     record_fields = {key: {"value": value} for key, value in fields.items()}
     body = {"app": KINTONE_APP_ID, "id": record_id, "record": record_fields}
 
-    print(f"[DEBUG] update_kintone_record url: {url}")
-    print(f"[DEBUG] update_kintone_record body: {json.dumps(body, ensure_ascii=False)}")
+    print(f"[DEBUG] update url: {url}")
+    print(f"[DEBUG] update record_id: {record_id!r}")
+    print(f"[DEBUG] update fields keys: {list(fields.keys())}")
+    print(f"[DEBUG] update body: {json.dumps(body, ensure_ascii=False)}")
 
     async with httpx.AsyncClient() as client:
         response = await client.put(url, headers=headers, json=body)
-        print(f"[DEBUG] update_kintone_record status: {response.status_code}")
-        print(f"[DEBUG] update_kintone_record response: {response.text}")
+        print(f"[DEBUG] update status: {response.status_code}")
+        print(f"[DEBUG] update response: {response.text}")
+        if not response.is_success:
+            try:
+                err = response.json()
+                print(f"[DEBUG] update error code: {err.get('code')}")
+                print(f"[DEBUG] update error message: {err.get('message')}")
+                print(f"[DEBUG] update error errors: {err.get('errors')}")
+            except Exception:
+                pass
         response.raise_for_status()
 
 
@@ -244,6 +254,9 @@ async def webhook(request: Request):
 
         # 第2段階：既存レコードを更新
         clean_reply2, update_fields = extract_marker(claude_reply, "KINTONE_UPDATE")
+        if update_fields:
+            print(f"[DEBUG] KINTONE_UPDATE detected: {update_fields}")
+            print(f"[DEBUG] stored record_id for user: {kintone_record_ids.get(user_id)!r}")
         if update_fields and user_id in kintone_record_ids:
             await update_kintone_record(kintone_record_ids[user_id], update_fields)
             claude_reply = clean_reply2
