@@ -198,6 +198,7 @@ async def webhook(request: Request):
         if kintone_record:
             kintone_record["LINEユーザーID"] = user_id
             kintone_record["status"] = "問い合わせ"
+            kintone_record["業者名"] = kintone_record.get("問い合わせ業者名", "")
             await post_to_kintone(kintone_record)
 
         async with httpx.AsyncClient() as client:
