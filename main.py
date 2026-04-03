@@ -197,7 +197,7 @@ async def webhook(request: Request):
         clean_reply, kintone_record = extract_kintone_record(claude_reply)
         if kintone_record:
             kintone_record["LINEユーザーID"] = user_id
-            kintone_record["ステータス"] = "問い合わせ"
+            kintone_record["status"] = "問い合わせ"
             await post_to_kintone(kintone_record)
 
         async with httpx.AsyncClient() as client:
