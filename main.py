@@ -103,17 +103,15 @@ LINEで承っております。
 
 [KINTONE_RECORD]
 {
-  "業者名": "（債権者名の値）",
-  "借入時期": "（値）",
-  "最終返済日": "（値）",
+  "問い合わせ業者名": "（債権者名の値）",
+  "借入時期_テキスト": "（借入時期の値）",
+  "最終返済日_テキスト": "（最終返済日の値）",
   "裁判所書類": "（裁判所からの書類の有無の値）",
-  "信用情報確認": "（信用情報から知ったかどうかの値）",
-  "ステータス": "問い合わせ"
+  "信用情報確認": "（信用情報から知ったかどうかの値）"
 }
 [/KINTONE_RECORD]
 
-5項目：債権者名・借入時期・最終返済日・裁判所からの書類の有無・信用情報から知ったかどうか
-ステータスは常に「問い合わせ」で固定してください。"""
+5項目：債権者名・借入時期・最終返済日・裁判所からの書類の有無・信用情報から知ったかどうか"""
 
 # ユーザーIDごとの会話履歴を保持
 conversation_histories: dict[str, list] = {}
@@ -198,6 +196,8 @@ async def webhook(request: Request):
         # kintoneデータが含まれていれば登録・除去
         clean_reply, kintone_record = extract_kintone_record(claude_reply)
         if kintone_record:
+            kintone_record["LINEユーザーID"] = user_id
+            kintone_record["ステータス"] = "問い合わせ"
             await post_to_kintone(kintone_record)
 
         async with httpx.AsyncClient() as client:
