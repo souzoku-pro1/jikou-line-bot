@@ -134,10 +134,8 @@ async def post_to_kintone(record: dict) -> None:
     fields = {key: {"value": value} for key, value in record.items()}
     body = {"app": KINTONE_APP_ID, "record": fields}
 
-    print(f"[DEBUG] post_to_kintone body: {body}")
     async with httpx.AsyncClient() as client:
         response = await client.post(url, headers=headers, json=body)
-        print(f"[DEBUG] kintone response status: {response.status_code}, text: {response.text}")
         response.raise_for_status()
 
 
