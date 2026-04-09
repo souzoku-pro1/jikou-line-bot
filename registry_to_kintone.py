@@ -135,12 +135,7 @@ def property_to_kintone_record(prop: dict, ocr_note: str) -> dict:
     owner_name = latest_owner["所有者"]["氏名_名称"] if latest_owner else ""
     owner_addr = latest_owner["所有者"].get("住所", "") if latest_owner else ""
     mochiwari = extract_mochiwari(owner_name)
-    # 持分表記を氏名から除去して状況フィールドに入れる
     owner_display = re.sub(r'（持分.+?）', '', owner_name or "").strip()
-    joukyou_parts = [owner_display, owner_addr]
-    if mochiwari:
-        joukyou_parts.append(f"持分: {mochiwari}")
-    joukyou = " / ".join(p for p in joukyou_parts if p)
 
     # 乙区（有効）
     active_otsuku = get_active_rights(otsuku)
@@ -150,8 +145,13 @@ def property_to_kintone_record(prop: dict, ocr_note: str) -> dict:
     )
     mortgage_text = build_mortgage_text(active_otsuku)
 
-    # 備考: OCRメモ + 原因
+    # 備考: 所有者情報 + 原因 + OCRメモ
     biko_parts = []
+    if owner_display or owner_addr:
+        owner_parts = [p for p in [owner_display, owner_addr] if p]
+        if mochiwari:
+            owner_parts.append(f"持分: {mochiwari}")
+        biko_parts.append(f"【所有者】{' / '.join(owner_parts)}")
     if title.get("原因"):
         biko_parts.append(f"【原因】{title['原因']}")
     if ocr_note:
@@ -175,7 +175,6 @@ def property_to_kintone_record(prop: dict, ocr_note: str) -> dict:
         "固定資産税評価額": {"value": ""},        # 登記情報に含まれない
         "担保抵当権":     {"value": "有" if has_mortgage else "無"},
         "担保内容":       {"value": mortgage_text},
-        "状況":           {"value": joukyou},
         "備考":           {"value": biko},
     }
     return record
