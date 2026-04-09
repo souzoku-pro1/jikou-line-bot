@@ -148,8 +148,8 @@ def property_to_kintone_record(prop: dict, ocr_note: str) -> dict:
     biko = ""
 
     shubetsu = prop.get("種別") or ""
-    # 建物は地番がないため家屋番号をフォールバック、区分建物のみ部屋番号に家屋番号を入れる
-    chiban = title.get("地番") or title.get("家屋番号") or ""
+    # 建物は地番なし（空欄）、区分建物のみ部屋番号に家屋番号を入れる
+    chiban = title.get("地番") or ""
     heya_bango = title.get("家屋番号") or "" if shubetsu == "区分建物" else ""
 
     record = {
