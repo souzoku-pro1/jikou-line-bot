@@ -54,18 +54,17 @@ def get_env(name: str) -> str:
 def parse_floor_areas(floor_text: str | None) -> dict:
     """
     「1階 58.50、2階 62.60、3階 62.60」などから各階面積を抽出。
-    戻り値: {"1": "58.5", "2": "62.6", "3": "62.6", ...}（数値文字列）
+    戻り値: {"1": 58.5, "2": 62.6, "3": 62.6, ...}（float）
     """
     result = {}
     if not floor_text:
         return result
     # パターン: "N階 数値" または "N階部分 数値"
     for m in re.finditer(r'(\d+)階(?:部分)?\s*([\d.]+)', floor_text):
-        # kintoneのNUMBERフィールド用に数値文字列へ変換（末尾ゼロを除去）
         try:
-            result[m.group(1)] = str(float(m.group(2)))
+            result[m.group(1)] = float(m.group(2))
         except ValueError:
-            result[m.group(1)] = m.group(2)
+            pass
     return result
 
 
@@ -174,9 +173,9 @@ def property_to_kintone_record(prop: dict, ocr_note: str) -> dict:
         "地番":           {"value": chiban},
         "地目":           {"value": title.get("地目") or ""},
         "地積":           {"value": title.get("地積_m2") or ""},
-        "床面積1階":      {"value": floors.get("1", "")},
-        "床面積2階":      {"value": floors.get("2", "")},
-        "床面積3階":      {"value": floors.get("3", "")},
+        "床面積1階":      {"value": floors.get("1", None)},
+        "床面積2階":      {"value": floors.get("2", None)},
+        "床面積3階":      {"value": floors.get("3", None)},
         "建物名":         {"value": title.get("種類") or ""},
         "部屋番号":       {"value": heya_bango},
         "専有面積":       {"value": ""},          # 区分建物専有面積（今回データなし）
