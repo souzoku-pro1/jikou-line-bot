@@ -145,18 +145,7 @@ def property_to_kintone_record(prop: dict, ocr_note: str) -> dict:
     )
     mortgage_text = build_mortgage_text(active_otsuku)
 
-    # 備考: 所有者情報 + 原因 + OCRメモ
-    biko_parts = []
-    if owner_display or owner_addr:
-        owner_parts = [p for p in [owner_display, owner_addr] if p]
-        if mochiwari:
-            owner_parts.append(f"持分: {mochiwari}")
-        biko_parts.append(f"【所有者】{' / '.join(owner_parts)}")
-    if title.get("原因"):
-        biko_parts.append(f"【原因】{title['原因']}")
-    if ocr_note:
-        biko_parts.append(f"【OCRメモ】{ocr_note}")
-    biko = "\n".join(biko_parts)
+    biko = ""
 
     shubetsu = prop.get("種別") or ""
     # 建物は地番がないため家屋番号をフォールバック、区分建物のみ部屋番号に家屋番号を入れる
