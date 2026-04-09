@@ -173,9 +173,9 @@ def property_to_kintone_record(prop: dict, ocr_note: str) -> dict:
         "地番":           {"value": chiban},
         "地目":           {"value": title.get("地目") or ""},
         "地積":           {"value": title.get("地積_m2") or ""},
-        "床面積1階":      {"value": floors.get("1", None)},
-        "床面積2階":      {"value": floors.get("2", None)},
-        "床面積3階":      {"value": floors.get("3", None)},
+        "床面積1階":      {"value": str(floors["1"]) if "1" in floors else ""},
+        "床面積2階":      {"value": str(floors["2"]) if "2" in floors else ""},
+        "床面積3階":      {"value": str(floors["3"]) if "3" in floors else ""},
         "建物名":         {"value": title.get("種類") or ""},
         "部屋番号":       {"value": heya_bango},
         "専有面積":       {"value": ""},          # 区分建物専有面積（今回データなし）
