@@ -54,17 +54,14 @@ def get_env(name: str) -> str:
 def parse_floor_areas(floor_text: str | None) -> dict:
     """
     「1階 58.50、2階 62.60、3階 62.60」などから各階面積を抽出。
-    戻り値: {"1": 58.5, "2": 62.6, "3": 62.6, ...}（float）
+    戻り値: {"1": "58.50", "2": "62.60", "3": "62.60", ...}（rawの文字列）
+    kintoneのNUMBERフィールドは文字列として送る必要があるため変換しない。
     """
     result = {}
     if not floor_text:
         return result
-    # パターン: "N階 数値" または "N階部分 数値"
     for m in re.finditer(r'(\d+)階(?:部分)?\s*([\d.]+)', floor_text):
-        try:
-            result[m.group(1)] = float(m.group(2))
-        except ValueError:
-            pass
+        result[m.group(1)] = m.group(2)  # "58.50" をそのまま文字列で保持
     return result
 
 
@@ -137,8 +134,12 @@ def property_to_kintone_record(prop: dict, ocr_note: str) -> dict:
     kouku = prop.get("甲区_所有権", [])
     otsuku = prop.get("乙区_その他権利", [])
 
-    # 床面積パース
+    # 床面積: "1階 58.50、2階 62.60、3階 62.60" → {"1": "58.50", "2": "62.60", ...}
     floors = parse_floor_areas(title.get("床面積_m2"))
+    # 各階の床面積をkintone NUMBER フィールド用の文字列として取り出す
+    floor_1 = floors.get("1", "")
+    floor_2 = floors.get("2", "")
+    floor_3 = floors.get("3", "")
 
     # 最新所有者
     latest_owner = get_latest_owner(kouku)
@@ -173,9 +174,9 @@ def property_to_kintone_record(prop: dict, ocr_note: str) -> dict:
         "地番":           {"value": chiban},
         "地目":           {"value": title.get("地目") or ""},
         "地積":           {"value": title.get("地積_m2") or ""},
-        "床面積1階":      {"value": str(floors["1"]) if "1" in floors else ""},
-        "床面積2階":      {"value": str(floors["2"]) if "2" in floors else ""},
-        "床面積3階":      {"value": str(floors["3"]) if "3" in floors else ""},
+        "床面積1階":      {"value": floor_1},
+        "床面積2階":      {"value": floor_2},
+        "床面積3階":      {"value": floor_3},
         "建物名":         {"value": title.get("種類") or ""},
         "部屋番号":       {"value": heya_bango},
         "専有面積":       {"value": ""},          # 区分建物専有面積（今回データなし）
