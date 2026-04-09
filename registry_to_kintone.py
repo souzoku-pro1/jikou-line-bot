@@ -54,14 +54,18 @@ def get_env(name: str) -> str:
 def parse_floor_areas(floor_text: str | None) -> dict:
     """
     「1階 58.50、2階 62.60、3階 62.60」などから各階面積を抽出。
-    戻り値: {"1": "58.50", "2": "62.60", "3": "62.60", ...}
+    戻り値: {"1": "58.5", "2": "62.6", "3": "62.6", ...}（数値文字列）
     """
     result = {}
     if not floor_text:
         return result
     # パターン: "N階 数値" または "N階部分 数値"
     for m in re.finditer(r'(\d+)階(?:部分)?\s*([\d.]+)', floor_text):
-        result[m.group(1)] = m.group(2)
+        # kintoneのNUMBERフィールド用に数値文字列へ変換（末尾ゼロを除去）
+        try:
+            result[m.group(1)] = str(float(m.group(2)))
+        except ValueError:
+            result[m.group(1)] = m.group(2)
     return result
 
 
@@ -145,7 +149,12 @@ def property_to_kintone_record(prop: dict, ocr_note: str) -> dict:
     )
     mortgage_text = build_mortgage_text(active_otsuku)
 
-    biko = ""
+    # 4階以上の床面積を備考にまとめる
+    upper_floors = {k: v for k, v in floors.items() if int(k) >= 4}
+    if upper_floors:
+        biko = "【床面積】" + "、".join(f"{k}階 {v}㎡" for k, v in sorted(upper_floors.items(), key=lambda x: int(x[0])))
+    else:
+        biko = ""
 
     shubetsu = prop.get("種別") or ""
     # 建物は地番なし（空欄）、区分建物のみ部屋番号に家屋番号を入れる
