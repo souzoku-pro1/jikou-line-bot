@@ -78,8 +78,15 @@ def extract_floor_count(structure: str | None) -> str:
 
 
 def get_active_rights(rights_list: list) -> list:
-    """乙区から抹消されていない有効な権利のみ返す。"""
-    return [r for r in rights_list if not r.get("抹消", False)]
+    """乙区から有効な権利のみ返す。
+    ・抹消フラグがFalse
+    ・登記目的に「抹消」を含まない（抹消登記自体を除外）
+    """
+    return [
+        r for r in rights_list
+        if not r.get("抹消", False)
+        and "抹消" not in str(r.get("登記目的", ""))
+    ]
 
 
 def get_latest_owner(kouku_list: list) -> dict | None:
