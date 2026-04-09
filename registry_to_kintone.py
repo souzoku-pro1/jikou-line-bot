@@ -158,17 +158,22 @@ def property_to_kintone_record(prop: dict, ocr_note: str) -> dict:
         biko_parts.append(f"【OCRメモ】{ocr_note}")
     biko = "\n".join(biko_parts)
 
+    shubetsu = prop.get("種別") or ""
+    # 建物は地番がないため家屋番号をフォールバック、区分建物のみ部屋番号に家屋番号を入れる
+    chiban = title.get("地番") or title.get("家屋番号") or ""
+    heya_bango = title.get("家屋番号") or "" if shubetsu == "区分建物" else ""
+
     record = {
-        "種別":           {"value": prop.get("種別") or ""},
+        "種別":           {"value": shubetsu},
         "所在":           {"value": title.get("所在") or ""},
-        "地番":           {"value": title.get("地番") or ""},
+        "地番":           {"value": chiban},
         "地目":           {"value": title.get("地目") or ""},
         "地積":           {"value": title.get("地積_m2") or ""},
         "床面積1階":      {"value": floors.get("1", "")},
         "床面積2階":      {"value": floors.get("2", "")},
         "床面積3階":      {"value": floors.get("3", "")},
         "建物名":         {"value": title.get("種類") or ""},
-        "部屋番号":       {"value": title.get("家屋番号") or ""},
+        "部屋番号":       {"value": heya_bango},
         "専有面積":       {"value": ""},          # 区分建物専有面積（今回データなし）
         "階数":           {"value": extract_floor_count(title.get("構造"))},
         "持分割合":       {"value": mochiwari},
