@@ -340,8 +340,12 @@ async def _extract_fixed_asset(ocr_text: str) -> dict:
             "role": "user",
             "content": (
                 "以下は固定資産税の課税明細書またはその関連書類のOCRテキストです。\n"
-                "次の2項目をJSONで抽出してください。不明な場合は null にしてください。\n"
-                '{"評価額": "（金額。例: 12345678）", "年度": "（年度。例: 令和6年度）"}\n'
+                "次の2項目を数値のみでJSONに抽出してください。不明な場合は null にしてください。\n"
+                "\n"
+                "- 評価額: 円単位の整数（例: 12345678）。カンマや「円」は除去すること。\n"
+                "- 年度: 西暦4桁の整数（例: 令和6年度→2024、令和7年度→2025）。\n"
+                "\n"
+                '出力形式: {"評価額": 12345678, "年度": 2024}\n'
                 "JSONのみ出力してください。\n\n"
                 f"=== OCRテキスト ===\n{ocr_text}\n=== END ==="
             ),
@@ -364,14 +368,11 @@ async def _post_fixed_asset_to_kintone(extracted: dict) -> str:
         "Content-Type": "application/json",
     }
 
-    # ── TODO: フィールドコードをkintoneアプリに合わせて変更してください ──
+    # kintone NUMBERフィールドは文字列として送信する
     record = {
-        # TODO: 評価額フィールドのコードを指定してください
-        # "固定資産税評価額": {"value": extracted.get("評価額") or ""},
-        # TODO: 年度フィールドのコードを指定してください
-        # "年度": {"value": extracted.get("年度") or ""},
+        "固定資産税評価額": {"value": str(extracted["評価額"]) if extracted.get("評価額") is not None else ""},
+        "固定資産税評価年度": {"value": str(extracted["年度"]) if extracted.get("年度") is not None else ""},
     }
-    # ─────────────────────────────────────────────────────────────
 
     body = {"app": KINTONE_FUDOSAN_APP_ID_OCR, "record": record}
     async with httpx.AsyncClient() as client:
