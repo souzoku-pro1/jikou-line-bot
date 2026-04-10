@@ -406,7 +406,6 @@ async def ocr_fixed_asset(file: UploadFile = File(...)):
         "KINTONE_DOMAIN or KINTONE_SUBDOMAIN": KINTONE_FUDOSAN_DOMAIN,
         "KINTONE_FUDOSAN_APP_ID": KINTONE_FUDOSAN_APP_ID_OCR,
         "KINTONE_FUDOSAN_API_TOKEN": KINTONE_FUDOSAN_API_TOKEN_OCR,
-        "LINE_USER_ID": LINE_USER_ID,
     }.items() if not v]
     if missing:
         raise HTTPException(status_code=500,
@@ -448,11 +447,13 @@ async def ocr_fixed_asset(file: UploadFile = File(...)):
         f"kintoneレコードID：{record_id}\n"
         f"━━━━━━━━━━━━━━━"
     )
-    try:
-        await _push_line_message(LINE_USER_ID, notify_text)
-    except Exception as e:
-        # 通知失敗はログのみ（登録自体は成功しているため400系にしない）
-        print(f"[WARN] LINE通知失敗: {e}")
+    if LINE_USER_ID:
+        try:
+            await _push_line_message(LINE_USER_ID, notify_text)
+        except Exception as e:
+            print(f"[WARN] LINE通知失敗: {e}")
+    else:
+        print("[INFO] LINE_USER_ID未設定のためLINE通知をスキップ")
 
     return {
         "status": "ok",
