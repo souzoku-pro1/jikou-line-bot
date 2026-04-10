@@ -368,6 +368,44 @@ async def _extract_fixed_asset(ocr_text: str) -> dict:
     return json.loads(raw.strip())
 
 
+# 丁目の数字変換テーブル（算用数字→漢数字）
+_CHOME_KANJI = {
+    1:'一', 2:'二', 3:'三', 4:'四', 5:'五',
+    6:'六', 7:'七', 8:'八', 9:'九', 10:'十',
+    11:'十一', 12:'十二', 13:'十三', 14:'十四', 15:'十五',
+    16:'十六', 17:'十七', 18:'十八', 19:'十九', 20:'二十',
+}
+
+def _normalize_shozaichi(address: str) -> str:
+    """OCR抽出の所在地をkintone検索用に正規化する
+
+    変換内容:
+    1. 都道府県名を削除（埼玉県川口市→川口市）
+    2. 丁目前の算用数字を漢数字に変換（3丁目→三丁目）
+    3. 番地表記を統一（32-6 / 32の6 → 32番地6）
+    """
+    if not address:
+        return address
+    # 1. 都道府県名を削除
+    address = re.sub(r'^(北海道|東京都|大阪府|京都府|.{2,3}県)', '', address)
+    # 2. 丁目前の算用数字→漢数字
+    def _chome_to_kanji(m):
+        n = int(m.group(1))
+        return _CHOME_KANJI.get(n, str(n)) + '丁目'
+    address = re.sub(r'(\d+)丁目', _chome_to_kanji, address)
+    # 3. 番地表記を統一（ハイフン・「の」→「番地」）
+    address = re.sub(r'(\d+)[－ー\-の](\d+)(番地?|号)?$', r'\1番地\2', address)
+    return address.strip()
+
+
+def _normalize_chiban(chiban: str) -> str:
+    """地番の表記を統一する（32-6 / 32の6 → 32番地6）"""
+    if not chiban:
+        return chiban
+    chiban = re.sub(r'(\d+)[－ー\-の](\d+)(番地?|号)?$', r'\1番地\2', chiban)
+    return chiban.strip()
+
+
 async def _search_kintone_record(shozaichi: str, chiban: str) -> str | None:
     """所在地・地番でkintoneレコードを検索してレコードIDを返す。見つからない場合はNone。"""
     FIELD_SHOZAICHI = "所在"
@@ -467,11 +505,14 @@ async def ocr_fixed_asset(file: UploadFile = File(...)):
 
     print(f"[DEBUG] extracted: {extracted}")
 
-    shozaichi = extracted.get("所在地") or ""
-    chiban    = extracted.get("地番")   or ""
-    if not shozaichi or not chiban:
+    shozaichi_raw = extracted.get("所在地") or ""
+    chiban        = extracted.get("地番")   or ""
+    if not shozaichi_raw or not chiban:
         raise HTTPException(status_code=422,
                             detail=f"所在地または地番を抽出できませんでした: {extracted}")
+
+    shozaichi = _normalize_shozaichi(shozaichi_raw)
+    print(f"[DEBUG] 所在地: {shozaichi_raw!r} → {shozaichi!r}")
 
     # 4. kintoneで所在地・地番が一致するレコードを検索
     try:
