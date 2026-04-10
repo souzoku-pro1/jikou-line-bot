@@ -6,10 +6,22 @@ import hashlib
 import base64
 import httpx
 import anthropic
-import fitz  # PyMuPDF
 from fastapi import FastAPI, Request, HTTPException, UploadFile, File
 
 app = FastAPI()
+
+
+@app.get("/health")
+async def health():
+    """起動確認・依存ライブラリのインポートチェック"""
+    status = {}
+    try:
+        import fitz
+        status["pymupdf"] = fitz.__version__
+    except ImportError as e:
+        status["pymupdf"] = f"NG: {e}"
+    return {"status": "ok", "deps": status}
+
 
 LINE_CHANNEL_SECRET = os.environ["LINE_CHANNEL_SECRET"]
 LINE_CHANNEL_ACCESS_TOKEN = os.environ["LINE_CHANNEL_ACCESS_TOKEN"]
@@ -320,6 +332,10 @@ def _ocr_page_bytes(image_bytes: bytes, api_key: str) -> str:
 
 def _ocr_pdf_bytes(pdf_bytes: bytes, api_key: str) -> str:
     """PDFバイトを PyMuPDF で画像化して全ページOCRし、結合テキストを返す"""
+    try:
+        import fitz
+    except ImportError:
+        raise RuntimeError("pymupdf がインストールされていません。Railway の requirements.txt に pymupdf を追加してください。")
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     pages_text = []
     for i, page in enumerate(doc):
