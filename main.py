@@ -321,8 +321,12 @@ def _ocr_pdf_bytes(pdf_bytes: bytes, api_key: str) -> str:
     url = f"https://vision.googleapis.com/v1/files:annotate?key={api_key}"
     req = urllib.request.Request(url, data=body,
                                   headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req) as resp:
-        result = json.loads(resp.read())
+    try:
+        with urllib.request.urlopen(req) as resp:
+            result = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        err_body = e.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Vision API {e.code}: {err_body}")
 
     # files:annotate のレスポンス構造:
     # result["responses"][0]["responses"] → ページごとの結果リスト
