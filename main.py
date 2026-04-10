@@ -339,7 +339,7 @@ def _ocr_pdf_bytes(pdf_bytes: bytes, api_key: str) -> str:
 
 
 async def _extract_fixed_asset(ocr_text: str) -> dict:
-    """OCRテキストから固定資産税評価額と年度を抽出して返す"""
+    """OCRテキストから固定資産税評価額・年度・所在地・地番を抽出して返す"""
     response = await claude_client.messages.create(
         model="claude-sonnet-4-6",
         max_tokens=512,
@@ -347,19 +347,20 @@ async def _extract_fixed_asset(ocr_text: str) -> dict:
             "role": "user",
             "content": (
                 "以下は固定資産税の課税明細書またはその関連書類のOCRテキストです。\n"
-                "次の2項目を数値のみでJSONに抽出してください。不明な場合は null にしてください。\n"
+                "次の4項目をJSONで抽出してください。不明な場合は null にしてください。\n"
                 "\n"
                 "- 評価額: 円単位の整数（例: 12345678）。カンマや「円」は除去すること。\n"
                 "- 年度: 西暦4桁の整数（例: 令和6年度→2024、令和7年度→2025）。\n"
+                "- 所在地: 不動産の所在地（例: 埼玉県戸田市喜沢）。番地は含めず市区町村・大字まで。\n"
+                "- 地番: 地番または家屋番号（例: 123-4）。\n"
                 "\n"
-                '出力形式: {"評価額": 12345678, "年度": 2024}\n'
+                '出力形式: {"評価額": 12345678, "年度": 2024, "所在地": "埼玉県戸田市喜沢", "地番": "123-4"}\n'
                 "JSONのみ出力してください。\n\n"
                 f"=== OCRテキスト ===\n{ocr_text}\n=== END ==="
             ),
         }],
     )
     raw = response.content[0].text.strip()
-    # コードブロックを除去
     if "```" in raw:
         raw = raw.split("```")[1]
         if raw.startswith("json"):
@@ -367,30 +368,55 @@ async def _extract_fixed_asset(ocr_text: str) -> dict:
     return json.loads(raw.strip())
 
 
-async def _post_fixed_asset_to_kintone(extracted: dict) -> str:
-    """抽出データをkintone不動産管理アプリに登録してレコードIDを返す"""
+async def _search_kintone_record(shozaichi: str, chiban: str) -> str | None:
+    """所在地・地番でkintoneレコードを検索してレコードIDを返す。見つからない場合はNone。"""
+    # TODO: 所在地のフィールドコードを指定してください（例: "所在"）
+    FIELD_SHOZAICHI = "所在"
+    # TODO: 地番のフィールドコードを指定してください（例: "地番"）
+    FIELD_CHIBAN = "地番"
+
+    import urllib.parse
+    query = f'{FIELD_SHOZAICHI} like "{shozaichi}" and {FIELD_CHIBAN} = "{chiban}"'
+    params = urllib.parse.urlencode({
+        "app": KINTONE_FUDOSAN_APP_ID_OCR,
+        "query": query,
+        "fields[0]": "$id",
+    })
+    url = f"https://{KINTONE_FUDOSAN_DOMAIN}.cybozu.com/k/v1/records.json?{params}"
+    headers = {"X-Cybozu-API-Token": KINTONE_FUDOSAN_API_TOKEN_OCR}
+
+    print(f"[DEBUG] kintone search query: {query}")
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(url, headers=headers)
+        print(f"[DEBUG] kintone search status: {resp.status_code}")
+        print(f"[DEBUG] kintone search response: {resp.text}")
+        if not resp.is_success:
+            raise Exception(f"kintone検索エラー {resp.status_code}: {resp.text}")
+        records = resp.json().get("records", [])
+        if not records:
+            return None
+        return records[0]["$id"]["value"]
+
+
+async def _update_kintone_record(record_id: str, extracted: dict) -> None:
+    """固定資産税評価額・年度を既存レコードに上書き更新する"""
     url = f"https://{KINTONE_FUDOSAN_DOMAIN}.cybozu.com/k/v1/record.json"
     headers = {
         "X-Cybozu-API-Token": KINTONE_FUDOSAN_API_TOKEN_OCR,
         "Content-Type": "application/json",
     }
-
-    # kintone NUMBERフィールドは文字列として送信する
     record = {
-        "固定資産税評価額": {"value": str(extracted["評価額"]) if extracted.get("評価額") is not None else ""},
-        "固定資産税評価年度": {"value": str(extracted["年度"]) if extracted.get("年度") is not None else ""},
+        "固定資産税評価額":   {"value": str(extracted["評価額"]) if extracted.get("評価額") is not None else ""},
+        "固定資産税評価年度": {"value": str(extracted["年度"])   if extracted.get("年度")   is not None else ""},
     }
-
-    body = {"app": KINTONE_FUDOSAN_APP_ID_OCR, "record": record}
-    print(f"[DEBUG] kintone POST url: {url}")
-    print(f"[DEBUG] kintone body: {json.dumps(body, ensure_ascii=False)}")
+    body = {"app": KINTONE_FUDOSAN_APP_ID_OCR, "id": record_id, "record": record}
+    print(f"[DEBUG] kintone PUT body: {json.dumps(body, ensure_ascii=False)}")
     async with httpx.AsyncClient() as client:
-        resp = await client.post(url, headers=headers, json=body)
-        print(f"[DEBUG] kintone status: {resp.status_code}")
-        print(f"[DEBUG] kintone response: {resp.text}")
+        resp = await client.put(url, headers=headers, json=body)
+        print(f"[DEBUG] kintone PUT status: {resp.status_code}")
+        print(f"[DEBUG] kintone PUT response: {resp.text}")
         if not resp.is_success:
-            raise Exception(f"kintone {resp.status_code}: {resp.text}")
-        return resp.json()["id"]
+            raise Exception(f"kintone更新エラー {resp.status_code}: {resp.text}")
 
 
 async def _push_line_message(user_id: str, text: str) -> None:
@@ -435,22 +461,42 @@ async def ocr_fixed_asset(file: UploadFile = File(...)):
     if not ocr_text.strip():
         raise HTTPException(status_code=422, detail="OCRでテキストを取得できませんでした")
 
-    # 3. Claude APIで評価額・年度を構造化抽出
+    # 3. Claude APIで評価額・年度・所在地・地番を構造化抽出
     try:
         extracted = await _extract_fixed_asset(ocr_text)
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Claude抽出エラー: {e}")
 
-    # 4. kintoneに登録
-    try:
-        record_id = await _post_fixed_asset_to_kintone(extracted)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"kintone登録エラー: {e}")
+    print(f"[DEBUG] extracted: {extracted}")
 
-    # 5. LINEで完了通知
+    shozaichi = extracted.get("所在地") or ""
+    chiban    = extracted.get("地番")   or ""
+    if not shozaichi or not chiban:
+        raise HTTPException(status_code=422,
+                            detail=f"所在地または地番を抽出できませんでした: {extracted}")
+
+    # 4. kintoneで所在地・地番が一致するレコードを検索
+    try:
+        record_id = await _search_kintone_record(shozaichi, chiban)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"kintone検索エラー: {e}")
+
+    if record_id is None:
+        raise HTTPException(status_code=404,
+                            detail=f"kintoneに一致するレコードが見つかりません（所在地: {shozaichi} / 地番: {chiban}）")
+
+    # 5. 一致レコードの評価額・年度を更新
+    try:
+        await _update_kintone_record(record_id, extracted)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"kintone更新エラー: {e}")
+
+    # 6. LINEで完了通知
     notify_text = (
-        f"✅ 固定資産税評価額の登録が完了しました\n"
+        f"✅ 固定資産税評価額の更新が完了しました\n"
         f"━━━━━━━━━━━━━━━\n"
+        f"所在地：{shozaichi}\n"
+        f"地番：{chiban}\n"
         f"年度：{extracted.get('年度') or '不明'}\n"
         f"評価額：{extracted.get('評価額') or '不明'}\n"
         f"kintoneレコードID：{record_id}\n"
