@@ -304,46 +304,33 @@ async def webhook(request: Request):
 # POST /ocr/fixed-asset  固定資産税評価額 OCR → kintone登録
 # ══════════════════════════════════════════════════════════════
 
-def _ocr_page_bytes(image_bytes: bytes, api_key: str) -> str:
-    """1ページ分の画像バイトを Vision API でOCRしてテキストを返す"""
+def _ocr_pdf_bytes(pdf_bytes: bytes, api_key: str) -> str:
+    """PDFを Vision API の files:annotate に直接送ってOCRする（PyMuPDF不要）"""
     import urllib.request
-    content = base64.b64encode(image_bytes).decode("utf-8")
+    content = base64.b64encode(pdf_bytes).decode("utf-8")
     body = json.dumps({
         "requests": [{
-            "image": {"content": content},
+            "inputConfig": {
+                "content": content,
+                "mimeType": "application/pdf",
+            },
             "features": [{"type": "DOCUMENT_TEXT_DETECTION"}],
             "imageContext": {"languageHints": ["ja", "en"]},
         }]
     }).encode("utf-8")
-    url = f"https://vision.googleapis.com/v1/images:annotate?key={api_key}"
+    url = f"https://vision.googleapis.com/v1/files:annotate?key={api_key}"
     req = urllib.request.Request(url, data=body,
                                   headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(req) as resp:
         result = json.loads(resp.read())
-    responses = result.get("responses", [])
-    if not responses:
-        return ""
-    annotation = responses[0].get("fullTextAnnotation")
-    if annotation:
-        return annotation.get("text", "")
-    texts = responses[0].get("textAnnotations", [])
-    return texts[0].get("description", "") if texts else ""
 
-
-def _ocr_pdf_bytes(pdf_bytes: bytes, api_key: str) -> str:
-    """PDFバイトを PyMuPDF で画像化して全ページOCRし、結合テキストを返す"""
-    try:
-        import fitz
-    except ImportError:
-        raise RuntimeError("pymupdf がインストールされていません。Railway の requirements.txt に pymupdf を追加してください。")
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    # files:annotate のレスポンス構造:
+    # result["responses"][0]["responses"] → ページごとの結果リスト
     pages_text = []
-    for i, page in enumerate(doc):
-        mat = fitz.Matrix(3, 3)          # ≈ 216dpi
-        pix = page.get_pixmap(matrix=mat)
-        text = _ocr_page_bytes(pix.tobytes("png"), api_key)
-        pages_text.append(f"--- ページ {i + 1} ---\n{text}" if text else f"--- ページ {i + 1} ---\n(テキストなし)")
-    doc.close()
+    for page_resp in result.get("responses", [{}])[0].get("responses", []):
+        annotation = page_resp.get("fullTextAnnotation")
+        if annotation:
+            pages_text.append(annotation.get("text", ""))
     return "\n\n".join(pages_text)
 
 
