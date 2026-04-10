@@ -378,9 +378,14 @@ async def _post_fixed_asset_to_kintone(extracted: dict) -> str:
     }
 
     body = {"app": KINTONE_FUDOSAN_APP_ID_OCR, "record": record}
+    print(f"[DEBUG] kintone POST url: {url}")
+    print(f"[DEBUG] kintone body: {json.dumps(body, ensure_ascii=False)}")
     async with httpx.AsyncClient() as client:
         resp = await client.post(url, headers=headers, json=body)
-        resp.raise_for_status()
+        print(f"[DEBUG] kintone status: {resp.status_code}")
+        print(f"[DEBUG] kintone response: {resp.text}")
+        if not resp.is_success:
+            raise Exception(f"kintone {resp.status_code}: {resp.text}")
         return resp.json()["id"]
 
 
