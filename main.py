@@ -6,7 +6,8 @@ import hashlib
 import base64
 import httpx
 import anthropic
-from fastapi import FastAPI, Request, HTTPException
+import fitz  # PyMuPDF
+from fastapi import FastAPI, Request, HTTPException, UploadFile, File
 
 app = FastAPI()
 
@@ -18,6 +19,14 @@ KINTONE_APP_ID = os.environ["KINTONE_APP_ID"]
 KINTONE_API_TOKEN = os.environ["KINTONE_API_TOKEN"]
 
 REPLY_URL = "https://api.line.me/v2/bot/message/reply"
+PUSH_URL  = "https://api.line.me/v2/bot/message/push"
+
+# OCR固定資産エンドポイント用の環境変数（起動時ではなくリクエスト時にチェック）
+GOOGLE_VISION_API_KEY        = os.environ.get("GOOGLE_VISION_API_KEY")
+KINTONE_FUDOSAN_DOMAIN       = os.environ.get("KINTONE_DOMAIN", os.environ.get("KINTONE_SUBDOMAIN", ""))
+KINTONE_FUDOSAN_APP_ID_OCR   = os.environ.get("KINTONE_FUDOSAN_APP_ID", "")
+KINTONE_FUDOSAN_API_TOKEN_OCR = os.environ.get("KINTONE_FUDOSAN_API_TOKEN", "")
+LINE_USER_ID                 = os.environ.get("LINE_USER_ID", "")
 
 claude_client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
 
@@ -277,3 +286,172 @@ async def webhook(request: Request):
             )
 
     return {"status": "ok"}
+
+
+# ══════════════════════════════════════════════════════════════
+# POST /ocr/fixed-asset  固定資産税評価額 OCR → kintone登録
+# ══════════════════════════════════════════════════════════════
+
+def _ocr_page_bytes(image_bytes: bytes, api_key: str) -> str:
+    """1ページ分の画像バイトを Vision API でOCRしてテキストを返す"""
+    import urllib.request
+    content = base64.b64encode(image_bytes).decode("utf-8")
+    body = json.dumps({
+        "requests": [{
+            "image": {"content": content},
+            "features": [{"type": "DOCUMENT_TEXT_DETECTION"}],
+            "imageContext": {"languageHints": ["ja", "en"]},
+        }]
+    }).encode("utf-8")
+    url = f"https://vision.googleapis.com/v1/images:annotate?key={api_key}"
+    req = urllib.request.Request(url, data=body,
+                                  headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req) as resp:
+        result = json.loads(resp.read())
+    responses = result.get("responses", [])
+    if not responses:
+        return ""
+    annotation = responses[0].get("fullTextAnnotation")
+    if annotation:
+        return annotation.get("text", "")
+    texts = responses[0].get("textAnnotations", [])
+    return texts[0].get("description", "") if texts else ""
+
+
+def _ocr_pdf_bytes(pdf_bytes: bytes, api_key: str) -> str:
+    """PDFバイトを PyMuPDF で画像化して全ページOCRし、結合テキストを返す"""
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    pages_text = []
+    for i, page in enumerate(doc):
+        mat = fitz.Matrix(3, 3)          # ≈ 216dpi
+        pix = page.get_pixmap(matrix=mat)
+        text = _ocr_page_bytes(pix.tobytes("png"), api_key)
+        pages_text.append(f"--- ページ {i + 1} ---\n{text}" if text else f"--- ページ {i + 1} ---\n(テキストなし)")
+    doc.close()
+    return "\n\n".join(pages_text)
+
+
+async def _extract_fixed_asset(ocr_text: str) -> dict:
+    """OCRテキストから固定資産税評価額と年度を抽出して返す"""
+    response = await claude_client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=512,
+        messages=[{
+            "role": "user",
+            "content": (
+                "以下は固定資産税の課税明細書またはその関連書類のOCRテキストです。\n"
+                "次の2項目をJSONで抽出してください。不明な場合は null にしてください。\n"
+                '{"評価額": "（金額。例: 12345678）", "年度": "（年度。例: 令和6年度）"}\n'
+                "JSONのみ出力してください。\n\n"
+                f"=== OCRテキスト ===\n{ocr_text}\n=== END ==="
+            ),
+        }],
+    )
+    raw = response.content[0].text.strip()
+    # コードブロックを除去
+    if "```" in raw:
+        raw = raw.split("```")[1]
+        if raw.startswith("json"):
+            raw = raw[4:]
+    return json.loads(raw.strip())
+
+
+async def _post_fixed_asset_to_kintone(extracted: dict) -> str:
+    """抽出データをkintone不動産管理アプリに登録してレコードIDを返す"""
+    url = f"https://{KINTONE_FUDOSAN_DOMAIN}.cybozu.com/k/v1/record.json"
+    headers = {
+        "X-Cybozu-API-Token": KINTONE_FUDOSAN_API_TOKEN_OCR,
+        "Content-Type": "application/json",
+    }
+
+    # ── TODO: フィールドコードをkintoneアプリに合わせて変更してください ──
+    record = {
+        # TODO: 評価額フィールドのコードを指定してください
+        # "固定資産税評価額": {"value": extracted.get("評価額") or ""},
+        # TODO: 年度フィールドのコードを指定してください
+        # "年度": {"value": extracted.get("年度") or ""},
+    }
+    # ─────────────────────────────────────────────────────────────
+
+    body = {"app": KINTONE_FUDOSAN_APP_ID_OCR, "record": record}
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(url, headers=headers, json=body)
+        resp.raise_for_status()
+        return resp.json()["id"]
+
+
+async def _push_line_message(user_id: str, text: str) -> None:
+    """LINE Push APIでメッセージを送る"""
+    async with httpx.AsyncClient() as client:
+        await client.post(
+            PUSH_URL,
+            headers={"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"},
+            json={"to": user_id, "messages": [{"type": "text", "text": text}]},
+        )
+
+
+@app.post("/ocr/fixed-asset")
+async def ocr_fixed_asset(file: UploadFile = File(...)):
+    """
+    PDFをアップロードすると固定資産税評価額・年度をOCRで抽出し
+    kintoneに登録してLINEで通知する。
+    """
+    # ─ 環境変数チェック ─
+    missing = [k for k, v in {
+        "GOOGLE_VISION_API_KEY": GOOGLE_VISION_API_KEY,
+        "KINTONE_DOMAIN or KINTONE_SUBDOMAIN": KINTONE_FUDOSAN_DOMAIN,
+        "KINTONE_FUDOSAN_APP_ID": KINTONE_FUDOSAN_APP_ID_OCR,
+        "KINTONE_FUDOSAN_API_TOKEN": KINTONE_FUDOSAN_API_TOKEN_OCR,
+        "LINE_USER_ID": LINE_USER_ID,
+    }.items() if not v]
+    if missing:
+        raise HTTPException(status_code=500,
+                            detail=f"環境変数が未設定です: {', '.join(missing)}")
+
+    if not file.filename or not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="PDFファイルを送信してください")
+
+    # 1. PDFを読み込む
+    pdf_bytes = await file.read()
+
+    # 2. Google Cloud Vision API でOCR
+    try:
+        ocr_text = _ocr_pdf_bytes(pdf_bytes, GOOGLE_VISION_API_KEY)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"OCRエラー: {e}")
+
+    if not ocr_text.strip():
+        raise HTTPException(status_code=422, detail="OCRでテキストを取得できませんでした")
+
+    # 3. Claude APIで評価額・年度を構造化抽出
+    try:
+        extracted = await _extract_fixed_asset(ocr_text)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Claude抽出エラー: {e}")
+
+    # 4. kintoneに登録
+    try:
+        record_id = await _post_fixed_asset_to_kintone(extracted)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"kintone登録エラー: {e}")
+
+    # 5. LINEで完了通知
+    notify_text = (
+        f"✅ 固定資産税評価額の登録が完了しました\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"年度：{extracted.get('年度') or '不明'}\n"
+        f"評価額：{extracted.get('評価額') or '不明'}\n"
+        f"kintoneレコードID：{record_id}\n"
+        f"━━━━━━━━━━━━━━━"
+    )
+    try:
+        await _push_line_message(LINE_USER_ID, notify_text)
+    except Exception as e:
+        # 通知失敗はログのみ（登録自体は成功しているため400系にしない）
+        print(f"[WARN] LINE通知失敗: {e}")
+
+    return {
+        "status": "ok",
+        "kintone_record_id": record_id,
+        "extracted": extracted,
+    }
