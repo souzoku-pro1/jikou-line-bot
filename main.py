@@ -370,9 +370,7 @@ async def _extract_fixed_asset(ocr_text: str) -> dict:
 
 async def _search_kintone_record(shozaichi: str, chiban: str) -> str | None:
     """所在地・地番でkintoneレコードを検索してレコードIDを返す。見つからない場合はNone。"""
-    # TODO: 所在地のフィールドコードを指定してください（例: "所在"）
     FIELD_SHOZAICHI = "所在"
-    # TODO: 地番のフィールドコードを指定してください（例: "地番"）
     FIELD_CHIBAN = "地番"
 
     import urllib.parse
