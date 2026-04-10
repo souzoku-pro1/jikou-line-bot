@@ -406,9 +406,13 @@ def _normalize_chiban(chiban: str) -> str:
     return chiban.strip()
 
 
-async def _run_kintone_search(query: str, headers: dict) -> list:
-    """kintone レコード検索を実行してレコードリストを返す"""
+async def _search_kintone_record(shozaichi: str) -> str | None:
+    """正規化済み所在地でkintoneレコードを部分一致検索してレコードIDを返す。見つからない場合はNone。"""
     import urllib.parse
+    FIELD_SHOZAICHI = "所在"
+    headers = {"X-Cybozu-API-Token": KINTONE_FUDOSAN_API_TOKEN_OCR}
+
+    query = f'{FIELD_SHOZAICHI} like "{shozaichi}"'
     params = urllib.parse.urlencode({
         "app": KINTONE_FUDOSAN_APP_ID_OCR,
         "query": query,
@@ -421,39 +425,10 @@ async def _run_kintone_search(query: str, headers: dict) -> list:
         print(f"[DEBUG] kintone search status: {resp.status_code} / response: {resp.text}")
         if not resp.is_success:
             raise Exception(f"kintone検索エラー {resp.status_code}: {resp.text}")
-        return resp.json().get("records", [])
-
-
-async def _search_kintone_record(shozaichi: str, chiban: str) -> str | None:
-    """所在地・地番でkintoneレコードを2段階で検索してレコードIDを返す。見つからない場合はNone。
-
-    ステップ1: 正規化済み所在地（漢数字丁目）+ 地番 で完全一致検索
-    ステップ2: 丁目以前の市区町村名のみで部分一致検索（ヒット数が1件ならそれを採用）
-    """
-    FIELD_SHOZAICHI = "所在"
-    FIELD_CHIBAN = "地番"
-    headers = {"X-Cybozu-API-Token": KINTONE_FUDOSAN_API_TOKEN_OCR}
-
-    # ── ステップ1: 正規化済み所在地 + 地番 ──
-    query1 = f'{FIELD_SHOZAICHI} like "{shozaichi}" and {FIELD_CHIBAN} = "{chiban}"'
-    records = await _run_kintone_search(query1, headers)
-    if records:
-        print(f"[DEBUG] ステップ1でヒット: {records[0]['$id']['value']}")
+        records = resp.json().get("records", [])
+        if not records:
+            return None
         return records[0]["$id"]["value"]
-
-    # ── ステップ2: 丁目より前の市区町村名で部分一致 + 地番 ──
-    # 「川口市並木三丁目」→「川口市並木」
-    city_part = re.sub(r'[一二三四五六七八九十百千]+丁目.*$', '', shozaichi).strip()
-    if not city_part:
-        city_part = shozaichi  # フォールバック
-    query2 = f'{FIELD_SHOZAICHI} like "{city_part}" and {FIELD_CHIBAN} = "{chiban}"'
-    print(f"[DEBUG] ステップ2（部分一致）: city_part={city_part!r}")
-    records = await _run_kintone_search(query2, headers)
-    if records:
-        print(f"[DEBUG] ステップ2でヒット: {records[0]['$id']['value']}")
-        return records[0]["$id"]["value"]
-
-    return None
 
 
 async def _update_kintone_record(record_id: str, extracted: dict) -> None:
@@ -538,7 +513,7 @@ async def ocr_fixed_asset(file: UploadFile = File(...)):
 
     # 4. kintoneで所在地・地番が一致するレコードを検索
     try:
-        record_id = await _search_kintone_record(shozaichi, chiban)
+        record_id = await _search_kintone_record(shozaichi)
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"kintone検索エラー: {e}")
 
