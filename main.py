@@ -632,7 +632,8 @@ async def _post_scan_to_kintone(app_id: str, api_token: str, fields: dict) -> st
         "X-Cybozu-API-Token": api_token,
         "Content-Type": "application/json",
     }
-    record = {k: {"value": str(v) if v is not None else ""} for k, v in fields.items()}
+    # None のフィールドは送信しない（DATE/DATETIME型フィールドで400エラーになるため）
+    record = {k: {"value": str(v)} for k, v in fields.items() if v is not None}
     body = {"app": app_id, "record": record}
     print(f"[DEBUG] scan kintone POST body: {json.dumps(body, ensure_ascii=False)}")
     async with httpx.AsyncClient() as client:
