@@ -575,13 +575,15 @@ _SCAN_FOLDER_CONFIG = {
         ),
     },
     "戸籍謄本": {
-        "app_id_env":  "KINTONE_SCAN_APP_ID_KOSEKI",
-        "token_env":   "KINTONE_SCAN_API_TOKEN_KOSEKI",
+        "app_id_env":  "KOSEKI_KINTONE_APP_ID",
+        "token_env":   "KOSEKI_KINTONE_API_TOKEN",
         "prompt": (
             "以下は戸籍謄本のOCRテキストです。\n"
-            "次の6項目をJSONで抽出してください。不明な場合はnullにしてください。\n"
-            "婚姻関係・養子縁組は該当する人名を列挙してください。\n"
-            '出力形式: {{"氏名": "...", "生年月日": "...", "死亡日": "...", "続柄": "...", "婚姻関係": "...", "養子縁組": "..."}}\n'
+            "次の8項目をJSONで抽出してください。不明な場合はnullにしてください。\n"
+            "生年月日・死亡日はYYYY-MM-DD形式で出力してください（例: 1950-03-15）。\n"
+            "婚姻関係・養子縁組は該当する人名を列挙してください（複数いる場合は読点区切り）。\n"
+            '出力形式: {{"氏名": "...", "生年月日": "YYYY-MM-DD", "死亡日": "YYYY-MM-DD", '
+            '"続柄": "...", "婚姻関係": "...", "養子縁組": "...", "本籍": "...", "筆頭者": "..."}}\n'
             "JSONのみ出力してください。\n\n"
             "=== OCRテキスト ===\n{ocr_text}\n=== END ==="
         ),
@@ -692,8 +694,8 @@ async def scan(req: ScanRequest):
 
     print(f"[DEBUG] scan extracted ({req.folder_name}): {extracted}")
 
-    # 相談カード: ファイル名・登録日時を付加
-    if req.folder_name == "相談カード":
+    # 相談カード・戸籍謄本: ファイル名・登録日時を付加
+    if req.folder_name in ("相談カード", "戸籍謄本"):
         from datetime import datetime, timezone
         extracted["ファイル名"] = req.file_name
         extracted["登録日時"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
