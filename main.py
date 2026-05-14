@@ -605,7 +605,7 @@ class ScanRequest(BaseModel):
     model_config = {"populate_by_name": True}
 
     file_id: str = Field(..., validation_alias=AliasChoices("file_id", "fileId"))
-    folder_name: str
+    folder_name: str = Field(..., validation_alias=AliasChoices("folder_name", "folderName"))
     file_name: str = ""
 
 
