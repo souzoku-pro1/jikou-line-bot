@@ -610,30 +610,10 @@ class ScanRequest(BaseModel):
 
 
 async def _download_drive_file(file_id: str) -> bytes:
-    """サービスアカウントでGoogle DriveからPDFをダウンロードする"""
-    sa_json_str = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "")
-    if not sa_json_str:
-        raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON未設定")
-
-    import json as _json
-    from google.oauth2 import service_account
-    from google.auth.transport.requests import Request as GoogleRequest
-
-    sa_info = _json.loads(sa_json_str)
-    credentials = service_account.Credentials.from_service_account_info(
-        sa_info,
-        scopes=["https://www.googleapis.com/auth/drive.readonly"],
-    )
-    credentials.refresh(GoogleRequest())
-
-    url = f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media"
+    """APIキーを使ってGoogle DriveからPDFをダウンロードする"""
+    url = f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media&key={GOOGLE_VISION_API_KEY}"
     async with httpx.AsyncClient() as client:
-        resp = await client.get(
-            url,
-            headers={"Authorization": f"Bearer {credentials.token}"},
-            follow_redirects=True,
-            timeout=60.0,
-        )
+        resp = await client.get(url, follow_redirects=True, timeout=60.0)
         if not resp.is_success:
             raise RuntimeError(f"Drive APIエラー {resp.status_code}: {resp.text}")
         return resp.content
@@ -692,7 +672,6 @@ async def scan(req: ScanRequest):
 
     missing = [k for k, v in {
         "GOOGLE_VISION_API_KEY": GOOGLE_VISION_API_KEY,
-        "GOOGLE_SERVICE_ACCOUNT_JSON": os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON"),
         config["app_id_env"]: app_id,
         config["token_env"]: api_token,
     }.items() if not v]

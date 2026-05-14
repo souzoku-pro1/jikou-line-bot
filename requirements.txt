@@ -3,4 +3,3 @@ uvicorn[standard]
 httpx
 anthropic
 python-multipart
-google-auth
