@@ -6,7 +6,7 @@ import hashlib
 import base64
 import httpx
 import anthropic
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, AliasChoices
 from fastapi import FastAPI, Request, HTTPException, UploadFile, File
 
 app = FastAPI()
@@ -602,7 +602,9 @@ _SCAN_FOLDER_CONFIG = {
 
 
 class ScanRequest(BaseModel):
-    file_id: str
+    model_config = {"populate_by_name": True}
+
+    file_id: str = Field(..., validation_alias=AliasChoices("file_id", "fileId"))
     folder_name: str
     file_name: str = ""
 
