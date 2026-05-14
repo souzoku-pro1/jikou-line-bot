@@ -6,6 +6,7 @@ import hashlib
 import base64
 import httpx
 import anthropic
+from pydantic import BaseModel
 from fastapi import FastAPI, Request, HTTPException, UploadFile, File
 
 app = FastAPI()
@@ -548,6 +549,181 @@ async def ocr_fixed_asset(file: UploadFile = File(...)):
 
     return {
         "status": "ok",
+        "kintone_record_id": record_id,
+        "extracted": extracted,
+    }
+
+
+# ══════════════════════════════════════════════════════════════
+# POST /scan  Google Drive PDF → OCR → Claude抽出 → kintone登録
+# ══════════════════════════════════════════════════════════════
+
+_SCAN_FOLDER_CONFIG = {
+    "相談カード": {
+        "app_id_env":  "KINTONE_SCAN_APP_ID_SODAN",
+        "token_env":   "KINTONE_SCAN_API_TOKEN_SODAN",
+        "prompt": (
+            "以下は相談カードのOCRテキストです。\n"
+            "次の4項目をJSONで抽出してください。不明な場合はnullにしてください。\n"
+            '出力形式: {{"氏名": "...", "生年月日": "...", "住所": "...", "被相続人名": "..."}}\n'
+            "JSONのみ出力してください。\n\n"
+            "=== OCRテキスト ===\n{ocr_text}\n=== END ==="
+        ),
+    },
+    "戸籍謄本": {
+        "app_id_env":  "KINTONE_SCAN_APP_ID_KOSEKI",
+        "token_env":   "KINTONE_SCAN_API_TOKEN_KOSEKI",
+        "prompt": (
+            "以下は戸籍謄本のOCRテキストです。\n"
+            "次の6項目をJSONで抽出してください。不明な場合はnullにしてください。\n"
+            "婚姻関係・養子縁組は該当する人名を列挙してください。\n"
+            '出力形式: {{"氏名": "...", "生年月日": "...", "死亡日": "...", "続柄": "...", "婚姻関係": "...", "養子縁組": "..."}}\n'
+            "JSONのみ出力してください。\n\n"
+            "=== OCRテキスト ===\n{ocr_text}\n=== END ==="
+        ),
+    },
+    "通帳": {
+        "app_id_env":  "KINTONE_SCAN_APP_ID_TSUCHOU",
+        "token_env":   "KINTONE_SCAN_API_TOKEN_TSUCHOU",
+        "prompt": (
+            "以下は通帳のOCRテキストです。\n"
+            "次の4項目をJSONで抽出してください。不明な場合はnullにしてください。\n"
+            "残高はページ末尾の最新残高を円単位の整数で抽出してください（カンマ・円記号は除去）。\n"
+            '出力形式: {{"金融機関名": "...", "口座番号": "...", "名義人": "...", "残高": 12345}}\n'
+            "JSONのみ出力してください。\n\n"
+            "=== OCRテキスト ===\n{ocr_text}\n=== END ==="
+        ),
+    },
+}
+
+
+class ScanRequest(BaseModel):
+    file_id: str
+    folder_name: str
+
+
+async def _download_drive_file(file_id: str) -> bytes:
+    """サービスアカウントでGoogle DriveからPDFをダウンロードする"""
+    sa_json_str = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "")
+    if not sa_json_str:
+        raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON未設定")
+
+    import json as _json
+    from google.oauth2 import service_account
+    from google.auth.transport.requests import Request as GoogleRequest
+
+    sa_info = _json.loads(sa_json_str)
+    credentials = service_account.Credentials.from_service_account_info(
+        sa_info,
+        scopes=["https://www.googleapis.com/auth/drive.readonly"],
+    )
+    credentials.refresh(GoogleRequest())
+
+    url = f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media"
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(
+            url,
+            headers={"Authorization": f"Bearer {credentials.token}"},
+            follow_redirects=True,
+            timeout=60.0,
+        )
+        if not resp.is_success:
+            raise RuntimeError(f"Drive APIエラー {resp.status_code}: {resp.text}")
+        return resp.content
+
+
+async def _extract_by_folder(ocr_text: str, folder_name: str) -> dict:
+    """foldernameに応じてOCRテキストからClaude APIで情報を抽出する"""
+    prompt = _SCAN_FOLDER_CONFIG[folder_name]["prompt"].format(ocr_text=ocr_text)
+    response = await claude_client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=512,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    raw = response.content[0].text.strip()
+    if "```" in raw:
+        raw = raw.split("```")[1]
+        if raw.startswith("json"):
+            raw = raw[4:]
+    return json.loads(raw.strip())
+
+
+async def _post_scan_to_kintone(app_id: str, api_token: str, fields: dict) -> str:
+    """スキャン抽出結果をkintoneに新規登録してレコードIDを返す"""
+    url = f"https://{KINTONE_SUBDOMAIN}.cybozu.com/k/v1/record.json"
+    headers = {
+        "X-Cybozu-API-Token": api_token,
+        "Content-Type": "application/json",
+    }
+    record = {k: {"value": str(v) if v is not None else ""} for k, v in fields.items()}
+    body = {"app": app_id, "record": record}
+    print(f"[DEBUG] scan kintone POST body: {json.dumps(body, ensure_ascii=False)}")
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(url, headers=headers, json=body)
+        print(f"[DEBUG] scan kintone POST status: {resp.status_code} / {resp.text}")
+        resp.raise_for_status()
+        return resp.json()["id"]
+
+
+@app.post("/scan")
+async def scan(req: ScanRequest):
+    """
+    Google DriveのファイルIDとフォルダ名を受け取り、
+    PDFをOCR → Claude抽出 → kintone登録する。
+
+    folder_name: 相談カード / 戸籍謄本 / 通帳
+    """
+    if req.folder_name not in _SCAN_FOLDER_CONFIG:
+        raise HTTPException(
+            status_code=400,
+            detail=f"未対応のフォルダ名: {req.folder_name}。対応値: {list(_SCAN_FOLDER_CONFIG.keys())}",
+        )
+
+    config = _SCAN_FOLDER_CONFIG[req.folder_name]
+    app_id   = os.environ.get(config["app_id_env"], "")
+    api_token = os.environ.get(config["token_env"], "")
+
+    missing = [k for k, v in {
+        "GOOGLE_VISION_API_KEY": GOOGLE_VISION_API_KEY,
+        "GOOGLE_SERVICE_ACCOUNT_JSON": os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON"),
+        config["app_id_env"]: app_id,
+        config["token_env"]: api_token,
+    }.items() if not v]
+    if missing:
+        raise HTTPException(status_code=500, detail=f"環境変数が未設定です: {', '.join(missing)}")
+
+    # 1. Google Drive からPDFダウンロード
+    try:
+        pdf_bytes = await _download_drive_file(req.file_id)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Driveダウンロードエラー: {e}")
+
+    # 2. Google Vision API でOCR
+    try:
+        ocr_text = _ocr_pdf_bytes(pdf_bytes, GOOGLE_VISION_API_KEY)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"OCRエラー: {e}")
+
+    if not ocr_text.strip():
+        raise HTTPException(status_code=422, detail="OCRでテキストを取得できませんでした")
+
+    # 3. Claude で情報抽出
+    try:
+        extracted = await _extract_by_folder(ocr_text, req.folder_name)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Claude抽出エラー: {e}")
+
+    print(f"[DEBUG] scan extracted ({req.folder_name}): {extracted}")
+
+    # 4. kintone に登録
+    try:
+        record_id = await _post_scan_to_kintone(app_id, api_token, extracted)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"kintone登録エラー: {e}")
+
+    return {
+        "status": "ok",
+        "folder_name": req.folder_name,
         "kintone_record_id": record_id,
         "extracted": extracted,
     }
