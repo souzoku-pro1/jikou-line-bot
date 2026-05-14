@@ -560,12 +560,16 @@ async def ocr_fixed_asset(file: UploadFile = File(...)):
 
 _SCAN_FOLDER_CONFIG = {
     "相談カード": {
-        "app_id_env":  "KINTONE_SCAN_APP_ID_SODAN",
-        "token_env":   "KINTONE_SCAN_API_TOKEN_SODAN",
+        "app_id_env":  "SOUZOKU_KINTONE_APP_ID",
+        "token_env":   "SOUZOKU_KINTONE_API_TOKEN",
         "prompt": (
-            "以下は相談カードのOCRテキストです。\n"
-            "次の4項目をJSONで抽出してください。不明な場合はnullにしてください。\n"
-            '出力形式: {{"氏名": "...", "生年月日": "...", "住所": "...", "被相続人名": "..."}}\n'
+            "以下は相続相談カードのOCRテキストです。\n"
+            "次の11項目をJSONで抽出してください。不明な場合はnullにしてください。\n"
+            "日付はすべてYYYY-MM-DD形式で出力してください（例: 1975-03-15）。\n"
+            '出力形式: {{"氏名": "...", "生年月日": "YYYY-MM-DD", "住所": "...", '
+            '"電話番号": "...", "メールアドレス": "...", "被相続人名": "...", "続柄": "...", '
+            '"被相続人生年月日": "YYYY-MM-DD", "被相続人死亡日": "YYYY-MM-DD", '
+            '"被相続人住所": "...", "被相続人本籍": "..."}}\n'
             "JSONのみ出力してください。\n\n"
             "=== OCRテキスト ===\n{ocr_text}\n=== END ==="
         ),
@@ -600,6 +604,7 @@ _SCAN_FOLDER_CONFIG = {
 class ScanRequest(BaseModel):
     file_id: str
     folder_name: str
+    file_name: str = ""
 
 
 async def _download_drive_file(file_id: str) -> bytes:
@@ -714,6 +719,12 @@ async def scan(req: ScanRequest):
         raise HTTPException(status_code=502, detail=f"Claude抽出エラー: {e}")
 
     print(f"[DEBUG] scan extracted ({req.folder_name}): {extracted}")
+
+    # 相談カード: ファイル名・登録日時を付加
+    if req.folder_name == "相談カード":
+        from datetime import datetime, timezone
+        extracted["ファイル名"] = req.file_name
+        extracted["登録日時"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     # 4. kintone に登録
     try:
