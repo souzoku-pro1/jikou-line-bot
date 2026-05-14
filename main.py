@@ -604,7 +604,7 @@ _SCAN_FOLDER_CONFIG = {
 class ScanRequest(BaseModel):
     model_config = {"populate_by_name": True}
 
-    pdf_base64: str = Field(..., validation_alias=AliasChoices("pdf_base64", "pdfBase64"))
+    pdf_base64: str = Field(..., validation_alias=AliasChoices("pdf_base64", "pdfBase64", "fileData"))
     folder_name: str = Field(..., validation_alias=AliasChoices("folder_name", "folderName"))
     file_name: str = Field("", validation_alias=AliasChoices("file_name", "fileName"))
 
