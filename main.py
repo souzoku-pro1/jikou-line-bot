@@ -604,19 +604,9 @@ _SCAN_FOLDER_CONFIG = {
 class ScanRequest(BaseModel):
     model_config = {"populate_by_name": True}
 
-    file_id: str = Field(..., validation_alias=AliasChoices("file_id", "fileId"))
+    pdf_base64: str = Field(..., validation_alias=AliasChoices("pdf_base64", "pdfBase64"))
     folder_name: str = Field(..., validation_alias=AliasChoices("folder_name", "folderName"))
-    file_name: str = ""
-
-
-async def _download_drive_file(file_id: str) -> bytes:
-    """APIキーを使ってGoogle DriveからPDFをダウンロードする"""
-    url = f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media&key={GOOGLE_VISION_API_KEY}"
-    async with httpx.AsyncClient() as client:
-        resp = await client.get(url, follow_redirects=True, timeout=60.0)
-        if not resp.is_success:
-            raise RuntimeError(f"Drive APIエラー {resp.status_code}: {resp.text}")
-        return resp.content
+    file_name: str = Field("", validation_alias=AliasChoices("file_name", "fileName"))
 
 
 async def _extract_by_folder(ocr_text: str, folder_name: str) -> dict:
@@ -655,8 +645,8 @@ async def _post_scan_to_kintone(app_id: str, api_token: str, fields: dict) -> st
 @app.post("/scan")
 async def scan(req: ScanRequest):
     """
-    Google DriveのファイルIDとフォルダ名を受け取り、
-    PDFをOCR → Claude抽出 → kintone登録する。
+    GASからbase64エンコードされたPDFとフォルダ名を受け取り、
+    OCR → Claude抽出 → kintone登録する。
 
     folder_name: 相談カード / 戸籍謄本 / 通帳
     """
@@ -678,11 +668,11 @@ async def scan(req: ScanRequest):
     if missing:
         raise HTTPException(status_code=500, detail=f"環境変数が未設定です: {', '.join(missing)}")
 
-    # 1. Google Drive からPDFダウンロード
+    # 1. base64デコード
     try:
-        pdf_bytes = await _download_drive_file(req.file_id)
+        pdf_bytes = base64.b64decode(req.pdf_base64)
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Driveダウンロードエラー: {e}")
+        raise HTTPException(status_code=400, detail=f"base64デコードエラー: {e}")
 
     # 2. Google Vision API でOCR
     try:
