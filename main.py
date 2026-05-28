@@ -1,4 +1,5 @@
 import os
+import stripe
 import re
 import json
 import hmac
@@ -712,3 +713,24 @@ async def scan(req: ScanRequest):
         "kintone_record_id": record_id,
         "extracted": extracted,
     }
+@app.post("/webhook/stripe")
+async def stripe_webhook(request: Request):
+    payload = await request.body()
+    sig_header = request.headers.get("stripe-signature")
+    webhook_secret = os.environ.get("STRIPE_WEBHOOK_SECRET")
+
+    try:
+        event = stripe.Webhook.construct_event(
+            payload, sig_header, webhook_secret
+        )
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    if event["type"] == "checkout.session.completed":
+        session = event["data"]["object"]
+        customer_name = session.get("customer_details", {}).get("name")
+        customer_email = session.get("customer_details", {}).get("email")
+        amount = session.get("amount_total")
+        print(f"決済完了: {customer_name} / {customer_email} / {amount}円")
+
+    return {"status": "ok"}
