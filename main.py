@@ -12,6 +12,9 @@ from fastapi import FastAPI, Request, HTTPException, UploadFile, File
 
 app = FastAPI()
 
+from cloudsign_webhook import router as cloudsign_router
+app.include_router(cloudsign_router)
+
 
 @app.get("/health")
 async def health():
