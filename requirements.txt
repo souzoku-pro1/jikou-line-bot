@@ -5,3 +5,4 @@ anthropic
 python-multipart
 python-docx
 requests
+stripe
