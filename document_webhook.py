@@ -1,0 +1,210 @@
+"""
+送付状自動生成 Webhook モジュール
+
+処理フロー:
+  1. URL の合言葉（DOCUMENT_WEBHOOK_SECRET）を検証
+  2. kintone Webhook ボディからレコード ID を取得
+  3. 書類ステータス が「送付状作成」のときだけ実行（誤発火・ループ防止）
+  4. 相談カードレコードを取得し差し込みデータを組み立て
+  5. templates/送付状_委任契約書.docx に機械置換
+  6. kintone にファイルアップロード → 添付フィールドに書き戻し
+  7. 書類ステータスを「送付状作成済」に更新
+"""
+
+import hmac
+import io
+import logging
+import os
+from datetime import date
+
+import httpx
+from docx import Document
+from fastapi import APIRouter, Request
+from fastapi.responses import JSONResponse
+
+logger = logging.getLogger("document")
+
+# ── 定数（後から変更しやすいようにここにまとめる） ─────────────────────────
+FIELD_STATUS      = "書類ステータス"   # トリガー用ドロップダウンフィールドコード
+TRIGGER_VALUE     = "送付状作成"       # このステータスのときだけ生成を実行
+COMPLETED_VALUE   = "送付状作成済"     # 生成完了後に書き込む値
+FIELD_ATTACHMENT  = "送付状"           # 添付ファイルフィールドコード（FILE型）
+TEMPLATE_PATH     = "docx_templates/送付状_委任契約書.docx"
+
+# ── 環境変数 ────────────────────────────────────────────────────────────────
+_SUBDOMAIN        = os.environ.get("KINTONE_SUBDOMAIN", "")
+_APP_ID           = os.environ.get("SOUZOKU_KINTONE_APP_ID", "")
+_API_TOKEN        = os.environ.get("SOUZOKU_KINTONE_API_TOKEN", "")
+_WEBHOOK_SECRET   = os.environ.get("DOCUMENT_WEBHOOK_SECRET", "")
+
+
+# ── ユーティリティ ───────────────────────────────────────────────────────────
+
+def _kintone_base() -> str:
+    sub = _SUBDOMAIN.replace(".cybozu.com", "").strip()
+    if sub.startswith("http"):
+        return sub.rstrip("/")
+    return f"https://{sub}.cybozu.com"
+
+
+def to_wareki(d: date) -> str:
+    if d >= date(2019, 5, 1):
+        n, era = d.year - 2018, "令和"
+    elif d >= date(1989, 1, 8):
+        n, era = d.year - 1988, "平成"
+    else:
+        return d.strftime("%Y年%m月%d日")
+    y = "元" if n == 1 else str(n)
+    return f"{era}{y}年{d.month}月{d.day}日"
+
+
+def fill_template(template_path: str, data: dict) -> bytes:
+    """テンプレートを差し込み置換して docx の bytes を返す"""
+    doc = Document(template_path)
+
+    def replace_in_paragraph(para):
+        full = "".join(run.text for run in para.runs)
+        if not any(k in full for k in data):
+            return
+        for k, v in data.items():
+            full = full.replace(k, v)
+        if para.runs:
+            para.runs[0].text = full
+            for run in para.runs[1:]:
+                run.text = ""
+
+    for para in doc.paragraphs:
+        replace_in_paragraph(para)
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                for para in cell.paragraphs:
+                    replace_in_paragraph(para)
+
+    buf = io.BytesIO()
+    doc.save(buf)
+    buf.seek(0)
+    return buf.read()
+
+
+# ── kintone API ──────────────────────────────────────────────────────────────
+
+async def _get_record(record_id: str) -> dict:
+    url = f"{_kintone_base()}/k/v1/record.json"
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(
+            url,
+            headers={"X-Cybozu-API-Token": _API_TOKEN},
+            params={"app": _APP_ID, "id": record_id},
+        )
+        resp.raise_for_status()
+        return resp.json()["record"]
+
+
+async def _upload_file(filename: str, content: bytes) -> str:
+    """multipart でファイルをアップロードして fileKey を返す"""
+    url = f"{_kintone_base()}/k/v1/file.json"
+    mime = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            url,
+            headers={"X-Cybozu-API-Token": _API_TOKEN},
+            files={"file": (filename, content, mime)},
+        )
+        resp.raise_for_status()
+        return resp.json()["fileKey"]
+
+
+async def _update_record(record_id: str, fields: dict) -> None:
+    url = f"{_kintone_base()}/k/v1/record.json"
+    record = {k: {"value": v} for k, v in fields.items()}
+    async with httpx.AsyncClient() as client:
+        resp = await client.put(
+            url,
+            headers={
+                "X-Cybozu-API-Token": _API_TOKEN,
+                "Content-Type": "application/json",
+            },
+            json={"app": _APP_ID, "id": record_id, "record": record},
+        )
+        resp.raise_for_status()
+
+
+# ── FastAPI Router ───────────────────────────────────────────────────────────
+
+router = APIRouter()
+
+
+@router.post("/document/{secret}")
+async def document_webhook(secret: str, request: Request):
+    # 1. 合言葉チェック
+    if not hmac.compare_digest(secret or "", _WEBHOOK_SECRET or ""):
+        return JSONResponse(status_code=403, content={"error": "forbidden"})
+
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "invalid json"})
+
+    # 2. レコード ID を取得
+    record_id: str | None = None
+    try:
+        record_id = body["record"]["$id"]["value"]
+    except (KeyError, TypeError):
+        record_id = body.get("recordId")
+    if not record_id:
+        logger.warning("レコードIDが取得できませんでした")
+        return JSONResponse(status_code=200, content={"ok": True, "skip": "no_record_id"})
+    record_id = str(record_id)
+
+    # 3. トリガー判定（Webhook ボディのステータス値で確認）
+    try:
+        status_in_webhook = body["record"][FIELD_STATUS]["value"]
+    except (KeyError, TypeError):
+        status_in_webhook = None
+
+    if status_in_webhook != TRIGGER_VALUE:
+        logger.info("トリガー値不一致のためスキップ record_id=%s status=%r", record_id, status_in_webhook)
+        return JSONResponse(status_code=200, content={"ok": True, "skip": "not_triggered"})
+
+    try:
+        # 4. レコード取得
+        record = await _get_record(record_id)
+
+        # ループ防止：既に完了済みなら何もしない
+        current_status = record.get(FIELD_STATUS, {}).get("value", "")
+        if current_status == COMPLETED_VALUE:
+            logger.info("送付状作成済みのためスキップ record_id=%s", record_id)
+            return JSONResponse(status_code=200, content={"ok": True, "skip": "already_done"})
+
+        # 5. 差し込みデータを組み立て
+        def fv(code: str) -> str:
+            return record.get(code, {}).get("value") or ""
+
+        data = {
+            "{{日付}}":      to_wareki(date.today()),
+            "{{依頼者住所}}": fv("住所"),
+            "{{依頼者氏名}}": fv("氏名"),
+            "{{被相続人名}}": fv("被相続人名"),
+        }
+        logger.info("差し込みデータ record_id=%s data=%s", record_id, data)
+
+        # 6. テンプレート置換
+        docx_bytes = fill_template(TEMPLATE_PATH, data)
+
+        # 7a. kintone にファイルアップロード
+        file_key = await _upload_file("送付状_委任契約書.docx", docx_bytes)
+        logger.info("ファイルアップロード完了 record_id=%s fileKey=%s", record_id, file_key)
+
+        # 7b. 添付フィールド書き戻し + ステータス更新（1回の PUT にまとめる）
+        await _update_record(record_id, {
+            FIELD_ATTACHMENT: [{"fileKey": file_key}],
+            FIELD_STATUS:     COMPLETED_VALUE,
+        })
+        logger.info("レコード更新完了 record_id=%s", record_id)
+
+    except Exception:
+        logger.exception("document_webhook処理エラー record_id=%s", record_id)
+        return JSONResponse(status_code=500, content={"error": "internal_error"})
+
+    return JSONResponse(status_code=200, content={"ok": True, "record_id": record_id})
