@@ -17,6 +17,16 @@ from document_webhook import router as document_router
 app.include_router(cloudsign_router)
 app.include_router(document_router)
 
+from chat_responder import (
+    get_app21_record,
+    classify_routing,
+    handle_customer_message,
+    get_approval_record,
+    mark_approval_sent,
+    send_line_push,
+    save_to_chatlog,
+)
+
 
 @app.get("/health")
 async def health():
@@ -164,6 +174,11 @@ kintone_record_ids: dict[str, str] = {}
 # ã¦ã¼ã¶ã¼IDãã¨ã®æ¥­èåãä¿æï¼ç¬¬2æ®µéæ´æ°ã§ä½¿ç¨ï¼
 user_business_names: dict[str, str] = {}
 
+# ヒアリング完了済みユーザーID（同セッション内で KINTONE_UPDATE を送出済み）
+hearing_completed: set[str] = set()
+
+KINTONE_WEBHOOK_TOKEN = os.environ.get("KINTONE_WEBHOOK_TOKEN", "")
+
 
 def verify_signature(body: bytes, signature: str) -> bool:
     hash = hmac.new(
@@ -239,7 +254,7 @@ async def ask_claude(user_id: str, user_message: str) -> str:
     history.append({"role": "user", "content": user_message})
 
     response = await claude_client.messages.create(
-        model="claude-sonnet-4-20250514",
+        model="claude-sonnet-4-6",
         max_tokens=1024,
         system=SYSTEM_PROMPT,
         messages=history,
@@ -271,6 +286,45 @@ async def webhook(request: Request):
         user_id = event["source"]["userId"]
         user_text = event["message"]["text"]
 
+        # ── ルーティング判定（案A修正版） ─────────────────────────────────
+        # [1] 同セッション内でヒアリング進行中かチェック
+        in_hearing_session = (
+            user_id in conversation_histories
+            and user_id not in hearing_completed
+        )
+
+        if not in_hearing_session:
+            # [2] kintone App 21 でユーザーのレコードを検索
+            app21_record = await get_app21_record(user_id)
+
+            if app21_record is not None:
+                status = app21_record.get("status", {}).get("value", "")
+                routing = classify_routing(status)
+
+                if routing != "hearing":
+                    # [3] ヒアリング完了済み → 顧客対応Claudeへ
+                    async def _line_reply(token: str, text: str) -> None:
+                        async with httpx.AsyncClient() as _c:
+                            await _c.post(
+                                REPLY_URL,
+                                headers={"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"},
+                                json={
+                                    "replyToken": token,
+                                    "messages": [{"type": "text", "text": text}],
+                                },
+                            )
+
+                    await handle_customer_message(
+                        user_id=user_id,
+                        user_message=user_text,
+                        reply_token=reply_token,
+                        app21_record=app21_record,
+                        reply_func=_line_reply,
+                    )
+                    continue
+                # routing == "hearing" → 既存ヒアリングフローへ fall through
+
+        # ── 既存ヒアリングフロー ──────────────────────────────────────────
         claude_reply = await ask_claude(user_id, user_text)
 
         # ç¬¬1æ®µéï¼ã¬ã³ã¼ãæ°è¦ä½æ
@@ -293,6 +347,7 @@ async def webhook(request: Request):
             update_fields["æ¥­èå"] = user_business_names.get(user_id, "")
             await update_kintone_record(kintone_record_ids[user_id], update_fields)
             claude_reply = clean_reply2
+            hearing_completed.add(user_id)  # ヒアリング完了をマーク
 
         async with httpx.AsyncClient() as client:
             await client.post(
@@ -305,6 +360,68 @@ async def webhook(request: Request):
             )
 
     return {"status": "ok"}
+
+
+@app.post("/webhook/kintone/approval")
+async def kintone_approval_webhook(request: Request):
+    """
+    kintone 承認キューアプリの Webhook を受け取る。
+    ステータス=承認済 かつ 送信済み=no のレコードに対して
+    最新の AI下書き を LINE push し、送信済み=yes に更新する（冪等）。
+    URL: /webhook/kintone/approval?token=<KINTONE_WEBHOOK_TOKEN>
+    """
+    token = request.query_params.get("token", "")
+    if not KINTONE_WEBHOOK_TOKEN or not hmac.compare_digest(token, KINTONE_WEBHOOK_TOKEN):
+        raise HTTPException(status_code=404, detail="not found")
+
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid json")
+
+    # レコード ID を取得
+    try:
+        record_id = body["record"]["$id"]["value"]
+    except (KeyError, TypeError):
+        record_id = body.get("recordId")
+    if not record_id:
+        return {"ok": True, "skip": "no_record_id"}
+    record_id = str(record_id)
+
+    # Webhook ボディで高速チェック（不要な API 呼び出しを減らす）
+    try:
+        webhook_status = body["record"]["ステータス2"]["value"]
+        webhook_sent   = body["record"]["送信済み"]["value"]
+    except (KeyError, TypeError):
+        return {"ok": True, "skip": "missing_fields"}
+
+    if webhook_status != "承認済" or webhook_sent != "no":
+        return {"ok": True, "skip": "not_triggered"}
+
+    # 最新レコードを取り直す（先生の修正を反映するため）
+    record = await get_approval_record(record_id)
+    if not record:
+        return {"ok": True, "skip": "record_not_found"}
+
+    current_status = record.get("ステータス2", {}).get("value", "")
+    current_sent   = record.get("送信済み",   {}).get("value", "")
+
+    if current_status != "承認済" or current_sent != "no":
+        return {"ok": True, "skip": "already_sent_or_not_approved"}
+
+    user_id  = record.get("line_user_id", {}).get("value", "")
+    ai_draft = record.get("AI下書き",     {}).get("value", "")
+    category = record.get("カテゴリ",     {}).get("value", "")
+
+    if not user_id or not ai_draft:
+        return {"ok": True, "skip": "missing_user_or_draft"}
+
+    # LINE push 送信 → 送信済みフラグ更新 → チャットログ保存
+    await send_line_push(user_id, ai_draft)
+    await mark_approval_sent(record_id)
+    await save_to_chatlog(user_id, "assistant", ai_draft, category, "yes")
+
+    return {"ok": True, "record_id": record_id}
 
 
 # ââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
