@@ -390,7 +390,7 @@ async def kintone_approval_webhook(request: Request):
 
     # Webhook ボディで高速チェック（不要な API 呼び出しを減らす）
     try:
-        webhook_status = body["record"]["ステータス"]["value"]
+        webhook_status = body["record"]["ステータス2"]["value"]
         webhook_sent   = body["record"]["送信済み"]["value"]
     except (KeyError, TypeError):
         return {"ok": True, "skip": "missing_fields"}
@@ -403,7 +403,7 @@ async def kintone_approval_webhook(request: Request):
     if not record:
         return {"ok": True, "skip": "record_not_found"}
 
-    current_status = record.get("ステータス", {}).get("value", "")
+    current_status = record.get("ステータス2", {}).get("value", "")
     current_sent   = record.get("送信済み",   {}).get("value", "")
 
     if current_status != "承認済" or current_sent != "no":

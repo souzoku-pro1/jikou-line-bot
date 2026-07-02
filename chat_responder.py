@@ -269,7 +269,7 @@ async def save_to_approval_queue(
             "AI下書き":      {"value": ai_draft},
             "カテゴリ":      {"value": category},
             "判断理由":      {"value": reason},
-            "ステータス":    {"value": "承認待ち"},
+            "ステータス2":   {"value": "承認待ち"},
             "送信済み":      {"value": "no"},
         },
     }
