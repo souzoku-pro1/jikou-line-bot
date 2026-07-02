@@ -173,7 +173,10 @@ async def _scheduler_loop() -> None:
     hour = int(os.environ.get("HEALTHCHECK_HOUR_JST", "7"))
     while True:
         wait = _seconds_until_next_run(hour)
-        logger.info("healthcheck scheduled in %.0f sec (daily %02d:00 JST)", wait, hour)
+        # Railway ログで起動登録を確認できるよう print も出す（uvicorn 配下では
+        # モジュールロガーの INFO がハンドラ未設定で出力されないため）
+        print(f"[HEALTHCHECK] scheduler registered: next run in {wait:.0f} sec "
+              f"(daily {hour:02d}:00 JST)", flush=True)
         await asyncio.sleep(wait)
         try:
             await run_healthcheck()
