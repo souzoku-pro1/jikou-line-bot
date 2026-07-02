@@ -8,7 +8,7 @@ import base64
 import httpx
 import anthropic
 from pydantic import BaseModel, Field, AliasChoices
-from fastapi import FastAPI, Request, HTTPException, UploadFile, File
+from fastapi import FastAPI, Request, HTTPException, UploadFile, File, BackgroundTasks
 
 app = FastAPI()
 
@@ -49,6 +49,29 @@ KINTONE_API_TOKEN = os.environ["KINTONE_API_TOKEN"]
 
 REPLY_URL = "https://api.line.me/v2/bot/message/reply"
 PUSH_URL  = "https://api.line.me/v2/bot/message/push"
+
+
+async def _line_reply_with_fallback(reply_token: str, user_id: str, text: str) -> None:
+    """LINE Reply APIを試み、失敗（400等）したらPush APIにフォールバック"""
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            REPLY_URL,
+            headers={"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"},
+            json={"replyToken": reply_token, "messages": [{"type": "text", "text": text}]},
+        )
+    if resp.is_success:
+        print(f"[LINE] reply OK user_id={user_id}")
+        return
+    print(f"[LINE] reply failed {resp.status_code} {resp.text[:200]}, trying push")
+    async with httpx.AsyncClient() as client:
+        push_resp = await client.post(
+            PUSH_URL,
+            headers={"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"},
+            json={"to": user_id, "messages": [{"type": "text", "text": text}]},
+        )
+    print(f"[LINE] push fallback status={push_resp.status_code}")
+    if not push_resp.is_success:
+        print(f"[LINE] push fallback error: {push_resp.text[:200]}")
 
 # OCR固定資産エンドポイント用の環境変数（起動時ではなくリクエスト時にチェック）
 GOOGLE_VISION_API_KEY        = os.environ.get("GOOGLE_VISION_API_KEY")
@@ -266,63 +289,38 @@ async def ask_claude(user_id: str, user_message: str) -> str:
     return reply_text
 
 
-@app.post("/webhook")
-async def webhook(request: Request):
-    body = await request.body()
-    signature = request.headers.get("X-Line-Signature", "")
-
-    if not verify_signature(body, signature):
-        raise HTTPException(status_code=400, detail="Invalid signature")
-
-    data = await request.json()
-
-    for event in data.get("events", []):
-        if event.get("type") != "message":
-            continue
-        if event["message"].get("type") != "text":
-            continue
-
-        reply_token = event["replyToken"]
-        user_id = event["source"]["userId"]
-        user_text = event["message"]["text"]
-
-        # ── ルーティング判定（案A修正版） ─────────────────────────────────
-        # [1] 同セッション内でヒアリング進行中かチェック
+async def _process_line_event(reply_token: str, user_id: str, user_text: str) -> None:
+    """LINEイベントの重い処理（BackgroundTasksで非同期実行）"""
+    print(f"[PROCESS] start user_id={user_id} text={user_text[:30]!r}")
+    try:
+        # ── ルーティング判定 ──────────────────────────────────────────────
         in_hearing_session = (
             user_id in conversation_histories
             and user_id not in hearing_completed
         )
 
         if not in_hearing_session:
-            # [2] kintone App 21 でユーザーのレコードを検索
             app21_record = await get_app21_record(user_id)
-
             if app21_record is not None:
                 status = app21_record.get("status", {}).get("value", "")
                 routing = classify_routing(status)
-
+                print(f"[ROUTING] user_id={user_id} App21 status={status!r} routing={routing}")
                 if routing != "hearing":
-                    # [3] ヒアリング完了済み → 顧客対応Claudeへ
-                    async def _line_reply(token: str, text: str) -> None:
-                        async with httpx.AsyncClient() as _c:
-                            await _c.post(
-                                REPLY_URL,
-                                headers={"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"},
-                                json={
-                                    "replyToken": token,
-                                    "messages": [{"type": "text", "text": text}],
-                                },
-                            )
-
+                    async def _reply_func(token: str, text: str) -> None:
+                        await _line_reply_with_fallback(token, user_id, text)
                     await handle_customer_message(
                         user_id=user_id,
                         user_message=user_text,
                         reply_token=reply_token,
                         app21_record=app21_record,
-                        reply_func=_line_reply,
+                        reply_func=_reply_func,
                     )
-                    continue
-                # routing == "hearing" → 既存ヒアリングフローへ fall through
+                    return
+                print(f"[ROUTING] user_id={user_id} → hearing (status={status!r})")
+            else:
+                print(f"[ROUTING] user_id={user_id} → hearing (no App21 record)")
+        else:
+            print(f"[ROUTING] user_id={user_id} → hearing (in_session)")
 
         # ── 既存ヒアリングフロー ──────────────────────────────────────────
         claude_reply = await ask_claude(user_id, user_text)
@@ -335,6 +333,7 @@ async def webhook(request: Request):
             user_business_names[user_id] = kintone_record.get("問い合わせ業者名", "")
             record_id = await post_to_kintone(kintone_record)
             kintone_record_ids[user_id] = record_id
+            print(f"[KINTONE] RECORD created record_id={record_id}")
             claude_reply = clean_reply
 
         # 第2段階：既存レコードを更新
@@ -345,17 +344,38 @@ async def webhook(request: Request):
         if update_fields and user_id in kintone_record_ids:
             await update_kintone_record(kintone_record_ids[user_id], update_fields)
             claude_reply = clean_reply2
-            hearing_completed.add(user_id)  # ヒアリング完了をマーク
+            hearing_completed.add(user_id)
 
-        async with httpx.AsyncClient() as client:
-            await client.post(
-                REPLY_URL,
-                headers={"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"},
-                json={
-                    "replyToken": reply_token,
-                    "messages": [{"type": "text", "text": claude_reply}],
-                },
-            )
+        await _line_reply_with_fallback(reply_token, user_id, claude_reply)
+
+    except Exception:
+        import traceback
+        print(f"[ERROR] _process_line_event failed user_id={user_id}:")
+        print(traceback.format_exc())
+
+
+@app.post("/webhook")
+async def webhook(request: Request, background_tasks: BackgroundTasks):
+    body = await request.body()
+    signature = request.headers.get("X-Line-Signature", "")
+
+    if not verify_signature(body, signature):
+        raise HTTPException(status_code=400, detail="Invalid signature")
+
+    data = json.loads(body)
+
+    for event in data.get("events", []):
+        if event.get("type") != "message":
+            continue
+        if event["message"].get("type") != "text":
+            continue
+
+        reply_token = event["replyToken"]
+        user_id = event["source"]["userId"]
+        user_text = event["message"]["text"]
+
+        background_tasks.add_task(_process_line_event, reply_token, user_id, user_text)
+        print(f"[WEBHOOK] queued user_id={user_id} text={user_text[:20]!r}")
 
     return {"status": "ok"}
 

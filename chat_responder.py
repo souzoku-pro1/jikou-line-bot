@@ -283,11 +283,11 @@ async def save_to_approval_queue(
             json=body,
         )
     if not resp.is_success:
-        logger.error(
-            "approval queue save failed: %s %s", resp.status_code, resp.text
-        )
+        print(f"[APP29] save failed: {resp.status_code} {resp.text[:300]}")
         return None
-    return resp.json().get("id")
+    record_id = resp.json().get("id")
+    print(f"[APP29] saved record_id={record_id}")
+    return record_id
 
 
 async def get_approval_record(record_id: str) -> Optional[dict]:
@@ -347,8 +347,9 @@ async def send_line_push(to: str, text: str) -> None:
             },
             json={"to": to, "messages": [{"type": "text", "text": text}]},
         )
+    print(f"[LINE_PUSH] to={to} status={resp.status_code}")
     if not resp.is_success:
-        logger.error("LINE push failed to=%s: %s %s", to, resp.status_code, resp.text)
+        print(f"[LINE_PUSH] ERROR: {resp.text[:300]}")
 
 
 async def _notify_attorney(
@@ -356,9 +357,10 @@ async def _notify_attorney(
 ) -> None:
     """弁護士に承認依頼を LINE Push で通知する"""
     if not ATTORNEY_LINE_USER_ID:
-        logger.warning("ATTORNEY_LINE_USER_ID not set, skipping attorney notification")
+        print("[ATTORNEY] ATTORNEY_LINE_USER_ID not set, skipping")
         return
     rid = approval_record_id or "（未取得）"
+    print(f"[ATTORNEY] notifying to={ATTORNEY_LINE_USER_ID} approval_id={rid} category={category}")
     msg = (
         f"【承認依頼】\n"
         f"顧客: {customer_name or user_id}\n"
@@ -444,6 +446,7 @@ async def handle_customer_message(
     category   = result["category"]
     auto_send  = result["auto_send"]
     reason     = result.get("reason", "")
+    print(f"[COMPOSE_REPLY] user_id={user_id} category={category!r} auto_send={auto_send} reason={reason!r}")
 
     # サーバー側二重チェック: モデルの auto_send=true かつカテゴリが許可リストにある場合のみ自動送信
     can_auto_send = auto_send and (category in AUTO_SEND_CATEGORIES)
@@ -454,9 +457,7 @@ async def handle_customer_message(
     if can_auto_send:
         await reply_func(reply_token, reply_text)
         await save_to_chatlog(user_id, "assistant", reply_text, category, "yes")
-        logger.info(
-            "auto_sent user_id=%s category=%s len=%d", user_id, category, len(reply_text)
-        )
+        print(f"[AUTO_SEND] user_id={user_id} category={category} len={len(reply_text)}")
     else:
         # 承認キューに下書きを保存
         approval_id = await save_to_approval_queue(
@@ -472,9 +473,4 @@ async def handle_customer_message(
         await save_to_chatlog(user_id, "assistant", PENDING_REPLY, category, "yes")
         # 弁護士へ承認依頼通知
         await _notify_attorney(user_id, customer_name, approval_id, category)
-        logger.info(
-            "queued_for_approval user_id=%s category=%s approval_id=%s",
-            user_id,
-            category,
-            approval_id,
-        )
+        print(f"[APPROVAL] queued user_id={user_id} category={category} approval_id={approval_id}")
