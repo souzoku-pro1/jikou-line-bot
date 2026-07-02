@@ -39,9 +39,9 @@ KINTONE_BASE = _sub if _sub.startswith("http") else f"https://{_sub.replace('.cy
 KINTONE_APP_ID = os.environ["KINTONE_APP_ID"]
 KINTONE_API_TOKEN = os.environ["KINTONE_API_TOKEN"]
 
-# kintone のフィールドコード（実アプリに合わせて変更）
+# kintone のフィールドコード（App 21 の実フィールドコードに合わせる）
 FIELD_DOCUMENT_ID = "cloudsign_document_id"  # 送信時に documentID を保存しておくフィールド
-FIELD_STATUS = "契約ステータス"              # 締結状態を入れるフィールド
+FIELD_STATUS = "status"                      # 案件ステータス（DROP_DOWN）のフィールドコード
 
 # LINE 通知（任意。設定が無ければスキップ）
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
@@ -184,7 +184,7 @@ def handle_webhook(secret: str, payload: dict) -> tuple[int, dict]:
         except Exception:
             logger.exception("書類取得失敗 doc=%s", document_id)
 
-        update_kintone_status(document_id, "締結済み")
+        update_kintone_status(document_id, "受任")
         notify_line(f"【締結完了】{title}\ndocumentID: {document_id}")
 
     # クラウドサインには常に200を返す（再送ループを防ぐ）

@@ -122,12 +122,12 @@ LINE が「配信失敗」と判断するケースがある（LINE はリトラ�
 
 ## 既知の不具合（今回スコープ外）
 
-| # | ファイル | 内容 |
-|---|---|---|
-| 1 | `cloudsign_webhook.py` | `契約ステータス` フィールドへの書き込みが失敗する。App 21 に該当フィールドが存在しないため、正しいフィールドコードへの修正が必要。 |
-| 2 | `cloudsign_webhook.py` | `業者名`（LOOKUP 型）に直接書き込もうとしている。LOOKUP フィールドは読み取り専用のため、対応する SINGLE_LINE_TEXT フィールドへの修正が必要。 |
-| 3 | `main.py` `/webhook/stripe` | kintone に `"ステータス"` フィールドコードで書き込んでいるが、kintone 予約語のため実際のフィールドコードが異なる可能性がある（例: `ステータス2`）。要確認。 |
-| 4 | 全般 | コンテナ再起動で `conversation_histories` / `kintone_record_ids` / `hearing_completed` が消える。ヒアリング途中のユーザーは最初からやり直しになる。永続化が必要な場合は Redis 等の導入が必要。 |
+| # | ファイル | 状態 | 内容 |
+|---|---|---|---|
+| 1 | `cloudsign_webhook.py` | ✅ 修正済 | `FIELD_STATUS = "契約ステータス"` → `"status"` に修正。書き込み値 `"締結済み"`（有効な選択肢外）→ `"受任"` に修正。`test_cloudsign_webhook.py` に回帰テストあり。 |
+| 2 | `main.py` | ✅ 修正済 | `業者名`（LOOKUP 型）への直接書き込みを除去（PR #3）。Claude が出力する `問い合わせ業者名`（SINGLE_LINE_TEXT）を直接 kintone へ送るよう変更。※README 初版では `cloudsign_webhook.py` への誤帰属があったため訂正。 |
+| 3 | `main.py` `/webhook/stripe` | ⚠️ 未対応 | kintone に `"ステータス"` フィールドコードで書き込んでいるが、kintone 予約語のため実際のフィールドコードが異なる可能性がある（例: `ステータス2`）。要確認。 |
+| 4 | 全般 | ⚠️ 未対応 | コンテナ再起動で `conversation_histories` / `kintone_record_ids` / `hearing_completed` が消える。ヒアリング途中のユーザーは最初からやり直しになる。永続化が必要な場合は Redis 等の導入が必要。 |
 
 ---
 
