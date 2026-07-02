@@ -21,6 +21,7 @@
 | 7 | [07-reuse.md](07-reuse.md) | 時効援用との共通化：流用モジュールと新規部分の切り分け |
 | 8 | [08-implementation-plan.md](08-implementation-plan.md) | 実装タスク分解（H系列）とハブ19タスクとの統合実装順序 |
 | 9 | [09-shinjutsu-package.md](09-shinjutsu-package.md) | 申述パッケージ（家裁提出8点セット・★App 35 家裁マスタ・組み立てフロー） |
+| 10 | [10-koseki-matrix.md](10-koseki-matrix.md) | 続柄別の必要戸籍マトリクス（除票最優先・連続戸籍の反復ループ・収集見込み突合） |
 
 ## 3原則の継承（docs/architecture/README.md より）
 
