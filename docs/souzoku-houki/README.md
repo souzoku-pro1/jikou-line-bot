@@ -20,6 +20,7 @@
 | 6 | [06-documents.md](06-documents.md) | 申述書・照会書回答案・上申書の docx テンプレート設計 |
 | 7 | [07-reuse.md](07-reuse.md) | 時効援用との共通化：流用モジュールと新規部分の切り分け |
 | 8 | [08-implementation-plan.md](08-implementation-plan.md) | 実装タスク分解（H系列）とハブ19タスクとの統合実装順序 |
+| 9 | [09-shinjutsu-package.md](09-shinjutsu-package.md) | 申述パッケージ（家裁提出8点セット・★App 35 家裁マスタ・組み立てフロー） |
 
 ## 3原則の継承（docs/architecture/README.md より）
 

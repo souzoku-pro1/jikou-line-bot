@@ -33,7 +33,8 @@ UNIT_CONFIG のエントリ追加だけで発送/受領ハブに乗る。
 | `財産処分有無` / `訴訟督促有無` / `未成年後見関与` | DROP_DOWN | なし / あり / 不明 |
 | `他の相続人` | MULTI_LINE_TEXT | |
 | `同時申述希望` | DROP_DOWN | なし / あり（人数・関係は他の相続人欄） |
-| `管轄裁判所` | SINGLE_LINE_TEXT | 被相続人最後の住所地の家裁。初期値 config（さいたま家裁等）・prepare が宛先に使用 |
+| `管轄裁判所` | SINGLE_LINE_TEXT | 被相続人最後の住所地の家裁。除票受領後に確定（09 §2.3）・prepare が宛先に使用 |
+| `家裁マスタレコードID` | SINGLE_LINE_TEXT | ★App 35 家裁マスタへの参照（09 §2）。郵券明細の取得キー |
 | `事件番号` | SINGLE_LINE_TEXT | 提出後に裁判所から付与（照会書 OCR から自動転記・手動修正可） |
 
 ### 1.3 熟慮期間（03 §2 の再掲・書き手を厳格化）
@@ -74,6 +75,7 @@ UNIT_CONFIG のエントリ追加だけで発送/受領ハブに乗る。
 | `取得方法` | DROP_DOWN | 依頼者郵送 / 職務上請求 / 事務所手配 |
 | `書類状態` | DROP_DOWN | 未 / 依頼中 / 請求中 / 受領 / 不要 |
 | `発送管理No` | SINGLE_LINE_TEXT | 職務上請求の App 30 レコード番号（M1 起票時に Railway が記入） |
+| `同封対象` | CHECK_BOX(同封) | 申述パッケージの疎明資料として同封する行（09 §3.2。超過型は受領時に自動チェック） |
 
 - 初期行は受任時に**相続順位に応じたテンプレート**（config の必要書類マトリクス）から
   Railway が自動生成（例: 兄弟姉妹相続なら戸籍の範囲が広がる）
@@ -133,6 +135,7 @@ UNIT_CONFIG["相続放棄"] = {
 |---|---|
 | `APP_HOUKI` / `TOKEN_HOUKI` | App 33 相続放棄案件 |
 | `APP_RESERVATION` / `TOKEN_RESERVATION` | App 34 予約枠 |
+| `APP_COURT_MASTER` / `TOKEN_COURT_MASTER` | ★App 35 家裁マスタ（09 §2） |
 | `HOUKI_LINE_CHANNEL_SECRET` / `HOUKI_LINE_CHANNEL_ACCESS_TOKEN` | 相続放棄専用 LINE 公式アカウント |
 | `HOUKI_WEBHOOK_TOKEN` | App 33 Webhook 合言葉 |
 
