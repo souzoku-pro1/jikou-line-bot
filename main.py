@@ -21,11 +21,24 @@ from chat_responder import (
     get_app21_record,
     classify_routing,
     handle_customer_message,
+    handle_claude_outage,
     get_approval_record,
     mark_approval_sent,
     send_line_push,
     save_to_chatlog,
 )
+from claude_gateway import (
+    ClaudeUnavailableError,
+    create_message_with_fallback,
+    extract_text,
+)
+from daily_healthcheck import start_healthcheck_scheduler
+
+
+@app.on_event("startup")
+async def _on_startup():
+    """日次死活監視スケジューラを起動（毎日 HEALTHCHECK_HOUR_JST 時に実行）"""
+    start_healthcheck_scheduler()
 
 
 @app.get("/health")
@@ -276,14 +289,15 @@ async def ask_claude(user_id: str, user_message: str) -> str:
     history = conversation_histories.setdefault(user_id, [])
     history.append({"role": "user", "content": user_message})
 
-    response = await claude_client.messages.create(
-        model="claude-sonnet-4-6",
+    response = await create_message_with_fallback(
+        claude_client,
+        context="ヒアリングフロー ask_claude",
         max_tokens=1024,
         system=SYSTEM_PROMPT,
         messages=history,
     )
 
-    reply_text = response.content[0].text
+    reply_text = extract_text(response)
     history.append({"role": "assistant", "content": reply_text})
 
     return reply_text
@@ -323,7 +337,24 @@ async def _process_line_event(reply_token: str, user_id: str, user_text: str) ->
             print(f"[ROUTING] user_id={user_id} → hearing (in_session)")
 
         # ── 既存ヒアリングフロー ──────────────────────────────────────────
-        claude_reply = await ask_claude(user_id, user_text)
+        try:
+            claude_reply = await ask_claude(user_id, user_text)
+        except ClaudeUnavailableError as e:
+            # PRIMARY / FALLBACK 両方失敗 → 確認中応答 + 承認キューに要対応レコード
+            async def _reply_func(token: str, text: str) -> None:
+                await _line_reply_with_fallback(token, user_id, text)
+            await handle_claude_outage(
+                user_id=user_id,
+                user_message=user_text,
+                reply_token=reply_token,
+                reply_func=_reply_func,
+                error=str(e),
+            )
+            # 履歴に応答なしの user メッセージが残らないようにする
+            history = conversation_histories.get(user_id, [])
+            if history and history[-1].get("role") == "user":
+                history.pop()
+            return
 
         # 第1段階：レコード新規作成
         clean_reply, kintone_record = extract_marker(claude_reply, "KINTONE_RECORD")
@@ -482,8 +513,9 @@ def _ocr_pdf_bytes(pdf_bytes: bytes, api_key: str) -> str:
 
 async def _extract_fixed_asset(ocr_text: str) -> dict:
     """OCRテキストから固定資産税評価額・年度・所在地・地番を抽出して返す"""
-    response = await claude_client.messages.create(
-        model="claude-sonnet-4-6",
+    response = await create_message_with_fallback(
+        claude_client,
+        context="OCR固定資産税抽出",
         max_tokens=512,
         messages=[{
             "role": "user",
@@ -502,7 +534,7 @@ async def _extract_fixed_asset(ocr_text: str) -> dict:
             ),
         }],
     )
-    raw = response.content[0].text.strip()
+    raw = extract_text(response).strip()
     if "```" in raw:
         raw = raw.split("```")[1]
         if raw.startswith("json"):
@@ -755,12 +787,13 @@ class ScanRequest(BaseModel):
 async def _extract_by_folder(ocr_text: str, folder_name: str) -> dict:
     """foldernameに応じてOCRテキストからClaude APIで情報を抽出する"""
     prompt = _SCAN_FOLDER_CONFIG[folder_name]["prompt"].format(ocr_text=ocr_text)
-    response = await claude_client.messages.create(
-        model="claude-sonnet-4-6",
+    response = await create_message_with_fallback(
+        claude_client,
+        context=f"スキャン抽出 {folder_name}",
         max_tokens=512,
         messages=[{"role": "user", "content": prompt}],
     )
-    raw = response.content[0].text.strip()
+    raw = extract_text(response).strip()
     if "```" in raw:
         raw = raw.split("```")[1]
         if raw.startswith("json"):

@@ -21,6 +21,12 @@ from typing import Callable, Optional
 import anthropic
 import httpx
 
+from claude_gateway import (
+    ClaudeUnavailableError,
+    create_message_with_fallback,
+)
+from config import HEARING_STATUSES, POST_ENGAGEMENT_STATUSES
+
 logger = logging.getLogger("chat_responder")
 
 # ── 環境変数 ──────────────────────────────────────────────────────────────────
@@ -36,10 +42,7 @@ _ANTHROPIC_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 ATTORNEY_LINE_USER_ID = os.environ.get("ATTORNEY_LINE_USER_ID", "")
 
 # ── ステータス分類 ─────────────────────────────────────────────────────────────
-# ヒアリング未完了 → 既存フロー
-HEARING_STATUSES         = {"", "受付中", "問い合わせ"}
-# 受任後 → 顧客対応Claude（受任後モード）
-POST_ENGAGEMENT_STATUSES = {"受任", "手続き中", "完了"}
+# HEARING_STATUSES / POST_ENGAGEMENT_STATUSES は config.py で一元管理
 # 受任前（決済完了・不受任など）→ 顧客対応Claude（受任前モード）
 # PRE_ENGAGEMENT: 上記以外の値すべて（安全側フォールバック含む）
 
@@ -374,10 +377,15 @@ async def _notify_attorney(
 # ── Claude 呼び出し ────────────────────────────────────────────────────────────
 
 async def _call_compose_reply(system_prompt: str, messages: list[dict]) -> dict:
-    """Claude API (tool use / compose_reply 強制) を呼び出し結果 dict を返す"""
+    """Claude API (tool use / compose_reply 強制) を呼び出し結果 dict を返す
+
+    モデル名は config.py（PRIMARY_MODEL / FALLBACK_MODEL）で管理。
+    モデル起因エラー時は claude_gateway が自動フォールバック＋管理者通知する。
+    """
     client = anthropic.AsyncAnthropic(api_key=_ANTHROPIC_KEY)
-    response = await client.messages.create(
-        model="claude-sonnet-4-6",
+    response = await create_message_with_fallback(
+        client,
+        context="顧客対応 compose_reply",
         max_tokens=1024,
         system=system_prompt,
         tools=[_COMPOSE_REPLY_TOOL],
@@ -388,6 +396,45 @@ async def _call_compose_reply(system_prompt: str, messages: list[dict]) -> dict:
     if not block:
         raise RuntimeError("compose_reply tool was not called by Claude")
     return block.input  # {"reply": ..., "category": ..., "auto_send": ..., "reason": ...}
+
+
+# ── Claude 応答不能時の共通処理 ────────────────────────────────────────────────
+
+OUTAGE_DRAFT_PLACEHOLDER = (
+    "（AI応答不能のため下書きがありません。顧客メッセージを確認し、"
+    "この欄に返信文を記入して承認してください）"
+)
+OUTAGE_CATEGORY = "AI障害・要対応"
+
+
+async def handle_claude_outage(
+    user_id: str,
+    user_message: str,
+    reply_token: str,
+    reply_func: Callable,
+    customer_name: str = "",
+    error: str = "",
+) -> None:
+    """
+    PRIMARY / FALLBACK の両方で Claude 応答が得られなかったときの共通処理。
+
+    1. ユーザーには定型の「確認中」応答を返す
+    2. 承認キュー（App 29）に要対応レコードを作成する
+    3. 弁護士に承認依頼を LINE Push で通知する
+    """
+    await reply_func(reply_token, PENDING_REPLY)
+    approval_id = await save_to_approval_queue(
+        user_id=user_id,
+        customer_name=customer_name,
+        customer_message=user_message,
+        ai_draft=OUTAGE_DRAFT_PLACEHOLDER,
+        category=OUTAGE_CATEGORY,
+        reason=f"Claude応答不能（要手動対応）: {error[:200]}",
+    )
+    await save_to_chatlog(user_id, "user", user_message, OUTAGE_CATEGORY, "no")
+    await save_to_chatlog(user_id, "assistant", PENDING_REPLY, OUTAGE_CATEGORY, "yes")
+    await _notify_attorney(user_id, customer_name, approval_id, OUTAGE_CATEGORY)
+    print(f"[OUTAGE] queued user_id={user_id} approval_id={approval_id}")
 
 
 # ── メインハンドラ ─────────────────────────────────────────────────────────────
@@ -436,9 +483,21 @@ async def handle_customer_message(
     # Claude で返信案を作成
     try:
         result = await _call_compose_reply(system_prompt, history)
+    except ClaudeUnavailableError as e:
+        # PRIMARY / FALLBACK 両方失敗 → 確認中応答 + 承認キューに要対応レコード
+        logger.exception("compose_reply unavailable for user_id=%s", user_id)
+        await handle_claude_outage(
+            user_id=user_id,
+            user_message=user_message,
+            reply_token=reply_token,
+            reply_func=reply_func,
+            customer_name=customer_name,
+            error=str(e),
+        )
+        return
     except Exception:
         logger.exception("compose_reply failed for user_id=%s", user_id)
-        # Claude 呼び出し失敗時は定型文を返して終了
+        # 一時的なエラー（レート制限等）は定型文を返して終了
         await reply_func(reply_token, PENDING_REPLY)
         return
 
