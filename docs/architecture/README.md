@@ -17,6 +17,7 @@
 | 4 | [04-module-01-shokumu-seikyu.md](04-module-01-shokumu-seikyu.md) | モジュール1: 職務上請求 |
 | 5 | [05-module-02-enaishomei-csv.md](05-module-02-enaishomei-csv.md) | モジュール2: e内容証明 差込差出しCSV |
 | 6 | [06-module-03-fax.md](06-module-03-fax.md) | モジュール3: FAX自動送信 |
+| 6a | [06a-fax-provider.md](06a-fax-provider.md) | FAXプロバイダ選定（T6-1 実施済み・推奨: InterFAX） |
 | 7 | [07-module-04-soufu-annai.md](07-module-04-soufu-annai.md) | モジュール4: 送付案内システム |
 | 8 | [08-module-05-scan-pipeline.md](08-module-05-scan-pipeline.md) | モジュール5: スキャン→OCR→kintone 受領パイプライン |
 | 9 | [09-implementation-plan.md](09-implementation-plan.md) | 依存関係・推奨実装順序・**Sonnet 発注用タスク分解（完了条件付き）** |
