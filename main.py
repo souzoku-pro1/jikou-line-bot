@@ -254,7 +254,7 @@ async def ask_claude(user_id: str, user_message: str) -> str:
     history.append({"role": "user", "content": user_message})
 
     response = await claude_client.messages.create(
-        model="claude-sonnet-4-20250514",
+        model="claude-sonnet-4-6",
         max_tokens=1024,
         system=SYSTEM_PROMPT,
         messages=history,
