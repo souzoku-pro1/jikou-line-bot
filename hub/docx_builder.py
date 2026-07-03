@@ -70,6 +70,46 @@ def fill_template(template_path: str, data: dict) -> bytes:
     return buf.read()
 
 
+def fill_template_multiline(template_path: str, data: dict) -> bytes:
+    """fill_template の複数行対応版（T2-1 で追加。既存 fill_template は不変）。
+
+    値に改行（\\n）を含むプレースホルダを Word の改行（<w:br/>）として差し込む。
+    同封物一覧のような「複数行を1プレースホルダで渡す」用途（設計 07 §2）に使う。
+    ※ 2行目以降の run は段落既定の書式になる（雛形は段落書式で整えること）
+    """
+    doc = Document(template_path)
+
+    def replace_in_paragraph(para):
+        full = "".join(run.text for run in para.runs)
+        if not any(k in full for k in data):
+            return
+        for k, v in data.items():
+            full = full.replace(k, str(v))
+        if not para.runs:
+            return
+        lines = full.split("\n")
+        para.runs[0].text = lines[0]
+        for run in para.runs[1:]:
+            run.text = ""
+        for line in lines[1:]:
+            br = para.add_run()
+            br.add_break()
+            para.add_run(line)
+
+    for para in doc.paragraphs:
+        replace_in_paragraph(para)
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                for para in cell.paragraphs:
+                    replace_in_paragraph(para)
+
+    buf = io.BytesIO()
+    doc.save(buf)
+    buf.seek(0)
+    return buf.read()
+
+
 def resolve_template(unit: str, doc_type: str, base_dir: str = TEMPLATE_ROOT) -> Path:
     """規約ベースのテンプレート解決: <base_dir>/<UNIT_CONFIG[unit].template_dir>/<doc_type>.docx
     ユニット未定義・ファイル不存在は TemplateNotFound"""
