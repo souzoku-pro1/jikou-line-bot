@@ -46,16 +46,22 @@ P7 仕上げ（運用ドキュメント・全体回帰）
 
 ### P0: 共通基盤抽出（すべて挙動不変リファクタ）
 
-#### T0-1 `hub/kintone.py` + `hub/webhook_auth.py` の新設
+#### T0-1 `hub/kintone.py` + `hub/webhook_auth.py` の新設（**実施済み 2026-07-03**）
 - 参照: 03 §3・§4
 - 作業: KintoneApp と共通クライアント関数群、webhook_auth 3関数を新規実装。
   `main.py` の `/webhook/kintone/approval` と `document_webhook.py` を hub 経由に置き換え
   （URL・レスポンス・kintone 書き込み内容は不変。旧関数は re-export で温存）
 - 完了条件:
-  - [ ] `test_hub_kintone.py` / `test_hub_webhook_auth.py` 新規（httpx モック、
+  - [x] `test_hub_kintone.py` / `test_hub_webhook_auth.py` 新規（httpx モック、
         revision 楽観ロック・KintoneConflict・GET のみ1回リトライを含む）
-  - [ ] 既存テスト無変更で全 PASS
-  - [ ] `/webhook/kintone/approval` と `/document/{secret}` の既存挙動の回帰テストを追加して PASS
+  - [x] 既存テスト無変更で全 PASS（cloudsign 8件・triage 分類一致率テスト含む）
+  - [x] `/webhook/kintone/approval` と `/document/{secret}` の既存挙動の回帰テストを追加して PASS
+        （`test_webhook_endpoints_regression.py`）
+- 実装ノート: 承認 Webhook の LINE 送信・送信済み更新・チャットログ保存
+  （`send_line_push` / `mark_approval_sent` / `save_to_chatlog`）は chat_responder のまま
+  （エラーを握りつぶす既存セマンティクスの維持。ユニット一般化 G1/H7 のスコープで扱う）。
+  hub 経由化したのは 合言葉検証・recordId 抽出・最新レコード再取得と、
+  document_webhook の kintone I/O 全部
 
 #### T0-2 `hub/notify.py` + `hub/scheduler.py` の新設
 - 参照: 03 §8・§9

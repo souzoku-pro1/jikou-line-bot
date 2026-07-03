@@ -22,7 +22,15 @@ from docx import Document
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
+from hub import kintone as hub_kintone
+from hub.webhook_auth import extract_record_id, verify_token
+
 logger = logging.getLogger("document")
+
+# 相談カードアプリのハブ経由接続（T0-1）
+_APP = hub_kintone.KintoneApp(
+    "相談カード (相続)", "SOUZOKU_KINTONE_APP_ID", "SOUZOKU_KINTONE_API_TOKEN"
+)
 
 # ── 定数（後から変更しやすいようにここにまとめる） ─────────────────────────
 FIELD_STATUS      = "書類ステータス"   # トリガー用ドロップダウンフィールドコード
@@ -87,47 +95,20 @@ def fill_template(template_path: str, data: dict) -> bytes:
     return buf.read()
 
 
-# ── kintone API ──────────────────────────────────────────────────────────────
+# ── kintone API（T0-1 で hub/kintone に移設。旧名は委譲ラッパーとして温存） ──
 
 async def _get_record(record_id: str) -> dict:
-    url = f"{_kintone_base()}/k/v1/record.json"
-    async with httpx.AsyncClient() as client:
-        resp = await client.get(
-            url,
-            headers={"X-Cybozu-API-Token": _API_TOKEN},
-            params={"app": _APP_ID, "id": record_id},
-        )
-        resp.raise_for_status()
-        return resp.json()["record"]
+    return await hub_kintone.get_record(_APP, record_id)
 
 
 async def _upload_file(filename: str, content: bytes) -> str:
     """multipart でファイルをアップロードして fileKey を返す"""
-    url = f"{_kintone_base()}/k/v1/file.json"
     mime = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(
-            url,
-            headers={"X-Cybozu-API-Token": _API_TOKEN},
-            files={"file": (filename, content, mime)},
-        )
-        resp.raise_for_status()
-        return resp.json()["fileKey"]
+    return await hub_kintone.upload_file(_APP, filename, content, mime)
 
 
 async def _update_record(record_id: str, fields: dict) -> None:
-    url = f"{_kintone_base()}/k/v1/record.json"
-    record = {k: {"value": v} for k, v in fields.items()}
-    async with httpx.AsyncClient() as client:
-        resp = await client.put(
-            url,
-            headers={
-                "X-Cybozu-API-Token": _API_TOKEN,
-                "Content-Type": "application/json",
-            },
-            json={"app": _APP_ID, "id": record_id, "record": record},
-        )
-        resp.raise_for_status()
+    await hub_kintone.update_record(_APP, record_id, fields)
 
 
 # ── FastAPI Router ───────────────────────────────────────────────────────────
@@ -137,8 +118,8 @@ router = APIRouter()
 
 @router.post("/document/{secret}")
 async def document_webhook(secret: str, request: Request):
-    # 1. 合言葉チェック
-    if not hmac.compare_digest(secret or "", _WEBHOOK_SECRET or ""):
+    # 1. 合言葉チェック（hub/webhook_auth。403 を返す点は従来どおり）
+    if not verify_token(secret or "", "DOCUMENT_WEBHOOK_SECRET"):
         return JSONResponse(status_code=403, content={"error": "forbidden"})
 
     try:
@@ -146,16 +127,11 @@ async def document_webhook(secret: str, request: Request):
     except Exception:
         return JSONResponse(status_code=400, content={"error": "invalid json"})
 
-    # 2. レコード ID を取得
-    record_id: str | None = None
-    try:
-        record_id = body["record"]["$id"]["value"]
-    except (KeyError, TypeError):
-        record_id = body.get("recordId")
+    # 2. レコード ID を取得（hub/webhook_auth・従来と同一ロジック）
+    record_id = extract_record_id(body)
     if not record_id:
         logger.warning("レコードIDが取得できませんでした")
         return JSONResponse(status_code=200, content={"ok": True, "skip": "no_record_id"})
-    record_id = str(record_id)
 
     # 3. トリガー判定（Webhook ボディのステータス値で確認）
     try:

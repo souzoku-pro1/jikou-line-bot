@@ -33,6 +33,11 @@ from claude_gateway import (
     extract_text,
 )
 from daily_healthcheck import start_healthcheck_scheduler
+from hub import kintone as hub_kintone
+from hub.webhook_auth import extract_record_id, verify_token
+
+# App 29（承認キュー）のハブ経由接続（T0-1。挙動は従来の get_approval_record と同等）
+_APP_APPROVAL = hub_kintone.KintoneApp("App 29 (承認キュー)", "APP_APPROVAL", "TOKEN_APPROVAL")
 
 
 @app.on_event("startup")
@@ -426,7 +431,7 @@ async def kintone_approval_webhook(request: Request):
     URL: /webhook/kintone/approval?token=<KINTONE_WEBHOOK_TOKEN>
     """
     token = request.query_params.get("token", "")
-    if not KINTONE_WEBHOOK_TOKEN or not hmac.compare_digest(token, KINTONE_WEBHOOK_TOKEN):
+    if not verify_token(token, "KINTONE_WEBHOOK_TOKEN"):
         raise HTTPException(status_code=404, detail="not found")
 
     try:
@@ -434,14 +439,10 @@ async def kintone_approval_webhook(request: Request):
     except Exception:
         raise HTTPException(status_code=400, detail="invalid json")
 
-    # レコード ID を取得
-    try:
-        record_id = body["record"]["$id"]["value"]
-    except (KeyError, TypeError):
-        record_id = body.get("recordId")
+    # レコード ID を取得（hub/webhook_auth・従来と同一ロジック）
+    record_id = extract_record_id(body)
     if not record_id:
         return {"ok": True, "skip": "no_record_id"}
-    record_id = str(record_id)
 
     # Webhook ボディで高速チェック（不要な API 呼び出しを減らす）
     try:
@@ -453,8 +454,11 @@ async def kintone_approval_webhook(request: Request):
     if webhook_status != "承認済" or webhook_sent != "no":
         return {"ok": True, "skip": "not_triggered"}
 
-    # 最新レコードを取り直す（先生の修正を反映するため）
-    record = await get_approval_record(record_id)
+    # 最新レコードを取り直す（先生の修正を反映するため・hub 経由）
+    try:
+        record = await hub_kintone.get_record(_APP_APPROVAL, record_id)
+    except hub_kintone.KintoneError:
+        record = None
     if not record:
         return {"ok": True, "skip": "record_not_found"}
 
