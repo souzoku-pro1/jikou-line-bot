@@ -240,10 +240,36 @@ class TestFeeRequiredPhrases(unittest.TestCase):
         self.assertTrue(g.can_auto_send)
 
     def test_missing_required_phrase_demotes(self):
-        """前払い・分割不可・不成立時費用の言及が欠けたら降格"""
+        """前払い・分割不可・不成立時費用の言及が欠けたら降格（固定文未送付の顧客）"""
         reply = "費用は1社あたり44,000円です。お支払いは銀行振込またはカード決済です。"
         g = apply_server_guards(
             _result(reply=reply, category="費用の定型案内"), [], "費用はいくらですか"
+        )
+        self.assertFalse(g.can_auto_send)
+        self.assertTrue(any("必須文言" in r for r in g.demotion_reasons))
+
+    def test_followup_after_fee_guide_is_allowed(self):
+        """固定文を送付済みの顧客への続き質問には簡潔な回答を許容
+        （会話単位の必須文言チェック・2026-07-03 弁護士承認済みの緩和）"""
+        history = [
+            {"role": "user", "content": "費用はいくらですか？"},
+            {"role": "assistant", "content": f"ご案内いたします。\n{FEE_GUIDE_TEXT}"},
+        ]
+        reply = "3社ですと、44,000円（税込）× 3社 = 132,000円（税込）となります。"
+        g = apply_server_guards(
+            _result(reply=reply, category="費用の定型案内"), history, "三社だといくらですか？"
+        )
+        self.assertTrue(g.can_auto_send)
+
+    def test_followup_without_prior_fee_guide_still_demotes(self):
+        """固定文を一度も送っていない顧客への簡潔回答は従来どおり降格"""
+        history = [
+            {"role": "user", "content": "こんにちは"},
+            {"role": "assistant", "content": "こんにちは。ご連絡ありがとうございます。"},
+        ]
+        reply = "3社ですと、44,000円（税込）× 3社 = 132,000円（税込）となります。"
+        g = apply_server_guards(
+            _result(reply=reply, category="費用の定型案内"), history, "三社だといくらですか？"
         )
         self.assertFalse(g.can_auto_send)
         self.assertTrue(any("必須文言" in r for r in g.demotion_reasons))
