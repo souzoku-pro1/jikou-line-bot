@@ -248,6 +248,43 @@ EXPECTED_KINTONE_SCHEMA = {
             "Drive_fileId": {"type": "SINGLE_LINE_TEXT"},
         },
     },
+    # 2026-07-03 作成・フォーム設計APIで14フィールドの全一致を確認済み
+    # （M1 職務上請求の宛先マスタ。初期データ投入は T3-1 で実施）
+    "App 31 (市区町村マスタ)": {
+        "app_id_env": "APP_CITY_MASTER",
+        "token_env": "TOKEN_CITY_MASTER",
+        "fields": {
+            "団体コード": {"type": "SINGLE_LINE_TEXT"},
+            "都道府県": {"type": "SINGLE_LINE_TEXT"},
+            "市区町村名": {"type": "SINGLE_LINE_TEXT"},
+            "担当部署": {"type": "SINGLE_LINE_TEXT"},
+            "郵便番号": {"type": "SINGLE_LINE_TEXT"},
+            "住所": {"type": "SINGLE_LINE_TEXT"},
+            "電話番号": {"type": "SINGLE_LINE_TEXT"},
+            "FAX番号": {"type": "SINGLE_LINE_TEXT"},
+            "手数料_戸籍謄本": {"type": "NUMBER"},
+            "手数料_除籍改製原": {"type": "NUMBER"},
+            "手数料_附票": {"type": "NUMBER"},
+            "手数料_住民票": {"type": "NUMBER"},
+            "備考": {"type": "MULTI_LINE_TEXT"},
+            "有効": {"type": "RADIO_BUTTON", "required_options": ["yes", "no"]},
+        },
+    },
+    # 2026-07-03 作成・フォーム設計APIで7フィールドの全一致を確認済み
+    # （M4 送付案内の文章ブロックマスタ。App 30 同封物選択との同期検査は T2-1 で追加）
+    "App 32 (同封物ブロックマスタ)": {
+        "app_id_env": "APP_ENCLOSURE",
+        "token_env": "TOKEN_ENCLOSURE",
+        "fields": {
+            "ブロックキー": {"type": "SINGLE_LINE_TEXT"},
+            "表示名": {"type": "SINGLE_LINE_TEXT"},
+            "案内文": {"type": "MULTI_LINE_TEXT"},
+            "対象ユニット": {"type": "CHECK_BOX", "required_options": ["時効援用"]},
+            "返送要否": {"type": "RADIO_BUTTON", "required_options": ["要", "不要"]},
+            "表示順": {"type": "NUMBER"},
+            "有効": {"type": "RADIO_BUTTON", "required_options": ["yes", "no"]},
+        },
+    },
 }
 
 

@@ -62,5 +62,60 @@ class TestApp30Schema(unittest.TestCase):
         self.assertIn("時効援用", APP30["fields"]["ユニット種別"]["required_options"])
 
 
+class TestApp31Schema(unittest.TestCase):
+    """App 31（市区町村マスタ）のスキーマ定義検証（docs/architecture/02 §3）"""
+
+    def setUp(self):
+        self.app31 = EXPECTED_KINTONE_SCHEMA["App 31 (市区町村マスタ)"]
+
+    def test_env_names(self):
+        self.assertEqual(self.app31["app_id_env"], "APP_CITY_MASTER")
+        self.assertEqual(self.app31["token_env"], "TOKEN_CITY_MASTER")
+
+    def test_field_count_is_14(self):
+        self.assertEqual(len(self.app31["fields"]), 14)
+
+    def test_fee_fields_are_number(self):
+        for code in ("手数料_戸籍謄本", "手数料_除籍改製原", "手数料_附票", "手数料_住民票"):
+            self.assertEqual(self.app31["fields"][code]["type"], "NUMBER", code)
+
+    def test_active_flag_options(self):
+        f = self.app31["fields"]["有効"]
+        self.assertEqual(f["type"], "RADIO_BUTTON")
+        self.assertEqual(f["required_options"], ["yes", "no"])
+
+    def test_all_types_valid(self):
+        for code, spec in self.app31["fields"].items():
+            self.assertIn(spec["type"], VALID_TYPES, f"{code} の型が不正")
+
+
+class TestApp32Schema(unittest.TestCase):
+    """App 32（同封物ブロックマスタ）のスキーマ定義検証（docs/architecture/02 §4.1）"""
+
+    def setUp(self):
+        self.app32 = EXPECTED_KINTONE_SCHEMA["App 32 (同封物ブロックマスタ)"]
+
+    def test_env_names(self):
+        self.assertEqual(self.app32["app_id_env"], "APP_ENCLOSURE")
+        self.assertEqual(self.app32["token_env"], "TOKEN_ENCLOSURE")
+
+    def test_field_count_is_7(self):
+        self.assertEqual(len(self.app32["fields"]), 7)
+
+    def test_return_flag_options(self):
+        f = self.app32["fields"]["返送要否"]
+        self.assertEqual(f["type"], "RADIO_BUTTON")
+        self.assertEqual(set(f["required_options"]), {"要", "不要"})
+
+    def test_unit_checkbox_requires_jikou(self):
+        f = self.app32["fields"]["対象ユニット"]
+        self.assertEqual(f["type"], "CHECK_BOX")
+        self.assertIn("時効援用", f["required_options"])
+
+    def test_all_types_valid(self):
+        for code, spec in self.app32["fields"].items():
+            self.assertIn(spec["type"], VALID_TYPES, f"{code} の型が不正")
+
+
 if __name__ == "__main__":
     unittest.main()
