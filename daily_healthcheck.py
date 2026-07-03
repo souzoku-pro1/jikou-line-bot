@@ -71,6 +71,10 @@ async def check_kintone_schema() -> list[str]:
         app_id = os.environ.get(spec["app_id_env"], "")
         token = os.environ.get(spec["token_env"], "")
         if not (app_id and token):
+            if spec.get("optional"):
+                # 未稼働の経路（例: 通帳スキャン）。env が設定されたら自動的に監視対象になる
+                logger.info("kintone schema skipped (optional / env unset): %s", app_label)
+                continue
             problems.append(
                 f"{app_label}: 環境変数 {spec['app_id_env']} / {spec['token_env']} が未設定"
             )
