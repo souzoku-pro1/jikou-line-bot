@@ -34,7 +34,15 @@
 
 import asyncio
 import os
+import sys
 import unittest
+
+
+def _safe_print(s: str) -> None:
+    """コンソールのエンコーディング（Windows は cp932）で表現できない文字を
+    置換して出力する。モデルの返信文には em-dash 等が含まれ得るため。"""
+    enc = getattr(sys.stdout, "encoding", None) or "utf-8"
+    print(s.encode(enc, errors="replace").decode(enc, errors="replace"))
 
 from chat_responder import (
     _call_compose_reply,
@@ -315,12 +323,12 @@ class TestTriageClassification(unittest.TestCase):
         print(f"\n=== トリアージ分類結果: {len(results) - len(mismatches)}/{len(results)} "
               f"一致率 {accuracy:.1%}（閾値 {PASS_THRESHOLD:.0%}） ===")
         for r in mismatches:
-            print(f"  [不一致] 期待={r['expected']}/{r.get('expected_notice', '-')} "
-                  f"実際={r['actual']}/{r['actual_notice']} "
-                  f"category={r['category']!r} auto_send={r['auto_send']} "
-                  f"降格理由={r['demotion_reasons']} "
-                  f"| {r['message'][:40]} "
-                  f"| 返信: {r['reply'][:80]}")
+            _safe_print(f"  [不一致] 期待={r['expected']}/{r.get('expected_notice', '-')} "
+                        f"実際={r['actual']}/{r['actual_notice']} "
+                        f"category={r['category']!r} auto_send={r['auto_send']} "
+                        f"降格理由={r['demotion_reasons']} "
+                        f"| {r['message'][:40]} "
+                        f"| 返信: {r['reply'][:80]}")
 
         self.assertGreaterEqual(
             accuracy, PASS_THRESHOLD,
