@@ -16,26 +16,23 @@ Claude API 呼び出しゲートウェイ（モデルフォールバック＋管
 """
 
 import logging
-import time
 from datetime import datetime, timedelta, timezone
 
 import anthropic
-import httpx
 
 from config import (
     FALLBACK_EXTRA_PARAMS,
     FALLBACK_MODEL,
     PRIMARY_MODEL,
-    get_admin_line_user_id,
 )
+
+# notify_admin_line は T0-2 で hub/notify.py に移設。
+# 既存の import 経路（from claude_gateway import notify_admin_line）互換のため re-export
+from hub.notify import notify_admin_line  # noqa: F401
 
 logger = logging.getLogger("claude_gateway")
 
 _JST = timezone(timedelta(hours=9))
-
-# 管理者通知のスロットル（同種の連続障害で LINE を埋めないため）
-_NOTIFY_MIN_INTERVAL_SEC = 300
-_last_notify_at: dict[str, float] = {}
 
 
 class ClaudeUnavailableError(Exception):
@@ -50,40 +47,6 @@ def _is_model_error(exc: Exception) -> bool:
         text = str(exc).lower()
         return "model" in text  # 廃止に伴う 400 系は message にモデル名/modelを含む
     return False
-
-
-async def notify_admin_line(text: str, throttle_key: str = "") -> None:
-    """管理者に LINE Push で通知する。失敗しても本処理には影響させない。"""
-    import os
-
-    admin_id = get_admin_line_user_id()
-    line_token = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
-    if not (admin_id and line_token):
-        logger.warning("admin LINE notify skipped (no admin id or token): %s", text[:100])
-        return
-
-    if throttle_key:
-        now = time.monotonic()
-        last = _last_notify_at.get(throttle_key, 0.0)
-        if now - last < _NOTIFY_MIN_INTERVAL_SEC:
-            logger.info("admin LINE notify throttled key=%s", throttle_key)
-            return
-        _last_notify_at[throttle_key] = now
-
-    try:
-        async with httpx.AsyncClient() as client:
-            resp = await client.post(
-                "https://api.line.me/v2/bot/message/push",
-                headers={
-                    "Authorization": f"Bearer {line_token}",
-                    "Content-Type": "application/json",
-                },
-                json={"to": admin_id, "messages": [{"type": "text", "text": text[:4900]}]},
-            )
-        if not resp.is_success:
-            logger.error("admin LINE notify failed: %s %s", resp.status_code, resp.text[:200])
-    except Exception:
-        logger.exception("admin LINE notify error")
 
 
 def _now_jst() -> str:

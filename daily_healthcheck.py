@@ -4,9 +4,11 @@
 監視項目:
   A. Anthropic Models API (GET /v1/models/{model_id}) で
      PRIMARY_MODEL / FALLBACK_MODEL の有効性を確認する
-  B. kintone フォーム設計取得 API で、コードが依存する App 21/28/29 の
+  B. kintone フォーム設計取得 API で、コードが依存するアプリの
      フィールドコード・型・選択肢値が config.EXPECTED_KINTONE_SCHEMA と
      一致するか検証する
+  C. docx テンプレートに、コードが差し込むプレースホルダが揃っているか検証する
+     （config.EXPECTED_DOCX_TEMPLATES と照合・T0-3 で追加）
 
 異常時のみ LINE Push で管理者に通知する。正常時はログのみ。
 
@@ -27,7 +29,12 @@ import anthropic
 import httpx
 
 from claude_gateway import notify_admin_line
-from config import EXPECTED_KINTONE_SCHEMA, FALLBACK_MODEL, PRIMARY_MODEL
+from config import (
+    EXPECTED_DOCX_TEMPLATES,
+    EXPECTED_KINTONE_SCHEMA,
+    FALLBACK_MODEL,
+    PRIMARY_MODEL,
+)
 
 logger = logging.getLogger("daily_healthcheck")
 
@@ -127,6 +134,34 @@ async def check_kintone_schema() -> list[str]:
 
 
 # ══════════════════════════════════════════════════════════════
+# 監視項目C: docx テンプレートのプレースホルダ検査（T0-3）
+# ══════════════════════════════════════════════════════════════
+
+def check_templates() -> list[str]:
+    """コードが差し込むプレースホルダがテンプレートに揃っているか検証する"""
+    from hub.docx_builder import TemplateNotFound, validate_template
+
+    problems: list[str] = []
+    for path, keys in EXPECTED_DOCX_TEMPLATES.items():
+        try:
+            missing = validate_template(path, keys)
+        except TemplateNotFound as e:
+            problems.append(f"テンプレート検査: {e}")
+            continue
+        except Exception as e:
+            problems.append(f"テンプレート {path} の検査に失敗: {str(e)[:150]}")
+            continue
+        if missing:
+            problems.append(
+                f"テンプレート {path} に差込プレースホルダ {missing} がありません"
+                "（テンプレート編集で消された可能性）"
+            )
+        else:
+            logger.info("template checked: %s", path)
+    return problems
+
+
+# ══════════════════════════════════════════════════════════════
 # 実行本体
 # ══════════════════════════════════════════════════════════════
 
@@ -143,6 +178,10 @@ async def run_healthcheck() -> list[str]:
         problems += await check_kintone_schema()
     except Exception as e:
         problems.append(f"kintone監視の実行自体が失敗: {str(e)[:150]}")
+    try:
+        problems += check_templates()
+    except Exception as e:
+        problems.append(f"テンプレート監視の実行自体が失敗: {str(e)[:150]}")
 
     if problems:
         logger.error("healthcheck NG (%d problems): %s", len(problems), problems)
@@ -163,29 +202,13 @@ async def run_healthcheck() -> list[str]:
 
 # ══════════════════════════════════════════════════════════════
 # アプリ内スケジューラ（FastAPI startup から呼ぶ）
+#   T0-2 でループ実装を hub/scheduler（ジョブレジストリ）に移設。
+#   登録名 "HEALTHCHECK" により Railway ログの登録行は従来と同一書式:
+#     [HEALTHCHECK] scheduler registered: next run in N sec (daily HH:00 JST)
 # ══════════════════════════════════════════════════════════════
 
-def _seconds_until_next_run(hour_jst: int) -> float:
-    now = datetime.now(_JST)
-    next_run = now.replace(hour=hour_jst, minute=0, second=0, microsecond=0)
-    if next_run <= now:
-        next_run += timedelta(days=1)
-    return (next_run - now).total_seconds()
-
-
-async def _scheduler_loop() -> None:
-    hour = int(os.environ.get("HEALTHCHECK_HOUR_JST", "7"))
-    while True:
-        wait = _seconds_until_next_run(hour)
-        # Railway ログで起動登録を確認できるよう print も出す（uvicorn 配下では
-        # モジュールロガーの INFO がハンドラ未設定で出力されないため）
-        print(f"[HEALTHCHECK] scheduler registered: next run in {wait:.0f} sec "
-              f"(daily {hour:02d}:00 JST)", flush=True)
-        await asyncio.sleep(wait)
-        try:
-            await run_healthcheck()
-        except Exception:
-            logger.exception("healthcheck run failed")
+from hub import scheduler as hub_scheduler  # noqa: E402
+from hub.scheduler import _seconds_until_next_run  # noqa: E402,F401  互換 re-export
 
 
 def start_healthcheck_scheduler() -> None:
@@ -193,7 +216,10 @@ def start_healthcheck_scheduler() -> None:
     if os.environ.get("HEALTHCHECK_DISABLED", "") == "1":
         logger.info("healthcheck scheduler disabled by HEALTHCHECK_DISABLED=1")
         return
-    asyncio.get_running_loop().create_task(_scheduler_loop())
+    hour = int(os.environ.get("HEALTHCHECK_HOUR_JST", "7"))
+    if not hub_scheduler.is_registered("HEALTHCHECK"):
+        hub_scheduler.register_daily("HEALTHCHECK", hour, run_healthcheck)
+    hub_scheduler.start_all()  # 冪等（二重 startup でもタスクは1つ）
 
 
 if __name__ == "__main__":

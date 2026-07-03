@@ -22,7 +22,15 @@ from docx import Document
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
+from hub import kintone as hub_kintone
+from hub.webhook_auth import extract_record_id, verify_token
+
 logger = logging.getLogger("document")
+
+# 相談カードアプリのハブ経由接続（T0-1）
+_APP = hub_kintone.KintoneApp(
+    "相談カード (相続)", "SOUZOKU_KINTONE_APP_ID", "SOUZOKU_KINTONE_API_TOKEN"
+)
 
 # ── 定数（後から変更しやすいようにここにまとめる） ─────────────────────────
 FIELD_STATUS      = "書類ステータス"   # トリガー用ドロップダウンフィールドコード
@@ -47,87 +55,25 @@ def _kintone_base() -> str:
     return f"https://{sub}.cybozu.com"
 
 
-def to_wareki(d: date) -> str:
-    if d >= date(2019, 5, 1):
-        n, era = d.year - 2018, "令和"
-    elif d >= date(1989, 1, 8):
-        n, era = d.year - 1988, "平成"
-    else:
-        return d.strftime("%Y年%m月%d日")
-    y = "元" if n == 1 else str(n)
-    return f"{era}{y}年{d.month}月{d.day}日"
+# fill_template / to_wareki は T0-3 で hub/docx_builder.py に移設（実装不変）。
+# 既存の import 経路（from document_webhook import fill_template 等）互換のため re-export
+from hub.docx_builder import fill_template, to_wareki  # noqa: E402,F401
 
 
-def fill_template(template_path: str, data: dict) -> bytes:
-    """テンプレートを差し込み置換して docx の bytes を返す"""
-    doc = Document(template_path)
-
-    def replace_in_paragraph(para):
-        full = "".join(run.text for run in para.runs)
-        if not any(k in full for k in data):
-            return
-        for k, v in data.items():
-            full = full.replace(k, v)
-        if para.runs:
-            para.runs[0].text = full
-            for run in para.runs[1:]:
-                run.text = ""
-
-    for para in doc.paragraphs:
-        replace_in_paragraph(para)
-    for table in doc.tables:
-        for row in table.rows:
-            for cell in row.cells:
-                for para in cell.paragraphs:
-                    replace_in_paragraph(para)
-
-    buf = io.BytesIO()
-    doc.save(buf)
-    buf.seek(0)
-    return buf.read()
-
-
-# ── kintone API ──────────────────────────────────────────────────────────────
+# ── kintone API（T0-1 で hub/kintone に移設。旧名は委譲ラッパーとして温存） ──
 
 async def _get_record(record_id: str) -> dict:
-    url = f"{_kintone_base()}/k/v1/record.json"
-    async with httpx.AsyncClient() as client:
-        resp = await client.get(
-            url,
-            headers={"X-Cybozu-API-Token": _API_TOKEN},
-            params={"app": _APP_ID, "id": record_id},
-        )
-        resp.raise_for_status()
-        return resp.json()["record"]
+    return await hub_kintone.get_record(_APP, record_id)
 
 
 async def _upload_file(filename: str, content: bytes) -> str:
     """multipart でファイルをアップロードして fileKey を返す"""
-    url = f"{_kintone_base()}/k/v1/file.json"
     mime = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(
-            url,
-            headers={"X-Cybozu-API-Token": _API_TOKEN},
-            files={"file": (filename, content, mime)},
-        )
-        resp.raise_for_status()
-        return resp.json()["fileKey"]
+    return await hub_kintone.upload_file(_APP, filename, content, mime)
 
 
 async def _update_record(record_id: str, fields: dict) -> None:
-    url = f"{_kintone_base()}/k/v1/record.json"
-    record = {k: {"value": v} for k, v in fields.items()}
-    async with httpx.AsyncClient() as client:
-        resp = await client.put(
-            url,
-            headers={
-                "X-Cybozu-API-Token": _API_TOKEN,
-                "Content-Type": "application/json",
-            },
-            json={"app": _APP_ID, "id": record_id, "record": record},
-        )
-        resp.raise_for_status()
+    await hub_kintone.update_record(_APP, record_id, fields)
 
 
 # ── FastAPI Router ───────────────────────────────────────────────────────────
@@ -137,8 +83,8 @@ router = APIRouter()
 
 @router.post("/document/{secret}")
 async def document_webhook(secret: str, request: Request):
-    # 1. 合言葉チェック
-    if not hmac.compare_digest(secret or "", _WEBHOOK_SECRET or ""):
+    # 1. 合言葉チェック（hub/webhook_auth。403 を返す点は従来どおり）
+    if not verify_token(secret or "", "DOCUMENT_WEBHOOK_SECRET"):
         return JSONResponse(status_code=403, content={"error": "forbidden"})
 
     try:
@@ -146,16 +92,11 @@ async def document_webhook(secret: str, request: Request):
     except Exception:
         return JSONResponse(status_code=400, content={"error": "invalid json"})
 
-    # 2. レコード ID を取得
-    record_id: str | None = None
-    try:
-        record_id = body["record"]["$id"]["value"]
-    except (KeyError, TypeError):
-        record_id = body.get("recordId")
+    # 2. レコード ID を取得（hub/webhook_auth・従来と同一ロジック）
+    record_id = extract_record_id(body)
     if not record_id:
         logger.warning("レコードIDが取得できませんでした")
         return JSONResponse(status_code=200, content={"ok": True, "skip": "no_record_id"})
-    record_id = str(record_id)
 
     # 3. トリガー判定（Webhook ボディのステータス値で確認）
     try:

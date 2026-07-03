@@ -46,33 +46,51 @@ P7 仕上げ（運用ドキュメント・全体回帰）
 
 ### P0: 共通基盤抽出（すべて挙動不変リファクタ）
 
-#### T0-1 `hub/kintone.py` + `hub/webhook_auth.py` の新設
+#### T0-1 `hub/kintone.py` + `hub/webhook_auth.py` の新設（**実施済み 2026-07-03**）
 - 参照: 03 §3・§4
 - 作業: KintoneApp と共通クライアント関数群、webhook_auth 3関数を新規実装。
   `main.py` の `/webhook/kintone/approval` と `document_webhook.py` を hub 経由に置き換え
   （URL・レスポンス・kintone 書き込み内容は不変。旧関数は re-export で温存）
 - 完了条件:
-  - [ ] `test_hub_kintone.py` / `test_hub_webhook_auth.py` 新規（httpx モック、
+  - [x] `test_hub_kintone.py` / `test_hub_webhook_auth.py` 新規（httpx モック、
         revision 楽観ロック・KintoneConflict・GET のみ1回リトライを含む）
-  - [ ] 既存テスト無変更で全 PASS
-  - [ ] `/webhook/kintone/approval` と `/document/{secret}` の既存挙動の回帰テストを追加して PASS
+  - [x] 既存テスト無変更で全 PASS（cloudsign 8件・triage 分類一致率テスト含む）
+  - [x] `/webhook/kintone/approval` と `/document/{secret}` の既存挙動の回帰テストを追加して PASS
+        （`test_webhook_endpoints_regression.py`）
+- 実装ノート: 承認 Webhook の LINE 送信・送信済み更新・チャットログ保存
+  （`send_line_push` / `mark_approval_sent` / `save_to_chatlog`）は chat_responder のまま
+  （エラーを握りつぶす既存セマンティクスの維持。ユニット一般化 G1/H7 のスコープで扱う）。
+  hub 経由化したのは 合言葉検証・recordId 抽出・最新レコード再取得と、
+  document_webhook の kintone I/O 全部
 
-#### T0-2 `hub/notify.py` + `hub/scheduler.py` の新設
+#### T0-2 `hub/notify.py` + `hub/scheduler.py` の新設（**実施済み 2026-07-03**）
 - 参照: 03 §8・§9
 - 作業: `notify_admin_line` を claude_gateway から移設（re-export 維持）、
   LINE Push 実装の一本化、ジョブレジストリ実装、daily_healthcheck を register_daily 経由に移行
 - 完了条件:
-  - [ ] `test_hub_notify.py` / `test_hub_scheduler.py` 新規（スロットル・ジョブ隔離・時刻計算）
-  - [ ] `railway run python daily_healthcheck.py` の手動実行インターフェースが従前どおり動く
-  - [ ] 既存テスト全 PASS
+  - [x] `test_hub_notify.py` / `test_hub_scheduler.py` 新規（スロットル・ジョブ隔離・時刻計算）
+  - [x] `railway run python daily_healthcheck.py` の手動実行インターフェースが従前どおり動く
+        （__main__ 経路・exit code・[HEALTHCHECK] ログ書式まで確認）
+  - [x] 既存テスト全 PASS（cloudsign / T0-1 回帰 / triage 分類一致率含む）
+- 実装ノート: LINE Push の一本化は hub/notify（push_line_message + notify_admin_line）
+  まで。chat_responder / cloudsign_webhook / main.py に残る Push 実装の呼び替えは
+  各モジュールの一般化タスク（G1〜G4）のスコープ。ジョブ登録名 "HEALTHCHECK" により
+  Railway の登録ログは従来と同一書式。二重 startup 時に旧実装はループが二重化し得たが、
+  レジストリ化で1タスクに保証される（改善・test_hub_scheduler で検証）
 
-#### T0-3 `hub/docx_builder.py` の新設 + `config.py` UNIT_CONFIG
+#### T0-3 `hub/docx_builder.py` の新設 + `config.py` UNIT_CONFIG（**実施済み 2026-07-03**）
 - 参照: 03 §6・§10
 - 作業: fill_template / to_wareki 移設（re-export 維持）、resolve_template / validate_template 追加、
   UNIT_CONFIG（時効援用のみ）追加、テンプレート検査を daily_healthcheck に登録
 - 完了条件:
-  - [ ] `test_hub_docx_builder.py` 新規（差込・和暦・規約解決・プレースホルダ検査）
-  - [ ] 既存 `/document/{secret}` 回帰テスト PASS・既存テスト全 PASS
+  - [x] `test_hub_docx_builder.py` 新規（差込〔run分割・表セル〕・和暦〔改元境界〕・
+        規約解決〔新ユニット=エントリ追加のみの検証込み〕・プレースホルダ検査）
+  - [x] 既存 `/document/{secret}` 回帰テスト PASS・既存テスト全 PASS
+        （101件 + triage 分類一致率 PASS・healthcheck ドライラン異常0件）
+- 実装ノート: テンプレート検査は config.EXPECTED_DOCX_TEMPLATES（パス→差込キーの
+  レジストリ）を新設して監視項目Cとして登録。実テンプレートとレジストリの一致は
+  test_hub_docx_builder が担保（誤警報防止）。list_placeholders() をレジストリ整備の
+  補助として追加
 
 ### P1: ハブ中核
 
