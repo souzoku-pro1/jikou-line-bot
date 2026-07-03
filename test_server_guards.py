@@ -24,10 +24,16 @@ from chat_responder import (
     BRANCHING_GUIDANCE_EXAMPLE,
     CHURN_NEUTRAL_REPLY,
     COURT_DOC_REQUEST_REPLY,
+    CRISIS_SUPPORT_REPLY,
+    FAQ3_CANONICAL_TEXTS,
     FEE_GUIDE_TEXT,
     FEE_REQUIRED_PHRASES,
+    IMMEDIATE_NOTICE_TEXTS,
     OUT_OF_SCOPE_DEBT_REPLY,
+    URGENT_NOTICE_KINDS,
+    URGENT_SEIZURE_PANIC_REPLY,
     apply_server_guards,
+    build_attorney_notification,
     find_forbidden_words,
     looks_like_court_doc_report,
 )
@@ -438,6 +444,73 @@ class TestImmediateNotice(unittest.TestCase):
         )
         self.assertTrue(g.can_auto_send)
         self.assertEqual(g.immediate_notice, "none")
+
+
+class TestCrisisAndUrgentNotices(unittest.TestCase):
+    """FAQ第3弾: 危機対応の専用即時文面と【緊急・要即時対応】通知（2026-07-03）"""
+
+    def test_crisis_support_notice(self):
+        g = apply_server_guards(
+            _result(category="緊急対応", auto_send=False, immediate_notice="crisis_support"),
+            [],
+            "借金のことで頭がいっぱいで、正直自殺も考えています。",
+        )
+        self.assertFalse(g.can_auto_send)
+        self.assertEqual(g.immediate_notice_text, CRISIS_SUPPORT_REPLY)
+
+    def test_urgent_seizure_panic_notice(self):
+        g = apply_server_guards(
+            _result(category="緊急対応", auto_send=False, immediate_notice="urgent_seizure_panic"),
+            [],
+            "明日にも給料を差し押さえられるかもしれません。",
+        )
+        self.assertEqual(g.immediate_notice_text, URGENT_SEIZURE_PANIC_REPLY)
+
+    def test_crisis_notices_are_not_deduped(self):
+        """危機対応の文面は過去に送信済みでも再送する（汎用文に落とさない）"""
+        history = [
+            {"role": "user", "content": "死にたいです"},
+            {"role": "assistant", "content": CRISIS_SUPPORT_REPLY},
+        ]
+        g = apply_server_guards(
+            _result(category="緊急対応", auto_send=False, immediate_notice="crisis_support"),
+            history,
+            "やっぱりもう死ぬしかないのかなと思っています。",
+        )
+        self.assertEqual(g.immediate_notice, "crisis_support")
+
+    def test_urgent_notification_format(self):
+        """希死念慮・差押え切迫は【緊急・要即時対応】フォーマットで通知される"""
+        for key, kind in URGENT_NOTICE_KINDS.items():
+            with self.subTest(key=key):
+                msg = build_attorney_notification(
+                    "U123", "テスト太郎", "42", "緊急対応",
+                    urgent_kind=kind, customer_message="明日差し押さえられるかもしれません",
+                )
+                self.assertIn("【緊急・要即時対応】", msg)
+                self.assertIn(kind, msg)
+                self.assertIn("明日差し押さえられる", msg)
+                self.assertNotIn("【承認依頼】", msg)
+
+    def test_normal_notification_format_unchanged(self):
+        """通常の承認依頼フォーマットは従来どおり"""
+        msg = build_attorney_notification("U123", "テスト太郎", "42", "法的判断・見通し")
+        self.assertIn("【承認依頼】", msg)
+        self.assertIn("承認キューレコードNo: 42", msg)
+        self.assertNotIn("緊急", msg)
+
+    def test_all_notice_templates_are_forbidden_word_free(self):
+        """即時定型文すべてに禁止語が含まれない"""
+        for key, text in IMMEDIATE_NOTICE_TEXTS.items():
+            with self.subTest(key=key):
+                self.assertEqual(find_forbidden_words(text), [])
+
+    def test_faq3_canonical_texts_are_forbidden_word_free(self):
+        """FAQ第3弾の確定文言（時効年数・アンケート返送・自宅来訪・差押え範囲等）に
+        「時効間近」等の既存禁止語が混入しないこと"""
+        for text in FAQ3_CANONICAL_TEXTS:
+            with self.subTest(text=text[:20]):
+                self.assertEqual(find_forbidden_words(text), [])
 
 
 class TestCourtDocDetection(unittest.TestCase):

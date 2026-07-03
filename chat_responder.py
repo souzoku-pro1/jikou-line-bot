@@ -87,19 +87,81 @@ OUT_OF_SCOPE_DEBT_REPLY = (
     "別途個別にご案内いたします。確認の上、改めてご連絡いたします。"
 )
 
+# 希死念慮の表明への専用文面（FAQ第3弾・2026-07-03 弁護士確定。
+# 実質回答は承認制のまま、この文面のみ即時送信し【緊急・要即時対応】で通知する）
+CRISIS_SUPPORT_REPLY = (
+    "お辛い状況の中、正直にお話しくださりありがとうございます。"
+    "借金の問題には解決の道があります。"
+    "弁護士が優先してご連絡しますので、少しだけお待ちください。"
+)
+
+# 差押え等が目前と訴えるパニックへの専用文面（FAQ第3弾・2026-07-03 弁護士確定）
+URGENT_SEIZURE_PANIC_REPLY = (
+    "ご不安な状況、承知いたしました。"
+    "至急、弁護士が内容を確認してご連絡します。"
+    "お手元に届いている書類があれば、全ページの写真をこのLINEにお送りください。"
+)
+
 # 承認キュー行き時に PENDING_REPLY の代わりに即時送信できる定型文
 IMMEDIATE_NOTICE_TEXTS = {
     "court_doc_request": COURT_DOC_REQUEST_REPLY,
     "churn_neutral": CHURN_NEUTRAL_REPLY,
     "out_of_scope_debt": OUT_OF_SCOPE_DEBT_REPLY,
+    "crisis_support": CRISIS_SUPPORT_REPLY,
+    "urgent_seizure_panic": URGENT_SEIZURE_PANIC_REPLY,
 }
 
-# 同じ定型文を二度送らないための照合マーカー（会話履歴の assistant 発言と照合）
+# 弁護士通知を【緊急・要即時対応】フォーマットにする定型文キー
+URGENT_NOTICE_KINDS = {
+    "crisis_support": "希死念慮の表明",
+    "urgent_seizure_panic": "差押え切迫の訴え",
+}
+
+# 同じ定型文を二度送らないための照合マーカー（会話履歴の assistant 発言と照合）。
+# 危機対応の2種（crisis_support / urgent_seizure_panic）は意図的に登録しない:
+# 繰り返しの訴えにも汎用の「確認中」文ではなく専用文面を返し続けるため。
 _TEMPLATE_DEDUP_MARKERS = {
     "court_doc_request": "全ページを写真に撮って",
     "churn_neutral": "最適な解決方法は異なります",
     "out_of_scope_debt": "別途個別にご案内",
 }
+
+# ── FAQ第3弾の確定文言（2026-07-03 弁護士確定。言い回しの改変禁止） ─────────────
+# 定数化して禁止語混入をテストで固定する（test_server_guards.py）
+JIKOU_YEARS_TEXT = (
+    "消費者金融やクレジットカード、債権回収会社からの借金は、"
+    "基本的に最後の返済から5年で時効援用が可能になります。"
+    "ただし、信用金庫や公的機関からの借入れ、判決を取られている場合などは"
+    "10年となることがあります。"
+)
+QUESTIONNAIRE_RETURN_TEXT = (
+    "返済しますという趣旨の回答をした場合、時効が更新（リセット）されている"
+    "可能性があります。ただしその場合でも時効援用通知を送付の上、交渉はいたします。"
+)
+HOME_VISIT_TEXT = (
+    "返済します・分割で支払います等の発言は時効が更新される可能性があります。"
+    "ただし口頭でのやり取りのため、時効が更新しないことも多々あります。"
+)
+SEIZURE_SCOPE_TEXT = (
+    "預貯金も対象になります。ただし給料は職場を知られている場合、"
+    "預貯金は銀行名に加えて支店名まで特定されていなければ、"
+    "差押えは簡単ではないことが多いです。"
+)
+MAIL_ADDRESS_TEXT = (
+    "無料のメールアドレス（Gmailなど）の取得をお願いしています。"
+    "スマートフォンで5分ほどで作成でき、作成方法もご案内します。"
+)
+
+# 禁止語テストの対象（新FAQの確定文言＋即時定型文すべて）
+FAQ3_CANONICAL_TEXTS = [
+    JIKOU_YEARS_TEXT,
+    QUESTIONNAIRE_RETURN_TEXT,
+    HOME_VISIT_TEXT,
+    SEIZURE_SCOPE_TEXT,
+    MAIL_ADDRESS_TEXT,
+    CRISIS_SUPPORT_REPLY,
+    URGENT_SEIZURE_PANIC_REPLY,
+]
 
 # ── 費用の定型案内（固定文） ────────────────────────────────────────────────────
 # 金額表記は「44,000円（税込）」で統一（2026-07-03 弁護士確定）
@@ -270,7 +332,10 @@ auto_send=false の場合のみ、次から選ぶ。該当なしは "none"。
 - court_doc_request:「裁判所から書類が来た」系の第一報のとき（過去の会話で既に書類の写真送付を依頼済みなら選ばない）
 - churn_neutral:「じゃあいいです」「もういいです」等の諦め・離脱の兆候のとき
 - out_of_scope_debt: 税金・個人からの借入れが対象の相談のとき
+- crisis_support: 希死念慮の表明（「自殺も考えている」「死にたい」等）のとき。カテゴリ「緊急対応」・auto_send=false とし、必ずこれを選ぶ
+- urgent_seizure_panic: 差押え等が目前と訴えるパニック（「明日差し押さえられるかも」等。書類が届いたかは不明）のとき。カテゴリ「緊急対応」・auto_send=false。※書類が届いた第一報は court_doc_request を優先
 auto_send=true のときは常に "none"。
+※ 紹介割引の問い合わせは「費用交渉・減額相談」（auto_send=false）で immediate_notice="none"（通常の定型文でよい）。
 
 【費用の定型案内】
 費用に関する質問には、次の固定文を一字一句変えずに返信に含めること（前後に会話の流れに合う自然な一文を添えてよい。省略・改変・要約は不可）:
@@ -347,6 +412,41 @@ auto_send=true のときは常に "none"。
 - 完了後の追加依頼の費用: 同一料金（1社あたり44,000円（税込））。割引制度はない。費用の質問なので【費用の定型案内】の固定文ルールに従う
 - 時効成立の証明書: 業者から証明書等は発行されない。完了は既存FAQのとおりLINEまたはメールで報告する
 
+【FAQ第3弾（弁護士確定済み・2026-07-03追加。数値・条件・言い回しの改変禁止。特記なき項目は自動送信可）】
+時効の基本・期間:
+- 時効は何年か: 次の文言をそのまま使い、借入先の確認質問を1つ添える:
+  「<<JIKOU_YEARS>>」
+- 最終返済日の記憶が曖昧（7〜8年前等）: 5年以上経過している認識であれば問題ない旨を案内し、見立てに接続する
+- 「借りたのは15年前、5年前まで返済していた」等: 誤解訂正型で答える。時効の起算点は借入日ではなく最終返済日。最終返済から5年以上経過していれば問題ない
+- 時効完成までの残り期間を教えて: 当事務所では正確な判断ができないため回答しない。完成後（最終返済から5年経過後）のご依頼を案内する
+- 完成まで待つべきか: 待ってからのご依頼を推奨。完成前に援用しても二度手間になることに加え、業者が裁判手続きをとってくることがある旨を説明する
+更新事由の細かい判断:
+- 電話で「払えません」と言った: まずくない。支払いを拒む発言は債務の承認に当たらない（jikou_update_flag も立てない）
+- 電話で「調べて折り返します」と言った: 問題ない（フラグも立てない）
+- アンケート様の書類を返送した:「どのような内容で返送されましたか？」と確認質問をした上で、次を添える:
+  「<<QUESTIONNAIRE_RETURN>>」
+- 10年以上前に裁判された記憶があるが不確実: 経過が不確実な場合は、明らかに10年以上経過していると判断できる状況になってから手続きをとる方がよい旨を案内する
+- 差押えは給料以外も対象か: 次の文言をそのまま使う:
+  「<<SEIZURE_SCOPE>>」
+- 業者が自宅に来て話した:「どのような内容をお話しされましたか？」と確認質問をした上で、次を添える:
+  「<<HOME_VISIT>>」
+業者の行動:
+- 「法的手続きに移行します」の通告が来た: 必ずしも裁判手続きがなされるとは限らない。一方、実際に裁判がいつ行われても不思議でない段階のため、早めの手続きが望ましい（自動送信可。書類の写真送付を勧めてよい）
+- 業者側の弁護士事務所から通知が来た: それは裁判ではない。裁判は裁判所からの書類によって行われる（自動送信可）
+- （受任後の顧客）通知を送ったのにまだ督促が来る: ご依頼から10日前後は行き違いで通知が届くことがある。ご依頼から1ヶ月程度経過後に届いた場合は必ずご連絡ください、と案内する
+費用・手続きの深掘り:
+- 不成立時にいくら損するか: 返金はなく、手続き費用分の損失になる（カテゴリ「手続きの一般的な流れ」。既存の不成立時費用の説明と整合させる）
+- 配偶者に内緒・郵送は本当にないか: 本当にない（既存の家族への秘匿FAQを強調して再掲してよい）
+- メールアドレスがない: 次の文言の趣旨で案内する:
+  「<<MAIL_ADDRESS>>」
+- ケースワーカーに相談してから決めてもいいか: もちろん問題ない
+資料・状況:
+- 未開封の封筒を全部写真で送りたい: もちろん可能、と歓迎して受け付ける
+- 詐欺ではないか・先にお金だけ取られないか: そのようなことは一切ない、と明確に否定する（実績1000件以上・Google口コミのFAQに自然に接続してよい）。※契約前のこの種の不安の確認は「クレーム・不満」ではなくFAQで自動送信可（受任後の対応への不満はこれまでどおりクレーム・不満で承認制）
+完了後・その他:
+- また借金やクレジットカードは作れるか: 手続きから5年程度はカード作成やローンは組めない前提でいた方がよい。一方、時効援用から数ヶ月以内に作成できる場合もある
+- 家族・職場に知られるか: ない。逆に時効援用手続きをとらないと、差押え等をされた際に職場や家族に知られてしまうことがある
+
 【必ず auto_send=false にするケース（上記に加えて）】
 - 不満・不信・強い不安の表明を伴うメッセージ（「本当に進めてくれているんですか」「対応が遅い」等）。進捗確認の形をとっていてもカテゴリ「クレーム・不満」で auto_send=false
 - 進捗について、上記顧客情報（ステータス等）にない事実を答える必要がある場合（「進捗の事実回答」は記録にある事実の範囲のみ）
@@ -367,6 +467,11 @@ _SYSTEM_PROMPT_TMPL = (
     .replace("<<DUNNING_INSTRUCTION>>", APPROVED_DUNNING_INSTRUCTION)
     .replace("<<BRANCHING_EXAMPLE>>", BRANCHING_GUIDANCE_EXAMPLE)
     .replace("<<HOTERASU_REPLY>>", HOTERASU_STANDARD_REPLY)
+    .replace("<<JIKOU_YEARS>>", JIKOU_YEARS_TEXT)
+    .replace("<<QUESTIONNAIRE_RETURN>>", QUESTIONNAIRE_RETURN_TEXT)
+    .replace("<<HOME_VISIT>>", HOME_VISIT_TEXT)
+    .replace("<<SEIZURE_SCOPE>>", SEIZURE_SCOPE_TEXT)
+    .replace("<<MAIL_ADDRESS>>", MAIL_ADDRESS_TEXT)
 )
 
 # ── tool 定義 ─────────────────────────────────────────────────────────────────
@@ -414,11 +519,17 @@ _COMPOSE_REPLY_TOOL = {
             },
             "immediate_notice": {
                 "type": "string",
-                "enum": ["none", "court_doc_request", "churn_neutral", "out_of_scope_debt"],
+                "enum": [
+                    "none", "court_doc_request", "churn_neutral",
+                    "out_of_scope_debt", "crisis_support", "urgent_seizure_panic",
+                ],
                 "description": (
                     "auto_send=false のとき顧客へ即時送信する定型文の選択。"
                     "court_doc_request=裁判所書類の第一報 / churn_neutral=諦め・離脱兆候 / "
-                    "out_of_scope_debt=税金・個人からの借入れ / 該当なしと auto_send=true は none"
+                    "out_of_scope_debt=税金・個人からの借入れ / "
+                    "crisis_support=希死念慮の表明 / "
+                    "urgent_seizure_panic=差押え等が目前と訴えるパニック / "
+                    "該当なしと auto_send=true は none"
                 ),
             },
             "reason": {
@@ -817,21 +928,58 @@ async def send_line_push(to: str, text: str) -> None:
         print(f"[LINE_PUSH] ERROR: {resp.text[:300]}")
 
 
-async def _notify_attorney(
-    user_id: str, customer_name: str, approval_record_id: Optional[str], category: str
-) -> None:
-    """弁護士に承認依頼を LINE Push で通知する"""
-    if not ATTORNEY_LINE_USER_ID:
-        print("[ATTORNEY] ATTORNEY_LINE_USER_ID not set, skipping")
-        return
+def build_attorney_notification(
+    user_id: str,
+    customer_name: str,
+    approval_record_id: Optional[str],
+    category: str,
+    urgent_kind: str = "",
+    customer_message: str = "",
+) -> str:
+    """弁護士向け通知文を組み立てる。
+
+    urgent_kind が指定された場合（希死念慮・差押え切迫）は
+    【緊急・要即時対応】フォーマット、それ以外は従来の【承認依頼】。
+    """
     rid = approval_record_id or "（未取得）"
-    print(f"[ATTORNEY] notifying to={ATTORNEY_LINE_USER_ID} approval_id={rid} category={category}")
-    msg = (
+    if urgent_kind:
+        return (
+            f"【緊急・要即時対応】\n"
+            f"種別: {urgent_kind}\n"
+            f"顧客: {customer_name or user_id}\n"
+            f"顧客メッセージ: {customer_message[:200]}\n"
+            f"承認キューレコードNo: {rid}\n"
+            f"至急、内容を確認して直接ご連絡ください。"
+        )
+    return (
         f"【承認依頼】\n"
         f"顧客: {customer_name or user_id}\n"
         f"カテゴリ: {category}\n"
         f"承認キューレコードNo: {rid}\n"
         f"kintone承認キューを確認し、ステータスを「承認済」に変更してください。"
+    )
+
+
+async def _notify_attorney(
+    user_id: str,
+    customer_name: str,
+    approval_record_id: Optional[str],
+    category: str,
+    urgent_kind: str = "",
+    customer_message: str = "",
+) -> None:
+    """弁護士に承認依頼（緊急時は【緊急・要即時対応】）を LINE Push で通知する"""
+    if not ATTORNEY_LINE_USER_ID:
+        print("[ATTORNEY] ATTORNEY_LINE_USER_ID not set, skipping")
+        return
+    rid = approval_record_id or "（未取得）"
+    print(
+        f"[ATTORNEY] notifying to={ATTORNEY_LINE_USER_ID} approval_id={rid} "
+        f"category={category} urgent={urgent_kind or '-'}"
+    )
+    msg = build_attorney_notification(
+        user_id, customer_name, approval_record_id, category,
+        urgent_kind=urgent_kind, customer_message=customer_message,
     )
     await send_line_push(ATTORNEY_LINE_USER_ID, msg)
 
@@ -1002,8 +1150,12 @@ async def handle_customer_message(
         ack_text = guard.immediate_notice_text or PENDING_REPLY
         await reply_func(reply_token, ack_text)
         await save_to_chatlog(user_id, "assistant", ack_text, category, "yes")
-        # 弁護士へ承認依頼通知
-        await _notify_attorney(user_id, customer_name, approval_id, category)
+        # 弁護士へ承認依頼通知（希死念慮・差押え切迫は【緊急・要即時対応】）
+        await _notify_attorney(
+            user_id, customer_name, approval_id, category,
+            urgent_kind=URGENT_NOTICE_KINDS.get(guard.immediate_notice, ""),
+            customer_message=user_message,
+        )
         print(
             f"[APPROVAL] queued user_id={user_id} category={category} "
             f"approval_id={approval_id} notice={guard.immediate_notice}"
