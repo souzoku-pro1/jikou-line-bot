@@ -6,7 +6,7 @@
   既存の import 経路（from claude_gateway import notify_admin_line）は
   claude_gateway 側の re-export で維持される。
 - push_line_message: LINE Push の共通実装（一本化の下回り）。
-- notify_attorney_approval（発送管理の承認依頼通知）は T1-2 で追加する。
+- notify_attorney_approval: 発送管理（App 30）の承認依頼通知（T1-2 で追加）。
 
 呼び出し元の警報文言はここでは持たない（文言は呼び出し元の責務）。
 """
@@ -76,3 +76,22 @@ async def notify_admin_line(text: str, throttle_key: str = "") -> None:
         _last_notify_at[throttle_key] = now
 
     await push_line_message(admin_id, text)
+
+
+async def notify_attorney_approval(record: dict) -> None:
+    """発送管理（App 30）の承認依頼を弁護士へ LINE Push する。
+    既存 App 29 の「【承認依頼】」と同型（docs/architecture/03 §8）。"""
+    attorney_id = os.environ.get("ATTORNEY_LINE_USER_ID", "")
+    if not attorney_id:
+        logger.warning("attorney approval notify skipped (ATTORNEY_LINE_USER_ID unset)")
+        return
+    record_id = record.get("$id", {}).get("value", "（不明）")
+    text = (
+        "【承認依頼】発送\n"
+        f"件名: {record.get('件名', {}).get('value', '')}\n"
+        f"チャネル: {record.get('チャネル', {}).get('value', '')} / "
+        f"顧客: {record.get('顧客名表示用', {}).get('value', '')}\n"
+        f"発送管理レコードNo: {record_id}\n"
+        "kintone で成果物を確認し、発送ステータスを「承認済」に変更してください。"
+    )
+    await push_line_message(attorney_id, text)
