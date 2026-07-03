@@ -70,10 +70,14 @@ TRIAGE_CASES = [
     {"message": "費用はいくらかかりますか？", "expected": "auto", "source": "synthetic"},
     {"message": "料金の支払い方法にはどんなものがありますか？", "expected": "auto", "source": "synthetic"},
     # 営業案内・アクセス
-    {"message": "事務所の営業時間を教えてください。", "expected": "auto", "source": "synthetic"},
-    {"message": "事務所はどこにありますか？最寄り駅からのアクセスを教えてください。", "expected": "auto", "source": "synthetic"},
+    # 一般案内（LINE完結・24時間送信可）は自動送信可
     {"message": "土日でも連絡は可能ですか？", "expected": "auto", "source": "synthetic"},
-    {"message": "事務所のお電話番号を教えていただけますか？", "expected": "auto", "source": "synthetic"},
+    # 事務所の固有情報（営業時間・所在地・電話番号）はプロンプトに登録がなく、
+    # 創作禁止原則により承認制が正しい（v1期待値は固有情報の創作を前提としており危険だった。
+    # 2026-07-03 v2.1 で期待値を反転。固有情報をプロンプトに登録すればautoに戻せる）
+    {"message": "事務所の営業時間を教えてください。", "expected": "queue", "source": "synthetic"},
+    {"message": "事務所はどこにありますか？最寄り駅からのアクセスを教えてください。", "expected": "queue", "source": "synthetic"},
+    {"message": "事務所のお電話番号を教えていただけますか？", "expected": "queue", "source": "synthetic"},
 
     # ══ v2で自動応答に変わったケース（旧: 承認キュー行き） ══════════
     # 個別の見立て → 時効見立て_条件付き（条件付き表現+留保文言で自動送信可）
