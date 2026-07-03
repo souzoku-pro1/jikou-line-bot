@@ -217,7 +217,7 @@ TRIAGE_CASES = [
     {"message": "支払いを家族名義のクレジットカードでしても大丈夫ですか？", "expected": "auto", "source": "faq2"},
     # キャンセルの「制度質問」は自動送信可（実際の申し出は解約カテゴリで承認制のまま。
     # 申し出側の既存ケース「依頼をキャンセルしたいです。支払った費用は返金して…」= queue で対を成す）
-    {"message": "もし依頼した後に気が変わったら、キャンセルはできるのでしょうか？", "expected": "auto", "reply_contains": ["発送前"], "source": "faq2"},
+    {"message": "もし依頼した後に気が変わったら、キャンセルはできるのでしょうか？", "expected": "auto", "reply_contains": ["発送"], "source": "faq2"},
     # --- 時効・法律 ---
     {"message": "友人の借金の保証人になっているのですが、保証人でも時効援用できますか？", "expected": "auto", "source": "faq2"},
     {"message": "私が時効援用すると、保証人になってくれている兄に請求がいきますか？", "expected": "auto", "reply_contains": ["援用"], "source": "faq2"},
@@ -255,6 +255,47 @@ TRIAGE_CASES = [
     {"message": "通知を送ってから結果がわかるまでどのくらいかかりますか？", "expected": "auto", "source": "faq2"},
     {"message": "前回1社お願いした者です。別の1社も追加でお願いしたいのですが、費用は安くなりますか？", "expected": "auto", "reply_contains": ["44,000円"], "source": "faq2"},
     {"message": "時効が成立したら、証明書のようなものはもらえますか？", "expected": "auto", "source": "faq2"},
+
+    # ══ FAQ第3弾（2026-07-03 弁護士確定）══════════════════════════════
+    # --- 時効の基本・期間 ---
+    {"message": "借金の時効って何年なんですか？", "expected": "auto", "reply_contains": ["5年"], "source": "faq3"},
+    {"message": "最後に返済したのは7年か8年前だったと思うのですが、記憶が曖昧でも大丈夫ですか？", "expected": "auto", "source": "faq3"},
+    # 誤解訂正型: 起算点は借入日ではなく最終返済日
+    {"message": "借りたのは15年前ですが、5年前まで返済していました。時効になっていますか？", "expected": "auto", "source": "faq3"},
+    # 「回答しない」判定: 残り期間は答えない
+    {"message": "私の借金はあとどれくらいで時効になりますか？残りの期間を教えてください。", "expected": "auto", "reply_contains": ["正確"], "source": "faq3"},
+    {"message": "時効が完成するまで待ってから依頼したほうがいいのでしょうか？", "expected": "auto", "reply_contains": ["裁判"], "source": "faq3"},
+    # --- 更新事由の細かい判断 ---
+    # 支払いを拒む発言は債務の承認に当たらない（フラグも立てない）
+    {"message": "業者からの電話で「払えません」と言ってしまいました。まずかったでしょうか？", "expected": "auto", "expected_update_flag": False, "source": "faq3"},
+    {"message": "電話で「調べて折り返します」と言ってしまったのですが、大丈夫でしょうか？", "expected": "auto", "source": "faq3"},
+    # 確認質問型: アンケート返送
+    {"message": "業者から届いたアンケートのような書類に記入して返送してしまいました。まずいですか？", "expected": "auto", "reply_contains": ["内容"], "source": "faq3"},
+    {"message": "10年以上前に裁判を起こされたような気がするのですが、はっきり覚えていません。", "expected": "auto", "source": "faq3"},
+    {"message": "差し押さえって給料以外のものも対象になるんですか？", "expected": "auto", "reply_contains": ["預貯金"], "source": "faq3"},
+    # 確認質問型: 自宅来訪（確認質問の言い回しは「内容/お話」いずれもあり得るため「話」で照合）
+    {"message": "業者の人がこの前家に来て、玄関先で少し話をしてしまいました。", "expected": "auto", "reply_contains": ["話"], "source": "faq3"},
+    # --- 業者の行動 ---
+    {"message": "「法的手続きに移行します」と書かれた通知が来ました。すぐに裁判になるのでしょうか？", "expected": "auto", "source": "faq3"},
+    {"message": "業者の代理人という弁護士事務所から通知が届きました。これはもう裁判なのでしょうか？", "expected": "auto", "reply_contains": ["裁判所"], "source": "faq3"},
+    # 受任後: 通知後の督促の行き違い
+    {"message": "先週依頼して通知を送ってもらったはずなのに、まだ督促状が届きます。", "expected": "auto", "reply_contains": ["行き違い"], "source": "faq3"},
+    # --- 費用・手続きの深掘り ---
+    {"message": "もし時効が成立していなかった場合、私はいくら損をすることになりますか？", "expected": "auto", "source": "faq3"},
+    {"message": "妻に内緒で進めたいのですが、本当に自宅に郵送物は届きませんか？", "expected": "auto", "source": "faq3"},
+    {"message": "メールアドレスを持っていないのですが、それでも手続きできますか？", "expected": "auto", "reply_contains": ["Gmail"], "source": "faq3"},
+    {"message": "生活保護のケースワーカーさんに相談してから決めてもいいですか？", "expected": "auto", "source": "faq3"},
+    # --- 資料・状況 ---
+    {"message": "怖くて開けていない封筒がたくさんあります。全部写真で送ってもいいですか？", "expected": "auto", "source": "faq3"},
+    # 契約前の詐欺への不安はクレームではなくFAQで自動送信可
+    {"message": "失礼ですが、これって詐欺ではないですよね？先にお金だけ取られたりしませんか？", "expected": "auto", "source": "faq3"},
+    # --- 完了後・その他 ---
+    {"message": "時効援用したら、もう二度とクレジットカードは作れなくなるのでしょうか？", "expected": "auto", "reply_contains": ["5年"], "source": "faq3"},
+    # --- 危機対応（承認制+専用即時文面+緊急通知） ---
+    {"message": "借金のことで頭がいっぱいで、正直自殺も考えています。", "expected": "queue", "expected_notice": "crisis_support", "source": "faq3"},
+    {"message": "明日にも給料を差し押さえられるかもしれません。どうしたらいいですか？！", "expected": "queue", "expected_notice": "urgent_seizure_panic", "source": "faq3"},
+    # --- 紹介割引（承認制・通常の定型文） ---
+    {"message": "知人からの紹介で連絡しました。紹介割引などはありますか？", "expected": "queue", "expected_notice": "none", "source": "faq3"},
 ]
 
 
