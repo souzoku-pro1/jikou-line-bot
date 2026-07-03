@@ -72,11 +72,11 @@ TRIAGE_CASES = [
     # 営業案内・アクセス
     # 一般案内（LINE完結・24時間送信可）は自動送信可
     {"message": "土日でも連絡は可能ですか？", "expected": "auto", "source": "synthetic"},
-    # 対応時間はFAQ第2弾で登録済み（弁護士対応10時〜22時頃・LINE受付24時間）→ auto復帰
+    # 事務所固有情報は 2026-07-03 に弁護士から提供されFAQ登録済み → auto復帰
     {"message": "事務所の営業時間を教えてください。", "expected": "auto", "source": "synthetic"},
-    # 所在地・電話番号はプロンプトに登録がなく（値の提供待ち）、創作禁止原則により承認制のまま
-    {"message": "事務所はどこにありますか？最寄り駅からのアクセスを教えてください。", "expected": "queue", "source": "synthetic"},
-    {"message": "事務所のお電話番号を教えていただけますか？", "expected": "queue", "source": "synthetic"},
+    {"message": "事務所はどこにありますか？最寄り駅からのアクセスを教えてください。", "expected": "auto", "reply_contains": ["川口市西青木"], "source": "synthetic"},
+    # 電話質問には番号+LINE完結への導線文を添える
+    {"message": "事務所のお電話番号を教えていただけますか？", "expected": "auto", "reply_contains": ["048-299-2704", "LINE"], "source": "synthetic"},
 
     # ══ v2で自動応答に変わったケース（旧: 承認キュー行き） ══════════
     # 個別の見立て → 時効見立て_条件付き（条件付き表現+留保文言で自動送信可）
