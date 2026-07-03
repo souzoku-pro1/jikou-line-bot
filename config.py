@@ -196,6 +196,58 @@ EXPECTED_KINTONE_SCHEMA = {
             "状況": {"type": "SINGLE_LINE_TEXT"},
         },
     },
+    # ── 発送/受領ハブ（docs/architecture/02 §2）──
+    # 2026-07-03 作成・フォーム設計APIで27フィールドの全一致を確認済み（T1-1）
+    "App 30 (発送管理)": {
+        "app_id_env": "APP_SHIPPING",
+        "token_env": "TOKEN_SHIPPING",
+        "fields": {
+            # 共通・案件参照
+            "ユニット種別": {"type": "DROP_DOWN", "required_options": ["時効援用"]},
+            "チャネル": {
+                "type": "DROP_DOWN",
+                "required_options": ["職務上請求", "e内容証明", "FAX", "送付案内", "スキャン受領"],
+            },
+            "方向": {"type": "DROP_DOWN", "required_options": ["発送", "受領"]},
+            "案件アプリID": {"type": "SINGLE_LINE_TEXT"},
+            "案件レコードID": {"type": "SINGLE_LINE_TEXT"},
+            "顧客名表示用": {"type": "SINGLE_LINE_TEXT"},
+            "件名": {"type": "SINGLE_LINE_TEXT"},
+            # 状態機械（01 §4。承認済への遷移は人のみ・T1-2）
+            "発送ステータス": {
+                "type": "DROP_DOWN",
+                "required_options": ["下書き", "承認待ち", "承認済", "発送処理中", "発送済",
+                                     "返送待ち", "完了", "エラー", "却下", "要確認"],
+            },
+            "実行済み": {"type": "RADIO_BUTTON", "required_options": ["no", "yes"]},
+            "承認者コメント": {"type": "MULTI_LINE_TEXT"},
+            "却下理由": {"type": "MULTI_LINE_TEXT"},
+            "エラー詳細": {"type": "MULTI_LINE_TEXT"},
+            "リトライ回数": {"type": "NUMBER"},
+            # 宛先
+            "宛先名": {"type": "SINGLE_LINE_TEXT"},
+            "宛先郵便番号": {"type": "SINGLE_LINE_TEXT"},
+            "宛先住所": {"type": "SINGLE_LINE_TEXT"},
+            "宛先FAX番号": {"type": "SINGLE_LINE_TEXT"},
+            # 成果物・本文
+            "成果物": {"type": "FILE"},
+            "本文_特記事項": {"type": "MULTI_LINE_TEXT"},
+            # 同封物選択の選択肢は仮値「（未設定）」のため required_options を置かない
+            # （T2-1 で App 32 と同期する実選択肢に差し替える）
+            "同封物選択": {"type": "CHECK_BOX"},
+            "チャネル固有データ": {"type": "MULTI_LINE_TEXT"},
+            # 発送・追跡・受領
+            "発送日時": {"type": "DATETIME"},
+            "追跡番号": {"type": "SINGLE_LINE_TEXT"},
+            "返送期限": {"type": "DATE"},
+            "送達結果": {
+                "type": "DROP_DOWN",
+                "required_options": ["未確認", "送達済", "不達", "返送受領"],
+            },
+            "受領ファイル": {"type": "FILE"},
+            "Drive_fileId": {"type": "SINGLE_LINE_TEXT"},
+        },
+    },
 }
 
 
