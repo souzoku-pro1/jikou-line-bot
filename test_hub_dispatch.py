@@ -268,8 +268,10 @@ class TestIdempotency(DispatchTestBase):
 
 class TestStatusRouting(DispatchTestBase):
     def test_other_statuses_are_skipped(self):
-        """サーバー処理対象外の状態（承認待ち・発送済・完了等）では何も書かない"""
-        for status in ("承認待ち", "発送処理中", "発送済", "返送待ち", "完了", "エラー", "却下"):
+        """サーバー処理対象外の状態（承認待ち・完了等）では何も書かない
+        ※発送済は T3-3 で処理対象になったため一覧から除外（返送待ち/完了への自動遷移。
+        　T2-2 実装ノートで予告済み・分岐テストは test_shokumu_wiring.py）"""
+        for status in ("承認待ち", "発送処理中", "返送待ち", "完了", "エラー", "却下"):
             with self.subTest(status=status):
                 store = FakeStore({"9": make_record(status)})
                 adapter = FakeAdapter()
