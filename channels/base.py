@@ -32,6 +32,16 @@ class DispatchResult:
     fields: dict = field(default_factory=dict)   # 書き戻し（外部APIの job_id 等）
 
 
+class PrepareDeferred(Exception):
+    """prepare を中断するが「エラーではない」状態（マスタの登録待ち等）。
+
+    ディスパッチャはこれを受けると**状態を変更せず**（下書きのまま）、
+    メッセージを LINE 警報として送る。人がマスタ登録後にレコードを
+    下書きのまま再保存すれば Webhook 再発火で自動再処理される。
+    （例: App 31 の住所未登録・手数料未登録。設計: 申述パッケージ 09 §2.2 と同思想）
+    """
+
+
 class ChannelAdapter:
     """チャネルアダプタの基底クラス。M1〜M5 が継承して実装する。"""
 

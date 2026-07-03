@@ -133,6 +133,17 @@ async def _handle_prepare(record: dict) -> None:
                 file_keys.append(await kintone.upload_file(
                     APP_SHIPPING, a.filename, a.content, a.mime))
             extra["成果物"] = [{"fileKey": k} for k in file_keys]
+    except channels.base.PrepareDeferred as e:
+        # エラーではない中断（マスタ登録待ち等）: 状態を変えず登録依頼の警報のみ
+        logger.info("prepare deferred record=%s: %s", record_id, e)
+        await notify.notify_admin_line(
+            "【発送管理: 対応依頼（エラーではありません）】\n"
+            f"レコードNo: {record_id}\n{_summary(record)}\n"
+            f"{e}\n"
+            "対応後、このレコードを（下書きのまま）再保存すると自動で再処理されます。",
+            throttle_key=f"prepare_deferred:{record_id}",
+        )
+        return
     except Exception as e:
         logger.exception("prepare failed record=%s", record_id)
         await _to_error(record, "下書き", f"prepare 失敗: {e}")
