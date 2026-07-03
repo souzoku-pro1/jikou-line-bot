@@ -43,13 +43,19 @@ async def _on_startup():
 
 @app.get("/health")
 async def health():
-    """起動確認・依存ライブラリのインポートチェック"""
+    """起動確認・依存ライブラリのインポートチェック
+
+    ※ 旧実装は PyMuPDF(fitz) を確認していたが、OCR は Vision API の
+      files:annotate に PDF を直接送る方式で PyMuPDF を使っておらず、
+      requirements.txt にも含まれないため常に NG 表示だった。
+      実際に本番が依存するライブラリの確認に置き換え（2026-07-03）。
+    """
     status = {}
     try:
-        import fitz
-        status["pymupdf"] = fitz.__version__
+        import docx  # noqa: F401  document_webhook の送付状生成が依存
+        status["python-docx"] = "ok"
     except ImportError as e:
-        status["pymupdf"] = f"NG: {e}"
+        status["python-docx"] = f"NG: {e}"
     return {"status": "ok", "deps": status}
 
 
