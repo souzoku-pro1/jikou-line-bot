@@ -17,8 +17,11 @@
 import unittest
 
 from chat_responder import (
+    _FORBIDDEN_PATTERNS,
+    APPROVED_DUNNING_INSTRUCTION,
     APPROVED_PHONE_INSTRUCTION,
     AUTO_SEND_CATEGORIES,
+    BRANCHING_GUIDANCE_EXAMPLE,
     CHURN_NEUTRAL_REPLY,
     COURT_DOC_REQUEST_REPLY,
     FEE_GUIDE_TEXT,
@@ -149,6 +152,61 @@ class TestForbiddenWords(unittest.TestCase):
                     _result(reply=reply, category="手続きの一般的な流れ"), [], "一般論を教えてください"
                 )
                 self.assertTrue(g.can_auto_send)
+
+    def test_dunning_instruction_full_text_is_allowlisted(self):
+        """受任後の督促状定型指示（但し書き込みの全文）は許可リストで通る"""
+        reply = f"ご安心ください。{APPROVED_DUNNING_INSTRUCTION}"
+        self.assertEqual(find_forbidden_words(reply), [])
+        g = apply_server_guards(
+            _result(reply=reply, category="手続きの一般的な流れ"), [], "督促状は無視していいですか"
+        )
+        self.assertTrue(g.can_auto_send)
+
+    def test_dunning_instruction_without_court_proviso_demotes(self):
+        """裁判所書類の但し書きを省略した部分利用は「無視して」が残り降格される"""
+        reply = "手続き中、業者からの督促状は無視していただいて問題ありません。"
+        hits = find_forbidden_words(reply)
+        self.assertTrue(hits, "但し書きなしの部分利用は禁止語として検出されるべき")
+        g = apply_server_guards(
+            _result(reply=reply, category="手続きの一般的な流れ"), [], "督促状は無視していいですか"
+        )
+        self.assertFalse(g.can_auto_send)
+
+    def test_branching_guidance_contains_no_directives(self):
+        """受任前向けの判断分岐提示型の標準文面に行動指示語・断定語が含まれない
+        （許可リストに依存せず、生パターン照合でも検出ゼロであることを固定）"""
+        for label, pattern in _FORBIDDEN_PATTERNS:
+            self.assertIsNone(
+                pattern.search(BRANCHING_GUIDANCE_EXAMPLE),
+                f"{label} が判断分岐提示型の文面に含まれています",
+            )
+        g = apply_server_guards(
+            _result(reply=BRANCHING_GUIDANCE_EXAMPLE, category="手続きの一般的な流れ"),
+            [],
+            "督促を無視してもいいですか",
+        )
+        self.assertTrue(g.can_auto_send)
+
+    def test_negated_assertive_words_are_allowed(self):
+        """「絶対に大丈夫とは言えません」等の留保付き応答は許可される
+        （断定要求への留保付き自動送信の緩和・2026-07-03 弁護士指示）"""
+        for reply in [
+            "可能性は高いですが、絶対に大丈夫とは言えません。",
+            "確実に消滅するとは言い切れませんが、可能性は高い状況です。",
+            "間違いなく成立するとは断言できませんが、前向きに進められます。",
+        ]:
+            with self.subTest(reply=reply):
+                self.assertEqual(find_forbidden_words(reply), [])
+
+    def test_affirmative_assertive_words_still_demote(self):
+        """否定を伴わない断定語は引き続き降格される"""
+        for reply in [
+            "絶対に大丈夫です。",
+            "確実に時効になります。",
+            "間違いなく成立します。",
+        ]:
+            with self.subTest(reply=reply):
+                self.assertTrue(find_forbidden_words(reply), f"検出されるべき: {reply}")
 
     def test_affirmative_kanarazu_forms_still_demote(self):
         """「必ず消滅します」等の肯定断定形は引き続き降格される"""
