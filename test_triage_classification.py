@@ -299,6 +299,30 @@ TRIAGE_CASES = [
 ]
 
 
+def select_cases(cases: list[dict], scope: str, diff_sources: str = "") -> list[dict]:
+    """実行対象ケースを選択する（API消費削減・2026-07-03 弁護士承認済み）。
+
+    scope="full": 全ケース（マージ直前と週次cronで実行）
+    scope="diff": 差分のみ。TRIAGE_DIFF_SOURCES（カンマ区切りのsourceタグ）で
+                  指定されたケース。未指定時はケース一覧の最後のsourceタグ
+                  （=最新ラウンド）を自動選択する。
+    """
+    if scope != "diff":
+        return cases
+    if diff_sources:
+        targets = {s.strip() for s in diff_sources.split(",") if s.strip()}
+    else:
+        targets = {cases[-1]["source"]}
+    selected = [c for c in cases if c["source"] in targets]
+    if not selected:
+        raise ValueError(f"TRIAGE_DIFF_SOURCES={diff_sources!r} に該当するケースがありません")
+    return selected
+
+
+TRIAGE_SCOPE = os.environ.get("TRIAGE_SCOPE", "full").lower()
+TRIAGE_DIFF_SOURCES = os.environ.get("TRIAGE_DIFF_SOURCES", "")
+
+
 def _build_system_prompt(status: str) -> str:
     return build_system_prompt(
         status=status,
@@ -342,6 +366,33 @@ async def _classify_case(sem: asyncio.Semaphore, case: dict) -> dict:
     }
 
 
+class TestSelectCases(unittest.TestCase):
+    """差分実行モードのケース選択ロジック（オフライン・APIキー不要）"""
+
+    _CASES = [
+        {"message": "a", "expected": "auto", "source": "synthetic"},
+        {"message": "b", "expected": "auto", "source": "v2"},
+        {"message": "c", "expected": "queue", "source": "faq3"},
+        {"message": "d", "expected": "auto", "source": "faq3"},
+    ]
+
+    def test_full_scope_returns_all(self):
+        self.assertEqual(len(select_cases(self._CASES, "full")), 4)
+
+    def test_diff_scope_defaults_to_latest_source(self):
+        """TRIAGE_DIFF_SOURCES 未指定の diff は最後のsourceタグ（最新ラウンド）を選ぶ"""
+        selected = select_cases(self._CASES, "diff")
+        self.assertEqual([c["message"] for c in selected], ["c", "d"])
+
+    def test_diff_scope_with_explicit_sources(self):
+        selected = select_cases(self._CASES, "diff", "v2,synthetic")
+        self.assertEqual([c["message"] for c in selected], ["a", "b"])
+
+    def test_diff_scope_with_unknown_source_raises(self):
+        with self.assertRaises(ValueError):
+            select_cases(self._CASES, "diff", "no-such-tag")
+
+
 @unittest.skipUnless(
     os.environ.get("ANTHROPIC_API_KEY"),
     "ANTHROPIC_API_KEY が未設定（railway run python -m pytest ... で実行すること）",
@@ -355,13 +406,20 @@ class TestTriageClassification(unittest.TestCase):
         self.assertLessEqual(len(TRIAGE_CASES), 130)
 
     def test_classification_accuracy(self):
-        """分類一致率が 95% 以上であること（Claude API を実際に呼ぶ）"""
-        results = asyncio.run(self._run_all())
+        """分類一致率が 95% 以上であること（Claude API を実際に呼ぶ）
+
+        TRIAGE_SCOPE=diff で差分ケースのみ実行（開発中の既定運用）。
+        全量は「マージ直前の1回」と「週次cron（.github/workflows/weekly-triage.yml）」
+        に限定する（API消費削減・2026-07-03 弁護士承認済みの運用ルール）。
+        """
+        cases = select_cases(TRIAGE_CASES, TRIAGE_SCOPE, TRIAGE_DIFF_SOURCES)
+        results = asyncio.run(self._run_all(cases))
 
         mismatches = [r for r in results if not r["ok"]]
         accuracy = (len(results) - len(mismatches)) / len(results)
 
-        print(f"\n=== トリアージ分類結果: {len(results) - len(mismatches)}/{len(results)} "
+        scope_note = "全量" if TRIAGE_SCOPE != "diff" else f"差分（{TRIAGE_DIFF_SOURCES or '最新ラウンド自動選択'}）"
+        print(f"\n=== トリアージ分類結果 [{scope_note}]: {len(results) - len(mismatches)}/{len(results)} "
               f"一致率 {accuracy:.1%}（閾値 {PASS_THRESHOLD:.0%}） ===")
         for r in mismatches:
             _safe_print(f"  [不一致] 期待={r['expected']}/{r.get('expected_notice', '-')} "
@@ -377,11 +435,16 @@ class TestTriageClassification(unittest.TestCase):
             "モデル入替の場合はプロンプト調整またはモデル再選定が必要です。",
         )
 
-    async def _run_all(self) -> list[dict]:
+    async def _run_all(self, cases: list[dict]) -> list[dict]:
         sem = asyncio.Semaphore(MAX_CONCURRENCY)
-        return list(await asyncio.gather(
-            *(_classify_case(sem, case) for case in TRIAGE_CASES)
+        # ウォームアップ: 先頭1件を単独で実行してプロンプトキャッシュを作成し、
+        # 以降の並列呼び出しをキャッシュヒットにする（並列先頭のキャッシュ
+        # ミス競合を避ける。書き込みは1回で済む）
+        first = await _classify_case(sem, cases[0])
+        rest = list(await asyncio.gather(
+            *(_classify_case(sem, case) for case in cases[1:])
         ))
+        return [first] + rest
 
 
 if __name__ == "__main__":

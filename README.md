@@ -153,6 +153,29 @@ AUTO_SEND_CATEGORIES = {
 python -m pytest test_server_guards.py -v
 ```
 
+### トリアージ実測のAPI消費削減運用（2026-07-03 弁護士承認済み）
+
+実測1回は入力約72万トークン（プロンプト約6千トークン×120ケース）消費する。
+以下の3点でコストを抑える:
+
+1. **プロンプトキャッシュ**: `_call_compose_reply()` で有効化済み。同一プロンプトの
+   2回目以降は入力単価が約1/10（本番の同一顧客の連続メッセージにも効く）
+2. **差分実行モード**: 開発中の実測は差分のみ実行する
+   ```bash
+   TRIAGE_SCOPE=diff railway run python -m pytest test_triage_classification.py -v -s
+   # 対象ラウンドを明示する場合: TRIAGE_DIFF_SOURCES=faq3,v2
+   # （未指定時はケース一覧の最後のsourceタグ=最新ラウンドを自動選択）
+   ```
+   **全量（TRIAGE_SCOPE未指定）はマージ直前の1回と週次cronに限定**
+3. **週次cron**: `.github/workflows/weekly-triage.yml` が毎週月曜 03:00 JST に
+   全量を実行（失敗時は GitHub から通知メール）。有効化にはリポジトリの
+   Actions Secrets に `ANTHROPIC_API_KEY_DEV`（テスト専用Workspaceのキー）の
+   登録が必要。**本番キーは登録しないこと**
+4. **テスト専用キー**: ローカル実測は `railway run`（本番キー）ではなく、
+   リポジトリ直下の `.env.test`（gitignore済み）に
+   `ANTHROPIC_API_KEY=<テスト専用Workspaceのキー>` を置いて
+   `python -m pytest test_triage_classification.py -v -s` で実行するのが推奨
+
 ### FAQ・応答型（システムプロンプト内の弁護士確定知識）
 
 顧客対応Claudeの標準回答は `chat_responder.py` のシステムプロンプト
@@ -200,7 +223,7 @@ Anthropic からモデル廃止（deprecation / retirement）通知メールが�
 
 3. **回帰テストを実行し、合格を確認**
    ```bash
-   railway run python -m pytest test_triage_classification.py -v -s   # 分類一致率 95% 以上で合格
+   railway run python -m pytest test_triage_classification.py -v -s   # 分類一致率 95% 以上で合格（モデル入替時は全量で）
    python -m pytest test_server_guards.py -v                           # サーバー側ガード（オフライン）
    python -m pytest test_cloudsign_webhook.py -v                       # 既存回帰テスト
    railway run python daily_healthcheck.py                             # 新モデルIDの有効性確認
