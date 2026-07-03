@@ -137,9 +137,24 @@ class TestForbiddenWords(unittest.TestCase):
         self.assertTrue(g.can_auto_send)
 
     def test_negated_directive_is_not_flagged(self):
-        """「無視してはいけません」のような打ち消しは禁止語にしない"""
-        reply = "裁判所からの書類は無視してはいけません。放置してはいけない書類です。"
-        self.assertEqual(find_forbidden_words(reply), [])
+        """「無視してはいけません」「無視してよいわけではありません」のような
+        打ち消しは禁止語にしない（断定語の否定形除外と同じ原則）"""
+        for reply in [
+            "裁判所からの書類は無視してはいけません。放置してはいけない書類です。",
+            "だからといって無視してよいわけではありません。",
+            "督促を放置していいわけではありませんので、ご相談ください。",
+        ]:
+            with self.subTest(reply=reply):
+                self.assertEqual(find_forbidden_words(reply), [])
+
+    def test_affirmative_directive_still_demotes(self):
+        """打ち消しを伴わない「無視して/放置して」は引き続き降格される"""
+        for reply in [
+            "督促は無視して大丈夫です。",
+            "その通知は放置してください。",
+        ]:
+            with self.subTest(reply=reply):
+                self.assertTrue(find_forbidden_words(reply), f"検出されるべき: {reply}")
 
     def test_negated_kanarazu_forms_are_allowed(self):
         """「必ず消滅するとは保証できない」等の否定形は許可される

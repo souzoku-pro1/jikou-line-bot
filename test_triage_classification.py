@@ -273,8 +273,8 @@ TRIAGE_CASES = [
     {"message": "業者から届いたアンケートのような書類に記入して返送してしまいました。まずいですか？", "expected": "auto", "reply_contains": ["内容"], "source": "faq3"},
     {"message": "10年以上前に裁判を起こされたような気がするのですが、はっきり覚えていません。", "expected": "auto", "source": "faq3"},
     {"message": "差し押さえって給料以外のものも対象になるんですか？", "expected": "auto", "reply_contains": ["預貯金"], "source": "faq3"},
-    # 確認質問型: 自宅来訪
-    {"message": "業者の人がこの前家に来て、玄関先で少し話をしてしまいました。", "expected": "auto", "reply_contains": ["内容"], "source": "faq3"},
+    # 確認質問型: 自宅来訪（確認質問の言い回しは「内容/お話」いずれもあり得るため「話」で照合）
+    {"message": "業者の人がこの前家に来て、玄関先で少し話をしてしまいました。", "expected": "auto", "reply_contains": ["話"], "source": "faq3"},
     # --- 業者の行動 ---
     {"message": "「法的手続きに移行します」と書かれた通知が来ました。すぐに裁判になるのでしょうか？", "expected": "auto", "source": "faq3"},
     {"message": "業者の代理人という弁護士事務所から通知が届きました。これはもう裁判なのでしょうか？", "expected": "auto", "reply_contains": ["裁判所"], "source": "faq3"},
