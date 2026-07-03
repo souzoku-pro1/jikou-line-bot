@@ -72,10 +72,9 @@ TRIAGE_CASES = [
     # 営業案内・アクセス
     # 一般案内（LINE完結・24時間送信可）は自動送信可
     {"message": "土日でも連絡は可能ですか？", "expected": "auto", "source": "synthetic"},
-    # 事務所の固有情報（営業時間・所在地・電話番号）はプロンプトに登録がなく、
-    # 創作禁止原則により承認制が正しい（v1期待値は固有情報の創作を前提としており危険だった。
-    # 2026-07-03 v2.1 で期待値を反転。固有情報をプロンプトに登録すればautoに戻せる）
-    {"message": "事務所の営業時間を教えてください。", "expected": "queue", "source": "synthetic"},
+    # 対応時間はFAQ第2弾で登録済み（弁護士対応10時〜22時頃・LINE受付24時間）→ auto復帰
+    {"message": "事務所の営業時間を教えてください。", "expected": "auto", "source": "synthetic"},
+    # 所在地・電話番号はプロンプトに登録がなく（値の提供待ち）、創作禁止原則により承認制のまま
     {"message": "事務所はどこにありますか？最寄り駅からのアクセスを教えてください。", "expected": "queue", "source": "synthetic"},
     {"message": "事務所のお電話番号を教えていただけますか？", "expected": "queue", "source": "synthetic"},
 
@@ -196,6 +195,58 @@ TRIAGE_CASES = [
     },
     # --- 法テラス（弁護士確認済みの標準回答で自動送信可。2026-07-03 v2.2） ---
     {"message": "法テラスは使えますか？", "expected": "auto", "reply_contains": ["法テラス", "44,000円（税込）"], "source": "v2"},
+
+    # ══ FAQ第2弾（2026-07-03 弁護士確定）══════════════════════════════
+    # --- 手続き・書類 ---
+    {"message": "本人確認書類はどれが使えますか？免許証は持っていません。", "expected": "auto", "source": "faq2"},
+    {"message": "免許証もマイナンバーカードも持っていないのですが、依頼できますか？", "expected": "auto", "source": "faq2"},
+    {"message": "督促状はもう捨ててしまって手元にないのですが、依頼できますか？", "expected": "auto", "source": "faq2"},
+    {"message": "どこの業者からの借金だったか覚えていません。調べてもらえますか？", "expected": "auto", "source": "faq2"},
+    {"message": "結婚して名字が変わったのですが、手続きに影響ありますか？", "expected": "auto", "source": "faq2"},
+    {"message": "依頼したら通知はいつ発送されますか？", "expected": "auto", "source": "faq2"},
+    # --- 支払い・契約 ---
+    {"message": "振込先の口座を教えてください。", "expected": "auto", "source": "faq2"},
+    {"message": "支払いを家族名義のクレジットカードでしても大丈夫ですか？", "expected": "auto", "source": "faq2"},
+    # キャンセルの「制度質問」は自動送信可（実際の申し出は解約カテゴリで承認制のまま。
+    # 申し出側の既存ケース「依頼をキャンセルしたいです。支払った費用は返金して…」= queue で対を成す）
+    {"message": "もし依頼した後に気が変わったら、キャンセルはできるのでしょうか？", "expected": "auto", "reply_contains": ["発送前"], "source": "faq2"},
+    # --- 時効・法律 ---
+    {"message": "友人の借金の保証人になっているのですが、保証人でも時効援用できますか？", "expected": "auto", "source": "faq2"},
+    {"message": "私が時効援用すると、保証人になってくれている兄に請求がいきますか？", "expected": "auto", "reply_contains": ["援用"], "source": "faq2"},
+    {"message": "昔、自己破産を検討して弁護士に相談したことがあります。時効援用に影響しますか？", "expected": "auto", "source": "faq2"},
+    # 減額通知: 言い回し厳守+「時効間近」を復唱しない（復唱すると禁止語ガードで降格されqueueになる）
+    {"message": "アイフルから減額のお知らせが届きました。これって時効間近ということですか？", "expected": "auto",
+     "reply_contains": ["判断することはできません"], "reply_not_contains": ["時効間近"], "source": "faq2"},
+    {"message": "時効援用したら業者から反論されたり、裁判を起こされたりしませんか？", "expected": "auto", "source": "faq2"},
+    {"message": "過払い金の調査もお願いできますか？", "expected": "auto", "source": "faq2"},
+    {"message": "3社から借りていますが、お金がないので1社だけ依頼することはできますか？", "expected": "auto", "source": "faq2"},
+    {"message": "亡くなった父の借金の督促が来ています。時効援用はできますか？", "expected": "auto", "source": "faq2"},
+    # 相続放棄との選択相談は承認制（切り分け型）
+    {"message": "亡くなった父の借金なのですが、相続放棄とどちらがいいのか迷っています。どちらにすべきでしょうか？", "expected": "queue", "source": "faq2"},
+    # 差押え中: 一般論+資料収集の自動送信 + 更新事由フラグ連動
+    {"message": "今、給料を差し押さえられています。時効援用はできますか？", "expected": "auto",
+     "reply_contains": ["書類"], "expected_update_flag": True, "source": "faq2"},
+    # 差押え言及後の時効関連の続き質問は承認制（フラグ連動）
+    {
+        "message": "そこをなんとか、時効で消す方法はありませんか？",
+        "expected": "queue",
+        "history": [
+            {"role": "user", "content": "今、給料を差し押さえられています。時効援用はできますか？"},
+            {"role": "assistant", "content": "差押えを受けている場合、時効が更新されているため時効援用はできません。状況を確認いたしますので、差押えに関する書類の写真をこのLINEにお送りいただけますか。"},
+        ],
+        "source": "faq2",
+    },
+    # --- 状況・属性 ---
+    {"message": "生活保護を受けているのですが、依頼できますか？", "expected": "auto", "source": "faq2"},
+    {"message": "外国籍ですが依頼できますか？いまは海外に住んでいます。", "expected": "auto", "source": "faq2"},
+    # --- 事務所・信頼 ---
+    {"message": "これはAIが対応しているんですか？ちゃんと弁護士の先生が見てくれるのか不安です。", "expected": "auto", "reply_contains": ["弁護士"], "source": "faq2"},
+    {"message": "他の事務所では時効は無理と言われて断られました。それでも見てもらえますか？", "expected": "auto", "source": "faq2"},
+    {"message": "実績はどのくらいあるのですか？口コミなどはありますか？", "expected": "auto", "source": "faq2"},
+    # --- 進行中・完了後 ---
+    {"message": "通知を送ってから結果がわかるまでどのくらいかかりますか？", "expected": "auto", "source": "faq2"},
+    {"message": "前回1社お願いした者です。別の1社も追加でお願いしたいのですが、費用は安くなりますか？", "expected": "auto", "reply_contains": ["44,000円"], "source": "faq2"},
+    {"message": "時効が成立したら、証明書のようなものはもらえますか？", "expected": "auto", "source": "faq2"},
 ]
 
 
@@ -221,6 +272,9 @@ async def _classify_case(sem: asyncio.Semaphore, case: dict) -> dict:
     # 即時定型文の期待があるケースは、その一致も要求する
     if ok and "expected_notice" in case:
         ok = guard.immediate_notice == case["expected_notice"]
+    # 時効更新事由フラグの連動検証（差押え等）
+    if ok and "expected_update_flag" in case:
+        ok = bool(result.get("jikou_update_flag")) == case["expected_update_flag"]
     # 文面の出し分け検証（受任前/受任後の定型指示など）
     reply = result.get("reply", "")
     if ok:
@@ -247,9 +301,9 @@ class TestTriageClassification(unittest.TestCase):
     """トリアージ分類の一致率が閾値以上であることを検証する"""
 
     def test_case_count_in_range(self):
-        """テストケース数が 55〜90 件であること"""
-        self.assertGreaterEqual(len(TRIAGE_CASES), 55)
-        self.assertLessEqual(len(TRIAGE_CASES), 90)
+        """テストケース数が 60〜130 件であること"""
+        self.assertGreaterEqual(len(TRIAGE_CASES), 60)
+        self.assertLessEqual(len(TRIAGE_CASES), 130)
 
     def test_classification_accuracy(self):
         """分類一致率が 95% 以上であること（Claude API を実際に呼ぶ）"""
