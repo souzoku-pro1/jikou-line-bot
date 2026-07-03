@@ -6,3 +6,4 @@ python-multipart
 python-docx
 requests
 stripe
+reportlab

@@ -126,15 +126,22 @@ P7 仕上げ（運用ドキュメント・全体回帰）
   返送期限の自動設定は T1-4 で追加。**kintone 側の Webhook 登録と HUB_WEBHOOK_TOKEN の
   Railway 登録はデプロイ後の人の作業**（App 30 作成手順書 §4 参照）
 
-#### T1-3 `hub/address_label.py`（reportlab 座標印字エンジン）
+#### T1-3 `hub/address_label.py`（reportlab 座標印字エンジン）（**実施済み 2026-07-03**）
 - 参照: 03 §7
 - 作業: requirements.txt に reportlab 追加、フォント同梱、render_overlay（grid モード込み）／
   render_letterpack_label／render_label_sheet
 - 完了条件:
-  - [ ] `test_hub_address_label.py` 新規（PDF 生成スモーク・ページサイズ・オフセット環境変数・
-        長文縮小）PASS
-  - [ ] `/health` の依存チェックに reportlab+フォントを追加し OK
-  - [ ] 既存テスト全 PASS
+  - [x] `test_hub_address_label.py` 新規（PDF 生成スモーク・ページサイズ・オフセット環境変数・
+        長文縮小）PASS（18件・面付け複数ページ・返信用ラベル・フォント冪等含む）
+  - [x] `/health` の依存チェックに reportlab+フォントを追加し OK
+  - [x] 既存テスト全 PASS（224件）
+- 実装ノート: IPAex ゴシックを assets/fonts/ に同梱（IPA Font License v1.0・ライセンス文書
+  同梱・欠損時は reportlab 内蔵 CID フォントにフォールバックし /health に表示）。
+  PDF は invariant モードで生成（同一入力→同一バイト列・テスト決定性）。
+  返信用ラベルの事務所情報は env（OFFICE_NAME/OFFICE_ZIP/OFFICE_ADDRESS/OFFICE_TEL・
+  config.get_office_info()）。**未設定だと render_reply_label が ValueError**
+  → Railway への登録が M1/M4 稼働前の人の作業。
+  ローカルの create_*.py（Meiryo 参照）は Windows 専用のため流用せず同梱方式を採用
 
 #### T1-4 返送期限監視ジョブ（**実施済み 2026-07-03**）
 - 参照: 03 §9、04 §1・§4
