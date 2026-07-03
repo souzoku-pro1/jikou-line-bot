@@ -151,6 +151,8 @@ def make_shipping_record(**over):
         "$id": {"value": "9"},
         "ユニット種別": {"value": "時効援用"},
         "宛先名": {"value": "山田太郎"},
+        "宛先郵便番号": {"value": "332-0001"},
+        "宛先住所": {"value": "埼玉県川口市朝日1-2-3"},
         "顧客名表示用": {"value": "山田太郎"},
         "件名": {"value": "委任契約書の送付"},
         "本文_特記事項": {"value": "同封の返信用封筒をご利用ください。"},
@@ -226,6 +228,28 @@ class TestBuildDocx(unittest.TestCase):
                                    顧客名表示用={"value": "山田太郎"})
         out = self._run(rec)
         self.assertIn("（ご依頼者：山田太郎　様）", _all_text(out))
+
+    def test_recipient_block_is_three_lines(self):
+        """宛先ブロック: 〒（1行目）／住所（2行目）／宛名+様（3行目）の縦積み"""
+        out = self._run(make_shipping_record())
+        doc = Document(io.BytesIO(out))
+        addr_para = next(p for p in doc.paragraphs if "〒332-0001" in p.text)
+        self.assertIn("<w:br", addr_para._p.xml,
+                      "〒と住所の間に Word の改行がある（横並びでない）")
+        self.assertIn("埼玉県川口市朝日1-2-3", addr_para.text)
+        self.assertNotIn("〒332-0001　埼玉県", addr_para.text.replace("\n", ""),
+                         "旧レイアウト（全角スペースの横並び）になっていない")
+        name_para = next(p for p in doc.paragraphs if "山田太郎" in p.text and "様" in p.text)
+        self.assertIsNot(addr_para, name_para, "宛名は別段落（3行目）")
+
+    def test_recipient_block_without_zip(self):
+        """郵便番号が空なら 〒 の行を出さない（住所から始まる）"""
+        out = self._run(make_shipping_record(宛先郵便番号={"value": ""}))
+        doc = Document(io.BytesIO(out))
+        text = "\n".join(p.text for p in doc.paragraphs)
+        self.assertNotIn("〒\n", text)
+        addr_para = next(p for p in doc.paragraphs if "埼玉県川口市朝日1-2-3" in p.text)
+        self.assertNotIn("〒", addr_para.text)
 
     def test_missing_office_info_raises(self):
         empty = {"OFFICE_NAME": "", "OFFICE_ADDRESS": ""}

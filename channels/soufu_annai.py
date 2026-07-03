@@ -241,9 +241,10 @@ async def build_soufu_annai_docx(record: dict, blocks: list[dict] | None = None,
     if tokki is None:
         tokki = record.get("本文_特記事項", {}).get("value", "")
 
+    # 宛先ブロックは3行の縦積み: 〒（1行目）→ 住所（2行目）→ 宛名+様（3行目・テンプレ側）
     zip_code = (record.get("宛先郵便番号", {}).get("value") or "").strip()
     address = (record.get("宛先住所", {}).get("value") or "").strip()
-    recipient_addr = f"〒{zip_code}　{address}" if zip_code else address
+    recipient_addr = f"〒{zip_code}\n{address}" if zip_code else address
 
     template = resolve_template(unit, DOC_TYPE)
     data = {
