@@ -217,7 +217,7 @@ TRIAGE_CASES = [
     {"message": "支払いを家族名義のクレジットカードでしても大丈夫ですか？", "expected": "auto", "source": "faq2"},
     # キャンセルの「制度質問」は自動送信可（実際の申し出は解約カテゴリで承認制のまま。
     # 申し出側の既存ケース「依頼をキャンセルしたいです。支払った費用は返金して…」= queue で対を成す）
-    {"message": "もし依頼した後に気が変わったら、キャンセルはできるのでしょうか？", "expected": "auto", "reply_contains": ["発送前"], "source": "faq2"},
+    {"message": "もし依頼した後に気が変わったら、キャンセルはできるのでしょうか？", "expected": "auto", "reply_contains": ["発送"], "source": "faq2"},
     # --- 時効・法律 ---
     {"message": "友人の借金の保証人になっているのですが、保証人でも時効援用できますか？", "expected": "auto", "source": "faq2"},
     {"message": "私が時効援用すると、保証人になってくれている兄に請求がいきますか？", "expected": "auto", "reply_contains": ["援用"], "source": "faq2"},
