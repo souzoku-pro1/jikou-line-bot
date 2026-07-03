@@ -178,8 +178,13 @@ async def _handle_dispatch(record: dict) -> None:
     extra["発送日時"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     await approval.transition(APP_SHIPPING, record_id, "発送処理中", "発送済", extra)
     if adapter.needs_return:
-        # 返送期限の自動設定は T1-4（返送期限監視ジョブ）で追加する
-        await approval.transition(APP_SHIPPING, record_id, "発送済", "返送待ち")
+        # 返送期限を自動設定（T1-4。日数はユニット設定・監視は return_deadline_check）
+        from hub.return_deadline import compute_deadline
+        unit = record.get("ユニット種別", {}).get("value", "")
+        await approval.transition(
+            APP_SHIPPING, record_id, "発送済", "返送待ち",
+            extra_fields={"返送期限": compute_deadline(unit)},
+        )
 
 
 async def _handle_reprocess(record: dict) -> None:

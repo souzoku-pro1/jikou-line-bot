@@ -136,13 +136,20 @@ P7 仕上げ（運用ドキュメント・全体回帰）
   - [ ] `/health` の依存チェックに reportlab+フォントを追加し OK
   - [ ] 既存テスト全 PASS
 
-#### T1-4 返送期限監視ジョブ
+#### T1-4 返送期限監視ジョブ（**実施済み 2026-07-03**）
 - 参照: 03 §9、04 §1・§4
 - 作業: `return_deadline_check` を register_daily に登録（返送期限超過 → LINE 警報・状態維持）、
   発送済→返送待ち遷移時の期限自動設定
 - 完了条件:
-  - [ ] `test_return_deadline.py` 新規（日付固定モック・超過/非超過/警報文言）PASS
-  - [ ] 既存テスト全 PASS
+  - [x] `test_return_deadline.py` 新規（日付固定モック・超過/非超過/警報文言）PASS
+        （期限当日は非超過・超過1日・期限未設定/不正値の通知・複数件1通集約・登録8:00 JST）
+  - [x] 既存テスト全 PASS（203件）
+- 実装ノート: 期限未設定の返送待ちレコードも警報に含める（設定漏れ=永遠に警報されない
+  事故の防止）。ジョブは毎日 8:00 JST（RETURN_DEADLINE_HOUR_JST で変更・
+  RETURN_DEADLINE_DISABLED=1 で停止）。返送期限の自動設定は
+  UNIT_CONFIG.return_deadline_days（既定21日）。
+  付随修正: test_hub_dispatch のダミー ANTHROPIC_API_KEY が triage テストの
+  skipUnless を誤解除する問題を修正（import 後にダミーのみ除去）
 
 ### P2: M4 送付案内（最初のチャネル）
 

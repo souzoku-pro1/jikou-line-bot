@@ -12,10 +12,14 @@ import unittest
 from unittest.mock import AsyncMock, patch
 
 # main import 前に環境変数を差し込む（既存テストと同じ流儀）
+# ANTHROPIC_API_KEY は main の import にのみ必要。ダミーを環境に残すと
+# test_triage_classification の skipUnless ガードが誤解除されるため、
+# import 後に「自分が入れたダミーの場合だけ」取り除く（実キーは温存）。
+_DUMMY_ANTHROPIC_KEY = "dummy_key_for_import_only"
+os.environ.setdefault("ANTHROPIC_API_KEY", _DUMMY_ANTHROPIC_KEY)
 os.environ.update({
     "LINE_CHANNEL_SECRET": "dummy_secret",
     "LINE_CHANNEL_ACCESS_TOKEN": "dummy_token",
-    "ANTHROPIC_API_KEY": "dummy_key",
     "KINTONE_SUBDOMAIN": "testsub",
     "KINTONE_APP_ID": "21",
     "KINTONE_API_TOKEN": "dummy",
@@ -38,6 +42,9 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 import channels  # noqa: E402
 import main  # noqa: E402
+
+if os.environ.get("ANTHROPIC_API_KEY") == _DUMMY_ANTHROPIC_KEY:
+    del os.environ["ANTHROPIC_API_KEY"]  # skip ガードの誤解除防止（上記コメント参照）
 from channels.base import Artifact, ChannelAdapter, DispatchResult, PrepareResult  # noqa: E402
 from hub import kintone  # noqa: E402
 

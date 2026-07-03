@@ -44,7 +44,9 @@ _APP_APPROVAL = hub_kintone.KintoneApp("App 29 (承認キュー)", "APP_APPROVAL
 
 @app.on_event("startup")
 async def _on_startup():
-    """日次死活監視スケジューラを起動（毎日 HEALTHCHECK_HOUR_JST 時に実行）"""
+    """定期ジョブの登録・起動（日次死活監視 7:00 / 返送期限監視 8:00 JST）"""
+    from hub.return_deadline import register_return_deadline_job
+    register_return_deadline_job()
     start_healthcheck_scheduler()
 
 
