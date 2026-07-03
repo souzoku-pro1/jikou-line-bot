@@ -45,8 +45,10 @@ def muni(name="川口市", address="埼玉県川口市青木2-1-1", zip_="332-86
 
 
 def shipping_record(items=None, municipality=None, **over):
+    # 生年月日は T3-2 追加要件（様式1で必須）に伴いフィクスチャへ追加（2026-07-03）
     data = {"request_items": items or [{"type": "戸籍謄本", "count": 1}],
-            "target": {"対象者": "山田太郎", "本籍": "埼玉県川口市…"},
+            "target": {"対象者": "山田太郎", "本籍": "埼玉県川口市…",
+                       "生年月日": "昭和25年3月15日"},
             "purpose": "消滅時効援用通知書の送付先調査のため"}
     if municipality:
         data["municipality"] = municipality
@@ -175,7 +177,9 @@ class TestPrepare(unittest.IsolatedAsyncioTestCase):
         rec = shipping_record(items=items, 宛先名={"value": ""},
                               チャネル固有データ={"value": json.dumps(
                                   {"request_items": items, "municipality": "川口市",
-                                   "target": {"対象者": "山田太郎"}, "purpose": "調査"},
+                                   "target": {"対象者": "山田太郎",
+                                              "生年月日": "昭和25年3月15日"},
+                                   "purpose": "調査"},
                                   ensure_ascii=False)})
         with patch("hub.kintone.search_records", new=AsyncMock(return_value=[muni()])):
             result = await ShokumuSeikyuAdapter().prepare(rec)

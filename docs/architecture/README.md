@@ -15,6 +15,7 @@
 | 2 | [02-kintone-design.md](02-kintone-design.md) | 新設 kintone アプリのフィールド定義、既存 App 21/28/29 との関係 |
 | 3 | [03-common-components.md](03-common-components.md) | 共通ライブラリ `hub/` の構成（宛名ラベル・docx・承認・警報 等） |
 | 4 | [04-module-01-shokumu-seikyu.md](04-module-01-shokumu-seikyu.md) | モジュール1: 職務上請求 |
+| 4a | [04a-shokumu-seikyu-calibration.md](04a-shokumu-seikyu-calibration.md) | 統一用紙の実機キャリブレーション手順書（T3-2・オーナーがプリンタの前でやる手順） |
 | 5 | [05-module-02-enaishomei-csv.md](05-module-02-enaishomei-csv.md) | モジュール2: e内容証明 差込差出しCSV |
 | 6 | [06-module-03-fax.md](06-module-03-fax.md) | モジュール3: FAX自動送信 |
 | 6a | [06a-fax-provider.md](06a-fax-provider.md) | FAXプロバイダ選定（T6-1 実施済み・推奨: InterFAX） |
