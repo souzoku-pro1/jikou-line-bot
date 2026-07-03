@@ -111,10 +111,42 @@ AUTO_SEND_CATEGORIES = {
     "費用の定型案内",
     "進捗の事実回答",
     "営業案内・アクセス",
+    "時効見立て_条件付き",   # v2: 一般論の断言 / 条件付きの個別見立て（留保文言必須）
 }
 ```
 
 変更後は feature ブランチでコミット → PR → main マージ → Railway 自動デプロイ。
+
+### サーバー側ガード（応答方針v2・2026-07 追加）
+
+自動送信の前に `chat_responder.apply_server_guards()` がコードでチェックし、
+違反時は承認キューに降格する（降格理由は App 29 の「判断理由」に併記される）:
+
+- **禁止語照合**: 断定語（確実に/絶対に/間違いなく/必ず消滅 等）・
+  行動指示語（払わないで/無視して/連絡しないで/放置して/出ないで 等）。
+  例外として、受任後顧客への電話対応の定型指示（弁護士確認済み文言
+  `APPROVED_PHONE_INSTRUCTION`）は許可リストで通す。
+- **費用の定型案内**: 必須文言（44,000円/前払い/分割払い/不成立時の費用発生）が
+  欠けた送信文は降格。固定文は `FEE_GUIDE_TEXT`。
+  ※ 税込/税抜の表記はLPの料金表と一致させること（コード内 TODO 参照）。
+- **時効見立て_条件付き**: 留保文言（一般論のただし書き or 個別見立ての
+  条件+確定留保）が無い送信文、および時効更新事由の疑いフラグ
+  （`jikou_update_flag`）が立った顧客への時効見立ては降格。
+
+承認キュー行きの場合も、以下は定型文のみ即時送信される
+（`PENDING_REPLY` の代わり。実質回答は承認制のまま）:
+
+| ケース | 定型文 |
+|---|---|
+| 裁判所書類の第一報 | `COURT_DOC_REQUEST_REPLY`（全ページの写真送付依頼） |
+| 諦め・離脱の兆候 | `CHURN_NEUTRAL_REPLY`（中立引き止め文） |
+| 税金・個人からの借入れ | `OUT_OF_SCOPE_DEBT_REPLY`（個別案内の予告） |
+
+ガードの回帰テスト（オフライン・APIキー不要）:
+
+```bash
+python -m pytest test_server_guards.py -v
+```
 
 ### モデル廃止通知が来たときの運用手順
 
@@ -135,6 +167,7 @@ Anthropic からモデル廃止（deprecation / retirement）通知メールが�
 3. **回帰テストを実行し、合格を確認**
    ```bash
    railway run python -m pytest test_triage_classification.py -v -s   # 分類一致率 95% 以上で合格
+   python -m pytest test_server_guards.py -v                           # サーバー側ガード（オフライン）
    python -m pytest test_cloudsign_webhook.py -v                       # 既存回帰テスト
    railway run python daily_healthcheck.py                             # 新モデルIDの有効性確認
    ```
