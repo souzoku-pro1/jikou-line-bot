@@ -204,10 +204,10 @@ class TestPrepare(unittest.IsolatedAsyncioTestCase):
         result = await adapter.dispatch(shipping_record())
         self.assertTrue(result.manual_mailing)
 
-    async def test_adapter_not_registered_yet(self):
-        """T3-3 まで CHANNEL_REGISTRY に登録されない"""
+    async def test_adapter_registered(self):
+        """T3-3 で CHANNEL_REGISTRY に結線済み（T3-1 時点の「未登録」検証を反転・2026-07-03）"""
         import channels
-        self.assertIsNone(channels.get_adapter("職務上請求"))
+        self.assertIsInstance(channels.get_adapter("職務上請求"), ShokumuSeikyuAdapter)
 
 
 class TestDispatcherDeferred(unittest.IsolatedAsyncioTestCase):

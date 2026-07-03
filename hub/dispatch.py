@@ -15,6 +15,7 @@ POST /hub/dispatch?token=<HUB_WEBHOOK_TOKEN>
 このモジュールは 発送ステータス を直接書かない（遷移は hub/approval.transition のみ）。
 """
 
+import json
 import logging
 from datetime import datetime, timezone
 
@@ -64,6 +65,8 @@ async def process_dispatch(record_id: str) -> None:
             await _handle_prepare(record)
         elif status == "承認済":
             await _handle_dispatch(record)
+        elif status == "発送済":
+            await _handle_shipped(record)
         elif status == "要確認":
             await _handle_reprocess(record)
         else:
@@ -196,6 +199,51 @@ async def _handle_dispatch(record: dict) -> None:
             APP_SHIPPING, record_id, "発送済", "返送待ち",
             extra_fields={"返送期限": compute_deadline(unit)},
         )
+
+
+async def _handle_shipped(record: dict) -> None:
+    """発送済（物理郵送チャネルでは人が投函後に設定→Webhook 再発火）→ 返送待ち/完了（T3-3）
+
+    返送要否の判定（優先順）:
+      1. アダプタの needs_return（チャネル全体の性質。M1 職務上請求 = True）
+      2. チャネル固有データ の needs_return フラグ（レコード単位。M4 送付案内が
+         prepare 時に「返送要否=要の同封物があるか」を記録する・T2-2 実装ノート参照）
+    - 返送あり → 返送待ち へ遷移し 返送期限 を自動設定（発送日=今日 + ユニット既定日数。
+      compute_deadline: UNIT_CONFIG.return_deadline_days・既定21日）
+    - 返送なし → 完了 へ遷移（SERVER_TRANSITIONS「発送済→完了 返送想定なし」）
+
+    ── M5 受領パイプライン（将来の T4系）との接続点 ─────────────────────────
+    返送待ちの消込（返送待ち→完了）は**ここでは行わない**。スキャン受領（M5）が
+    受領文書を発送管理レコードへ突合して 完了 に遷移させる（設計 08 §3・04 §4）。
+    突合できず人の判断が要る場合、M5 は 要確認 に置き、_handle_reprocess が受ける。
+    期限超過の監視は return_deadline_check（T1-4・毎日 8:00 JST）が「返送待ち」を
+    チャネル横断で拾う（このチャネルのレコードも自動的に対象になる）。
+    """
+    adapter = await _adapter_for(record)
+    if adapter is None:
+        return
+    record_id = _rid(record)
+
+    needs_return = adapter.needs_return
+    if not needs_return:
+        try:
+            data = json.loads(record.get("チャネル固有データ", {}).get("value") or "{}")
+            needs_return = bool(data.get("needs_return"))
+        except ValueError:
+            needs_return = False  # prepare 通過済みで JSON が壊れているのは想定外。
+                                  # フラグ不明は「フラグなし」と同じ扱い（返送なし→完了）
+
+    if needs_return:
+        from hub.return_deadline import compute_deadline
+        unit = record.get("ユニット種別", {}).get("value", "")
+        await approval.transition(
+            APP_SHIPPING, record_id, "発送済", "返送待ち",
+            extra_fields={"返送期限": compute_deadline(unit)},
+        )
+        logger.info("shipped record=%s -> 返送待ち (needs_return)", record_id)
+    else:
+        await approval.transition(APP_SHIPPING, record_id, "発送済", "完了")
+        logger.info("shipped record=%s -> 完了 (返送想定なし)", record_id)
 
 
 async def _handle_reprocess(record: dict) -> None:

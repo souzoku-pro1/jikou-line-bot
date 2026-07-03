@@ -18,6 +18,8 @@ def get_adapter(channel_name: str) -> ChannelAdapter | None:
 
 
 # ── 実装済みチャネルの登録（T2-2〜） ─────────────────────────────────────────
+from channels.shokumu_seikyu import ShokumuSeikyuAdapter  # noqa: E402
 from channels.soufu_annai import SoufuAnnaiAdapter  # noqa: E402
 
-register(SoufuAnnaiAdapter())
+register(SoufuAnnaiAdapter())     # M4 送付案内（T2-2）
+register(ShokumuSeikyuAdapter())  # M1 職務上請求（T3-3 で結線）

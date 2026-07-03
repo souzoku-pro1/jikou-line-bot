@@ -19,7 +19,11 @@ T3-2 で追加（2026-07-03・同日の追加要件で2様式対応に改訂）:
   - 様式1は生年月日必須（欠損→エラー遷移「生年月日が必要です」）・様式2は任意（空欄は非印字）
   - 請求者欄の印字は様式1=既定OFF（印字済み在庫）・様式2=既定ON。print_requester で上書き可
   - レターパック往復ラベル（宛先=App 31 引き当て自治体・返信用=事務所宛「行」）
-T3-3 で追加: CHANNEL_REGISTRY への登録・状態結線（登録されるまでディスパッチャからは呼ばれない）
+T3-3 で追加（2026-07-03）: CHANNEL_REGISTRY への登録（channels/__init__.py）・状態結線。
+  App 30 で「チャネル=職務上請求」の起票が実際に動く:
+    下書き→prepare→承認待ち →（人が承認）→ 発送処理中＋印刷投函指示 LINE
+    →（人が投函・発送済に変更）→ 返送待ち＋返送期限自動設定（hub/dispatch._handle_shipped）
+    →（M5 受領・将来の T4系が消込）→ 完了。期限超過は return_deadline_check が毎朝監視
 """
 
 import json
@@ -612,7 +616,15 @@ class ShokumuSeikyuAdapter(ChannelAdapter):
         )
 
     async def dispatch(self, record: dict) -> DispatchResult:
-        """物理郵送チャネル: 印刷指示のみ（投函・追跡番号入力・発送済への変更は事務員）"""
+        """物理郵送チャネル: 印刷指示のみ（投函・追跡番号入力・発送済への変更は事務員）。
+
+        以降の流れ（T3-3 結線・hub/dispatch 側）:
+        - 発送済（人が設定）→ _handle_shipped が 返送待ち＋返送期限 を自動設定
+          （needs_return=True のため。期限=発送日＋ユニット既定日数）
+        - 返送待ち→完了 の消込は M5 スキャン受領（将来の T4系）の接続点。
+          戸籍等の受領文書をこのレコードに突合して完了させる（設計 08 §3・04 §4）。
+          突合不能時は 要確認 → reprocess()（本アダプタでは未実装・基底の no-op）
+        - 期限超過は return_deadline_check（毎日 8:00 JST）が警報（状態は変えない）"""
         return DispatchResult(manual_mailing=True)
 
 
