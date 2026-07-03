@@ -1003,13 +1003,24 @@ async def _call_compose_reply(system_prompt: str, messages: list[dict]) -> dict:
 
     モデル名は config.py（PRIMARY_MODEL / FALLBACK_MODEL）で管理。
     モデル起因エラー時は claude_gateway が自動フォールバック＋管理者通知する。
+
+    システムプロンプト（約6千トークン）は prompt caching を有効化する。
+    キャッシュはプレフィックス一致のため、完全に同一のプロンプト
+    （=同一顧客の連続メッセージや、回帰テストの同一status群）で
+    2回目以降の入力単価が約1/10になる（2026-07-03 API消費削減・弁護士承認済み）。
     """
     client = anthropic.AsyncAnthropic(api_key=_ANTHROPIC_KEY)
     response = await create_message_with_fallback(
         client,
         context="顧客対応 compose_reply",
         max_tokens=1024,
-        system=system_prompt,
+        system=[
+            {
+                "type": "text",
+                "text": system_prompt,
+                "cache_control": {"type": "ephemeral"},
+            }
+        ],
         tools=[_COMPOSE_REPLY_TOOL],
         tool_choice={"type": "tool", "name": "compose_reply"},
         messages=messages,

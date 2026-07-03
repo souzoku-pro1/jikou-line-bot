@@ -1,0 +1,36 @@
+# 週次のトリアージ全量回帰（API消費削減運用の一部・2026-07-03 弁護士承認済み）
+#
+# 開発中の実測は TRIAGE_SCOPE=diff（差分のみ）で行い、全量120件は
+# 「マージ直前の1回」と「この週次実行」に限定する。
+#
+# 有効化に必要な設定（リポジトリ Settings → Secrets and variables → Actions）:
+#   ANTHROPIC_API_KEY_DEV : テスト専用Workspaceで発行したAPIキー
+#   （本番キーは登録しないこと。Secretが未設定の間、このワークフローは
+#    テストがskipされて素通りする）
+#
+# 失敗時は GitHub からリポジトリオーナーに通知メールが届く。
+# kintone・LINE には一切アクセスしない（Claude API のみ）。
+
+name: weekly-triage-regression
+
+on:
+  schedule:
+    # 毎週月曜 03:00 JST（日曜 18:00 UTC）。問い合わせの少ない時間帯
+    - cron: "0 18 * * 0"
+  workflow_dispatch: {}  # 手動実行も可
+
+jobs:
+  triage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt pytest
+      - name: Run full triage regression
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY_DEV }}
+          TRIAGE_SCOPE: full
+        run: python -m pytest test_triage_classification.py -v -s
