@@ -13,6 +13,10 @@ Claude API 呼び出しゲートウェイ（モデルフォールバック＋管
 
 モデル起因でないエラー（429 / 529 / ネットワーク等）はフォールバックせず
 そのまま送出する（SDK が自動リトライ済みのため）。
+
+例外: クレジット残高系エラー（credit balance / billing）は、フォールバックせず
+管理者に LINE 警報した上で送出する（2026-07-03 の無警報沈黙事象への対策。
+同一アカウントのためフォールバックしても解消しない）。
 """
 
 import logging
@@ -49,6 +53,35 @@ def _is_model_error(exc: Exception) -> bool:
     return False
 
 
+def _is_billing_error(exc: Exception) -> bool:
+    """残高・課金起因のエラー（クレジット不足等）かどうか。
+
+    2026-07-03 にクレジット切れが無警報で沈黙する事象が発生。
+    この 400 はメッセージに "model" を含まずモデル起因判定に乗らないため、
+    フォールバック警報が発動せず、管理者は気づけなかった。
+    """
+    if isinstance(exc, (anthropic.BadRequestError, anthropic.PermissionDeniedError)):
+        text = str(exc).lower()
+        return "credit balance" in text or "billing" in text or "purchase credits" in text
+    return False
+
+
+async def _notify_billing_error(context: str, exc: Exception) -> None:
+    """クレジット残高系エラーを管理者に LINE Push で警報する（スロットル付き）"""
+    logger.error("Anthropic billing error: %s", exc)
+    await notify_admin_line(
+        "【Anthropicクレジット残高不足・要対応】\n"
+        f"時刻: {_now_jst()}\n"
+        f"呼び出し元: {context or '不明'}\n"
+        f"エラー: {str(exc)[:300]}\n"
+        "Claude API が全停止しています（フォールバックモデルも同一アカウントの"
+        "ため復旧しません）。console.anthropic.com の Plans & Billing で"
+        "クレジットを補充してください。\n"
+        "復旧までの間、顧客には定型の「確認中」応答のみが返ります。",
+        throttle_key="billing_error",
+    )
+
+
 def _now_jst() -> str:
     return datetime.now(_JST).strftime("%Y-%m-%d %H:%M:%S JST")
 
@@ -72,6 +105,11 @@ async def create_message_with_fallback(
     try:
         return await client.messages.create(model=PRIMARY_MODEL, **kwargs)
     except anthropic.APIError as primary_exc:
+        if _is_billing_error(primary_exc):
+            # クレジット不足はフォールバックしても解消しない（同一アカウント）。
+            # 管理者に警報した上で従来どおり送出する（呼び出し元の挙動は不変）
+            await _notify_billing_error(context, primary_exc)
+            raise
         if not _is_model_error(primary_exc):
             raise
         logger.error(
