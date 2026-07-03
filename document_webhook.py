@@ -55,44 +55,9 @@ def _kintone_base() -> str:
     return f"https://{sub}.cybozu.com"
 
 
-def to_wareki(d: date) -> str:
-    if d >= date(2019, 5, 1):
-        n, era = d.year - 2018, "令和"
-    elif d >= date(1989, 1, 8):
-        n, era = d.year - 1988, "平成"
-    else:
-        return d.strftime("%Y年%m月%d日")
-    y = "元" if n == 1 else str(n)
-    return f"{era}{y}年{d.month}月{d.day}日"
-
-
-def fill_template(template_path: str, data: dict) -> bytes:
-    """テンプレートを差し込み置換して docx の bytes を返す"""
-    doc = Document(template_path)
-
-    def replace_in_paragraph(para):
-        full = "".join(run.text for run in para.runs)
-        if not any(k in full for k in data):
-            return
-        for k, v in data.items():
-            full = full.replace(k, v)
-        if para.runs:
-            para.runs[0].text = full
-            for run in para.runs[1:]:
-                run.text = ""
-
-    for para in doc.paragraphs:
-        replace_in_paragraph(para)
-    for table in doc.tables:
-        for row in table.rows:
-            for cell in row.cells:
-                for para in cell.paragraphs:
-                    replace_in_paragraph(para)
-
-    buf = io.BytesIO()
-    doc.save(buf)
-    buf.seek(0)
-    return buf.read()
+# fill_template / to_wareki は T0-3 で hub/docx_builder.py に移設（実装不変）。
+# 既存の import 経路（from document_webhook import fill_template 等）互換のため re-export
+from hub.docx_builder import fill_template, to_wareki  # noqa: E402,F401
 
 
 # ── kintone API（T0-1 で hub/kintone に移設。旧名は委譲ラッパーとして温存） ──

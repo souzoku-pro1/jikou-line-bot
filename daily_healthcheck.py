@@ -4,9 +4,11 @@
 監視項目:
   A. Anthropic Models API (GET /v1/models/{model_id}) で
      PRIMARY_MODEL / FALLBACK_MODEL の有効性を確認する
-  B. kintone フォーム設計取得 API で、コードが依存する App 21/28/29 の
+  B. kintone フォーム設計取得 API で、コードが依存するアプリの
      フィールドコード・型・選択肢値が config.EXPECTED_KINTONE_SCHEMA と
      一致するか検証する
+  C. docx テンプレートに、コードが差し込むプレースホルダが揃っているか検証する
+     （config.EXPECTED_DOCX_TEMPLATES と照合・T0-3 で追加）
 
 異常時のみ LINE Push で管理者に通知する。正常時はログのみ。
 
@@ -27,7 +29,12 @@ import anthropic
 import httpx
 
 from claude_gateway import notify_admin_line
-from config import EXPECTED_KINTONE_SCHEMA, FALLBACK_MODEL, PRIMARY_MODEL
+from config import (
+    EXPECTED_DOCX_TEMPLATES,
+    EXPECTED_KINTONE_SCHEMA,
+    FALLBACK_MODEL,
+    PRIMARY_MODEL,
+)
 
 logger = logging.getLogger("daily_healthcheck")
 
@@ -127,6 +134,34 @@ async def check_kintone_schema() -> list[str]:
 
 
 # ══════════════════════════════════════════════════════════════
+# 監視項目C: docx テンプレートのプレースホルダ検査（T0-3）
+# ══════════════════════════════════════════════════════════════
+
+def check_templates() -> list[str]:
+    """コードが差し込むプレースホルダがテンプレートに揃っているか検証する"""
+    from hub.docx_builder import TemplateNotFound, validate_template
+
+    problems: list[str] = []
+    for path, keys in EXPECTED_DOCX_TEMPLATES.items():
+        try:
+            missing = validate_template(path, keys)
+        except TemplateNotFound as e:
+            problems.append(f"テンプレート検査: {e}")
+            continue
+        except Exception as e:
+            problems.append(f"テンプレート {path} の検査に失敗: {str(e)[:150]}")
+            continue
+        if missing:
+            problems.append(
+                f"テンプレート {path} に差込プレースホルダ {missing} がありません"
+                "（テンプレート編集で消された可能性）"
+            )
+        else:
+            logger.info("template checked: %s", path)
+    return problems
+
+
+# ══════════════════════════════════════════════════════════════
 # 実行本体
 # ══════════════════════════════════════════════════════════════
 
@@ -143,6 +178,10 @@ async def run_healthcheck() -> list[str]:
         problems += await check_kintone_schema()
     except Exception as e:
         problems.append(f"kintone監視の実行自体が失敗: {str(e)[:150]}")
+    try:
+        problems += check_templates()
+    except Exception as e:
+        problems.append(f"テンプレート監視の実行自体が失敗: {str(e)[:150]}")
 
     if problems:
         logger.error("healthcheck NG (%d problems): %s", len(problems), problems)

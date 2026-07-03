@@ -78,13 +78,19 @@ P7 仕上げ（運用ドキュメント・全体回帰）
   Railway の登録ログは従来と同一書式。二重 startup 時に旧実装はループが二重化し得たが、
   レジストリ化で1タスクに保証される（改善・test_hub_scheduler で検証）
 
-#### T0-3 `hub/docx_builder.py` の新設 + `config.py` UNIT_CONFIG
+#### T0-3 `hub/docx_builder.py` の新設 + `config.py` UNIT_CONFIG（**実施済み 2026-07-03**）
 - 参照: 03 §6・§10
 - 作業: fill_template / to_wareki 移設（re-export 維持）、resolve_template / validate_template 追加、
   UNIT_CONFIG（時効援用のみ）追加、テンプレート検査を daily_healthcheck に登録
 - 完了条件:
-  - [ ] `test_hub_docx_builder.py` 新規（差込・和暦・規約解決・プレースホルダ検査）
-  - [ ] 既存 `/document/{secret}` 回帰テスト PASS・既存テスト全 PASS
+  - [x] `test_hub_docx_builder.py` 新規（差込〔run分割・表セル〕・和暦〔改元境界〕・
+        規約解決〔新ユニット=エントリ追加のみの検証込み〕・プレースホルダ検査）
+  - [x] 既存 `/document/{secret}` 回帰テスト PASS・既存テスト全 PASS
+        （101件 + triage 分類一致率 PASS・healthcheck ドライラン異常0件）
+- 実装ノート: テンプレート検査は config.EXPECTED_DOCX_TEMPLATES（パス→差込キーの
+  レジストリ）を新設して監視項目Cとして登録。実テンプレートとレジストリの一致は
+  test_hub_docx_builder が担保（誤警報防止）。list_placeholders() をレジストリ整備の
+  補助として追加
 
 ### P1: ハブ中核
 

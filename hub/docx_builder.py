@@ -1,0 +1,107 @@
+"""docx 生成の共通実装（hub/docx_builder）
+
+設計: docs/architecture/03-common-components.md §6
+
+- fill_template / to_wareki: document_webhook.py から移設（T0-3・実装変更なし）。
+  既存の import 経路は document_webhook 側の re-export で維持される。
+- resolve_template: docx_templates/<ユニットの template_dir>/<種別>.docx の規約解決
+- validate_template: テンプレート内に必要プレースホルダ（{{...}}）が揃っているか検査
+  （daily_healthcheck に登録し、人がテンプレートを編集して差込キーを消した事故を検知）
+"""
+
+import io
+import re
+from datetime import date
+from pathlib import Path
+
+from docx import Document
+
+from config import UNIT_CONFIG
+
+# テンプレート規約のルートディレクトリ（リポジトリ相対・既存の配置と同じ）
+TEMPLATE_ROOT = "docx_templates"
+
+_PLACEHOLDER_RE = re.compile(r"\{\{[^{}]+\}\}")
+
+
+class TemplateNotFound(Exception):
+    """テンプレートファイルが規約の場所に存在しない / ユニットが未定義"""
+
+
+def to_wareki(d: date) -> str:
+    """西暦→和暦表記（document_webhook から移設・実装不変）"""
+    if d >= date(2019, 5, 1):
+        n, era = d.year - 2018, "令和"
+    elif d >= date(1989, 1, 8):
+        n, era = d.year - 1988, "平成"
+    else:
+        return d.strftime("%Y年%m月%d日")
+    y = "元" if n == 1 else str(n)
+    return f"{era}{y}年{d.month}月{d.day}日"
+
+
+def fill_template(template_path: str, data: dict) -> bytes:
+    """テンプレートを差し込み置換して docx の bytes を返す
+    （document_webhook から移設・実装不変。run 分割されたプレースホルダにも対応）"""
+    doc = Document(template_path)
+
+    def replace_in_paragraph(para):
+        full = "".join(run.text for run in para.runs)
+        if not any(k in full for k in data):
+            return
+        for k, v in data.items():
+            full = full.replace(k, v)
+        if para.runs:
+            para.runs[0].text = full
+            for run in para.runs[1:]:
+                run.text = ""
+
+    for para in doc.paragraphs:
+        replace_in_paragraph(para)
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                for para in cell.paragraphs:
+                    replace_in_paragraph(para)
+
+    buf = io.BytesIO()
+    doc.save(buf)
+    buf.seek(0)
+    return buf.read()
+
+
+def resolve_template(unit: str, doc_type: str, base_dir: str = TEMPLATE_ROOT) -> Path:
+    """規約ベースのテンプレート解決: <base_dir>/<UNIT_CONFIG[unit].template_dir>/<doc_type>.docx
+    ユニット未定義・ファイル不存在は TemplateNotFound"""
+    conf = UNIT_CONFIG.get(unit)
+    if conf is None:
+        raise TemplateNotFound(f"ユニット未定義: {unit}（config.UNIT_CONFIG に登録してください）")
+    path = Path(base_dir) / conf["template_dir"] / f"{doc_type}.docx"
+    if not path.is_file():
+        raise TemplateNotFound(f"テンプレートがありません: {path}")
+    return path
+
+
+def _extract_text(path) -> str:
+    doc = Document(str(path))
+    parts = [p.text for p in doc.paragraphs]
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                parts.extend(p.text for p in cell.paragraphs)
+    return "\n".join(parts)
+
+
+def validate_template(path, required_keys: list[str]) -> list[str]:
+    """テンプレートに必要プレースホルダが揃っているか検査し、欠けているキーの一覧を返す
+    （空リスト = 問題なし）。ファイル不存在は TemplateNotFound。"""
+    p = Path(path)
+    if not p.is_file():
+        raise TemplateNotFound(f"テンプレートがありません: {p}")
+    text = _extract_text(p)
+    return [k for k in required_keys if k not in text]
+
+
+def list_placeholders(path) -> list[str]:
+    """テンプレート内の {{...}} プレースホルダを列挙する（レジストリ整備の補助）"""
+    return sorted(set(_PLACEHOLDER_RE.findall(_extract_text(path))))
