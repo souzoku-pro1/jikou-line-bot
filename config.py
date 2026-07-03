@@ -270,6 +270,21 @@ EXPECTED_KINTONE_SCHEMA = {
             "有効": {"type": "RADIO_BUTTON", "required_options": ["yes", "no"]},
         },
     },
+    # 2026-07-03 作成・フォーム設計APIで7フィールドの全一致を確認済み
+    # （M4 送付案内の文章ブロックマスタ。App 30 同封物選択との同期検査は T2-1 で追加）
+    "App 32 (同封物ブロックマスタ)": {
+        "app_id_env": "APP_ENCLOSURE",
+        "token_env": "TOKEN_ENCLOSURE",
+        "fields": {
+            "ブロックキー": {"type": "SINGLE_LINE_TEXT"},
+            "表示名": {"type": "SINGLE_LINE_TEXT"},
+            "案内文": {"type": "MULTI_LINE_TEXT"},
+            "対象ユニット": {"type": "CHECK_BOX", "required_options": ["時効援用"]},
+            "返送要否": {"type": "RADIO_BUTTON", "required_options": ["要", "不要"]},
+            "表示順": {"type": "NUMBER"},
+            "有効": {"type": "RADIO_BUTTON", "required_options": ["yes", "no"]},
+        },
+    },
 }
 
 

@@ -89,5 +89,33 @@ class TestApp31Schema(unittest.TestCase):
             self.assertIn(spec["type"], VALID_TYPES, f"{code} の型が不正")
 
 
+class TestApp32Schema(unittest.TestCase):
+    """App 32（同封物ブロックマスタ）のスキーマ定義検証（docs/architecture/02 §4.1）"""
+
+    def setUp(self):
+        self.app32 = EXPECTED_KINTONE_SCHEMA["App 32 (同封物ブロックマスタ)"]
+
+    def test_env_names(self):
+        self.assertEqual(self.app32["app_id_env"], "APP_ENCLOSURE")
+        self.assertEqual(self.app32["token_env"], "TOKEN_ENCLOSURE")
+
+    def test_field_count_is_7(self):
+        self.assertEqual(len(self.app32["fields"]), 7)
+
+    def test_return_flag_options(self):
+        f = self.app32["fields"]["返送要否"]
+        self.assertEqual(f["type"], "RADIO_BUTTON")
+        self.assertEqual(set(f["required_options"]), {"要", "不要"})
+
+    def test_unit_checkbox_requires_jikou(self):
+        f = self.app32["fields"]["対象ユニット"]
+        self.assertEqual(f["type"], "CHECK_BOX")
+        self.assertIn("時効援用", f["required_options"])
+
+    def test_all_types_valid(self):
+        for code, spec in self.app32["fields"].items():
+            self.assertIn(spec["type"], VALID_TYPES, f"{code} の型が不正")
+
+
 if __name__ == "__main__":
     unittest.main()
