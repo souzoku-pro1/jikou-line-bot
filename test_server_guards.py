@@ -132,6 +132,39 @@ class TestForbiddenWords(unittest.TestCase):
         reply = "裁判所からの書類は無視してはいけません。放置してはいけない書類です。"
         self.assertEqual(find_forbidden_words(reply), [])
 
+    def test_negated_kanarazu_forms_are_allowed(self):
+        """「必ず消滅するとは保証できない」等の否定形は許可される
+        （法律知識ブロックの必須文言。2026-07-03 実測での誤検出を受けた弁護士承認済みの緩和）"""
+        for reply in [
+            "支払督促の場合、業者により見解が分かれるため、必ず消滅するとは保証できません。",
+            "「必ず消滅する」とは言い切れないのが正直なところです。",
+            "必ず消滅するとは限らない点にご注意ください。",
+            "必ず時効になるとは限りません。",
+            "必ず成立するとは言えませんが、可能性は十分あります。",
+            "必ず消滅するとは断言できません。",
+        ]:
+            with self.subTest(reply=reply):
+                self.assertEqual(find_forbidden_words(reply), [])
+                g = apply_server_guards(
+                    _result(reply=reply, category="手続きの一般的な流れ"), [], "一般論を教えてください"
+                )
+                self.assertTrue(g.can_auto_send)
+
+    def test_affirmative_kanarazu_forms_still_demote(self):
+        """「必ず消滅します」等の肯定断定形は引き続き降格される"""
+        for reply in [
+            "必ず消滅しますのでご安心ください。",
+            "5年経過していれば必ず時効になります。",
+            "この場合は必ず成立します。",
+            "時効援用すれば必ず消滅するのでご安心ください。",
+        ]:
+            with self.subTest(reply=reply):
+                self.assertTrue(find_forbidden_words(reply), f"検出されるべき: {reply}")
+                g = apply_server_guards(
+                    _result(reply=reply, category="時効見立て_条件付き"), [], "大丈夫ですか"
+                )
+                self.assertFalse(g.can_auto_send)
+
 
 class TestFeeRequiredPhrases(unittest.TestCase):
     """b) 費用の定型案内の必須文言チェック"""
