@@ -65,6 +65,12 @@
 
 ### 3.1 方式
 
+> **実装済み（2026-07-03 T3-2）**: `FORM_COORDS` は26項目で実装（請求者欄・対象者欄・
+> 請求種別6種のチェック＋通数・利用目的2行・依頼者氏名）。チェック印は「レ」
+> （U+2713 "✓" は同梱フォント外のため）。**座標は初期値であり実用紙の実測が未実施** —
+> 手順は [04a-shokumu-seikyu-calibration.md](04a-shokumu-seikyu-calibration.md)。
+> 校正用PDFは `python -m channels.shokumu_seikyu <出力フォルダ>` で生成。
+
 - 統一用紙（A4・複写式）に、**記入欄の文字だけ**を印字した PDF を重ね打ちする
 - `hub/address_label.render_overlay()`（03 §7）を使用。座標表はこのチャネルが持つ:
 

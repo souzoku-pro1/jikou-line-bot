@@ -146,10 +146,11 @@ def _address_items(name: str, zip_code: str, address: str,
 
 
 def render_letterpack_label(to_name: str, to_zip: str, to_address: str,
-                            *, size_mm: tuple[float, float] = LETTERPACK_LABEL_MM,
+                            *, honorific: str = "様",
+                            size_mm: tuple[float, float] = LETTERPACK_LABEL_MM,
                             grid: bool = False) -> bytes:
     """レターパック「お届け先」欄への貼付サイズ（既定 100×70mm）の宛名ラベル PDF"""
-    items = _address_items(to_name, to_zip, to_address, *size_mm)
+    items = _address_items(to_name, to_zip, to_address, *size_mm, honorific=honorific)
     return render_overlay(size_mm, items, grid=grid)
 
 
@@ -167,6 +168,45 @@ def render_reply_label(*, size_mm: tuple[float, float] = LETTERPACK_LABEL_MM,
     items = _address_items(office["名称"], office["郵便番号"], office["住所"],
                            *size_mm, honorific="行")
     return render_overlay(size_mm, items, grid=grid)
+
+
+def render_letterpack_roundtrip(to_name: str, to_zip: str, to_address: str,
+                                *, honorific: str = "様",
+                                size_mm: tuple[float, float] = LETTERPACK_LABEL_MM,
+                                grid: bool = False) -> bytes:
+    """レターパック往復ラベル PDF（2ページ: 1p=宛先、2p=返信用・事務所宛「行」）。
+    返信用の宛先は config.get_office_info()（環境変数）から。
+    事務所情報が未設定なら ValueError（誤った空ラベルの印刷を防ぐ・render_reply_label と同じ）"""
+    office = get_office_info()
+    missing = [k for k in ("名称", "郵便番号", "住所") if not office.get(k)]
+    if missing:
+        raise ValueError(
+            f"事務所情報が未設定です: {missing}（環境変数 OFFICE_NAME / OFFICE_ZIP / "
+            "OFFICE_ADDRESS を設定してください）"
+        )
+    font = _ensure_font()
+    off_x, off_y = _offsets_mm()
+    w_mm, h_mm = size_mm
+
+    pages = [
+        _address_items(to_name, to_zip, to_address, w_mm, h_mm, honorific=honorific),
+        _address_items(office["名称"], office["郵便番号"], office["住所"],
+                       w_mm, h_mm, honorific="行"),
+    ]
+    buf = io.BytesIO()
+    c = canvas.Canvas(buf, pagesize=(w_mm * mm, h_mm * mm), invariant=1)
+    for items in pages:
+        if grid:
+            _draw_grid(c, w_mm, h_mm)
+        for item in items:
+            size = item.font_size
+            if item.max_width_mm is not None:
+                size = fit_font_size(item.text, font, size, item.max_width_mm)
+            c.setFont(font, size)
+            c.drawString((item.x_mm + off_x) * mm, (item.y_mm + off_y) * mm, item.text)
+        c.showPage()
+    c.save()
+    return buf.getvalue()
 
 
 # A4 面付けレイアウト: (列数, 行数)。ラベルシール規格に合わせて追加可能

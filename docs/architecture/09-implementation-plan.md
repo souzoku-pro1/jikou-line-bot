@@ -228,14 +228,30 @@ P7 仕上げ（運用ドキュメント・全体回帰）
   - **CHANNEL_REGISTRY 未登録**（T2-1 と同じ前倒し防止。結線は T3-3）。実データ投入も未実施
     （dry-run→発注者承認→`--execute` の手順で人が実行）
 
-#### T3-2 重ね打ち PDF・レターパックラベル
+#### T3-2 重ね打ち PDF・レターパックラベル　★実施済み（2026-07-03）
 - 参照: 04 §3、03 §7
 - 作業: FORM_COORDS 座標表（実用紙実測は人が行い値を提供）・重ね打ち PDF 生成・
   レターパック往復ラベル・キャリブレーション手順の README 化
 - 完了条件:
-  - [ ] 座標表全キー印字・grid モード・オフセットのテスト PASS
+  - [x] 座標表全キー印字・grid モード・オフセットのテスト PASS
   - [ ] 試し刷り確認（人）で実用紙に整合 — タスク完了は「テスト PASS + 試し刷り手順書」まで
-  - [ ] 既存テスト全 PASS
+        （**手順書は 04a として作成済み。実測・試し刷りは人の作業として未実施**）
+  - [x] 既存テスト全 PASS（308 passed / 2 skipped）
+- 実装ノート（2026-07-03）:
+  - `channels/shokumu_seikyu.py` に FORM_COORDS（26項目・A4 左下原点mm）・
+    `build_request_form_pdf`（grid= で方眼重畳）・`build_calibration_pdf`（方眼＋全キー名印字）。
+    **座標は設計初期値（FORM_VERSION=v0）。実測キャリブレーションは 04a の手順で人が実施**
+  - チェック印は「レ」（U+2713 は IPAex に無くトーフ化しうるため）。長文は fit_font_size で
+    縮小（欄ごとの許容幅 `_FORM_MAX_WIDTH_MM`）。利用目的は42字で2行に折り返し
+  - `hub/address_label.render_letterpack_roundtrip` 新設（2ページ: 1p=宛先「御中」・
+    2p=返信用事務所宛「行」）。render_letterpack_label に honorific 引数追加（既定「様」・後方互換）
+  - prepare 成果物は3点に: 発送準備チェックリスト.pdf / 職務上請求書_重ね打ち.pdf /
+    レターパック往復ラベル.pdf。OFFICE_* 未設定時は宛先面のみに縮退し
+    チェックリストに「返信用は手書き」と明記（prepare は止めない・アダプタは notify 禁止のため）
+  - 校正用PDF3点の CLI: `python -m channels.shokumu_seikyu <出力フォルダ>`。
+    手順書は docs/architecture/04a-shokumu-seikyu-calibration.md（オーナー向け・印刷倍率100%必須等）
+  - 弁護士登録番号は env `OFFICE_ATTORNEY_REG`（任意・未設定なら空欄=手書き）
+  - テストは test_shokumu_form.py（18件・新規）。T3-1 の test_shokumu_seikyu.py は無変更
 
 #### T3-3 M1 結線（発送済→返送待ち→期限監視）
 - 参照: 04 §1・§4〜§6
