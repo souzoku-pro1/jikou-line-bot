@@ -208,6 +208,47 @@ class TestForbiddenWords(unittest.TestCase):
             with self.subTest(reply=reply):
                 self.assertTrue(find_forbidden_words(reply), f"検出されるべき: {reply}")
 
+    def test_jikou_madjika_is_forbidden(self):
+        """「時効間近」は全応答で使用禁止（FAQ第2弾・2026-07-03 弁護士指示）"""
+        for reply in [
+            "この通知は時効間近のサインである可能性があります。",
+            "時効間近ですので、お早めにご依頼ください。",
+        ]:
+            with self.subTest(reply=reply):
+                hits = find_forbidden_words(reply)
+                self.assertTrue(any("時効間近" in h for h in hits))
+                g = apply_server_guards(
+                    _result(reply=reply, category="手続きの一般的な流れ"), [], "減額通知が来ました"
+                )
+                self.assertFalse(g.can_auto_send)
+
+    def test_gengaku_notice_standard_reply_is_clean(self):
+        """減額通知の標準回答（弁護士確定の言い回し）は禁止語に触れない"""
+        reply = (
+            "一般的に、減額のご案内は時効にかかっている可能性が高くなる傾向は"
+            "ありますが、時効にかかっていなくても届くことがあります。"
+            "この通知だけで時効の成否を判断することはできません。"
+        )
+        self.assertEqual(find_forbidden_words(reply), [])
+        g = apply_server_guards(
+            _result(reply=reply, category="手続きの一般的な流れ"), [], "減額通知が届きました"
+        )
+        self.assertTrue(g.can_auto_send)
+
+    def test_sashiosae_general_reply_is_clean_and_flag_neutral(self):
+        """差押え中の一般論+資料収集の返信は自動送信可（フラグは見立てカテゴリのみ降格）"""
+        reply = (
+            "差押えを受けている場合、時効が更新されているため時効援用はできません。"
+            "状況を確認いたしますので、差押えに関する書類の写真をこのLINEにお送りいただけますか。"
+        )
+        self.assertEqual(find_forbidden_words(reply), [])
+        g = apply_server_guards(
+            _result(reply=reply, category="手続きの一般的な流れ", jikou_update_flag=True),
+            [],
+            "給料を差し押さえられています。時効援用できますか？",
+        )
+        self.assertTrue(g.can_auto_send)
+
     def test_affirmative_kanarazu_forms_still_demote(self):
         """「必ず消滅します」等の肯定断定形は引き続き降格される"""
         for reply in [
