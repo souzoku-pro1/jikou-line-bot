@@ -1,3 +1,5 @@
 .env
 .clasprc.json
 .env.test
+__pycache__/
+*.pyc

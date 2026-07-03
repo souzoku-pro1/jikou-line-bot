@@ -30,7 +30,7 @@ from claude_gateway import create_message_with_fallback
 from config import get_office_info
 from hub import kintone
 from hub.address_label import render_label_sheet
-from hub.docx_builder import fill_template_multiline, resolve_template, to_wareki
+from hub.docx_builder import fill_template_with_table, resolve_template, to_wareki
 
 logger = logging.getLogger("channels.soufu_annai")
 
@@ -56,11 +56,10 @@ async def fetch_blocks(unit: str, selected_keys: list[str]) -> list[dict]:
     if not selected_keys:
         raise SoufuAnnaiError("同封物が選択されていません（同封物選択が空）")
 
+    # fields 指定なし＝全フィールド取得（App 32 への列追加〔部数等〕に自動追従。
+    # 存在しない列名を fields に並べると kintone がエラーになるため指定しない）
     records = await kintone.search_records(
-        APP_ENCLOSURE,
-        '有効 in ("yes") order by 表示順 asc',
-        fields=["$id", "ブロックキー", "表示名", "案内文", "対象ユニット", "返送要否", "表示順"],
-    )
+        APP_ENCLOSURE, '有効 in ("yes") order by 表示順 asc')
     by_key = {r.get("ブロックキー", {}).get("value", ""): r for r in records}
 
     missing = [k for k in selected_keys if k not in by_key]
@@ -98,6 +97,7 @@ def build_enclosure_text(blocks: list[dict]) -> str:
 
 
 def _office_signature() -> str:
+    """差出人ブロック（事務所書式の並び: 〒→住所→名称→弁護士名→TEL→FAX。env 駆動）"""
     office = get_office_info()
     missing = [k for k in ("名称", "住所") if not office.get(k)]
     if missing:
@@ -105,13 +105,53 @@ def _office_signature() -> str:
             f"事務所情報が未設定です: {missing}（環境変数 OFFICE_NAME / OFFICE_ADDRESS 等を"
             "設定してください。対外文書に空の署名は出せません）"
         )
-    lines = [office["名称"]]
+    lines = []
     if office.get("郵便番号"):
         lines.append(f"〒{office['郵便番号']}")
     lines.append(office["住所"])
+    lines.append(office["名称"])
+    if office.get("弁護士名"):
+        lines.append(f"弁護士　{office['弁護士名']}")
     if office.get("電話"):
-        lines.append(f"TEL: {office['電話']}")
+        lines.append(f"ＴＥＬ：{office['電話']}")
+    if office.get("FAX"):
+        lines.append(f"ＦＡＸ：{office['FAX']}")
     return "\n".join(lines)
+
+
+def _build_body(record: dict, needs_return: bool) -> str:
+    """本文可変部（{{本文}}）。書式の文体（〜お送りいたします）を踏襲した定型組み立て"""
+    lines = ["さて、下記のとおり書類をお送りいたしますので、ご査収のほど"
+             "よろしくお願い申し上げます。"]
+    if needs_return:
+        lines.append("　ご署名・ご押印等が必要な書類につきましては、下表の備考欄をご確認の"
+                     "うえ、当事務所までご返送くださいますようお願い申し上げます。")
+    # ご依頼者表示: 宛先が依頼者本人のとき・顧客名が空のときは印字しない（自然な書面にする）
+    customer = (record.get("顧客名表示用", {}).get("value") or "").strip()
+    recipient = (record.get("宛先名", {}).get("value") or "").strip()
+    if customer and customer != recipient:
+        lines.append(f"（ご依頼者：{customer}　様）")
+    return "\n".join(lines)
+
+
+def _build_table_rows(blocks: list[dict]) -> list[dict]:
+    """書類表（No./書類名/部数/備考）の行データ。備考=案内文＋返送要否に応じた文言"""
+    rows = []
+    for i, b in enumerate(blocks, start=1):
+        note = (b.get("案内文", {}).get("value") or "").strip()
+        wants_return = (b.get("返送要否", {}).get("value") or "") == "要"
+        remarks = [note] if note else []
+        if wants_return and "返送" not in note:
+            remarks.append("ご返送をお願いいたします")
+        count = (b.get("部数", {}).get("value") or "").strip() if isinstance(
+            b.get("部数", {}).get("value"), str) else b.get("部数", {}).get("value")
+        rows.append({
+            "No": str(i),
+            "書類名": b.get("表示名", {}).get("value", ""),
+            "部数": str(count or "1"),
+            "備考": "　".join(remarks),
+        })
+    return rows
 
 
 # ── AI 特記事項（07 §3。加飾であり必須依存にしない）──────────────────────────
@@ -191,7 +231,7 @@ def _build_labels_pdf(record: dict) -> bytes:
 
 async def build_soufu_annai_docx(record: dict, blocks: list[dict] | None = None,
                                  tokki: str | None = None) -> bytes:
-    """発送管理レコードから送付案内 docx を生成する（prepare の中核）"""
+    """発送管理レコードから送付案内 docx を生成する（prepare の中核・事務所正式書式）"""
     unit = record.get("ユニット種別", {}).get("value", "")
     if not unit:
         raise SoufuAnnaiError("ユニット種別が未設定です")
@@ -201,17 +241,20 @@ async def build_soufu_annai_docx(record: dict, blocks: list[dict] | None = None,
     if tokki is None:
         tokki = record.get("本文_特記事項", {}).get("value", "")
 
+    zip_code = (record.get("宛先郵便番号", {}).get("value") or "").strip()
+    address = (record.get("宛先住所", {}).get("value") or "").strip()
+    recipient_addr = f"〒{zip_code}　{address}" if zip_code else address
+
     template = resolve_template(unit, DOC_TYPE)
     data = {
         "{{日付}}": to_wareki(date.today()),
-        "{{宛先名}}": record.get("宛先名", {}).get("value", ""),
-        "{{顧客名}}": record.get("顧客名表示用", {}).get("value", ""),
-        "{{件名}}": record.get("件名", {}).get("value", ""),
-        "{{同封物一覧}}": build_enclosure_text(blocks),
+        "{{依頼者住所}}": recipient_addr,
+        "{{依頼者氏名}}": record.get("宛先名", {}).get("value", ""),
+        "{{事務所署名ブロック}}": _office_signature(),
+        "{{本文}}": _build_body(record, _needs_return(blocks)),
         "{{特記事項}}": tokki,
-        "{{事務所署名}}": _office_signature(),
     }
-    return fill_template_multiline(str(template), data)
+    return fill_template_with_table(str(template), data, _build_table_rows(blocks))
 
 
 class SoufuAnnaiAdapter(ChannelAdapter):

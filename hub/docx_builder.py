@@ -70,6 +70,34 @@ def fill_template(template_path: str, data: dict) -> bytes:
     return buf.read()
 
 
+def _replace_multiline_in_paragraph(para, data: dict) -> None:
+    full = "".join(run.text for run in para.runs)
+    if not any(k in full for k in data):
+        return
+    for k, v in data.items():
+        full = full.replace(k, str(v))
+    if not para.runs:
+        return
+    lines = full.split("\n")
+    para.runs[0].text = lines[0]
+    for run in para.runs[1:]:
+        run.text = ""
+    for line in lines[1:]:
+        br = para.add_run()
+        br.add_break()
+        para.add_run(line)
+
+
+def _apply_multiline(doc: Document, data: dict) -> None:
+    for para in doc.paragraphs:
+        _replace_multiline_in_paragraph(para, data)
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                for para in cell.paragraphs:
+                    _replace_multiline_in_paragraph(para, data)
+
+
 def fill_template_multiline(template_path: str, data: dict) -> bytes:
     """fill_template の複数行対応版（T2-1 で追加。既存 fill_template は不変）。
 
@@ -78,32 +106,50 @@ def fill_template_multiline(template_path: str, data: dict) -> bytes:
     ※ 2行目以降の run は段落既定の書式になる（雛形は段落書式で整えること）
     """
     doc = Document(template_path)
+    _apply_multiline(doc, data)
+    buf = io.BytesIO()
+    doc.save(buf)
+    buf.seek(0)
+    return buf.read()
 
-    def replace_in_paragraph(para):
-        full = "".join(run.text for run in para.runs)
-        if not any(k in full for k in data):
-            return
-        for k, v in data.items():
-            full = full.replace(k, str(v))
-        if not para.runs:
-            return
-        lines = full.split("\n")
-        para.runs[0].text = lines[0]
-        for run in para.runs[1:]:
-            run.text = ""
-        for line in lines[1:]:
-            br = para.add_run()
-            br.add_break()
-            para.add_run(line)
 
-    for para in doc.paragraphs:
-        replace_in_paragraph(para)
+def fill_table_rows(doc: Document, rows: list[dict], marker_prefix: str = "{{行:") -> None:
+    """{{行:列名}} を含むテンプレート行を rows の件数分複製して差し込む
+    （souzoku-shorui 02 §2 の設計を前倒し実装・T2-2 テンプレ統合で使用）。
+
+    - テンプレート行の書式・罫線は行の複製（deepcopy）で継承される
+    - rows が空のときはテンプレート行を削除する（空の表は「該当なし」にしない）
+    - 対象は最初に見つかったテンプレート行1つ（1テンプレート=1可変表の規約）
+    """
+    import copy as _copy
+
+    from docx.table import _Row
+
     for table in doc.tables:
         for row in table.rows:
-            for cell in row.cells:
-                for para in cell.paragraphs:
-                    replace_in_paragraph(para)
+            if not any(marker_prefix in cell.text for cell in row.cells):
+                continue
+            template_tr = row._tr
+            for item in rows:
+                new_tr = _copy.deepcopy(template_tr)
+                template_tr.addprevious(new_tr)
+                new_row = _Row(new_tr, table)
+                data = {marker_prefix + k + "}}": str(v) for k, v in item.items()}
+                for cell in new_row.cells:
+                    for para in cell.paragraphs:
+                        _replace_multiline_in_paragraph(para, data)
+            template_tr.getparent().remove(template_tr)
+            return
+    # テンプレート行が見つからない場合は何もしない（validate_template で検知する）
 
+
+def fill_template_with_table(template_path: str, data: dict,
+                             table_rows: list[dict],
+                             marker_prefix: str = "{{行:") -> bytes:
+    """スカラー差込（複数行対応）＋表の行複製をまとめて行う（送付案内の正式書式用）"""
+    doc = Document(template_path)
+    _apply_multiline(doc, data)
+    fill_table_rows(doc, table_rows, marker_prefix=marker_prefix)
     buf = io.BytesIO()
     doc.save(buf)
     buf.seek(0)

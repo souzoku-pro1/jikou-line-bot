@@ -317,10 +317,11 @@ EXPECTED_DOCX_TEMPLATES = {
     "docx_templates/送付状_委任契約書.docx": [
         "{{日付}}", "{{依頼者住所}}", "{{依頼者氏名}}", "{{被相続人名}}",
     ],
-    # channels/soufu_annai.py（M4 送付案内・T2-1）が差し込む7キー
+    # channels/soufu_annai.py（M4 送付案内）が差し込むキー（事務所正式書式・2026-07-03 差替）
     "docx_templates/jikou/送付案内.docx": [
-        "{{日付}}", "{{宛先名}}", "{{顧客名}}", "{{件名}}",
-        "{{同封物一覧}}", "{{特記事項}}", "{{事務所署名}}",
+        "{{日付}}", "{{依頼者住所}}", "{{依頼者氏名}}", "{{事務所署名ブロック}}",
+        "{{本文}}", "{{特記事項}}",
+        "{{行:No}}", "{{行:書類名}}", "{{行:部数}}", "{{行:備考}}",
     ],
 }
 
@@ -337,6 +338,8 @@ def get_office_info() -> dict:
         "郵便番号": os.environ.get("OFFICE_ZIP", ""),
         "住所": os.environ.get("OFFICE_ADDRESS", ""),
         "電話": os.environ.get("OFFICE_TEL", ""),
+        "FAX": os.environ.get("OFFICE_FAX", ""),
+        "弁護士名": os.environ.get("OFFICE_ATTORNEY", ""),
     }
 
 
