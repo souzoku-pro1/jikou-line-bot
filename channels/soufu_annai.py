@@ -9,17 +9,27 @@ T2-1 の範囲:
   - 送付案内 docx の生成（hub/docx_builder.fill_template_multiline 経由）
   - App 30/32 の同期検査（daily_healthcheck の監視項目D として登録）
 
-T2-2 で追加されるもの（本ファイルでは未実装）:
-  - AI 特記事項生成・宛名ラベル同時出力・dispatch（印刷指示）・返送要否分岐・
-    CHANNEL_REGISTRY への登録（登録されるまでディスパッチャからは呼ばれない）
+T2-2 で追加（設計 07 §1・§3-4）:
+  - AI 特記事項生成（compose_note・失敗時は空欄で続行＝AI は加飾で必須依存にしない）
+  - 宛名ラベル PDF の同時出力（宛先面＋返信用の事務所宛面・hub/address_label）
+  - dispatch（manual_mailing=印刷指示で停止・投函と発送済への変更は事務員）
+  - CHANNEL_REGISTRY への登録（channels/__init__.py）
+  - 返送要否は チャネル固有データ に記録（発送済後の返送待ち自動遷移は未実装・
+    T1-2 の確定挙動〔発送済 Webhook は skip〕を変えないため。09 実装ノート参照）
 """
 
+import json
 import logging
+import os
 from datetime import date
 
-from channels.base import DOCX_MIME, Artifact, ChannelAdapter, PrepareResult
+import anthropic
+
+from channels.base import DOCX_MIME, PDF_MIME, Artifact, ChannelAdapter, DispatchResult, PrepareResult
+from claude_gateway import create_message_with_fallback
 from config import get_office_info
 from hub import kintone
+from hub.address_label import render_label_sheet
 from hub.docx_builder import fill_template_multiline, resolve_template, to_wareki
 
 logger = logging.getLogger("channels.soufu_annai")
@@ -104,13 +114,92 @@ def _office_signature() -> str:
     return "\n".join(lines)
 
 
-async def build_soufu_annai_docx(record: dict) -> bytes:
+# ── AI 特記事項（07 §3。加飾であり必須依存にしない）──────────────────────────
+
+_COMPOSE_NOTE_TOOL = {
+    "name": "compose_note",
+    "description": "送付案内に添える特記事項を1〜2文で作成する",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "note": {"type": "string",
+                     "description": "特記事項（敬体・50字×2文以内。不要なら空文字）"},
+        },
+        "required": ["note"],
+    },
+}
+
+_NOTE_PROMPT = """\
+法律事務所が書類を郵送する際の送付案内（カバーレター）に添える特記事項を作成してください。
+
+【禁則（chat_responder と同じルール）】
+- 法的判断・見通しの断定禁止
+- 記録にない日付・金額・進捗の創作禁止
+- 敬体。50字×2文以内。同封物の扱い方の案内（返送のお願い・記入箇所の案内等）に限る
+- 書くべきことがなければ note は空文字にする
+
+件名: {subject}
+宛先: {recipient}
+同封物:
+{enclosures}"""
+
+
+async def generate_tokki_note(record: dict, blocks: list[dict]) -> str:
+    """特記事項の一文を Claude で生成する。**失敗時は空欄を返して続行**
+    （対外文書の品質は承認ステップで担保・07 §3。警報も出さない）"""
+    try:
+        client = anthropic.AsyncAnthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
+        response = await create_message_with_fallback(
+            client,
+            context="送付案内 特記事項生成",
+            max_tokens=256,
+            tools=[_COMPOSE_NOTE_TOOL],
+            tool_choice={"type": "tool", "name": "compose_note"},
+            messages=[{"role": "user", "content": _NOTE_PROMPT.format(
+                subject=record.get("件名", {}).get("value", ""),
+                recipient=record.get("宛先名", {}).get("value", ""),
+                enclosures=build_enclosure_text(blocks),
+            )}],
+        )
+        block_ = next((b for b in response.content if b.type == "tool_use"), None)
+        note = (block_.input.get("note", "") if block_ else "").strip()
+        return note[:120]
+    except Exception:
+        logger.exception("特記事項の生成に失敗（空欄で続行）")
+        return ""
+
+
+def _needs_return(blocks: list[dict]) -> bool:
+    return any((b.get("返送要否", {}).get("value") or "") == "要" for b in blocks)
+
+
+def _build_labels_pdf(record: dict) -> bytes:
+    """宛名ラベル PDF（宛先面＋返信用の事務所宛面・07 §1）"""
+    office = get_office_info()
+    addresses = [{
+        "宛先名": record.get("宛先名", {}).get("value", ""),
+        "郵便番号": record.get("宛先郵便番号", {}).get("value", ""),
+        "住所": record.get("宛先住所", {}).get("value", ""),
+    }, {
+        "宛先名": office.get("名称", ""),
+        "郵便番号": office.get("郵便番号", ""),
+        "住所": office.get("住所", ""),
+        "敬称": "行",   # 返信用
+    }]
+    return render_label_sheet(addresses)
+
+
+async def build_soufu_annai_docx(record: dict, blocks: list[dict] | None = None,
+                                 tokki: str | None = None) -> bytes:
     """発送管理レコードから送付案内 docx を生成する（prepare の中核）"""
     unit = record.get("ユニット種別", {}).get("value", "")
     if not unit:
         raise SoufuAnnaiError("ユニット種別が未設定です")
-    selected = record.get("同封物選択", {}).get("value") or []
-    blocks = await fetch_blocks(unit, list(selected))
+    if blocks is None:
+        selected = record.get("同封物選択", {}).get("value") or []
+        blocks = await fetch_blocks(unit, list(selected))
+    if tokki is None:
+        tokki = record.get("本文_特記事項", {}).get("value", "")
 
     template = resolve_template(unit, DOC_TYPE)
     data = {
@@ -119,22 +208,55 @@ async def build_soufu_annai_docx(record: dict) -> bytes:
         "{{顧客名}}": record.get("顧客名表示用", {}).get("value", ""),
         "{{件名}}": record.get("件名", {}).get("value", ""),
         "{{同封物一覧}}": build_enclosure_text(blocks),
-        "{{特記事項}}": record.get("本文_特記事項", {}).get("value", ""),
+        "{{特記事項}}": tokki,
         "{{事務所署名}}": _office_signature(),
     }
     return fill_template_multiline(str(template), data)
 
 
 class SoufuAnnaiAdapter(ChannelAdapter):
-    """M4 送付案内。T2-2 で dispatch（印刷指示）・ラベル・AI 特記事項を実装し、
-    CHANNEL_REGISTRY へ登録する（それまでディスパッチャからは呼ばれない）"""
+    """M4 送付案内（T2-2 完成形・channels/__init__.py で CHANNEL_REGISTRY に登録）"""
 
     channel_name = "送付案内"
-    needs_return = False  # 返送要否分岐（ブロックの 要 混在時）は T2-2
+    needs_return = False  # 物理郵送のため dispatch では返送遷移しない（下記 dispatch 参照）
 
     async def prepare(self, record: dict) -> PrepareResult:
-        docx_bytes = await build_soufu_annai_docx(record)
-        return PrepareResult(artifacts=[Artifact("送付案内.docx", docx_bytes, DOCX_MIME)])
+        unit = record.get("ユニット種別", {}).get("value", "")
+        if not unit:
+            raise SoufuAnnaiError("ユニット種別が未設定です")
+        selected = list(record.get("同封物選択", {}).get("value") or [])
+        blocks = await fetch_blocks(unit, selected)
+
+        # 特記事項: 人が書いた値を優先。空なら AI 下書き（失敗は空欄で続行）。
+        # 生成結果は kintone にも書き戻し、承認前に弁護士が編集できるようにする（07 §1）
+        fields: dict = {}
+        tokki = (record.get("本文_特記事項", {}).get("value") or "").strip()
+        ai_generated = False
+        if not tokki:
+            tokki = await generate_tokki_note(record, blocks)
+            if tokki:
+                fields["本文_特記事項"] = tokki
+                ai_generated = True
+
+        docx_bytes = await build_soufu_annai_docx(record, blocks=blocks, tokki=tokki)
+        labels_pdf = _build_labels_pdf(record)
+
+        fields["チャネル固有データ"] = json.dumps({
+            "blocks": selected,                    # prepare 時点のスナップショット（07 §4）
+            "needs_return": _needs_return(blocks),
+            "ai_note": {"generated": ai_generated},
+        }, ensure_ascii=False)
+
+        return PrepareResult(
+            artifacts=[Artifact("送付案内.docx", docx_bytes, DOCX_MIME),
+                       Artifact("宛名ラベル.pdf", labels_pdf, PDF_MIME)],
+            fields=fields,
+        )
+
+    async def dispatch(self, record: dict) -> DispatchResult:
+        """物理郵送チャネル: 印刷指示のみ（発送処理中で停止し、印刷・封入・投函・
+        発送済への変更は事務員。hub/dispatch の manual_mailing 経路）"""
+        return DispatchResult(manual_mailing=True)
 
 
 # ── App 30/32 同期検査（daily_healthcheck 監視項目D・02 §4.2）─────────────────

@@ -178,19 +178,182 @@ class TestBuildDocx(unittest.TestCase):
         with self.assertRaises(SoufuAnnaiError):
             run(build_soufu_annai_docx(make_shipping_record(ユニット種別={"value": ""})))
 
-    def test_adapter_prepare_returns_artifact(self):
+    def test_adapter_prepare_returns_artifacts(self):
         records = [block("委任契約書2通"), block("返信用封筒")]
         with patch.dict("os.environ", _OFFICE_ENV), \
              patch("hub.kintone.search_records", new=AsyncMock(return_value=records)):
             result = run(soufu_annai.SoufuAnnaiAdapter().prepare(make_shipping_record()))
-        self.assertEqual(len(result.artifacts), 1)
+        self.assertEqual(len(result.artifacts), 2, "T2-2: docx + 宛名ラベルPDF")
         self.assertEqual(result.artifacts[0].filename, "送付案内.docx")
         self.assertTrue(result.artifacts[0].content.startswith(b"PK"))
+        self.assertEqual(result.artifacts[1].filename, "宛名ラベル.pdf")
+        self.assertTrue(result.artifacts[1].content.startswith(b"%PDF"))
 
-    def test_adapter_is_not_registered_yet(self):
-        """T2-2 まで CHANNEL_REGISTRY に登録されない（承認済 Webhook で誤起動しない）"""
+    def test_adapter_is_registered(self):
+        """T2-2: CHANNEL_REGISTRY に登録済み（ディスパッチャから呼ばれる）"""
         import channels
-        self.assertIsNone(channels.get_adapter("送付案内"))
+        adapter = channels.get_adapter("送付案内")
+        self.assertIsNotNone(adapter)
+        self.assertIsInstance(adapter, soufu_annai.SoufuAnnaiAdapter)
+
+
+class _FakeToolResponse:
+    """create_message_with_fallback の戻り（tool_use ブロック）の代役"""
+
+    def __init__(self, note):
+        class B:
+            type = "tool_use"
+            input = {"note": note}
+        self.content = [B()]
+
+
+class TestTokkiNote(unittest.TestCase):
+    """AI 特記事項（T2-2）: 加飾であり必須依存にしない"""
+
+    def _blocks(self):
+        return [block("委任契約書2通", note="ご返送ください"), block("返信用封筒")]
+
+    def test_generated_note_is_used_and_written_back(self):
+        with patch.dict("os.environ", _OFFICE_ENV), \
+             patch("hub.kintone.search_records",
+                   new=AsyncMock(return_value=self._blocks())), \
+             patch("channels.soufu_annai.create_message_with_fallback",
+                   new=AsyncMock(return_value=_FakeToolResponse("返信用封筒にてご返送ください。"))):
+            result = run(soufu_annai.SoufuAnnaiAdapter().prepare(
+                make_shipping_record(本文_特記事項={"value": ""})))
+        self.assertEqual(result.fields["本文_特記事項"], "返信用封筒にてご返送ください。")
+        doc = Document(io.BytesIO(result.artifacts[0].content))
+        text = "\n".join(p.text for p in doc.paragraphs)
+        self.assertIn("返信用封筒にてご返送ください。", text)
+
+    def test_ai_failure_continues_with_blank(self):
+        """██ AI 生成失敗 → 空欄で prepare 続行（警報なし・成果物は生成される）██"""
+        with patch.dict("os.environ", _OFFICE_ENV), \
+             patch("hub.kintone.search_records",
+                   new=AsyncMock(return_value=self._blocks())), \
+             patch("channels.soufu_annai.create_message_with_fallback",
+                   new=AsyncMock(side_effect=RuntimeError("api down"))), \
+             patch("hub.notify.notify_admin_line", new=AsyncMock()) as alert:
+            result = run(soufu_annai.SoufuAnnaiAdapter().prepare(
+                make_shipping_record(本文_特記事項={"value": ""})))
+        self.assertEqual(len(result.artifacts), 2, "docx+ラベルは生成される")
+        self.assertNotIn("本文_特記事項", result.fields, "空欄のまま（書き戻さない）")
+        alert.assert_not_awaited()
+
+    def test_human_note_is_not_overwritten(self):
+        """人が書いた特記事項があるときは AI を呼ばない"""
+        ai = AsyncMock(return_value=_FakeToolResponse("AIの文"))
+        with patch.dict("os.environ", _OFFICE_ENV), \
+             patch("hub.kintone.search_records",
+                   new=AsyncMock(return_value=self._blocks())), \
+             patch("channels.soufu_annai.create_message_with_fallback", new=ai):
+            result = run(soufu_annai.SoufuAnnaiAdapter().prepare(
+                make_shipping_record(本文_特記事項={"value": "人間が書いた注意書き"})))
+        ai.assert_not_awaited()
+        self.assertNotIn("本文_特記事項", result.fields)
+        doc = Document(io.BytesIO(result.artifacts[0].content))
+        self.assertIn("人間が書いた注意書き", "\n".join(p.text for p in doc.paragraphs))
+
+
+class TestPrepareArtifacts(unittest.TestCase):
+    def test_prepare_outputs_docx_and_label_pdf_and_metadata(self):
+        records = [block("委任契約書2通"), block("返信用封筒", units=("時効援用",))]
+        records[0]["返送要否"] = {"value": "要"}
+        with patch.dict("os.environ", _OFFICE_ENV), \
+             patch("hub.kintone.search_records", new=AsyncMock(return_value=records)):
+            result = run(soufu_annai.SoufuAnnaiAdapter().prepare(make_shipping_record()))
+        names = [a.filename for a in result.artifacts]
+        self.assertEqual(names, ["送付案内.docx", "宛名ラベル.pdf"])
+        self.assertTrue(result.artifacts[1].content.startswith(b"%PDF"))
+        import json as _json
+        meta = _json.loads(result.fields["チャネル固有データ"])
+        self.assertTrue(meta["needs_return"], "返送要否=要 のブロックを含むためフラグON")
+        self.assertEqual(meta["blocks"], ["委任契約書2通", "返信用封筒"])
+
+    def test_dispatch_is_manual_mailing(self):
+        result = run(soufu_annai.SoufuAnnaiAdapter().dispatch(make_shipping_record()))
+        self.assertTrue(result.manual_mailing)
+
+
+class TestEndToEnd(unittest.IsolatedAsyncioTestCase):
+    """██ 起票→承認→出力の一巡（T2-2 完了条件）██
+    下書き Webhook → prepare（docx+ラベル添付・承認待ち・弁護士通知）
+    → 承認済 Webhook → claim → 発送処理中 → 印刷指示（manual_mailing で停止）"""
+
+    async def test_full_cycle(self):
+        import copy
+
+        from hub import dispatch
+
+        store_rec = {
+            "$id": {"value": "9"}, "$revision": {"value": "1"},
+            "発送ステータス": {"value": "下書き"},
+            "チャネル": {"value": "送付案内"},
+            "ユニット種別": {"value": "時効援用"},
+            "件名": {"value": "委任契約書の送付"},
+            "顧客名表示用": {"value": "山田太郎"},
+            "宛先名": {"value": "山田太郎"},
+            "宛先郵便番号": {"value": "332-0001"},
+            "宛先住所": {"value": "埼玉県川口市1-1"},
+            "本文_特記事項": {"value": ""},
+            "同封物選択": {"value": ["委任契約書2通", "返信用封筒"]},
+            "実行済み": {"value": "no"},
+        }
+        records = {"9": store_rec}
+        uploaded, updates = [], []
+
+        async def fake_get(app, rid):
+            return copy.deepcopy(records[rid])
+
+        async def fake_update(app, rid, fields, revision=None):
+            rec = records[rid]
+            cur = int(rec["$revision"]["value"])
+            if revision is not None and int(revision) != cur:
+                raise kintone.KintoneConflict(409, "GAIA_CO02", "conflict")
+            for k, v in fields.items():
+                rec[k] = {"value": v}
+            rec["$revision"] = {"value": str(cur + 1)}
+            updates.append(dict(fields))
+
+        async def fake_upload(app, filename, content, mime):
+            uploaded.append(filename)
+            return f"fk_{len(uploaded)}"
+
+        blocks = [block("委任契約書2通", order="1"), block("返信用封筒", order="2")]
+        notify_admin, notify_attorney = AsyncMock(), AsyncMock()
+
+        with patch.dict("os.environ", _OFFICE_ENV), \
+             patch("hub.kintone.get_record", new=fake_get), \
+             patch("hub.kintone.update_record", new=fake_update), \
+             patch("hub.kintone.upload_file", new=fake_upload), \
+             patch("hub.kintone.search_records", new=AsyncMock(return_value=blocks)), \
+             patch("channels.soufu_annai.create_message_with_fallback",
+                   new=AsyncMock(return_value=_FakeToolResponse("ご返送ください。"))), \
+             patch("hub.notify.notify_admin_line", new=notify_admin), \
+             patch("hub.notify.notify_attorney_approval", new=notify_attorney):
+
+            # ① 起票（下書き保存）→ Webhook
+            await dispatch.process_dispatch("9")
+            self.assertEqual(records["9"]["発送ステータス"]["value"], "承認待ち")
+            self.assertEqual(uploaded, ["送付案内.docx", "宛名ラベル.pdf"])
+            self.assertEqual(records["9"]["成果物"]["value"],
+                             [{"fileKey": "fk_1"}, {"fileKey": "fk_2"}])
+            self.assertEqual(records["9"]["本文_特記事項"]["value"], "ご返送ください。")
+            notify_attorney.assert_awaited_once()
+
+            # ② 弁護士が kintone 上で承認（人の操作をストアで再現）
+            records["9"]["発送ステータス"] = {"value": "承認済"}
+
+            # ③ 承認済 Webhook → claim → 発送処理中 → 印刷指示で停止
+            await dispatch.process_dispatch("9")
+            self.assertEqual(records["9"]["実行済み"]["value"], "yes")
+            self.assertEqual(records["9"]["発送ステータス"]["value"], "発送処理中")
+            texts = [c.args[0] for c in notify_admin.await_args_list]
+            self.assertTrue(any("印刷・投函" in t for t in texts))
+
+            # ④ 二重 Webhook でも再実行されない（冪等）
+            await dispatch.process_dispatch("9")
+            self.assertEqual(records["9"]["発送ステータス"]["value"], "発送処理中")
 
 
 class TestBlockSync(unittest.TestCase):
