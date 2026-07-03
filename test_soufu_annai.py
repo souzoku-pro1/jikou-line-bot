@@ -32,7 +32,20 @@ _OFFICE_ENV = {
     "OFFICE_ZIP": "332-0000",
     "OFFICE_ADDRESS": "埼玉県川口市テスト町1-2-3",
     "OFFICE_TEL": "048-000-0000",
+    "OFFICE_FAX": "048-000-0001",
+    "OFFICE_ATTORNEY": "大野　太郎",
 }
+
+
+def _all_text(docx_bytes: bytes) -> str:
+    """段落＋表セルの全文（新書式は書類表を含むため表も走査）"""
+    doc = Document(io.BytesIO(docx_bytes))
+    parts = [p.text for p in doc.paragraphs]
+    for t in doc.tables:
+        for row in t.rows:
+            for c in row.cells:
+                parts.append(c.text)
+    return "\n".join(parts)
 
 
 def block(key, order="1", units=("時効援用",), note="", name=None):
@@ -158,12 +171,61 @@ class TestBuildDocx(unittest.TestCase):
     def test_generates_docx_with_all_content(self):
         out = self._run(make_shipping_record())
         self.assertTrue(out.startswith(b"PK"))
-        doc = Document(io.BytesIO(out))
-        text = "\n".join(p.text for p in doc.paragraphs)
-        for expected in ("山田太郎", "委任契約書の送付", "■ 委任契約書2通",
-                         "大野法律事務所", "令和", "同封の返信用封筒"):
+        text = _all_text(out)
+        for expected in ("山田太郎",                      # 宛先
+                         "書　類　送　付",     # 事務所書式の表題
+                         "拝啓　時下ますますご清祥",   # 事務所書式の挨拶文
+                         "大野法律事務所", "弁護士　大野　太郎",
+                         "ＴＥＬ：048-000-0000", "ＦＡＸ：048-000-0001",
+                         "令和",
+                         "委任契約書2通",                  # 書類表の書類名
+                         "ご返送ください",                  # 書類表の備考（案内文）
+                         "同封の返信用封筒"):               # 特記事項（人の記入値）
             self.assertIn(expected, text)
         self.assertNotIn("{{", text, "未置換プレースホルダが残っていない")
+
+    def test_table_rows_match_block_count(self):
+        """レイアウト崩れがないこと: 行数が同封物の件数に追従（ヘッダ+件数）"""
+        for n in (1, 2, 5):
+            records = [block(f"書類{i}", order=str(i)) for i in range(n)]
+            rec = make_shipping_record(
+                同封物選択={"value": [f"書類{i}" for i in range(n)]},
+                本文_特記事項={"value": "x"})
+            with patch.dict("os.environ", _OFFICE_ENV), \
+                 patch("hub.kintone.search_records", new=AsyncMock(return_value=records)):
+                out = run(build_soufu_annai_docx(rec))
+            doc = Document(io.BytesIO(out))
+            table = doc.tables[0]
+            self.assertEqual(len(table.rows), 1 + n, f"n={n}: ヘッダ+{n}行")
+            self.assertEqual(len(table.columns), 4, "4列（No./書類名/部数/備考）を維持")
+            # No. 列の連番と部数既定値
+            self.assertEqual(table.rows[1].cells[0].text, "1")
+            self.assertEqual(table.rows[1].cells[2].text, "1", "部数列が無い場合の既定は1")
+
+    def test_remarks_column_reflects_return_flag(self):
+        """備考列: 案内文なし+返送要否=要 → 定型の返送依頼文言"""
+        b1 = block("要返送書類", note="")
+        b1["返送要否"] = {"value": "要"}
+        rec = make_shipping_record(同封物選択={"value": ["要返送書類"]},
+                                   本文_特記事項={"value": "x"})
+        with patch.dict("os.environ", _OFFICE_ENV), \
+             patch("hub.kintone.search_records", new=AsyncMock(return_value=[b1])):
+            out = run(build_soufu_annai_docx(rec))
+        doc = Document(io.BytesIO(out))
+        self.assertIn("ご返送をお願いいたします", doc.tables[0].rows[1].cells[3].text)
+
+    def test_customer_line_omitted_when_empty_or_same(self):
+        """顧客名表示用が空・宛先と同一のときは「（ご依頼者：…）」を印字しない"""
+        for customer in ("", "山田太郎"):  # 空 / 宛先と同一
+            rec = make_shipping_record(顧客名表示用={"value": customer})
+            out = self._run(rec)
+            self.assertNotIn("ご依頼者", _all_text(out), f"customer={customer!r}")
+
+    def test_customer_line_printed_when_different(self):
+        rec = make_shipping_record(宛先名={"value": "アコム株式会社"},
+                                   顧客名表示用={"value": "山田太郎"})
+        out = self._run(rec)
+        self.assertIn("（ご依頼者：山田太郎　様）", _all_text(out))
 
     def test_missing_office_info_raises(self):
         empty = {"OFFICE_NAME": "", "OFFICE_ADDRESS": ""}
