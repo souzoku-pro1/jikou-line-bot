@@ -109,16 +109,22 @@ P7 仕上げ（運用ドキュメント・全体回帰）
   実アプリ ID = 30。Webhook 登録と `HUB_WEBHOOK_TOKEN` は /hub/dispatch 実装後（T1-2）に実施。
   `同封物選択` は仮選択肢「（未設定）」のため required_options を置かない（T2-1 で差し替え）
 
-#### T1-2 状態機械・承認・ディスパッチャ（`hub/approval.py` / `hub/dispatch.py` / `channels/base.py`）
+#### T1-2 状態機械・承認・ディスパッチャ（`hub/approval.py` / `hub/dispatch.py` / `channels/base.py`）（**実施済み 2026-07-03**）
 - 参照: 03 §5、01 §4
 - 作業: 遷移表・claim_execution（revision 楽観ロック）・`POST /hub/dispatch`・
   CHANNEL_REGISTRY・notify_attorney_approval。テスト用フェイクチャネルで一巡を検証
 - 完了条件:
-  - [ ] `test_hub_dispatch.py` 新規: 下書き→prepare→承認待ち／承認済→claim→dispatch→発送済／
+  - [x] `test_hub_dispatch.py` 新規: 下書き→prepare→承認待ち／承認済→claim→dispatch→発送済／
         二重 Webhook で dispatch 1回／禁止遷移の総当たり検査／却下・エラー経路
-  - [ ] **「承認待ち→承認済」へ遷移させるコードパスが存在しない**ことをテストで担保
-        （transition() が該当遷移を人以外に許さない）
-  - [ ] 既存テスト全 PASS
+        （+ `test_hub_approval.py`: 10×10全組の総当たり・claim 3分岐）
+  - [x] **「承認待ち→承認済」へ遷移させるコードパスが存在しない**ことをテストで担保
+        （SERVER_TRANSITIONS に →承認済 の組が無いことの検査 + 全状態からの遷移拒否 +
+         dispatch モジュールが 発送ステータス を直接書かないソースレベル検査）
+  - [x] 既存テスト全 PASS（187件・無変更）
+- 実装ノート: 未対応チャネルは「状態を変えず警報のみ」（承認可能性の保全・エラー遷移にしない）。
+  manual_mailing チャネルは 発送処理中 で停止し印刷指示を LINE 通知（発送済への変更は事務員）。
+  返送期限の自動設定は T1-4 で追加。**kintone 側の Webhook 登録と HUB_WEBHOOK_TOKEN の
+  Railway 登録はデプロイ後の人の作業**（App 30 作成手順書 §4 参照）
 
 #### T1-3 `hub/address_label.py`（reportlab 座標印字エンジン）
 - 参照: 03 §7

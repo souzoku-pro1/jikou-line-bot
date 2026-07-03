@@ -14,8 +14,10 @@ app = FastAPI()
 
 from cloudsign_webhook import router as cloudsign_router
 from document_webhook import router as document_router
+from hub.dispatch import router as hub_dispatch_router
 app.include_router(cloudsign_router)
 app.include_router(document_router)
+app.include_router(hub_dispatch_router)
 
 from chat_responder import (
     get_app21_record,
