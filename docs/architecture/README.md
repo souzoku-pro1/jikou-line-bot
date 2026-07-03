@@ -21,6 +21,7 @@
 | 7 | [07-module-04-soufu-annai.md](07-module-04-soufu-annai.md) | モジュール4: 送付案内システム |
 | 8 | [08-module-05-scan-pipeline.md](08-module-05-scan-pipeline.md) | モジュール5: スキャン→OCR→kintone 受領パイプライン |
 | 9 | [09-implementation-plan.md](09-implementation-plan.md) | 依存関係・推奨実装順序・**Sonnet 発注用タスク分解（完了条件付き）** |
+| 10 | [10-unit-02-souzoku-houki.md](10-unit-02-souzoku-houki.md) | **ユニット2: 相続放棄**（B案ベース受任フロー・電話推奨度判定・熟慮期間管理・App 33。相続放棄の正本。詳細は [docs/souzoku-houki/](../souzoku-houki/README.md)） |
 
 ## Sonnet への発注方法
 

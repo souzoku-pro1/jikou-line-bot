@@ -1,5 +1,12 @@
 # 08. 実装タスク分解とハブタスク台帳との統合実装順序
 
+> **正本参照（2026-07-03）**: 相続放棄ユニットの正本は
+> [docs/architecture/10-unit-02-souzoku-houki.md](../architecture/10-unit-02-souzoku-houki.md)。
+> 本ファイルと記述が衝突する場合は正本が優先する（受任フロー=B案ベース・裁量スキップ、
+> 料金=88,000円+2人目以降33,000円、契約順序=決済→CloudSign、予約枠アプリ不採用 等の変更あり）。
+> 本ファイルは詳細設計・履歴として存置。
+
+
 相続放棄ユニットのタスクは **H系列**。発送/受領ハブの **T系列**
 （[docs/architecture/09-implementation-plan.md](../architecture/09-implementation-plan.md)・全19+1タスク）
 への依存を各タスクに明示する。発注方法・プロンプト雛形・全タスク共通の完了条件
