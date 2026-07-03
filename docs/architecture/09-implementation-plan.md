@@ -63,14 +63,20 @@ P7 仕上げ（運用ドキュメント・全体回帰）
   hub 経由化したのは 合言葉検証・recordId 抽出・最新レコード再取得と、
   document_webhook の kintone I/O 全部
 
-#### T0-2 `hub/notify.py` + `hub/scheduler.py` の新設
+#### T0-2 `hub/notify.py` + `hub/scheduler.py` の新設（**実施済み 2026-07-03**）
 - 参照: 03 §8・§9
 - 作業: `notify_admin_line` を claude_gateway から移設（re-export 維持）、
   LINE Push 実装の一本化、ジョブレジストリ実装、daily_healthcheck を register_daily 経由に移行
 - 完了条件:
-  - [ ] `test_hub_notify.py` / `test_hub_scheduler.py` 新規（スロットル・ジョブ隔離・時刻計算）
-  - [ ] `railway run python daily_healthcheck.py` の手動実行インターフェースが従前どおり動く
-  - [ ] 既存テスト全 PASS
+  - [x] `test_hub_notify.py` / `test_hub_scheduler.py` 新規（スロットル・ジョブ隔離・時刻計算）
+  - [x] `railway run python daily_healthcheck.py` の手動実行インターフェースが従前どおり動く
+        （__main__ 経路・exit code・[HEALTHCHECK] ログ書式まで確認）
+  - [x] 既存テスト全 PASS（cloudsign / T0-1 回帰 / triage 分類一致率含む）
+- 実装ノート: LINE Push の一本化は hub/notify（push_line_message + notify_admin_line）
+  まで。chat_responder / cloudsign_webhook / main.py に残る Push 実装の呼び替えは
+  各モジュールの一般化タスク（G1〜G4）のスコープ。ジョブ登録名 "HEALTHCHECK" により
+  Railway の登録ログは従来と同一書式。二重 startup 時に旧実装はループが二重化し得たが、
+  レジストリ化で1タスクに保証される（改善・test_hub_scheduler で検証）
 
 #### T0-3 `hub/docx_builder.py` の新設 + `config.py` UNIT_CONFIG
 - 参照: 03 §6・§10
