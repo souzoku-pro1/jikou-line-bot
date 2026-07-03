@@ -9,6 +9,8 @@
      一致するか検証する
   C. docx テンプレートに、コードが差し込むプレースホルダが揃っているか検証する
      （config.EXPECTED_DOCX_TEMPLATES と照合・T0-3 で追加）
+  D. App 32（同封物ブロックマスタ）の有効ブロックキーが App 30『同封物選択』の
+     選択肢と同期しているか検証する（docs/architecture/02 §4.2・T2-1 で追加）
 
 異常時のみ LINE Push で管理者に通知する。正常時はログのみ。
 
@@ -182,6 +184,11 @@ async def run_healthcheck() -> list[str]:
         problems += check_templates()
     except Exception as e:
         problems.append(f"テンプレート監視の実行自体が失敗: {str(e)[:150]}")
+    try:
+        from channels.soufu_annai import check_block_sync  # 監視項目D（T2-1）
+        problems += await check_block_sync()
+    except Exception as e:
+        problems.append(f"App30/32同期監視の実行自体が失敗: {str(e)[:150]}")
 
     if problems:
         logger.error("healthcheck NG (%d problems): %s", len(problems), problems)

@@ -15,3 +15,9 @@ def register(adapter: ChannelAdapter) -> None:
 
 def get_adapter(channel_name: str) -> ChannelAdapter | None:
     return CHANNEL_REGISTRY.get(channel_name)
+
+
+# ── 実装済みチャネルの登録（T2-2〜） ─────────────────────────────────────────
+from channels.soufu_annai import SoufuAnnaiAdapter  # noqa: E402
+
+register(SoufuAnnaiAdapter())

@@ -197,7 +197,8 @@ def render_label_sheet(addresses: list[dict], layout: str = "A4_2x6",
             base_x = col * cell_w
             base_y = h_mm - (row + 1) * cell_h  # 左上の面から順に
             items = _address_items(addr.get("宛先名", ""), addr.get("郵便番号", ""),
-                                   addr.get("住所", ""), cell_w, cell_h)
+                                   addr.get("住所", ""), cell_w, cell_h,
+                                   honorific=addr.get("敬称", "様"))
             for item in items:
                 size = item.font_size
                 if item.max_width_mm is not None:
