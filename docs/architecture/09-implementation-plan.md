@@ -94,14 +94,20 @@ P7 仕上げ（運用ドキュメント・全体回帰）
 
 ### P1: ハブ中核
 
-#### T1-1 App 30 発送管理の作成とスキーマ監視
+#### T1-1 App 30 発送管理の作成とスキーマ監視（**実施済み 2026-07-03**）
 - 参照: 02 §2・§6・§7
 - 作業: 【人の作業】kintone で App 30 を 02 §2.1 どおり作成し、Webhook・一覧・API トークンを設定、
   Railway に `APP_SHIPPING` / `TOKEN_SHIPPING` / `HUB_WEBHOOK_TOKEN` を登録。
   【Sonnet】`EXPECTED_KINTONE_SCHEMA` に App 30 を追加
 - 完了条件:
-  - [ ] `railway run python daily_healthcheck.py` が App 30 込みで exit 0
-  - [ ] スキーマ定義のユニットテスト（選択肢網羅）PASS・既存テスト全 PASS
+  - [x] `railway run python daily_healthcheck.py` が App 30 込みで exit 0（異常0件・8アプリ目として検証）
+  - [x] スキーマ定義のユニットテスト（選択肢網羅）PASS・既存テスト全 PASS（`test_config_schema.py`・全110件）
+- 実装ノート: アプリ作成は Computer Use（docs/instructions/cu-app30.md）で実施したが、
+  フィールドコードが英語に意訳される等4種の不一致が発生 → フォーム更新 API で修正
+  （25件リネーム・NUMBER→SINGLE_LINE_TEXT の2件再作成・登録時初期値2件 OFF）し、
+  フォーム設計 API の機械突合で **27/27 全一致**を確認してから登録した。
+  実アプリ ID = 30。Webhook 登録と `HUB_WEBHOOK_TOKEN` は /hub/dispatch 実装後（T1-2）に実施。
+  `同封物選択` は仮選択肢「（未設定）」のため required_options を置かない（T2-1 で差し替え）
 
 #### T1-2 状態機械・承認・ディスパッチャ（`hub/approval.py` / `hub/dispatch.py` / `channels/base.py`）
 - 参照: 03 §5、01 §4
