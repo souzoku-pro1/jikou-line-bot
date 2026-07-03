@@ -65,6 +65,11 @@ async def health():
         status["python-docx"] = "ok"
     except ImportError as e:
         status["python-docx"] = f"NG: {e}"
+    try:
+        from hub.address_label import font_status  # reportlab + 同梱フォント（T1-3）
+        status["reportlab"] = font_status()
+    except Exception as e:
+        status["reportlab"] = f"NG: {e}"
     return {"status": "ok", "deps": status}
 
 
