@@ -128,7 +128,8 @@ class TestFullCycle(unittest.IsolatedAsyncioTestCase):
                          ["発送準備チェックリスト.pdf", "職務上請求書_様式1_戸籍謄本.pdf",
                           "レターパック往復ラベル.pdf"])
         self.notify_attorney.assert_awaited_once()
-        self.assertEqual(self.store.field("宛先名"), "川口市　市民課")
+        # 2026-07-04 修正: 封筒宛先は施設名表記（川口市→川口市役所）
+        self.assertEqual(self.store.field("宛先名"), "川口市役所　市民課")
 
         # 2) 人が承認（承認待ち→承認済は kintone 上の人の操作）→ Webhook 再発火
         self.store.records["9"]["発送ステータス"] = {"value": "承認済"}
