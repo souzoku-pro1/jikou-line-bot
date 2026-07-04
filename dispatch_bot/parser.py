@@ -10,6 +10,8 @@
 """
 
 
+import json
+
 import anthropic
 
 from claude_gateway import create_message_with_fallback
@@ -70,7 +72,11 @@ def build_system_prompt() -> str:
 - 顧客への返信文を作らない（この会話に顧客はいない）
 - 法的判断・文面の創作をしない（あなたの仕事は構造化のみ）
 - 該当するタスク種別がなければ task_type=null とする（intent は task のままでよい）
-- 解釈に自信がなければ confidence=low とし clarification に聞き返し文を書く
+- confidence は「task_type を正しく特定できたか」への自信。task_type が特定できたなら
+  medium 以上とする。種別の別名の写像（例: 附票→戸籍の附票）・全角数字の変換・
+  氏名が顧客名か対象者か不明といった曖昧さは low の理由にしない
+  （不明な項目は null / 未設定にすればよい。不足はシステム側が個別に聞き返す）
+- task_type が特定できないときのみ confidence=low とし clarification に聞き返し文を書く
 - missing_fields には各タスクの「必須入力項目」として上に明示されたものだけを入れる。
   一覧にない入力項目（書類名・送付日・部数など）を**創作して要求しない**
 - clarification に書くのは missing_fields に挙げた項目の確認のみ。複数項目を
@@ -106,9 +112,15 @@ async def parse_instruction(text: str) -> dict:
     )
     for block in response.content:
         if block.type == "tool_use" and block.name == "parse_instruction":
-            parsed = _normalize(dict(block.input))
+            raw = dict(block.input)
+            parsed = _normalize(raw)
+            # raw confidence（正規化前）と task_params 要約も出す（2026-07-04 調査で
+            # 「正規化発動の有無」「抽出結果」がログから判別できなかったため）
+            params = json.dumps(parsed["task_params"], ensure_ascii=False)[:300]
             print(f"[DISPATCHBOT] parsed intent={parsed['intent']} "
-                  f"task={parsed['task_type']} conf={parsed['confidence']}")
+                  f"task={parsed['task_type']} conf={parsed['confidence']} "
+                  f"(raw_conf={raw.get('confidence')!r}) "
+                  f"customer={parsed['customer_name']!r} params={params}")
             return parsed
     raise ValueError("parse_instruction の tool_use ブロックがありません "
                      f"(stop_reason={response.stop_reason})")

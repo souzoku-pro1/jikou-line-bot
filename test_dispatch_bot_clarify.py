@@ -80,8 +80,13 @@ class TestClarifyIsRegistryDriven(unittest.IsolatedAsyncioTestCase):
         for data in cases:
             handler.reset_sessions()
             with self.subTest(confidence=data["confidence"]):
+                # 2026-07-04 低確信度分岐の限定後は low でもフローが進むため、
+                # 同封物選択肢（App 32）もモックする
                 with patch.object(parser, "parse_instruction",
                                   new=AsyncMock(return_value=data)), \
+                     patch.object(enclosures, "list_options",
+                                  new=AsyncMock(return_value=[enclosures.EnclosureOption(
+                                      key="委任契約書", label="委任契約書")])), \
                      patch.object(case_search, "search_cases",
                                   new=AsyncMock(return_value=[hit()])):
                     reply = await handler.handle_message("U1", "送付案内作って")
