@@ -97,12 +97,17 @@ def confirmation_message(spec: TaskSpec, case: CaseHit, parsed: dict) -> str:
         noun = spec.display_name.removesuffix("の作成")
         return (f"{warn}{case.customer_name}さん（No.{case.record_id}・{case.status}）に"
                 f"{noun}{enc}を起票します。\nOK / キャンセル（30分有効）")
-    # 中・高リスク: フルテンプレ（06 §2.2。D3 時点の登録タスクは低のみ・D4 以降で使用）
+    # 中・高リスク: フルテンプレ（06 §2.2。D4: 職務上請求で使用）
     enc_line = f"同封物: {'・'.join(labels)}\n" if labels else ""
+    # タスク固有の明細行（D4: 対象者・種別と通数・宛先自治体・小為替概算等はレジストリの
+    # summary_fn から。文言をチャネル知識ごと confirm に持ち込まない）
+    detail = ""
+    if spec.summary_fn:
+        detail = "\n".join(spec.summary_fn(parsed)) + "\n"
     return (f"【確認】以下で起票します\n{warn}"
             f"案件: No.{case.record_id} {case.customer_name}（{case.unit}・{case.status}）\n"
             f"タスク: {spec.display_name}（{'App 30 起票' if spec.destination == 'app30' else '実行キュー起票'}）\n"
-            f"{enc_line}"
+            f"{enc_line}{detail}"
             f"実行範囲: {spec.auto_scope}\n"
             f"対外送信: なし（対外実行の承認は従来どおり kintone で行います）\n"
             f"リスク区分: {spec.risk}\n"

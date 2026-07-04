@@ -21,7 +21,9 @@ from hub import kintone, notify
 _SESSION_TTL_SEC = 30 * 60
 _MAX_CLARIFY = 2  # 聞き返しは2往復まで（03 §7）
 
-MSG_UNSUPPORTED = "第1弾では送付案内のみ対応しています"
+MSG_UNSUPPORTED = ("未対応のタスクです。現在対応: "
+                   + "・".join(s.display_name for s in registry.TASK_REGISTRY.values()
+                               if not s.answer_only))
 MSG_QUERY_LATER = "照会機能（要対応一覧など）は第2弾で実装されます"
 MSG_NO_PENDING = ("確認待ちの指示はありません（期限切れの可能性があります）。"
                   "もう一度指示してください")
@@ -43,7 +45,11 @@ class Session:
     clarify_count: int = 0              # これまでに聞き返した回数
     candidates: list = field(default_factory=list)   # 案件複数候補（番号選択待ち）
     enclosure_options: list = field(default_factory=list)  # 同封物選択肢（番号選択待ち）
-    parsed: dict | None = None          # 番号選択待ち時の解析結果
+    parsed: dict | None = None          # 番号選択・選択肢待ち時の解析結果
+    topic: str = ""                     # 直前に聞いた論点（同一論点の再質問は1回まで・D4）
+    topic_repeat: int = 0               # 同一論点の再質問回数
+    choice: str = ""                    # pre_confirm 選択肢待ち（task_type を格納）
+    case_hit: object = None             # 選択肢待ち時の確定済み案件
     created_at: float = field(default_factory=time.monotonic)
 
     def expired(self) -> bool:
@@ -86,7 +92,7 @@ async def _execute_confirmed(user_id: str) -> str:
         return f"実行済みです（App 30 No.{pending.record_id}）\n{pending.record_url}"
 
     try:
-        rid, url, already = await app30_filer.file_soufu_annai(pending)
+        rid, url, already = await app30_filer.file_from_pending(pending)
     except kintone.KintoneError as e:
         # 起票失敗: ユーザーに通知＋管理者警報。pending は消込済みでよい（再指示でやり直し）
         confirm.invalidate(user_id)
@@ -125,14 +131,25 @@ def _first_missing_question(spec, parsed: dict) -> str | None:
     return None
 
 
-def _ask(session_user: str, base_text: str, question: str,
-         prev: Session | None) -> str:
-    """聞き返し（回数管理・2往復で打ち切り・03 §7）"""
+def _ask(session_user: str, base_text: str, topic: str, question: str,
+         prev: Session | None, spec=None, **extra) -> str:
+    """聞き返し（03 §7・D4改訂）:
+    - 1論点1往復×必要項目数まで許容（総往復上限は spec.max_clarify・既定2）
+    - 同一論点の再質問は1回まで（2回聞いても埋まらなければ打ち切り）
+    - 上限超過は打ち切り→kintone直接起票を案内"""
     count = (prev.clarify_count if prev else 0) + 1
-    if count > _MAX_CLARIFY:
+    max_rounds = spec.max_clarify if spec else _MAX_CLARIFY
+    if count > max_rounds:
         _sessions.pop(session_user, None)
         return MSG_GIVE_UP
-    _sessions[session_user] = Session(base_text=base_text, clarify_count=count)
+    repeat = 0
+    if prev and prev.topic == topic:
+        repeat = prev.topic_repeat + 1
+        if repeat > 1:  # 質問1回＋再質問1回で埋まらない論点は打ち切り
+            _sessions.pop(session_user, None)
+            return MSG_GIVE_UP
+    _sessions[session_user] = Session(base_text=base_text, clarify_count=count,
+                                      topic=topic, topic_repeat=repeat, **extra)
     return question
 
 
@@ -147,6 +164,22 @@ async def handle_message(user_id: str, text: str) -> str:
 async def _handle(user_id: str, text: str) -> str:
     text = (text or "").strip()
     session = _get_session(user_id)
+
+    # ── 選択肢応答（pre_confirm の 1/2。App 31 未登録時等・D4） ──────────────
+    if session and session.choice and re.fullmatch(r"[12]", text):
+        spec = registry.get_task(session.choice)
+        action, msg = spec.choice_fn(session.parsed, int(text))
+        if action == "invalid":
+            return msg
+        parsed = session.parsed
+        hit = session.case_hit
+        base_text = session.base_text
+        _sessions.pop(user_id, None)
+        if action == "abort":
+            return msg
+        return _start_confirmation(user_id, parsed, hit, base_text)
+    if session and session.choice and re.fullmatch(r"\d{1,2}", text):
+        return "1 か 2 の番号で選んでください"
 
     # ── 番号選択①: 同封物（複数可・カンマ区切り。現対話への応答・06 §3.1） ──
     if session and session.enclosure_options and             re.fullmatch(r"\d{1,2}(\s*[,、，]\s*\d{1,2})*", text):
@@ -173,8 +206,9 @@ async def _handle(user_id: str, text: str) -> str:
         if 1 <= idx <= len(session.candidates):
             hit = session.candidates[idx - 1]
             parsed = session.parsed
+            base_text = session.base_text
             _sessions.pop(user_id, None)
-            return _start_confirmation(user_id, parsed, hit, session.base_text)
+            return await _finalize(user_id, parsed, hit, base_text)
         return f"1〜{len(session.candidates)} の番号で選んでください"
 
     # ── 解析（聞き返し中なら元指示に回答を結合して再解析・03 §7） ─────────
@@ -203,7 +237,7 @@ async def _handle(user_id: str, text: str) -> str:
         return prefix + MSG_QUERY_LATER
     if intent == "unknown":
         question = parsed["clarification"] or MSG_UNKNOWN
-        return prefix + _ask(user_id, base_text, question, session)
+        return prefix + _ask(user_id, base_text, "unknown", question, session)
 
     # ── intent == task ───────────────────────────────────────────────────
     spec = registry.get_task(parsed["task_type"])
@@ -213,18 +247,22 @@ async def _handle(user_id: str, text: str) -> str:
     if parsed["confidence"] == "low":
         # タスク種別が特定できている低確信度は定型で聞き返す
         # （モデルの clarification は使わない＝存在しない項目の創作防止）
-        return prefix + _ask(user_id, base_text,
+        return prefix + _ask(user_id, base_text, "low_confidence",
                              "指示の内容をもう少し具体的に教えてください"
-                             "（例:「鈴木さんに送付案内を作って」）", session)
+                             "（例:「鈴木さんに送付案内を作って」）", session, spec)
 
     # 必須項目の不足 → 聞き返し（1論点ずつ・03 §7）。
     # ★質問文は必ずレジストリの定義（required_fields / field_questions）から組み立てる。
     #   モデルの missing_fields / clarification をそのまま出さない（2026-07-04 不具合修正:
     #   「書類名」「送付日」等、レジストリに存在しない項目を創作して3項目同時に
     #   要求する事象が実機で発生したため）
+    if spec.param_normalizer:
+        # モデル抽出値の検証・正規化（不正種別・通数は落として聞き返しに乗せる・D4）
+        parsed["task_params"] = spec.param_normalizer(parsed["task_params"])
+
     question = _first_missing_question(spec, parsed)
     if question:
-        return prefix + _ask(user_id, base_text, question, session)
+        return prefix + _ask(user_id, base_text, "customer_name", question, session, spec)
 
     # ── 同封物の解決（必須・動的選択肢。2026-07-04 実機エラー対応） ────────
     # 選択肢は App 32 の有効ブロックから動的取得（ハードコードしない）。
@@ -240,13 +278,17 @@ async def _handle(user_id: str, text: str) -> str:
             parsed["task_params"]["enclosures"] = [o.key for o in matched]
             parsed["task_params"]["enclosure_labels"] = [o.label for o in matched]
         else:
-            count = (session.clarify_count if session else 0) + 1
-            if count > _MAX_CLARIFY:
-                _sessions.pop(user_id, None)
-                return prefix + MSG_GIVE_UP
-            _sessions[user_id] = Session(base_text=base_text, clarify_count=count,
-                                         enclosure_options=options, parsed=parsed)
-            return prefix + enclosures.format_question(options)
+            return prefix + _ask(user_id, base_text, "enclosures",
+                                 enclosures.format_question(options), session, spec,
+                                 enclosure_options=options, parsed=parsed)
+
+    # ── タスク固有の動的必須項目（D4: 職務上請求は種別通数→自治体→対象者→
+    #    生年月日〔様式1のみ〕の順に1論点ずつ。質問文はレジストリ定義から） ──────
+    if spec.missing_param_fn:
+        field_key = spec.missing_param_fn(parsed)
+        if field_key:
+            q = spec.field_questions.get(field_key, f"「{field_key}」を教えてください")
+            return prefix + _ask(user_id, base_text, field_key, q, session, spec)
 
     return prefix + await _resolve_case_and_confirm(user_id, parsed, base_text)
 
@@ -265,6 +307,21 @@ async def _resolve_case_and_confirm(user_id: str, parsed: dict, base_text: str) 
         _sessions[user_id] = Session(base_text=base_text, candidates=hits, parsed=parsed)
         return case_search.format_choices(hits, parsed["customer_name"])
 
+    return await _finalize(user_id, parsed, hits[0], base_text)
+
+
+async def _finalize(user_id: str, parsed: dict, hit: case_search.CaseHit,
+                    base_text: str) -> str:
+    """案件確定後の最終処理: pre_confirm フック（App 31照合等・D4）→ 復唱確認"""
+    spec = registry.get_task(parsed["task_type"])
+    if spec and spec.pre_confirm_fn:
+        action, payload = await spec.pre_confirm_fn(parsed)
+        if action == "choice":
+            # 選択肢（1/2）待ち。応答は choice_fn で処理（現対話への応答扱い）
+            _sessions[user_id] = Session(base_text=base_text, parsed=parsed,
+                                         case_hit=hit, choice=parsed["task_type"])
+            return payload
+
     # ── 解釈確定 → 復唱確認＋pending 発行（D3・06 §2-3） ────────────────
     _sessions.pop(user_id, None)
-    return _start_confirmation(user_id, parsed, hits[0], base_text)
+    return _start_confirmation(user_id, parsed, hit, base_text)

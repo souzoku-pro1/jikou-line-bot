@@ -40,8 +40,56 @@ async def find_existing(command_id: str) -> str | None:
     return None
 
 
-async def file_soufu_annai(pending: Pending) -> tuple[str, str, bool]:
-    """送付案内を App 30 に「下書き」で起票する。
+def _audit_meta(pending: Pending) -> dict:
+    """指示Bot由来の監査メタ（チャネル固有データに併記・02 §6。
+    prepare 側の書き戻しは hub/dispatch のマージにより本キーを保持する）"""
+    return {"dispatch_bot": {
+        "指示原文": pending.instruction_text,
+        "userId": pending.user_id,
+        "解釈日時": datetime.now(_JST).isoformat(timespec="seconds"),
+        "pending_command_id": pending.command_id,
+    }}
+
+
+def _fields_soufu_annai(pending: Pending, case_rec: dict, customer: str) -> dict:
+    return {
+        "チャネル": "送付案内",
+        "件名": f"送付案内（{customer}）",
+        "宛先名": customer,
+        "宛先郵便番号": case_rec.get("郵便番号", {}).get("value", ""),
+        "宛先住所": case_rec.get("住所", {}).get("value", ""),
+        # 同封物選択はブロックキーで設定（App 30 のチェックボックス選択肢は
+        # App 32 のブロックキーと同期・architecture/02 §4.2。空だと prepare が
+        # 「同封物が選択されていません」でエラーになるため必須・2026-07-04 修正）
+        "同封物選択": pending.parsed.get("task_params", {}).get("enclosures") or [],
+        "チャネル固有データ": json.dumps(_audit_meta(pending), ensure_ascii=False),
+    }
+
+
+def _fields_shokumu_seikyu(pending: Pending, case_rec: dict, customer: str) -> dict:
+    """職務上請求（D4）: チャネル固有JSONは channels/shokumu_seikyu.parse_channel_data が
+    通る形式（request_items/municipality/target/purpose・04 §2）＋監査メタ併記。
+    宛先名は空で起票する（prepare が App 31 から施設名で解決して書き戻す）"""
+    from dispatch_bot import shokumu
+    channel_json = shokumu.build_channel_json(pending.parsed)
+    return {
+        "チャネル": "職務上請求",
+        "件名": f"職務上請求（{customer}・{channel_json['municipality']}）",
+        "宛先名": "",
+        "宛先郵便番号": "",
+        "宛先住所": "",
+        "チャネル固有データ": json.dumps({**channel_json, **_audit_meta(pending)},
+                                          ensure_ascii=False),
+    }
+
+_FIELDS_BY_TASK = {
+    "soufu_annai": _fields_soufu_annai,
+    "shokumu_seikyu": _fields_shokumu_seikyu,
+}
+
+
+async def file_from_pending(pending: Pending) -> tuple[str, str, bool]:
+    """pending のタスク種別に応じて App 30 に「下書き」で起票する。
 
     Returns: (record_id, record_url, already_filed)
     already_filed=True は二重実行ガードで既存レコードを検出した場合（新規作成なし）
@@ -51,33 +99,20 @@ async def file_soufu_annai(pending: Pending) -> tuple[str, str, bool]:
         print(f"[DISPATCHBOT] duplicate filing blocked cmd={pending.command_id[:8]} -> No.{existing}")
         return existing, record_url(existing), True
 
-    # 宛先は App 21 の案件データから（05 §3.1: 宛先は案件から解決）
+    # 宛先・顧客名は App 21 の案件データから（05 §3.1: 宛先は案件から解決）
     case_rec = await kintone.get_record(APP_CASE, pending.case.record_id)
     customer = case_rec.get("顧客名", {}).get("value", "") or pending.case.customer_name
 
-    meta = {"dispatch_bot": {
-        "指示原文": pending.instruction_text,
-        "userId": pending.user_id,
-        "解釈日時": datetime.now(_JST).isoformat(timespec="seconds"),
-        "pending_command_id": pending.command_id,
-    }}
+    task_type = pending.parsed.get("task_type") or ""
+    build = _FIELDS_BY_TASK[task_type]  # レジストリ登録タスクのみ到達（KeyErrorは実装漏れ）
     fields = {
         "発送ステータス": "下書き",
-        "チャネル": "送付案内",
         "ユニット種別": pending.case.unit,
-        "件名": f"送付案内（{customer}）",
         "顧客名表示用": customer,
-        "宛先名": customer,
-        "宛先郵便番号": case_rec.get("郵便番号", {}).get("value", ""),
-        "宛先住所": case_rec.get("住所", {}).get("value", ""),
         "案件アプリID": os.environ.get("KINTONE_APP_ID", ""),
         "案件レコードID": pending.case.record_id,
-        # 同封物選択はブロックキーで設定（App 30 のチェックボックス選択肢は
-        # App 32 のブロックキーと同期・architecture/02 §4.2。空だと prepare が
-        # 「同封物が選択されていません」でエラーになるため必須・2026-07-04 修正）
-        "同封物選択": pending.parsed.get("task_params", {}).get("enclosures") or [],
         "実行済み": "no",
-        "チャネル固有データ": json.dumps(meta, ensure_ascii=False),
+        **build(pending, case_rec, customer),
     }
     # ★単票API（POST /k/v1/record.json）で起票すること。
     # 一括API（records.json・create_records）は kintone 仕様で「レコード追加」Webhook が

@@ -45,8 +45,9 @@ def run(coro):
 
 
 class TestRegistry(unittest.TestCase):
-    def test_only_soufu_annai_registered(self):
-        self.assertEqual(set(registry.TASK_REGISTRY), {"soufu_annai"})
+    def test_registered_tasks(self):
+        """D4 で shokumu_seikyu が追加（第1.5弾）。それ以外は未登録のまま"""
+        self.assertEqual(set(registry.TASK_REGISTRY), {"soufu_annai", "shokumu_seikyu"})
         spec = registry.get_task("soufu_annai")
         self.assertFalse(spec.answer_only)
         self.assertEqual(spec.destination, "app30")
@@ -59,7 +60,7 @@ class TestRegistry(unittest.TestCase):
         self.assertIn(catalog.splitlines()[0], parser.build_system_prompt())
 
     def test_unknown_task_type_returns_none(self):
-        self.assertIsNone(registry.get_task("shokumu_seikyu"))
+        self.assertIsNone(registry.get_task("fax_send"))
         self.assertIsNone(registry.get_task(None))
 
 
@@ -187,9 +188,10 @@ class TestHandler(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(reply, case_search.NOT_FOUND_MESSAGE)
 
     async def test_unsupported_task_type(self):
-        p, s = self._patch(parsed(task_type="shokumu_seikyu"))
+        """未登録タスク（例: FAX送信）は案内を返す（職務上請求は D4 で対応済みのため題材変更）"""
+        p, s = self._patch(parsed(task_type="fax_send"))
         with p, s:
-            reply = await handler.handle_message("U1", "佐藤さんの職務上請求を川口市宛で")
+            reply = await handler.handle_message("U1", "佐藤さんに受任通知をFAXして")
         self.assertEqual(reply, handler.MSG_UNSUPPORTED)
 
     async def test_query_intent_returns_phase2_notice(self):
