@@ -48,8 +48,23 @@ D5→D6→D7〜D10（第2弾・D5のkintone作成が先行）。D11〜D13（第3
 - デプロイ前確認: main.py の差分が include_router 1行であること
 - 実機確認: LINE Developers でWebhook検証→オーナー送信でエコー→別アカウントで沈黙+警報
 
-### D2 自然言語解析＋案件検索
+### D2 自然言語解析＋案件検索　★実施済み（2026-07-04）
 - 目的: claude_gateway 経由の構造化解析と App 21 横断検索（03）
+- 実装ノート（2026-07-04）:
+  - dispatch_bot/ に parser.py（tool use強制・context="指示Bot解析"・正規化）・
+    case_search.py（顧客名like・0件時は空白除去/姓のみで1回だけ再検索・完了/不受任は⚠付き）・
+    registry.py（TaskSpec＋soufu_annaiのみ・解析プロンプトの種別一覧はレジストリから自動生成）・
+    handler.py（応答組み立て・セッション）を新設
+  - 聞き返しセッションはインメモリ30分TTL・ユーザーごと最大1件。回答は元指示に
+    「（追加回答）」で結合して再解析。2往復で打ち切り（03 §7 どおり）
+  - 複数候補は番号選択（同姓同名はNo・statusで区別）。範囲外番号は再案内
+  - D2の終点は【解釈結果】の提示（復唱・pending・起票はD3）。intent=confirm は
+    「確認待ちの指示はありません」・query は「第2弾で実装」・未対応タスクは
+    「第1弾では送付案内のみ対応しています」
+  - ClaudeUnavailableError は定型返信（起票ゼロ・顧客Botのような承認キュー起票はしない）
+  - D1テストのうち固定応答を検証していた2件は、D2仕様（⑤固定応答の置換）に伴い
+    handler モック方式に更新（それ以外の既存テストは無変更）
+  - テスト: test_dispatch_bot_parser.py 26件。全体 389 passed / 2 skipped
 - 依存: D1
 - 変更対象: dispatch_bot/router.py（エコーを解析に差し替え）
 - 新規: `dispatch_bot/parser.py`（tool useスキーマ・プロンプト）・`dispatch_bot/case_search.py`・

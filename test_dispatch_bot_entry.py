@@ -113,17 +113,21 @@ class TestSignature(unittest.TestCase):
 
 
 class TestWhitelist(unittest.TestCase):
-    def test_allowed_user_gets_fixed_reply(self):
-        resp, reply, alert = _post(_event_body(user_id="U_owner1"))
+    def test_allowed_user_gets_handled_reply(self):
+        """許可内メッセージは handler の応答が返る（D2 で固定応答から解析応答に置換）"""
+        with patch("dispatch_bot.handler.handle_message",
+                   new=AsyncMock(return_value="解析応答テスト")):
+            resp, reply, alert = _post(_event_body(user_id="U_owner1"))
         self.assertEqual(resp.status_code, 200)
         reply.assert_awaited_once()
-        self.assertEqual(reply.await_args.args[2],
-                         "指示Botの入口は開通しています（解析機能はD2で実装されます）")
+        self.assertEqual(reply.await_args.args[2], "解析応答テスト")
         alert.assert_not_awaited()
 
     def test_second_allowed_user_and_space_tolerance(self):
         """カンマ区切りの2人目（空白付き）も許可される"""
-        resp, reply, _ = _post(_event_body(user_id="U_owner2"))
+        with patch("dispatch_bot.handler.handle_message",
+                   new=AsyncMock(return_value="ok")):
+            resp, reply, _ = _post(_event_body(user_id="U_owner2"))
         reply.assert_awaited_once()
 
     def test_unauthorized_user_is_silent_with_alert(self):

@@ -30,9 +30,6 @@ logger = logging.getLogger("dispatch_bot")
 
 router = APIRouter()
 
-# D2 で解析に差し替わる固定応答（D1 の開通確認用）
-_D1_FIXED_REPLY = "指示Botの入口は開通しています（解析機能はD2で実装されます）"
-
 
 def verify_line_signature(body: bytes, signature: str) -> bool:
     """X-Line-Signature の HMAC-SHA256 検証（指示Bot専用 secret）。
@@ -103,8 +100,11 @@ async def process_dispatch_bot_event(reply_token: str, user_id: str, user_text: 
 
         logger.info("[DISPATCHBOT] message userId=%s... text=%r",
                     user_id[:10], user_text[:50])
-        # D1: 固定応答のみ（解析・復唱・起票は D2/D3 で実装）
-        await _send_reply(reply_token, user_id, _D1_FIXED_REPLY)
+        # D2: 解析→案件検索→解釈結果の提示（復唱確認・起票は D3）
+        from dispatch_bot.handler import handle_message
+        reply_text = await handle_message(user_id, user_text)
+        if reply_text:
+            await _send_reply(reply_token, user_id, reply_text)
     except Exception:
         logger.exception("[DISPATCHBOT] process failed userId=%s...", user_id[:10])
 
