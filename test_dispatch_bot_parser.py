@@ -136,13 +136,13 @@ class TestHandler(unittest.IsolatedAsyncioTestCase):
                 patch.object(case_search, "search_cases",
                              new=AsyncMock(return_value=hits or [])))
 
-    async def test_task_single_hit_presents_interpretation(self):
+    async def test_task_single_hit_presents_confirmation(self):
+        """解釈確定→復唱確認（D3で【解釈結果】提示から復唱に変更）"""
         p, s = self._patch(parsed(), hits=[hit()])
         with p, s:
             reply = await handler.handle_message("U1", "鈴木さんに送付案内を作って")
-        self.assertIn("【解釈結果】", reply)
-        self.assertIn("送付案内の作成", reply)
-        self.assertIn("No.45 鈴木一郎（受任・時効援用）", reply)
+        self.assertIn("鈴木一郎さん（No.45・受任）に送付案内を起票します。", reply)
+        self.assertIn("OK / キャンセル（30分有効）", reply)
         self.assertNotIn("⚠", reply)
 
     async def test_completed_case_shows_warning(self):
@@ -160,10 +160,10 @@ class TestHandler(unittest.IsolatedAsyncioTestCase):
         self.assertIn("3件あります", reply)
         self.assertIn("1. 鈴木一郎（No.45・受任・時効援用）", reply)
         self.assertIn("3. ⚠ 鈴木一郎（No.12・完了・時効援用）", reply)
-        # 番号選択（同姓同名は No で区別）
+        # 番号選択（同姓同名は No で区別）→ 復唱確認へ（D3）
         reply2 = await handler.handle_message("U1", "3")
-        self.assertIn("No.12 鈴木一郎", reply2)
-        self.assertIn("【解釈結果】", reply2)
+        self.assertIn("鈴木一郎さん（No.12・完了）に送付案内を起票します。", reply2)
+        self.assertIn("OK / キャンセル", reply2)
 
     async def test_out_of_range_number(self):
         p, s = self._patch(parsed(), hits=[hit(), hit("52", "鈴木花子", "受任")])
@@ -217,7 +217,7 @@ class TestHandler(unittest.IsolatedAsyncioTestCase):
             reply1 = await handler.handle_message("U1", "送付案内を作って")
             self.assertIn("氏名を教えてください", reply1)
             reply2 = await handler.handle_message("U1", "鈴木さん")
-        self.assertIn("【解釈結果】", reply2)
+        self.assertIn("送付案内を起票します。", reply2)
         combined = parse_mock.await_args_list[1].args[0]
         self.assertIn("送付案内を作って", combined)
         self.assertIn("（追加回答）鈴木さん", combined)

@@ -64,7 +64,7 @@ class TestClarifyIsRegistryDriven(unittest.IsolatedAsyncioTestCase):
                           new=AsyncMock(return_value=[hit()])) as search:
             reply = await handler.handle_message("U1", "鈴木さんに送付案内作って")
         search.assert_awaited_once()
-        self.assertIn("【解釈結果】", reply)
+        self.assertIn("送付案内を起票します。", reply)
 
     async def test_model_clarification_never_reaches_user_for_tasks(self):
         """タスク特定済みの聞き返し経路すべてで、モデルの clarification 文が出ない"""

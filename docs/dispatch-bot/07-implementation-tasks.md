@@ -75,8 +75,27 @@ D5→D6→D7〜D10（第2弾・D5のkintone作成が先行）。D11〜D13（第3
   案件検索1件/複数選択肢/0件/No直指定・完了案件警告・ClaudeUnavailable→定型返信
 - 完了条件: [ ] ゴールデンテストPASS [ ] chat_responder を import しないこと（テストで静的検査） [ ] 既存全PASS
 
-### D3 復唱＋pending＋App 30起票（送付案内）
+### D3 復唱＋pending＋App 30起票（送付案内）　★実施済み（2026-07-04）
 - 目的: 第1弾の完成。OK→App 30 下書き起票→既存prepare合流（06・05 §3.1）
+- 実装ノート（2026-07-04）:
+  - dispatch_bot/confirm.py: Pending（UUID・30分TTL・単回消込・ユーザーごと最大1件・
+    インメモリ=再起動で安全側）・リスク別復唱テンプレ（低=簡潔版2行。中高用フルテンプレも
+    実装済みだが D3 の登録タスクは低のみ）
+  - dispatch_bot/app30_filer.py: App 30 へ「下書き」起票のみ（発送ステータスを先へ進める
+    コードなし=承認原則の維持をソース検査テストで固定）。宛先は App 21 から解決。
+    チャネル固有データに dispatch_bot メタ（指示原文/userId/解釈日時/pending_command_id）
+  - 二重実行防止の多層: pending 単回消込＋起票直前の pending_command_id 既存検索
+    （既存検出時は「起票済みです・二重実行を防止しました」）
+  - 割込み無効化: pending 有効中の別指示は「先ほどの確認は取り消しました。」を前置し
+    新しい解析へ。OK/キャンセル/番号選択/聞き返し回答のみ現対話への応答
+  - 起票失敗: ユーザーに定型返信＋管理者警報（throttle_key=dispatchbot_filing_error）。
+    pending は消込（再指示でやり直し）
+  - キャンセル（pendingあり）=「キャンセルしました。もう一度指示し直してください」
+  - D2テストのうち終点【解釈結果】提示を検証していた4箇所を復唱検証に更新
+    （仕様進化に伴うもの。それ以外の既存テストは無変更）
+  - テスト: test_dispatch_bot_confirm.py 12件。全体 407 passed / 2 skipped
+- **これで第1弾（LINE→送付案内起票）完成**。実機一巡: 指示→復唱→OK→App 30 に
+  下書き→既存 Webhook が prepare→承認待ち＋弁護士LINE→（kintoneで承認）→印刷指示
 - 依存: D2・T2-2（実施済み）
 - 変更対象: dispatch_bot/router.py・registry.py
 - 新規: `dispatch_bot/confirm.py`（復唱テンプレ2種・pending管理〔インメモリ・30分・単回・割込み無効〕）・
