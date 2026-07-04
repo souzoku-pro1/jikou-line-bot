@@ -23,8 +23,19 @@ D5→D6→D7〜D10（第2弾・D5のkintone作成が先行）。D11〜D13（第3
 
 ## 第1弾（対応タスク: 送付案内のみ）
 
-### D1 LINE入口＋ホワイトリスト＋沈黙警報
+### D1 LINE入口＋ホワイトリスト＋沈黙警報　★実施済み（2026-07-04）
 - 目的: /webhook/dispatch-bot の新設と認証境界の確立（02）
+- 実装ノート（2026-07-04）:
+  - dispatch_bot/router.py 新設。main.py への変更は import＋include_router の2行のみ
+    （既存ルーターと同ブロック・顧客Bot /webhook のコードパス変更ゼロをdiffで確認）
+  - 署名検証は DISPATCHBOT_CHANNEL_SECRET 専用（顧客Bot secret では通らないことを
+    テストで担保）。secret未設定=常に400・ホワイトリスト未設定/空=deny-all
+  - 許可外は沈黙＋notify_admin_line（throttle_key=dispatchbot_unauthorized:<userId>・
+    警報にはuserId先頭10文字と本文先頭50文字のみ）。follow イベントも同様
+  - 固定応答は reply→失敗時 push フォールバック（DISPATCHBOT_CHANNEL_ACCESS_TOKEN 使用）
+  - env 3種は 2026-07-04 に Railway 登録済み（ALLOWED_USER_IDS=オーナー1名）
+  - テスト: test_dispatch_bot_entry.py 16件（chat_responder 非import・顧客トークン
+    不使用・App 28 非書き込みのソース検査を含む）。全体 363 passed / 2 skipped
 - 依存: なし（既存 hub/notify・webhook流儀のみ）
 - 変更対象: main.py（include_router 1行のみ）
 - 新規: `dispatch_bot/__init__.py`・`dispatch_bot/router.py`・`test_dispatch_bot_entry.py`
