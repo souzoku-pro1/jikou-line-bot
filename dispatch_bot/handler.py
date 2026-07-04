@@ -14,7 +14,7 @@ import time
 from dataclasses import dataclass, field
 
 from claude_gateway import ClaudeUnavailableError
-from dispatch_bot import app30_filer, case_search, confirm, parser, registry
+from dispatch_bot import app30_filer, case_search, confirm, enclosures, parser, registry
 from hub import kintone, notify
 
 
@@ -41,8 +41,9 @@ class Session:
     """聞き返し・候補選択の対話状態（ユーザーごとに最大1件・03 §7）"""
     base_text: str = ""                 # 元指示（聞き返し回答はここに結合して再解析）
     clarify_count: int = 0              # これまでに聞き返した回数
-    candidates: list = field(default_factory=list)   # 複数候補（番号選択待ち）
-    parsed: dict | None = None          # 候補選択待ち時の解析結果
+    candidates: list = field(default_factory=list)   # 案件複数候補（番号選択待ち）
+    enclosure_options: list = field(default_factory=list)  # 同封物選択肢（番号選択待ち）
+    parsed: dict | None = None          # 番号選択待ち時の解析結果
     created_at: float = field(default_factory=time.monotonic)
 
     def expired(self) -> bool:
@@ -106,10 +107,17 @@ async def _execute_confirmed(user_id: str) -> str:
             f"この後の生成・承認はkintone側で行われます\n{url}")
 
 
+# 選択肢をマスタから動的取得して番号選択式で聞く項目（field_questions では扱わない）
+_DYNAMIC_FIELDS = {"enclosures"}
+
+
 def _first_missing_question(spec, parsed: dict) -> str | None:
     """レジストリの必須入力項目のうち**最初の不足1つだけ**の質問文を返す（1論点・03 §7）。
-    不足がなければ None。モデル出力の missing_fields は判定に使わない"""
+    不足がなければ None。モデル出力の missing_fields は判定に使わない。
+    動的フィールド（同封物）は専用フロー（_handle 内）で扱う"""
     for f in spec.required_fields:
+        if f in _DYNAMIC_FIELDS:
+            continue
         value = parsed["customer_name"] if f == "customer_name" \
                 else parsed["task_params"].get(f)
         if not value:
@@ -140,7 +148,26 @@ async def _handle(user_id: str, text: str) -> str:
     text = (text or "").strip()
     session = _get_session(user_id)
 
-    # ── 番号選択（複数候補への応答。現 pending への応答として扱う・06 §3.1） ──
+    # ── 番号選択①: 同封物（複数可・カンマ区切り。現対話への応答・06 §3.1） ──
+    if session and session.enclosure_options and             re.fullmatch(r"\d{1,2}(\s*[,、，]\s*\d{1,2})*", text):
+        opts = session.enclosure_options
+        nums = [int(n) for n in re.split(r"[,、，]", text.replace(" ", "").replace("　", ""))]
+        if all(1 <= n <= len(opts) for n in nums):
+            chosen, seen = [], set()
+            for n in nums:
+                o = opts[n - 1]
+                if o.key not in seen:
+                    chosen.append(o)
+                    seen.add(o.key)
+            parsed = session.parsed
+            parsed["task_params"]["enclosures"] = [o.key for o in chosen]
+            parsed["task_params"]["enclosure_labels"] = [o.label for o in chosen]
+            base_text = session.base_text
+            _sessions.pop(user_id, None)
+            return await _resolve_case_and_confirm(user_id, parsed, base_text)
+        return f"1〜{len(opts)} の番号で選んでください（複数はカンマ区切り）"
+
+    # ── 番号選択②: 案件複数候補への応答（06 §3.1） ─────────────────────────
     if session and session.candidates and re.fullmatch(r"\d{1,2}", text):
         idx = int(text)
         if 1 <= idx <= len(session.candidates):
@@ -199,15 +226,45 @@ async def _handle(user_id: str, text: str) -> str:
     if question:
         return prefix + _ask(user_id, base_text, question, session)
 
-    # ── 案件検索（03 §4） ────────────────────────────────────────────────
+    # ── 同封物の解決（必須・動的選択肢。2026-07-04 実機エラー対応） ────────
+    # 選択肢は App 32 の有効ブロックから動的取得（ハードコードしない）。
+    # 指示文由来の書類名（モデルが task_params.enclosures に抽出）は
+    # App 32 の表示名/ブロックキーと照合できたもののみ採用し、聞き返しをスキップ
+    if "enclosures" in spec.required_fields and             not parsed["task_params"].get("enclosure_labels"):
+        options = await enclosures.list_options(_DEFAULT_UNIT)
+        if not options:
+            _sessions.pop(user_id, None)
+            return prefix + enclosures.MSG_NO_OPTIONS
+        matched = enclosures.match_names(parsed["task_params"].get("enclosures"), options)
+        if matched:
+            parsed["task_params"]["enclosures"] = [o.key for o in matched]
+            parsed["task_params"]["enclosure_labels"] = [o.label for o in matched]
+        else:
+            count = (session.clarify_count if session else 0) + 1
+            if count > _MAX_CLARIFY:
+                _sessions.pop(user_id, None)
+                return prefix + MSG_GIVE_UP
+            _sessions[user_id] = Session(base_text=base_text, clarify_count=count,
+                                         enclosure_options=options, parsed=parsed)
+            return prefix + enclosures.format_question(options)
+
+    return prefix + await _resolve_case_and_confirm(user_id, parsed, base_text)
+
+
+# App 21（時効援用）のみが検索対象の第1弾定数（App 33 実装後にユニット判定を拡張）
+_DEFAULT_UNIT = "時効援用"
+
+
+async def _resolve_case_and_confirm(user_id: str, parsed: dict, base_text: str) -> str:
+    """案件検索 → 候補選択 or 復唱確認（同封物回答後の再入口でも使う）"""
     hits = await case_search.search_cases(parsed["customer_name"])
     if not hits:
         _sessions.pop(user_id, None)
-        return prefix + case_search.NOT_FOUND_MESSAGE
+        return case_search.NOT_FOUND_MESSAGE
     if len(hits) > 1:
         _sessions[user_id] = Session(base_text=base_text, candidates=hits, parsed=parsed)
-        return prefix + case_search.format_choices(hits, parsed["customer_name"])
+        return case_search.format_choices(hits, parsed["customer_name"])
 
     # ── 解釈確定 → 復唱確認＋pending 発行（D3・06 §2-3） ────────────────
     _sessions.pop(user_id, None)
-    return prefix + _start_confirmation(user_id, parsed, hits[0], base_text)
+    return _start_confirmation(user_id, parsed, hits[0], base_text)

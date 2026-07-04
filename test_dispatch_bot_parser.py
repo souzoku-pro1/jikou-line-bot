@@ -18,7 +18,7 @@ os.environ.setdefault("KINTONE_APP_ID", "21")
 os.environ.setdefault("KINTONE_API_TOKEN", "dummy")
 
 from claude_gateway import ClaudeUnavailableError  # noqa: E402
-from dispatch_bot import case_search, handler, parser, registry  # noqa: E402
+from dispatch_bot import case_search, enclosures, handler, parser, registry  # noqa: E402
 
 
 def tool_response(**input_data):
@@ -28,8 +28,9 @@ def tool_response(**input_data):
 
 
 def parsed(**over):
+    # 同封物必須化（2026-07-04）に伴い、既定で指示文由来の同封物を含める
     base = {"intent": "task", "task_type": "soufu_annai",
-            "customer_name": "鈴木", "task_params": {},
+            "customer_name": "鈴木", "task_params": {"enclosures": ["委任契約書"]},
             "confidence": "high", "missing_fields": [], "clarification": None}
     base.update(over)
     return base
@@ -128,6 +129,13 @@ class TestCaseSearch(unittest.IsolatedAsyncioTestCase):
 class TestHandler(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         handler.reset_sessions()
+        # 同封物選択肢（App 32）は全テストでモック（実API呼び出し防止）
+        patcher = patch.object(
+            enclosures, "list_options",
+            new=AsyncMock(return_value=[enclosures.EnclosureOption(
+                key="委任契約書", label="委任契約書")]))
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def _patch(self, parse_results, hits=None):
         """parse_instruction と search_cases を差し替える"""
@@ -141,7 +149,7 @@ class TestHandler(unittest.IsolatedAsyncioTestCase):
         p, s = self._patch(parsed(), hits=[hit()])
         with p, s:
             reply = await handler.handle_message("U1", "鈴木さんに送付案内を作って")
-        self.assertIn("鈴木一郎さん（No.45・受任）に送付案内を起票します。", reply)
+        self.assertIn("鈴木一郎さん（No.45・受任）に送付案内（委任契約書）を起票します。", reply)
         self.assertIn("OK / キャンセル（30分有効）", reply)
         self.assertNotIn("⚠", reply)
 
@@ -162,7 +170,7 @@ class TestHandler(unittest.IsolatedAsyncioTestCase):
         self.assertIn("3. ⚠ 鈴木一郎（No.12・完了・時効援用）", reply)
         # 番号選択（同姓同名は No で区別）→ 復唱確認へ（D3）
         reply2 = await handler.handle_message("U1", "3")
-        self.assertIn("鈴木一郎さん（No.12・完了）に送付案内を起票します。", reply2)
+        self.assertIn("鈴木一郎さん（No.12・完了）に送付案内（委任契約書）を起票します。", reply2)
         self.assertIn("OK / キャンセル", reply2)
 
     async def test_out_of_range_number(self):
@@ -217,7 +225,7 @@ class TestHandler(unittest.IsolatedAsyncioTestCase):
             reply1 = await handler.handle_message("U1", "送付案内を作って")
             self.assertIn("氏名を教えてください", reply1)
             reply2 = await handler.handle_message("U1", "鈴木さん")
-        self.assertIn("送付案内を起票します。", reply2)
+        self.assertIn("を起票します。", reply2)
         combined = parse_mock.await_args_list[1].args[0]
         self.assertIn("送付案内を作って", combined)
         self.assertIn("（追加回答）鈴木さん", combined)
