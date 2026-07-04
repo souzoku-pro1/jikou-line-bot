@@ -493,6 +493,20 @@ async def find_municipality(record: dict, data: dict) -> dict:
     return muni
 
 
+def municipality_office_name(name: str) -> str:
+    """市区町村名 → 封筒宛先用の施設名。
+    川口市→川口市役所 / 千代田区→千代田区役所 / 伊奈町→伊奈町役場 / ○○村→○○村役場。
+    該当しない場合はそのまま返す。
+    ※App 30 宛先名の自動入力とレターパック宛先ラベル・チェックリスト用。
+    　統一用紙の「○○長 殿」（宛先自治体名）には使わない（そちらは自治体名のままが正しい）"""
+    n = (name or "").strip()
+    if n.endswith(("市", "区")):
+        return n + "役所"
+    if n.endswith(("町", "村")):
+        return n + "役場"
+    return n
+
+
 def compute_kogawase(items: list[dict], muni: dict) -> tuple[int, list[str]]:
     """請求内訳 × App 31 手数料 → (定額小為替の合計額, 明細行)。
     手数料未登録の種別があれば PrepareDeferred（登録依頼警報）"""
@@ -518,11 +532,11 @@ def compute_kogawase(items: list[dict], muni: dict) -> tuple[int, list[str]]:
     return total, lines
 
 
-def _build_checklist_pdf(record: dict, muni: dict, data: dict,
-                         total: int, breakdown: list[str],
-                         label_note: str = "",
-                         form_names: list[str] | None = None) -> bytes:
-    """発送準備チェックリスト PDF（事務員向け・A4。設計 04 §1 の成果物c）"""
+def _checklist_lines(record: dict, muni: dict, data: dict,
+                     total: int, breakdown: list[str],
+                     label_note: str = "",
+                     form_names: list[str] | None = None) -> list[str]:
+    """チェックリストの行組み立て（純関数・テスト対象）。宛先は施設名表記（〜市役所等）"""
     muni_name = muni.get("市区町村名", {}).get("value", "")
     dept = (muni.get("担当部署", {}).get("value") or "").strip()
     target = data.get("target", {})
@@ -530,7 +544,7 @@ def _build_checklist_pdf(record: dict, muni: dict, data: dict,
         "職務上請求 発送準備チェックリスト",
         "",
         f"件名: {record.get('件名', {}).get('value', '')}",
-        f"宛先: {muni_name} {dept}".rstrip(),
+        f"宛先: {municipality_office_name(muni_name)} {dept}".rstrip(),
         f"　　　〒{muni.get('郵便番号', {}).get('value', '')} {muni.get('住所', {}).get('value', '')}",
         f"対象者: {target.get('対象者', '')}　本籍/住所: {target.get('本籍', '') or target.get('住所', '')}",
         f"利用目的: {data.get('purpose', '')}",
@@ -548,6 +562,15 @@ def _build_checklist_pdf(record: dict, muni: dict, data: dict,
         "",
         f"備考（App 31）: {(muni.get('備考', {}).get('value') or 'なし')}",
     ]
+    return lines
+
+
+def _build_checklist_pdf(record: dict, muni: dict, data: dict,
+                         total: int, breakdown: list[str],
+                         label_note: str = "",
+                         form_names: list[str] | None = None) -> bytes:
+    """発送準備チェックリスト PDF（事務員向け・A4。設計 04 §1 の成果物c）"""
+    lines = _checklist_lines(record, muni, data, total, breakdown, label_note, form_names)
     items = []
     y = 280.0
     for i, line in enumerate(lines):
@@ -568,12 +591,14 @@ class ShokumuSeikyuAdapter(ChannelAdapter):
         muni = await find_municipality(record, data)
         total, breakdown = compute_kogawase(data["request_items"], muni)
 
-        # 宛先・小為替合計をレコードへ書き戻し（承認画面で人が確認できる状態にする）
+        # 宛先・小為替合計をレコードへ書き戻し（承認画面で人が確認できる状態にする）。
+        # 封筒宛先（宛先名・ラベル）は施設名表記（川口市→川口市役所）。手入力があれば優先
         muni_name = muni.get("市区町村名", {}).get("value", "")
         dept = (muni.get("担当部署", {}).get("value") or "").strip()
         data["kogawase_total"] = total
+        office_name = municipality_office_name(muni_name)
         recipient = ((record.get("宛先名", {}).get("value") or "").strip()
-                     or (f"{muni_name}　{dept}" if dept else muni_name))
+                     or (f"{office_name}　{dept}" if dept else office_name))
         recipient_zip = muni.get("郵便番号", {}).get("value", "")
         recipient_addr = muni.get("住所", {}).get("value", "")
         fields = {

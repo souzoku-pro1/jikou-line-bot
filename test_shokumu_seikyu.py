@@ -186,7 +186,8 @@ class TestPrepare(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result.artifacts[0].filename, "発送準備チェックリスト.pdf")
         self.assertTrue(result.artifacts[0].content.startswith(b"%PDF"))
-        self.assertEqual(result.fields["宛先名"], "川口市　市民課")
+        # 2026-07-04 修正: 封筒宛先は施設名表記（川口市→川口市役所）
+        self.assertEqual(result.fields["宛先名"], "川口市役所　市民課")
         self.assertEqual(result.fields["宛先郵便番号"], "332-8601")
         self.assertEqual(result.fields["宛先住所"], "埼玉県川口市青木2-1-1")
         meta = json.loads(result.fields["チャネル固有データ"])
