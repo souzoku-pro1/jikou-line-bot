@@ -73,6 +73,10 @@ def build_system_prompt() -> str:
 - 法的判断・文面の創作をしない（あなたの仕事は構造化のみ）
 - 該当するタスク種別がなければ task_type=null とする（intent は task のままでよい）
 - 解釈に自信がなければ confidence=low とし clarification に聞き返し文を書く
+- missing_fields には各タスクの「必須入力項目」として上に明示されたものだけを入れる。
+  一覧にない入力項目（書類名・送付日・部数など）を**創作して要求しない**
+- clarification に書くのは missing_fields に挙げた項目の確認のみ。複数項目を
+  列挙しない（聞き返しは1メッセージ1論点。文面は最終的にシステム側が組み立てる）
 """
 
 

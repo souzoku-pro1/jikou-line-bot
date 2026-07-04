@@ -233,12 +233,15 @@ class TestHandler(unittest.IsolatedAsyncioTestCase):
         self.assertIn("氏名を教えてください", r2)
         self.assertEqual(r3, handler.MSG_GIVE_UP)
 
-    async def test_low_confidence_asks_clarification(self):
+    async def test_low_confidence_asks_fixed_clarification(self):
+        """低確信度（タスク特定済み）は定型の聞き返し。モデルの clarification は
+        使わない（2026-07-04 不具合修正: 存在しない項目の創作防止）"""
         p, s = self._patch(parsed(confidence="low",
                                   clarification="どの書類の送付案内ですか？"))
         with p, s:
             reply = await handler.handle_message("U1", "あれやっといて")
-        self.assertEqual(reply, "どの書類の送付案内ですか？")
+        self.assertIn("もう少し具体的に", reply)
+        self.assertNotIn("どの書類", reply, "モデル生成の聞き返しを出さない")
 
     async def test_claude_unavailable_returns_fixed_message(self):
         with patch.object(parser, "parse_instruction",

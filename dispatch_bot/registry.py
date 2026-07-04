@@ -20,6 +20,9 @@ class TaskSpec:
     auto_scope: str           # 自動実行可能範囲
     approval_scope: str       # 人の承認が要る範囲
     required_fields: list[str] = field(default_factory=list)  # 不足→聞き返し
+    # 必須項目ごとの聞き返し文（**聞き返しは必ずここから組み立てる**。
+    # モデルの自由生成に任せない＝存在しない項目の創作防止・2026-07-04 不具合修正）
+    field_questions: dict[str, str] = field(default_factory=dict)
     search_apps: list[str] = field(default_factory=list)      # 案件検索対象（env名）
     artifacts: str = ""       # 成果物種類・保存先
     adapter: str = ""         # 実行アダプタ（D3で実装）
@@ -44,9 +47,16 @@ def catalog_for_prompt() -> str:
     filing = [s for s in TASK_REGISTRY.values() if not s.answer_only]
 
     def lines(specs):
-        return "\n".join(f"- {s.task_type}: {s.display_name}"
-                         + (f"（{s.hint_for_parser}）" if s.hint_for_parser else "")
-                         for s in specs) or "（なし）"
+        out = []
+        for s in specs:
+            line = f"- {s.task_type}: {s.display_name}"
+            if s.hint_for_parser:
+                line += f"（{s.hint_for_parser}）"
+            if not s.answer_only:
+                fields = ", ".join(s.required_fields) or "なし"
+                line += f"｜必須入力項目: {fields}【これ以外の入力項目は存在しない】"
+            out.append(line)
+        return "\n".join(out) or "（なし）"
 
     return f"<即答型（intent=query）>\n{lines(answer)}\n<起票型（intent=task）>\n{lines(filing)}"
 
@@ -61,7 +71,10 @@ register(TaskSpec(
     risk="低",
     auto_scope="App 30 起票→既存 prepare（docx+ラベル生成）→承認待ちまで",
     approval_scope="発送の承認（App 30 承認待ち→承認済・kintone上）",
+    # 必須は顧客名のみ（設計05 §3.1: 宛先は案件から解決・同封物選択は既定。
+    # 「書類名」「送付日」等は入力項目に存在しない＝聞いてはいけない）
     required_fields=["customer_name"],
+    field_questions={"customer_name": "どの顧客（案件）への指示ですか？氏名を教えてください"},
     search_apps=["KINTONE_APP_ID"],
     artifacts="App 30 添付（送付案内.docx・宛名ラベル.pdf）",
     adapter="App30Filer",  # D3 で実装
