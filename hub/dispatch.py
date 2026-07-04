@@ -87,6 +87,31 @@ def _rid(record: dict) -> str:
     return str(record["$id"]["value"])
 
 
+def _merge_channel_data(record: dict, fields: dict) -> dict:
+    """チャネル固有データの書き戻しを「全置換」から「マージ」にする（2026-07-04）。
+
+    指示Bot（dispatch_bot）が起票時に書き込む監査メタ（dispatch_bot キー:
+    指示原文/userId/解釈日時/pending_command_id）が、チャネル側 prepare の
+    書き戻しで消える不具合（App 30 No.5 で確認）への共通対策。
+    - 既存 JSON のトップレベルキーを保持しつつ、チャネル側の書き戻しで
+      同名キーは新値優先で更新する（shallow merge）
+    - チャネル個別に直さず、フィールド書き戻しの共通経路（本モジュール）で吸収する
+    - 既存/新規のどちらかが JSON として不正・dict でない場合はチャネル側の
+      値をそのまま使う（従来挙動＝GUI 起票等メタなしのケースは出力不変）
+    """
+    if "チャネル固有データ" not in fields:
+        return fields
+    try:
+        existing = json.loads(record.get("チャネル固有データ", {}).get("value") or "{}")
+        new = json.loads(fields["チャネル固有データ"] or "{}")
+    except ValueError:
+        return fields
+    if not isinstance(existing, dict) or not isinstance(new, dict) or not existing:
+        return fields
+    merged = {**existing, **new}
+    return {**fields, "チャネル固有データ": json.dumps(merged, ensure_ascii=False)}
+
+
 def _summary(record: dict) -> str:
     return (f"件名: {record.get('件名', {}).get('value', '')} / "
             f"チャネル: {record.get('チャネル', {}).get('value', '')} / "
@@ -129,7 +154,7 @@ async def _handle_prepare(record: dict) -> None:
     record_id = _rid(record)
     try:
         result = await adapter.prepare(record)
-        extra = dict(result.fields)
+        extra = _merge_channel_data(record, dict(result.fields))
         if result.artifacts:
             file_keys = []
             for a in result.artifacts:
@@ -176,7 +201,7 @@ async def _handle_dispatch(record: dict) -> None:
         await _to_error(record, "発送処理中", f"dispatch 失敗: {e}")
         return
 
-    extra = dict(result.fields)
+    extra = _merge_channel_data(record, dict(result.fields))
     if result.manual_mailing:
         # 物理郵送: 発送処理中のまま停止（印刷・投函・発送済への変更は人）
         if extra:

@@ -87,7 +87,7 @@ merge時刻は origin/main のコミット時刻（JST）。
 4. **座標キャリブレーション【人作業】**: 職務上請求の統一用紙2様式（FORM_VERSION=v0・
    実測前）。手順は docs/architecture/04a
 5. No.3/No.4 テストレコードの整理【人・kintone】（§4）・No.5 の承認→印刷フロー確認は任意
-6. チャネル固有データの dispatch_bot メタが prepare で上書きされる件（§4 の気づき）
+6. ~~チャネル固有データの dispatch_bot メタが prepare で上書きされる件（§4 の気づき）~~ **対応済み（同日 feature/fix-channel-data-merge）**: hub/dispatch の共通書き戻し経路で shallow merge に変更（既存トップレベルキー保持・同名キーは新値優先・既存なし/不正JSONは従来どおり全置換）
 
 ## 6. 運用規律の遵守記録
 
