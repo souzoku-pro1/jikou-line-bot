@@ -16,7 +16,9 @@ build_request_form_pdfs が要求:
   - target.対象者（対象者なしの職務上請求は成立しないため必須扱い）
 コード上も実務上も任意（聞かない・指示文にあれば載せる）:
   - target.フリガナ／本籍／住所／筆頭者／世帯主
-  - purpose（未指定は既定文言 DEFAULT_PURPOSE。復唱後・承認画面で弁護士が確認可能）
+  - purpose … 未指定時は**ユニット種別ごとの確定文言**（PURPOSE_BY_UNIT・
+    2026-07-04 弁護士判断）を使用。ユニット不明なら既定を置かず**聞き返しで直接入力**
+    （不適切な定型を職務上請求書に印字するより聞く方が安全）。復唱に利用目的行を表示
 """
 
 import json
@@ -40,9 +42,16 @@ QUESTIONS = {
     "target_name": "請求対象者（戸籍・住民票の名義人）の氏名を教えてください",
     "birth_date": ("対象者の生年月日を教えてください"
                    "（戸籍系の請求では様式上必須です。例: 昭和25年3月15日 または 1950-03-15）"),
+    "purpose": ("職務上請求書に記載する利用目的を教えてください"
+                "（このユニットには既定文言がないため、印字する文言をそのまま入力してください）"),
 }
 
-DEFAULT_PURPOSE = "受任事件の処理のため"
+# 利用目的の既定文言（ユニット種別ごと・2026-07-04 弁護士判断による確定文言）。
+# ここに無いユニットは既定を置かず purpose を聞き返す（first_missing）
+PURPOSE_BY_UNIT = {
+    "時効援用": "受任事件（消滅時効援用）の通知書送付先調査のため",
+    "相続放棄": "受任事件（相続放棄申述）の申述に必要な戸籍等の取得のため",
+}
 
 MSG_ABORTED = "中止しました。App 31 に登録後、もう一度指示してください"
 
@@ -91,7 +100,18 @@ def first_missing(parsed: dict) -> str | None:
         return "target_name"
     if includes_form1(p["request_items"]) and not p["target"].get("生年月日"):
         return "birth_date"
+    if not resolved_purpose(p):
+        # ユニット不明かつ purpose 未指定: 不適切な定型を印字するより聞く（2026-07-04）
+        return "purpose"
     return None
+
+
+def resolved_purpose(p: dict) -> str:
+    """印字される利用目的: 指示文の明示指定 → ユニット別の確定文言 → なし（聞き返し）"""
+    explicit = str(p.get("purpose") or "").strip()
+    if explicit:
+        return explicit
+    return PURPOSE_BY_UNIT.get(str(p.get("unit") or ""), "")
 
 
 async def pre_confirm(parsed: dict) -> tuple[str, str]:
@@ -141,6 +161,7 @@ def summary_lines(parsed: dict) -> list[str]:
         f"請求: {items}",
         f"宛先自治体: {p['municipality']}{p.get('muni_note', '')}",
         f"小為替概算: {p.get('kogawase_estimate', '（未算出）')}",
+        f"利用目的: {resolved_purpose(p)}",  # 印字文言を復唱段階で確認（2026-07-04）
         "発送には kintone での承認が別途必要です（このOKでは発送されません）",
     ]
 
@@ -152,5 +173,6 @@ def build_channel_json(parsed: dict) -> dict:
         "request_items": p["request_items"],
         "municipality": p["municipality"],
         "target": p.get("target") or {},
-        "purpose": str(p.get("purpose") or "").strip() or DEFAULT_PURPOSE,
+        # 明示指定→ユニット別確定文言。両方なしは first_missing が聞き返すため到達しない
+        "purpose": resolved_purpose(p),
     }

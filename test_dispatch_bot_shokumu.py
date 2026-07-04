@@ -89,8 +89,10 @@ class TestParamAudit(unittest.TestCase):
             self.assertIn(key, spec.field_questions)
 
     def test_missing_order_and_form_branch(self):
-        """聞く順: 種別通数→自治体→対象者→生年月日（様式1のみ）"""
-        p = lambda tp: {"task_params": shokumu.normalize_params(tp)}
+        """聞く順: 種別通数→自治体→対象者→生年月日（様式1のみ）。
+        unit はハンドラが注入する前提（既定文言の解決に使用）のためテストでも付与"""
+        p = lambda tp: {"task_params": {**shokumu.normalize_params(tp),
+                                        "unit": "時効援用"}}
         self.assertEqual(shokumu.first_missing(p({})), "request_items")
         self.assertEqual(shokumu.first_missing(
             p({"request_items": [{"type": "戸籍謄本", "count": 1}]})), "municipality")
@@ -147,6 +149,8 @@ class TestFullAskPath(Base):
             self.assertIn("請求: 戸籍謄本2通・戸籍の附票1通", r5)
             self.assertIn("宛先自治体: 川口市", r5)
             self.assertIn("小為替概算: 1,200円", r5)
+            self.assertIn("利用目的: 受任事件（消滅時効援用）の通知書送付先調査のため", r5,
+                          "印字文言を復唱段階で確認できる")
             self.assertIn("発送には kintone での承認が別途必要です", r5)
             self.assertIn("リスク区分: 中", r5)
             r6 = await self.send("OK")
@@ -161,7 +165,9 @@ class TestFullAskPath(Base):
         rec = {"チャネル固有データ": {"value": fields["チャネル固有データ"]}}
         data = parse_channel_data(rec)
         self.assertEqual(data["municipality"], "川口市")
-        self.assertEqual(data["purpose"], shokumu.DEFAULT_PURPOSE)
+        self.assertEqual(data["purpose"],
+                         "受任事件（消滅時効援用）の通知書送付先調査のため",
+                         "時効援用ユニットの確定文言（2026-07-04 弁護士判断）")
         self.assertIn("dispatch_bot", data, "監査メタ併記")
 
     async def test_bulk_extraction_skips_questions(self):
@@ -264,6 +270,54 @@ class TestMunicipalityBranch(Base):
         with ps[0], ps[1], ps[2], ps[3], ps[4]:
             reply = await self.send("佐藤さんの戸籍謄本2通と附票1通を川口市に")
         self.assertIn("概算不能（App 31 の手数料未登録", reply)
+
+
+class TestPurposeByUnit(Base):
+    """利用目的の既定文言（ユニット別・2026-07-04 弁護士確定）"""
+
+    def test_unit_wordings(self):
+        self.assertEqual(
+            shokumu.resolved_purpose({"unit": "時効援用"}),
+            "受任事件（消滅時効援用）の通知書送付先調査のため")
+        self.assertEqual(
+            shokumu.resolved_purpose({"unit": "相続放棄"}),
+            "受任事件（相続放棄申述）の申述に必要な戸籍等の取得のため")
+
+    def test_explicit_purpose_wins(self):
+        self.assertEqual(
+            shokumu.resolved_purpose({"unit": "時効援用", "purpose": "指定の目的"}),
+            "指定の目的")
+
+    def test_unknown_unit_falls_to_question(self):
+        """定義外ユニット: 既定文言を置かず purpose が聞き返し項目になる"""
+        params = shokumu.normalize_params(dict(FULL_PARAMS))
+        params["unit"] = "補助金"
+        self.assertEqual(shokumu.first_missing({"task_params": params}), "purpose")
+        params["purpose"] = "公募要件確認のため"
+        self.assertIsNone(shokumu.first_missing({"task_params": params}))
+        self.assertIn("purpose", registry.get_task("shokumu_seikyu").field_questions)
+
+    async def test_unknown_unit_asks_then_uses_answer(self):
+        """ハンドラ経由: 不明ユニットでは利用目的を質問→回答文言がそのまま復唱・起票に載る"""
+        seq = [parsed(task_params=dict(FULL_PARAMS)),
+               parsed(task_params=dict(FULL_PARAMS, purpose="公正証書作成準備のため")),
+               parsed(intent="confirm")]
+        ps = self.patches(seq)
+        with ps[0], ps[1], ps[2], ps[3], ps[4],              patch.object(handler, "_DEFAULT_UNIT", "不明ユニット"):
+            r1 = await self.send("佐藤さんの戸籍謄本2通と附票1通を川口市に職務上請求")
+            self.assertIn("利用目的を教えてください", r1)
+            r2 = await self.send("公正証書作成準備のため")
+            self.assertIn("利用目的: 公正証書作成準備のため", r2)
+            r3 = await self.send("OK")
+        fields = self.create_mock.await_args.args[1]
+        data = json.loads(fields["チャネル固有データ"])
+        self.assertEqual(data["purpose"], "公正証書作成準備のため")
+
+    def test_known_units_do_not_ask_purpose(self):
+        params = shokumu.normalize_params(dict(FULL_PARAMS))
+        for unit in ("時効援用", "相続放棄"):
+            params["unit"] = unit
+            self.assertIsNone(shokumu.first_missing({"task_params": params}), unit)
 
 
 if __name__ == "__main__":

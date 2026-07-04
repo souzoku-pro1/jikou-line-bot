@@ -259,6 +259,9 @@ async def _handle(user_id: str, text: str) -> str:
     if spec.param_normalizer:
         # モデル抽出値の検証・正規化（不正種別・通数は落として聞き返しに乗せる・D4）
         parsed["task_params"] = spec.param_normalizer(parsed["task_params"])
+        # ユニット種別を注入（第1弾は検索対象が App 21=時効援用のみ。purpose の
+        # ユニット別既定文言の解決に使う。App 33 実装時は案件由来に切り替える）
+        parsed["task_params"].setdefault("unit", _DEFAULT_UNIT)
 
     question = _first_missing_question(spec, parsed)
     if question:
