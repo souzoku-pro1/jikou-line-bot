@@ -9,14 +9,12 @@
 - モデルは claude_gateway 側で config.PRIMARY_MODEL が使われる（ここでは指定しない）
 """
 
-import logging
 
 import anthropic
 
 from claude_gateway import create_message_with_fallback
 from dispatch_bot import registry
 
-logger = logging.getLogger("dispatch_bot.parser")
 
 _client: anthropic.AsyncAnthropic | None = None
 
@@ -109,8 +107,8 @@ async def parse_instruction(text: str) -> dict:
     for block in response.content:
         if block.type == "tool_use" and block.name == "parse_instruction":
             parsed = _normalize(dict(block.input))
-            logger.info("[DISPATCHBOT] parsed intent=%s task=%s conf=%s",
-                        parsed["intent"], parsed["task_type"], parsed["confidence"])
+            print(f"[DISPATCHBOT] parsed intent={parsed['intent']} "
+                  f"task={parsed['task_type']} conf={parsed['confidence']}")
             return parsed
     raise ValueError("parse_instruction の tool_use ブロックがありません "
                      f"(stop_reason={response.stop_reason})")

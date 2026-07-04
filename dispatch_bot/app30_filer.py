@@ -12,7 +12,6 @@
 """
 
 import json
-import logging
 import os
 from datetime import datetime, timedelta, timezone
 
@@ -20,7 +19,6 @@ from dispatch_bot.case_search import APP_CASE
 from dispatch_bot.confirm import Pending
 from hub import kintone
 
-logger = logging.getLogger("dispatch_bot.app30_filer")
 
 _JST = timezone(timedelta(hours=9))
 
@@ -50,8 +48,7 @@ async def file_soufu_annai(pending: Pending) -> tuple[str, str, bool]:
     """
     existing = await find_existing(pending.command_id)
     if existing:
-        logger.warning("[DISPATCHBOT] duplicate filing blocked cmd=%s -> No.%s",
-                       pending.command_id[:8], existing)
+        print(f"[DISPATCHBOT] duplicate filing blocked cmd={pending.command_id[:8]} -> No.{existing}")
         return existing, record_url(existing), True
 
     # 宛先は App 21 の案件データから（05 §3.1: 宛先は案件から解決）
@@ -78,7 +75,10 @@ async def file_soufu_annai(pending: Pending) -> tuple[str, str, bool]:
         "実行済み": "no",
         "チャネル固有データ": json.dumps(meta, ensure_ascii=False),
     }
-    ids = await kintone.create_records(APP_SHIPPING, [fields])
-    rid = str(ids[0])
-    logger.info("[DISPATCHBOT] filed App30 No.%s cmd=%s", rid, pending.command_id[:8])
+    # ★単票API（POST /k/v1/record.json）で起票すること。
+    # 一括API（records.json・create_records）は kintone 仕様で「レコード追加」Webhook が
+    # 発射されず、/hub/dispatch → prepare が走らない（2026-07-04 実機不具合の原因。
+    # サイボウズ 2025-03-21 障害告知でも一括APIは Webhook 非送信が正規仕様と示されている）
+    rid = str(await kintone.create_record(APP_SHIPPING, fields))
+    print(f"[DISPATCHBOT] filed App30 No.{rid} cmd={pending.command_id[:8]}")
     return rid, record_url(rid), False
