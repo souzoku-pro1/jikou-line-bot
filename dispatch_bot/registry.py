@@ -7,6 +7,7 @@
 """
 
 from dataclasses import dataclass, field
+from typing import Callable
 
 
 @dataclass(frozen=True)
@@ -28,6 +29,14 @@ class TaskSpec:
     adapter: str = ""         # 実行アダプタ（D3で実装）
     on_failure: str = ""      # 失敗時の扱い
     hint_for_parser: str = "" # 解析プロンプトの一覧に載せる補足
+    # ── D4 追加: タスク固有フック（handler はこれらの有無だけを見る・個別分岐しない）──
+    required_desc: str = ""   # 解析プロンプトに載せる必須項目の説明（空なら required_fields）
+    max_clarify: int = 2      # 聞き返しの総往復上限（03 §7。D4変更: 職務上請求=8）
+    param_normalizer: Callable | None = None   # task_params の検証・正規化
+    missing_param_fn: Callable | None = None   # 不足項目キーを1つ返す（動的・条件付き必須用）
+    pre_confirm_fn: Callable | None = None     # 復唱前の非同期チェック（App 31照合等）
+    choice_fn: Callable | None = None          # pre_confirm の選択肢応答（1/2）の処理
+    summary_fn: Callable | None = None         # 復唱フルテンプレに挿入する明細行
 
 
 TASK_REGISTRY: dict[str, TaskSpec] = {}
@@ -53,7 +62,7 @@ def catalog_for_prompt() -> str:
             if s.hint_for_parser:
                 line += f"（{s.hint_for_parser}）"
             if not s.answer_only:
-                fields = ", ".join(s.required_fields) or "なし"
+                fields = s.required_desc or ", ".join(s.required_fields) or "なし"
                 line += f"｜必須入力項目: {fields}【これ以外の入力項目は存在しない】"
             out.append(line)
         return "\n".join(out) or "（なし）"
@@ -84,4 +93,44 @@ register(TaskSpec(
     hint_for_parser=("顧客へ書類を郵送する際の案内文書。「〜さんに送付案内」等。"
                      "指示文に同封する書類名（例: 委任契約書）が含まれる場合のみ "
                      "task_params.enclosures に文字列配列で入れる（推測で補完しない）"),
+))
+
+
+# ── 職務上請求（D4・第1.5弾。設計 05 §3.1 / 必須項目は dispatch_bot/shokumu.py の
+#    洗い出し結果に従う） ─────────────────────────────────────────────────────
+from dispatch_bot import shokumu  # noqa: E402（循環回避のため末尾 import）
+
+register(TaskSpec(
+    task_type="shokumu_seikyu",
+    display_name="職務上請求",
+    answer_only=False,
+    destination="app30",
+    run_at="railway",
+    risk="中",  # 金銭計算（小為替）・必須項目多数（06 §4）→復唱はフルテンプレ
+    auto_scope="App 30 起票→既存 prepare（宛先解決・小為替計算・様式1/2重ね打ち）→承認待ちまで",
+    approval_scope="発送の承認（App 30 承認待ち→承認済・kintone上）＋投函（発送済への変更）",
+    required_fields=["customer_name"],  # 静的必須はここ。動的必須は missing_param_fn
+    field_questions={
+        "customer_name": "どの顧客（案件）への指示ですか？氏名を教えてください",
+        **shokumu.QUESTIONS,
+    },
+    search_apps=["KINTONE_APP_ID"],
+    artifacts="App 30 添付（チェックリスト・様式1/様式2 重ね打ちPDF・往復ラベル）",
+    adapter="App30Filer",
+    on_failure="起票失敗はLINEにエラー返信（prepare失敗・住所未登録警報は既存の警報系）",
+    hint_for_parser=("戸籍謄本・住民票等を市区町村へ請求する。"
+                     "task_params には指示文から取れた項目のみ入れる: "
+                     'request_items=[{"type": 種別, "count": 通数}]（種別は 戸籍謄本/除籍謄本/'
+                     "改製原戸籍/戸籍の附票/住民票/住民票の除票 のみ）・"
+                     "municipality=請求先市区町村名・"
+                     'target={"対象者","フリガナ","本籍","住所","筆頭者","世帯主","生年月日"}・'
+                     "purpose=利用目的（あれば）"),
+    required_desc=("customer_name, request_items（種別と通数）, municipality, "
+                   "target.対象者, target.生年月日（戸籍系請求のみ必須）"),
+    max_clarify=8,  # 03 §7 の D4 変更: 1論点1往復×必要項目数・全体8往復で打ち切り
+    param_normalizer=shokumu.normalize_params,
+    missing_param_fn=shokumu.first_missing,
+    pre_confirm_fn=shokumu.pre_confirm,
+    choice_fn=shokumu.choice,
+    summary_fn=shokumu.summary_lines,
 ))

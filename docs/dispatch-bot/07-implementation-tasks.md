@@ -112,8 +112,36 @@ D5→D6→D7〜D10（第2弾・D5のkintone作成が先行）。D11〜D13（第3
 
 ## 第1.5弾
 
-### D4 職務上請求の指示対応（聞き返しフロー込み）
+### D4 職務上請求の指示対応（聞き返しフロー込み）　★実施済み（2026-07-04）
 - 目的: チャネル固有JSON（request_items/target/municipality）の対話的な組み立て（03 §7・05 §3.1）
+- 実装ノート（2026-07-04）:
+  - **第一工程（教訓③）: 必須項目の洗い出し**を実物（parse_channel_data /
+    build_request_form_pdfs / find_municipality）から実施。結果は dispatch_bot/shokumu.py
+    冒頭に明文化: コード必須=request_items（種別∈6種・通数≥1）・municipality・
+    様式1（戸籍系）を含む場合の target.生年月日／実務必須扱い=target.対象者／
+    任意=フリガナ・本籍・住所・筆頭者・世帯主・purpose（既定文言 DEFAULT_PURPOSE）
+  - レジストリに shokumu_seikyu 登録（リスク=中・App 30起票・max_clarify=8）。
+    TaskSpec に D4 フック追加: param_normalizer / missing_param_fn / pre_confirm_fn /
+    choice_fn / summary_fn / max_clarify / required_desc（handler はフックの有無だけを見る）
+  - 聞き返し多段化（03 §7 の D4 差分どおり）: 1論点1往復×必要項目・同一論点の再質問1回まで・
+    全体8往復で打ち切り。質問順=種別通数→自治体→対象者→生年月日（様式1のみ・様式2のみなら聞かない）
+  - 一括抽出: 解析ヒントで request_items/municipality/target を tool use 抽出し、
+    取れた項目の聞き返しはスキップ。未対応種別・通数不正は normalize で落として聞き返しへ
+  - App 31 照合（pre_confirm）: 登録済み→小為替概算を復唱に表示（手数料未登録は「概算不能」）／
+    未登録→「1. 中止 / 2. このまま起票（PrepareDeferred の既存挙動で警報→登録→再保存）」の選択
+  - 復唱は中リスクのフルテンプレ（06 §2.2）＋summary_fn の明細（対象者・種別と通数・
+    宛先自治体・小為替概算・「発送には kintone での承認が別途必要」注記）
+  - 起票: app30_filer を file_from_pending にタスク汎用化。チャネル固有JSONは
+    parse_channel_data 実物を通す形式＋dispatch_bot 監査メタ併記（マージ基盤の上）
+  - テスト: test_dispatch_bot_shokumu.py 12件（全項目聞く経路・一括抽出スキップ・
+    様式2のみ生年月日スキップ・同一論点打ち切り・8往復打ち切り・App 31未登録3分岐・
+    手数料未登録の概算注記・parse_channel_data 実通過）。全体 440 passed / 2 skipped
+  - 既存テスト3件を「shokumu_seikyu=未登録」前提から更新（未登録題材を fax_send に変更）
+  - **purpose 既定文言の確定（2026-07-04 弁護士判断）**: ユニット種別別の確定文言
+    （時効援用=「受任事件（消滅時効援用）の通知書送付先調査のため」／相続放棄=
+    「受任事件（相続放棄申述）の申述に必要な戸籍等の取得のため」）。定義外ユニットは
+    既定を置かず purpose を聞き返し項目に追加（不適切な定型の印字防止）。
+    復唱に利用目的行を追加（印字文言を復唱段階で確認可能）
 - 依存: D3・T3-3（実施済み）
 - 変更対象: registry.py（shokumu_seikyuエントリ追加）・parser.py（missing_fields聞き返しの往復結合）
 - 新規: `test_dispatch_bot_shokumu.py`
