@@ -72,6 +72,10 @@ async def file_soufu_annai(pending: Pending) -> tuple[str, str, bool]:
         "宛先住所": case_rec.get("住所", {}).get("value", ""),
         "案件アプリID": os.environ.get("KINTONE_APP_ID", ""),
         "案件レコードID": pending.case.record_id,
+        # 同封物選択はブロックキーで設定（App 30 のチェックボックス選択肢は
+        # App 32 のブロックキーと同期・architecture/02 §4.2。空だと prepare が
+        # 「同封物が選択されていません」でエラーになるため必須・2026-07-04 修正）
+        "同封物選択": pending.parsed.get("task_params", {}).get("enclosures") or [],
         "実行済み": "no",
         "チャネル固有データ": json.dumps(meta, ensure_ascii=False),
     }

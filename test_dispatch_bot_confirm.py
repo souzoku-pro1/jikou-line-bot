@@ -18,13 +18,17 @@ os.environ.setdefault("KINTONE_API_TOKEN", "dummy")
 os.environ.setdefault("APP_SHIPPING", "30")
 os.environ.setdefault("TOKEN_SHIPPING", "dummy")
 
-from dispatch_bot import app30_filer, case_search, confirm, handler, parser  # noqa: E402
+from dispatch_bot import app30_filer, case_search, confirm, enclosures, handler, parser  # noqa: E402
 from hub import kintone  # noqa: E402
 
 
+ENC_OPTIONS = [enclosures.EnclosureOption(key="委任契約書", label="委任契約書")]
+
+
 def parsed(**over):
+    # 同封物必須化（2026-07-04）に伴い、既定で指示文由来の同封物を含める
     base = {"intent": "task", "task_type": "soufu_annai",
-            "customer_name": "鈴木", "task_params": {},
+            "customer_name": "鈴木", "task_params": {"enclosures": ["委任契約書"]},
             "confidence": "high", "missing_fields": [], "clarification": None}
     base.update(over)
     return base
@@ -60,6 +64,8 @@ class Base(unittest.IsolatedAsyncioTestCase):
             patch("hub.kintone.search_records", new=self.search30_mock),
             patch("hub.kintone.create_record", new=self.create_mock),
             patch("hub.kintone.create_records", new=self.bulk_mock),
+            patch.object(enclosures, "list_options",
+                         new=AsyncMock(return_value=list(ENC_OPTIONS))),
         ]
 
     async def send(self, text, user="U1"):
@@ -70,12 +76,12 @@ class TestFullCycle(Base):
     async def test_instruction_to_filing(self):
         """一巡: 指示→復唱（簡潔版2行）→OK→起票＋返信"""
         ps = self.patches([parsed(), parsed(intent="confirm")])
-        with ps[0], ps[1], ps[2], ps[3], ps[4], ps[5]:
+        with ps[0], ps[1], ps[2], ps[3], ps[4], ps[5], ps[6]:
             reply1 = await self.send("鈴木さんに送付案内を作って")
             # 復唱: 低リスク簡潔版（06 §2.1）
             self.assertEqual(
                 reply1,
-                "鈴木一郎さん（No.45・受任）に送付案内を起票します。\n"
+                "鈴木一郎さん（No.45・受任）に送付案内（委任契約書）を起票します。\n"
                 "OK / キャンセル（30分有効）")
             reply2 = await self.send("OK")
 
@@ -98,6 +104,8 @@ class TestFullCycle(Base):
         self.assertEqual(fields["案件アプリID"], "21")
         self.assertEqual(fields["案件レコードID"], "45")
         self.assertEqual(fields["実行済み"], "no")
+        self.assertEqual(fields["同封物選択"], ["委任契約書"],
+                         "同封物選択はブロックキーで設定（2026-07-04 修正）")
         meta = json.loads(fields["チャネル固有データ"])["dispatch_bot"]
         self.assertIn("鈴木さんに送付案内を作って", meta["指示原文"])
         self.assertEqual(meta["userId"], "U1")
@@ -107,7 +115,7 @@ class TestFullCycle(Base):
 
     async def test_completed_case_warning_in_confirmation(self):
         ps = self.patches(parsed(), hits=[hit(status="完了")])
-        with ps[0], ps[1], ps[2], ps[3], ps[4], ps[5]:
+        with ps[0], ps[1], ps[2], ps[3], ps[4], ps[5], ps[6]:
             reply = await self.send("鈴木さんに送付案内")
         self.assertIn("⚠ この案件は status=完了 です", reply)
         self.assertIn("起票します。", reply)
@@ -116,10 +124,10 @@ class TestFullCycle(Base):
         """複数候補→番号選択→復唱→OK→起票（番号選択は現対話への応答）"""
         hits = [hit("45"), hit("52", "鈴木花子", "手続き中")]
         ps = self.patches([parsed(), parsed(intent="confirm")], hits=hits)
-        with ps[0], ps[1], ps[2], ps[3], ps[4], ps[5]:
+        with ps[0], ps[1], ps[2], ps[3], ps[4], ps[5], ps[6]:
             await self.send("鈴木さんに送付案内")
             reply = await self.send("2")
-            self.assertIn("鈴木花子さん（No.52・手続き中）に送付案内を起票します。", reply)
+            self.assertIn("鈴木花子さん（No.52・手続き中）に送付案内（委任契約書）を起票します。", reply)
             reply2 = await self.send("OK")
         self.assertIn("起票しました", reply2)
         fields = self.create_mock.await_args.args[1]
@@ -131,7 +139,7 @@ class TestPendingSafety(Base):
         """二重OK: 起票は1回・2回目はリンク再掲（06 §3.1 単回消込）"""
         ps = self.patches([parsed(), parsed(intent="confirm"),
                            parsed(intent="confirm")])
-        with ps[0], ps[1], ps[2], ps[3], ps[4], ps[5]:
+        with ps[0], ps[1], ps[2], ps[3], ps[4], ps[5], ps[6]:
             await self.send("鈴木さんに送付案内")
             r1 = await self.send("OK")
             r2 = await self.send("OK")
@@ -143,7 +151,7 @@ class TestPendingSafety(Base):
     async def test_expired_ok(self):
         """30分経過後のOKは期限切れ（何も起票しない）"""
         ps = self.patches([parsed(), parsed(intent="confirm")])
-        with ps[0], ps[1], ps[2], ps[3], ps[4], ps[5]:
+        with ps[0], ps[1], ps[2], ps[3], ps[4], ps[5], ps[6]:
             await self.send("鈴木さんに送付案内")
             # 期限を強制超過
             p = confirm._pending["U1"]
@@ -154,7 +162,7 @@ class TestPendingSafety(Base):
 
     async def test_ok_without_pending(self):
         ps = self.patches(parsed(intent="confirm"))
-        with ps[0], ps[1], ps[2], ps[3], ps[4], ps[5]:
+        with ps[0], ps[1], ps[2], ps[3], ps[4], ps[5], ps[6]:
             reply = await self.send("OK")
         self.assertEqual(reply, handler.MSG_NO_PENDING)
         self.create_mock.assert_not_awaited()
@@ -163,7 +171,7 @@ class TestPendingSafety(Base):
         """キャンセル→④の文言。その後のOKは pending なし扱い"""
         ps = self.patches([parsed(), parsed(intent="cancel"),
                            parsed(intent="confirm")])
-        with ps[0], ps[1], ps[2], ps[3], ps[4], ps[5]:
+        with ps[0], ps[1], ps[2], ps[3], ps[4], ps[5], ps[6]:
             await self.send("鈴木さんに送付案内")
             r1 = await self.send("キャンセル")
             r2 = await self.send("OK")
@@ -186,7 +194,8 @@ class TestPendingSafety(Base):
                                                "住所": {"value": "X"},
                                                "郵便番号": {"value": ""}})), \
              patch("hub.kintone.search_records", new=AsyncMock(return_value=[])), \
-             patch("hub.kintone.create_record", new=self.create_mock):
+             patch.object(enclosures, "list_options",
+                          new=AsyncMock(return_value=list(ENC_OPTIONS))),              patch("hub.kintone.create_record", new=self.create_mock):
             await self.send("鈴木さんに送付案内")           # pending A
             r2 = await self.send("田中さんに送付案内")       # 割込み → pending B
             self.assertTrue(r2.startswith(handler.MSG_INTERRUPTED))
@@ -198,7 +207,7 @@ class TestPendingSafety(Base):
 
     async def test_pending_is_per_user(self):
         ps = self.patches([parsed(), parsed(intent="confirm")])
-        with ps[0], ps[1], ps[2], ps[3], ps[4], ps[5]:
+        with ps[0], ps[1], ps[2], ps[3], ps[4], ps[5], ps[6]:
             await self.send("鈴木さんに送付案内", user="U_owner1")
             reply = await self.send("OK", user="U_other")
         self.assertEqual(reply, handler.MSG_NO_PENDING)
@@ -209,7 +218,7 @@ class TestFilingGuardsAndFailure(Base):
     async def test_duplicate_guard_blocks_second_create(self):
         """第2層: 同一 pending_command_id のレコードが既にあれば作成しない（06 §3.3）"""
         ps = self.patches([parsed(), parsed(intent="confirm")], existing="99")
-        with ps[0], ps[1], ps[2], ps[3], ps[4], ps[5]:
+        with ps[0], ps[1], ps[2], ps[3], ps[4], ps[5], ps[6]:
             await self.send("鈴木さんに送付案内")
             reply = await self.send("OK")
         self.create_mock.assert_not_awaited()
@@ -224,7 +233,7 @@ class TestFilingGuardsAndFailure(Base):
                            parsed(intent="confirm")])
         alert = AsyncMock()
         self.create_mock.side_effect = kintone.KintoneError(500, "GAIA_XX", "boom")
-        with ps[0], ps[1], ps[2], ps[3], ps[4], ps[5], \
+        with ps[0], ps[1], ps[2], ps[3], ps[4], ps[5], ps[6], \
              patch("hub.notify.notify_admin_line", new=alert):
             await self.send("鈴木さんに送付案内")
             r1 = await self.send("OK")
@@ -242,7 +251,7 @@ class TestSingleRecordApi(Base):
 
     async def test_filing_uses_single_record_api_only(self):
         ps = self.patches([parsed(), parsed(intent="confirm")])
-        with ps[0], ps[1], ps[2], ps[3], ps[4], ps[5]:
+        with ps[0], ps[1], ps[2], ps[3], ps[4], ps[5], ps[6]:
             await self.send("鈴木さんに送付案内")
             await self.send("OK")
         self.create_mock.assert_awaited_once()   # 単票 create_record が1回

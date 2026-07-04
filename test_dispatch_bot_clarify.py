@@ -20,7 +20,7 @@ os.environ.setdefault("KINTONE_SUBDOMAIN", "testsub")
 os.environ.setdefault("KINTONE_APP_ID", "21")
 os.environ.setdefault("KINTONE_API_TOKEN", "dummy")
 
-from dispatch_bot import case_search, handler, parser, registry  # noqa: E402
+from dispatch_bot import case_search, enclosures, handler, parser, registry  # noqa: E402
 
 # 実機で観測されたモデル出力の再現（存在しない項目の創作＋複数列挙）
 BUGGY_PARSE = {
@@ -55,16 +55,20 @@ class TestClarifyIsRegistryDriven(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn(word, reply, f"存在しない項目/複数列挙が混入: {word}")
 
     async def test_invented_missing_fields_ignored_when_customer_present(self):
-        """顧客名が取れていれば、創作 missing_fields があっても聞き返さず検索に進む"""
+        """顧客名・同封物が取れていれば、創作 missing_fields があっても聞き返さず検索に進む"""
         data = dict(BUGGY_PARSE, customer_name="鈴木",
+                    task_params={"enclosures": ["委任契約書"]},
                     missing_fields=["送付する書類名", "送付日"])
         with patch.object(parser, "parse_instruction",
                           new=AsyncMock(return_value=data)), \
+             patch.object(enclosures, "list_options",
+                          new=AsyncMock(return_value=[enclosures.EnclosureOption(
+                              key="委任契約書", label="委任契約書")])), \
              patch.object(case_search, "search_cases",
                           new=AsyncMock(return_value=[hit()])) as search:
             reply = await handler.handle_message("U1", "鈴木さんに送付案内作って")
         search.assert_awaited_once()
-        self.assertIn("送付案内を起票します。", reply)
+        self.assertIn("を起票します。", reply)
 
     async def test_model_clarification_never_reaches_user_for_tasks(self):
         """タスク特定済みの聞き返し経路すべてで、モデルの clarification 文が出ない"""
@@ -86,11 +90,14 @@ class TestClarifyIsRegistryDriven(unittest.IsolatedAsyncioTestCase):
 
 
 class TestRegistryDefinition(unittest.TestCase):
-    def test_soufu_annai_requires_only_customer_name(self):
-        """設計05 §3.1: 必須は顧客名のみ（宛先は案件から・同封物選択は既定）"""
+    def test_soufu_annai_required_fields(self):
+        """必須は顧客名＋同封物（2026-07-04: 同封物空起票のprepareエラーを受け必須化。
+        宛先は案件から解決・「送付日」等は存在しない項目のまま）"""
         spec = registry.get_task("soufu_annai")
-        self.assertEqual(spec.required_fields, ["customer_name"])
+        self.assertEqual(spec.required_fields, ["customer_name", "enclosures"])
         self.assertIn("customer_name", spec.field_questions)
+        self.assertNotIn("enclosures", spec.field_questions,
+                         "同封物は動的選択肢（App 32）で聞くため静的質問文を持たない")
 
     def test_first_missing_question_is_single_topic(self):
         """_first_missing_question は最初の不足1つだけを返す（1論点）"""

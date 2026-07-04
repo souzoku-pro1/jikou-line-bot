@@ -71,13 +71,17 @@ register(TaskSpec(
     risk="低",
     auto_scope="App 30 起票→既存 prepare（docx+ラベル生成）→承認待ちまで",
     approval_scope="発送の承認（App 30 承認待ち→承認済・kintone上）",
-    # 必須は顧客名のみ（設計05 §3.1: 宛先は案件から解決・同封物選択は既定。
-    # 「書類名」「送付日」等は入力項目に存在しない＝聞いてはいけない）
-    required_fields=["customer_name"],
+    # 必須は顧客名＋同封物（2026-07-04: 同封物選択を空で起票すると prepare が
+    # エラーになるため必須化。宛先は案件から解決。「送付日」等は存在しない項目）。
+    # enclosures の聞き返しは App 32 の有効ブロックから動的に番号選択式で組み立てる
+    # （handler の動的フィールド扱い・field_questions には載せない）
+    required_fields=["customer_name", "enclosures"],
     field_questions={"customer_name": "どの顧客（案件）への指示ですか？氏名を教えてください"},
     search_apps=["KINTONE_APP_ID"],
     artifacts="App 30 添付（送付案内.docx・宛名ラベル.pdf）",
     adapter="App30Filer",  # D3 で実装
     on_failure="起票失敗はLINEにエラー返信（prepare失敗は既存の警報系）",
-    hint_for_parser="顧客へ書類を郵送する際の案内文書。「〜さんに送付案内」等",
+    hint_for_parser=("顧客へ書類を郵送する際の案内文書。「〜さんに送付案内」等。"
+                     "指示文に同封する書類名（例: 委任契約書）が含まれる場合のみ "
+                     "task_params.enclosures に文字列配列で入れる（推測で補完しない）"),
 ))
