@@ -243,15 +243,25 @@ class TestHandler(unittest.IsolatedAsyncioTestCase):
         self.assertIn("氏名を教えてください", r2)
         self.assertEqual(r3, handler.MSG_GIVE_UP)
 
-    async def test_low_confidence_asks_fixed_clarification(self):
-        """低確信度（タスク特定済み）は定型の聞き返し。モデルの clarification は
-        使わない（2026-07-04 不具合修正: 存在しない項目の創作防止）"""
+    async def test_low_confidence_with_resolved_task_proceeds(self):
+        """低確信度でも task_type 特定済みならレジストリ駆動フローへ進む
+        （2026-07-04 実機修正: 定型聞き返しで抽出結果を破棄しない）。
+        モデルの clarification は引き続き出さない（創作防止）"""
         p, s = self._patch(parsed(confidence="low",
-                                  clarification="どの書類の送付案内ですか？"))
+                                  clarification="どの書類の送付案内ですか？"),
+                           hits=[hit()])
+        with p, s:
+            reply = await handler.handle_message("U1", "鈴木さんに送付案内")
+        self.assertIn("を起票します。", reply, "復唱まで進む（定型聞き返しにしない）")
+        self.assertNotIn("どの書類", reply, "モデル生成の聞き返しを出さない")
+        self.assertNotIn("もう少し具体的に", reply)
+
+    async def test_low_confidence_without_task_type_asks(self):
+        """task_type 未特定の低確信度のみ定型聞き返し（低確信度分岐の限定先）"""
+        p, s = self._patch(parsed(confidence="low", task_type=None))
         with p, s:
             reply = await handler.handle_message("U1", "あれやっといて")
         self.assertIn("もう少し具体的に", reply)
-        self.assertNotIn("どの書類", reply, "モデル生成の聞き返しを出さない")
 
     async def test_claude_unavailable_returns_fixed_message(self):
         with patch.object(parser, "parse_instruction",

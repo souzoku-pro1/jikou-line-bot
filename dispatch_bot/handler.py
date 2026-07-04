@@ -243,13 +243,15 @@ async def _handle(user_id: str, text: str) -> str:
     spec = registry.get_task(parsed["task_type"])
     if spec is None:
         _sessions.pop(user_id, None)
+        if parsed["task_type"] is None:
+            # task_type 未特定（低確信度分岐はここに限定・2026-07-04 実機修正:
+            # task_type が特定できていれば low でもレジストリ駆動の不足聞き返しに
+            # 進む。モデルは氏名の帰属曖昧さ等で low を返し得るが、不足・曖昧は
+            # コード側の個別質問が自然に解消する）
+            return prefix + _ask(user_id, base_text, "low_confidence",
+                                 "指示の内容をもう少し具体的に教えてください"
+                                 "（例:「鈴木さんに送付案内を作って」）", session)
         return prefix + MSG_UNSUPPORTED
-    if parsed["confidence"] == "low":
-        # タスク種別が特定できている低確信度は定型で聞き返す
-        # （モデルの clarification は使わない＝存在しない項目の創作防止）
-        return prefix + _ask(user_id, base_text, "low_confidence",
-                             "指示の内容をもう少し具体的に教えてください"
-                             "（例:「鈴木さんに送付案内を作って」）", session, spec)
 
     # 必須項目の不足 → 聞き返し（1論点ずつ・03 §7）。
     # ★質問文は必ずレジストリの定義（required_fields / field_questions）から組み立てる。
