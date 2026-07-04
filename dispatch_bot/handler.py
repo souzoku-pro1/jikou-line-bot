@@ -69,6 +69,17 @@ def _present_interpretation(parsed: dict, hit: case_search.CaseHit) -> str:
     return "\n".join(lines)
 
 
+def _first_missing_question(spec, parsed: dict) -> str | None:
+    """レジストリの必須入力項目のうち**最初の不足1つだけ**の質問文を返す（1論点・03 §7）。
+    不足がなければ None。モデル出力の missing_fields は判定に使わない"""
+    for f in spec.required_fields:
+        value = parsed["customer_name"] if f == "customer_name" \
+                else parsed["task_params"].get(f)
+        if not value:
+            return spec.field_questions.get(f, f"「{f}」を教えてください")
+    return None
+
+
 def _ask(session_user: str, base_text: str, question: str,
          prev: Session | None) -> str:
     """聞き返し（回数管理・2往復で打ち切り・03 §7）"""
@@ -126,16 +137,20 @@ async def _handle(user_id: str, text: str) -> str:
         _sessions.pop(user_id, None)
         return MSG_UNSUPPORTED
     if parsed["confidence"] == "low":
-        question = parsed["clarification"] or "指示の内容をもう少し具体的に教えてください"
-        return _ask(user_id, base_text, question, session)
+        # タスク種別が特定できている低確信度は定型で聞き返す
+        # （モデルの clarification は使わない＝存在しない項目の創作防止）
+        return _ask(user_id, base_text,
+                    "指示の内容をもう少し具体的に教えてください"
+                    "（例:「鈴木さんに送付案内を作って」）", session)
 
-    # 必須項目の不足 → 聞き返し（1論点ずつ・03 §7）
-    if "customer_name" in spec.required_fields and not parsed["customer_name"]:
-        return _ask(user_id, base_text, "どの顧客（案件）への指示ですか？氏名を教えてください",
-                    session)
-    if parsed["missing_fields"]:
-        items = "・".join(parsed["missing_fields"][:3])
-        return _ask(user_id, base_text, f"次の項目を教えてください: {items}", session)
+    # 必須項目の不足 → 聞き返し（1論点ずつ・03 §7）。
+    # ★質問文は必ずレジストリの定義（required_fields / field_questions）から組み立てる。
+    #   モデルの missing_fields / clarification をそのまま出さない（2026-07-04 不具合修正:
+    #   「書類名」「送付日」等、レジストリに存在しない項目を創作して3項目同時に
+    #   要求する事象が実機で発生したため）
+    question = _first_missing_question(spec, parsed)
+    if question:
+        return _ask(user_id, base_text, question, session)
 
     # ── 案件検索（03 §4） ────────────────────────────────────────────────
     hits = await case_search.search_cases(parsed["customer_name"])
