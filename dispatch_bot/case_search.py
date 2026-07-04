@@ -6,12 +6,10 @@
 - 完了・不受任の案件も候補に含める（⚠付き。除外はしない・03 §4.3）
 """
 
-import logging
 from dataclasses import dataclass
 
 from hub import kintone
 
-logger = logging.getLogger("dispatch_bot.case_search")
 
 APP_CASE = kintone.KintoneApp("App 21 (案件)", "KINTONE_APP_ID", "KINTONE_API_TOKEN")
 
@@ -66,7 +64,7 @@ async def search_cases(customer_name: str) -> list[CaseHit]:
     retry = compact if compact != name else name.split()[0] if " " in name else \
             name.split("　")[0] if "　" in name else ""
     if retry and retry != name:
-        logger.info("[DISPATCHBOT] case retry search %r -> %r", name, retry)
+        print(f"[DISPATCHBOT] case retry search {name!r} -> {retry!r}")
         return await _search(retry)
     return []
 

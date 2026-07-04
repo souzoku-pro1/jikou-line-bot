@@ -18,7 +18,6 @@ import base64
 import hashlib
 import hmac
 import json
-import logging
 import os
 
 import httpx
@@ -26,7 +25,6 @@ from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 
 from hub import notify
 
-logger = logging.getLogger("dispatch_bot")
 
 router = APIRouter()
 
@@ -56,7 +54,7 @@ async def _send_reply(reply_token: str, user_id: str, text: str) -> None:
     トークンは DISPATCHBOT_CHANNEL_ACCESS_TOKEN（顧客Botのトークンは使わない）"""
     token = os.environ.get("DISPATCHBOT_CHANNEL_ACCESS_TOKEN", "")
     if not token:
-        logger.error("[DISPATCHBOT] DISPATCHBOT_CHANNEL_ACCESS_TOKEN 未設定のため返信不可")
+        print("[DISPATCHBOT] ERROR: DISPATCHBOT_CHANNEL_ACCESS_TOKEN 未設定のため返信不可")
         return
     headers = {"Authorization": f"Bearer {token}"}
     async with httpx.AsyncClient(timeout=10) as client:
@@ -68,7 +66,7 @@ async def _send_reply(reply_token: str, user_id: str, text: str) -> None:
         )
         if resp.status_code == 200:
             return
-        logger.warning("[DISPATCHBOT] reply failed (%s), falling back to push", resp.status_code)
+        print(f"[DISPATCHBOT] reply failed ({resp.status_code}), falling back to push")
         await client.post(
             "https://api.line.me/v2/bot/message/push",
             headers=headers,
@@ -94,19 +92,20 @@ async def process_dispatch_bot_event(reply_token: str, user_id: str, user_text: 
     try:
         if not is_allowed(user_id):
             # 沈黙（reply も push もしない）＋管理者警報のみ
-            logger.warning("[DISPATCHBOT] unauthorized userId=%s...", user_id[:10])
+            print(f"[DISPATCHBOT] unauthorized userId={user_id[:10]}...")
             await _alert_unauthorized(user_id, user_text)
             return
 
-        logger.info("[DISPATCHBOT] message userId=%s... text=%r",
-                    user_id[:10], user_text[:50])
+        print(f"[DISPATCHBOT] message userId={user_id[:10]}... text={user_text[:50]!r}")
         # D2: 解析→案件検索→解釈結果の提示（復唱確認・起票は D3）
         from dispatch_bot.handler import handle_message
         reply_text = await handle_message(user_id, user_text)
         if reply_text:
             await _send_reply(reply_token, user_id, reply_text)
     except Exception:
-        logger.exception("[DISPATCHBOT] process failed userId=%s...", user_id[:10])
+        import traceback
+        print(f"[DISPATCHBOT] ERROR: process failed userId={user_id[:10]}...:")
+        print(traceback.format_exc())
 
 
 async def _process_follow_event(user_id: str) -> None:
@@ -114,7 +113,7 @@ async def _process_follow_event(user_id: str) -> None:
     if not is_allowed(user_id):
         await _alert_unauthorized(user_id, "（友だち追加イベント）")
         return
-    logger.info("[DISPATCHBOT] follow userId=%s... (allowed)", user_id[:10])
+    print(f"[DISPATCHBOT] follow userId={user_id[:10]}... (allowed)")
 
 
 @router.post("/webhook/dispatch-bot")

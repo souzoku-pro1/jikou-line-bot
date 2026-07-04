@@ -9,7 +9,6 @@
   「もう一度確認される」方向に倒れる（安全側・06 §3.2）
 """
 
-import logging
 import re
 import time
 from dataclasses import dataclass, field
@@ -18,7 +17,6 @@ from claude_gateway import ClaudeUnavailableError
 from dispatch_bot import app30_filer, case_search, confirm, parser, registry
 from hub import kintone, notify
 
-logger = logging.getLogger("dispatch_bot.handler")
 
 _SESSION_TTL_SEC = 30 * 60
 _MAX_CLARIFY = 2  # 聞き返しは2往復まで（03 §7）
@@ -91,7 +89,7 @@ async def _execute_confirmed(user_id: str) -> str:
     except kintone.KintoneError as e:
         # 起票失敗: ユーザーに通知＋管理者警報。pending は消込済みでよい（再指示でやり直し）
         confirm.invalidate(user_id)
-        logger.error("[DISPATCHBOT] filing failed cmd=%s: %s", pending.command_id[:8], e)
+        print(f"[DISPATCHBOT] ERROR: filing failed cmd={pending.command_id[:8]}: {e}")
         await notify.notify_admin_line(
             "【指示Bot: 起票失敗】\n"
             f"タスク: {pending.parsed.get('task_type')} / 案件No.{pending.case.record_id}\n"
@@ -171,8 +169,7 @@ async def _handle(user_id: str, text: str) -> str:
     # 　聞き返し回答は session 経由=ここに来る時点で pending は存在しない）
     prefix = ""
     if intent in ("task", "query", "unknown") and confirm.invalidate(user_id):
-        logger.info("[DISPATCHBOT] pending interrupted by new instruction user=%s...",
-                    user_id[:10])
+        print(f"[DISPATCHBOT] pending interrupted by new instruction user={user_id[:10]}...")
         prefix = MSG_INTERRUPTED + "\n"
 
     if intent == "query":

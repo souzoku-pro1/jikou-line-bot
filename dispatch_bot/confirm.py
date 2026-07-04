@@ -9,7 +9,6 @@
 - 復唱の情報密度はリスク比例（低=簡潔版2行／中・高=フルテンプレ・一律フル禁止）
 """
 
-import logging
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -17,7 +16,6 @@ from dataclasses import dataclass, field
 from dispatch_bot.case_search import CaseHit
 from dispatch_bot.registry import TaskSpec
 
-logger = logging.getLogger("dispatch_bot.confirm")
 
 PENDING_TTL_SEC = 30 * 60  # 30分（06 §3.1）
 
@@ -47,8 +45,7 @@ def create(user_id: str, parsed: dict, case: CaseHit, instruction_text: str) -> 
     p = Pending(command_id=str(uuid.uuid4()), user_id=user_id,
                 parsed=parsed, case=case, instruction_text=instruction_text)
     _pending[user_id] = p
-    logger.info("[DISPATCHBOT] pending created id=%s user=%s...",
-                p.command_id[:8], user_id[:10])
+    print(f"[DISPATCHBOT] pending created id={p.command_id[:8]} user={user_id[:10]}...")
     return p
 
 
