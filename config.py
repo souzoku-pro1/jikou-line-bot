@@ -288,8 +288,8 @@ EXPECTED_KINTONE_SCHEMA = {
     # ── 戸籍読解（R系列・docs/koseki-ocr/02 §1）──
     # 2026-07-05 フォーム設計取得APIで実機22フィールドの全一致を確認して登録。
     # 編製日・消除日は和暦原文保持のため SINGLE_LINE_TEXT（DATE型にしない・
-    # 2026-07-05 検収裁定）。App 34（人物・APP_KOSEKI_PERSON）は実機が設計の
-    # 完全形に達しておらず期待値未確定のため未登録（2026-07-05 裁定・02 §2 注記）
+    # 2026-07-05 検収裁定）。App 34（人物）は同日、引き継ぎブリーフの完全形35
+    # （当初21＋追加14）との実機全一致を確認して下記に登録済み（02 §2 改訂版参照）
     "App 33 (戸籍読解)": {
         "app_id_env": "APP_KOSEKI_BOOK",
         "token_env": "TOKEN_KOSEKI_BOOK",
@@ -335,6 +335,88 @@ EXPECTED_KINTONE_SCHEMA = {
             "確認日時": {"type": "DATETIME"},
             "様式確信度": {"type": "NUMBER"},
             "全体確信度": {"type": "NUMBER"},
+        },
+    },
+    # ── 人物（R系列・docs/koseki-ocr/02 §2 改訂版）──
+    # 2026-07-05 実機突合で完全形35（当初21＋追加14・トップ34＋サブテーブル2）の
+    # 全一致を確認して登録。SUBTABLE の内部列は healthcheck の検査対象外
+    # （型一致のみ検査）。選択肢はフォーム設計取得APIの実機実出力どおり
+    "App 34 (人物)": {
+        "app_id_env": "APP_KOSEKI_PERSON",
+        "token_env": "TOKEN_KOSEKI_PERSON",
+        # env 未設定の環境では監視をスキップ（設定されたら自動的に監視対象になる）
+        "optional": True,
+        "fields": {
+            # 案件参照（ハブ共通方式）
+            "ユニット種別": {
+                "type": "DROP_DOWN",
+                "required_options": ["時効援用", "相続放棄", "相続一般", "補助金"],
+            },
+            "案件アプリID": {"type": "SINGLE_LINE_TEXT"},
+            "案件レコードID": {"type": "SINGLE_LINE_TEXT"},
+            "被相続人名表示用": {"type": "SINGLE_LINE_TEXT"},
+            # 氏名系（表示名・原文・名寄せ用正字）
+            "氏名": {"type": "SINGLE_LINE_TEXT"},
+            "氏名フリガナ": {"type": "SINGLE_LINE_TEXT"},
+            "旧姓別名": {"type": "SINGLE_LINE_TEXT"},
+            "氏名_原文": {"type": "SINGLE_LINE_TEXT"},
+            "氏名_正字": {"type": "SINGLE_LINE_TEXT"},
+            # 確定値の日付（和暦原文は身分事項側）
+            "生年月日": {"type": "DATE"},
+            "死亡日": {"type": "DATE"},
+            "性別": {
+                "type": "DROP_DOWN",
+                "required_options": ["男", "女", "不明"],
+            },
+            # 親子エッジ（関係図・相続人導出の骨格）
+            "父人物ID": {"type": "SINGLE_LINE_TEXT"},
+            "母人物ID": {"type": "SINGLE_LINE_TEXT"},
+            "養父人物ID": {"type": "SINGLE_LINE_TEXT"},
+            "養母人物ID": {"type": "SINGLE_LINE_TEXT"},
+            "被相続人フラグ": {
+                "type": "RADIO_BUTTON",
+                "required_options": ["no", "yes"],
+            },
+            "生死区分": {
+                "type": "DROP_DOWN",
+                "required_options": ["生存", "死亡", "不明"],
+            },
+            "続柄メモ": {"type": "SINGLE_LINE_TEXT"},
+            "本籍最新": {"type": "SINGLE_LINE_TEXT"},
+            "住所最新": {"type": "SINGLE_LINE_TEXT"},
+            # 名寄せ（候補提示=機械・確定=人）
+            "名寄せキー": {"type": "SINGLE_LINE_TEXT"},
+            "名寄せ確定": {
+                "type": "DROP_DOWN",
+                "required_options": ["未確定", "自動候補", "確定"],
+            },
+            # 相続人導出（候補=機械・資格確定=弁護士）
+            "相続人候補": {
+                "type": "DROP_DOWN",
+                "required_options": ["候補", "非該当", "未判定"],
+            },
+            "相続資格": {
+                "type": "DROP_DOWN",
+                "required_options": ["未判定", "法定相続人", "代襲相続人",
+                                     "数次相続人", "相続放棄済", "資格なし"],
+            },
+            # 読解トレーサビリティ・監査痕跡
+            "読解由来": {
+                "type": "RADIO_BUTTON",
+                "required_options": ["AI読解", "手入力"],
+            },
+            "読解JSON断片": {"type": "MULTI_LINE_TEXT"},
+            "グラフ確定日時": {"type": "DATETIME"},
+            "確認状態": {
+                "type": "DROP_DOWN",
+                "required_options": ["未確認", "確認済", "要再確認"],
+            },
+            "確認者": {"type": "SINGLE_LINE_TEXT"},
+            "確認日時": {"type": "DATETIME"},
+            "備考": {"type": "MULTI_LINE_TEXT"},
+            # サブテーブル（内部列は型検査の対象外）
+            "身分事項": {"type": "SUBTABLE"},
+            "登場戸籍": {"type": "SUBTABLE"},
         },
     },
 }
