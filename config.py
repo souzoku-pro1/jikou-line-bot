@@ -285,6 +285,58 @@ EXPECTED_KINTONE_SCHEMA = {
             "有効": {"type": "RADIO_BUTTON", "required_options": ["yes", "no"]},
         },
     },
+    # ── 戸籍読解（R系列・docs/koseki-ocr/02 §1）──
+    # 2026-07-05 フォーム設計取得APIで実機22フィールドの全一致を確認して登録。
+    # 編製日・消除日は和暦原文保持のため SINGLE_LINE_TEXT（DATE型にしない・
+    # 2026-07-05 検収裁定）。App 34（人物・APP_KOSEKI_PERSON）は実機が設計の
+    # 完全形に達しておらず期待値未確定のため未登録（2026-07-05 裁定・02 §2 注記）
+    "App 33 (戸籍読解)": {
+        "app_id_env": "APP_KOSEKI_BOOK",
+        "token_env": "TOKEN_KOSEKI_BOOK",
+        # env 未設定の環境では監視をスキップ（設定されたら自動的に監視対象になる）
+        "optional": True,
+        "fields": {
+            # 案件参照4点（ハブ共通方式）
+            "ユニット種別": {
+                "type": "DROP_DOWN",
+                "required_options": ["時効援用", "相続放棄", "相続一般", "補助金"],
+            },
+            "案件アプリID": {"type": "SINGLE_LINE_TEXT"},
+            "案件レコードID": {"type": "SINGLE_LINE_TEXT"},
+            "被相続人名表示用": {"type": "SINGLE_LINE_TEXT"},
+            # 戸籍の識別子（原文表記）
+            "本籍": {"type": "SINGLE_LINE_TEXT"},
+            "筆頭者": {"type": "SINGLE_LINE_TEXT"},
+            "戸籍種別": {
+                "type": "DROP_DOWN",
+                "required_options": ["現行", "改製原（平成）", "改製原（昭和）",
+                                     "除籍", "不明"],
+            },
+            # 連続性の判定材料（和暦原文のまま保持）
+            "編製日": {"type": "SINGLE_LINE_TEXT"},
+            "消除日": {"type": "SINGLE_LINE_TEXT"},
+            "編製事由": {"type": "SINGLE_LINE_TEXT"},
+            "従前戸籍_本籍": {"type": "SINGLE_LINE_TEXT"},
+            "従前戸籍_筆頭者": {"type": "SINGLE_LINE_TEXT"},
+            "新戸籍_本籍": {"type": "SINGLE_LINE_TEXT"},
+            # 原本・読解結果（/koseki/ingest・koseki_reader が読み書き）
+            "原本PDF": {"type": "FILE"},
+            "ページ画像": {"type": "FILE"},
+            "Drive_fileId": {"type": "SINGLE_LINE_TEXT"},
+            "読解JSON": {"type": "MULTI_LINE_TEXT"},
+            "読解状態": {
+                "type": "DROP_DOWN",
+                # 書き: "未読解"(koseki_ingest) / "AI読解済"・"要再読解"(koseki_reader)
+                # "確認済" は人手確認フロー（R4）が使う
+                "required_options": ["未読解", "AI読解済", "確認済", "要再読解"],
+            },
+            # 監査痕跡・品質管理
+            "確認者": {"type": "SINGLE_LINE_TEXT"},
+            "確認日時": {"type": "DATETIME"},
+            "様式確信度": {"type": "NUMBER"},
+            "全体確信度": {"type": "NUMBER"},
+        },
+    },
 }
 
 
