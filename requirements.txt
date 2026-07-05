@@ -7,3 +7,4 @@ python-docx
 requests
 stripe
 reportlab
+pymupdf
