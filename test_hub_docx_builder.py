@@ -174,6 +174,20 @@ class TestRealTemplateRegistry(unittest.TestCase):
         import daily_healthcheck
         self.assertEqual(daily_healthcheck.check_templates(), [])
 
+    def test_registry_keys_are_portable_across_os(self):
+        """レジストリキーが両OSで解決できることの固定。
+        検査（validate_template）は Path(key).is_file() の pathlib 解釈であり、
+        バックスラッシュ区切りは Linux（Railway）ではファイル名の一部と
+        解釈されて不存在誤判定になるため、キーはスラッシュ区切りに限る"""
+        from pathlib import Path, PurePosixPath
+        from config import EXPECTED_DOCX_TEMPLATES
+        for key in EXPECTED_DOCX_TEMPLATES:
+            with self.subTest(template=key):
+                self.assertNotIn("\\", key,
+                                 "バックスラッシュ区切りは Linux で不存在誤判定になる")
+                self.assertTrue(Path(*PurePosixPath(key).parts).is_file(),
+                                "POSIX の区切り解釈で実ファイルに辿り着けない")
+
 
 def _add_row_table(doc: Document, header: list[str], template_cells: list[str]):
     """ヘッダ1行＋テンプレート行1行の表を追加する（fill_table_rows テスト用）"""
