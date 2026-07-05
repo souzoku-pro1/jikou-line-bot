@@ -113,31 +113,56 @@ def fill_template_multiline(template_path: str, data: dict) -> bytes:
     return buf.read()
 
 
-def fill_table_rows(doc: Document, rows: list[dict], marker_prefix: str = "{{行:") -> None:
+def fill_table_rows(doc: Document, rows: list[dict], marker_prefix: str = "{{行:",
+                    *, row_marker: str | None = None,
+                    empty_text: str | None = None) -> None:
     """{{行:列名}} を含むテンプレート行を rows の件数分複製して差し込む
-    （souzoku-shorui 02 §2 の設計を前倒し実装・T2-2 テンプレ統合で使用）。
+    （souzoku-shorui 02 §2・S2。T2-2 テンプレ統合〔送付案内の書類表〕で使用中）。
 
     - テンプレート行の書式・罫線は行の複製（deepcopy）で継承される
-    - rows が空のときはテンプレート行を削除する（空の表は「該当なし」にしない）
-    - 対象は最初に見つかったテンプレート行1つ（1テンプレート=1可変表の規約）
+    - row_marker（例 "{{行:財産}}"）を指定すると、そのマーカーを含む行だけを対象にする。
+      可変表が複数ある帳票（財産目録の種別セクション等）はセクションごとに
+      マーカーを変えて本関数を呼び分ける。複製行ではマーカー自体は空文字になる
+      （rows の列名と一致する場合はその値が優先）
+    - row_marker 未指定時は最初に見つかったテンプレート行1つが対象（従来互換）
+    - rows が空のときはテンプレート行を削除する。empty_text を指定した場合は
+      書式を継承した1行を残し、row_marker の位置（未指定時は行内の最初の
+      プレースホルダ）に empty_text を差し込み、他のプレースホルダは空欄にする
     """
     import copy as _copy
 
     from docx.table import _Row
 
+    needle = row_marker if row_marker is not None else marker_prefix
     for table in doc.tables:
         for row in table.rows:
-            if not any(marker_prefix in cell.text for cell in row.cells):
+            if not any(needle in cell.text for cell in row.cells):
                 continue
             template_tr = row._tr
-            for item in rows:
+
+            def _stamp(data: dict) -> None:
                 new_tr = _copy.deepcopy(template_tr)
                 template_tr.addprevious(new_tr)
                 new_row = _Row(new_tr, table)
-                data = {marker_prefix + k + "}}": str(v) for k, v in item.items()}
                 for cell in new_row.cells:
                     for para in cell.paragraphs:
                         _replace_multiline_in_paragraph(para, data)
+
+            if not rows and empty_text is not None:
+                row_text = "\n".join(cell.text for cell in row.cells)
+                placeholders = [ph for ph in _PLACEHOLDER_RE.findall(row_text)
+                                if ph.startswith(marker_prefix)]
+                data = {ph: "" for ph in placeholders}
+                anchor = row_marker if row_marker is not None else (
+                    placeholders[0] if placeholders else None)
+                if anchor is not None:
+                    data[anchor] = empty_text
+                _stamp(data)
+            for item in rows:
+                data = {marker_prefix + k + "}}": str(v) for k, v in item.items()}
+                if row_marker is not None:
+                    data.setdefault(row_marker, "")
+                _stamp(data)
             template_tr.getparent().remove(template_tr)
             return
     # テンプレート行が見つからない場合は何もしない（validate_template で検知する）
