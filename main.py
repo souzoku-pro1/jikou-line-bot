@@ -8,7 +8,7 @@ import base64
 import httpx
 import anthropic
 from pydantic import BaseModel, Field, AliasChoices
-from fastapi import FastAPI, Request, HTTPException, UploadFile, File, BackgroundTasks
+from fastapi import FastAPI, Request, HTTPException, UploadFile, File, Form, BackgroundTasks
 
 app = FastAPI()
 
@@ -658,10 +658,15 @@ async def _push_line_message(user_id: str, text: str) -> None:
 
 
 @app.post("/ocr/fixed-asset")
-async def ocr_fixed_asset(file: UploadFile = File(...)):
+async def ocr_fixed_asset(file: UploadFile = File(...),
+                          case_hint: str | None = Form(default=None)):
     """
     PDFをアップロードすると固定資産税評価額・年度をOCRで抽出し
     kintoneに登録してLINEで通知する。
+
+    case_hint（省略可・S4）: 案件レコードID。App 財産への財産行 upsert
+    （units/souzoku/zaisan_sync・souzoku-shorui/02 §3）の案件紐付けに使う。
+    既存の呼び出し（file のみ）の動作は不変。
     """
     # ─ 環境変数チェック ─
     missing = [k for k, v in {
@@ -741,11 +746,29 @@ async def ocr_fixed_asset(file: UploadFile = File(...)):
     else:
         print("[INFO] LINE_USER_ID未設定のためLINE通知をスキップ")
 
-    return {
+    # 7. S4 追記型拡張（souzoku-shorui/02 §3）: App 財産への財産行 upsert。
+    #    既存処理（1〜6）成功後にのみ実行。無効時（ZAISAN_SYNC_DISABLED=1 /
+    #    APP_ZAISAN 未設定）は None が返り、従来レスポンスをそのまま返す。
+    #    追加処理の失敗は既存処理の成功応答を壊さない
+    zaisan_sync = None
+    try:
+        from units.souzoku.zaisan_sync import sync_fixed_asset
+        zaisan_sync = await sync_fixed_asset(
+            fudosan_record_id=record_id, extracted=extracted,
+            shozaichi=shozaichi, pdf_bytes=pdf_bytes,
+            filename=file.filename, case_hint=case_hint)
+    except Exception as e:
+        print(f"[WARN] 財産行同期に失敗（既存処理は完了済み）: {e}")
+        zaisan_sync = {"status": "error", "detail": str(e)[:200]}
+
+    response = {
         "status": "ok",
         "kintone_record_id": record_id,
         "extracted": extracted,
     }
+    if zaisan_sync is not None:
+        response["zaisan_sync"] = zaisan_sync
+    return response
 
 
 # ══════════════════════════════════════════════════════════════
