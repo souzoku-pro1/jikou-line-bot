@@ -117,6 +117,20 @@ class TestAuth(_Base):
         resp = self.post(_Kintone(), {**_ENV, "KOSEKI_INGEST_TOKEN": ""})
         self.assertEqual(resp.status_code, 404)
 
+    def test_probe_without_body_is_404_not_422(self):
+        """token 無し・body 無しの探信にも 404（file 必須の 422 で存在が漏れない・
+        2026-07-05 実機で発見した回帰の固定）"""
+        with patch.dict("os.environ", _ENV):
+            resp = client.post(URL)
+        self.assertEqual(resp.status_code, 404)
+
+    def test_valid_token_without_file_is_400(self):
+        """認証後のファイル欠落は 400 の明示エラー"""
+        with patch.dict("os.environ", _ENV):
+            resp = client.post(URL + "?token=koseki_token")
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("PDF", resp.json()["detail"])
+
 
 class TestEnvGuards(_Base):
     def test_app_env_unset_is_503_explicit(self):
