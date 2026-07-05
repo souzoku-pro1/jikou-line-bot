@@ -226,3 +226,22 @@ D5→D6→D7〜D10（第2弾・D5のkintone作成が先行）。D11〜D13（第3
 - /webhook（顧客Bot）・/hub/dispatch の挙動不変（回帰テスト）
 - LINE OK で対外効果が発生しない（禁止リスト突合テスト）
 - 秘密情報の直書きなし（環境変数のみ）
+
+## 教訓記録
+
+### Claude Code permissions（deny）強化（2026-07-05）
+
+- **settings.json はセッション起動時のディレクトリで読み込まれる。**
+  セッション途中での作成・途中の cd では無効（再起動が必要）。ホームディレクトリで
+  起動した場合はプロジェクトの `.claude/settings.json` が一切読まれない。
+  検証・運用はリポジトリ内で起動していることの確認から始める。
+- **`Bash(...)` 形式の deny は PowerShell ツールには適用されない。**
+  powershell.exe / pwsh / cmd を経由するラッパー経路は `Bash(powershell*)` 等で遮断し、
+  PowerShell ツール側には `PowerShell(...)` 形式で鏡写しのルールを追加する（公式記法）。
+  PowerShell のエイリアス（curl 等）は cmdlet 名に正規化されるため、
+  `Invoke-WebRequest` / `Invoke-RestMethod` の実体側も塞ぐこと。
+- **GitHub API 直叩き（python 経由）は permissions では担保不能。**
+  行動規約＋トークン権限分離で担保する（既裁定）。
+- **検証手順の型**: 再起動→リポジトリ内起動の確認→
+  ①Bash直接 ②Bash→powershell.exe ラッパー ③PowerShellツール直接 の3経路すり抜けテスト
+  （git push --dry-run 等の無害コマンドで全件ブロックを確認）。
