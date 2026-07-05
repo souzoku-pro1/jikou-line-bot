@@ -117,5 +117,92 @@ class TestApp32Schema(unittest.TestCase):
             self.assertIn(spec["type"], VALID_TYPES, f"{code} の型が不正")
 
 
+class TestApp33Schema(unittest.TestCase):
+    """App 33（戸籍読解）のスキーマ定義検証
+    （docs/koseki-ocr/02 §1・2026-07-05 実機フォーム設計APIと突合済み）"""
+
+    def setUp(self):
+        self.app33 = EXPECTED_KINTONE_SCHEMA["App 33 (戸籍読解)"]
+
+    def test_env_names(self):
+        self.assertEqual(self.app33["app_id_env"], "APP_KOSEKI_BOOK")
+        self.assertEqual(self.app33["token_env"], "TOKEN_KOSEKI_BOOK")
+
+    def test_field_count_is_22(self):
+        self.assertEqual(len(self.app33["fields"]), 22)
+
+    def test_is_optional(self):
+        """env 未設定の環境では監視スキップ（通帳と同じ optional 方式）"""
+        self.assertIs(self.app33.get("optional"), True)
+
+    def test_dates_are_text_not_date(self):
+        """編製日・消除日は和暦原文保持のため SINGLE_LINE_TEXT
+        （DATE型にしない・2026-07-05 検収裁定・02 §1）"""
+        for code in ("編製日", "消除日"):
+            self.assertEqual(self.app33["fields"][code]["type"],
+                             "SINGLE_LINE_TEXT", code)
+
+    def test_reading_status_options(self):
+        """読解状態は koseki_ingest/koseki_reader が書く3値＋人手確認の「確認済」"""
+        f = self.app33["fields"]["読解状態"]
+        self.assertEqual(f["type"], "DROP_DOWN")
+        self.assertEqual(set(f["required_options"]),
+                         {"未読解", "AI読解済", "確認済", "要再読解"})
+
+    def test_koseki_type_options(self):
+        f = self.app33["fields"]["戸籍種別"]
+        self.assertEqual(set(f["required_options"]),
+                         {"現行", "改製原（平成）", "改製原（昭和）", "除籍", "不明"})
+
+    def test_reader_written_fields_present(self):
+        """koseki_ingest / koseki_reader が読み書きするフィールドが監視に含まれること"""
+        for code in ("原本PDF", "ページ画像", "Drive_fileId", "読解JSON",
+                     "読解状態", "案件アプリID", "案件レコードID",
+                     "様式確信度", "全体確信度"):
+            self.assertIn(code, self.app33["fields"])
+
+    def test_all_types_valid(self):
+        for code, spec in self.app33["fields"].items():
+            self.assertIn(spec["type"], VALID_TYPES, f"{code} の型が不正")
+
+
+class TestHealthcheckOptionalSkip(unittest.TestCase):
+    """check_kintone_schema の env 未設定時の挙動
+    （optional=スキップ・警報なし / 非optional=警報。既存挙動の回帰込み）"""
+
+    def _run(self, schema):
+        import asyncio
+        from unittest.mock import patch
+
+        import daily_healthcheck
+
+        with patch.dict(os.environ, {"KINTONE_SUBDOMAIN": "testsub"}, clear=True), \
+                patch.object(daily_healthcheck, "EXPECTED_KINTONE_SCHEMA", schema):
+            return asyncio.run(daily_healthcheck.check_kintone_schema())
+
+    def test_app33_env_unset_is_silently_skipped(self):
+        """App 33 の env 未設定は警報ゼロ（該当アプリの検査スキップ）"""
+        schema = {"App 33 (戸籍読解)": EXPECTED_KINTONE_SCHEMA["App 33 (戸籍読解)"]}
+        self.assertEqual(self._run(schema), [])
+
+    def test_non_optional_env_unset_still_alarms(self):
+        """既存回帰: optional でないアプリの env 未設定は従来どおり警報"""
+        schema = {"App 21 (案件)": EXPECTED_KINTONE_SCHEMA["App 21 (案件)"]}
+        problems = self._run(schema)
+        self.assertEqual(len(problems), 1)
+        self.assertIn("KINTONE_APP_ID", problems[0])
+
+    def test_optional_flag_generic(self):
+        """optional 方式の一般挙動: optional のみスキップ・非optional のみ警報"""
+        schema = {
+            "opt": {"app_id_env": "X_APP", "token_env": "X_TOKEN",
+                    "optional": True, "fields": {}},
+            "req": {"app_id_env": "Y_APP", "token_env": "Y_TOKEN", "fields": {}},
+        }
+        problems = self._run(schema)
+        self.assertEqual(len(problems), 1)
+        self.assertIn("Y_APP", problems[0])
+
+
 if __name__ == "__main__":
     unittest.main()
