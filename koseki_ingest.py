@@ -136,5 +136,17 @@ async def koseki_ingest(token: str = "",
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"kintone登録エラー: {e}")
 
+    # R3（2026-07-05 裁定・A案）: 登録成功後に同期で構造化読解を試みる。
+    # 読解の失敗・Claude 全断・例外は本応答を壊さない（レコードは 未読解 の
+    # まま残り、koseki_reader.process_unread_records で後日回収できる）。
+    # 応答形は従来どおり（読解結果はレコード側に反映される）
+    try:
+        from koseki_reader import process_record
+        reading = await process_record(record_id)
+        print(f"[KOSEKI_INGEST] 読解結果 record={record_id}: {reading}")
+    except Exception as e:
+        print(f"[KOSEKI_INGEST] 読解に失敗（未読解のまま・核関数で回収可能）"
+              f" record={record_id}: {e}")
+
     return {"status": "ok", "kintone_record_id": record_id,
             "page_images": len(page_images), "ocr_chars": len(ocr_text)}

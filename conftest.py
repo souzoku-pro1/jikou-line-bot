@@ -8,10 +8,18 @@ pytest 共通設定
 2. ANTHROPIC_API_KEY が未設定なら、リポジトリ直下の .env.test から読み込む。
    .env.test にはテスト専用Workspaceのキーだけを置くこと（本番キーは置かない。
    .gitignore 済みでコミットされない）。書式: KEY=VALUE の行のみ対応。
+
+3. R3 戸籍読解（koseki_reader）はテストでは既定無効にする。
+   /koseki/ingest は登録成功後に同期読解を呼ぶため（A案・2026-07-05 裁定）、
+   reader を知らない既存テストから実 API（kintone / Claude・.env.test の
+   実キー含む）へ到達し得る。reader 自身のテストは KOSEKI_READER_DISABLED を
+   外した上で全 I/O をモックする。本番は env 未設定＝有効。
 """
 
 import os
 from pathlib import Path
+
+os.environ.setdefault("KOSEKI_READER_DISABLED", "1")
 
 try:
     import truststore
