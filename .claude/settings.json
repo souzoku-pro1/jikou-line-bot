@@ -1,0 +1,46 @@
+{
+  "permissions": {
+    "allow": [
+      "Edit",
+      "Write",
+      "Bash(python -m pytest*)",
+      "Bash(pytest*)",
+      "Bash(git add*)",
+      "Bash(git commit*)",
+      "Bash(git branch*)",
+      "Bash(git checkout*)",
+      "Bash(git log*)",
+      "Bash(git diff*)"
+    ],
+    "ask": [
+      "Bash(gh pr merge*)",
+      "Bash(railway*)",
+      "Bash(rm -rf*)",
+      "Bash(rm -fr*)"
+    ],
+    "deny": [
+      "Bash(git push*)",
+      "Bash(curl*)",
+      "Bash(wget*)",
+      "Bash(chmod 777*)",
+      "Bash(powershell*)",
+      "Bash(pwsh*)",
+      "Bash(cmd*)",
+      "PowerShell(git push*)",
+      "PowerShell(curl*)",
+      "PowerShell(wget*)",
+      "PowerShell(chmod 777*)",
+      "PowerShell(Invoke-WebRequest *)",
+      "PowerShell(Invoke-RestMethod *)",
+      "Read(.env)",
+      "Read(.env.*)",
+      "Read(**/.env)",
+      "Read(**/.env.*)",
+      "Read(**/*.pem)",
+      "Read(**/*.key)",
+      "Read(~/.ssh/**)",
+      "Read(~/.aws/**)",
+      "Read(~/.railway/**)"
+    ]
+  }
+}
