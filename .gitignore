@@ -3,3 +3,7 @@
 .env.test
 __pycache__/
 *.pyc
+
+# Claude Code: 資格情報・セッションデータを誤commitしない（settings.jsonのみ追跡・2026-07-06）
+.claude/*
+!.claude/settings.json
