@@ -62,7 +62,11 @@ def _render_page_images(pdf_bytes: bytes) -> list[bytes]:
 
 @router.post("/koseki/ingest")
 async def koseki_ingest(token: str = "",
-                        file: UploadFile = File(...),
+                        # file は意図的に optional: 必須（File(...)）にすると
+                        # ファイル無しの探信に FastAPI が 422 を返してしまい、
+                        # token 検証（404 の存在しないフリ）より先に
+                        # エンドポイントの存在が漏れる（2026-07-05 実機確認）
+                        file: UploadFile | None = File(default=None),
                         case_hint: str | None = Form(default=None),
                         case_app_hint: str | None = Form(default=None),
                         drive_file_id: str | None = Form(default=None)):
@@ -85,7 +89,7 @@ async def koseki_ingest(token: str = "",
         raise HTTPException(status_code=500,
                             detail="環境変数が未設定です: GOOGLE_VISION_API_KEY")
 
-    if not file.filename or not file.filename.lower().endswith(".pdf"):
+    if file is None or not file.filename or not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="PDFファイルを送信してください")
 
     pdf_bytes = await file.read()
