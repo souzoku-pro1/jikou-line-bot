@@ -17,6 +17,7 @@ APP30 = EXPECTED_KINTONE_SCHEMA["App 30 (発送管理)"]
 VALID_TYPES = {
     "SINGLE_LINE_TEXT", "MULTI_LINE_TEXT", "NUMBER", "DROP_DOWN",
     "RADIO_BUTTON", "CHECK_BOX", "DATE", "DATETIME", "FILE",
+    "SUBTABLE",  # App 34（人物）の身分事項・登場戸籍（2026-07-05 追加）
 }
 
 
@@ -166,6 +167,56 @@ class TestApp33Schema(unittest.TestCase):
             self.assertIn(spec["type"], VALID_TYPES, f"{code} の型が不正")
 
 
+class TestApp34Schema(unittest.TestCase):
+    """App 34（人物）のスキーマ定義検証
+    （docs/koseki-ocr/02 §2 改訂版・2026-07-05 実機フォーム設計APIと完全形35一致を確認済み）"""
+
+    def setUp(self):
+        self.app34 = EXPECTED_KINTONE_SCHEMA["App 34 (人物)"]
+
+    def test_env_names(self):
+        """env名の正は APP_KOSEKI_PERSON（APP_JINBUTSU は使わない・2026-07-05 裁定）"""
+        self.assertEqual(self.app34["app_id_env"], "APP_KOSEKI_PERSON")
+        self.assertEqual(self.app34["token_env"], "TOKEN_KOSEKI_PERSON")
+
+    def test_field_count_is_34(self):
+        """完全形35 = トップレベル34（サブテーブル2本含む）＋登場戸籍の続柄原文（テーブル内）"""
+        self.assertEqual(len(self.app34["fields"]), 34)
+
+    def test_is_optional(self):
+        self.assertIs(self.app34.get("optional"), True)
+
+    def test_parent_edges_present(self):
+        """親子エッジ4（関係図・相続人導出の骨格）が監視対象に含まれること"""
+        for code in ("父人物ID", "母人物ID", "養父人物ID", "養母人物ID"):
+            self.assertEqual(self.app34["fields"][code]["type"],
+                             "SINGLE_LINE_TEXT", code)
+
+    def test_dropdown_options_match_live(self):
+        """選択肢は実機実出力どおり（2026-07-05 フォーム設計取得API）"""
+        expect = {
+            "名寄せ確定": {"未確定", "自動候補", "確定"},
+            "相続人候補": {"候補", "非該当", "未判定"},
+            "相続資格": {"未判定", "法定相続人", "代襲相続人",
+                         "数次相続人", "相続放棄済", "資格なし"},
+            "生死区分": {"生存", "死亡", "不明"},
+            "確認状態": {"未確認", "確認済", "要再確認"},
+        }
+        for code, options in expect.items():
+            f = self.app34["fields"][code]
+            self.assertEqual(f["type"], "DROP_DOWN", code)
+            self.assertEqual(set(f["required_options"]), options, code)
+
+    def test_subtables_registered_as_type_only(self):
+        """身分事項・登場戸籍は SUBTABLE 型のみ検査（内部列は対象外）"""
+        for code in ("身分事項", "登場戸籍"):
+            self.assertEqual(self.app34["fields"][code], {"type": "SUBTABLE"}, code)
+
+    def test_all_types_valid(self):
+        for code, spec in self.app34["fields"].items():
+            self.assertIn(spec["type"], VALID_TYPES, f"{code} の型が不正")
+
+
 class TestHealthcheckOptionalSkip(unittest.TestCase):
     """check_kintone_schema の env 未設定時の挙動
     （optional=スキップ・警報なし / 非optional=警報。既存挙動の回帰込み）"""
@@ -183,6 +234,11 @@ class TestHealthcheckOptionalSkip(unittest.TestCase):
     def test_app33_env_unset_is_silently_skipped(self):
         """App 33 の env 未設定は警報ゼロ（該当アプリの検査スキップ）"""
         schema = {"App 33 (戸籍読解)": EXPECTED_KINTONE_SCHEMA["App 33 (戸籍読解)"]}
+        self.assertEqual(self._run(schema), [])
+
+    def test_app34_env_unset_is_silently_skipped(self):
+        """App 34 の env 未設定は警報ゼロ（optional 方式・App 33 と同じ）"""
+        schema = {"App 34 (人物)": EXPECTED_KINTONE_SCHEMA["App 34 (人物)"]}
         self.assertEqual(self._run(schema), [])
 
     def test_non_optional_env_unset_still_alarms(self):
