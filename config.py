@@ -419,6 +419,142 @@ EXPECTED_KINTONE_SCHEMA = {
             "登場戸籍": {"type": "SUBTABLE"},
         },
     },
+    # ── 財産（S系列・docs/souzoku-shorui/01 §1.1）──
+    # 2026-07-06 フォーム設計取得APIで実機19フィールドの全一致（型・選択肢順序・
+    # 初期値・defaultNowなし）を確認して登録。zaisan_mokuroku / zaisan_sync が読み書き
+    "App 35 (財産)": {
+        "app_id_env": "APP_ZAISAN",
+        "token_env": "TOKEN_ZAISAN",
+        # env 未設定の環境では監視をスキップ（設定されたら自動的に監視対象になる）
+        "optional": True,
+        "fields": {
+            # 案件参照（ハブ共通方式）
+            "ユニット種別": {
+                "type": "DROP_DOWN",
+                "required_options": ["時効援用", "相続放棄", "相続一般", "補助金"],
+            },
+            "案件アプリID": {"type": "SINGLE_LINE_TEXT"},
+            "案件レコードID": {"type": "SINGLE_LINE_TEXT"},
+            "被相続人名表示用": {"type": "SINGLE_LINE_TEXT"},
+            # 財産の実体（1レコード=1財産または1債務）
+            "財産種別": {
+                "type": "DROP_DOWN",
+                "required_options": ["不動産_土地", "不動産_建物", "不動産_区分建物",
+                                     "預貯金", "有価証券", "生命保険", "出資金",
+                                     "自動車", "動産", "債権", "債務", "葬儀費用",
+                                     "その他"],
+            },
+            "特定情報": {"type": "MULTI_LINE_TEXT"},
+            "名義": {"type": "SINGLE_LINE_TEXT"},
+            # 評価（確定は弁護士のみ yes・書類生成の前提条件）
+            "評価額": {"type": "NUMBER"},
+            "評価方法": {
+                "type": "DROP_DOWN",
+                "required_options": ["固定資産税評価額", "相続税評価額", "残高証明",
+                                     "解約返戻金相当額", "時価査定", "額面", "その他"],
+            },
+            "評価基準日": {"type": "DATE"},
+            "評価確定": {
+                "type": "RADIO_BUTTON",
+                "required_options": ["no", "yes"],
+            },
+            "備考": {"type": "MULTI_LINE_TEXT"},
+            # データ源・トレーサビリティ（OCR経路の確信度・原本必須）
+            "データ源": {
+                "type": "DROP_DOWN",
+                "required_options": ["OCR_課税明細", "OCR_残高証明", "OCR_登記事項証明",
+                                     "手入力", "ヒアリング"],
+            },
+            "確信度": {"type": "NUMBER"},
+            "元アプリID": {"type": "SINGLE_LINE_TEXT"},
+            "元レコードID": {"type": "SINGLE_LINE_TEXT"},
+            "原本": {"type": "FILE"},
+            "冪等キー": {"type": "SINGLE_LINE_TEXT"},
+            "有効": {"type": "RADIO_BUTTON", "required_options": ["yes", "no"]},
+        },
+    },
+    # ── 相続人（S系列・docs/souzoku-shorui/01 §2）──
+    # 2026-07-06 フォーム設計取得APIで実機16フィールドの全一致を確認して登録。
+    # 生年月日は SINGLE_LINE_TEXT（正本設計の型指定。協議書の当事者表示に和暦等を
+    # そのまま差し込むため DATE 型にしない）
+    "App 36 (相続人)": {
+        "app_id_env": "APP_SOUZOKUNIN",
+        "token_env": "TOKEN_SOUZOKUNIN",
+        # env 未設定の環境では監視をスキップ（設定されたら自動的に監視対象になる）
+        "optional": True,
+        "fields": {
+            # 案件参照（ハブ共通方式）
+            "ユニット種別": {
+                "type": "DROP_DOWN",
+                "required_options": ["時効援用", "相続放棄", "相続一般", "補助金"],
+            },
+            "案件アプリID": {"type": "SINGLE_LINE_TEXT"},
+            "案件レコードID": {"type": "SINGLE_LINE_TEXT"},
+            "被相続人名表示用": {"type": "SINGLE_LINE_TEXT"},
+            # 当事者表示（協議書の署名欄等に差込）
+            "氏名": {"type": "SINGLE_LINE_TEXT"},
+            "フリガナ": {"type": "SINGLE_LINE_TEXT"},
+            "続柄": {
+                "type": "DROP_DOWN",
+                "required_options": ["配偶者", "子", "直系尊属", "兄弟姉妹",
+                                     "甥姪（代襲）", "受遺者（相続人外）", "その他"],
+            },
+            "法定相続分": {"type": "SINGLE_LINE_TEXT"},
+            "住所": {"type": "SINGLE_LINE_TEXT"},
+            "生年月日": {"type": "SINGLE_LINE_TEXT"},
+            "本籍": {"type": "SINGLE_LINE_TEXT"},
+            "連絡先": {"type": "SINGLE_LINE_TEXT"},
+            "状態": {
+                "type": "DROP_DOWN",
+                "required_options": ["通常", "放棄済み", "代襲", "相続分譲渡",
+                                     "未成年（特別代理人要）", "成年被後見人"],
+            },
+            # 書類生成の前提（戸籍確認済=yes は弁護士のみ）・添付書類管理
+            "戸籍確認済": {
+                "type": "RADIO_BUTTON",
+                "required_options": ["no", "yes"],
+            },
+            "印鑑証明": {
+                "type": "DROP_DOWN",
+                "required_options": ["未", "依頼中", "受領"],
+            },
+            "データ源": {
+                "type": "DROP_DOWN",
+                "required_options": ["ヒアリング", "戸籍読解", "手入力"],
+            },
+        },
+    },
+    # ── 割付（S系列・docs/souzoku-shorui/01 §3〔設計上は App 38 表記・実機は 37〕）──
+    # 2026-07-06 フォーム設計取得APIで実機11フィールドの全一致（型・選択肢順序・
+    # 初期値）を確認して登録。遺産分割協議書の「誰が何を取得するか」の1行=1割付
+    "App 37 (割付)": {
+        "app_id_env": "APP_WARITSUKE",
+        "token_env": "TOKEN_WARITSUKE",
+        # env 未設定の環境では監視をスキップ（設定されたら自動的に監視対象になる）
+        "optional": True,
+        "fields": {
+            # 案件参照（ハブ共通方式）
+            "ユニット種別": {
+                "type": "DROP_DOWN",
+                "required_options": ["時効援用", "相続放棄", "相続一般", "補助金"],
+            },
+            "案件アプリID": {"type": "SINGLE_LINE_TEXT"},
+            "案件レコードID": {"type": "SINGLE_LINE_TEXT"},
+            "被相続人名表示用": {"type": "SINGLE_LINE_TEXT"},
+            # 割付の実体（財産×相続人の対応・両端は App 35/36 のレコードID参照）
+            "財産レコードID": {"type": "SINGLE_LINE_TEXT"},
+            "相続人レコードID": {"type": "SINGLE_LINE_TEXT"},
+            "取得区分": {
+                "type": "DROP_DOWN",
+                "required_options": ["単独取得", "共有取得", "換価分割", "代償取得",
+                                     "債務引受", "保険金受取（みなし）"],
+            },
+            "持分": {"type": "SINGLE_LINE_TEXT"},
+            "代償金額": {"type": "NUMBER"},
+            "条件メモ": {"type": "MULTI_LINE_TEXT"},
+            "有効": {"type": "RADIO_BUTTON", "required_options": ["yes", "no"]},
+        },
+    },
 }
 
 
