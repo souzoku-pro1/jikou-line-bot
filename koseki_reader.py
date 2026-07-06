@@ -51,77 +51,157 @@ IDENTITY_EVENT_TYPES = ["出生", "婚姻", "離婚", "養子縁組", "離縁", 
 
 _CONFIDENCE_MAP = {
     "type": "object",
-    "description": "フィールド名→確信度（0〜1）",
+    "description": "フィールド名（このツールの英語プロパティ名）→確信度（0〜1）",
     "additionalProperties": {"type": "number"},
 }
 
-# 02 §3 の読解 JSON スキーマ（tool use で強制する）
+# 02 §3 の読解 JSON スキーマ（tool use で強制する）。
+# ⚠ プロパティキーは英数字のみ: Anthropic API は input_schema のキー名に
+# ^[a-zA-Z0-9_.-]{1,64}$ を強制し、日本語キーは 400 で即時拒否される
+# （2026-07-06 実機で判明・test_koseki_tool_schema の静的検査で固定）。
+# 保存する読解 JSON は従来どおり 02 §3 の日本語キー——to_japanese_reading が写像する
 KOSEKI_READING_TOOL = {
     "name": "save_koseki_reading",
     "description": "戸籍OCRテキストの構造化読解結果を保存する（02 §3 スキーマ）",
     "input_schema": {
         "type": "object",
         "properties": {
-            "様式": {"type": "string", "enum": FORMS},
-            "様式confidence": {"type": "number", "description": "様式判定の確信度 0〜1"},
-            "戸籍": {
+            "form": {"type": "string", "enum": FORMS, "description": "様式"},
+            "form_confidence": {"type": "number", "description": "様式判定の確信度 0〜1"},
+            "koseki": {
                 "type": "object",
+                "description": "戸籍（表紙・戸籍事項）",
                 "properties": {
-                    "本籍": {"type": "string", "description": "原文表記のまま"},
-                    "筆頭者": {"type": "string", "description": "戸主含む・原文表記のまま"},
-                    "編製日": {"type": "string", "description": "和暦原文のまま（例: 昭和32年4月1日）"},
-                    "編製日_西暦": {"type": ["string", "null"],
-                                    "description": "YYYY-MM-DD。変換に自信がなければ null"},
-                    "消除日": {"type": "string", "description": "和暦原文のまま。なければ空文字"},
-                    "消除日_西暦": {"type": ["string", "null"],
-                                    "description": "YYYY-MM-DD。変換に自信がなければ null"},
-                    "編製事由": {"type": "string", "description": "転籍・改製・婚姻等（原文）"},
-                    "従前戸籍": {
+                    "honseki": {"type": "string", "description": "本籍。原文表記のまま"},
+                    "hittousha": {"type": "string",
+                                  "description": "筆頭者（戸主含む）・原文表記のまま"},
+                    "hensei_date": {"type": "string",
+                                    "description": "編製日。和暦原文のまま（例: 昭和32年4月1日）"},
+                    "hensei_date_seireki": {"type": ["string", "null"],
+                                            "description": "編製日の西暦 YYYY-MM-DD。"
+                                                           "変換に自信がなければ null"},
+                    "shojo_date": {"type": "string",
+                                   "description": "消除日。和暦原文のまま。なければ空文字"},
+                    "shojo_date_seireki": {"type": ["string", "null"],
+                                           "description": "消除日の西暦 YYYY-MM-DD。"
+                                                          "変換に自信がなければ null"},
+                    "hensei_reason": {"type": "string",
+                                      "description": "編製事由。転籍・改製・婚姻等（原文）"},
+                    "juzen_koseki": {
                         "type": "object",
-                        "properties": {"本籍": {"type": "string"},
-                                       "筆頭者": {"type": "string"}},
+                        "description": "従前戸籍",
+                        "properties": {"honseki": {"type": "string"},
+                                       "hittousha": {"type": "string"}},
                     },
-                    "新戸籍_本籍": {"type": "string"},
+                    "shin_koseki_honseki": {"type": "string", "description": "新戸籍の本籍"},
                     "confidence": _CONFIDENCE_MAP,
                 },
-                "required": ["本籍", "筆頭者"],
+                "required": ["honseki", "hittousha"],
             },
-            "人物": {
+            "persons": {
                 "type": "array",
+                "description": "戸籍に記録されている人物",
                 "items": {
                     "type": "object",
                     "properties": {
-                        "氏名": {"type": "string", "description": "旧字体・異体字も原文どおり"},
-                        "続柄": {"type": "string"},
-                        "生年月日": {"type": "string", "description": "和暦原文のまま"},
-                        "除籍済み": {"type": "boolean"},
-                        "除籍事由": {"type": "string"},
-                        "身分事項": {
+                        "name": {"type": "string",
+                                 "description": "氏名。旧字体・異体字も原文どおり"},
+                        "zokugara": {"type": "string", "description": "続柄"},
+                        "birth_date": {"type": "string",
+                                       "description": "生年月日。和暦原文のまま"},
+                        "removed": {"type": "boolean", "description": "除籍済み"},
+                        "removed_reason": {"type": "string", "description": "除籍事由"},
+                        "identity_events": {
                             "type": "array",
+                            "description": "身分事項",
                             "items": {
                                 "type": "object",
                                 "properties": {
-                                    "種別": {"type": "string",
-                                             "enum": IDENTITY_EVENT_TYPES},
-                                    "日付": {"type": "string",
-                                             "description": "和暦原文のまま"},
-                                    "相手方": {"type": "string"},
-                                    "備考": {"type": "string",
-                                             "description": "種別=その他 のとき原文を保持"},
+                                    "type": {"type": "string",
+                                             "enum": IDENTITY_EVENT_TYPES,
+                                             "description": "種別"},
+                                    "date": {"type": "string",
+                                             "description": "日付。和暦原文のまま"},
+                                    "aite": {"type": "string", "description": "相手方"},
+                                    "biko": {"type": "string",
+                                             "description": "備考。種別=その他 のとき原文を保持"},
                                     "confidence": {"type": "number"},
                                 },
-                                "required": ["種別"],
+                                "required": ["type"],
                             },
                         },
                         "confidence": _CONFIDENCE_MAP,
                     },
-                    "required": ["氏名"],
+                    "required": ["name"],
                 },
             },
         },
-        "required": ["様式", "様式confidence", "戸籍", "人物"],
+        "required": ["form", "form_confidence", "koseki", "persons"],
     },
 }
+
+# ── 写像層: Claude 出力（英語キー）→ 02 §3 の日本語キー JSON ──────────────
+# 保存 JSON・validate_reading・App 33 書込・確信度計算・R4 の外部契約は日本語キーの
+# まま不変。写像は「対応表にあるキーだけ翻訳・無いキーは素通し」——
+# 日本語キー入力には恒等（再読解で旧 JSON を食っても壊れない）・欠落キーは
+# 欠落のまま（必須欠落は従来どおり validate_reading が検知する）
+
+_TOP_JA = {"form": "様式", "form_confidence": "様式confidence",
+           "koseki": "戸籍", "persons": "人物"}
+_KOSEKI_JA = {"honseki": "本籍", "hittousha": "筆頭者",
+              "hensei_date": "編製日", "hensei_date_seireki": "編製日_西暦",
+              "shojo_date": "消除日", "shojo_date_seireki": "消除日_西暦",
+              "hensei_reason": "編製事由", "juzen_koseki": "従前戸籍",
+              "shin_koseki_honseki": "新戸籍_本籍"}
+_PERSON_JA = {"name": "氏名", "zokugara": "続柄", "birth_date": "生年月日",
+              "removed": "除籍済み", "removed_reason": "除籍事由",
+              "identity_events": "身分事項"}
+_EVENT_JA = {"type": "種別", "date": "日付", "aite": "相手方", "biko": "備考"}
+
+
+def _map_flat(obj, key_map: dict):
+    """1階層のキー翻訳。confidence マップの中身（フィールド名→数値）も同じ表で翻訳"""
+    if not isinstance(obj, dict):
+        return obj
+    out = {}
+    for k, v in obj.items():
+        jk = key_map.get(k, k)
+        if jk == "confidence" and isinstance(v, dict):
+            v = {key_map.get(ck, ck): cv for ck, cv in v.items()}
+        out[jk] = v
+    return out
+
+
+def _map_person(person):
+    if not isinstance(person, dict):
+        return person
+    mapped = _map_flat(person, _PERSON_JA)
+    events = mapped.get("身分事項")
+    if isinstance(events, list):
+        mapped["身分事項"] = [_map_flat(e, _EVENT_JA) for e in events]
+    return mapped
+
+
+def to_japanese_reading(raw: dict) -> dict:
+    """Claude 出力（KOSEKI_READING_TOOL の英語キー）を 02 §3 の日本語キーへ写像する。
+
+    - 対応表にあるキーのみ翻訳。無いキー（日本語キー・将来の未知キー）は素通し
+      （日本語キー入力には恒等＝既存 JSON の再処理でも安全）
+    - 欠落キーは補完しない（必須欠落の検知は validate_reading の責務のまま）
+    """
+    if not isinstance(raw, dict):
+        return raw
+    mapped = _map_flat(raw, _TOP_JA)
+    koseki = mapped.get("戸籍")
+    if isinstance(koseki, dict):
+        koseki = _map_flat(koseki, _KOSEKI_JA)
+        if isinstance(koseki.get("従前戸籍"), dict):
+            koseki["従前戸籍"] = _map_flat(koseki["従前戸籍"], _KOSEKI_JA)
+        mapped["戸籍"] = koseki
+    persons = mapped.get("人物")
+    if isinstance(persons, list):
+        mapped["人物"] = [_map_person(p) for p in persons]
+    return mapped
 
 
 class KosekiReaderError(Exception):
@@ -158,7 +238,9 @@ async def _read_with_claude(ocr_text: str) -> dict:
     )
     for block in response.content:
         if block.type == "tool_use" and block.name == KOSEKI_READING_TOOL["name"]:
-            return dict(block.input)
+            # 英語キー（API 制約）→ 02 §3 の日本語キーへ写像して返す。
+            # 以降（validate_reading・確信度計算・保存）の契約は従来どおり日本語キー
+            return to_japanese_reading(dict(block.input))
     raise KosekiReaderError(
         f"tool_use ブロックがない応答（stop_reason={response.stop_reason}）")
 
