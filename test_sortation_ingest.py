@@ -284,6 +284,65 @@ class TestAskChannelAndRecipient(_Base):
         self.assertEqual(self.push.await_args.args[0], "U-attorney")
 
 
+_LOG_ENV = {**_ENV, "APP_SORTATION_LOG": "38", "TOKEN_SORTATION_LOG": "t38"}
+
+
+class TestSortationLog(_Base):
+    """仕分けログ（App 38）登録（第2段②）: ask 時のみ・env 縮退・失敗縮退"""
+
+    JUDGED = {"doc_type": "戸籍", "customer_record_id": None,
+              "confidence": 0.4, "reason": "宛名がOCRで読めない"}
+
+    def post_with_log(self, create=None, env=_LOG_ENV, judged=None, **kw):
+        self.create = create if create is not None else AsyncMock(return_value="7")
+        p = patch("hub.kintone.create_record", new=self.create)
+        p.start()
+        self.addCleanup(p.stop)
+        return self.post(env=env, judged=judged or self.JUDGED, **kw)
+
+    def test_ask_registers_log_record(self):
+        resp = self.post_with_log(
+            candidates=[cand(12, "山田太郎", "山田一郎")], ocr_text="山田太郎 様",
+            data={"drive_file_id": "drv-9", "drive_file_url": "https://drive/x"})
+        self.assertEqual(resp.json()["action"], "ask")
+        app, fields = self.create.await_args.args
+        self.assertEqual(app.app_id_env, "APP_SORTATION_LOG")
+        self.assertEqual(fields, {
+            "ファイル名": "scan001.pdf",
+            "Drive_fileId": "drv-9",
+            "Drive_URL": "https://drive/x",
+            "書類種類": "戸籍",
+            "確信度": "0.4",
+            "判定理由": "宛名がOCRで読めない",
+            "候補一覧": "山田太郎（被相続人: 山田一郎・No.12・相談カード (相続)）",
+            "状態": "照会中",
+        })
+        self.assertIn("仕分けログ: https://testsub.cybozu.com/k/38/show#record=7",
+                      self.line_text())
+
+    def test_log_env_unset_skips_registration_and_keeps_notify(self):
+        """env 未設定は登録スキップ＝従来どおり LINE 通知のみ（回帰維持）"""
+        resp = self.post_with_log(env=_ENV)  # APP_SORTATION_LOG なし
+        self.assertEqual(resp.json()["action"], "ask")
+        self.assertEqual(self.create.await_count, 0)
+        self.assertNotIn("仕分けログ:", self.line_text())
+
+    def test_log_failure_keeps_notify_without_url(self):
+        """登録失敗でも照会通知は送る（URL 行なし）"""
+        from hub.kintone import KintoneError
+        resp = self.post_with_log(create=AsyncMock(side_effect=KintoneError(500)))
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["action"], "ask")
+        self.assertNotIn("仕分けログ:", self.line_text())
+
+    def test_auto_does_not_register_log(self):
+        judged = {"doc_type": "戸籍", "customer_record_id": "12",
+                  "confidence": 0.95, "reason": "x"}
+        resp = self.post_with_log(judged=judged, candidates=[cand(12, "山田太郎")])
+        self.assertEqual(resp.json()["action"], "auto")
+        self.assertEqual(self.create.await_count, 0)
+
+
 class TestDegradedPaths(_Base):
     def test_claude_failure_degrades_to_ask(self):
         """Claude 全断: action=ask / doc_type=不明 / 判定不能の旨を通知"""

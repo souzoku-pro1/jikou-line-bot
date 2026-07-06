@@ -50,6 +50,8 @@ class Session:
     topic_repeat: int = 0               # 同一論点の再質問回数
     choice: str = ""                    # pre_confirm 選択肢待ち（task_type を格納）
     case_hit: object = None             # 選択肢待ち時の確定済み案件
+    flow: str = ""                      # タスク固有フロー保有時の task_type（第2段②）
+    flow_state: dict = field(default_factory=dict)  # フロー側の対話状態
     created_at: float = field(default_factory=time.monotonic)
 
     def expired(self) -> bool:
@@ -88,10 +90,18 @@ async def _execute_confirmed(user_id: str) -> str:
         return MSG_NO_PENDING
     if state == "expired":
         return MSG_EXPIRED
+    spec = registry.get_task((pending.parsed or {}).get("task_type")) if pending else None
     if state == "executed":
+        if spec and spec.execute_fn:  # App 30 以外が実行先のタスク（第2段②）
+            return f"実行済みです\n{pending.record_url}"
         return f"実行済みです（App 30 No.{pending.record_id}）\n{pending.record_url}"
 
     try:
+        if spec and spec.execute_fn:
+            # タスク固有の実行（第2段②: App 38 状態更新等。App 30 起票はしない）
+            message, rid, url = await spec.execute_fn(pending)
+            confirm.mark_executed(pending, rid, url)
+            return message
         rid, url, already = await app30_filer.file_from_pending(pending)
     except kintone.KintoneError as e:
         # 起票失敗: ユーザーに通知＋管理者警報。pending は消込済みでよい（再指示でやり直し）
@@ -164,6 +174,16 @@ async def handle_message(user_id: str, text: str) -> str:
 async def _handle(user_id: str, text: str) -> str:
     text = (text or "").strip()
     session = _get_session(user_id)
+
+    # ── タスク固有フローのセッション応答（第2段②。フックの有無だけを見る）────
+    # フロー側が消費しない入力（キャンセル語・別指示）は (False, "") が返り、
+    # 下の通常解析にそのまま落ちる
+    if session and session.flow:
+        flow_spec = registry.get_task(session.flow)
+        if flow_spec and flow_spec.flow_reply_fn:
+            handled, reply = await flow_spec.flow_reply_fn(user_id, text, session)
+            if handled:
+                return reply
 
     # ── 選択肢応答（pre_confirm の 1/2。App 31 未登録時等・D4） ──────────────
     if session and session.choice and re.fullmatch(r"[12]", text):
@@ -252,6 +272,11 @@ async def _handle(user_id: str, text: str) -> str:
                                  "指示の内容をもう少し具体的に教えてください"
                                  "（例:「鈴木さんに送付案内を作って」）", session)
         return prefix + MSG_UNSUPPORTED
+
+    # ── タスク固有フロー（第2段②: 仕分け等）。標準パイプライン（必須項目→
+    #    同封物→案件検索→復唱）を丸ごとフロー側に委譲する ────────────────────
+    if spec.flow_fn:
+        return prefix + await spec.flow_fn(user_id, parsed, base_text, session)
 
     # 必須項目の不足 → 聞き返し（1論点ずつ・03 §7）。
     # ★質問文は必ずレジストリの定義（required_fields / field_questions）から組み立てる。

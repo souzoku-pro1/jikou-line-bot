@@ -37,6 +37,13 @@ class TaskSpec:
     pre_confirm_fn: Callable | None = None     # 復唱前の非同期チェック（App 31照合等）
     choice_fn: Callable | None = None          # pre_confirm の選択肢応答（1/2）の処理
     summary_fn: Callable | None = None         # 復唱フルテンプレに挿入する明細行
+    # ── 第2段②追加: タスク固有フロー（handler はフックの有無だけを見る原則のまま）──
+    flow_fn: Callable | None = None        # 標準パイプライン（必須項目→案件検索→復唱）
+                                           # を丸ごと差し替える非同期フロー
+    flow_reply_fn: Callable | None = None  # flow が張ったセッションへの応答処理
+                                           # （番号選択等。(handled, reply) を返す）
+    execute_fn: Callable | None = None     # OK 後の実行（App 30 起票の代わり。
+                                           # (message, record_id, record_url) を返す）
 
 
 TASK_REGISTRY: dict[str, TaskSpec] = {}
@@ -133,4 +140,31 @@ register(TaskSpec(
     pre_confirm_fn=shokumu.pre_confirm,
     choice_fn=shokumu.choice,
     summary_fn=shokumu.summary_lines,
+))
+
+
+# ── 書類の仕分け（第2段②。フローは dispatch_bot/sortation_assign.py に隔離） ──
+from dispatch_bot import sortation_assign  # noqa: E402（循環回避のため末尾 import）
+
+register(TaskSpec(
+    task_type="sortation_assign",
+    display_name="書類の仕分け",
+    answer_only=False,
+    destination="sortation_log",  # App 30 には起票しない（App 38 の状態更新のみ）
+    run_at="railway",
+    risk="低",  # 対外効果ゼロ（Drive・LINE顧客側は動かない。移動は GAS=③の責務）
+    auto_scope="仕分けログ（App 38）の 状態=照会中→確定 の更新まで",
+    approval_scope="Drive のフォルダ移動（GAS のフォルダ整理実行・第2段③）",
+    required_fields=["customer_name"],
+    field_questions={"customer_name": sortation_assign.QUESTION_CUSTOMER},
+    search_apps=["SOUZOKU_KINTONE_APP_ID"],
+    artifacts="App 38 仕分けログ（状態=確定・仕分け先レコードID/氏名/フォルダ名/確定日時）",
+    adapter="SortationAssign",
+    on_failure="更新失敗はLINEにエラー返信（管理者警報つき・既存の警報系）",
+    hint_for_parser=("Drive に届いた書類を顧客フォルダへ仕分けする。"
+                     "「〇〇のフォルダに入れて」「〇〇さんの書類」等。"
+                     "customer_name に顧客名のみ入れる（書類の特定は番号選択で行う）"),
+    flow_fn=sortation_assign.flow,
+    flow_reply_fn=sortation_assign.flow_reply,
+    execute_fn=sortation_assign.execute,
 ))

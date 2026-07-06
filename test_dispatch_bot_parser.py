@@ -46,8 +46,9 @@ def run(coro):
 
 class TestRegistry(unittest.TestCase):
     def test_registered_tasks(self):
-        """D4 で shokumu_seikyu が追加（第1.5弾）。それ以外は未登録のまま"""
-        self.assertEqual(set(registry.TASK_REGISTRY), {"soufu_annai", "shokumu_seikyu"})
+        """第2段で sortation_assign 追加（2026-07-06 裁定・案A）。それ以外は未登録のまま"""
+        self.assertEqual(set(registry.TASK_REGISTRY),
+                         {"soufu_annai", "shokumu_seikyu", "sortation_assign"})
         spec = registry.get_task("soufu_annai")
         self.assertFalse(spec.answer_only)
         self.assertEqual(spec.destination, "app30")

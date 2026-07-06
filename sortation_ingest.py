@@ -35,10 +35,15 @@ from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 
 from claude_gateway import create_message_with_fallback
 from customer_directory import Candidate, list_candidates
+from hub import kintone
 from hub.notify import push_line_message
 from hub.webhook_auth import verify_token
 
 router = APIRouter()
+
+# 仕分けログ（App 38・第2段②）。ask 判定の台帳＝Bot仕分け指示（照会中→確定）の対象
+APP_SORTATION_LOG = kintone.KintoneApp(
+    "App 38 (仕分けログ)", "APP_SORTATION_LOG", "TOKEN_SORTATION_LOG")
 
 # doc_type は suggested_filename にそのまま入るため、ファイル名として自然な表記に
 # 限る（区切りは「・」。/ や : 等ファイル名に使えない文字を入れない）
@@ -163,9 +168,37 @@ def _ask_recipient() -> str:
     return os.environ.get("ATTORNEY_LINE_USER_ID", "").strip()
 
 
+async def _log_ask(file_name: str, drive_file_id: str, drive_file_url: str,
+                   doc_type: str, confidence: float, reason: str,
+                   top: list[Candidate]) -> str | None:
+    """ask 判定を仕分けログ（App 38）に登録し、レコード URL を返す。
+    env 未設定は登録スキップ（None）＝従来どおり LINE 通知のみの縮退。
+    登録失敗も None（照会通知を壊さない）"""
+    if not (APP_SORTATION_LOG.app_id() and APP_SORTATION_LOG.token()):
+        print("[SORTATION] 仕分けログ登録スキップ"
+              "（APP_SORTATION_LOG / TOKEN_SORTATION_LOG 未設定）")
+        return None
+    try:
+        record_id = await kintone.create_record(APP_SORTATION_LOG, {
+            "ファイル名": file_name,
+            "Drive_fileId": drive_file_id,
+            "Drive_URL": drive_file_url,
+            "書類種類": doc_type,
+            "確信度": str(confidence),
+            "判定理由": reason,
+            "候補一覧": "\n".join(c.label() for c in top),
+            "状態": "照会中",
+        })
+    except Exception as e:
+        print(f"[SORTATION] 仕分けログ登録に失敗（照会通知は継続）: {e}")
+        return None
+    return (f"{kintone._base_url()}/k/{APP_SORTATION_LOG.app_id()}"
+            f"/show#record={record_id}")
+
+
 async def _notify_ask(file_name: str, drive_file_url: str, doc_type: str,
                       confidence: float, reason: str,
-                      top: list[Candidate]) -> None:
+                      top: list[Candidate], log_url: str | None = None) -> None:
     """照会通知（T3）。業務指示Botチャネル名義で送る。
     宛先未解決・送信失敗は縮退（応答を壊さない）"""
     attorney_id = _ask_recipient()
@@ -186,6 +219,8 @@ async def _notify_ask(file_name: str, drive_file_url: str, doc_type: str,
     else:
         lines.append("候補: 該当なし")
     lines.append("Drive で確認のうえ手動で仕分けしてください。")
+    if log_url:
+        lines.append(f"仕分けログ: {log_url}")
     try:
         await push_line_message(attorney_id, "\n".join(lines),
                                 token_env="DISPATCHBOT_CHANNEL_ACCESS_TOKEN")
@@ -266,8 +301,11 @@ async def sortation_ingest(token: str = "",
           f"customer={customer.record_id if customer else None} conf={confidence}")
 
     if action == "ask":
-        await _notify_ask(file_name, url, doc_type, confidence, reason,
-                          _top_candidates(candidates, ocr_text, customer))
+        top = _top_candidates(candidates, ocr_text, customer)
+        log_url = await _log_ask(file_name, fid, url, doc_type, confidence,
+                                 reason, top)
+        await _notify_ask(file_name, url, doc_type, confidence, reason, top,
+                          log_url)
 
     return {
         "action": action,
