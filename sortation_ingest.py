@@ -40,8 +40,12 @@ from hub.webhook_auth import verify_token
 
 router = APIRouter()
 
-DOC_TYPES = ["戸籍", "評価証明", "残高証明", "登記事項証明", "通帳", "保険",
-             "契約書", "本人確認書類", "その他"]
+# doc_type は suggested_filename にそのまま入るため、ファイル名として自然な表記に
+# 限る（区切りは「・」。/ や : 等ファイル名に使えない文字を入れない）
+DOC_TYPES = ["戸籍", "住民票・戸籍附票", "評価証明・課税明細", "登記事項証明",
+             "残高証明", "通帳", "保険", "契約書", "委任状", "印鑑証明書",
+             "遺言書", "通知書・連絡文書", "請求書・領収書", "本人確認書類",
+             "その他"]
 DOC_TYPE_UNKNOWN = "不明"  # 判定不能の縮退時のみ（Claude には選ばせない）
 
 _DEFAULT_THRESHOLD = 0.85
@@ -58,7 +62,9 @@ JUDGE_TOOL = {
         "properties": {
             "doc_type": {
                 "type": "string", "enum": DOC_TYPES,
-                "description": "書類の種類。判別できなければ「その他」",
+                "description": "書類の種類。判別できなければ「その他」。"
+                               "どの候補にも明確に該当しない場合は「その他」を"
+                               "選ぶこと。近そうな候補に寄せない",
             },
             "customer_record_id": {
                 "type": ["string", "null"],

@@ -116,7 +116,7 @@ class TestAuth(_Base):
 
 
 class TestAutoBranch(_Base):
-    JUDGED = {"doc_type": "評価証明", "customer_record_id": "12",
+    JUDGED = {"doc_type": "評価証明・課税明細", "customer_record_id": "12",
               "confidence": 0.93, "reason": "宛名と被相続人名が一致"}
 
     def test_auto_response_contract(self):
@@ -125,11 +125,11 @@ class TestAutoBranch(_Base):
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.json(), {
             "action": "auto",
-            "doc_type": "評価証明",
+            "doc_type": "評価証明・課税明細",
             "confidence": 0.93,
             "customer": {"record_id": "12", "name": "山田太郎",
                          "folder_name": "No12_山田太郎"},
-            "suggested_filename": "山田太郎_評価証明_20260706.pdf",
+            "suggested_filename": "山田太郎_評価証明・課税明細_20260706.pdf",
         })
         self.assertEqual(self.push.await_count, 0, "auto は照会通知しない")
 
@@ -158,6 +158,35 @@ class TestAutoBranch(_Base):
         self.assertEqual(resp.json()["action"], "ask")
         self.assertIsNone(resp.json()["customer"])
         self.assertIsNone(resp.json()["suggested_filename"])
+
+
+class TestDocTypeOptions(unittest.TestCase):
+    """doc_type 候補の拡充（2026-07-06 誤判定修正）の固定"""
+
+    EXPECTED = ["戸籍", "住民票・戸籍附票", "評価証明・課税明細", "登記事項証明",
+                "残高証明", "通帳", "保険", "契約書", "委任状", "印鑑証明書",
+                "遺言書", "通知書・連絡文書", "請求書・領収書", "本人確認書類",
+                "その他"]
+
+    def test_doc_types_are_expanded_15(self):
+        self.assertEqual(sortation_ingest.DOC_TYPES, self.EXPECTED)
+        enum = sortation_ingest.JUDGE_TOOL["input_schema"]["properties"][
+            "doc_type"]["enum"]
+        self.assertEqual(enum, self.EXPECTED, "tool スキーマの enum も同一リスト")
+
+    def test_doc_types_are_filename_safe(self):
+        """doc_type は suggested_filename にそのまま入るため、ファイル名に
+        使えない文字を含まないこと"""
+        for t in sortation_ingest.DOC_TYPES:
+            for ch in '/\\:*?"<>|':
+                self.assertNotIn(ch, t, t)
+
+    def test_schema_instructs_not_to_force_nearest(self):
+        """「近そうな候補に寄せない」の指示が description に入っていること"""
+        desc = sortation_ingest.JUDGE_TOOL["input_schema"]["properties"][
+            "doc_type"]["description"]
+        self.assertIn("その他", desc)
+        self.assertIn("近そうな候補に寄せない", desc)
 
 
 class TestAskBranchAndNotify(_Base):
