@@ -10,12 +10,13 @@
     設定してから実行すること（未設定だと証明書エラーになる）
   - `clasp push` は GAS 側を上書きするため、意図的なデプロイ時以外は実行しないこと
 - 取得日: 2026-07-03（clasp 3.3.0 / clasp clone で取得）
+- **2026-07-06 同期**: 戸籍読解ブロック追加分は clasp の Google 再認証失効（invalid_rapt）のため **GAS エディタからの手動転記**で反映（大野が実物と構造一致を目視確認済み）。clasp 再ログイン→pull での機械同期は別タスク
 
 ## 内容
 
 | ファイル | 内容 |
 |---|---|
-| `コード.js` | `onFileAdded()` 1関数のみ。3つの Drive フォルダ（相談カード/戸籍謄本/通帳）を全走査し、`[済]` プレフィックスのないファイルを base64 化して Railway `POST /scan` へ送信、成功後にファイル名へ `[済]` を付与 |
+| `コード.js` | `onFileAdded()` 1関数のみ。**4つの Drive フォルダを監視**（2026-07-06 戸籍読解を追加）: ①相談カード/戸籍謄本/通帳 → base64 JSON で `POST /scan`（従来どおり・無変更） ②戸籍読解 → multipart で `POST /koseki/ingest?token=`（独立ブロック・ファイル単位 try/catch・muteHttpExceptions・`[済]` リネームは HTTP 200 時のみ）。KOSEKI_TOKEN の実物値は GAS エディタ側のみ（この写しではプレースホルダ） |
 | `appsscript.json` | マニフェスト（Asia/Tokyo・V8。トリガー定義は含まれない） |
 
 ## 注意（現状の既知の挙動）
