@@ -217,6 +217,123 @@ class TestApp34Schema(unittest.TestCase):
             self.assertIn(spec["type"], VALID_TYPES, f"{code} の型が不正")
 
 
+class TestApp35Schema(unittest.TestCase):
+    """App 35（財産）のスキーマ定義検証
+    （docs/souzoku-shorui/01 §1.1・2026-07-06 実機フォーム設計APIと19フィールド全一致を確認済み）"""
+
+    def setUp(self):
+        self.app35 = EXPECTED_KINTONE_SCHEMA["App 35 (財産)"]
+
+    def test_env_names(self):
+        self.assertEqual(self.app35["app_id_env"], "APP_ZAISAN")
+        self.assertEqual(self.app35["token_env"], "TOKEN_ZAISAN")
+
+    def test_field_count_is_19(self):
+        self.assertEqual(len(self.app35["fields"]), 19)
+
+    def test_is_optional(self):
+        self.assertIs(self.app35.get("optional"), True)
+
+    def test_case_reference_fields(self):
+        """案件参照4点（ハブ共通方式）が監視対象に含まれること"""
+        f = self.app35["fields"]
+        self.assertEqual(set(f["ユニット種別"]["required_options"]),
+                         {"時効援用", "相続放棄", "相続一般", "補助金"})
+        for code in ("案件アプリID", "案件レコードID", "被相続人名表示用"):
+            self.assertEqual(f[code]["type"], "SINGLE_LINE_TEXT", code)
+
+    def test_zaisan_type_options_13(self):
+        """財産種別13値（実機実出力どおり・債務/葬儀費用を含む）"""
+        f = self.app35["fields"]["財産種別"]
+        self.assertEqual(f["type"], "DROP_DOWN")
+        self.assertEqual(len(f["required_options"]), 13)
+        self.assertEqual(set(f["required_options"]),
+                         {"不動産_土地", "不動産_建物", "不動産_区分建物", "預貯金",
+                          "有価証券", "生命保険", "出資金", "自動車", "動産",
+                          "債権", "債務", "葬儀費用", "その他"})
+
+    def test_valuation_fields(self):
+        """評価まわり: 評価方法7値・評価基準日=DATE・評価確定=RADIO（yes/no）"""
+        f = self.app35["fields"]
+        self.assertEqual(set(f["評価方法"]["required_options"]),
+                         {"固定資産税評価額", "相続税評価額", "残高証明",
+                          "解約返戻金相当額", "時価査定", "額面", "その他"})
+        self.assertEqual(f["評価基準日"]["type"], "DATE")
+        self.assertEqual(f["評価確定"]["type"], "RADIO_BUTTON")
+        self.assertEqual(set(f["評価確定"]["required_options"]), {"no", "yes"})
+
+    def test_traceability_fields(self):
+        """データ源5値（OCR3経路＋手入力＋ヒアリング）・原本=FILE・冪等キー・有効フラグ"""
+        f = self.app35["fields"]
+        self.assertEqual(set(f["データ源"]["required_options"]),
+                         {"OCR_課税明細", "OCR_残高証明", "OCR_登記事項証明",
+                          "手入力", "ヒアリング"})
+        self.assertEqual(f["原本"]["type"], "FILE")
+        self.assertEqual(f["冪等キー"]["type"], "SINGLE_LINE_TEXT")
+        self.assertEqual(set(f["有効"]["required_options"]), {"yes", "no"})
+
+    def test_all_types_valid(self):
+        for code, spec in self.app35["fields"].items():
+            self.assertIn(spec["type"], VALID_TYPES, f"{code} の型が不正")
+
+
+class TestApp36Schema(unittest.TestCase):
+    """App 36（相続人）のスキーマ定義検証
+    （docs/souzoku-shorui/01 §2・2026-07-06 実機フォーム設計APIと16フィールド全一致を確認済み）"""
+
+    def setUp(self):
+        self.app36 = EXPECTED_KINTONE_SCHEMA["App 36 (相続人)"]
+
+    def test_env_names(self):
+        self.assertEqual(self.app36["app_id_env"], "APP_SOUZOKUNIN")
+        self.assertEqual(self.app36["token_env"], "TOKEN_SOUZOKUNIN")
+
+    def test_field_count_is_16(self):
+        self.assertEqual(len(self.app36["fields"]), 16)
+
+    def test_is_optional(self):
+        self.assertIs(self.app36.get("optional"), True)
+
+    def test_birth_date_is_text_not_date(self):
+        """生年月日は SINGLE_LINE_TEXT（協議書の当事者表示に和暦等を
+        そのまま差し込むため DATE 型にしない・設計01 §2）"""
+        self.assertEqual(self.app36["fields"]["生年月日"]["type"],
+                         "SINGLE_LINE_TEXT")
+
+    def test_zokugara_options_with_zenkaku_parens(self):
+        """続柄7値・括弧は全角（実機実出力どおり）"""
+        f = self.app36["fields"]["続柄"]
+        self.assertEqual(f["type"], "DROP_DOWN")
+        self.assertEqual(set(f["required_options"]),
+                         {"配偶者", "子", "直系尊属", "兄弟姉妹",
+                          "甥姪（代襲）", "受遺者（相続人外）", "その他"})
+
+    def test_status_options_6(self):
+        """状態6値（未成年の括弧も全角）"""
+        f = self.app36["fields"]["状態"]
+        self.assertEqual(set(f["required_options"]),
+                         {"通常", "放棄済み", "代襲", "相続分譲渡",
+                          "未成年（特別代理人要）", "成年被後見人"})
+
+    def test_document_generation_gate_fields(self):
+        """書類生成の前提: 戸籍確認済=RADIO（yes/no）・印鑑証明3値・データ源3値"""
+        f = self.app36["fields"]
+        self.assertEqual(f["戸籍確認済"]["type"], "RADIO_BUTTON")
+        self.assertEqual(set(f["戸籍確認済"]["required_options"]), {"no", "yes"})
+        self.assertEqual(set(f["印鑑証明"]["required_options"]),
+                         {"未", "依頼中", "受領"})
+        self.assertEqual(set(f["データ源"]["required_options"]),
+                         {"ヒアリング", "戸籍読解", "手入力"})
+
+    def test_no_yuukou_field(self):
+        """App 36 に「有効」フィールドは無い（App 35 との差異・実機どおり）"""
+        self.assertNotIn("有効", self.app36["fields"])
+
+    def test_all_types_valid(self):
+        for code, spec in self.app36["fields"].items():
+            self.assertIn(spec["type"], VALID_TYPES, f"{code} の型が不正")
+
+
 class TestHealthcheckOptionalSkip(unittest.TestCase):
     """check_kintone_schema の env 未設定時の挙動
     （optional=スキップ・警報なし / 非optional=警報。既存挙動の回帰込み）"""
@@ -239,6 +356,16 @@ class TestHealthcheckOptionalSkip(unittest.TestCase):
     def test_app34_env_unset_is_silently_skipped(self):
         """App 34 の env 未設定は警報ゼロ（optional 方式・App 33 と同じ）"""
         schema = {"App 34 (人物)": EXPECTED_KINTONE_SCHEMA["App 34 (人物)"]}
+        self.assertEqual(self._run(schema), [])
+
+    def test_app35_env_unset_is_silently_skipped(self):
+        """App 35 の env 未設定は警報ゼロ（optional 方式・App 33/34 と同じ）"""
+        schema = {"App 35 (財産)": EXPECTED_KINTONE_SCHEMA["App 35 (財産)"]}
+        self.assertEqual(self._run(schema), [])
+
+    def test_app36_env_unset_is_silently_skipped(self):
+        """App 36 の env 未設定は警報ゼロ（optional 方式・App 33/34 と同じ）"""
+        schema = {"App 36 (相続人)": EXPECTED_KINTONE_SCHEMA["App 36 (相続人)"]}
         self.assertEqual(self._run(schema), [])
 
     def test_non_optional_env_unset_still_alarms(self):
