@@ -524,8 +524,37 @@ EXPECTED_KINTONE_SCHEMA = {
             },
         },
     },
-    # App 37（割付・APP_WARITSUKE）は実機未作成・検収前のため未登録。
-    # CU 作成→フォーム設計取得APIでの検収合格後にここへ追記する（2026-07-06 時点）
+    # ── 割付（S系列・docs/souzoku-shorui/01 §3〔設計上は App 38 表記・実機は 37〕）──
+    # 2026-07-06 フォーム設計取得APIで実機11フィールドの全一致（型・選択肢順序・
+    # 初期値）を確認して登録。遺産分割協議書の「誰が何を取得するか」の1行=1割付
+    "App 37 (割付)": {
+        "app_id_env": "APP_WARITSUKE",
+        "token_env": "TOKEN_WARITSUKE",
+        # env 未設定の環境では監視をスキップ（設定されたら自動的に監視対象になる）
+        "optional": True,
+        "fields": {
+            # 案件参照（ハブ共通方式）
+            "ユニット種別": {
+                "type": "DROP_DOWN",
+                "required_options": ["時効援用", "相続放棄", "相続一般", "補助金"],
+            },
+            "案件アプリID": {"type": "SINGLE_LINE_TEXT"},
+            "案件レコードID": {"type": "SINGLE_LINE_TEXT"},
+            "被相続人名表示用": {"type": "SINGLE_LINE_TEXT"},
+            # 割付の実体（財産×相続人の対応・両端は App 35/36 のレコードID参照）
+            "財産レコードID": {"type": "SINGLE_LINE_TEXT"},
+            "相続人レコードID": {"type": "SINGLE_LINE_TEXT"},
+            "取得区分": {
+                "type": "DROP_DOWN",
+                "required_options": ["単独取得", "共有取得", "換価分割", "代償取得",
+                                     "債務引受", "保険金受取（みなし）"],
+            },
+            "持分": {"type": "SINGLE_LINE_TEXT"},
+            "代償金額": {"type": "NUMBER"},
+            "条件メモ": {"type": "MULTI_LINE_TEXT"},
+            "有効": {"type": "RADIO_BUTTON", "required_options": ["yes", "no"]},
+        },
+    },
 }
 
 

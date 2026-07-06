@@ -334,6 +334,54 @@ class TestApp36Schema(unittest.TestCase):
             self.assertIn(spec["type"], VALID_TYPES, f"{code} の型が不正")
 
 
+class TestApp37Schema(unittest.TestCase):
+    """App 37（割付）のスキーマ定義検証
+    （docs/souzoku-shorui/01 §3・2026-07-06 実機フォーム設計APIと11フィールド全一致を確認済み）"""
+
+    def setUp(self):
+        self.app37 = EXPECTED_KINTONE_SCHEMA["App 37 (割付)"]
+
+    def test_env_names(self):
+        self.assertEqual(self.app37["app_id_env"], "APP_WARITSUKE")
+        self.assertEqual(self.app37["token_env"], "TOKEN_WARITSUKE")
+
+    def test_field_count_is_11(self):
+        self.assertEqual(len(self.app37["fields"]), 11)
+
+    def test_is_optional(self):
+        self.assertIs(self.app37.get("optional"), True)
+
+    def test_allocation_edge_fields(self):
+        """割付の両端（App 35 財産・App 36 相続人へのレコードID参照）が監視対象に含まれること"""
+        for code in ("財産レコードID", "相続人レコードID"):
+            self.assertEqual(self.app37["fields"][code]["type"],
+                             "SINGLE_LINE_TEXT", code)
+
+    def test_acquisition_type_options_with_zenkaku_parens(self):
+        """取得区分6値（保険金受取の括弧は全角・実機実出力どおり）"""
+        f = self.app37["fields"]["取得区分"]
+        self.assertEqual(f["type"], "DROP_DOWN")
+        self.assertEqual(set(f["required_options"]),
+                         {"単独取得", "共有取得", "換価分割", "代償取得",
+                          "債務引受", "保険金受取（みなし）"})
+
+    def test_compensation_and_memo(self):
+        """代償金額=NUMBER・条件メモ=複数行・持分=文字列（分数表記等をそのまま持つ）"""
+        f = self.app37["fields"]
+        self.assertEqual(f["代償金額"]["type"], "NUMBER")
+        self.assertEqual(f["条件メモ"]["type"], "MULTI_LINE_TEXT")
+        self.assertEqual(f["持分"]["type"], "SINGLE_LINE_TEXT")
+
+    def test_yuukou_flag(self):
+        f = self.app37["fields"]["有効"]
+        self.assertEqual(f["type"], "RADIO_BUTTON")
+        self.assertEqual(set(f["required_options"]), {"yes", "no"})
+
+    def test_all_types_valid(self):
+        for code, spec in self.app37["fields"].items():
+            self.assertIn(spec["type"], VALID_TYPES, f"{code} の型が不正")
+
+
 class TestHealthcheckOptionalSkip(unittest.TestCase):
     """check_kintone_schema の env 未設定時の挙動
     （optional=スキップ・警報なし / 非optional=警報。既存挙動の回帰込み）"""
@@ -366,6 +414,11 @@ class TestHealthcheckOptionalSkip(unittest.TestCase):
     def test_app36_env_unset_is_silently_skipped(self):
         """App 36 の env 未設定は警報ゼロ（optional 方式・App 33/34 と同じ）"""
         schema = {"App 36 (相続人)": EXPECTED_KINTONE_SCHEMA["App 36 (相続人)"]}
+        self.assertEqual(self._run(schema), [])
+
+    def test_app37_env_unset_is_silently_skipped(self):
+        """App 37 の env 未設定は警報ゼロ（optional 方式・App 33〜36 と同じ）"""
+        schema = {"App 37 (割付)": EXPECTED_KINTONE_SCHEMA["App 37 (割付)"]}
         self.assertEqual(self._run(schema), [])
 
     def test_non_optional_env_unset_still_alarms(self):
