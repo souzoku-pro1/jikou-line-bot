@@ -17,11 +17,13 @@ from document_webhook import router as document_router
 from hub.dispatch import router as hub_dispatch_router
 from dispatch_bot.router import router as dispatch_bot_router
 from koseki_ingest import router as koseki_ingest_router
+from sortation_ingest import router as sortation_ingest_router
 app.include_router(cloudsign_router)
 app.include_router(document_router)
 app.include_router(hub_dispatch_router)
 app.include_router(dispatch_bot_router)
 app.include_router(koseki_ingest_router)
+app.include_router(sortation_ingest_router)
 
 from chat_responder import (
     get_app21_record,
