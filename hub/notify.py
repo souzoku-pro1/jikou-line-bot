@@ -28,9 +28,15 @@ _last_notify_at: dict[str, float] = {}
 _PUSH_URL = "https://api.line.me/v2/bot/message/push"
 
 
-async def push_line_message(to: str, text: str) -> bool:
-    """LINE Push の共通実装。成功で True。失敗はログのみ（例外を送出しない）。"""
-    line_token = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
+async def push_line_message(to: str, text: str,
+                            token_env: str = "LINE_CHANNEL_ACCESS_TOKEN") -> bool:
+    """LINE Push の共通実装。成功で True。失敗はログのみ（例外を送出しない）。
+
+    token_env: 送信チャネルのアクセストークン env 名。既定は顧客Bot
+    （LINE_CHANNEL_ACCESS_TOKEN）。業務指示Bot名義で送るときは
+    DISPATCHBOT_CHANNEL_ACCESS_TOKEN を指定する（例: 仕分け照会通知）。
+    """
+    line_token = os.environ.get(token_env, "")
     if not (to and line_token):
         logger.warning("LINE push skipped (no destination or token)")
         return False

@@ -149,13 +149,29 @@ def _top_candidates(candidates: list[Candidate], ocr_text: str,
     return ranked[:3]
 
 
+def _ask_recipient() -> str:
+    """照会通知の宛先解決（2026-07-06 裁定の優先順）:
+    SORTATION_ASK_TO → DISPATCHBOT_ALLOWED_USER_IDS の先頭 → ATTORNEY_LINE_USER_ID。
+    指示Botチャネルで送るため、通常は指示Botで認可済みの userId に届く並び"""
+    explicit = os.environ.get("SORTATION_ASK_TO", "").strip()
+    if explicit:
+        return explicit
+    allowed = os.environ.get("DISPATCHBOT_ALLOWED_USER_IDS", "")
+    first = next((p.strip() for p in allowed.split(",") if p.strip()), "")
+    if first:
+        return first
+    return os.environ.get("ATTORNEY_LINE_USER_ID", "").strip()
+
+
 async def _notify_ask(file_name: str, drive_file_url: str, doc_type: str,
                       confidence: float, reason: str,
                       top: list[Candidate]) -> None:
-    """照会通知（T3）。宛先未設定・送信失敗は縮退（応答を壊さない）"""
-    attorney_id = os.environ.get("ATTORNEY_LINE_USER_ID", "")
+    """照会通知（T3）。業務指示Botチャネル名義で送る。
+    宛先未解決・送信失敗は縮退（応答を壊さない）"""
+    attorney_id = _ask_recipient()
     if not attorney_id:
-        print("[SORTATION] 照会通知スキップ（ATTORNEY_LINE_USER_ID 未設定）")
+        print("[SORTATION] 照会通知スキップ（SORTATION_ASK_TO / "
+              "DISPATCHBOT_ALLOWED_USER_IDS / ATTORNEY_LINE_USER_ID すべて未設定）")
         return
     lines = [
         "【書類仕分け照会】自動仕分けできませんでした",
@@ -171,7 +187,8 @@ async def _notify_ask(file_name: str, drive_file_url: str, doc_type: str,
         lines.append("候補: 該当なし")
     lines.append("Drive で確認のうえ手動で仕分けしてください。")
     try:
-        await push_line_message(attorney_id, "\n".join(lines))
+        await push_line_message(attorney_id, "\n".join(lines),
+                                token_env="DISPATCHBOT_CHANNEL_ACCESS_TOKEN")
     except Exception as e:
         print(f"[SORTATION] 照会通知に失敗（応答は継続）: {e}")
 
