@@ -79,6 +79,7 @@ OCR は**独立した2系統**が稼働している。設計書（docs/architect
     処理されなくなる**（poison-pill 構造）
   - Railway URL・3フォルダの Drive フォルダ ID はハードコード。送信ペイロードは
     `{fileData, fileName, folderName}`（Railway 側 ScanRequest の別名と一致）
+- 【2026-07-06 追記】GAS は**4フォルダ監視**に拡張（`戸籍読解` フォルダ→ multipart で `POST /koseki/ingest`・既存3フォルダ→/scan は無変更。詳細は legacy/gas/README.md）
 - Drive フォルダ構成: `相談カード` / `戸籍謄本` / `通帳` の3フォルダ（ID は legacy/gas/ に
   記録）。処理済みファイルも同一フォルダ内に `[済]` 付きで残り続ける
 
