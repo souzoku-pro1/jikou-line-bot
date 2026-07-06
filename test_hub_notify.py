@@ -142,6 +142,36 @@ class TestPushLineMessage(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(ok)
         self.assertEqual(len(FakeClient.calls), 0)
 
+    async def test_default_channel_is_customer_bot(self):
+        """既存呼び出し元の無変更回帰: token_env 省略時は従来どおり
+        LINE_CHANNEL_ACCESS_TOKEN のチャネルで送る"""
+        with use_fake([FakeResponse(200)]):
+            ok = await notify.push_line_message("U1", "hello")
+        self.assertTrue(ok)
+        _, kw = FakeClient.calls[0]
+        self.assertEqual(kw["headers"]["Authorization"], "Bearer line_tok")
+
+    async def test_token_env_selects_channel(self):
+        """token_env 指定で送信チャネル（Authorization ヘッダ）が切り替わる"""
+        env = {"DISPATCHBOT_CHANNEL_ACCESS_TOKEN": "bot_tok"}
+        with patch.dict("os.environ", env, clear=False), \
+                use_fake([FakeResponse(200)]):
+            ok = await notify.push_line_message(
+                "U1", "hello", token_env="DISPATCHBOT_CHANNEL_ACCESS_TOKEN")
+        self.assertTrue(ok)
+        _, kw = FakeClient.calls[0]
+        self.assertEqual(kw["headers"]["Authorization"], "Bearer bot_tok")
+
+    async def test_token_env_unset_skips(self):
+        """指定した token_env が未設定なら送らない（既定と同じ縮退）"""
+        with patch.dict("os.environ",
+                        {"DISPATCHBOT_CHANNEL_ACCESS_TOKEN": ""}, clear=False):
+            with use_fake([]):
+                ok = await notify.push_line_message(
+                    "U1", "x", token_env="DISPATCHBOT_CHANNEL_ACCESS_TOKEN")
+        self.assertFalse(ok)
+        self.assertEqual(len(FakeClient.calls), 0)
+
 
 class TestReExport(unittest.TestCase):
     def test_claude_gateway_reexports_notify_admin_line(self):

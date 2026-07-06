@@ -194,7 +194,9 @@ class TestAskBranchAndNotify(_Base):
         """照会通知にファイル名・Driveリンク・理由・候補label・確信度が載る"""
         judged = {"doc_type": "戸籍", "customer_record_id": None,
                   "confidence": 0.4, "reason": "宛名がOCRで読めない"}
-        resp = self.post(judged=judged,
+        resp = self.post(env={**_ENV, "SORTATION_ASK_TO": "",
+                              "DISPATCHBOT_ALLOWED_USER_IDS": ""},
+                         judged=judged,
                          candidates=[cand(12, "山田太郎", "山田一郎")],
                          ocr_text="山田太郎 様",
                          data={"drive_file_url": "https://drive.google.com/x"})
@@ -233,13 +235,53 @@ class TestAskBranchAndNotify(_Base):
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.json()["action"], "ask")
 
-    def test_attorney_env_unset_skips_notify_but_responds(self):
+    def test_recipient_envs_all_unset_skips_notify_but_responds(self):
+        """宛先3系統すべて未設定なら通知スキップ（応答は ask のまま・既存縮退）"""
         judged = {"doc_type": "戸籍", "customer_record_id": None,
                   "confidence": 0.3, "reason": "x"}
         resp = self.post(env={"SORTATION_INGEST_TOKEN": "sort_token",
+                              "SORTATION_ASK_TO": "",
+                              "DISPATCHBOT_ALLOWED_USER_IDS": "",
                               "ATTORNEY_LINE_USER_ID": ""}, judged=judged)
         self.assertEqual(resp.json()["action"], "ask")
         self.assertEqual(self.push.await_count, 0)
+
+
+class TestAskChannelAndRecipient(_Base):
+    """照会通知のチャネル（業務指示Bot名義）と宛先解決順（2026-07-06 裁定）"""
+
+    JUDGED = {"doc_type": "戸籍", "customer_record_id": None,
+              "confidence": 0.3, "reason": "x"}
+
+    def test_sends_via_dispatch_bot_channel(self):
+        """token_env=DISPATCHBOT_CHANNEL_ACCESS_TOKEN で送る（顧客Bot名義にしない）"""
+        self.post(judged=self.JUDGED)
+        self.assertEqual(self.push.await_args.kwargs.get("token_env"),
+                         "DISPATCHBOT_CHANNEL_ACCESS_TOKEN")
+
+    def test_recipient_priority_1_explicit_env(self):
+        """SORTATION_ASK_TO が最優先"""
+        resp = self.post(env={**_ENV, "SORTATION_ASK_TO": "U-explicit",
+                              "DISPATCHBOT_ALLOWED_USER_IDS": "U-owner1,U-owner2"},
+                         judged=self.JUDGED)
+        self.assertEqual(resp.json()["action"], "ask")
+        self.assertEqual(self.push.await_args.args[0], "U-explicit")
+
+    def test_recipient_priority_2_allowed_first(self):
+        """SORTATION_ASK_TO 空なら DISPATCHBOT_ALLOWED_USER_IDS の先頭"""
+        resp = self.post(env={**_ENV, "SORTATION_ASK_TO": "",
+                              "DISPATCHBOT_ALLOWED_USER_IDS": " U-owner1 , U-owner2 "},
+                         judged=self.JUDGED)
+        self.assertEqual(resp.json()["action"], "ask")
+        self.assertEqual(self.push.await_args.args[0], "U-owner1")
+
+    def test_recipient_priority_3_attorney_fallback(self):
+        """上2つが空なら ATTORNEY_LINE_USER_ID"""
+        resp = self.post(env={**_ENV, "SORTATION_ASK_TO": "",
+                              "DISPATCHBOT_ALLOWED_USER_IDS": ""},
+                         judged=self.JUDGED)
+        self.assertEqual(resp.json()["action"], "ask")
+        self.assertEqual(self.push.await_args.args[0], "U-attorney")
 
 
 class TestDegradedPaths(_Base):
