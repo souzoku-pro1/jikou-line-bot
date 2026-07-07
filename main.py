@@ -81,6 +81,12 @@ async def health():
         status["reportlab"] = font_status()
     except Exception as e:
         status["reportlab"] = f"NG: {e}"
+    # graphviz（Z2 関係図の dot 描画・nixpacks.toml で追加）。
+    # 不在でも関係図の描画のみ不可＝他機能は落とさない（明示表示のみ）
+    import shutil
+    dot_path = shutil.which("dot")
+    status["graphviz"] = f"ok ({dot_path})" if dot_path else \
+        "NG: dot バイナリなし（関係図の描画のみ不可・他機能は正常）"
     return {"status": "ok", "deps": status}
 
 
