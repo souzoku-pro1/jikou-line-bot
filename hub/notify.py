@@ -28,6 +28,21 @@ _last_notify_at: dict[str, float] = {}
 _PUSH_URL = "https://api.line.me/v2/bot/message/push"
 
 
+def business_token_env() -> str:
+    """業務通知（管理者警報・承認通知・受領通知）の送信チャネル（2026-07-07 裁定）。
+
+    業務通知は業務指示Bot（DISPATCHBOT_CHANNEL_ACCESS_TOKEN）から送る。
+    未設定の環境では既定（顧客Bot）へフォールバック＋警告ログ
+    （警報の欠落防止を優先）。顧客向け送信はこの関数を使わない（現状のまま）。
+    """
+    if os.environ.get("DISPATCHBOT_CHANNEL_ACCESS_TOKEN", ""):
+        return "DISPATCHBOT_CHANNEL_ACCESS_TOKEN"
+    logger.warning(
+        "DISPATCHBOT_CHANNEL_ACCESS_TOKEN unset; "
+        "business notification falls back to LINE_CHANNEL_ACCESS_TOKEN")
+    return "LINE_CHANNEL_ACCESS_TOKEN"
+
+
 async def push_line_message(to: str, text: str,
                             token_env: str = "LINE_CHANNEL_ACCESS_TOKEN") -> bool:
     """LINE Push の共通実装。成功で True。失敗はログのみ（例外を送出しない）。
@@ -81,7 +96,8 @@ async def notify_admin_line(text: str, throttle_key: str = "") -> None:
             return
         _last_notify_at[throttle_key] = now
 
-    await push_line_message(admin_id, text)
+    # 業務通知は指示Botチャネルから（2026-07-07 裁定・14呼び出し元は無変更）
+    await push_line_message(admin_id, text, token_env=business_token_env())
 
 
 async def notify_attorney_approval(record: dict) -> None:
@@ -100,4 +116,5 @@ async def notify_attorney_approval(record: dict) -> None:
         f"発送管理レコードNo: {record_id}\n"
         "kintone で成果物を確認し、発送ステータスを「承認済」に変更してください。"
     )
-    await push_line_message(attorney_id, text)
+    # 業務通知は指示Botチャネルから（2026-07-07 裁定）
+    await push_line_message(attorney_id, text, token_env=business_token_env())

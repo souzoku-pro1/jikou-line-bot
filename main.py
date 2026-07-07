@@ -44,6 +44,7 @@ from claude_gateway import (
 )
 from daily_healthcheck import start_healthcheck_scheduler
 from hub import kintone as hub_kintone
+from hub import notify as hub_notify
 from hub.webhook_auth import extract_record_id, verify_token
 
 # App 29（承認キュー）のハブ経由接続（T0-1。挙動は従来の get_approval_record と同等）
@@ -653,16 +654,6 @@ async def _update_kintone_record(record_id: str, extracted: dict) -> None:
             raise Exception(f"kintone更新エラー {resp.status_code}: {resp.text}")
 
 
-async def _push_line_message(user_id: str, text: str) -> None:
-    """LINE Push APIでメッセージを送る"""
-    async with httpx.AsyncClient() as client:
-        await client.post(
-            PUSH_URL,
-            headers={"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"},
-            json={"to": user_id, "messages": [{"type": "text", "text": text}]},
-        )
-
-
 @app.post("/ocr/fixed-asset")
 async def ocr_fixed_asset(file: UploadFile = File(...),
                           case_hint: str | None = Form(default=None)):
@@ -745,10 +736,12 @@ async def ocr_fixed_asset(file: UploadFile = File(...),
         f"━━━━━━━━━━━━━━━"
     )
     if LINE_USER_ID:
-        try:
-            await _push_line_message(LINE_USER_ID, notify_text)
-        except Exception as e:
-            print(f"[WARN] LINE通知失敗: {e}")
+        # 受領通知は業務通知＝指示Botチャネルから（2026-07-07 裁定・
+        # レガシー _push_line_message は廃止し hub/notify に一本化）
+        ok = await hub_notify.push_line_message(
+            LINE_USER_ID, notify_text, token_env=hub_notify.business_token_env())
+        if not ok:
+            print("[WARN] LINE通知失敗（push_line_message が False）")
     else:
         print("[INFO] LINE_USER_ID未設定のためLINE通知をスキップ")
 
