@@ -111,14 +111,24 @@ def to_dot(graph: KinshipGraph) -> str:
     return "\n".join(lines) + "\n"
 
 
-def render_kinship(graph: KinshipGraph, fmt: str = "svg") -> bytes:
+def render_kinship(graph: KinshipGraph, fmt: str = "svg",
+                   heir_scope: bool = False) -> bytes:
     """検証 → dot 生成 → graphviz 実行。SVG/PDF のバイト列を返す。
 
     - 生成前提の未充足は KinshipValidationRejected（problems=Z1 の列挙）で
       **描画しない**（dot も実行しない）
     - dot バイナリ不在は GraphvizUnavailable（縮退・他機能に影響させない）
+    - heir_scope=True（R4-3・D-5 裁定）: 検証要求を「相続人確定に必要な人物」
+      （heir_derivation.required_persons）に絞る。被相続人が特定できない場合は
+      従来どおり全ノード検証に縮退。既定 False=従来挙動（後方互換）
     """
-    problems = validate_for_rendering(graph)
+    required_ids = None
+    if heir_scope:
+        from heir_derivation import required_persons  # 遅延 import（循環回避）
+        decedents = graph.decedents()
+        if len(decedents) == 1:
+            required_ids = required_persons(graph, decedents[0])
+    problems = validate_for_rendering(graph, required_ids)
     if problems:
         raise KinshipValidationRejected(problems)
     if fmt not in ("svg", "pdf"):
