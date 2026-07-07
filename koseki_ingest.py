@@ -36,6 +36,47 @@ router = APIRouter()
 
 APP_KOSEKI_BOOK = kintone.KintoneApp(
     "App 33 (戸籍読解)", "APP_KOSEKI_BOOK", "TOKEN_KOSEKI_BOOK")
+APP_SHIPPING = kintone.KintoneApp(
+    "App 30 (発送管理)", "APP_SHIPPING", "TOKEN_SHIPPING")
+
+
+async def _file_case_link_review(record_id: str, fid: str, pdf_bytes: bytes,
+                                 filename: str) -> str | None:
+    """案件参照が埋まらなかった戸籍の要確認起票（R4-0・2026-07-07 裁定）。
+
+    確定は S5-2.5 の関所（review_resolve の RESOLVERS["koseki_ingest"]）が行う。
+    封筒は S5 と同形式・チャネル固有データのトップキー = koseki_ingest。
+    env 未設定はスキップ・起票失敗は ingest の成功応答を壊さない（ログのみ）
+    """
+    if not (APP_SHIPPING.app_id() and APP_SHIPPING.token()):
+        print("[KOSEKI_INGEST] 要確認起票スキップ（APP_SHIPPING 未設定）")
+        return None
+    detail = {"理由": "案件紐付け不能", "戸籍レコードID": record_id, "冪等キー": fid}
+    fields = {
+        "発送ステータス": "要確認",
+        "方向": "受領",
+        "チャネル": "スキャン受領",
+        "ユニット種別": "相続一般",
+        "件名": "戸籍読解の案件紐付け: 案件紐付け不能",
+        "エラー詳細": f"案件紐付け不能\n{json.dumps(detail, ensure_ascii=False)}"[:500],
+        "チャネル固有データ": json.dumps({"koseki_ingest": detail},
+                                         ensure_ascii=False),
+        "実行済み": "no",
+    }
+    try:
+        try:
+            key = await kintone.upload_file(
+                APP_SHIPPING, filename or "戸籍.pdf", pdf_bytes, "application/pdf")
+            fields["成果物"] = [{"fileKey": key}]
+        except Exception as e:
+            print(f"[KOSEKI_INGEST] 要確認への原本添付に失敗（起票は続行）: {e}")
+        review_id = str(await kintone.create_record(APP_SHIPPING, fields))
+        print(f"[KOSEKI_INGEST] 案件紐付け不能を要確認起票 record={record_id} "
+              f"review={review_id}")
+        return review_id
+    except Exception as e:
+        print(f"[KOSEKI_INGEST] 要確認起票に失敗（登録は成功済み・処理続行）: {e}")
+        return None
 
 
 def _ocr_pdf(pdf_bytes: bytes, api_key: str) -> str:
@@ -148,5 +189,13 @@ async def koseki_ingest(token: str = "",
         print(f"[KOSEKI_INGEST] 読解に失敗（未読解のまま・核関数で回収可能）"
               f" record={record_id}: {e}")
 
-    return {"status": "ok", "kintone_record_id": record_id,
-            "page_images": len(page_images), "ocr_chars": len(ocr_text)}
+    # R4-0（2026-07-07 裁定）: 案件参照が埋まらなかった戸籍は App 30 要確認へ。
+    # 確定（案件紐付け＋クローズ）は S5-2.5 の関所が行う
+    response = {"status": "ok", "kintone_record_id": record_id,
+                "page_images": len(page_images), "ocr_chars": len(ocr_text)}
+    if not case_hint:
+        review_id = await _file_case_link_review(
+            record_id, fid, pdf_bytes, file.filename)
+        if review_id:
+            response["review_record_id"] = review_id
+    return response

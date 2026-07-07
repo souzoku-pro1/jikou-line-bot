@@ -221,21 +221,28 @@ async def execute(pending) -> tuple[str, str, str]:
     if status == "resolved":
         lines = [f"要確認{len(result.get('items') or [])}件を {folder} の案件に"
                  "確定しました"]
-        first_zaisan = ""
+        first_id, first_app = "", None
+        from review_resolve import APP_KOSEKI_BOOK, APP_ZAISAN
         for item in result.get("items") or []:
-            zid = str(item.get("zaisan_record_id") or "")
-            first_zaisan = first_zaisan or zid
-            action = "追記" if item.get("zaisan") == "updated" else "新規"
-            lines.append(f"・要確認 No.{item.get('review_record_id')} → "
-                         f"財産行 No.{zid}（{action}）")
+            rid = item.get("review_record_id")
+            if item.get("koseki_record_id"):  # R4-0: 戸籍の案件紐付け
+                kid = str(item.get("koseki_record_id"))
+                lines.append(f"・要確認 No.{rid} → 戸籍 No.{kid} に案件を紐付け")
+                if not first_id:
+                    first_id, first_app = kid, APP_KOSEKI_BOOK
+            else:  # S5-2.5: 財産行の生成/追記
+                zid = str(item.get("zaisan_record_id") or "")
+                action = "追記" if item.get("zaisan") == "updated" else "新規"
+                lines.append(f"・要確認 No.{rid} → 財産行 No.{zid}（{action}）")
+                if not first_id:
+                    first_id, first_app = zid, APP_ZAISAN
         lines.append("（kintone内部のみ・対外送信なし）")
         url = ""
-        from review_resolve import APP_ZAISAN
-        if first_zaisan and APP_ZAISAN.app_id():
-            url = (f"{kintone._base_url()}/k/{APP_ZAISAN.app_id()}"
-                   f"/show#record={first_zaisan}")
+        if first_id and first_app and first_app.app_id():
+            url = (f"{kintone._base_url()}/k/{first_app.app_id()}"
+                   f"/show#record={first_id}")
             lines.append(url)
-        return "\n".join(lines), first_zaisan, url
+        return "\n".join(lines), first_id, url
 
     # ガード中止・env縮退・未知キー: 理由をそのまま報告（意訳しない）
     prefix = {"aborted": "確定を中止しました",

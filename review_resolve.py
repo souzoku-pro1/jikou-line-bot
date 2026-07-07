@@ -24,6 +24,7 @@
 """
 
 import json
+import os
 import re
 from dataclasses import dataclass, field
 
@@ -34,6 +35,9 @@ from registry_ingest import (
     APP_ZAISAN,
     _upsert_zaisan,
 )
+
+APP_KOSEKI_BOOK = kintone.KintoneApp(
+    "App 33 (戸籍読解)", "APP_KOSEKI_BOOK", "TOKEN_KOSEKI_BOOK")
 
 STATUS_PENDING = "要確認"
 STATUS_DONE = "完了"
@@ -204,9 +208,61 @@ async def _resolve_registry(group: ReviewGroup, case_record_id: str) -> dict:
             "items": results}
 
 
-# ハンドラ登録辞書（裁定: 第1版は registry_ingest 専用。将来 zaisan_sync／
-# S6 通帳／R4 名寄せはキー追加で載せる）
-RESOLVERS = {"registry_ingest": _resolve_registry}
+# ── koseki_ingest（R4-0 戸籍の案件紐付け不能）の確定ハンドラ ─────────────────
+
+async def _resolve_koseki(group: ReviewGroup, case_record_id: str) -> dict:
+    """戸籍の案件紐付けグループの確定:
+    App 33 の案件アプリID/案件レコードIDを埋め、App 30 をクローズする。
+    App 34（人物）には触れない（人物化は R4-1 の仕事・裁定）"""
+    # ── phase 1: 書き込み直前の全件再読（T1 と同じ意味論・1件でも変化なら全体中止）──
+    verified = []
+    for item in group.items:
+        record = await kintone.get_record(APP_SHIPPING, item.record_id)
+        status, executed = _v(record, "発送ステータス"), _v(record, "実行済み")
+        if status != STATUS_PENDING or executed != "no":
+            return {"status": "aborted",
+                    "reason": f"No.{item.record_id} が要確認ではなくなっています"
+                              f"（発送ステータス={status}・実行済み={executed}）。"
+                              "グループ全体を中止しました（書き込みなし）"}
+        koseki_id = str(item.detail.get("戸籍レコードID") or "")
+        if not koseki_id:
+            return {"status": "aborted",
+                    "reason": f"No.{item.record_id} に戸籍レコードIDがありません"
+                              "（書き込みなし）"}
+        koseki = await kintone.get_record(APP_KOSEKI_BOOK, koseki_id)
+        current_case = _v(koseki, "案件レコードID")
+        if current_case and current_case != case_record_id:
+            return {"status": "aborted",
+                    "reason": f"戸籍 No.{koseki_id} は既に案件 No.{current_case} に"
+                              "紐付いています。付け替えは kintone で直接行ってください"
+                              "（書き込みなし）"}
+        verified.append((item, koseki_id))
+
+    # ── phase 2: 案件紐付け → クローズ ─────────────────────────────────────
+    results = []
+    for item, koseki_id in verified:
+        await kintone.update_record(APP_KOSEKI_BOOK, koseki_id, {
+            "案件アプリID": os.environ.get("SOUZOKU_KINTONE_APP_ID", ""),
+            "案件レコードID": case_record_id,
+        })
+        await kintone.update_record(APP_SHIPPING, item.record_id, {
+            "発送ステータス": STATUS_DONE,
+            "実行済み": "yes",
+        })
+        results.append({"review_record_id": item.record_id,
+                        "koseki_record_id": koseki_id})
+        print(f"[REVIEW_RESOLVE] koseki linked review=No.{item.record_id} "
+              f"koseki={koseki_id} case={case_record_id}")
+    return {"status": "resolved", "case_record_id": case_record_id,
+            "items": results}
+
+
+# ハンドラ登録辞書: トップキー → (確定ハンドラ, 必要な kintone env)。
+# 将来の zaisan_sync／S6 通帳はキー追加で載せる
+RESOLVERS = {
+    "registry_ingest": (_resolve_registry, (APP_SHIPPING, APP_FUDOSAN, APP_ZAISAN)),
+    "koseki_ingest": (_resolve_koseki, (APP_SHIPPING, APP_KOSEKI_BOOK)),
+}
 
 
 async def resolve_group(group: ReviewGroup, case_record_id: str) -> dict:
@@ -214,18 +270,19 @@ async def resolve_group(group: ReviewGroup, case_record_id: str) -> dict:
 
     Returns: {"status": "resolved"|"aborted"|"unsupported"|"unavailable", ...}
     - unsupported: RESOLVERS に無いトップキー（明示応答・黙って無視しない）
-    - unavailable: 必要 env（App 25/30/35）の未設定
+    - unavailable: そのハンドラが必要とする env の未設定
     - aborted: 二重確定ガード発動（書き込みゼロで中止・理由つき）
     """
-    for app in (APP_SHIPPING, APP_FUDOSAN, APP_ZAISAN):
-        if not (app.app_id() and app.token()):
-            return {"status": "unavailable",
-                    "reason": f"{app.label} の env（{app.app_id_env}）が未設定です"}
-    handler = RESOLVERS.get(group.source)
-    if handler is None:
+    entry = RESOLVERS.get(group.source)
+    if entry is None:
         return {"status": "unsupported",
                 "reason": f"{MSG_UNSUPPORTED_SOURCE}"
                           f"（チャネル固有データのキー={group.source}）"}
+    handler, required_apps = entry
+    for app in required_apps:
+        if not (app.app_id() and app.token()):
+            return {"status": "unavailable",
+                    "reason": f"{app.label} の env（{app.app_id_env}）が未設定です"}
     if not case_record_id:
         return {"status": "aborted", "reason": "案件レコードIDが指定されていません"}
     return await handler(group, case_record_id)
