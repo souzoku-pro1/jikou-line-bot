@@ -168,3 +168,32 @@ register(TaskSpec(
     flow_reply_fn=sortation_assign.flow_reply,
     execute_fn=sortation_assign.execute,
 ))
+
+
+# ── 要確認の確定（S5-2.5 T2。フローは dispatch_bot/review_resolve_task.py に隔離）──
+from dispatch_bot import review_resolve_task  # noqa: E402（循環回避のため末尾 import）
+
+register(TaskSpec(
+    task_type="review_resolve",
+    display_name="要確認の確定",
+    answer_only=False,
+    destination="review_queue",  # App 30 要確認のクローズ＋App 35 生成（起票はしない）
+    run_at="railway",
+    risk="低",  # kintone 内部のみ（Drive・LINE顧客側・対外送信なし）
+    auto_scope="App 30 要確認→完了のクローズと App 35 財産行の生成まで",
+    approval_scope="なし（対外効果ゼロ。以降の評価確定は従来どおり弁護士がkintoneで）",
+    required_fields=["customer_name"],
+    field_questions={"customer_name": review_resolve_task.QUESTION_CUSTOMER},
+    search_apps=["SOUZOKU_KINTONE_APP_ID"],
+    artifacts="App 35 財産行＋App 30 クローズ（完了・実行済み=yes）",
+    adapter="ReviewResolve",
+    on_failure="更新失敗はLINEにエラー返信（管理者警報つき・既存の警報系）",
+    hint_for_parser=("要確認キュー（App 30）を案件へ確定する。"
+                     "「〇〇さんの要確認を確定して」「要確認を処理して」等。"
+                     "customer_name に顧客名。「No.12の案件へ」等の番号指定は "
+                     "task_params.case_record_id に数字のみ入れる"),
+    required_desc="customer_name または 案件No（例: No.12）",
+    flow_fn=review_resolve_task.flow,
+    flow_reply_fn=review_resolve_task.flow_reply,
+    execute_fn=review_resolve_task.execute,
+))
