@@ -263,6 +263,97 @@ class TestSignals(unittest.TestCase):
         self.assertEqual([v.record_id for v in views], ["2"])
 
 
+class TestCanonScoring(unittest.TestCase):
+    """R4-2d: 大字・漢数字→算用のカノニカライズ比較（③④のみ・保存値不変）"""
+
+    def test_daiji_birth_matches_arabic_kaneji_case(self):
+        """No.25-14 型: 大字出生 ⇔ 算用出生が③一致（①+③で候補化）"""
+        s = score_of([person_record(25, "鈴木金次",
+                                    birth="昭和拾參年參月弐拾弐日",
+                                    koseki=("3",)),
+                      person_record(14, "鈴木 金次", birth="昭和13年3月22日",
+                                    koseki=("4",))])
+        self.assertIn(person_merge.SIGNAL_NAME, s["signals"])
+        self.assertIn(person_merge.SIGNAL_BIRTH, s["signals"], "大字⇔算用の③一致")
+        self.assertTrue(s["qualified"])
+
+    def test_nameonly_daiji_chiyoko_case(self):
+        """No.26-13 型: 名のみ+大字出生 ⇔ 氏名フル+算用（②+③で候補化）"""
+        koseki = DEFAULT_KOSEKI + [koseki_record(7, "鈴木",
+                                                 honseki="東京都足立区鹿浜三丁目")]
+        s = score_of([person_record(26, "チヨ子", birth="昭和拾參年四月參日",
+                                    koseki=("7",)),
+                      person_record(13, "鈴木チヨ子", birth="昭和13年4月3日",
+                                    koseki=("4",))],
+                     koseki=koseki)
+        self.assertIn(person_merge.SIGNAL_NAME_COMPLETED, s["signals"])
+        self.assertIn(person_merge.SIGNAL_BIRTH, s["signals"])
+        self.assertTrue(s["qualified"])
+
+    def test_daiji_marriage_date_compatible(self):
+        """④の互換日付が大字表記に対応（同一相手方+大字⇔算用日付）"""
+        s = score_of([person_record(12, "鈴木縫次郎", koseki=("3",),
+                                    marriages=[("内田チョ子",
+                                                "昭和参拾五年拾壱月弐拾弐日")]),
+                      person_record(14, "鈴木金次", koseki=("4",),
+                                    marriages=[("内田チョ子",
+                                                "昭和35年11月22日")])])
+        self.assertIn(person_merge.SIGNAL_MARRIAGE, s["signals"])
+        self.assertTrue(s["qualified"])
+
+    def test_nuijiro_real_data_not_caught_report(self):
+        """No.12-14 型（実データ）: ③は大字⇔算用で一致するが、①②不成立・
+        ④は相手方の小書き仮名差（内田チヨ子/内田チョ子）で不成立 →
+        単独③のため候補化されない（手動統合裁定へ・完了報告事項）"""
+        s = score_of([person_record(12, "鈴木縫次郎",
+                                    birth="昭和拾參年參月弐拾弐日",
+                                    koseki=("3",),
+                                    marriages=[("内田チヨ子",
+                                                "昭和参拾五年拾壱月弐拾弐日")]),
+                      person_record(14, "鈴木金次", birth="昭和13年3月22日",
+                                    koseki=("4",),
+                                    marriages=[("内田チョ子",
+                                                "昭和35年11月22日")])])
+        self.assertIn(person_merge.SIGNAL_BIRTH, s["signals"], "③自体は一致する")
+        self.assertNotIn(person_merge.SIGNAL_MARRIAGE, s["signals"],
+                         "④は相手方のョ/ヨ差で不成立")
+        self.assertFalse(s["qualified"], "単独③は候補にしない（凍結裁定のまま）")
+
+    def test_small_kana_names_still_distinct(self):
+        """①は現行挙動のまま: 小書き仮名（ョ/ヨ）を同一視しない（氏名の
+        丸め込みはしない・R5-1 判断4と同じ原則）"""
+        s = score_of([person_record(13, "鈴木チヨ子", birth="昭和拾參年四月參日",
+                                    koseki=("3",)),
+                      person_record(30, "鈴木チョ子", birth="昭和13年4月3日",
+                                    koseki=("4",))])
+        self.assertNotIn(person_merge.SIGNAL_NAME, s["signals"])
+        self.assertIn(person_merge.SIGNAL_BIRTH, s["signals"])
+        self.assertFalse(s["qualified"])
+
+    def test_saved_values_keep_original_notation(self):
+        """保存値不変: 封筒の生年月日実値は大字の原文正規化のまま
+        （カノニカライズは比較時のみ・App 34 も不変=update payload固定は既存）"""
+        kt = _KT([person_record(25, "鈴木金次", birth="昭和拾參年參月弐拾弐日",
+                                koseki=("3",)),
+                  person_record(14, "鈴木 金次", birth="昭和13年3月22日",
+                                koseki=("4",))])
+        arm(self, kt)
+        run(detect_merge_candidates())
+        detail = kt.envelope()["person_merge"]
+        self.assertEqual(detail["根拠"]["生年月日実値"]["25"],
+                         "昭和拾參年參月弐拾弐日", "大字の原文を保持")
+        self.assertEqual(detail["根拠"]["生年月日実値"]["14"], "昭和13年3月22日")
+
+    def test_date_compatible_daiji_rules(self):
+        from person_merge import _date_compatible
+        self.assertTrue(_date_compatible("昭和参拾五年拾壱月弐拾弐日",
+                                         "昭和35年11月22日"))
+        self.assertFalse(_date_compatible("平成11年1月", "平成11年11月"),
+                         "既存の安全側規則は維持")
+        self.assertFalse(_date_compatible("昭和拾參年參月弐拾弐日",
+                                          "昭和16年12月4日"))
+
+
 class TestChainReduction(unittest.TestCase):
     """3名以上の連鎖の縮約（勝者=最小番号への集約）"""
 
