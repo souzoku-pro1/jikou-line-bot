@@ -170,6 +170,32 @@ register(TaskSpec(
 ))
 
 
+# ── 名寄せ候補の確定（R4-2b T2。フローは dispatch_bot/person_merge_task.py に隔離）──
+from dispatch_bot import person_merge_task  # noqa: E402（循環回避のため末尾 import）
+
+register(TaskSpec(
+    task_type="person_merge",
+    display_name="名寄せ候補の確定",
+    answer_only=False,
+    destination="merge_queue",  # App 30 person_merge 封筒のクローズ＋App 34 統合
+    run_at="railway",
+    risk="中",  # 敗者レコードの物理削除を伴う（監査JSON＋二段確認で防御）
+    auto_scope="App 34 の統合（勝者マージ・敗者削除・監査JSON添付）と App 30 クローズまで",
+    approval_scope="なし（対外効果ゼロ。統合の確定判断そのものが LINE の OK）",
+    required_fields=[],  # 顧客名不要（操作は一覧の番号指定・案件をまたぐ）
+    search_apps=[],
+    artifacts="App 30 封筒クローズ＋監査JSON添付・App 34 勝者レコード更新",
+    adapter="PersonMerge",
+    on_failure="実行失敗はLINEにエラー返信（候補ごとに独立・部分成功を報告）",
+    hint_for_parser=("App 34 人物の名寄せ候補（同一人物の重複レコード）の一覧提示と"
+                     "統合・棄却。「名寄せ候補を見せて」「人物を統合して」等。"
+                     "追加パラメータは不要（操作は一覧提示後の番号指定で行う）"),
+    flow_fn=person_merge_task.flow,
+    flow_reply_fn=person_merge_task.flow_reply,
+    execute_fn=person_merge_task.execute,
+))
+
+
 # ── 要確認の確定（S5-2.5 T2。フローは dispatch_bot/review_resolve_task.py に隔離）──
 from dispatch_bot import review_resolve_task  # noqa: E402（循環回避のため末尾 import）
 
