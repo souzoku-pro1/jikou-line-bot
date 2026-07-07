@@ -26,6 +26,7 @@ token 認証: ?token=（env SORTATION_INGEST_TOKEN）。不一致・env 未設�
 404 の「存在しないフリ」（koseki_ingest と同じ流儀・探信に file 必須 422 を返さない）
 """
 
+import hashlib
 import json
 import os
 from datetime import datetime, timedelta, timezone
@@ -118,6 +119,63 @@ _FORWARD_LINES = {"戸籍": "koseki", "登記事項証明": "registry",
 def _forward_enabled() -> bool:
     """既定無効（実機有効化は明示指示後・SORTATION_FORWARD_ENABLED=1）"""
     return os.environ.get("SORTATION_FORWARD_ENABLED") == "1"
+
+
+def _split_enabled() -> bool:
+    """書類分割層（D1-2）の有効化フラグ（既定無効）"""
+    return os.environ.get("SORTATION_SPLIT_ENABLED") == "1"
+
+
+async def _try_split_analysis(pdf_bytes: bytes, vision_key: str,
+                              file_name: str) -> tuple[str | None, dict | None]:
+    """D1-2: ページ別 OCR → 区間判定。失敗・分割不能は (結合テキスト or None, None)
+    を返して従来経路へ縮退（安全側）。成功時は (結合テキスト, 分割結果)"""
+    try:
+        from main import _ocr_pdf_pages  # 実行時 import（循環回避）
+        page_texts = _ocr_pdf_pages(pdf_bytes, vision_key)
+    except Exception as e:
+        print(f"[SORTATION] ページ別OCRに失敗（従来経路へ） file={file_name}: {e}")
+        return None, None
+    ocr_text = "\n\n".join(page_texts)
+    try:
+        from document_splitter import analyze_segments  # 実行時 import（循環回避）
+        result = await analyze_segments(page_texts)
+    except Exception as e:
+        print(f"[SORTATION] 区間判定に失敗（従来経路へ） file={file_name}: {e}")
+        return ocr_text, None
+    if result.get("status") != "ok":
+        # 分割不能の明示シグナル: 分割せず全体を従来経路へ（ask に落ちるかは
+        # 従来判定に委ねる・裁定どおり）
+        print(f"[SORTATION] 分割不能（従来経路へ） file={file_name}: "
+              f"{result.get('reason')}")
+        return ocr_text, None
+    if not result.get("needs_split"):
+        return ocr_text, None  # 単一区間 = 高速パス（従来経路そのまま）
+    return ocr_text, result
+
+
+async def _forward_fragments(segments: list[dict], pdf_bytes: bytes,
+                             file_name: str, parent_fid: str,
+                             customer: Candidate) -> list[dict]:
+    """D1-2: 複数区間の各断片を種別ゲートに通して個別回送。
+    断片1つの失敗（split/forward）は他の断片・auto 成功を壊さない縮退"""
+    try:
+        from document_splitter import split_pdf  # 実行時 import（循環回避）
+        fragments = split_pdf(pdf_bytes, segments)
+    except Exception as e:
+        print(f"[SORTATION] 断片化に失敗（回送なし・仕分け結果は不変）"
+              f" file={file_name}: {e}")
+        return [{"status": "error", "error": f"断片化失敗: {str(e)[:150]}"}]
+    forwarded: list[dict] = []
+    for seg, fragment in zip(segments, fragments):
+        pages = f"p{seg['start_page']}-{seg['end_page']}"
+        result = await _forward_to_line(
+            seg["doc_type"], float(seg.get("confidence") or 0.0),
+            fragment, f"{file_name}#{pages}", f"{parent_fid}#{pages}", customer)
+        if result is not None:  # ゲート不通過（対象外種別等）の断片は載せない
+            forwarded.append({**result, "pages": pages,
+                              "doc_type": seg["doc_type"]})
+    return forwarded
 
 
 def _forward_threshold() -> float:
@@ -332,13 +390,23 @@ async def sortation_ingest(token: str = "",
             print(f"[SORTATION] duplicate drive_file_id={fid}（再判定して同一契約で応答）")
         _seen_drive_file_ids.add(fid)
 
+    # D1-2: 分割層（フラグ配下）。ページ別 OCR→区間判定。単一区間・分割不能・
+    # 失敗は split_result=None（従来経路そのまま＝高速パス/安全側）
+    split_result: dict | None = None
+    pre_text: str | None = None
+    if _split_enabled():
+        pre_text, split_result = await _try_split_analysis(
+            pdf_bytes, vision_key, file_name)
+
     # OCR → 候補注入 → Claude 判定。失敗はすべて ask の安全側縮退（doc_type=不明）
+    # （複数区間でも顧客判定は親PDF全体で1回・裁定）
     judged: dict | None = None
     candidates: list[Candidate] = []
     ocr_text = ""
     failure = ""
     try:
-        ocr_text = _ocr_pdf(pdf_bytes, vision_key)
+        ocr_text = pre_text if pre_text is not None else \
+            _ocr_pdf(pdf_bytes, vision_key)
         candidates = await list_candidates()
         judged = await _judge_with_claude(ocr_text, candidates)
     except Exception as e:
@@ -370,6 +438,13 @@ async def sortation_ingest(token: str = "",
             reason = f"候補リスト外の record_id={suggested_id} が返されたため棄却。" + reason
             confidence = 0.0
 
+    # D1-2: 複数区間のとき応答の doc_type は主種別（最大ページ数の区間・同数は先頭）
+    segments = (split_result or {}).get("segments")
+    if segments:
+        main_seg = max(segments, key=lambda s: (s["end_page"] - s["start_page"],
+                                                -s["start_page"]))
+        doc_type = main_seg["doc_type"]
+
     action = "auto" if customer is not None and confidence >= _threshold() else "ask"
     print(f"[SORTATION] judged file={file_name} action={action} doc_type={doc_type} "
           f"customer={customer.record_id if customer else None} conf={confidence}")
@@ -381,20 +456,30 @@ async def sortation_ingest(token: str = "",
         await _notify_ask(file_name, url, doc_type, confidence, reason, top,
                           log_url)
 
+    # D1-2: 混在時の suggested_filename は「氏名_主種別ほかN件_日付」
+    filename_doc = f"{doc_type}ほか{len(segments) - 1}件" if segments else doc_type
     response = {
         "action": action,
         "doc_type": doc_type,
         "confidence": confidence,
         "customer": _customer_payload(customer) if customer else None,
         "suggested_filename":
-            f"{customer.customer_name}_{doc_type}_{_today_jst()}.pdf"
+            f"{customer.customer_name}_{filename_doc}_{_today_jst()}.pdf"
             if customer else None,
     }
-    # S5-3 T1: auto（顧客確定）のみ読解ラインへ回送（既存キーは不変・追加キーのみ
-    # ＝GAS 無変更。フラグ既定無効・ゲート不通過時は forwarded キー自体を付けない）
+    # S5-3 T1/D1-2: auto（顧客確定）のみ読解ラインへ回送（既存キーは不変・追加キー
+    # のみ＝GAS 無変更。フラグ既定無効・ゲート不通過時は forwarded キー自体なし）
     if action == "auto" and _forward_enabled():
-        forwarded = await _forward_to_line(doc_type, doc_type_conf, pdf_bytes,
-                                           file_name, fid, customer)
-        if forwarded is not None:
-            response["forwarded"] = forwarded
+        if segments:
+            # 複数区間: 各断片を種別ゲートに通して個別回送（冪等=親fid#pN-M）
+            parent_fid = fid or f"sha256:{hashlib.sha256(pdf_bytes).hexdigest()}"
+            forwarded_list = await _forward_fragments(
+                segments, pdf_bytes, file_name, parent_fid, customer)
+            if forwarded_list:
+                response["forwarded"] = forwarded_list
+        else:
+            forwarded = await _forward_to_line(doc_type, doc_type_conf, pdf_bytes,
+                                               file_name, fid, customer)
+            if forwarded is not None:
+                response["forwarded"] = forwarded
     return response
