@@ -118,9 +118,12 @@ def render_kinship(graph: KinshipGraph, fmt: str = "svg",
     - 生成前提の未充足は KinshipValidationRejected（problems=Z1 の列挙）で
       **描画しない**（dot も実行しない）
     - dot バイナリ不在は GraphvizUnavailable（縮退・他機能に影響させない）
-    - heir_scope=True（R4-3・D-5 裁定）: 検証要求を「相続人確定に必要な人物」
-      （heir_derivation.required_persons）に絞る。被相続人が特定できない場合は
-      従来どおり全ノード検証に縮退。既定 False=従来挙動（後方互換）
+    - heir_scope=True（R4-3・D-5 裁定＋Z2 改修=D-5 の完成形）: 検証要求と
+      **描画対象ノードの両方**を「相続人確定に必要な人物」
+      （heir_derivation.required_persons）に絞る。エッジは両端が範囲内の
+      もののみ・夫婦の不可視点ノードは双方が範囲内の場合のみ生成される。
+      被相続人が特定できない場合は従来どおり全ノード検証・全ノード描画に縮退。
+      既定 False=従来挙動（後方互換）
     """
     required_ids = None
     if heir_scope:
@@ -131,6 +134,9 @@ def render_kinship(graph: KinshipGraph, fmt: str = "svg",
     problems = validate_for_rendering(graph, required_ids)
     if problems:
         raise KinshipValidationRejected(problems)
+    if required_ids is not None:
+        from kinship_graph import subgraph
+        graph = subgraph(graph, required_ids)  # 描画も必要人物に絞る（Z2改修）
     if fmt not in ("svg", "pdf"):
         raise KinshipRenderError(f"未対応の出力形式: {fmt}")
     dot_bin = shutil.which("dot")
