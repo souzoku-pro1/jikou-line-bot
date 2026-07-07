@@ -342,6 +342,13 @@ async def process_record(record_id: str) -> dict:
 
     reading = await _read_with_claude(ocr_text)
 
+    # R5-1: 低確信度読解へのセカンドオピニオン（視覚再読解・突合）。
+    # SECOND_OPINION_ENABLED 既定無効=完全不発。発動時も一次読解の値は不変で、
+    # 一致フィールドの確信度引き上げと「セカンドオピニオン」ブロックの追記のみ。
+    # 失敗は縮退（一次読解のまま）——読解の成立を壊さない
+    from koseki_second_opinion import maybe_second_opinion  # 遅延 import（循環回避）
+    reading = await maybe_second_opinion(record, reading)
+
     errors = validate_reading(reading)
     form_conf = float(reading.get("様式confidence")) \
         if _is_conf(reading.get("様式confidence")) else 0.0
