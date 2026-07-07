@@ -179,14 +179,22 @@ def build_graph(records: list[dict]) -> KinshipGraph:
     return graph
 
 
-def validate_for_rendering(graph: KinshipGraph) -> list[str]:
+def validate_for_rendering(graph: KinshipGraph,
+                           required_ids: set[str] | None = None) -> list[str]:
     """生成前提の検証（05 §1「確認済データのみから描画」の機械化）。
 
     Returns: 未充足の列挙（**どの人物のどの項目か**を含む・人が次に確認すべき
     ことが分かる形）。空リスト = 生成可。レンダラ（Z2/Z3）は非空なら生成拒否する。
+
+    required_ids（R4-3・D-5 裁定）: 相続順位エンジンの
+    heir_derivation.required_persons が返す「相続人確定に必要な人物ID」に
+    検証対象を絞る。None は従来どおり全ノード要求（後方互換・既定）。
+    被相続人の存在・死亡日の検証は絞り込みに関わらず全体で行う
     """
     problems: list[str] = []
-    for n in graph.nodes:
+    targets = graph.nodes if required_ids is None else [
+        n for n in graph.nodes if n.record_id in required_ids]
+    for n in targets:
         who = f"No.{n.record_id} {n.name}"
         if n.meyose != "確定":
             problems.append(f"{who}: 名寄せ確定が「{n.meyose or '空'}」"
