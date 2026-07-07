@@ -314,9 +314,12 @@ class TestIngestWiring(unittest.TestCase):
             patch("hub.kintone.upload_file", new=upload_file),
             patch("hub.kintone.create_record", new=create_record),
             patch("koseki_reader.process_record", new=reader_mock),
+            # APP_SHIPPING は空に固定 = R4-0 の要確認起票をスキップ（本テストの
+            # 検証対象は読解結線のみ。他テストモジュールの process env 漏れも遮断）
             patch.dict("os.environ", {"KOSEKI_INGEST_TOKEN": "koseki_token",
                                       "APP_KOSEKI_BOOK": "33",
-                                      "TOKEN_KOSEKI_BOOK": "t"}),
+                                      "TOKEN_KOSEKI_BOOK": "t",
+                                      "APP_SHIPPING": "", "TOKEN_SHIPPING": ""}),
         ]
         for p in patchers:
             p.start()

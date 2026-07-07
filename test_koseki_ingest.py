@@ -7,6 +7,7 @@ kintone / Vision / ページ画像化は全てモック。
 """
 
 import hashlib
+import json
 import os
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -49,9 +50,13 @@ URL = "/koseki/ingest"
 PDF = b"%PDF-1.4 dummy koseki"
 PDF_SHA = f"sha256:{hashlib.sha256(PDF).hexdigest()}"
 
-# 有効化に必要な環境（token・App 33 env）
+# 有効化に必要な環境（token・App 33 env）。
+# APP_SHIPPING は既定で空= R4-0 の要確認起票をスキップ（従来テストの挙動を固定。
+# 他テストモジュールが process env に APP_SHIPPING を注入する漏れも遮断）。
+# 起票の検証は TestCaseLinkReview 側で明示的に設定する
 _ENV = {"KOSEKI_INGEST_TOKEN": "koseki_token",
-        "APP_KOSEKI_BOOK": "33", "TOKEN_KOSEKI_BOOK": "t"}
+        "APP_KOSEKI_BOOK": "33", "TOKEN_KOSEKI_BOOK": "t",
+        "APP_SHIPPING": "", "TOKEN_SHIPPING": ""}
 
 
 class _Kintone:
@@ -60,6 +65,7 @@ class _Kintone:
     def __init__(self, existing=()):
         self.existing = list(existing)
         self.created = []
+        self.reviews = []           # App 30 要確認起票（R4-0）
         self.uploaded = []          # (filename, mime)
         self.search_queries = []
 
@@ -73,6 +79,11 @@ class _Kintone:
         return f"fk-{len(self.uploaded)}"
 
     async def create_record(self, app, fields):
+        if app.app_id_env == "APP_SHIPPING":  # R4-0 の要確認起票
+            if getattr(self, "fail_shipping", False):
+                raise RuntimeError("App 30 down")
+            self.reviews.append(fields)
+            return "30-1"
         assert app.app_id_env == "APP_KOSEKI_BOOK"
         self.created.append(fields)
         return "88"
@@ -218,6 +229,50 @@ class TestIdempotency(_Base):
         self.assertEqual(kt.created, [], "再登録しない")
         self.ocr.assert_not_called()
         self.assertEqual(kt.uploaded, [], "アップロードもしない")
+
+
+class TestCaseLinkReview(_Base):
+    """R4-0: 案件参照が埋まらなかった戸籍の App 30 要確認起票（S5 と同じ封筒形式）"""
+
+    _LINK_ENV = {**_ENV, "APP_SHIPPING": "30", "TOKEN_SHIPPING": "t30"}
+
+    def test_no_case_hint_files_review_with_envelope(self):
+        kt = _Kintone()
+        resp = self.post(kt, self._LINK_ENV, data={"drive_file_id": "drv-1"})
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["review_record_id"], "30-1")
+        review, = kt.reviews
+        self.assertEqual(review["発送ステータス"], "要確認")
+        self.assertEqual(review["方向"], "受領")
+        self.assertEqual(review["チャネル"], "スキャン受領")
+        self.assertEqual(review["実行済み"], "no")
+        self.assertIn("案件紐付け不能", review["件名"])
+        channel = json.loads(review["チャネル固有データ"])
+        self.assertEqual(list(channel), ["koseki_ingest"], "トップキー=koseki_ingest")
+        self.assertEqual(channel["koseki_ingest"]["戸籍レコードID"], "88")
+        self.assertEqual(channel["koseki_ingest"]["冪等キー"], "drv-1")
+        self.assertIn("成果物", review, "原本PDFを添付")
+
+    def test_case_hint_given_does_not_file_review(self):
+        kt = _Kintone()
+        resp = self.post(kt, self._LINK_ENV, data={"case_hint": "100"})
+        self.assertEqual(kt.reviews, [])
+        self.assertNotIn("review_record_id", resp.json())
+
+    def test_shipping_env_unset_skips_filing(self):
+        kt = _Kintone()
+        resp = self.post(kt, _ENV)  # APP_SHIPPING 空
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(kt.reviews, [])
+        self.assertNotIn("review_record_id", resp.json())
+
+    def test_filing_failure_does_not_break_ingest(self):
+        kt = _Kintone()
+        kt.fail_shipping = True
+        resp = self.post(kt, self._LINK_ENV)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["kintone_record_id"], "88")
+        self.assertNotIn("review_record_id", resp.json())
 
 
 class TestExistingScanRegression(unittest.TestCase):

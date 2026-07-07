@@ -215,6 +215,24 @@ class TestExecute(_Base):
         self.assertIn("対応する確定処理がありません", reply)
 
 
+class TestExecuteKosekiItems(_Base):
+    """R4-0: koseki_ingest グループの確定結果表示（戸籍への紐付け行・App 33 リンク）"""
+
+    async def test_koseki_items_rendered_with_link(self):
+        self.arm(groups=[group()], cands=[cand(12, "熊澤正広")],
+                 resolve={"status": "resolved", "case_record_id": "12",
+                          "items": [{"review_record_id": "9",
+                                     "koseki_record_id": "1"}]},
+                 env={**_ENV, "APP_KOSEKI_BOOK": "33",
+                      "TOKEN_KOSEKI_BOOK": "t33"})
+        await handler.handle_message("U1", "熊澤さんの要確認を確定して")
+        with patch.object(parser, "parse_instruction",
+                          new=AsyncMock(return_value=dict(PARSE_CONFIRM))):
+            reply = await handler.handle_message("U1", "OK")
+        self.assertIn("・要確認 No.9 → 戸籍 No.1 に案件を紐付け", reply)
+        self.assertIn("/k/33/show#record=1", reply)
+
+
 class TestExistingTasksUnaffected(_Base):
     async def test_soufu_annai_pipeline_untouched(self):
         parse = {"intent": "task", "task_type": "soufu_annai", "customer_name": None,

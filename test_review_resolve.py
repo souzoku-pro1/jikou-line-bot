@@ -34,6 +34,7 @@ if os.environ.get("ANTHROPIC_API_KEY") == "dummy_key_for_import_only":
 _ENV = {"APP_SHIPPING": "30", "TOKEN_SHIPPING": "t30",
         "APP_ZAISAN": "35", "TOKEN_ZAISAN": "t35",
         "KINTONE_FUDOSAN_APP_ID": "25", "KINTONE_FUDOSAN_API_TOKEN": "t25",
+        "APP_KOSEKI_BOOK": "33", "TOKEN_KOSEKI_BOOK": "t33",
         "SOUZOKU_KINTONE_APP_ID": "26"}
 
 
@@ -70,10 +71,11 @@ def land_prop():
 class _KT:
     """hub.kintone モック（env 名＋クエリで振り分け）"""
 
-    def __init__(self, *, shipping=None, fudosan=None, zaisan_existing=(),
-                 pending=()):
+    def __init__(self, *, shipping=None, fudosan=None, koseki=None,
+                 zaisan_existing=(), pending=()):
         self.shipping = shipping or {}   # id -> {発送ステータス, 実行済み}
         self.fudosan = fudosan or {}     # id -> record(wrapped)
+        self.koseki = koseki or {}       # id -> record(wrapped)（App 33・R4-0）
         self.zaisan_existing = list(zaisan_existing)
         self.pending = list(pending)
         self.created, self.updated, self.uploaded, self.downloaded = [], [], [], []
@@ -88,6 +90,8 @@ class _KT:
     async def get_record(self, app, record_id):
         if app.app_id_env == "APP_SHIPPING":
             return wrap(self.shipping[str(record_id)])
+        if app.app_id_env == "APP_KOSEKI_BOOK":
+            return self.koseki[str(record_id)]
         return self.fudosan[str(record_id)]
 
     async def create_record(self, app, fields):
@@ -341,6 +345,81 @@ class TestResolveGroup(unittest.TestCase):
         self.assertEqual(set(fields), {"特定情報", "名義", "原本"},
                          "評価額・評価確定・データ源・有効は不触")
         self.assertEqual(fields["原本"][0], {"fileKey": "old-key"})
+
+
+class TestResolveKoseki(unittest.TestCase):
+    """R4-0: koseki_ingest ハンドラ（戸籍の案件紐付け＋クローズ・App 34 不触）"""
+
+    def group(self, detail=None):
+        return ReviewGroup(
+            source="koseki_ingest", idempotency_key="drv-1",
+            items=[ReviewItem(record_id="9",
+                              subject="戸籍読解の案件紐付け: 案件紐付け不能",
+                              detail=detail if detail is not None else
+                              {"戸籍レコードID": "1", "冪等キー": "drv-1"})])
+
+    def kt(self, *, status="要確認", executed="no", current_case=""):
+        return _KT(shipping={"9": {"発送ステータス": status, "実行済み": executed}},
+                   koseki={"1": wrap({"案件レコードID": current_case})})
+
+    def test_happy_path_links_case_and_closes(self):
+        kt = self.kt()
+        arm(self, kt)
+        result = run(resolve_group(self.group(), "100"))
+        self.assertEqual(result["status"], "resolved")
+        self.assertEqual(result["items"],
+                         [{"review_record_id": "9", "koseki_record_id": "1"}])
+        koseki_updates = kt.by_env(kt.updated, "APP_KOSEKI_BOOK")
+        self.assertEqual(koseki_updates,
+                         [("APP_KOSEKI_BOOK", "1",
+                           {"案件アプリID": "26", "案件レコードID": "100"})])
+        closes = kt.by_env(kt.updated, "APP_SHIPPING")
+        self.assertEqual(closes, [("APP_SHIPPING", "9",
+                                   {"発送ステータス": "完了", "実行済み": "yes"})])
+        self.assertEqual(kt.created, [], "App 34 を含め新規レコードは作らない")
+
+    def test_already_linked_to_other_case_aborts(self):
+        kt = self.kt(current_case="55")
+        arm(self, kt)
+        result = run(resolve_group(self.group(), "100"))
+        self.assertEqual(result["status"], "aborted")
+        self.assertIn("既に案件 No.55 に紐付いています", result["reason"])
+        self.assertEqual(kt.updated, [])
+
+    def test_already_linked_to_same_case_resolves(self):
+        kt = self.kt(current_case="100")
+        arm(self, kt)
+        result = run(resolve_group(self.group(), "100"))
+        self.assertEqual(result["status"], "resolved")
+
+    def test_guard_status_changed_aborts(self):
+        kt = self.kt(status="完了", executed="yes")
+        arm(self, kt)
+        result = run(resolve_group(self.group(), "100"))
+        self.assertEqual(result["status"], "aborted")
+        self.assertEqual(kt.updated, [])
+
+    def test_missing_koseki_id_aborts(self):
+        kt = self.kt()
+        arm(self, kt)
+        result = run(resolve_group(self.group(detail={}), "100"))
+        self.assertEqual(result["status"], "aborted")
+        self.assertIn("戸籍レコードID", result["reason"])
+
+    def test_koseki_book_env_unset_is_unavailable(self):
+        kt = self.kt()
+        arm(self, kt, env={**_ENV, "APP_KOSEKI_BOOK": ""})
+        result = run(resolve_group(self.group(), "100"))
+        self.assertEqual(result["status"], "unavailable")
+        self.assertIn("APP_KOSEKI_BOOK", result["reason"])
+
+    def test_zaisan_env_not_required_for_koseki(self):
+        """必要 env はハンドラ別（koseki は App 25/35 不要・レジストリ分離の検証）"""
+        kt = self.kt()
+        arm(self, kt, env={**_ENV, "APP_ZAISAN": "",
+                           "KINTONE_FUDOSAN_APP_ID": ""})
+        result = run(resolve_group(self.group(), "100"))
+        self.assertEqual(result["status"], "resolved")
 
 
 if __name__ == "__main__":
