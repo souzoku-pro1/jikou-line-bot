@@ -12,7 +12,7 @@
 | 技術 | 長所 | 短所 |
 |---|---|---|
 | Mermaid | 記法が簡単・Markdown 親和 | 家系図レイアウト（夫婦横並び＋子への垂線）の制御が弱い・サーバーレンダリングに Node/ヘッドレスブラウザが必要（Railway に重い） |
-| **Graphviz（推奨）** | 自動レイアウト成熟・世代=rank の表現が家系図に合う・夫婦連結は不可視ノードの定石あり・SVG/PDF 出力・Python バインディング | Railway コンテナに graphviz バイナリの追加が必要（nixpacks 設定・R7 で対応） |
+| **Graphviz（推奨）** | 自動レイアウト成熟・世代=rank の表現が家系図に合う・夫婦連結は不可視ノードの定石あり・SVG/PDF 出力・Python バインディング | Railway コンテナに graphviz バイナリの追加が必要（**Railpack の `railpack.json` → `deploy.aptPackages` で導入**。2026-07-07 実機確認: 本サービスのビルダーは Railpack v0.30 で nixpacks.toml は読まれない。日本語フォントは `fonts-ipaexfont` を同時導入し dot の fontname=IPAexGothic を解決） |
 | SVG 直接生成 | 完全制御・依存ゼロ | 任意の複雑さ（再婚・養子・代襲の交差）でレイアウト計算の開発コストが跳ね上がる |
 | reportlab 座標描画 | 既存基盤 | 同上（自動レイアウトがない） |
 
