@@ -111,7 +111,8 @@ def _threshold() -> float:
 # ask は回送しない（確定時回送は T3）・相談カードは対象外・OCR 2回は第1版許容。
 # 下流の品質ゲート（戸籍=要再読解・登記=validate/確信度→要確認）が第2の網
 
-_FORWARD_LINES = {"戸籍": "koseki", "登記事項証明": "registry"}
+_FORWARD_LINES = {"戸籍": "koseki", "登記事項証明": "registry",
+                  "評価証明・課税明細": "valuation"}  # S4-M3（2026-07-07 裁定）
 
 
 def _forward_enabled() -> bool:
@@ -139,6 +140,13 @@ async def _forward_to_line(doc_type: str, doc_type_conf: float,
                 case_hint=customer.record_id,
                 case_app_hint=os.environ.get("SOUZOKU_KINTONE_APP_ID", ""),
                 drive_file_id=fid)  # 冪等キー貫通（専用フォルダ経由との二重防止）
+        elif line == "valuation":  # S4-M3: case_hint/drive_file_id 貫通は T1 と同じ型
+            from valuation_ingest import ingest_valuation_pdf
+            result = await ingest_valuation_pdf(
+                pdf_bytes, file_name,
+                case_hint=customer.record_id,
+                case_app_hint=os.environ.get("SOUZOKU_KINTONE_APP_ID", ""),
+                drive_file_id=fid)
         else:
             from registry_ingest import ingest_registry_pdf
             result = await ingest_registry_pdf(
