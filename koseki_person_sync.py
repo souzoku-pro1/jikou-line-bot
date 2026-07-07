@@ -159,11 +159,20 @@ def _person_fields(person: dict, reading: dict, koseki_record: dict,
     return {k: v for k, v in fields.items() if v not in ("", [], None)}
 
 
+def _escape(value: str) -> str:
+    return (value or "").replace('"', '\\"')
+
+
 async def _find_existing(koseki_id: str, name: str) -> str:
-    """冪等キー = (戸籍レコードID, 氏名)。登場戸籍サブテーブル内の一致で判定"""
+    """冪等キー = (戸籍レコードID, 氏名)。登場戸籍サブテーブル内の一致で判定。
+
+    ⚠ 戸籍レコードID は SUBTABLE（登場戸籍）内のフィールドのため、kintone クエリ
+    仕様上 `=` 演算子が使えない（GAIA_IQ07・2026-07-07 実機で発生）——**`in` を使う**。
+    トップレベルの 氏名 は従来どおり `=`。
+    """
     records = await kintone.search_records(
         APP_KOSEKI_PERSON,
-        f'戸籍レコードID = "{koseki_id}" and 氏名 = "{name}"',
+        f'戸籍レコードID in ("{_escape(koseki_id)}") and 氏名 = "{_escape(name)}"',
         fields=["$id"])
     return _v(records[0], "$id") if records else ""
 
@@ -234,4 +243,43 @@ async def sync_persons_from_koseki(koseki_record_id: str) -> dict:
 
     print(f"[KOSEKI_PERSON_SYNC] koseki={koseki_record_id} "
           f"created={len(results['created'])} skipped={len(results['skipped'])}")
+    return results
+
+
+async def sync_missing_persons(limit: int = 20) -> list[dict]:
+    """案件紐付け済みだが人物未生成の戸籍を拾って人物化する（回収用・恒久部品）。
+
+    R3 の process_unread_records と同型: 対象を検索し、1件の失敗は他を止めない。
+    起動は**コード内からの手動呼び出し専用**（自動結線しない。R4-0 経路の失敗時や
+    フラグ無効期間の回収に使う。本番実行は別途の明示指示を待つ）。
+    KOSEKI_PERSON_SYNC_ENABLED フラグには依存しない（手動呼び出し自体が明示承認）。
+    """
+    if not (APP_KOSEKI_PERSON.app_id() and APP_KOSEKI_PERSON.token()):
+        print("[KOSEKI_PERSON_SYNC] 回収スキップ（APP_KOSEKI_PERSON 未設定）")
+        return []
+    records = await kintone.search_records(
+        APP_KOSEKI_BOOK,
+        '読解状態 in ("確認済", "AI読解済") and 案件レコードID != ""'
+        f' order by レコード番号 asc limit {int(limit)}',
+        fields=["$id"])
+    results = []
+    for record in records:
+        koseki_id = str((record.get("$id") or {}).get("value") or "")
+        try:
+            existing = await kintone.search_records(
+                APP_KOSEKI_PERSON,
+                # サブテーブル内フィールドは = 不可・in を使う（GAIA_IQ07）
+                f'戸籍レコードID in ("{_escape(koseki_id)}")',
+                fields=["$id"])
+            if existing:
+                results.append({"status": "skipped",
+                                "koseki_record_id": koseki_id,
+                                "reason": "人物生成済み"})
+                continue
+            results.append(await sync_persons_from_koseki(koseki_id))
+        except Exception as e:
+            print(f"[KOSEKI_PERSON_SYNC] 回収失敗（他の戸籍は継続）"
+                  f" koseki={koseki_id}: {e}")
+            results.append({"status": "error", "koseki_record_id": koseki_id,
+                            "detail": str(e)[:200]})
     return results

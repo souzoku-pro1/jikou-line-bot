@@ -241,6 +241,84 @@ class TestVariants(unittest.TestCase):
         self.assertEqual(kt.created, [])
 
 
+class TestIdempotencyQueryFormat(unittest.TestCase):
+    """冪等クエリの実機仕様固定: サブテーブル内フィールド（戸籍レコードID）は
+    `=` 不可（GAIA_IQ07・2026-07-07 実機）——`in` を使う。氏名（トップ）は `=`"""
+
+    def test_find_existing_uses_in_operator_for_subtable_field(self):
+        kt = _KT()
+        arm(self, kt)
+        run(sync_persons_from_koseki("1"))
+        self.assertTrue(kt.searches, "冪等チェックの検索が実行される")
+        for q in kt.searches:
+            self.assertIn('戸籍レコードID in ("1")', q,
+                          "サブテーブル内フィールドは in 演算子")
+            self.assertNotIn("戸籍レコードID =", q, "= は実機で GAIA_IQ07")
+        self.assertIn('氏名 = "熊澤 秀和"', kt.searches[0])
+
+
+class TestSyncMissingPersons(unittest.TestCase):
+    """回収関数（案件紐付け済み×人物未生成のみ拾う・失敗は他を止めない）"""
+
+    def _arm(self, *, koseki_ids=("1", "2", "3"), personified=("2",),
+             sync_side_effect=None, env=_ENV):
+        self.book_query = []
+        self.person_query = []
+
+        async def search_records(app, query, fields=None):
+            if app.app_id_env == "APP_KOSEKI_BOOK":
+                self.book_query.append(query)
+                return [{"$id": {"value": i}} for i in koseki_ids]
+            self.person_query.append(query)
+            for i in personified:
+                if f'戸籍レコードID in ("{i}")' in query:
+                    return [{"$id": {"value": "既存"}}]
+            return []
+
+        self.sync = AsyncMock(side_effect=sync_side_effect,
+                              return_value={"status": "synced", "created": [],
+                                            "skipped": []})
+        patchers = [
+            patch("hub.kintone.search_records", new=search_records),
+            patch("koseki_person_sync.sync_persons_from_koseki", new=self.sync),
+            patch.dict(os.environ, env),
+        ]
+        for p in patchers:
+            p.start()
+            self.addCleanup(p.stop)
+
+    def test_picks_only_linked_and_unpersonified(self):
+        self._arm()
+        results = run(koseki_person_sync.sync_missing_persons())
+        # 対象抽出の条件: 読解済み×案件紐付け済み
+        self.assertIn('読解状態 in ("確認済", "AI読解済")', self.book_query[0])
+        self.assertIn('案件レコードID != ""', self.book_query[0])
+        # 人物生成済み（id=2）はスキップ・未生成（1,3）のみ人物化
+        self.assertEqual([c.args[0] for c in self.sync.await_args_list],
+                         ["1", "3"])
+        skipped = [r for r in results if r.get("reason") == "人物生成済み"]
+        self.assertEqual([r["koseki_record_id"] for r in skipped], ["2"])
+        # 人物生成済み判定も in 演算子（GAIA_IQ07 の再発防止）
+        for q in self.person_query:
+            self.assertNotIn("戸籍レコードID =", q)
+
+    def test_one_failure_does_not_stop_others(self):
+        async def side(koseki_id):
+            if koseki_id == "1":
+                raise RuntimeError("boom")
+            return {"status": "synced", "koseki_record_id": koseki_id,
+                    "created": [], "skipped": []}
+        self._arm(personified=(), sync_side_effect=side)
+        results = run(koseki_person_sync.sync_missing_persons())
+        self.assertEqual([r["status"] for r in results],
+                         ["error", "synced", "synced"])
+
+    def test_env_unset_returns_empty(self):
+        self._arm(env={**_ENV, "APP_KOSEKI_PERSON": ""})
+        self.assertEqual(run(koseki_person_sync.sync_missing_persons()), [])
+        self.sync.assert_not_awaited()
+
+
 class TestR40Wiring(unittest.TestCase):
     """R4-0 ハンドラからの起動（env フラグ・既定無効）"""
 
