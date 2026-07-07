@@ -196,6 +196,36 @@ register(TaskSpec(
 ))
 
 
+# ── 人物の確認（R4-2e T2。フローは dispatch_bot/person_confirm_task.py に隔離）──
+from dispatch_bot import person_confirm_task  # noqa: E402（循環回避のため末尾 import）
+
+register(TaskSpec(
+    task_type="person_confirm",
+    display_name="人物の確認",
+    answer_only=False,
+    destination="person_confirm",  # App 34 の確認5フィールド更新（起票なし）
+    run_at="railway",
+    risk="低",  # kintone 内部のみ（削除なし・Drive・LINE顧客側・対外送信なし）
+    auto_scope="App 34 の確認フィールド（名寄せ確定/確認状態/生死区分/死亡日/"
+               "被相続人フラグ）の更新まで",
+    approval_scope="なし（対外効果ゼロ。書き込み自体が LINE の OK による人の確認）",
+    required_fields=["customer_name"],
+    field_questions={"customer_name": person_confirm_task.QUESTION_CUSTOMER},
+    search_apps=["SOUZOKU_KINTONE_APP_ID"],
+    artifacts="App 34 確認フィールド更新（確認済には確認者・確認日時を自動付記）",
+    adapter="PersonConfirm",
+    on_failure="更新失敗はLINEにエラー返信（人物ごと独立・部分成功を報告）",
+    hint_for_parser=("App 34 人物レコードの確認操作（名寄せ・確認状態・生死・死亡日・"
+                     "被相続人）。「〇〇さんの人物を確認して」「案件の人物一覧」等。"
+                     "customer_name に顧客名。「No.4の人物」等の番号指定は "
+                     "task_params.case_record_id に数字のみ入れる"),
+    required_desc="customer_name または 案件No（例: No.4）",
+    flow_fn=person_confirm_task.flow,
+    flow_reply_fn=person_confirm_task.flow_reply,
+    execute_fn=person_confirm_task.execute,
+))
+
+
 # ── 要確認の確定（S5-2.5 T2。フローは dispatch_bot/review_resolve_task.py に隔離）──
 from dispatch_bot import review_resolve_task  # noqa: E402（循環回避のため末尾 import）
 
