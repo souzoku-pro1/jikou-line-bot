@@ -70,14 +70,22 @@ def _v(record: dict, code: str) -> str:
 def normalize_addr(text: str) -> str:
     """所在・地番の表記揺れ正規化（名寄せは正規化後の完全一致のみ・裁定）。
     全角半角（NFKC）・空白除去・ハイフン類の統一・「番地」→「番」・
-    算用数字の丁目→漢数字（main._CHOME_KANJI を流用）"""
+    算用数字の丁目→漢数字（main._CHOME_KANJI を流用）。
+    S4-M2（2026-07-07 裁定）で /ocr/fixed-asset の _normalize_shozaichi の知見を統合:
+    都道府県名の削除・数字間の「-」「の」→「番」（32-6 / 32の6 / 32番地6 を同値化）"""
     if not text:
         return ""
     s = unicodedata.normalize("NFKC", text)
     s = re.sub(r"[\s　]+", "", s)
+    s = re.sub(r"^(北海道|東京都|大阪府|京都府|.{2,3}県)", "", s)
     for h in _HYPHENS:
         s = s.replace(h, "-")
     s = s.replace("番地", "番")
+    # 数字間の区切り（- / の）を「番」へ（"1-2-3" のような多段も収束するまで適用）
+    prev = None
+    while prev != s:
+        prev = s
+        s = re.sub(r"(\d)[-の](\d)", r"\1番\2", s)
     from main import _CHOME_KANJI  # 実行時 import（循環 import 回避・既存部品の流用）
 
     def kanji_chome(m):

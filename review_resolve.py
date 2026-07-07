@@ -268,11 +268,65 @@ async def _resolve_koseki(group: ReviewGroup, case_record_id: str) -> dict:
             "items": results}
 
 
+# ── valuation_ingest（S4-M2 評価証明・課税明細の案件紐付け不能）の確定ハンドラ ──
+
+async def _resolve_valuation(group: ReviewGroup, case_record_id: str) -> dict:
+    """評価読解グループの確定: App 25 から財産行を upsert（S4 の資産温存・
+    valuation_ingest.upsert_zaisan_from_fudosan を共用）→ App 30 クローズ"""
+    from valuation_ingest import upsert_zaisan_from_fudosan  # 遅延 import
+
+    # ── phase 1: 書き込み直前の全件再読（T1 と同じ意味論・1件でも変化なら全体中止）──
+    verified = []
+    for item in group.items:
+        record = await kintone.get_record(APP_SHIPPING, item.record_id)
+        status, executed = _v(record, "発送ステータス"), _v(record, "実行済み")
+        if status != STATUS_PENDING or executed != "no":
+            return {"status": "aborted",
+                    "reason": f"No.{item.record_id} が要確認ではなくなっています"
+                              f"（発送ステータス={status}・実行済み={executed}）。"
+                              "グループ全体を中止しました（書き込みなし）"}
+        fudosan_id = str(item.detail.get("不動産レコードID") or "")
+        if not fudosan_id:
+            return {"status": "aborted",
+                    "reason": f"No.{item.record_id} に不動産レコードIDがありません"
+                              "（再構成不能・書き込みなし）"}
+        verified.append((item, fudosan_id))
+
+    # ── phase 2: 財産行 upsert → クローズ ──────────────────────────────────
+    results = []
+    for item, fudosan_id in verified:
+        pdf_bytes = b""
+        if item.file_keys:
+            try:
+                pdf_bytes = await kintone.download_file(
+                    APP_SHIPPING, item.file_keys[0])
+            except Exception as e:
+                print(f"[REVIEW_RESOLVE] 原本の取得に失敗（添付なしで続行）: {e}")
+        outcome = await upsert_zaisan_from_fudosan(
+            fudosan_id, case_record_id,
+            str(item.detail.get("冪等キー") or ""),
+            pdf_bytes=pdf_bytes,
+            filename=item.file_name or "課税明細.pdf")
+        await kintone.update_record(APP_SHIPPING, item.record_id, {
+            "発送ステータス": STATUS_DONE,
+            "実行済み": "yes",
+        })
+        results.append({"review_record_id": item.record_id,
+                        "fudosan_record_id": fudosan_id, **outcome})
+        print(f"[REVIEW_RESOLVE] valuation resolved review=No.{item.record_id} "
+              f"fudosan={fudosan_id} zaisan={outcome.get('zaisan_record_id')} "
+              f"case={case_record_id}")
+    return {"status": "resolved", "case_record_id": case_record_id,
+            "items": results}
+
+
 # ハンドラ登録辞書: トップキー → (確定ハンドラ, 必要な kintone env)。
 # 将来の zaisan_sync／S6 通帳はキー追加で載せる
 RESOLVERS = {
     "registry_ingest": (_resolve_registry, (APP_SHIPPING, APP_FUDOSAN, APP_ZAISAN)),
     "koseki_ingest": (_resolve_koseki, (APP_SHIPPING, APP_KOSEKI_BOOK)),
+    "valuation_ingest": (_resolve_valuation,
+                         (APP_SHIPPING, APP_FUDOSAN, APP_ZAISAN)),
 }
 
 
