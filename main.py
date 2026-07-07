@@ -515,20 +515,31 @@ async def kintone_approval_webhook(request: Request):
 # POST /ocr/fixed-asset  固定資産税評価額 OCR → kintone登録
 # ══════════════════════════════════════════════════════════════
 
-def _ocr_pdf_bytes(pdf_bytes: bytes, api_key: str) -> str:
-    """PDFを Vision API の files:annotate に直接送ってOCRする（PyMuPDF不要）"""
+def _pdf_page_count(pdf_bytes: bytes) -> int | None:
+    """PDF の総ページ数（PyMuPDF 不在・破損時は None = 従来動作へ縮退）"""
+    try:
+        import fitz  # PyMuPDF
+        with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
+            return doc.page_count
+    except Exception as e:
+        print(f"[OCR] ページ数の取得に失敗（従来の単発リクエストへ縮退）: {e}")
+        return None
+
+
+def _vision_annotate(pdf_bytes: bytes, api_key: str,
+                     pages: list[int] | None = None) -> list[str]:
+    """Vision files:annotate を1回呼び、ページごとのテキストのリストを返す。
+    pages 未指定は API 既定（先頭5ページ）＝従来動作"""
     import urllib.request
     content = base64.b64encode(pdf_bytes).decode("utf-8")
-    body = json.dumps({
-        "requests": [{
-            "inputConfig": {
-                "content": content,
-                "mimeType": "application/pdf",
-            },
-            "features": [{"type": "DOCUMENT_TEXT_DETECTION"}],
-            "imageContext": {"languageHints": ["ja", "en"]},
-        }]
-    }).encode("utf-8")
+    request: dict = {
+        "inputConfig": {"content": content, "mimeType": "application/pdf"},
+        "features": [{"type": "DOCUMENT_TEXT_DETECTION"}],
+        "imageContext": {"languageHints": ["ja", "en"]},
+    }
+    if pages:
+        request["pages"] = pages
+    body = json.dumps({"requests": [request]}).encode("utf-8")
     url = f"https://vision.googleapis.com/v1/files:annotate?key={api_key}"
     req = urllib.request.Request(url, data=body,
                                   headers={"Content-Type": "application/json"})
@@ -539,14 +550,32 @@ def _ocr_pdf_bytes(pdf_bytes: bytes, api_key: str) -> str:
         err_body = e.read().decode("utf-8", errors="replace")
         raise RuntimeError(f"Vision API {e.code}: {err_body}")
 
-    # files:annotate のレスポンス構造:
-    # result["responses"][0]["responses"] → ページごとの結果リスト
     pages_text = []
     for page_resp in result.get("responses", [{}])[0].get("responses", []):
         annotation = page_resp.get("fullTextAnnotation")
         if annotation:
             pages_text.append(annotation.get("text", ""))
-    return "\n\n".join(pages_text)
+    return pages_text
+
+
+def _ocr_pdf_pages(pdf_bytes: bytes, api_key: str) -> list[str]:
+    """全ページを5ページずつのバッチで OCR し、ページ順のテキストリストを返す
+    （D1-1・2026-07-07。Vision files:annotate（同期）は1リクエスト最大5ページの
+    ため、従来実装は5ページ超の後半を取りこぼしていた）。
+    ページ数不明（PyMuPDF 不在等）は従来の単発リクエストに縮退"""
+    total = _pdf_page_count(pdf_bytes)
+    if total is None:
+        return _vision_annotate(pdf_bytes, api_key)
+    pages_text: list[str] = []
+    for start in range(1, total + 1, 5):
+        batch = list(range(start, min(start + 4, total) + 1))
+        pages_text.extend(_vision_annotate(pdf_bytes, api_key, pages=batch))
+    return pages_text
+
+
+def _ocr_pdf_bytes(pdf_bytes: bytes, api_key: str) -> str:
+    """PDF 全ページの OCR テキスト（結合版・既存呼び出し元の契約は不変）"""
+    return "\n\n".join(_ocr_pdf_pages(pdf_bytes, api_key))
 
 
 async def _extract_fixed_asset(ocr_text: str) -> dict:
