@@ -12,6 +12,9 @@ from hub import notify
 
 _ENV = {
     "LINE_CHANNEL_ACCESS_TOKEN": "line_tok",
+    # 業務通知チャネル（2026-07-07 裁定）。値を固定して他テストモジュールの
+    # process env 漏れ（bot_token 等）による非決定性を遮断
+    "DISPATCHBOT_CHANNEL_ACCESS_TOKEN": "bot_tok",
     "ATTORNEY_LINE_USER_ID": "U_admin",
 }
 
@@ -67,7 +70,8 @@ class TestNotifyAdminLine(unittest.IsolatedAsyncioTestCase):
         _, kw = FakeClient.calls[0]
         self.assertEqual(kw["json"]["to"], "U_admin")
         self.assertEqual(kw["json"]["messages"][0]["text"], "警報テスト")
-        self.assertEqual(kw["headers"]["Authorization"], "Bearer line_tok")
+        # 2026-07-07 裁定: 業務通知は指示Botチャネル（旧: line_tok=顧客Bot）
+        self.assertEqual(kw["headers"]["Authorization"], "Bearer bot_tok")
 
     async def test_throttle_suppresses_same_key(self):
         with use_fake([FakeResponse(200), FakeResponse(200)]):
@@ -171,6 +175,53 @@ class TestPushLineMessage(unittest.IsolatedAsyncioTestCase):
                     "U1", "x", token_env="DISPATCHBOT_CHANNEL_ACCESS_TOKEN")
         self.assertFalse(ok)
         self.assertEqual(len(FakeClient.calls), 0)
+
+
+class TestBusinessChannel(unittest.IsolatedAsyncioTestCase):
+    """業務通知の送信チャネル（2026-07-07 裁定）: 指示Botから送る・
+    DISPATCHBOT 未設定は既定へフォールバック＋警告ログ（警報の欠落防止）"""
+
+    def setUp(self):
+        self._env = patch.dict("os.environ", _ENV, clear=False)
+        self._env.start()
+        self.addCleanup(self._env.stop)
+        notify._last_notify_at.clear()
+
+    async def test_admin_notify_uses_dispatch_bot_channel(self):
+        with use_fake([FakeResponse(200)]):
+            await notify.notify_admin_line("警報")
+        _, kw = FakeClient.calls[0]
+        self.assertEqual(kw["headers"]["Authorization"], "Bearer bot_tok",
+                         "管理者警報は指示Botチャネル（ヘッダのピン留め）")
+
+    async def test_attorney_approval_uses_dispatch_bot_channel(self):
+        record = {"$id": {"value": "1"}, "件名": {"value": "x"},
+                  "チャネル": {"value": "郵送"}, "顧客名表示用": {"value": "y"}}
+        with use_fake([FakeResponse(200)]):
+            await notify.notify_attorney_approval(record)
+        _, kw = FakeClient.calls[0]
+        self.assertEqual(kw["headers"]["Authorization"], "Bearer bot_tok",
+                         "承認依頼は指示Botチャネル（ヘッダのピン留め）")
+
+    async def test_fallback_to_customer_bot_with_warning_when_unset(self):
+        with patch.dict("os.environ",
+                        {"DISPATCHBOT_CHANNEL_ACCESS_TOKEN": ""}, clear=False):
+            with self.assertLogs("hub.notify", level="WARNING") as logs:
+                with use_fake([FakeResponse(200)]):
+                    await notify.notify_admin_line("警報")
+        _, kw = FakeClient.calls[0]
+        self.assertEqual(kw["headers"]["Authorization"], "Bearer line_tok",
+                         "未設定時は既定へフォールバック（警報の欠落防止）")
+        self.assertTrue(any("falls back" in m for m in logs.output))
+
+    def test_business_token_env_values(self):
+        self.assertEqual(notify.business_token_env(),
+                         "DISPATCHBOT_CHANNEL_ACCESS_TOKEN")
+        with patch.dict("os.environ",
+                        {"DISPATCHBOT_CHANNEL_ACCESS_TOKEN": ""}, clear=False):
+            with self.assertLogs("hub.notify", level="WARNING"):
+                self.assertEqual(notify.business_token_env(),
+                                 "LINE_CHANNEL_ACCESS_TOKEN")
 
 
 class TestReExport(unittest.TestCase):
