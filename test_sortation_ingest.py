@@ -347,8 +347,8 @@ _FWD_ENV = {**_ENV, "SORTATION_FORWARD_ENABLED": "1",
             "SOUZOKU_KINTONE_APP_ID": "26"}
 
 
-class TestForwarding(_Base):
-    """S5-3 T1: doc_type別の読解ライン回送（auto×種別×doc_type_confidence ゲート）"""
+class _ForwardHarness(_Base):
+    """回送系テストの共通足場（テストは持たない）"""
 
     def judged(self, doc_type="戸籍", dtc=0.95):
         return {"doc_type": doc_type, "doc_type_confidence": dtc,
@@ -370,6 +370,10 @@ class TestForwarding(_Base):
             self.addCleanup(p.stop)
         return self.post(env=env, judged=judged,
                          candidates=[cand(12, "山田太郎")], **kw)
+
+
+class TestForwarding(_ForwardHarness):
+    """S5-3 T1: doc_type別の読解ライン回送（auto×種別×doc_type_confidence ゲート）"""
 
     def test_koseki_forward_with_case_hint_and_idempotency_passthrough(self):
         resp = self.post_fwd(self.judged(), data={"drive_file_id": "drv-9"})
@@ -469,6 +473,133 @@ class TestForwarding(_Base):
             {"action", "doc_type", "confidence", "customer",
              "suggested_filename", "forwarded"})
         self.assertEqual(body["suggested_filename"], "山田太郎_戸籍_20260706.pdf")
+
+
+_SPLIT_ENV = {**_FWD_ENV, "SORTATION_SPLIT_ENABLED": "1"}
+
+
+def sseg(start, end, doc_type="戸籍", conf=0.95):
+    return {"start_page": start, "end_page": end, "doc_type": doc_type,
+            "confidence": conf}
+
+
+class TestSplitWiring(_ForwardHarness):
+    """D1-2: 分割層の結線（フラグ配下・高速パス・複数区間の個別回送・縮退）"""
+
+    def post_split(self, judged, *, split=None, pages=("p1", "p2", "p3"),
+                   fragments=None, env=_SPLIT_ENV, **kw):
+        self.pages_mock = MagicMock(return_value=list(pages))
+        self.analyze = AsyncMock(return_value=split if split is not None else
+                                 {"status": "ok", "needs_split": False,
+                                  "segments": [sseg(1, len(pages), "戸籍")]})
+        self.split_pdf = MagicMock(
+            return_value=fragments if fragments is not None else
+            [b"frag-%d" % i for i in range(1, 4)])
+        for p in [patch("main._ocr_pdf_pages", new=self.pages_mock),
+                  patch("document_splitter.analyze_segments", new=self.analyze),
+                  patch("document_splitter.split_pdf", new=self.split_pdf)]:
+            p.start()
+            self.addCleanup(p.stop)
+        return self.post_fwd(judged, env=env, **kw)
+
+    MULTI = {"status": "ok", "needs_split": True,
+             "segments": [sseg(1, 2, "戸籍", 0.95),
+                          sseg(3, 3, "住民票・戸籍附票", 0.9),
+                          sseg(4, 4, "評価証明・課税明細", 0.9)]}
+
+    def test_flag_off_is_fully_unchanged(self):
+        """フラグ無効: ページ別OCR・区間判定とも呼ばれず従来応答のまま"""
+        pages_mock = MagicMock()
+        analyze = AsyncMock()
+        for p in [patch("main._ocr_pdf_pages", new=pages_mock),
+                  patch("document_splitter.analyze_segments", new=analyze)]:
+            p.start()
+            self.addCleanup(p.stop)
+        resp = self.post_fwd(self.judged())  # _FWD_ENV（分割フラグなし）
+        pages_mock.assert_not_called()
+        analyze.assert_not_awaited()
+        self.assertEqual(resp.json()["forwarded"]["line"], "koseki",
+                         "従来の単一 forwarded（dict）のまま")
+
+    def test_fast_path_single_segment_matches_legacy_response(self):
+        """フラグ有効×単一区間: 従来と同一応答（キー・値とも完全一致）"""
+        resp = self.post_split(self.judged(), data={"drive_file_id": "drv-9"})
+        self.assertEqual(resp.json(), {
+            "action": "auto", "doc_type": "戸籍", "confidence": 0.93,
+            "customer": {"record_id": "12", "name": "山田太郎",
+                         "folder_name": "No12_山田太郎"},
+            "suggested_filename": "山田太郎_戸籍_20260706.pdf",
+            "forwarded": {"line": "koseki", "status": "ok",
+                          "kintone_record_id": "33-9"},
+        })
+        (_, _), kwargs = self.koseki.await_args
+        self.assertEqual(kwargs["drive_file_id"], "drv-9",
+                         "単一区間は断片キー化しない（従来のまま）")
+
+    def test_multi_segments_forward_fragments_individually(self):
+        """複数区間: 対象種別のみ個別回送・冪等=親fid#pN-M・case_hint貫通・
+        主種別のdoc_typeと「ほかN件」ファイル名"""
+        resp = self.post_split(self.judged(), split=self.MULTI,
+                               pages=("p1", "p2", "p3", "p4"),
+                               fragments=[b"f1", b"f2", b"f3"],
+                               data={"drive_file_id": "drv-9"})
+        body = resp.json()
+        self.assertEqual(body["doc_type"], "戸籍", "主種別=最大ページ数の区間")
+        self.assertEqual(body["suggested_filename"],
+                         "山田太郎_戸籍ほか2件_20260706.pdf")
+        self.assertEqual([f["line"] for f in body["forwarded"]],
+                         ["koseki", "valuation"],
+                         "住民票（対象外）は回送されず配列にも載らない")
+        self.assertEqual([f["pages"] for f in body["forwarded"]],
+                         ["p1-2", "p4-4"])
+        (frag, fname), kwargs = self.koseki.await_args
+        self.assertEqual(frag, b"f1", "断片PDFを回送")
+        self.assertEqual(kwargs["drive_file_id"], "drv-9#p1-2", "冪等=親fid#pN-M")
+        self.assertEqual(kwargs["case_hint"], "12")
+        _, vkwargs = self.valuation.await_args
+        self.assertEqual(vkwargs["drive_file_id"], "drv-9#p4-4")
+
+    def test_multi_without_drive_file_id_uses_parent_sha(self):
+        self.post_split(self.judged(), split=self.MULTI,
+                        pages=("p1", "p2", "p3", "p4"),
+                        fragments=[b"f1", b"f2", b"f3"])
+        _, kwargs = self.koseki.await_args
+        self.assertRegex(kwargs["drive_file_id"], r"^sha256:[0-9a-f]{64}#p1-2$")
+
+    def test_unsplittable_falls_back_to_legacy(self):
+        """分割不能シグナル → 従来経路（全体judge・forwarded は従来 dict 形）"""
+        resp = self.post_split(self.judged(),
+                               split={"status": "unsplittable",
+                                      "reason": "区間検証に不合格"})
+        body = resp.json()
+        self.assertEqual(body["action"], "auto")
+        self.assertEqual(body["doc_type"], "戸籍")
+        self.assertNotIn("ほか", body["suggested_filename"])
+        self.assertEqual(body["forwarded"]["line"], "koseki", "従来 dict 形")
+        self.split_pdf.assert_not_called()
+
+    def test_one_fragment_failure_does_not_break_others(self):
+        koseki = AsyncMock(side_effect=RuntimeError("line down"))
+        resp = self.post_split(self.judged(), split=self.MULTI,
+                               pages=("p1", "p2", "p3", "p4"),
+                               fragments=[b"f1", b"f2", b"f3"], koseki=koseki)
+        body = resp.json()
+        self.assertEqual(body["action"], "auto", "auto 成功は不変")
+        statuses = {f["line"]: f["status"] for f in body["forwarded"]}
+        self.assertEqual(statuses["koseki"], "error")
+        self.assertEqual(statuses["valuation"], "ok", "他の断片は継続")
+
+    def test_multi_ask_contract_keys_unchanged(self):
+        """複数区間でも ask の応答キーは不変（forwarded なし・主種別反映のみ）"""
+        judged = {"doc_type": "戸籍", "doc_type_confidence": 0.99,
+                  "customer_record_id": None, "confidence": 0.3, "reason": "x"}
+        resp = self.post_split(judged, split=self.MULTI,
+                               pages=("p1", "p2", "p3", "p4"))
+        body = resp.json()
+        self.assertEqual(set(body), {"action", "doc_type", "confidence",
+                                     "customer", "suggested_filename"})
+        self.assertEqual(body["action"], "ask")
+        self.assertEqual(body["doc_type"], "戸籍")
 
 
 class TestDegradedPaths(_Base):
