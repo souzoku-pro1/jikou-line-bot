@@ -66,12 +66,15 @@ def _norm(text: str) -> str:
 
 
 def _date_compatible(a: str, b: str) -> bool:
-    """和暦日付の互換比較。正規化後の完全一致、または一方が日未満の粒度
-    （「日」を含まない）でもう一方の前方部分に一致する場合に互換とみなす。
-    例: 平成11年7月 ⇔ 平成11年7月19日 は互換。
+    """和暦日付の互換比較。カノニカライズ（R4-2d: R5-1 の _canon 流用＝
+    大字・漢数字→算用。比較時のみ・保存値は不変）後の完全一致、または一方が
+    日未満の粒度（「日」を含まない）でもう一方の前方部分に一致する場合に
+    互換とみなす。例: 平成11年7月 ⇔ 平成11年7月19日 は互換・
+    昭和参拾五年拾壱月弐拾弐日 ⇔ 昭和35年11月22日 は互換。
     「日」を含む同士の前方一致（平成11年7月1日 vs 平成11年7月19日）は
     別日のため互換にしない（安全側）"""
-    na, nb = _norm(a), _norm(b)
+    from koseki_second_opinion import _canon  # 遅延 import（起動順の安全側）
+    na, nb = _canon(a), _canon(b)
     if not na or not nb:
         return False
     if na == nb:
@@ -185,7 +188,10 @@ def score_pair(a: PersonView, b: PersonView,
         # ②: 名のみ人物の氏補完後一致（例: 香音＋戸籍氏「鈴木」→ 鈴木香音）
         signals.append(SIGNAL_NAME_COMPLETED)
 
-    if a.birth and a.birth == b.birth:
+    # ③ 生年月日: カノニカライズ比較（R4-2d・大字⇔算用の表記差を吸収。
+    # 比較時のみで PersonView.birth・封筒の実値は原文正規化のまま不変）
+    from koseki_second_opinion import _canon  # 遅延 import（起動順の安全側）
+    if a.birth and b.birth and _canon(a.birth) == _canon(b.birth):
         signals.append(SIGNAL_BIRTH)
         evidence["生年月日"] = a.birth
 
