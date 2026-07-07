@@ -1,0 +1,6 @@
+# Railway（nixpacks）ビルド設定 — Z2（2026-07-07）で graphviz バイナリを追加
+# （相続関係図の dot 描画に使用）。
+# "..." は nixpacks 既定のパッケージ集合をそのまま維持する指定であり、
+# 既存ビルド（Python プロバイダの自動検出）を壊さない最小変更。
+[phases.setup]
+nixPkgs = ["...", "graphviz"]
