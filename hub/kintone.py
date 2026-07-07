@@ -162,6 +162,16 @@ async def update_record(app: KintoneApp, record_id: str, fields: dict,
     await _write("PUT", f"{_base_url()}/k/v1/record.json", app, body)
 
 
+async def delete_record(app: KintoneApp, record_id: str) -> None:
+    """レコードの物理削除（R4-2b: 名寄せ統合の敗者削除用）。
+    削除はリトライしない（書き込みと同じ流儀）。呼び出し元は監査記録の保存成功を
+    削除の前提条件とすること（person_merge_exec の順序固定）"""
+    await _write(
+        "DELETE", f"{_base_url()}/k/v1/records.json", app,
+        {"app": app.app_id(), "ids": [record_id]},
+    )
+
+
 async def upload_file(app: KintoneApp, filename: str, content: bytes, mime: str) -> str:
     """ファイルアップロード（multipart）。fileKey を返す"""
     try:

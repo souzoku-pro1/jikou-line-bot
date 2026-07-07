@@ -46,11 +46,11 @@ def run(coro):
 
 class TestRegistry(unittest.TestCase):
     def test_registered_tasks(self):
-        """S5-2.5 で review_resolve 追加（2026-07-07 裁定・時点ピンの追随は正当）。
-        それ以外は未登録のまま"""
+        """S5-2.5 で review_resolve・R4-2b で person_merge 追加
+        （2026-07-07 裁定・時点ピンの追随は正当）。それ以外は未登録のまま"""
         self.assertEqual(set(registry.TASK_REGISTRY),
                          {"soufu_annai", "shokumu_seikyu", "sortation_assign",
-                          "review_resolve"})
+                          "review_resolve", "person_merge"})
         spec = registry.get_task("soufu_annai")
         self.assertFalse(spec.answer_only)
         self.assertEqual(spec.destination, "app30")

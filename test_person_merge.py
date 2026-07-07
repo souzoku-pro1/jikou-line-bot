@@ -341,7 +341,7 @@ class TestDetectFlow(unittest.TestCase):
         self.assertEqual(kt.updated, [], "保留ペアは自動候補にしない")
 
     def test_duplicate_pair_skipped(self):
-        """未処理の同ペア封筒あり → 起票もマークもスキップ（冪等）"""
+        """同ペアの封筒あり（未処理・裁定済みを問わず）→ 起票もマークもスキップ"""
         kt = _KT(self.MAKOTO3[:2], filed_keys={"person_merge:6-9"})
         arm(self, kt)
         result = run(detect_merge_candidates())
@@ -350,7 +350,10 @@ class TestDetectFlow(unittest.TestCase):
         self.assertEqual(kt.created, [])
         self.assertEqual(kt.updated, [])
         self.assertIn('like "person_merge:6-9"', kt.shipping_queries[0])
-        self.assertIn('実行済み in ("no")', kt.shipping_queries[0])
+        # R4-2b: 状態を問わず照合（「別人」裁定でクローズ済みの封筒も再起票を
+        # 恒久抑止する）。ステータス条件があるとクローズ済みが漏れる
+        self.assertNotIn("発送ステータス", kt.shipping_queries[0])
+        self.assertNotIn("実行済み", kt.shipping_queries[0])
 
     def test_already_confirmed_person_not_touched(self):
         """名寄せ確定が未確定以外（確定/自動候補）の人物には書かない"""

@@ -247,11 +247,15 @@ def reduce_chain_pairs(pairs: list[tuple[str, str]]) -> list[tuple[str, str]]:
 
 
 async def _already_filed(pair_key: str) -> bool:
-    """同一ペアの未処理封筒が存在すれば重複起票しない（冪等）"""
+    """同一ペアの封筒が存在すれば重複起票しない（冪等）。
+
+    状態を問わず照合する（R4-2b 改修）: 未処理（要確認）だけでなく、
+    「別人」裁定でクローズ済みの封筒も対象に含める＝**棄却済みペアの再起票を
+    恒久抑止**する。統合済みペアは敗者削除により再検出されないため無害
+    """
     records = await kintone.search_records(
         APP_SHIPPING,
-        f'チャネル固有データ like "{pair_key}" and 発送ステータス in ("要確認")'
-        ' and 実行済み in ("no")',
+        f'チャネル固有データ like "{pair_key}"',
         fields=["$id"])
     return bool(records)
 
@@ -334,7 +338,7 @@ async def detect_merge_candidates() -> dict:
                  "保留": score["pending"]}
         if await _already_filed(key):
             results["skipped_duplicates"] += 1
-            entry["filed"] = "skip（未処理の同ペア封筒あり）"
+            entry["filed"] = "skip（同ペアの封筒あり: 未処理または裁定済み）"
             results["candidates"].append(entry)
             continue
         review_id = await _file_candidate(by_id[lo], by_id[hi], score)
