@@ -64,6 +64,22 @@ class KinshipGraph:
         return [n for n in self.nodes if n.is_decedent]
 
 
+def subgraph(graph: KinshipGraph, ids: set) -> KinshipGraph:
+    """人物IDの部分集合に絞った部分グラフ（Z2 heir_scope 描画絞り込み用の純関数）。
+
+    - ノード: ids に含まれるもののみ
+    - エッジ: **両端が ids に含まれるもののみ**（片端が範囲外のエッジは落とす。
+      夫婦連結の不可視点ノードは to_dot が残存する婚姻エッジからのみ生成する
+      ため、夫婦の双方が範囲内の場合のみ描かれる）
+    - warnings は元グラフのまま保持（情報提供・絞り込みで消さない）
+    """
+    keep = {n.record_id for n in graph.nodes if n.record_id in ids}
+    return KinshipGraph(
+        nodes=[n for n in graph.nodes if n.record_id in keep],
+        edges=[e for e in graph.edges if e.a in keep and e.b in keep],
+        warnings=list(graph.warnings))
+
+
 def _v(record: dict, code: str) -> str:
     return str((record.get(code) or {}).get("value") or "").strip()
 

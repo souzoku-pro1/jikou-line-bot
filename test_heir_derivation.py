@@ -563,6 +563,62 @@ class TestZ1GateScope(unittest.TestCase):
                          "必要人物（6/7/8）が充足していれば下位順位の未確認は"
                          "拒否理由にならない")
 
+    def test_subgraph_filters_nodes_and_edges(self):
+        """subgraph: ノードは ids のみ・エッジは両端が範囲内のもののみ"""
+        from kinship_graph import subgraph
+        graph = self._graph()
+        sub = subgraph(graph, {"6", "7", "8"})
+        self.assertEqual({n.record_id for n in sub.nodes}, {"6", "7", "8"})
+        kinds = {(e.kind, e.a, e.b) for e in sub.edges}
+        self.assertEqual(kinds, {("婚姻", "6", "7"), ("親子", "6", "8")},
+                         "片端が範囲外の親子エッジ（14-6等）は落ちる")
+
+    def test_heir_scope_draws_only_required_nodes(self):
+        """heir_scope=True: 描画対象も必要人物に絞られる（dot 実体で検証）"""
+        import kinship_renderer
+        captured = {}
+
+        def fake_run(cmd, input=None, capture_output=None):
+            captured["dot"] = input.decode("utf-8")
+
+            class R:
+                returncode = 0
+                stdout = b"<svg/>"
+                stderr = b""
+            return R()
+
+        graph = self._graph()
+        with patch("kinship_renderer.shutil.which", return_value="dot"), \
+                patch("kinship_renderer.subprocess.run", new=fake_run):
+            kinship_renderer.render_kinship(graph, fmt="svg", heir_scope=True)
+        dot = captured["dot"]
+        for pid in ("p6", "p7", "p8"):
+            self.assertIn(f'"{pid}"', dot)
+        for pid in ("p14", "p13", "p20"):
+            self.assertNotIn(f'"{pid}"', dot, "範囲外ノードは描画しない")
+        self.assertIn('"m6_7"', dot, "双方範囲内の夫婦は不可視点ノードで連結")
+        self.assertNotIn('"m14_13"', dot)
+        self.assertNotIn("鈴木金次", dot, "範囲外人物のラベルも非出現")
+
+    def test_couple_point_dropped_when_one_side_out_of_scope(self):
+        """夫婦連結: 片側が描画対象外なら不可視点ノードを生成しない"""
+        from kinship_graph import subgraph
+        from kinship_renderer import to_dot
+        graph = self._graph()
+        sub = subgraph(graph, {"6", "8"})  # 香奈(7)を範囲外に
+        dot = to_dot(sub)
+        self.assertNotIn('"m6_7"', dot)
+        self.assertNotIn('"p7"', dot)
+        self.assertIn('"p6" -> "p8"', dot, "夫婦点なしでは親から直接の垂線")
+
+    def test_heir_scope_false_draws_all_nodes(self):
+        """heir_scope=False（既定）: 現行どおり全ノード描画（後方互換）"""
+        from kinship_renderer import to_dot
+        graph = self._graph()
+        dot = to_dot(graph)
+        for pid in ("p6", "p7", "p8", "p14", "p13", "p20"):
+            self.assertIn(f'"{pid}"', dot)
+
     def test_renderer_heir_scope_wiring(self):
         """render_kinship(heir_scope=True) がエンジン→必要人物→ゲートを結線"""
         from kinship_renderer import (
