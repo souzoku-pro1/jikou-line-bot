@@ -71,6 +71,13 @@ JUDGE_TOOL = {
                                "どの候補にも明確に該当しない場合は「その他」を"
                                "選ぶこと。近そうな候補に寄せない",
             },
+            "doc_type_confidence": {
+                "type": "number",
+                "description": "書類の種類（doc_type）の判定にどれだけ自信が"
+                               "あるか（0〜1）。顧客帰属の自信（confidence）とは"
+                               "別。様式・記載内容から種類が明確なら高く、"
+                               "断片的・不鮮明なら低く",
+            },
             "customer_record_id": {
                 "type": ["string", "null"],
                 "description": "候補リスト中で該当する顧客の record_id。"
@@ -87,13 +94,67 @@ JUDGE_TOOL = {
                 "description": "判定根拠（帰属を決めた/決められなかった理由を簡潔に）",
             },
         },
-        "required": ["doc_type", "customer_record_id", "confidence", "reason"],
+        "required": ["doc_type", "doc_type_confidence", "customer_record_id",
+                     "confidence", "reason"],
     },
 }
 
 
 def _threshold() -> float:
     return float(os.environ.get("SORTATION_AUTO_THRESHOLD", str(_DEFAULT_THRESHOLD)))
+
+
+# ── 回送（S5-3 T1・2026-07-07 裁定）────────────────────────────────────────
+# auto（顧客確定）かつ 対象種別 かつ doc_type_confidence ≥ 閾値 のときのみ、
+# 読解ラインへ Railway 内部の関数呼び出しで回送する（pdf_bytes を流用・
+# case_hint=顧客レコードID 付与＝案件紐付け不能の要確認が原理的に消える）。
+# ask は回送しない（確定時回送は T3）・相談カードは対象外・OCR 2回は第1版許容。
+# 下流の品質ゲート（戸籍=要再読解・登記=validate/確信度→要確認）が第2の網
+
+_FORWARD_LINES = {"戸籍": "koseki", "登記事項証明": "registry"}
+
+
+def _forward_enabled() -> bool:
+    """既定無効（実機有効化は明示指示後・SORTATION_FORWARD_ENABLED=1）"""
+    return os.environ.get("SORTATION_FORWARD_ENABLED") == "1"
+
+
+def _forward_threshold() -> float:
+    return float(os.environ.get("SORTATION_FORWARD_THRESHOLD", "0.85"))
+
+
+async def _forward_to_line(doc_type: str, doc_type_conf: float,
+                           pdf_bytes: bytes, file_name: str, fid: str,
+                           customer: Candidate) -> dict | None:
+    """ゲート通過時のみ読解ラインへ回送。回送失敗は auto 成功を壊さない
+    （ログ＋forwarded.status=error の縮退）。ゲート不通過は None（キー自体なし）"""
+    line = _FORWARD_LINES.get(doc_type)
+    if line is None or doc_type_conf < _forward_threshold():
+        return None
+    try:
+        if line == "koseki":
+            from koseki_ingest import ingest_koseki_pdf
+            result = await ingest_koseki_pdf(
+                pdf_bytes, file_name,
+                case_hint=customer.record_id,
+                case_app_hint=os.environ.get("SOUZOKU_KINTONE_APP_ID", ""),
+                drive_file_id=fid)  # 冪等キー貫通（専用フォルダ経由との二重防止）
+        else:
+            from registry_ingest import ingest_registry_pdf
+            result = await ingest_registry_pdf(
+                pdf_bytes, file_name,
+                case_hint=customer.record_id, drive_file_id=fid)
+        forwarded = {"line": line, "status": result.get("status")}
+        for key in ("kintone_record_id", "results"):
+            if key in result:
+                forwarded[key] = result[key]
+        print(f"[SORTATION] forwarded file={file_name} line={line} "
+              f"status={forwarded['status']}")
+        return forwarded
+    except Exception as e:
+        print(f"[SORTATION] 回送に失敗（仕分け結果は不変） line={line} "
+              f"file={file_name}: {e}")
+        return {"line": line, "status": "error", "error": str(e)[:200]}
 
 
 def _today_jst() -> str:
@@ -277,7 +338,7 @@ async def sortation_ingest(token: str = "",
         print(f"[SORTATION] 判定不能のため照会へ縮退 file={file_name}: {e}")
 
     if judged is None:
-        doc_type, confidence = DOC_TYPE_UNKNOWN, 0.0
+        doc_type, confidence, doc_type_conf = DOC_TYPE_UNKNOWN, 0.0, 0.0
         reason = f"判定処理が実行できませんでした（{failure}）"
         customer = None
     else:
@@ -287,6 +348,11 @@ async def sortation_ingest(token: str = "",
             confidence = min(max(float(judged.get("confidence") or 0.0), 0.0), 1.0)
         except (TypeError, ValueError):
             confidence = 0.0
+        try:
+            doc_type_conf = min(max(
+                float(judged.get("doc_type_confidence") or 0.0), 0.0), 1.0)
+        except (TypeError, ValueError):
+            doc_type_conf = 0.0
         reason = str(judged.get("reason") or "")
         # customer_record_id は候補リスト内のもののみ有効（リスト外の創作は棄却）
         suggested_id = judged.get("customer_record_id")
@@ -307,7 +373,7 @@ async def sortation_ingest(token: str = "",
         await _notify_ask(file_name, url, doc_type, confidence, reason, top,
                           log_url)
 
-    return {
+    response = {
         "action": action,
         "doc_type": doc_type,
         "confidence": confidence,
@@ -316,3 +382,11 @@ async def sortation_ingest(token: str = "",
             f"{customer.customer_name}_{doc_type}_{_today_jst()}.pdf"
             if customer else None,
     }
+    # S5-3 T1: auto（顧客確定）のみ読解ラインへ回送（既存キーは不変・追加キーのみ
+    # ＝GAS 無変更。フラグ既定無効・ゲート不通過時は forwarded キー自体を付けない）
+    if action == "auto" and _forward_enabled():
+        forwarded = await _forward_to_line(doc_type, doc_type_conf, pdf_bytes,
+                                           file_name, fid, customer)
+        if forwarded is not None:
+            response["forwarded"] = forwarded
+    return response

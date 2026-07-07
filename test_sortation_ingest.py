@@ -343,6 +343,108 @@ class TestSortationLog(_Base):
         self.assertEqual(self.create.await_count, 0)
 
 
+_FWD_ENV = {**_ENV, "SORTATION_FORWARD_ENABLED": "1",
+            "SOUZOKU_KINTONE_APP_ID": "26"}
+
+
+class TestForwarding(_Base):
+    """S5-3 T1: doc_type別の読解ライン回送（auto×種別×doc_type_confidence ゲート）"""
+
+    def judged(self, doc_type="戸籍", dtc=0.95):
+        return {"doc_type": doc_type, "doc_type_confidence": dtc,
+                "customer_record_id": "12", "confidence": 0.93,
+                "reason": "宛名一致"}
+
+    def post_fwd(self, judged, env=_FWD_ENV, koseki=None, registry=None, **kw):
+        self.koseki = koseki if koseki is not None else AsyncMock(
+            return_value={"status": "ok", "kintone_record_id": "33-9"})
+        self.registry = registry if registry is not None else AsyncMock(
+            return_value={"status": "ok", "results": [{"zaisan": "created"}]})
+        for p in [patch("koseki_ingest.ingest_koseki_pdf", new=self.koseki),
+                  patch("registry_ingest.ingest_registry_pdf", new=self.registry)]:
+            p.start()
+            self.addCleanup(p.stop)
+        return self.post(env=env, judged=judged,
+                         candidates=[cand(12, "山田太郎")], **kw)
+
+    def test_koseki_forward_with_case_hint_and_idempotency_passthrough(self):
+        resp = self.post_fwd(self.judged(), data={"drive_file_id": "drv-9"})
+        body = resp.json()
+        self.assertEqual(body["action"], "auto")
+        self.assertEqual(body["forwarded"],
+                         {"line": "koseki", "status": "ok",
+                          "kintone_record_id": "33-9"})
+        (pdf_bytes, fname), kwargs = self.koseki.await_args
+        self.assertEqual(pdf_bytes, PDF, "sortation が持つ pdf_bytes を流用")
+        self.assertEqual(kwargs["case_hint"], "12", "確定顧客のレコードID")
+        self.assertEqual(kwargs["case_app_hint"], "26")
+        self.assertEqual(kwargs["drive_file_id"], "drv-9", "冪等キー貫通")
+
+    def test_registry_forward(self):
+        resp = self.post_fwd(self.judged(doc_type="登記事項証明"))
+        body = resp.json()
+        self.assertEqual(body["forwarded"]["line"], "registry")
+        _, kwargs = self.registry.await_args
+        self.assertEqual(kwargs["case_hint"], "12")
+        # drive_file_id 省略時は空のまま渡し、下流の ingest 中核が同一 bytes から
+        # sha256 冪等キーを導出する（sortation 単独投入と同値になる）
+        self.assertEqual(kwargs["drive_file_id"], "")
+        self.koseki.assert_not_awaited()
+
+    def test_flag_off_by_default_no_forward_and_contract_unchanged(self):
+        """フラグ既定無効: forwarded キー自体が無い（既存契約そのまま）"""
+        resp = self.post_fwd(self.judged(), env={**_ENV,
+                                                 "SOUZOKU_KINTONE_APP_ID": "26"})
+        self.assertNotIn("forwarded", resp.json())
+        self.koseki.assert_not_awaited()
+
+    def test_below_threshold_no_forward(self):
+        resp = self.post_fwd(self.judged(dtc=0.84))
+        self.assertNotIn("forwarded", resp.json())
+        self.koseki.assert_not_awaited()
+
+    def test_threshold_env_override(self):
+        resp = self.post_fwd(self.judged(dtc=0.6),
+                             env={**_FWD_ENV,
+                                  "SORTATION_FORWARD_THRESHOLD": "0.5"})
+        self.assertEqual(resp.json()["forwarded"]["line"], "koseki")
+
+    def test_non_target_doc_type_no_forward(self):
+        """対象外種別（通帳等）は高確信度でも回送しない（相談カードも対象外）"""
+        for doc_type in ("通帳", "住民票・戸籍附票", "その他"):
+            with self.subTest(doc_type=doc_type):
+                resp = self.post_fwd(self.judged(doc_type=doc_type))
+                self.assertNotIn("forwarded", resp.json())
+
+    def test_ask_route_never_forwards(self):
+        """ask（顧客未確定）は種別・確信度を満たしても回送しない"""
+        judged = {"doc_type": "戸籍", "doc_type_confidence": 0.99,
+                  "customer_record_id": None, "confidence": 0.3, "reason": "x"}
+        resp = self.post_fwd(judged)
+        self.assertEqual(resp.json()["action"], "ask")
+        self.assertNotIn("forwarded", resp.json())
+        self.koseki.assert_not_awaited()
+
+    def test_forward_failure_degrades_without_breaking_auto(self):
+        resp = self.post_fwd(self.judged(),
+                             koseki=AsyncMock(side_effect=RuntimeError("line down")))
+        body = resp.json()
+        self.assertEqual(body["action"], "auto", "auto 成功は不変")
+        self.assertEqual(body["customer"]["folder_name"], "No12_山田太郎")
+        self.assertEqual(body["forwarded"]["status"], "error")
+        self.assertIn("line down", body["forwarded"]["error"])
+
+    def test_existing_response_keys_unchanged_when_forwarding(self):
+        """回送時も auto の既存キーは不変（GAS 無変更の担保・追加は forwarded のみ）"""
+        resp = self.post_fwd(self.judged())
+        body = resp.json()
+        self.assertEqual(
+            set(body),
+            {"action", "doc_type", "confidence", "customer",
+             "suggested_filename", "forwarded"})
+        self.assertEqual(body["suggested_filename"], "山田太郎_戸籍_20260706.pdf")
+
+
 class TestDegradedPaths(_Base):
     def test_claude_failure_degrades_to_ask(self):
         """Claude 全断: action=ask / doc_type=不明 / 判定不能の旨を通知"""
