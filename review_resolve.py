@@ -249,8 +249,19 @@ async def _resolve_koseki(group: ReviewGroup, case_record_id: str) -> dict:
             "発送ステータス": STATUS_DONE,
             "実行済み": "yes",
         })
-        results.append({"review_record_id": item.record_id,
-                        "koseki_record_id": koseki_id})
+        result = {"review_record_id": item.record_id,
+                  "koseki_record_id": koseki_id}
+        # R4-1: 案件が付いた戸籍の人物化（env KOSEKI_PERSON_SYNC_ENABLED=1 のとき
+        # のみ・既定無効）。失敗しても紐付け・クローズの成功は壊さない
+        try:
+            from koseki_person_sync import sync_enabled, sync_persons_from_koseki
+            if sync_enabled():
+                result["persons"] = await sync_persons_from_koseki(koseki_id)
+        except Exception as e:
+            print(f"[REVIEW_RESOLVE] 人物化に失敗（紐付けは完了済み）"
+                  f" koseki={koseki_id}: {e}")
+            result["persons"] = {"status": "error", "reason": str(e)[:200]}
+        results.append(result)
         print(f"[REVIEW_RESOLVE] koseki linked review=No.{item.record_id} "
               f"koseki={koseki_id} case={case_record_id}")
     return {"status": "resolved", "case_record_id": case_record_id,
