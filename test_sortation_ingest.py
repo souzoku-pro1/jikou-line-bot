@@ -360,8 +360,12 @@ class TestForwarding(_Base):
             return_value={"status": "ok", "kintone_record_id": "33-9"})
         self.registry = registry if registry is not None else AsyncMock(
             return_value={"status": "ok", "results": [{"zaisan": "created"}]})
+        self.valuation = AsyncMock(
+            return_value={"status": "ok", "results": [{"zaisan": "updated"}]})
         for p in [patch("koseki_ingest.ingest_koseki_pdf", new=self.koseki),
-                  patch("registry_ingest.ingest_registry_pdf", new=self.registry)]:
+                  patch("registry_ingest.ingest_registry_pdf", new=self.registry),
+                  patch("valuation_ingest.ingest_valuation_pdf",
+                        new=self.valuation)]:
             p.start()
             self.addCleanup(p.stop)
         return self.post(env=env, judged=judged,
@@ -408,6 +412,28 @@ class TestForwarding(_Base):
                              env={**_FWD_ENV,
                                   "SORTATION_FORWARD_THRESHOLD": "0.5"})
         self.assertEqual(resp.json()["forwarded"]["line"], "koseki")
+
+    def test_valuation_forward(self):
+        """S4-M3: 評価証明・課税明細も回送対象（case_hint/冪等キー貫通は T1 と同じ型）"""
+        resp = self.post_fwd(self.judged(doc_type="評価証明・課税明細"),
+                             data={"drive_file_id": "drv-9"})
+        body = resp.json()
+        self.assertEqual(body["action"], "auto")
+        self.assertEqual(body["forwarded"],
+                         {"line": "valuation", "status": "ok",
+                          "results": [{"zaisan": "updated"}]})
+        (pdf_bytes, _), kwargs = self.valuation.await_args
+        self.assertEqual(pdf_bytes, PDF)
+        self.assertEqual(kwargs["case_hint"], "12")
+        self.assertEqual(kwargs["case_app_hint"], "26")
+        self.assertEqual(kwargs["drive_file_id"], "drv-9")
+        self.koseki.assert_not_awaited()
+        self.registry.assert_not_awaited()
+
+    def test_valuation_below_threshold_no_forward(self):
+        resp = self.post_fwd(self.judged(doc_type="評価証明・課税明細", dtc=0.84))
+        self.assertNotIn("forwarded", resp.json())
+        self.valuation.assert_not_awaited()
 
     def test_non_target_doc_type_no_forward(self):
         """対象外種別（通帳等）は高確信度でも回送しない（相談カードも対象外）"""
