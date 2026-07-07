@@ -275,6 +275,50 @@ class TestCaseLinkReview(_Base):
         self.assertNotIn("review_record_id", resp.json())
 
 
+class TestPersonSyncWiring(_Base):
+    """R4-1 結線の補修: 案件付き登録（回送等）でも人物化が起動する
+    （KOSEKI_PERSON_SYNC_ENABLED 配下・失敗は登録成功を壊さない）"""
+
+    _SYNC_ENV = {**_ENV, "KOSEKI_PERSON_SYNC_ENABLED": "1"}
+
+    def _post_with_sync(self, env, sync, data=None):
+        p = patch("koseki_person_sync.sync_persons_from_koseki", new=sync)
+        p.start()
+        self.addCleanup(p.stop)
+        return self.post(_Kintone(), env, data=data)
+
+    def test_case_hint_with_flag_runs_person_sync(self):
+        sync = AsyncMock(return_value={"status": "synced",
+                                       "created": [{"氏名": "鈴木太郎"}],
+                                       "skipped": []})
+        resp = self._post_with_sync(self._SYNC_ENV, sync,
+                                    data={"case_hint": "4"})
+        sync.assert_awaited_once_with("88")
+        self.assertEqual(resp.json()["persons"]["status"], "synced")
+
+    def test_flag_off_does_not_sync(self):
+        sync = AsyncMock()
+        resp = self._post_with_sync(_ENV, sync, data={"case_hint": "4"})
+        sync.assert_not_awaited()
+        self.assertNotIn("persons", resp.json())
+
+    def test_no_case_hint_does_not_sync_even_with_flag(self):
+        """案件なしは要確認起票経路のみ（人物化は関所の確定後・従来どおり）"""
+        sync = AsyncMock()
+        resp = self._post_with_sync(self._SYNC_ENV, sync)
+        sync.assert_not_awaited()
+        self.assertNotIn("persons", resp.json())
+
+    def test_sync_failure_does_not_break_registration(self):
+        sync = AsyncMock(side_effect=RuntimeError("boom"))
+        resp = self._post_with_sync(self._SYNC_ENV, sync,
+                                    data={"case_hint": "4"})
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertEqual(body["kintone_record_id"], "88", "登録成功は不変")
+        self.assertEqual(body["persons"]["status"], "error")
+
+
 class TestExistingScanRegression(unittest.TestCase):
     """既存 /scan（戸籍謄本→App 27）が R2 の追加後も不変であることの固定"""
 

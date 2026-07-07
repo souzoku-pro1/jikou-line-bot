@@ -319,6 +319,36 @@ class TestSyncMissingPersons(unittest.TestCase):
         self.sync.assert_not_awaited()
 
 
+class TestDoubleInvocationIdempotency(unittest.TestCase):
+    """関所経由（R4-0）と登録時結線（回送）の二重起動を冪等（戸籍レコードID＋氏名）
+    が防ぐことの固定: 同一戸籍への2回目の人物化は起票ゼロ・更新ゼロ"""
+
+    def test_second_sync_creates_nothing(self):
+        created_names: set[str] = set()
+
+        class _StatefulKT(_KT):
+            async def search_records(self, app, query, fields=None):
+                self.searches.append(query)
+                for name in created_names:
+                    if f'氏名 = "{name}"' in query:
+                        return [{"$id": {"value": f"既存-{name}"}}]
+                return []
+
+            async def create_record(self, app, fields):
+                created_names.add(fields["氏名"])
+                self.created.append(fields)
+                return str(340 + len(self.created))
+
+        kt = _StatefulKT()
+        arm(self, kt)
+        first = run(sync_persons_from_koseki("1"))   # 1回目（例: 回送経由）
+        second = run(sync_persons_from_koseki("1"))  # 2回目（例: 関所経由）
+        self.assertEqual(len(first["created"]), 5)
+        self.assertEqual(len(second["created"]), 0, "二重起動でも起票ゼロ")
+        self.assertEqual(len(second["skipped"]), 5)
+        self.assertEqual(kt.updated, [], "既存レコードの更新もゼロ")
+
+
 class TestR40Wiring(unittest.TestCase):
     """R4-0 ハンドラからの起動（env フラグ・既定無効）"""
 

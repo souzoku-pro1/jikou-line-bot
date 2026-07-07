@@ -186,6 +186,21 @@ async def ingest_koseki_pdf(pdf_bytes: bytes, filename: str, *,
             record_id, fid, pdf_bytes, filename)
         if review_id:
             response["review_record_id"] = review_id
+    else:
+        # R4-1 結線の補修（2026-07-07 裁定）: 回送等で最初から案件付きの戸籍は
+        # 関所（R4-0 ハンドラ）を通らないため、ここでも人物化を起動する。
+        # KOSEKI_PERSON_SYNC_ENABLED 配下・失敗しても登録成功を壊さない縮退
+        # （関所側と同じ意味論）。関所経由との二重起動は人物化側の冪等
+        # （戸籍レコードID＋氏名）が防ぐ。読解失敗時（未読解のまま）は
+        # 人物化側の状態ゲートが skipped を返すのみで安全
+        try:
+            from koseki_person_sync import sync_enabled, sync_persons_from_koseki
+            if sync_enabled():
+                response["persons"] = await sync_persons_from_koseki(record_id)
+        except Exception as e:
+            print(f"[KOSEKI_INGEST] 人物化に失敗（登録は成功済み・"
+                  f"sync_missing_persons で回収可能） record={record_id}: {e}")
+            response["persons"] = {"status": "error", "reason": str(e)[:200]}
     return response
 
 
