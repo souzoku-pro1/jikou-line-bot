@@ -101,24 +101,16 @@ def _render_page_images(pdf_bytes: bytes) -> list[bytes]:
     return images
 
 
-@router.post("/koseki/ingest")
-async def koseki_ingest(token: str = "",
-                        # file は意図的に optional: 必須（File(...)）にすると
-                        # ファイル無しの探信に FastAPI が 422 を返してしまい、
-                        # token 検証（404 の存在しないフリ）より先に
-                        # エンドポイントの存在が漏れる（2026-07-05 実機確認）
-                        file: UploadFile | None = File(default=None),
-                        case_hint: str | None = Form(default=None),
-                        case_app_hint: str | None = Form(default=None),
-                        drive_file_id: str | None = Form(default=None)):
-    """戸籍 PDF（複数ページ可）を受領し App 33 に 1 レコード登録する。
+async def ingest_koseki_pdf(pdf_bytes: bytes, filename: str, *,
+                            case_hint: str | None = None,
+                            case_app_hint: str | None = None,
+                            drive_file_id: str | None = None) -> dict:
+    """戸籍 PDF の登録処理の中核（S5-3 で分離）。
 
-    case_hint: 案件レコードID（省略可）。case_app_hint: 案件アプリID（省略可）。
-    drive_file_id: 冪等キー（省略時は PDF の SHA-256 から生成）。
+    /koseki/ingest エンドポイントと、仕分けからの回送（sortation_ingest の
+    内部呼び出し）が共用する。挙動はエンドポイント時代と不変:
+    冪等 skip・OCR・原本/ページ画像添付・R3 同期読解・案件未紐付けの要確認起票。
     """
-    if not verify_token(token, "KOSEKI_INGEST_TOKEN"):
-        raise HTTPException(status_code=404, detail="Not Found")
-
     if not (APP_KOSEKI_BOOK.app_id() and APP_KOSEKI_BOOK.token()):
         raise HTTPException(
             status_code=503,
@@ -130,10 +122,6 @@ async def koseki_ingest(token: str = "",
         raise HTTPException(status_code=500,
                             detail="環境変数が未設定です: GOOGLE_VISION_API_KEY")
 
-    if file is None or not file.filename or not file.filename.lower().endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="PDFファイルを送信してください")
-
-    pdf_bytes = await file.read()
     fid = (drive_file_id or "").strip() or \
         f"sha256:{hashlib.sha256(pdf_bytes).hexdigest()}"
 
@@ -157,7 +145,7 @@ async def koseki_ingest(token: str = "",
     try:
         fields = {
             "原本PDF": [{"fileKey": await kintone.upload_file(
-                APP_KOSEKI_BOOK, file.filename, pdf_bytes, "application/pdf")}],
+                APP_KOSEKI_BOOK, filename, pdf_bytes, "application/pdf")}],
             "Drive_fileId": fid,
             # R2 は OCR 生テキストの仮置きまで。R3 の AI 読解が置き換える（裁定）
             "読解JSON": json.dumps({"ocr_text": ocr_text}, ensure_ascii=False),
@@ -195,7 +183,35 @@ async def koseki_ingest(token: str = "",
                 "page_images": len(page_images), "ocr_chars": len(ocr_text)}
     if not case_hint:
         review_id = await _file_case_link_review(
-            record_id, fid, pdf_bytes, file.filename)
+            record_id, fid, pdf_bytes, filename)
         if review_id:
             response["review_record_id"] = review_id
     return response
+
+
+@router.post("/koseki/ingest")
+async def koseki_ingest(token: str = "",
+                        # file は意図的に optional: 必須（File(...)）にすると
+                        # ファイル無しの探信に FastAPI が 422 を返してしまい、
+                        # token 検証（404 の存在しないフリ）より先に
+                        # エンドポイントの存在が漏れる（2026-07-05 実機確認）
+                        file: UploadFile | None = File(default=None),
+                        case_hint: str | None = Form(default=None),
+                        case_app_hint: str | None = Form(default=None),
+                        drive_file_id: str | None = Form(default=None)):
+    """戸籍 PDF（複数ページ可）を受領し App 33 に 1 レコード登録する。
+
+    case_hint: 案件レコードID（省略可）。case_app_hint: 案件アプリID（省略可）。
+    drive_file_id: 冪等キー（省略時は PDF の SHA-256 から生成）。
+    処理の中核は ingest_koseki_pdf（仕分けからの回送と共用・S5-3）。
+    """
+    if not verify_token(token, "KOSEKI_INGEST_TOKEN"):
+        raise HTTPException(status_code=404, detail="Not Found")
+
+    if file is None or not file.filename or not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="PDFファイルを送信してください")
+
+    return await ingest_koseki_pdf(
+        await file.read(), file.filename,
+        case_hint=case_hint, case_app_hint=case_app_hint,
+        drive_file_id=drive_file_id)

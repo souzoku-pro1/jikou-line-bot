@@ -314,30 +314,20 @@ async def _upsert_zaisan(prop: dict, fudosan_id: str, case_id: str,
     return {"zaisan": "created", "zaisan_record_id": zaisan_id}
 
 
-@router.post("/registry/ingest")
-async def registry_ingest(token: str = "",
-                          # file は意図的に optional: File(...) だと探信に 422 が
-                          # 返り 404 偽装より先に存在が漏れる（koseki_ingest と同じ）
-                          file: UploadFile | None = File(default=None),
-                          case_hint: str | None = Form(default=None),
-                          drive_file_id: str | None = Form(default=None)):
-    """登記事項証明 PDF を受領し、読解→不動産25・App 財産へ転記する。
+async def ingest_registry_pdf(pdf_bytes: bytes, filename: str, *,
+                              case_hint: str | None = None,
+                              drive_file_id: str | None = None) -> dict:
+    """登記 PDF の読解→転記処理の中核（S5-3 で分離）。
 
-    case_hint: 案件レコードID（省略可）。drive_file_id: 冪等キー（省略時は sha256）。
+    /registry/ingest エンドポイントと、仕分けからの回送（sortation_ingest の
+    内部呼び出し）が共用する。挙動はエンドポイント時代と不変:
+    冪等 skip・品質ゲート・名寄せ・App 25/35 転記・要確認キュー。
     """
-    if not verify_token(token, "REGISTRY_INGEST_TOKEN"):
-        raise HTTPException(status_code=404, detail="Not Found")
-
     vision_key = os.environ.get("GOOGLE_VISION_API_KEY", "")
     if not vision_key:
         raise HTTPException(status_code=500,
                             detail="環境変数が未設定です: GOOGLE_VISION_API_KEY")
 
-    if file is None or not file.filename or not file.filename.lower().endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="PDFファイルを送信してください")
-
-    pdf_bytes = await file.read()
-    filename = file.filename
     fid = (drive_file_id or "").strip() or \
         f"sha256:{hashlib.sha256(pdf_bytes).hexdigest()}"
 
@@ -430,3 +420,26 @@ async def registry_ingest(token: str = "",
           f"全体確信度={overall}")
     return {"status": "ok", "全体確信度": overall, "results": results,
             "ocr_chars": len(ocr_text)}
+
+
+@router.post("/registry/ingest")
+async def registry_ingest(token: str = "",
+                          # file は意図的に optional: File(...) だと探信に 422 が
+                          # 返り 404 偽装より先に存在が漏れる（koseki_ingest と同じ）
+                          file: UploadFile | None = File(default=None),
+                          case_hint: str | None = Form(default=None),
+                          drive_file_id: str | None = Form(default=None)):
+    """登記事項証明 PDF を受領し、読解→不動産25・App 財産へ転記する。
+
+    case_hint: 案件レコードID（省略可）。drive_file_id: 冪等キー（省略時は sha256）。
+    処理の中核は ingest_registry_pdf（仕分けからの回送と共用・S5-3）。
+    """
+    if not verify_token(token, "REGISTRY_INGEST_TOKEN"):
+        raise HTTPException(status_code=404, detail="Not Found")
+
+    if file is None or not file.filename or not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="PDFファイルを送信してください")
+
+    return await ingest_registry_pdf(
+        await file.read(), file.filename,
+        case_hint=case_hint, drive_file_id=drive_file_id)
