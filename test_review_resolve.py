@@ -422,5 +422,51 @@ class TestResolveKoseki(unittest.TestCase):
         self.assertEqual(result["status"], "resolved")
 
 
+class TestResolveValuation(unittest.TestCase):
+    """S4-M2: valuation_ingest ハンドラ（25から財産行 upsert・S4 資産温存・クローズ）"""
+
+    def group(self):
+        return ReviewGroup(
+            source="valuation_ingest", idempotency_key="sha256:v1",
+            items=[ReviewItem(record_id="11",
+                              subject="評価証明・課税明細の読解転記: 案件紐付け不能",
+                              detail={"不動産レコードID": "7",
+                                      "冪等キー": "sha256:v1"},
+                              file_keys=["pdf-11"], file_name="hyoka.pdf")])
+
+    def kt(self):
+        return _KT(shipping={"11": {"発送ステータス": "要確認", "実行済み": "no"}},
+                   fudosan={"7": wrap({"種別": "土地", "所在": "入間市東藤沢七丁目",
+                                       "地番": "153番26", "部屋番号": "",
+                                       "固定資産税評価額": "12345678",
+                                       "固定資産税評価年度": "2026"})})
+
+    def test_happy_path_upserts_zaisan_and_closes(self):
+        kt = self.kt()
+        arm(self, kt)
+        result = run(resolve_group(self.group(), "3"))
+        self.assertEqual(result["status"], "resolved")
+        self.assertEqual(result["items"][0]["zaisan"], "created")
+        (_, fields), = kt.by_env(kt.created, "APP_ZAISAN")
+        self.assertEqual(fields["データ源"], "OCR_課税明細")
+        self.assertEqual(fields["評価額"], "12345678")
+        self.assertEqual(fields["評価基準日"], "2026-01-01", "賦課期日温存")
+        self.assertEqual(fields["評価確定"], "no")
+        self.assertNotIn("名義", fields,
+                         "確定ハンドラ経由では名義を書かない（登記由来が正の序列）")
+        closes = kt.by_env(kt.updated, "APP_SHIPPING")
+        self.assertEqual(closes, [("APP_SHIPPING", "11",
+                                   {"発送ステータス": "完了", "実行済み": "yes"})])
+
+    def test_guard_aborts_without_writes(self):
+        kt = self.kt()
+        kt.shipping["11"]["発送ステータス"] = "完了"
+        arm(self, kt)
+        result = run(resolve_group(self.group(), "3"))
+        self.assertEqual(result["status"], "aborted")
+        self.assertEqual(kt.created, [])
+        self.assertEqual(kt.updated, [])
+
+
 if __name__ == "__main__":
     unittest.main()
