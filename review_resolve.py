@@ -320,13 +320,60 @@ async def _resolve_valuation(group: ReviewGroup, case_record_id: str) -> dict:
             "items": results}
 
 
+# ── bank_ingest（S6-1 通帳・残高証明の案件紐付け不能）の確定ハンドラ ─────────
+
+async def _resolve_bank(group: ReviewGroup, case_record_id: str) -> dict:
+    """口座グループの確定: 要確認 detail の口座断片から財産行を upsert
+    （bank_ingest.upsert_account_row を共用・再OCRしない）→ App 30 クローズ"""
+    from bank_ingest import upsert_account_row  # 遅延 import
+
+    verified = []
+    for item in group.items:
+        record = await kintone.get_record(APP_SHIPPING, item.record_id)
+        status, executed = _v(record, "発送ステータス"), _v(record, "実行済み")
+        if status != STATUS_PENDING or executed != "no":
+            return {"status": "aborted",
+                    "reason": f"No.{item.record_id} が要確認ではなくなっています"
+                              f"（発送ステータス={status}・実行済み={executed}）。"
+                              "グループ全体を中止しました（書き込みなし）"}
+        account = item.detail.get("口座")
+        if not isinstance(account, dict) or not account.get("金融機関名"):
+            return {"status": "aborted",
+                    "reason": f"No.{item.record_id} に口座情報がありません"
+                              "（再構成不能・書き込みなし）"}
+        verified.append((item, account))
+
+    results = []
+    for item, account in verified:
+        pdf_bytes = b""
+        if item.file_keys:
+            try:
+                pdf_bytes = await kintone.download_file(
+                    APP_SHIPPING, item.file_keys[0])
+            except Exception as e:
+                print(f"[REVIEW_RESOLVE] 原本の取得に失敗（添付なしで続行）: {e}")
+        outcome = await upsert_account_row(
+            account, str(item.detail.get("書類形態") or "不明"), case_record_id,
+            pdf_bytes=pdf_bytes, filename=item.file_name or "残高証明.pdf")
+        await kintone.update_record(APP_SHIPPING, item.record_id, {
+            "発送ステータス": STATUS_DONE,
+            "実行済み": "yes",
+        })
+        results.append({"review_record_id": item.record_id, **outcome})
+        print(f"[REVIEW_RESOLVE] bank resolved review=No.{item.record_id} "
+              f"zaisan={outcome.get('zaisan_record_id')} case={case_record_id}")
+    return {"status": "resolved", "case_record_id": case_record_id,
+            "items": results}
+
+
 # ハンドラ登録辞書: トップキー → (確定ハンドラ, 必要な kintone env)。
-# 将来の zaisan_sync／S6 通帳はキー追加で載せる
+# 将来の zaisan_sync はキー追加で載せる
 RESOLVERS = {
     "registry_ingest": (_resolve_registry, (APP_SHIPPING, APP_FUDOSAN, APP_ZAISAN)),
     "koseki_ingest": (_resolve_koseki, (APP_SHIPPING, APP_KOSEKI_BOOK)),
     "valuation_ingest": (_resolve_valuation,
                          (APP_SHIPPING, APP_FUDOSAN, APP_ZAISAN)),
+    "bank_ingest": (_resolve_bank, (APP_SHIPPING, APP_ZAISAN)),
 }
 
 

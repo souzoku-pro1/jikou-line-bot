@@ -18,6 +18,7 @@ from hub.dispatch import router as hub_dispatch_router
 from dispatch_bot.router import router as dispatch_bot_router
 from koseki_ingest import router as koseki_ingest_router
 from registry_ingest import router as registry_ingest_router
+from bank_ingest import router as bank_ingest_router
 from sortation_ingest import router as sortation_ingest_router
 from valuation_ingest import router as valuation_ingest_router
 app.include_router(cloudsign_router)
@@ -26,6 +27,7 @@ app.include_router(hub_dispatch_router)
 app.include_router(dispatch_bot_router)
 app.include_router(koseki_ingest_router)
 app.include_router(registry_ingest_router)
+app.include_router(bank_ingest_router)
 app.include_router(sortation_ingest_router)
 app.include_router(valuation_ingest_router)
 
