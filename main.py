@@ -40,6 +40,7 @@ from chat_responder import (
     mark_approval_sent,
     send_line_push,
     save_to_chatlog,
+    ATTORNEY_LINE_USER_ID,
 )
 from claude_gateway import (
     ClaudeUnavailableError,
@@ -355,6 +356,38 @@ async def _process_line_event(reply_token: str, user_id: str, user_text: str) ->
         if not in_hearing_session:
             app21_record = await get_app21_record(user_id)
             if app21_record is not None:
+                # ── 対応モード「人対応」判定 ────────────────────────────────
+                # App21参照後・既存ルーティング分岐の手前で早期return する。
+                # 「人対応」の場合は顧客へ一切送信せず（自動応答・定型文・承認
+                # キュー投入を含め完全無言）、App28へ受信ログ＋管理者へLINE通知
+                # のみ行い、既存経路（受付ヒアリング／顧客対応Claude）には進めない。
+                # フィールド無し・空は「自動」とみなす（後方互換）。
+                response_mode = (
+                    app21_record.get("response_mode", {}).get("value", "") or "自動"
+                )
+                if response_mode == "人対応":
+                    display_name = (
+                        app21_record.get("顧客名", {}).get("value", "") or user_id
+                    )
+                    print(
+                        f"[HUMAN_MODE] user_id={user_id} mode=人対応 → silent early-return"
+                    )
+                    # (b) App28（チャットログ）に受信内容を記録（顧客へは送信しない）
+                    #     方向=user / 本文=user_text / userId=user_id / timestamp はApp28側で自動付与。
+                    #     category は App28 に新たな選択肢要件を持ち込まないよう空で記録する。
+                    await save_to_chatlog(user_id, "user", user_text, "", "no")
+                    # (c) 管理者へLINE push通知
+                    if ATTORNEY_LINE_USER_ID:
+                        await send_line_push(
+                            ATTORNEY_LINE_USER_ID,
+                            f"【人対応中】{display_name}：{user_text}",
+                        )
+                    else:
+                        print(
+                            "[HUMAN_MODE] ATTORNEY_LINE_USER_ID not set, admin notify skipped"
+                        )
+                    return
+
                 status = app21_record.get("status", {}).get("value", "")
                 routing = classify_routing(status)
                 print(f"[ROUTING] user_id={user_id} App21 status={status!r} routing={routing}")
