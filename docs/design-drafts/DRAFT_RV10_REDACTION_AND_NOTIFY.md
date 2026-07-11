@@ -98,8 +98,11 @@ Stripe の生レスポンス）。これらは **log/exception には常に完�
 - print 直書き禁止（logger 経由へ・移行期は許可リスト）。
 - 例外 detail への str(e)/resp.text 直渡し禁止（HTTPException 引数検査・P1-005b と同型）。
 - 顧客Bot token での業務通知禁止。
-- **`emit` を経由しない sink 書き込み検出**（logger/response/line への PII 変数直渡しを
-  ヒューリスティックで警告）。完全自動化は困難 → 【OPEN・owner=司令塔】強制 vs レビュー規律の線引き。
+- **【裁定済み・2026-07-12 司令塔】機械強制の範囲＝(a) sink 関数の import 境界
+  （`emit` を経由しない生 logger/response/line 書き込み経路の検出）＋(b) print /
+  resp.text / str(e) の直接出力の禁止、までをテストで固定する。PII 変数名検出
+  （変数名ヒューリスティック）は対象外＝レビュー規律で担保**（過検知/漏れが避けられず
+  機械強制に不適なため）。
 
 ## 6. 段階PR案（順序を再編: contract 先行）
 1. **PR-1: redaction contract（emit + policy + kind + §13.1禁止 + unknown/構造化=完全抑止 +
@@ -114,7 +117,8 @@ Stripe の生レスポンス）。これらは **log/exception には常に完�
 ## 7. OPEN・BLOCKED
 - 【OPEN・owner=大野】伏字水準（ログ/業務LINE の出し分け・既定=完全抑止）。
 - 【OPEN・owner=大野/司令塔】dead-man 外部主体と別 credential の実体。
-- 【OPEN・owner=司令塔】AST 機械強制の範囲（PII 変数検出の強制度）。
+- 【裁定済み・2026-07-12】AST 機械強制の範囲＝sink import 境界＋print/resp.text/str(e)
+  直接出力のテスト固定まで。PII 変数名検出は対象外（レビュー規律・§5）。
 - 【OPEN・owner=大野】**過去ログの裁定**（既に Railway 集約ログに残った PII の保持/削除方針・
   保持期間・アクセス権）。判断材料: ログ基盤の保持設定・法務。
 - BLOCKED_NEEDS_HUMAN: DISPATCHBOT_CHANNEL_ACCESS_TOKEN 本番投入有無（fallback 発火の現況）・
