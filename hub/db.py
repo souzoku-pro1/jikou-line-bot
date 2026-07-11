@@ -98,12 +98,23 @@ async def session_scope():
             raise
 
 
-def reset_for_tests() -> None:
-    """テスト専用: lazy キャッシュを破棄する（本番コードから呼ばない）。
-    async エンジンの dispose はイベントループが要るためテストでは参照破棄のみ"""
+def dispose_all() -> None:
+    """生成済みエンジンを全て破棄しキャッシュを空にする（CLI終了時・テスト用。
+    アプリの通常経路では呼ばない——エンジンはプロセス生存中共有が前提）。
+
+    AsyncEngine.dispose() はコルーチンだが、ここでは同期文脈（alembic CLI・
+    テスト teardown）から呼ばれるため、内包する sync_engine の dispose で
+    プールを同期的に閉じる（SQLAlchemy 公式の同期側 API・イベントループ不要）"""
     global _engine, _async_engine, _async_session_factory
     if _engine is not None:
         _engine.dispose()
+    if _async_engine is not None:
+        _async_engine.sync_engine.dispose()
     _engine = None
     _async_engine = None
     _async_session_factory = None
+
+
+def reset_for_tests() -> None:
+    """テスト専用の別名（意図の明示・本番コードから呼ばない）"""
+    dispose_all()

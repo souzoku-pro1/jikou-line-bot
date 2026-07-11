@@ -13,12 +13,11 @@ from logging.config import fileConfig
 from pathlib import Path
 
 from alembic import context
-from sqlalchemy import create_engine
 
 # リポジトリ直下を import path に（どこから起動しても hub.db を解決できるように）
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from hub.db import database_url  # noqa: E402
+from hub.db import database_url, dispose_all, get_engine  # noqa: E402
 
 config = context.config
 
@@ -42,16 +41,19 @@ def run_migrations_offline() -> None:
 
 
 def run_migrations_online() -> None:
-    """通常モード: DATABASE_URL へ接続して migration を適用する"""
-    engine = create_engine(database_url(), pool_pre_ping=True)
+    """通常モード: DATABASE_URL へ接続して migration を適用する。
+    エンジンは hub/db.py の一点集約から取得する（D4・独自 create_engine 禁止は
+    test_db_foundation_hardening の AST 検査で恒久固定）。CLI プロセス終了前に
+    dispose_all() で後片付けする（dispose の責任もこのモジュールが持つ）"""
     try:
+        engine = get_engine()
         with engine.connect() as connection:
             context.configure(connection=connection,
                               target_metadata=target_metadata)
             with context.begin_transaction():
                 context.run_migrations()
     finally:
-        engine.dispose()
+        dispose_all()
 
 
 if context.is_offline_mode():
