@@ -50,6 +50,7 @@ import hub.db as db  # noqa: E402
 from hub.inbound_event import (  # noqa: E402
     Base,
     InboundEvent,
+    JournalRowMissing,
     _utcnow,
     mark_done,
     mark_failed,
@@ -57,6 +58,7 @@ from hub.inbound_event import (  # noqa: E402
     stale_processing_minutes,
 )
 import main  # noqa: E402
+from unittest.mock import AsyncMock  # noqa: E402
 
 REPO = Path(__file__).parent
 
@@ -131,13 +133,15 @@ class TestStaleProcessingReclaim(_SqliteDbMixin):
         self.assertEqual(row["attempts"], 2)
         self.assertEqual(row["state"], "processing")
 
-    def test_recent_processing_is_skipped(self):
+    def test_recent_processing_is_in_progress(self):
+        """15分以内の processing への重複は in_progress
+        （P1-005c・D14で skipped_duplicate から変更・503側へ）"""
         _run(record_stripe_event(EVENT, PAYLOAD))
         db.reset_for_tests()
         self.age_claimed_at(minutes=5)  # 15分以内＝実行中とみなす
         outcome, pk = _run(record_stripe_event(EVENT, PAYLOAD))
         db.reset_for_tests()
-        self.assertEqual((outcome, pk), ("skipped_duplicate", None))
+        self.assertEqual((outcome, pk), ("in_progress", None))
 
     def test_null_claimed_at_is_treated_as_stale(self):
         """列追加前の行（claimed_at=NULL）は救済対象"""
@@ -167,7 +171,7 @@ class TestStaleProcessingReclaim(_SqliteDbMixin):
         (o1, _), (o2, pk2) = _run(_two())
         db.reset_for_tests()
         self.assertEqual(o1, "reprocess")           # 再claim成立（claimed_at更新）
-        self.assertEqual((o2, pk2), ("skipped_duplicate", None))  # 2件目は敗者
+        self.assertEqual((o2, pk2), ("in_progress", None))  # 2件目は敗者（D14で503側）
 
     def test_stale_minutes_env(self):
         self.assertEqual(stale_processing_minutes(), 15)  # 既定
@@ -188,24 +192,38 @@ class TestStaleProcessingReclaim(_SqliteDbMixin):
         self.assertEqual(outcome, "reprocess")
 
 
-class TestMarkRowcountWarning(_SqliteDbMixin):
-    def test_mark_done_missing_row_warns(self):
+class TestMarkRowcountFailClosed(_SqliteDbMixin):
+    """D16（P1-005c）: rowcount=0 は警告ログ+JournalRowMissing 例外（fail closed）"""
+
+    def test_mark_done_missing_row_raises(self):
         with self.assertLogs("hub.inbound_event", level="WARNING") as logs:
-            _run(mark_done(99999))
+            with self.assertRaises(JournalRowMissing):
+                _run(mark_done(99999))
         db.reset_for_tests()
         self.assertTrue(any("journal row missing" in m for m in logs.output))
 
-    def test_mark_failed_missing_row_warns(self):
+    def test_mark_failed_missing_row_raises(self):
         with self.assertLogs("hub.inbound_event", level="WARNING") as logs:
-            _run(mark_failed(99999, "RuntimeError"))
+            with self.assertRaises(JournalRowMissing):
+                _run(mark_failed(99999, "RuntimeError"))
         db.reset_for_tests()
         self.assertTrue(any("journal row missing" in m for m in logs.output))
 
 
 class _StatusClient:
-    """main.httpx.AsyncClient 差し替え: 指定ステータスの kintone 応答を返す"""
+    """main.httpx.AsyncClient 差し替え: 指定ステータスの kintone 応答を返す。
+    GET（D15 reconciliation）は get_records を返し、呼び出しを gets に記録"""
     status_code = 200
     posts: list = []
+    gets: list = []
+    get_records: list = []
+
+    @classmethod
+    def reset(cls):
+        cls.status_code = 200
+        cls.posts = []
+        cls.gets = []
+        cls.get_records = []
 
     def __init__(self, *a, **kw):
         pass
@@ -228,14 +246,20 @@ class _StatusClient:
             resp.raise_for_status.return_value = None
         return resp
 
+    async def get(self, url, headers=None, params=None):
+        _StatusClient.gets.append((url, params))
+        resp = MagicMock(status_code=200)
+        resp.raise_for_status.return_value = None
+        resp.json.return_value = {"records": list(_StatusClient.get_records)}
+        return resp
 
-class TestKintoneNon2xx(_SqliteDbMixin):
-    """D11(M02): kintone非2xxがdoneに固定される経路ゼロ"""
+
+class _HandlerMixin(_SqliteDbMixin):
+    """ハンドラレベルテストの共通土台（journal ON・kintoneモック）"""
 
     def setUp(self):
         super().setUp()
-        _StatusClient.status_code = 200
-        _StatusClient.posts = []
+        _StatusClient.reset()
         self.client = TestClient(main.app, raise_server_exceptions=False)
 
     def _post(self):
@@ -244,6 +268,17 @@ class TestKintoneNon2xx(_SqliteDbMixin):
              patch.object(main.httpx, "AsyncClient", _StatusClient):
             return self.client.post("/webhook/stripe", content=PAYLOAD,
                                     headers={"stripe-signature": "sig"})
+
+    def _delete_all(self):
+        async def _d():
+            async with db.session_scope() as session:
+                await session.execute(sa.delete(InboundEvent))
+        _run(_d())
+        db.reset_for_tests()
+
+
+class TestKintoneNon2xx(_HandlerMixin):
+    """D11(M02): kintone非2xxがdoneに固定される経路ゼロ"""
 
     def test_non_2xx_marks_failed_and_returns_5xx(self):
         for code in (400, 401, 429, 500):
@@ -258,13 +293,6 @@ class TestKintoneNon2xx(_SqliteDbMixin):
                 self.assertEqual(row["last_error"], "HTTPStatusError")
                 # 後片付け（次のsubTestのため行を消す）
                 self._delete_all()
-
-    def _delete_all(self):
-        async def _d():
-            async with db.session_scope() as session:
-                await session.execute(sa.delete(InboundEvent))
-        _run(_d())
-        db.reset_for_tests()
 
     def test_2xx_marks_done(self):
         _StatusClient.status_code = 200
@@ -292,6 +320,136 @@ class TestKintoneNon2xx(_SqliteDbMixin):
             r = self._post()
         self.assertEqual(r.status_code, 200)
         self.assertEqual(r.json(), {"status": "ok"})
+
+
+class TestInProgress503(_HandlerMixin):
+    """D14(H01): 実行中(15分以内)の重複配送は 503（Stripe再送を維持）"""
+
+    def test_recent_processing_returns_503_and_no_business(self):
+        _run(record_stripe_event(EVENT, PAYLOAD))  # 実行中の行を残置
+        db.reset_for_tests()
+        with patch.dict(os.environ, {"STRIPE_EVENT_JOURNAL_ENABLED": "1"}):
+            r = self._post()
+        self.assertEqual(r.status_code, 503)  # 200で飲まない
+        self.assertEqual(_StatusClient.posts, [])  # 業務処理は走らない
+        row = self.fetch_only_row()
+        self.assertEqual(row["state"], "processing")
+        self.assertEqual(row["attempts"], 2)  # 再送は記録される
+
+    def test_done_duplicate_still_200_skip(self):
+        with patch.dict(os.environ, {"STRIPE_EVENT_JOURNAL_ENABLED": "1"}):
+            r1 = self._post()
+            r2 = self._post()
+        self.assertEqual(r1.status_code, 200)
+        self.assertEqual(r2.status_code, 200)  # doneの重複は従来どおり200 skip
+        self.assertEqual(r2.json().get("journal"), "skipped_duplicate")
+
+
+class TestCrashRecoveryEndToEnd(_HandlerMixin):
+    """D14: INSERT後クラッシュ→503継続→15分超の再送でstale再claim→回収→done。
+    「INSERT後クラッシュ→再送200→再送停止→永久未処理」の経路が存在しないことの
+    end-to-end 固定（Codex提案テスト1）"""
+
+    def test_crash_then_retries_recover(self):
+        # INSERT直後にクラッシュした状況を再現（processing行が残置）
+        _run(record_stripe_event(EVENT, PAYLOAD))
+        db.reset_for_tests()
+        with patch.dict(os.environ, {"STRIPE_EVENT_JOURNAL_ENABLED": "1"}):
+            self.age_claimed_at(minutes=5)   # 5分後の再送
+            r1 = self._post()
+            self.assertEqual(r1.status_code, 503)   # まだ回収しない・再送は続く
+            self.assertEqual(_StatusClient.posts, [])
+            self.age_claimed_at(minutes=20)  # 15分窓を越えた再送
+            r2 = self._post()
+        self.assertEqual(r2.status_code, 200)
+        self.assertEqual(len(_StatusClient.posts), 1)  # 回収されて業務処理1回
+        row = self.fetch_only_row()
+        self.assertEqual(row["state"], "done")
+
+
+class TestReconciliation(_HandlerMixin):
+    """D15(H02): 再処理経路はPOST前にApp 21をStripe決済IDで照合"""
+
+    def _make_failed_row(self):
+        async def _flow():
+            _, pk = await record_stripe_event(EVENT, PAYLOAD)
+            await mark_failed(pk, "HTTPStatusError")
+        _run(_flow())
+        db.reset_for_tests()
+
+    def test_failed_reclaim_with_existing_record_skips_post(self):
+        """「kintone 500だがレコード作成済み」の再送で二重起票しない"""
+        self._make_failed_row()
+        _StatusClient.get_records = [{"$id": {"value": "7"}}]
+        with patch.dict(os.environ, {"STRIPE_EVENT_JOURNAL_ENABLED": "1"}):
+            r = self._post()
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json().get("journal"), "reconciled")
+        self.assertEqual(len(_StatusClient.gets), 1)   # 照合が走った
+        self.assertEqual(_StatusClient.posts, [])      # 二重起票しない
+        self.assertEqual(self.fetch_only_row()["state"], "done")
+
+    def test_failed_reclaim_without_existing_record_posts(self):
+        self._make_failed_row()
+        _StatusClient.get_records = []
+        with patch.dict(os.environ, {"STRIPE_EVENT_JOURNAL_ENABLED": "1"}):
+            r = self._post()
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(len(_StatusClient.gets), 1)
+        self.assertEqual(len(_StatusClient.posts), 1)  # 未起票なら従来どおりPOST
+        self.assertEqual(self.fetch_only_row()["state"], "done")
+
+    def test_stale_reclaim_also_reconciles(self):
+        _run(record_stripe_event(EVENT, PAYLOAD))
+        db.reset_for_tests()
+        self.age_claimed_at(minutes=20)
+        _StatusClient.get_records = [{"$id": {"value": "7"}}]
+        with patch.dict(os.environ, {"STRIPE_EVENT_JOURNAL_ENABLED": "1"}):
+            r = self._post()
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json().get("journal"), "reconciled")
+        self.assertEqual(_StatusClient.posts, [])
+        self.assertEqual(self.fetch_only_row()["state"], "done")
+
+    def test_initial_processing_does_not_pre_search(self):
+        """初回処理では事前検索なし（存在し得ない・レイテンシ増回避）"""
+        with patch.dict(os.environ, {"STRIPE_EVENT_JOURNAL_ENABLED": "1"}):
+            r = self._post()
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(_StatusClient.gets, [])       # GETは呼ばれない
+        self.assertEqual(len(_StatusClient.posts), 1)
+
+
+class TestJournalRowMissingHandler(_HandlerMixin):
+    """D16(M01): mark_doneのrowcount=0はfail closed→500"""
+
+    def test_row_vanished_after_business_returns_500(self):
+        async def _process_and_vanish(event):
+            # 業務処理成功後・mark_done前にjournal行が消えた異常を再現
+            async with db.session_scope() as session:
+                await session.execute(sa.delete(InboundEvent))
+        with patch.dict(os.environ, {"STRIPE_EVENT_JOURNAL_ENABLED": "1"}), \
+             patch.object(main, "_process_stripe_event",
+                          new=AsyncMock(side_effect=_process_and_vanish)):
+            r = self._post()
+        self.assertEqual(r.status_code, 500)  # 成功ACKにしない
+
+
+class TestLogsContainNoIdentifiers(_SqliteDbMixin):
+    """D17(L01): stale再claim警告ログはPKのみ（dedup_key・event ID なし）"""
+
+    def test_stale_reclaim_log_has_pk_only(self):
+        _run(record_stripe_event(EVENT, PAYLOAD))
+        db.reset_for_tests()
+        self.age_claimed_at(minutes=20)
+        with self.assertLogs("hub.inbound_event", level="WARNING") as logs:
+            outcome, _ = _run(record_stripe_event(EVENT, PAYLOAD))
+        db.reset_for_tests()
+        self.assertEqual(outcome, "reprocess")
+        joined = " ".join(logs.output)
+        self.assertIn("pk=", joined)
+        self.assertNotIn("evt_", joined)          # event ID を出さない
+        self.assertNotIn("stripe:", joined)       # dedup_key を出さない
 
 
 class TestMarkFailedCallPolicy(unittest.TestCase):

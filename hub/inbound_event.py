@@ -12,10 +12,14 @@
     - 既存 state=failed    → reprocess（claim して再実行。D7 の 5xx→Stripe再送と対）
     - 既存 state=processing:
         claimed_at が STALE_PROCESSING_MINUTES（env・既定15分）以内 →
-          skipped_duplicate（実行中の可能性・同時二重配送の二重処理防止）
+          **in_progress**（呼び出し側は 503 を返し Stripe の再送を維持する。
+          P1-005c・D14: 200 で飲むと「INSERT後クラッシュ→再送停止→永久未処理」
+          の経路ができるため。真に処理中なら完了後の再送が done→200 skip になり、
+          クラッシュ済みなら再送が続いて 15 分経過後の配送が stale 再claimで回収する
+          ——「回収を起動する主体 = Stripe 再送」が構造的に保たれる。
+          Stripe の再送は指数バックオフで最大3日間継続するため 15 分窓を確実に跨ぐ）
         claimed_at が超過 or NULL（列追加前の行）→ **stale とみなし再claim**
-          （P1-005b・RCF-M06 解消。クラッシュで processing に滞留した行が
-          永久に skip され続ける穴を塞ぐ）
+          （P1-005b・RCF-M06 解消）
   claim は全て条件付き UPDATE + RETURNING（並行競合で勝者は1つ）
 - D13 裁定（P1-005b票で確定）: 「未処理の闇損失」を「まれな二重処理」より
   重く見る。stale 再claim による業務処理の二重実行は「クラッシュ後の再送」に
@@ -103,8 +107,11 @@ async def record_stripe_event(event: dict, payload: bytes) -> tuple[str, int | N
     Returns:
         ("new", pk)                — 新規。業務処理へ進む
         ("reprocess", pk)          — failed の再送 or stale processing の再claim。
-                                      業務処理へ進む
-        ("skipped_duplicate", None) — 処理済み/実行中の重複。業務処理を走らせない
+                                      業務処理へ進む（呼び出し側は D15 の
+                                      reconciliation を先に行うこと）
+        ("skipped_duplicate", None) — done 済みの重複。業務処理を走らせない（200）
+        ("in_progress", None)       — 実行中（15分以内の processing）の重複。
+                                      呼び出し側は 503 で Stripe 再送を維持（D14）
     DB 到達不能・未設定は例外送出（D7: 上位で 5xx にする。ここで飲まない）
     """
     dedup_key = stripe_dedup_key(event, payload)
@@ -157,33 +164,45 @@ async def record_stripe_event(event: dict, payload: bytes) -> tuple[str, int | N
             .returning(InboundEvent.id))
         claimed_id = claimed.scalar_one_or_none()
         if claimed_id is not None:
+            # D17: ログは PK のみ（dedup_key・event ID を出さない）
             logger.warning(
-                "stale processing row reclaimed dedup_key=%s (RCF-M06)",
-                dedup_key)
+                "stale processing row reclaimed pk=%s (RCF-M06)", claimed_id)
             return "reprocess", claimed_id
 
-        # (3) done / 実行中(15分以内)の processing → 重複 skip（再送回数のみ記録）
-        await session.execute(
+        # (3) done / 実行中(15分以内)の processing → 再送回数を記録し状態で分岐
+        bumped = await session.execute(
             sa.update(InboundEvent)
             .where(InboundEvent.dedup_key == dedup_key)
-            .values(attempts=InboundEvent.attempts + 1))
-    return "skipped_duplicate", None
+            .values(attempts=InboundEvent.attempts + 1)
+            .returning(InboundEvent.state))
+        state = bumped.scalar_one_or_none()
+    if state == "done":
+        return "skipped_duplicate", None
+    # processing(15分以内) / 競合で状態が動いた直後 / 行消失 —— いずれも
+    # 503 側に倒す（D14: 200 で飲まない。Stripe 再送が次の判定機会を作る）
+    return "in_progress", None
+
+
+class JournalRowMissing(RuntimeError):
+    """journal 行の消失（起きてはならない異常・fail closed。P1-005c・D16）"""
 
 
 async def mark_done(event_pk: int) -> None:
+    """rowcount=0 は JournalRowMissing（D16: fail closed→上位が5xx）"""
     async with session_scope() as session:
         result = await session.execute(
             sa.update(InboundEvent)
             .where(InboundEvent.id == event_pk)
             .values(state="done", processed_at=_utcnow(), last_error=None))
         if result.rowcount == 0:
-            # journal行の消失は起きてはならない異常（分類のみ・値なし）
             logger.warning("mark_done: journal row missing pk=%s", event_pk)
+            raise JournalRowMissing(f"mark_done: pk={event_pk}")
 
 
 async def mark_failed(event_pk: int, error_class: str) -> None:
     """error_class は分類のみ（例外クラス名等・100字で切る）。
-    例外本文 str(e) を渡さないこと（call-policy を AST テストで機械強制）"""
+    例外本文 str(e) を渡さないこと（call-policy を AST テストで機械強制）。
+    rowcount=0 は JournalRowMissing（D16: fail closed→上位が5xx）"""
     async with session_scope() as session:
         result = await session.execute(
             sa.update(InboundEvent)
@@ -192,3 +211,4 @@ async def mark_failed(event_pk: int, error_class: str) -> None:
                     last_error=(error_class or "unknown")[:100]))
         if result.rowcount == 0:
             logger.warning("mark_failed: journal row missing pk=%s", event_pk)
+            raise JournalRowMissing(f"mark_failed: pk={event_pk}")

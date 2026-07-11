@@ -103,7 +103,8 @@ class _SqliteDbMixin(unittest.TestCase):
 
 class TestRecordStripeEvent(_SqliteDbMixin):
     def test_new_then_duplicate(self):
-        """D9: 同一 evt_id の2回目は skipped_duplicate・attempts が増える"""
+        """同一 evt_id の2回目: 実行中(processing)への重複は in_progress
+        （P1-005c・D14で skipped_duplicate から変更＝503側へ倒す）"""
         async def _flow():
             first = await record_stripe_event(EVENT, PAYLOAD)
             second = await record_stripe_event(EVENT, PAYLOAD)
@@ -112,7 +113,7 @@ class TestRecordStripeEvent(_SqliteDbMixin):
         db.reset_for_tests()
         self.assertEqual(o1, "new")
         self.assertIsNotNone(pk1)
-        self.assertEqual((o2, pk2), ("skipped_duplicate", None))
+        self.assertEqual((o2, pk2), ("in_progress", None))
         rows = self.fetch_rows()
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["attempts"], 2)
@@ -175,7 +176,7 @@ class TestRecordStripeEvent(_SqliteDbMixin):
 
 
 class _FakeAsyncClient:
-    """main.httpx.AsyncClient の差し替え（kintone POST を記録するだけ）"""
+    """main.httpx.AsyncClient の差し替え（kintone POST/GET を記録するだけ）"""
     posts: list = []
     fail_next: bool = False
 
@@ -193,7 +194,16 @@ class _FakeAsyncClient:
             _FakeAsyncClient.fail_next = False
             raise RuntimeError("kintone down (simulated)")
         _FakeAsyncClient.posts.append((url, json))
-        return MagicMock(status_code=200)
+        resp = MagicMock(status_code=200)
+        resp.raise_for_status.return_value = None
+        return resp
+
+    async def get(self, url, headers=None, params=None):
+        # D15 reconciliation（P1-005c）: 既存レコードなしを返す
+        resp = MagicMock(status_code=200)
+        resp.raise_for_status.return_value = None
+        resp.json.return_value = {"records": []}
+        return resp
 
 
 class TestStripeWebhookHandler(_SqliteDbMixin):
