@@ -64,6 +64,15 @@ async def _on_startup():
     start_healthcheck_scheduler()
 
 
+@app.on_event("shutdown")
+async def _on_shutdown():
+    """DBエンジンの後片付け（P1-005a・P1-004申し送り①）。
+    async文脈のため正規API await adispose_all() を使う（同期 dispose_all() は
+    ループ内で明示例外になる・D6）。DBを一度も使っていなければ何もしない（lazy）"""
+    from hub.db import adispose_all
+    await adispose_all()
+
+
 @app.get("/health")
 async def health():
     """起動確認・依存ライブラリのインポートチェック
@@ -1001,6 +1010,12 @@ async def scan(req: ScanRequest):
         "kintone_record_id": record_id,
         "extracted": extracted,
     }
+def _stripe_journal_enabled() -> bool:
+    """InboundEvent journal（P1-005a・D10）。既定OFF＝完全に従来挙動。
+    ONへの切替は env STRIPE_EVENT_JOURNAL_ENABLED=1（大野が投入）"""
+    return os.environ.get("STRIPE_EVENT_JOURNAL_ENABLED") == "1"
+
+
 @app.post("/webhook/stripe")
 async def stripe_webhook(request: Request):
     payload = await request.body()
@@ -1014,6 +1029,33 @@ async def stripe_webhook(request: Request):
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+    # ── InboundEvent journal（P1-005a・D9: 入口の関所。業務ロジックは不変）──
+    # DB到達不能時はここで例外→FastAPIが500を返し、Stripeの自動リトライに
+    # 委ねる（D7: 成功ACKを返さない・memory fallback禁止）
+    journal_pk = None
+    if _stripe_journal_enabled():
+        from hub.inbound_event import record_stripe_event
+        outcome, journal_pk = await record_stripe_event(event, payload)
+        if outcome == "skipped_duplicate":
+            print(f"[STRIPE] duplicate event skipped id={event.get('id')}")
+            return {"status": "ok", "journal": "skipped_duplicate"}
+
+    try:
+        await _process_stripe_event(event)
+    except Exception as e:
+        if journal_pk is not None:
+            from hub.inbound_event import mark_failed
+            await mark_failed(journal_pk, type(e).__name__)
+        raise
+
+    if journal_pk is not None:
+        from hub.inbound_event import mark_done
+        await mark_done(journal_pk)
+    return {"status": "ok"}
+
+
+async def _process_stripe_event(event: dict) -> None:
+    """既存のStripe業務処理（P1-005aで関数化のみ・ロジック不変）"""
     if event["type"] == "checkout.session.completed":
         session = event["data"]["object"]
         customer_name = session.get("customer_details", {}).get("name")
@@ -1038,5 +1080,3 @@ async def stripe_webhook(request: Request):
         }
         async with httpx.AsyncClient() as client:
             await client.post(kintone_url, headers=kintone_headers, json=kintone_data)
-
-    return {"status": "ok"}
