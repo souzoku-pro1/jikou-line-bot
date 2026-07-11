@@ -357,3 +357,36 @@ gh pr create --base main
 GET https://jikou-line-bot-production.up.railway.app/health
 → {"status": "ok", "deps": {...}}
 ```
+
+## DB migration（P1-004・PostgreSQL / alembic）
+
+原則（設計判断 D1〜D5・製品設計完全版 §14.4）:
+
+- **migration は明示コマンドのみ**。アプリ起動時の自動 upgrade は禁止
+  （main.py から alembic を import しない・startup にも結線しない）
+- 接続は `hub/db.py` に一点集約。`DATABASE_URL` 未設定でもアプリは正常起動する
+  （DB層は lazy 初期化。未設定のまま DB 機能に到達したときのみ明示エラー）
+- スキーマ変更は必ず migration ファイル経由（手動 CREATE TABLE 禁止）
+
+運用手順（本番・大野が実行）:
+
+```
+# 適用（未適用の migration を全て適用）
+railway run alembic upgrade head
+
+# 現在どこまで適用済みかの確認
+railway run alembic current
+
+# 1つ戻す（ロールバック）
+railway run alembic downgrade -1
+
+# 実行せずSQLを確認したいとき（接続せずスクリプト出力のみ）
+railway run alembic upgrade head --sql
+```
+
+開発（ローカル・DATABASE_URL を自分で設定した場合のみ）:
+
+```
+alembic revision -m "説明"   # 空の migration 雛形を生成
+alembic upgrade head          # 適用
+```
