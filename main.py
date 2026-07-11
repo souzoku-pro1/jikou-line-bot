@@ -1033,15 +1033,36 @@ async def stripe_webhook(request: Request):
     # DB到達不能時はここで例外→FastAPIが500を返し、Stripeの自動リトライに
     # 委ねる（D7: 成功ACKを返さない・memory fallback禁止）
     journal_pk = None
+    outcome = None
     if _stripe_journal_enabled():
         from hub.inbound_event import record_stripe_event
         outcome, journal_pk = await record_stripe_event(event, payload)
         if outcome == "skipped_duplicate":
-            print(f"[STRIPE] duplicate event skipped id={event.get('id')}")
+            print("[STRIPE] duplicate delivery skipped (already done)")
             return {"status": "ok", "journal": "skipped_duplicate"}
+        if outcome == "in_progress":
+            # D14（P1-005c・H01）: 実行中(15分以内)の重複は 200 で飲まず 503。
+            # 真に処理中→完了後の再送は done→200 skip。クラッシュ済み→再送が
+            # 続き 15 分経過後の配送が stale 再claimで回収（回収の起動主体=
+            # Stripe再送。指数バックオフで最大3日継続＝15分窓を確実に跨ぐ）
+            raise HTTPException(status_code=503,
+                                detail="event processing in progress")
 
     try:
+        if outcome == "reprocess":
+            # D15（P1-005c・H02）: 再処理経路は POST 前に App 21 を
+            # Stripe決済ID で照合（§8.7「ACK不明は再実行より先にreconciliation」）。
+            # 「kintone 500 だがレコード作成済み」の再送で二重起票しない
+            session_id = str(((event.get("data") or {}).get("object") or {})
+                             .get("id") or "")
+            if await _stripe_session_already_filed(session_id):
+                from hub.inbound_event import mark_done
+                await mark_done(journal_pk)
+                print("[STRIPE] reconciled: record already filed")
+                return {"status": "ok", "journal": "reconciled"}
         await _process_stripe_event(event)
+    except HTTPException:
+        raise
     except Exception as e:
         if journal_pk is not None:
             from hub.inbound_event import mark_failed
@@ -1052,6 +1073,23 @@ async def stripe_webhook(request: Request):
         from hub.inbound_event import mark_done
         await mark_done(journal_pk)
     return {"status": "ok"}
+
+
+async def _stripe_session_already_filed(session_id: str) -> bool:
+    """App 21 に Stripe決済ID 一致のレコードが既にあるか（D15 reconciliation）。
+    フィールドコード「Stripe決済ID」は _process_stripe_event の書き込みと同一。
+    初回処理では呼ばない（存在し得ないため・レイテンシ増を避ける・D15）。
+    kintone 到達不能はここで飲まず例外→failed→Stripe再送に委ねる"""
+    if not session_id:
+        return False
+    url = f"https://{os.environ.get('KINTONE_SUBDOMAIN')}.cybozu.com/k/v1/records.json"
+    headers = {"X-Cybozu-API-Token": os.environ.get("KINTONE_API_TOKEN")}
+    params = {"app": 21,
+              "query": f'Stripe決済ID = "{session_id}" limit 1'}
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(url, headers=headers, params=params)
+    resp.raise_for_status()
+    return bool(resp.json().get("records"))
 
 
 async def _process_stripe_event(event: dict) -> None:
@@ -1079,4 +1117,9 @@ async def _process_stripe_event(event: dict) -> None:
             }
         }
         async with httpx.AsyncClient() as client:
-            await client.post(kintone_url, headers=kintone_headers, json=kintone_data)
+            resp = await client.post(kintone_url, headers=kintone_headers,
+                                     json=kintone_data)
+        # D11（P1-005b・M02）: kintone非2xxを業務失敗として例外化。
+        # 「黙って成功扱い」を廃止する安全側一方向の変更（flag OFF時にも適用）。
+        # 例外→handlerが5xx→Stripe再送→journal ONならfailed行の再claimで回復
+        resp.raise_for_status()
