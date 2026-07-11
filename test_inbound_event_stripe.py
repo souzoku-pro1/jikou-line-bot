@@ -157,7 +157,8 @@ class TestRecordStripeEvent(_SqliteDbMixin):
                          {"id", "provider", "external_event_id", "caller_id",
                           "dedup_key", "payload_hash", "event_type",
                           "signature_result", "received_at", "state",
-                          "processed_at", "attempts", "last_error"})
+                          "processed_at", "attempts", "last_error",
+                          "claimed_at"})  # claimed_at は P1-005b（D12）で追加
 
     def test_dedup_key_without_event_id_falls_back_to_hash(self):
         key = stripe_dedup_key({"type": "x"}, b"body")

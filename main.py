@@ -1079,4 +1079,9 @@ async def _process_stripe_event(event: dict) -> None:
             }
         }
         async with httpx.AsyncClient() as client:
-            await client.post(kintone_url, headers=kintone_headers, json=kintone_data)
+            resp = await client.post(kintone_url, headers=kintone_headers,
+                                     json=kintone_data)
+        # D11（P1-005b・M02）: kintone非2xxを業務失敗として例外化。
+        # 「黙って成功扱い」を廃止する安全側一方向の変更（flag OFF時にも適用）。
+        # 例外→handlerが5xx→Stripe再送→journal ONならfailed行の再claimで回復
+        resp.raise_for_status()

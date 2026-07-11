@@ -10,9 +10,17 @@
   再送（dedup_key 衝突）の扱い:
     - 既存 state=done      → skipped_duplicate（業務処理を走らせない・attempts+1）
     - 既存 state=failed    → reprocess（claim して再実行。D7 の 5xx→Stripe再送と対）
-    - 既存 state=processing → skipped_duplicate（同時二重配送の二重処理防止を優先。
-      プロセスクラッシュで processing のまま残った行の救済（stale claim）は
-      本弾では未実装＝既知の限界。DEFER台帳 RCF-M06 として登録）
+    - 既存 state=processing:
+        claimed_at が STALE_PROCESSING_MINUTES（env・既定15分）以内 →
+          skipped_duplicate（実行中の可能性・同時二重配送の二重処理防止）
+        claimed_at が超過 or NULL（列追加前の行）→ **stale とみなし再claim**
+          （P1-005b・RCF-M06 解消。クラッシュで processing に滞留した行が
+          永久に skip され続ける穴を塞ぐ）
+  claim は全て条件付き UPDATE + RETURNING（並行競合で勝者は1つ）
+- D13 裁定（P1-005b票で確定）: 「未処理の闇損失」を「まれな二重処理」より
+  重く見る。stale 再claim による業務処理の二重実行は「クラッシュ後の再送」に
+  限定され（15分窓＋条件付きUPDATE）、kintone 側で同一決済IDの二重起票が
+  起きた場合も App 21 の Stripe決済ID 検索で人が気付ける。この方向にのみ倒す
 - DB 到達不能時は例外をそのまま送出（D7: 呼び出し側が 5xx を返し
   Stripe の自動リトライに委ねる。memory fallback 禁止）
 
@@ -20,13 +28,17 @@
 """
 
 import hashlib
-from datetime import datetime, timezone
+import logging
+import os
+from datetime import datetime, timedelta, timezone
 
 import sqlalchemy as sa
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from hub.db import session_scope
+
+logger = logging.getLogger("hub.inbound_event")
 
 
 class Base(DeclarativeBase):
@@ -59,6 +71,8 @@ class InboundEvent(Base):
     attempts: Mapped[int] = mapped_column(sa.Integer, nullable=False, default=1)
     # 失敗分類のみ（例外クラス名等）。本文・PII・vendor生値は入れない（RCF-M05流儀）
     last_error: Mapped[str | None] = mapped_column(sa.Text)
+    # 処理権を取った時刻（INSERT時・claim時に更新）。stale判定の基準（P1-005b・D12）
+    claimed_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
 
 
 def payload_sha256(payload: bytes) -> str:
@@ -73,16 +87,28 @@ def stripe_dedup_key(event: dict, payload: bytes) -> str:
     return f"stripe:sha256:{payload_sha256(payload)}"
 
 
+def stale_processing_minutes() -> int:
+    """processing を stale とみなす閾値（env STALE_PROCESSING_MINUTES・既定15分）"""
+    raw = os.environ.get("STALE_PROCESSING_MINUTES", "")
+    try:
+        minutes = int(raw)
+    except ValueError:
+        return 15
+    return minutes if minutes > 0 else 15
+
+
 async def record_stripe_event(event: dict, payload: bytes) -> tuple[str, int | None]:
     """Stripe event を journal に記録し、処理可否を返す。
 
     Returns:
         ("new", pk)                — 新規。業務処理へ進む
-        ("reprocess", pk)          — 前回 failed の再送。業務処理へ進む
-        ("skipped_duplicate", None) — 処理済み/処理中の重複。業務処理を走らせない
+        ("reprocess", pk)          — failed の再送 or stale processing の再claim。
+                                      業務処理へ進む
+        ("skipped_duplicate", None) — 処理済み/実行中の重複。業務処理を走らせない
     DB 到達不能・未設定は例外送出（D7: 上位で 5xx にする。ここで飲まない）
     """
     dedup_key = stripe_dedup_key(event, payload)
+    now = _utcnow()
     row = InboundEvent(
         provider="stripe",
         external_event_id=str(event.get("id") or "") or None,
@@ -92,6 +118,7 @@ async def record_stripe_event(event: dict, payload: bytes) -> tuple[str, int | N
         event_type=str(event.get("type") or "") or None,
         signature_result="verified",  # 呼び出し側は construct_event 成功後のみ来る
         state="processing",
+        claimed_at=now,
     )
     try:
         async with session_scope() as session:
@@ -102,19 +129,40 @@ async def record_stripe_event(event: dict, payload: bytes) -> tuple[str, int | N
     except IntegrityError:
         pass  # dedup_key 衝突 = 再送/重複。以降で状態に応じて分岐
 
+    stale_cutoff = now - timedelta(minutes=stale_processing_minutes())
     async with session_scope() as session:
-        # failed の行だけを claim（条件付きUPDATEで競合安全に再処理権を取る）
+        # (1) failed の行を claim（条件付きUPDATEで競合安全に再処理権を取る）
         claimed = await session.execute(
             sa.update(InboundEvent)
             .where(InboundEvent.dedup_key == dedup_key,
                    InboundEvent.state == "failed")
             .values(state="processing",
-                    attempts=InboundEvent.attempts + 1)
+                    attempts=InboundEvent.attempts + 1,
+                    claimed_at=now)
             .returning(InboundEvent.id))
         claimed_id = claimed.scalar_one_or_none()
         if claimed_id is not None:
             return "reprocess", claimed_id
-        # done / processing → 重複 skip（再送回数だけ記録に残す）
+
+        # (2) stale processing の再claim（D12/RCF-M06: クラッシュ滞留の救済。
+        #     claimed_at NULL は列追加前の行＝救済対象。15分以内は実行中とみなす）
+        claimed = await session.execute(
+            sa.update(InboundEvent)
+            .where(InboundEvent.dedup_key == dedup_key,
+                   InboundEvent.state == "processing",
+                   sa.or_(InboundEvent.claimed_at.is_(None),
+                          InboundEvent.claimed_at < stale_cutoff))
+            .values(attempts=InboundEvent.attempts + 1,
+                    claimed_at=now)
+            .returning(InboundEvent.id))
+        claimed_id = claimed.scalar_one_or_none()
+        if claimed_id is not None:
+            logger.warning(
+                "stale processing row reclaimed dedup_key=%s (RCF-M06)",
+                dedup_key)
+            return "reprocess", claimed_id
+
+        # (3) done / 実行中(15分以内)の processing → 重複 skip（再送回数のみ記録）
         await session.execute(
             sa.update(InboundEvent)
             .where(InboundEvent.dedup_key == dedup_key)
@@ -124,17 +172,23 @@ async def record_stripe_event(event: dict, payload: bytes) -> tuple[str, int | N
 
 async def mark_done(event_pk: int) -> None:
     async with session_scope() as session:
-        await session.execute(
+        result = await session.execute(
             sa.update(InboundEvent)
             .where(InboundEvent.id == event_pk)
             .values(state="done", processed_at=_utcnow(), last_error=None))
+        if result.rowcount == 0:
+            # journal行の消失は起きてはならない異常（分類のみ・値なし）
+            logger.warning("mark_done: journal row missing pk=%s", event_pk)
 
 
 async def mark_failed(event_pk: int, error_class: str) -> None:
-    """error_class は分類のみ（例外クラス名等・100字で切る）。本文を渡さない"""
+    """error_class は分類のみ（例外クラス名等・100字で切る）。
+    例外本文 str(e) を渡さないこと（call-policy を AST テストで機械強制）"""
     async with session_scope() as session:
-        await session.execute(
+        result = await session.execute(
             sa.update(InboundEvent)
             .where(InboundEvent.id == event_pk)
             .values(state="failed", processed_at=_utcnow(),
                     last_error=(error_class or "unknown")[:100]))
+        if result.rowcount == 0:
+            logger.warning("mark_failed: journal row missing pk=%s", event_pk)
