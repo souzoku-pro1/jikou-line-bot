@@ -100,29 +100,38 @@ def fetch_document(document_id: str) -> dict:
     return resp.json()
 
 
+# 失敗分類は閉集合の固定文字列のみ（RCF-M05: vendor由来の生値・本文・PII・token を
+# 分類文字列に埋め込まない。HTTP コードも下記の既知集合から選ぶ）
+_HTTP_CODE_CLASSES = {401: "api_http_401", 403: "api_http_403", 404: "api_http_404"}
+
+
 def _classify_fetch_error(exc: Exception) -> str:
-    """安全ログ用の失敗分類（識別子のみ。本文・PII・token・生レスポンスを含めない）"""
+    """安全ログ用の失敗分類（閉集合の固定文字列のみを返す）"""
     if isinstance(exc, requests.HTTPError):
         code = getattr(getattr(exc, "response", None), "status_code", None)
-        return f"api_http_{code}" if code else "api_http_error"
+        return _HTTP_CODE_CLASSES.get(code, "api_http_error")
     if isinstance(exc, requests.Timeout):
         return "api_timeout"
     if isinstance(exc, requests.RequestException):
         return "api_request_error"
-    return f"error_{type(exc).__name__}"
+    return "unexpected_error"
 
 
 def verify_completed_document(document_id: str) -> tuple[dict | None, str]:
-    """書類詳細 API で webhook の真正性を確認する（fail-closed 化・P0B-002）。
+    """書類詳細 API で webhook の真正性を確認する（fail-closed 化・P0B-002/003）。
 
     戻り値: (書類dict, "") 成功 ／ (None, 失敗分類) 失敗。
     失敗と判定する条件（いずれも受任遷移させない）:
       - fetch_document の例外（HTTPエラー・タイムアウト・接続失敗ほか）
       - レスポンスが dict でない（想定外レスポンス）
-      - レスポンスの id が webhook の documentID と一致しない（id キーがある場合）
+      - レスポンスに id が無い（RCF-H01: id を照合できないものは安全側で失敗。
+        CloudSign API が id を返さない仕様だと実機確認できた場合のみ、
+        その根拠と実レスポンス fixture をテストに固定した上で別途緩める）
+      - レスポンスの id が webhook の documentID と一致しない
       - レスポンスの status が STATUS_COMPLETED(2) でない
         ※書類詳細 API の status 値は webhook と同体系（:50-53 の注のとおり
           実環境/サンドボックスで要確認）。キー欠落も安全側で失敗扱いにする
+    失敗分類は固定文字列のみ（RCF-M05）。
     """
     try:
         doc = fetch_document(document_id)
@@ -131,10 +140,12 @@ def verify_completed_document(document_id: str) -> tuple[dict | None, str]:
     if not isinstance(doc, dict):
         return None, "unexpected_response_type"
     doc_id = doc.get("id")
-    if doc_id is not None and str(doc_id) != str(document_id):
+    if doc_id is None:
+        return None, "document_id_missing"
+    if str(doc_id) != str(document_id):
         return None, "document_id_mismatch"
     if doc.get("status") != STATUS_COMPLETED:
-        return None, f"status_mismatch_{doc.get('status')}"
+        return None, "status_mismatch"
     return doc, ""
 
 
@@ -269,7 +280,17 @@ def handle_webhook(secret: str, payload: dict) -> tuple[int, dict]:
             return 200, {"ok": True, "state": "verification_failed"}
 
         title = doc.get("title", "")
-        update_kintone_status(document_id, "受任")
+        if not update_kintone_status(document_id, "受任"):
+            # RCF-M04: 照合は成功したが kintone に一致案件がない（未更新）。
+            # 受任は成立していないので「締結完了」通知は出さず、要人手確認を
+            # 業務チャネルで警報する（顧客チャネルへは出さない）
+            logger.warning("CloudSign照合成功だがkintone未更新 doc=%s", document_id)
+            notify_business_line(
+                "【CloudSign照合成功・kintone未更新・要人手確認】\n"
+                f"documentID: {document_id}\n"
+                "documentID に一致する案件レコードが見つからず、受任へ更新できて"
+                "いません。kintone の cloudsign_document_id を確認してください。")
+            return 200, {"ok": True, "state": "kintone_update_failed"}
         notify_line(f"【締結完了】{title}\ndocumentID: {document_id}")
         return 200, {"ok": True, "state": "processed"}
 

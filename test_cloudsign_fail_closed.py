@@ -92,7 +92,8 @@ class TestVerificationFailureFailClosed(unittest.TestCase):
         ("接続失敗", {"side_effect": requests.ConnectionError()}),
         ("想定外例外", {"side_effect": ValueError("boom")}),
         ("status不一致", {"return_value": {"id": "doc1", "status": 1}}),
-        ("statusキー欠落", {"return_value": {"title": "t"}}),
+        ("statusキー欠落", {"return_value": {"id": "doc1", "title": "t"}}),
+        ("idキー欠落", {"return_value": {"title": "t", "status": 2}}),
         ("documentID不整合", {"return_value": {"id": "other", "status": 2}}),
         ("非dictレスポンス", {"return_value": ["unexpected"]}),
     ]
@@ -116,14 +117,17 @@ class TestVerificationFailureFailClosed(unittest.TestCase):
                 self.assertIn("失敗分類", msg)
 
     def test_failure_reason_classification(self):
+        """失敗分類は閉集合の固定文字列（RCF-M05: vendor生値を埋め込まない）"""
         cases = [
             ({"side_effect": _http_error(404)}, "api_http_404"),
             ({"side_effect": _http_error(401)}, "api_http_401"),
+            ({"side_effect": _http_error(500)}, "api_http_error"),  # 既知集合外は縮退
             ({"side_effect": requests.Timeout()}, "api_timeout"),
             ({"side_effect": requests.ConnectionError()}, "api_request_error"),
-            ({"side_effect": ValueError("boom")}, "error_ValueError"),
-            ({"return_value": {"id": "doc1", "status": 1}}, "status_mismatch_1"),
-            ({"return_value": {"title": "t"}}, "status_mismatch_None"),
+            ({"side_effect": ValueError("boom")}, "unexpected_error"),
+            ({"return_value": {"id": "doc1", "status": 1}}, "status_mismatch"),
+            ({"return_value": {"id": "doc1", "title": "t"}}, "status_mismatch"),
+            ({"return_value": {"title": "t", "status": 2}}, "document_id_missing"),
             ({"return_value": {"id": "other", "status": 2}}, "document_id_mismatch"),
             ({"return_value": ["unexpected"]}, "unexpected_response_type"),
         ]
@@ -134,19 +138,52 @@ class TestVerificationFailureFailClosed(unittest.TestCase):
                 self.assertIsNone(doc)
                 self.assertEqual(reason, expected_reason)
 
+    def test_failure_reason_never_contains_vendor_status_value(self):
+        """RCF-M05: vendor が返した status 実値（例: 99999）が分類文字列に漏れない"""
+        with patch.object(mod, "fetch_document",
+                          return_value={"id": "doc1", "status": 99999}):
+            doc, reason = mod.verify_completed_document("doc1")
+        self.assertIsNone(doc)
+        self.assertEqual(reason, "status_mismatch")
+        self.assertNotIn("99999", reason)
+
     def test_success_verification_returns_doc(self):
         with patch.object(mod, "fetch_document", return_value=dict(COMPLETED_DOC)):
             doc, reason = mod.verify_completed_document("doc1")
         self.assertEqual(reason, "")
         self.assertEqual(doc["title"], "委任契約書")
 
-    def test_id_key_absent_is_not_mismatch(self):
-        """書類詳細に id キーが無い場合は id 照合をスキップ（status 照合のみ）"""
+    def test_id_key_absent_is_fail_closed(self):
+        """書類詳細に id キーが無い場合も照合失敗（RCF-H01: fail-closed）。
+        CloudSign API が id を返さない仕様と実機確認できた場合のみ、
+        実レスポンス fixture を固定した上で別途緩める"""
         with patch.object(mod, "fetch_document",
                           return_value={"title": "t", "status": 2}):
             doc, reason = mod.verify_completed_document("doc1")
-        self.assertEqual(reason, "")
-        self.assertIsNotNone(doc)
+        self.assertIsNone(doc)
+        self.assertEqual(reason, "document_id_missing")
+
+
+class TestKintoneUpdateFailed(unittest.TestCase):
+    """RCF-M04: 照合成功だが kintone に一致レコードなし（update_kintone_status=False）
+    → 受任は成立していないので「締結完了」通知を出さず、要人手確認を業務チャネルで警報"""
+
+    def test_no_match_alerts_and_does_not_notify_customer_channel(self):
+        with patch.object(mod, "fetch_document", return_value=dict(COMPLETED_DOC)), \
+             patch.object(mod, "update_kintone_status", return_value=False) as mock_update, \
+             patch.object(mod, "notify_line") as mock_notify, \
+             patch.object(mod, "notify_business_line") as mock_biz:
+            code, body = mod.handle_webhook(SECRET, dict(COMPLETED_EVENT))
+
+        self.assertEqual(code, 200)
+        self.assertEqual(body.get("state"), "kintone_update_failed")  # processed とも
+        # verification_failed とも識別できる固有の state
+        mock_update.assert_called_once_with("doc1", "受任")
+        mock_notify.assert_not_called()   # 「締結完了」通知は出さない
+        mock_biz.assert_called_once()     # 要人手確認の業務警報（顧客チャネルへは出さない）
+        msg = mock_biz.call_args.args[0]
+        self.assertIn("doc1", msg)
+        self.assertIn("kintone未更新", msg)
 
 
 class TestRepeatedFailedEventsNeverTransition(unittest.TestCase):
