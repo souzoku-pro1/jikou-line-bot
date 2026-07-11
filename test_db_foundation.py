@@ -132,12 +132,37 @@ class TestNoAutoMigrationPolicy(unittest.TestCase):
                          "アプリ本体から alembic を import しない（D2: "
                          "migration は明示コマンドのみ）")
 
-    def test_main_does_not_import_hub_db(self):
-        """main.py は hub.db に触れない（D3: 起動経路にDB層を入れない）。
-        P1-005 で結線する際はこのテストを設計判断つきで更新すること"""
+    def test_main_touches_hub_db_only_in_allowed_forms(self):
+        """main.py と hub.db の境界（P1-005a で設計判断つき更新）。
+
+        旧仕様（P1-004）: main.py は hub.db に一切触れない。
+        新仕様（P1-005a）: 次の2形のみ許可——
+          1. shutdown hook 内の `from hub.db import adispose_all`（P1-004申し送り①）
+          2. hub.inbound_event 経由の利用（journal。hub.db を直接名指ししない）
+        引き続き禁止: get_engine / get_async_engine / session_scope /
+        dispose_all（同期）を main.py が直接使うこと（D3/D4/D6）。
+        起動経路（import時・startup）でDBに触れない性質は
+        「DATABASE_URL なしで全suiteが通る」ことでも担保される"""
         src = (REPO / "main.py").read_text(encoding="utf-8")
-        self.assertNotIn("hub.db", src)
-        self.assertNotIn("from hub import db", src)
+        tree = ast.parse(src)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module == "hub.db":
+                names = {a.name for a in node.names}
+                self.assertEqual(names, {"adispose_all"},
+                                 f"main.py:{node.lineno} hub.db からの import は "
+                                 f"adispose_all のみ許可: {names}")
+        for banned in ("get_engine", "get_async_engine", "session_scope"):
+            self.assertNotIn(banned, src,
+                             f"main.py が {banned} を直接使うのは禁止（D4）")
+        # 同期 dispose_all の直接呼び出し禁止（adispose_all は許可・D6）
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                f = node.func
+                name = f.id if isinstance(f, ast.Name) else \
+                    f.attr if isinstance(f, ast.Attribute) else ""
+                self.assertNotEqual(name, "dispose_all",
+                                    f"main.py:{node.lineno} 同期 dispose_all は"
+                                    "禁止（shutdownは await adispose_all・D6）")
 
     def test_alembic_ini_stays_ascii(self):
         """alembic.ini は locale エンコーディングで読まれる（Windows=cp932）ため
@@ -147,11 +172,34 @@ class TestNoAutoMigrationPolicy(unittest.TestCase):
 
 
 class TestAlembicScaffold(unittest.TestCase):
-    def test_single_baseline_revision(self):
-        """D5: 現時点の revision は空 baseline の1本のみ"""
-        files = [p for p in (REPO / "alembic" / "versions").glob("*.py")]
-        self.assertEqual(len(files), 1, f"想定外のrevision: {files}")
-        self.assertIn("baseline", files[0].name)
+    def test_revisions_form_single_linear_chain_from_baseline(self):
+        """migration履歴の健全性（P1-005a で D5 の「1本のみ」pin から更新）:
+        root は空 baseline ただ1つ・分岐なしの一直線であること
+        （複数head・迷子revisionの混入を検知する）"""
+        import re
+        revs = {}
+        for p in (REPO / "alembic" / "versions").glob("*.py"):
+            src = p.read_text(encoding="utf-8")
+            rev = re.search(r"^revision: str = '([0-9a-f]+)'", src, re.M)
+            down = re.search(
+                r"^down_revision: .*? = (None|'([0-9a-f]+)')", src, re.M)
+            self.assertIsNotNone(rev, f"{p.name}: revision 不明")
+            self.assertIsNotNone(down, f"{p.name}: down_revision 不明")
+            revs[rev.group(1)] = (down.group(2), p.name)
+        roots = [(r, name) for r, (down, name) in revs.items() if down is None]
+        self.assertEqual(len(roots), 1, f"root は1つのみ: {roots}")
+        self.assertIn("baseline", roots[0][1])
+        # 分岐なし（同じ down_revision を持つ revision が2つ以上ない）
+        downs = [down for down, _ in revs.values() if down is not None]
+        self.assertEqual(len(downs), len(set(downs)),
+                         "migration履歴が分岐している（headが複数）")
+        # 全revisionが root から辿れる一直線
+        children = {down: r for r, (down, _) in revs.items()}
+        chain, cur = 1, roots[0][0]
+        while cur in children:
+            cur = children[cur]
+            chain += 1
+        self.assertEqual(chain, len(revs), "rootから辿れない迷子revisionがある")
 
     def test_offline_upgrade_generates_sql(self):
         """scaffold 一式（ini→env.py→versions）が実DB無しで通ることの煙テスト。

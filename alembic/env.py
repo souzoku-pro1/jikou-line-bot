@@ -18,14 +18,15 @@ from alembic import context
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from hub.db import database_url, dispose_all, get_engine  # noqa: E402
+from hub.inbound_event import Base  # noqa: E402（ORM metadata の起点・P1-005a）
 
 config = context.config
 
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-# P1-005 で models の metadata に差し替える（autogenerate 用）
-target_metadata = None
+# autogenerate 用（モデルを追加したら hub/inbound_event.Base を継承させること）
+target_metadata = Base.metadata
 
 
 def run_migrations_offline() -> None:
