@@ -8,3 +8,7 @@ requests
 stripe
 reportlab
 pymupdf
+# ── DB基盤（P1-004・O-01 PostgreSQL）。追加分のみ==固定（既存行の固定化は別タスク）──
+sqlalchemy==2.0.51
+alembic==1.18.5
+psycopg[binary]==3.3.4
