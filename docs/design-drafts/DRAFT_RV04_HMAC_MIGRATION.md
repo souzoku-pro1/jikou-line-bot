@@ -1,18 +1,41 @@
-# DRAFT: RV-04 query token → header HMAC 移行設計
+# DRAFT: RV-04 query token → header HMAC 移行設計（v2・Codexレビュー反映）
 
 > **status: DRAFT（司令塔裁定待ち）・実装開始根拠にしない。**
-> 対象SHA 7b03069 の実物調査に基づく叩き台。確定は次セッションの司令塔裁定。
+> 対象SHA 7b03069 の実物調査に基づく叩き台。R-P1-007-drafts-v2 の所見（BLOCKER2/HIGH11/
+> MEDIUM12/LOW3 全ACCEPT・REJECT0）を反映した改訂版。確定は次セッションの司令塔裁定。
+> **OPEN 項目は仮決めせず OPEN ラベル＋owner を明記する。**
 
-前提資料: docs/evidence/ENDPOINT_TRUST_BOUNDARY_INVENTORY.md（境界B）・製品設計完全版v2.4 §12.10。
+前提資料: docs/evidence/ENDPOINT_TRUST_BOUNDARY_INVENTORY.md（境界B）・製品設計完全版v2.4 §12.4/§12.10。
+
+---
+
+## ★共有節: 実装順序骨子（M11・3 DRAFT 共通）
+
+RV04/RV10/App36 の重量タスクは相互依存する。M11 として全体を8段階で並べる（3 DRAFT に
+同一掲載）。各段の前提を跨がない順にする:
+
+1. **redaction contract 確定**（RV10 §1・sink/audience policy と禁止カテゴリの確定。
+   OPEN の伏字水準は大野裁定で埋める）— 以降のログ設計の土台。
+2. **RV10 S1 切替＋notify fail-closed**（顧客Bot への機微 PII 漏れを最優先で停止）。
+3. **RV04 multipart body-hash PoC**（v1 contract 成立条件・別票）。GAS の UrlFetchApp で
+   生body の SHA-256 が再現できることを実証してから canonical を凍結。
+4. **RV04 GAS群 header HMAC 実装＋dual-accept Phase A**（署名存在時 fallback 禁止＝downgrade防止）。
+5. **RV10 S2/S3/S4 段階解消＋AST 機械強制**（body最小化・print全廃・例外分類化）。
+6. **App36 DerivationRun（immutable）＋App36 projection 起票（R4-3b）**。
+7. **App37 割付＋TemplateVersion registry**（成果物生成 Phase 5 の前提）。
+8. **dead-man 監視＋RV04 dual-accept 廃止（Phase C）＋kintone webhook 代替（K選択後）**。
+
+OPEN（各段の着手前に大野裁定が要る）: K選択（RV04 §3）・PII 出し分け水準（RV10 §1）・
+凍結表追補（App36 放棄写像）・過去ログ裁定（RV10）。
+
+---
 
 ## 0. 問題
 境界B の8本は共有 token を **URL query/path** に載せる（`?token=`・`/{secret}`）。
-アクセスログ・リファラ・プロキシ・GASエディタ履歴で漏れうる。署名（HMAC）＋
-timestamp＋nonce へ移行し、replay・path転用・body改変・期限外を防ぐ。
+アクセスログ・リファラ・プロキシ・GASエディタ履歴で漏れうる。署名（HMAC）＋timestamp＋
+nonce へ移行し、replay・path転用・body改変・期限外・downgrade を防ぐ。
 
 ## 1. ★最重要の分岐: 呼出し元がヘッダを付けられるか
-
-実物調査の結論（対象8本を2群に分ける）:
 
 | endpoint | 呼出し元 | カスタムヘッダ | HMAC移行 |
 |---|---|---|---|
@@ -21,112 +44,135 @@ timestamp＋nonce へ移行し、replay・path転用・body改変・期限外を
 | /valuation/ingest | GAS(予定) | 可 | ○ |
 | /bank/ingest | GAS(予定) | 可 | ○ |
 | /sortation/ingest | GAS | 可 | ○ |
-| /webhook/kintone/approval | **kintone webhook** | **不可** | △ 代替（後述） |
+| /webhook/kintone/approval | **kintone webhook** | **不可** | △ 代替（§3） |
 | /hub/dispatch | **kintone webhook** | **不可** | △ 代替 |
 | /document/{secret} | **kintone webhook** | **不可** | △ 代替 |
 
-**kintone のアプリWebhook はカスタムヘッダを付けられない**（固定POSTのみ）。
-→ HMAC-in-header は kintone webhook 由来の3本には**適用不能**。分岐して代替設計にする。
+**kintone のアプリWebhook はカスタムヘッダを付けられない**（固定POSTのみ）→ HMAC-in-header は
+kintone webhook 由来の3本には**適用不能**。§3 の代替に分岐。
 
 ## 2. GAS群（5本）: header HMAC v1
 
-### 2.1 canonical encoding（署名対象文字列 v1）
-改行 `\n` 連結・順序固定:
+### 2.1 canonical encoding（BLOCKER: 曖昧さの排除）
+各フィールドを **length-prefix 化**して連結する（区切り文字の注入・境界曖昧を排除）:
 ```
-v1
-<key_id>
-<caller_id>
-<method(大文字)>
-<normalized_path>        # クエリ除去・末尾スラッシュ正規化。例 /koseki/ingest
-<timestamp(UNIX秒)>
-<nonce(128bit hex)>
-<content_sha256(hex)>    # リクエストbody生バイトのSHA-256
+canonical = concat_for each field f in ORDER:
+              ascii(len(utf8(f))) || ":" || utf8(f) || "\n"
+ORDER = [ "v1", key_id, caller_id, method_upper, normalized_path,
+          timestamp_str, nonce_hex, content_sha256_hex ]
 ```
-署名 = `hex(HMAC_SHA256(key=<caller別secret>, msg=<上記canonical>))`。
+- 代替（length-prefixが GAS で困難な場合）: 各フィールドを**厳格文字集合に限定**
+  （key_id/caller_id=`[a-z0-9-]`、method=`[A-Z]`、path=正規化後の`[a-z0-9/._-]`、
+  timestamp=`[0-9]`、nonce/hash=`[0-9a-f]`）した上で `\n` 連結。区切り注入不能を集合で保証。
+- **normalized_path**: クエリ除去・末尾スラッシュ除去・小文字化・`.` `..` 排除（path転用防止）。
+- 署名 = `hex(HMAC_SHA256(key=<key_id が解決する secret>, msg=utf8(canonical)))`。
+- **cross-language テストベクトル節（HIGH）**: server(Python)・client(GAS/JS)双方で同一
+  canonical→同一署名になることを、固定入力→固定署名の golden ベクトル（最低5本・
+  ASCII/日本語ファイル名/空body/multipart/境界長）で相互検証する。これを v1 contract の一部にする。
 
 ### 2.2 送信ヘッダ
 ```
 X-Sig-Version: v1
-X-Sig-Key-Id: <key_id>          # secretのローテーション識別（例 koseki-2026-07）
-X-Sig-Caller: <caller_id>       # gas-koseki 等
+X-Sig-Key-Id: <key_id>
+X-Sig-Caller: <caller_id>
 X-Sig-Timestamp: <unix秒>
 X-Sig-Nonce: <128bit hex>
 X-Sig-Content-SHA256: <hex>
 X-Sig-Signature: <hex>
 ```
-※ multipart（file+drive_file_id）でも content_sha256 は**生bodyバイト全体**を対象にする
-（GAS側は `blob.getBytes()` を含む最終payloadのhashを取る必要＝GAS実装で要検証）。
 
-### 2.3 サーバ検証順（fail-closed）
-1. version==v1 / 必須ヘッダ全存在（欠落=401）
-2. key_id→secret解決（unknown key=401・**keyストアはenv `SIG_KEY_<KEY_ID>` 案**）
-3. `abs(now - timestamp) <= SKEW`（既定300秒・env `SIG_MAX_SKEW_SEC`）超過=401
-4. content_sha256 が実body hashと一致（body改変検知・不一致=401）
-5. 署名再計算＝`compare_digest`（不一致=401）
-6. **nonce一回性**（後述）を満たす（再利用=409 or 401）
-すべて通れば処理。既存の verify_token（query）は §4 の dual-accept 期間のみ併存。
+### 2.3 サーバ検証順（fail-closed・downgrade防止）
+1. **署名ヘッダ（X-Sig-*）が1つでも存在すれば署名経路として扱い、query token への
+   fallback を禁止**（HIGH: downgrade 攻撃防止）。version!=v1 や欠落は 401（旧経路に落ちない）。
+2. key_id を key registry（§2.5）で解決（unknown/expired/revoked=401）。
+3. caller_id と key registry の `caller` 一致（不一致=401）。
+4. method / normalized_path が registry の `allowed_methods`/`allowed_paths` に含まれる（外=403）。
+5. `now - SKEW <= timestamp <= now + SKEW`（既定SKEW=300秒・env `SIG_MAX_SKEW_SEC`）超過=401。
+6. content_sha256 が実body hash と一致（body改変検知・不一致=401）。
+7. 署名再計算＝`compare_digest`（不一致=401）。
+8. **nonce 一回性**（§2.4）。再利用=409。
+全通過で処理。query token 受理は §4 dual-accept 期間中、かつ**署名ヘッダ不在時のみ**併存。
 
-### 2.4 nonce 一回使用のサーバ側実装（inbound_event 流用の可否）
-- **案A（流用）**: `inbound_event` に `provider="sig:<caller>"` / `dedup_key="nonce:<nonce>"`
-  で INSERT、UNIQUE衝突=replay。既存の journal 基盤（P1-005a）をそのまま使え、
-  滞留監視・TTLも共通化できる。ただし ingest は現状 journal を通していない（Stripeのみ）。
-- **案B（専用）**: `signature_nonce(nonce PK, caller, seen_at)` を新テーブルにし、
-  `seen_at < now-SKEW` の行を定期削除。責務が明確・inbound_eventの意味が濁らない。
-- **叩き台の推奨**: 案B（nonceは署名検証の関心事で、業務イベントjournalとは別レイヤ。
-  ただしテーブル追加コスト）。timestamp SKEW窓（5分）内のnonceだけ保持すれば良いので小さい。
-- 【論点1】案A/B の選択（司令塔裁定）。
+### 2.4 nonce 一回使用（HIGH: 保持期限の明確化）
+- **保持期限 = 署名 timestamp + SKEW**（受理し得る最遅時刻）まで。この時刻を過ぎた nonce は
+  そもそも §2.3-5 で timestamp 超過 401 になるため、期限切れ nonce 行は安全に削除できる。
+  → nonce 行に `expires_at = timestamp + SKEW` を持たせ、`expires_at < now` を定期削除。
+- **案A（inbound_event 流用）** / **案B（専用 signature_nonce テーブル）**。
+  - 叩き台推奨: **案B**（nonce は署名検証レイヤの関心事・inbound_event の業務意味を濁さない。
+    保持窓が SKEW=5分と小さくテーブルも小さい）。schema 案:
+    `signature_nonce(nonce TEXT PK, key_id TEXT, caller TEXT, seen_at ts, expires_at ts)`。
+    INSERT の UNIQUE 衝突＝replay→409。
+- 【OPEN・owner=大野/司令塔】案A/B（判断材料: inbound_event の運用一体化 vs レイヤ分離）。
 
-## 3. kintone webhook群（3本）: 代替設計
+### 2.5 key registry モデル（BLOCKER: 鍵管理の構造化）
+key_id 単位で以下を持つ（保管先は env or 将来の secret manager・§7）:
+```
+key_id        : 一意・再利用禁止（rotation で新IDを発番）
+secret        : HMAC 鍵（値はログ/例外に出さない）
+caller        : この鍵を使える caller_id（例 gas-koseki）
+allowed_methods: {POST}
+allowed_paths : {/koseki/ingest} 等（caller が叩いてよい path 集合）
+not_before    : 有効化時刻
+expires_at    : 失効時刻
+status        : active / retiring / revoked
+```
+- **rotation lifecycle（HIGH）**: (1) 新 key_id を `active`・not_before 設定で追加 →
+  (2) GAS を新 key_id に切替 → (3) 旧 key_id を `retiring`（受理はするが警告ログ）→
+  (4) 一定期間後 `revoked`（受理停止）。**key_id は失効後も再利用しない**（過去署名の
+  取り違え防止）。rollback は「新 key_id を revoked にし旧を active に戻す」で対応。
+- 失効/revoked 鍵での署名は 401（reason=`key_revoked`）。
 
-ヘッダ不可のため HMAC不可。3案:
+## 3. kintone webhook群（3本）: 代替設計（採用条件つき）
 
-- **案K1（URL secret強化＋rotation運用）**: 現状の path/query secret を「長いランダム＋
-  key_id埋め込み（/document/{key_id}.{secret}）」にし、定期rotationを runbook 化。
-  署名ではないので replay/body改変は防げないが、kintone→自サーバのTLS内でIP的にも
-  限定され、**現実的な最小改善**。
-- **案K2（中継GAS化）**: kintone webhook を直接受けず、GAS Web App or 中継を挟んで
-  署名を付け直す。到達性は増えるが構成が複雑・障害点増。
-- **案K3（ポーリング化）**: webhook廃止し、GAS/schedulerがkintoneをポーリングして
-  自サーバの署名付きエンドポイントを叩く（sortation第2段の App38 ポーリングが実例・
-  legacy/gas/コード.js:120-）。webhookのリアルタイム性は落ちるが署名境界に統一できる。
-- **叩き台の推奨**: 3本それぞれ用途で分ける — approval/hub-dispatch は案K1（rotation）、
-  document は生成トリガーなので案K3（ポーリング）に寄せられる可能性。
-- 【論点2】kintone webhook 3本の代替方式（K1/K2/K3）の選択。
+ヘッダ不可のため HMAC 不可。各案は**採用条件を満たす場合のみ**可:
 
-## 4. dual-accept 期間の設計（GAS群）
-1. **Phase A（併存）**: サーバは「新署名OK **or** 旧query token OK」を受理。
-   GAS未改修でも動く。新ロジックを本番投入しても既存を壊さない。
-2. **Phase B（GAS切替）**: GASエディタで各フォルダの fetch に署名ヘッダ付与（大野）。
-   Railwayログで「署名経路で来ているか」を観測（signature_result列で判別）。
-3. **Phase C（旧廃止）**: 全caller が署名経路に移ったことを確認後、query token 受理を停止。
-   旧 `*_INGEST_TOKEN` env を revoke。
-4. **rotation**: 以後は key_id 単位で secret を回す（新key_id併存→旧key_id廃止）。
+- **案K1（URL secret 強化＋rotation）**: 署名ではないので単独では replay/body改変を防げない。
+  **§12.4 の代替防御を一括で束ねた場合のみ採用可**（MEDIUM）:
+  ①イベント dedup（inbound_event journal）②条件付き状態遷移（refetch_and_check で最新状態
+  再判定）③kintone 側の再照合（受信 recordId を kintone から取り直して検証）④source
+  restriction（可能なら kintone/CloudSign の送信元 IP レンジ制限）⑤詳細ログ抑止（reason code のみ）。
+  この5点セットが揃わない K1 は不可。
+- **案K2（中継GAS化）**: 中継を挟んで署名を付け直す。**中継入口自体の認証を改善する
+  （中継が誰でも叩ける口にならない）ことを採用条件とする**（MEDIUM）。
+- **案K3（ポーリング化）**: webhook 廃止し GAS/scheduler が kintone をポーリング→署名付き
+  エンドポイントへ。**M04（条件付き）**: リアルタイム性低下の許容・ポーリング間隔・
+  取りこぼし防止（カーソル/更新時刻）・kintone API レート・二重処理防止（dedup）を
+  満たす場合のみ。sortation 第2段の App38 ポーリング（legacy/gas/コード.js:120-）が実例。
+- 【OPEN・owner=大野/司令塔】kintone webhook 3本の代替（K1/K2/K3）。判断材料:
+  approval/hub-dispatch は状態遷移トリガー（K1 の②③が効く）・document は生成トリガー
+  （K3 に寄せやすい）。3本一律でなく用途別選択でよい。
 
-## 5. caller別 切替順序（制約つき）
-1. **/sortation/ingest**（最初）: 業務影響が観測しやすく、回送先はin-process＝この1本の
-   切替で下流も守れる。
-2. koseki/registry（戸籍・登記ライン・実機実績あり）
-3. valuation/bank（token未投入＝未稼働のうちに新方式で開通できる＝dual不要の好機）
-4. kintone webhook 3本（代替方式・別トラック）
-- GASは1ファイル（legacy/gas/コード.js＝正本はGASエディタ側）に全fetchが集約されるため、
-  **署名付与ヘルパをGAS内に1つ作り各fetchで共用**する実装が現実的（大野作業・BLOCKED）。
+## 4. dual-accept 期間（GAS群・downgrade 防止込み）
+1. **Phase A（併存）**: **署名ヘッダ不在時のみ** 旧 query token を受理。署名ヘッダがあれば
+   署名検証のみ（失敗しても token に落ちない＝downgrade 防止）。
+2. **Phase B（GAS切替）**: GAS に署名付与（大野）。signature_result 列で署名経路到達を観測。
+3. **Phase C（旧廃止）**: 全 caller 署名移行を確認後、query token 受理を停止・旧 `*_INGEST_TOKEN`
+   revoke。
+4. **rotation**: 以後 §2.5 の lifecycle で key_id 単位に回す。
+
+## 5. caller別 切替順序
+1. /sortation/ingest（業務影響が観測しやすい・回送先 in-process）
+2. koseki/registry（実機実績あり）
+3. valuation/bank（token 未投入＝未稼働のうちに新方式で開通＝dual 不要の好機）
+4. kintone webhook 3本（代替・別トラック）
+- GAS は1ファイルに全 fetch 集約 → **署名付与ヘルパを GAS 内に1つ**作り共用（大野・BLOCKED）。
 
 ## 6. テスト戦略
-- **replay**: 同一nonce再送→409/401（案A/Bどちらでも）
-- **path転用**: /koseki の署名を /bank へ→normalized_path不一致で401
-- **body改変**: content_sha256改変・body差し替え→401
-- **期限外**: timestamp を SKEW超過→401
-- **unknown key**: 未登録key_id→401
-- **skew境界**: ちょうどSKEW内/外の分岐
-- **dual-accept**: 新署名OK・旧token OK・両方無し（401）の3系
-- いずれも mock（実HTTP不要）。canonical encoding の固定は golden 文字列で pin。
-- kintone webhook代替は方式確定後に別途。
+- replay（同一nonce=409）／path転用（署名の path 流用=401）／body改変（content_sha256不一致=401）／
+  期限外（timestamp SKEW超過=401）／unknown/expired/revoked key（=401・reason別）／
+  method/path 非許可（=403）／**downgrade（署名ヘッダあり+署名不正で token 併記→401、tokenに落ちない）**／
+  skew境界／dual-accept 3系（署名OK・token OK・両方無=401）。
+- **cross-language golden ベクトル**（§2.1・server/client一致）を contract テストに固定。
+- multipart body hash は §7 PoC 成立を前提。
 
-## 7. 論点・BLOCKED
-- 【論点1】nonceストア（inbound_event流用=案A / 専用テーブル=案B）
-- 【論点2】kintone webhook 3本の代替（K1/K2/K3）
-- 【論点3】key_idの保管（env `SIG_KEY_*` / 将来のsecret manager）
-- 【論点4】content_sha256 の対象（multipart生body全体で確定してよいか・GAS実装可否）
-- BLOCKED_NEEDS_HUMAN: GASエディタでの署名ヘッダ実装（UrlFetchAppでの生bodyhash計算の
-  実現性検証）・kintone webhook設定のヘッダ/URL自由度の実確認・watcher（/ocrは境界Cで別だが
-  同じ事務所PC由来で将来署名化するなら実装場所の確認）
+## 7. 論点・OPEN・BLOCKED
+- 【OPEN・owner=大野/司令塔】nonce ストア（案A/B）・kintone webhook 代替（K1/K2/K3）・
+  key_id 保管（env `SIG_KEY_*` / 将来 secret manager）。
+- **multipart body-hash PoC を v1 contract 成立の先行条件として別票化**（M11 段3）:
+  GAS UrlFetchApp で `blob.getBytes()` を含む最終 payload の SHA-256 が、サーバ受信生body の
+  hash と一致することを実証。不一致なら content 対象の定義を再設計（例: フィールド別 hash）。
+- **認証ログ方針（HIGH）**: 認証失敗ログは **固定 reason code（`bad_sig`/`skew`/`key_revoked`/
+  `path_denied`/`replay` 等）＋caller_id＋key_id＋相関ID(nonce or request id)** に限定。
+  secret・body・PII・vendor 生値を出さない（RV10 §禁止と統合）。
+- BLOCKED_NEEDS_HUMAN: GAS 署名ヘッダ実装（生body hash 計算の実現性＝PoC）・kintone webhook
+  設定のヘッダ/URL/送信元 IP 自由度の実確認・watcher（/ocr は境界C で別だが将来署名化の実装場所）。

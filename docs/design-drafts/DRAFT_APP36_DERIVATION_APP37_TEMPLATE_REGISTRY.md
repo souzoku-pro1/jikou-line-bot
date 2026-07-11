@@ -1,136 +1,173 @@
-# DRAFT: App36 相続人導出 / App37 割付 / TemplateVersion registry 実装設計
+# DRAFT: App36 相続人導出 / App37 割付 / TemplateVersion registry 実装設計（v2・Codexレビュー反映）
 
 > **status: DRAFT（司令塔裁定待ち）・実装開始根拠にしない。**
 > 対象SHA 7b03069。R4-3実装・config・封筒/関所パターンの実物調査に基づく叩き台。
-> 製品設計完全版v2.4 §8.11/§9.21/§9.23。
+> 製品設計完全版v2.4 §8.11/§9.21/§9.23。R-P1-007-drafts-v2（全ACCEPT・REJECT0）反映。
+> **OPEN は仮決めせず owner を明記。**
+
+---
+
+## ★共有節: 実装順序骨子（M11・3 DRAFT 共通）
+
+（詳細は DRAFT_RV04_HMAC_MIGRATION §共有節）
+1. redaction contract 確定 → 2. RV10 S1切替＋fail-closed → 3. RV04 multipart PoC →
+4. RV04 GAS群 HMAC＋dual-accept → 5. RV10 S2/S3/S4＋AST →
+6. **App36 DerivationRun（immutable）＋App36 projection 起票（R4-3b）** →
+7. **App37 割付＋TemplateVersion registry** →
+8. dead-man 監視＋dual-accept 廃止＋kintone webhook 代替。
+
+本書は段6・段7 の設計。
+
+---
 
 ## 0. 現況（実物確認）
-- **R4-3（heir_derivation.py）は実装済み・純関数・書き込みゼロ**（docstring明記「App34/36への
-  書き込みゼロ・封筒起票も本スコープ外=R4-3b」）。凍結テスト47ケース（09-heir-test-cases.md・
-  大野2026-07-07承認）でPASS固定。
-- **R4-3b（導出結果→App36起票）は未実装**。`APP_SOUZOKUNIN`/`APP_WARITSUKE` は config スキーマ定義と
+- **R4-3（heir_derivation.py）は実装済み・純関数・書き込みゼロ**（docstring「App34/36への書き込み
+  ゼロ・封筒起票も本スコープ外=R4-3b」）。凍結テスト47ケース（09-heir-test-cases.md・
+  大野2026-07-07承認）で PASS 固定。
+- **R4-3b（導出→App36起票）は未実装**。`APP_SOUZOKUNIN`/`APP_WARITSUKE` は config スキーマ定義と
   スキーマ整合テストのみ。KintoneApp 定義・create_record・変換関数いずれも不在。
-- config スキーマは起票を見越して先行整備済み（App36続柄＝HeirCandidate.zokugaraと対応、
-  法定相続分=TEXTでFraction文字列可、データ源=戸籍読解）。
 
-## 1. heir_derivation の入出力（結線点の確定）
-
-- 入力: `derive_heirs(persons: list[HeirPerson], declarations, kosekis, decedent_id, at_date)`。
-  `persons_from_records(records: list[dict])`（heir_derivation.py:105）が **App34 GET形dict → HeirPerson**
-  の読み取り専用変換（自身はfetchしない）。
+## 1. heir_derivation の入出力（結線点）
+- 入力: `derive_heirs(persons, declarations, kosekis, decedent_id, at_date)`。
+  `persons_from_records(records)`（heir_derivation.py:105）が App34 GET形dict → HeirPerson の
+  読み取り専用変換。
 - 出力: `Derivation`（status/heirs/shares/flags/hold_reasons/rank/provisional）。
   `HeirCandidate`（person_id/name/zokugara/share:Fraction/basis/facts/via）。
-- グラフ連携: `required_persons(graph, decedent)`（:709）は kinship_graph を入力に取りZ1ゲート絞り込み。
-- **要弁護士フラグ**: flags が1つでもあれば `provisional`（参考値）。**確定は弁護士**（機械は起票まで）。
+- グラフ連携: `required_persons(graph, decedent)`（:709）が Z1 ゲート絞り込み。
+- flags が1つでもあれば `provisional`。**確定は弁護士**。
 
-## 2. DerivationRun テーブル（app-state DB・§9.21）
+## 2. DerivationRun テーブル（app-state DB・§9.21 全field・immutable）
 
-導出の実行履歴を残す（監査・再現・「いつの戸籍/申告で導出したか」）。§9.21 の field を実装型へ写像案:
+導出の実行を **immutable な監査レコード**として残す（HIGH: 正本 §9.21 全 field 反映）:
 
 | 列 | 型 | 内容 |
 |---|---|---|
 | id | BigInteger PK | |
-| case_app_id / case_record_id | Text | 案件参照（ハブ共通方式） |
+| case_app_id / case_record_id | Text | 案件参照 |
 | decedent_person_id | Text | 被相続人（App34 record id） |
-| at_date | Text | 相続開始日（和暦原文はApp34側・ここは確定西暦） |
-| input_person_ids | JSONB | 導出に使ったApp34 record idの集合（再現性） |
-| input_hash | Text | persons+declarations の正規化SHA-256（同一入力の再導出dedup） |
-| status | Text | derived / held / error（Derivation.status） |
+| at_date | Text | 相続開始日（確定西暦） |
+| **frozen_case_version** | Text | 導出時の案件/凍結表バージョン（再現性・§9.21） |
+| **input_person_revisions** | JSONB | App34 各 record の `$revision` 集合（後で人物が変わったら検知） |
+| input_person_ids | JSONB | 使った App34 record id 集合 |
+| **input_hash** | Text | **正規化SHA-256。対象＝persons ＋ input_person_revisions ＋ kosekis ＋ declarations ＋ at_date ＋ engine_version ＋ frozen_case_version**（HIGH: 同一入力の厳密同定） |
+| status | Text | derived / held / error |
 | rank | Integer | 1/2/3/0 |
-| result | JSONB | shares（person_id→分数文字列）・heirs明細・flags・hold_reasons |
-| provisional | Boolean | 要弁護士フラグ有無 |
-| engine_version | Text | heir_derivation のバージョン（テストケース版 v0.1 等・再導出判定） |
+| **result_payload** | JSONB | **person_id のみ**の shares/heirs（§4・氏名非保持・facts最小化・schema allowlist） |
+| **result_hash** | Text | result_payload の SHA-256（改ざん検知・run 比較） |
+| **lawyer_flags** | JSONB | 要弁護士フラグ（flags を構造化・provisional 由来） |
+| provisional | Boolean | フラグ有無 |
+| **human_state** | Text | pending / confirmed / rejected（人の確定状態） |
+| **decided_by** | Text | 確定した弁護士識別（人の操作者） |
+| **supersedes_run_id** | BigInteger | この run が置き換える旧 run（再導出の連鎖） |
+| engine_version | Text | heir_derivation バージョン（テスト版 v0.1 等） |
 | created_at | DateTime(tz) | |
 
-- **PII方針**: result に氏名を持つか要裁定（RV-10）。person_id＋shares のみにして氏名は
-  App34/36参照で解決する案が安全（【論点1】）。
-- migration は alembic 第4弾（P1-004基盤に乗せる・手動DDL禁止）。DerivationRun は
-  inbound_event と同じ `Base`（hub/inbound_event.Base）に相乗りか別metadataか【論点2】。
+- **immutable（HIGH）**: DerivationRun は **UPDATE/DELETE を拒否**（追記のみ）。人の確定や
+  再導出は**新 run を作り supersedes_run_id で連鎖**。`supersedes` 連鎖の検証（循環禁止・
+  同一 case で active head は1つ）をテストで固定。
+- migration は alembic 第4弾（P1-004基盤・手動DDL禁止）。
+- 【OPEN・owner=司令塔】DerivationRun/TemplateVersion の metadata（inbound_event.Base 相乗り or
+  別 Base）。判断材料: マイグレーション autogenerate の分離度。
 
-## 3. App36 起票設計（R4-3b・封筒→関所パターンに乗せる）
-
-実物の2段パターン（person_merge/review_resolve）に接続する。**結線点は調査で確定済み**:
+## 3. App36 起票設計（R4-3b・封筒→関所・projection 保護更新）
 
 ### 3.1 封筒起票（機械）
-- 雛形 = `person_merge._file_candidate` / `app30_filer.file_from_pending`
-  （App30 に `発送ステータス:"要確認"` ＋ `チャネル固有データ:{"heir_derivation": detail}` ＋
-  `create_record(APP_SHIPPING)`・**単票API必須**）。
-- detail に DerivationRun の id と shares/heirs（person_id ベース）を格納。
-- 冪等キー = `heir_derivation:{case_record_id}:{input_hash}`（同一入力の再導出で二重封筒を防ぐ・
-  person_merge の `_pair_key` と同型）。
-- flags（要弁護士）があっても封筒は起票する（人が関所で見て確定/保留を判断）。
+- 雛形 = `person_merge._file_candidate` / `app30_filer.file_from_pending`（App30 に
+  `発送ステータス:"要確認"` ＋ `チャネル固有データ:{"heir_derivation": detail}` ＋
+  `create_record(APP_SHIPPING)`・**単票API必須**）。detail に DerivationRun.id を格納。
+- 冪等キー = `heir_derivation:{case_record_id}:{input_hash}`（同一入力の再導出で二重封筒防止）。
 
 ### 3.2 関所（人の確定）
 - `review_resolve.RESOLVERS`（review_resolve.py:371）にトップキー `"heir_derivation"` ＋ ハンドラ ＋
-  必要env（`APP_SOUZOKUNIN`/`TOKEN_SOUZOKUNIN`）を追加 → `resolve_group` 経由で発火。
-- ハンドラは既存 `_resolve_koseki` 型（phase1: 全件再読の二重確定ガード → phase2: 本テーブルupsert →
-  App30を`完了`/`実行済み:yes`でクローズ）。
-- **本テーブル = App36**: `HeirCandidate → App36レコード` の写像:
-  - zokugara → `続柄`（選択肢が対応済み）／share → `法定相続分`（Fraction文字列）／
-    person_id → `相続人レコードID` 参照は無し（App36は人物のprojectionなので `氏名`等はApp34から解決）／
-    `データ源:"戸籍読解"`／`戸籍確認済:"no"`（yes は弁護士のみ）／`状態:"通常"`（放棄はdeclarations由来）。
-- **App36 を current projection とする**: 同一 case×person の再確定は upsert（冪等キー＝
-  case_record_id＋person_id）。registry_ingest._upsert_zaisan（:275）が既存の型
-  （search→update/create分岐）。
+  env（`APP_SOUZOKUNIN`/`TOKEN_SOUZOKUNIN`）追加 → `resolve_group` 経由。
+- ハンドラは既存 `_resolve_koseki` 型（phase1: 全件再読の二重確定ガード → phase2: App36 upsert →
+  App30 を `完了`/`実行済み:yes` クローズ）。**確定時に DerivationRun.human_state=confirmed・
+  decided_by を新 run で記録**。
 
-### 3.3 新規に必要なもの（未存在）
-1. `KintoneApp("App 36 (相続人)", "APP_SOUZOKUNIN", "TOKEN_SOUZOKUNIN")` インスタンス定義
-2. `derive_heirs`出力 → App36 fields の変換関数（純関数・テスト可能）
-3. RESOLVERS ハンドラ（heir_derivation キー）
-4. env flag（`HEIR_DERIVATION_ENABLED` 案・既定OFF・person_sync 慣行と同じ安全側）
-5. 起動経路: R4-1（人物確定後）の後続として、または指示Bot語彙「相続人を導出して」
+### 3.3 App36 を current projection とする（HIGH: run 比較＋human_state 保護）
+- **projection 更新は run の新旧比較に基づく**: 新 run の result と現 App36 を突合し、
+  **差分のみ**更新（全消し再作成しない）。
+- **human_state 保護**: App36 の人が触ったフィールド（特に `戸籍確認済=yes`・`状態` の手修正）は
+  **機械の再導出で上書きしない**（人の確定を機械が壊さない）。上書き対象は機械由来フィールド
+  （続柄/法定相続分/データ源）に限定。
+- 冪等キー＝case_record_id＋person_id。registry_ingest._upsert_zaisan（:275）が既存の型。
 
-## 4. App37 割付の入力正本化
+### 3.4 「戸籍確認済=yes」遷移表（HIGH: 弁護士のみ・逆遷移禁止）
+| from | to | 許可主体 | 記録 |
+|---|---|---|---|
+| no | yes | **弁護士のみ** | decided_by＋decided_at を記録 |
+| yes | no | **禁止**（逆遷移不可） | — |
+| （機械の再導出） | yes を維持 | 機械は yes を no に落とさない | 3.3 の保護と一致 |
 
-- スキーマ（config:530-557）: 財産レコードID(App35参照)・相続人レコードID(App36参照)・
-  取得区分(6種)・持分/代償金額/条件メモ・有効。**財産×相続人の対応の1行=1割付**。
-- App37 は**人が入力する正本**（機械は導出しない＝誰が何を取得するかは遺産分割協議の結果）。
-  → 実装は「指示Bot or kintone直接入力での割付登録」＋スキーマ死活監視。導出エンジン不要。
-- **App36 が起票済みであることが前提**（相続人レコードIDを参照するため）。R4-3b が先。
-- 実スキーマ突合: config は 2026-07-06 フォーム設計取得APIで実機11フィールド一致を確認済み
-  （config:528コメント）。**追加のCU作業は現時点で不要**（スキーマは既に実機整合）。
-  ただし App36 側は起票コードが無いだけでスキーマは整合済み → CU不要。
+### 3.5 result_payload の schema allowlist（HIGH: 氏名非保持）
+- result_payload は **person_id のみ**（氏名・住所・生年月日を保持しない）。氏名等は App34/36
+  参照で実行時解決。facts は導出根拠の最小限（条文キー等）に絞る。
+- schema allowlist で「許可キー以外は保存拒否」（PII 混入を構造で防ぐ・RV10 §1.2 と整合）。
 
-## 5. TemplateVersion registry（§9.23）
+### 3.6 放棄（相続放棄）の写像（OPEN: 凍結表追補）
+- declarations.renounced の人物を App36 `状態:"放棄済み"` に写像する**方針は明記**するが、
+  放棄が順位繰上げに与える影響（次順位の相続人化）の写像網羅は凍結47ケースに**追補が要る**。
+- 【OPEN・owner=大野（弁護士承認）】放棄→順位繰上げの写像を凍結表に追補。判断材料: 現行47ケースの
+  放棄カバレッジ・弁護士レビュー。**仮決めしない**（承認まで放棄写像は confirmed にしない）。
 
-成果物生成（財産目録・遺産分割協議書・遺言）のテンプレを版管理する。
+### 3.7 新規に必要なもの（未存在）
+1. `KintoneApp("App 36 (相続人)", "APP_SOUZOKUNIN", "TOKEN_SOUZOKUNIN")` 定義
+2. `derive_heirs` 出力 → App36 fields 変換（純関数・schema allowlist 準拠）
+3. RESOLVERS ハンドラ（heir_derivation）
+4. env flag（`HEIR_DERIVATION_ENABLED`・既定OFF）
+5. 起動経路: R4-1 後続 or 指示Bot語彙「相続人を導出して」
+   【OPEN・owner=司令塔】起動経路の選択。
 
-### 5.1 テーブル案（app-state DB）
+## 4. App37 割付の入力正本化（承認者・revision・snapshot）
+
+- スキーマ（config:530-557）: 財産レコードID(App35)・相続人レコードID(App36)・取得区分(6種)・
+  持分/代償金額/条件メモ・有効。財産×相続人の1行=1割付。
+- App37 は**人が入力する正本**（機械は導出しない）。App36 起票済みが前提（相続人レコードID参照）。
+- **追加すべきフィールド（HIGH）**: `承認者`（割付を承認した弁護士）・`revision`（割付の版）・
+  `成果物生成時snapshot`（生成時点の割付内容を凍結＝後から割付が変わっても既発行成果物の
+  再現性を担保）。※これらは実機 App37 への**フィールド追加が要る**＝BLOCKED（CU/kintone）。
+- 実スキーマ突合: config は 2026-07-06 実機11フィールド一致確認済み。ただし上記3フィールドは
+  **新規追加分**＝実機未整備。
+- 【OPEN・owner=大野】App37 割付を指示Bot で入れるか kintone 直接入力か（事務所フロー）。
+
+## 5. TemplateVersion registry（§9.23 全field・bytes再現・単一active）
+
+### 5.1 テーブル案（§9.23 全 field）
 | 列 | 型 | 内容 |
 |---|---|---|
 | id | BigInteger PK | |
-| template_key | Text | 論理名（例 zaisan_mokuroku / isan_bunkatsu_kyogisho） |
-| version | Text | セマンティック版（v1.0 等） |
-| file_path | Text | repo内テンプレパス or Drive fileId |
-| content_hash | Text | テンプレ実体のSHA-256（改変検知） |
-| placeholders | JSONB | 差込プレースホルダ集合（EXPECTED_DOCX_TEMPLATES と突合） |
+| template_key | Text | 論理名（zaisan_mokuroku 等） |
+| version | Text | セマンティック版 |
+| **file_ref** | Text | repo path or Drive fileId |
+| **content_hash** | Text | テンプレ実体 SHA-256 |
+| **content_bytes_ref** | Text | **バイト再現の保存先**（生成物の bytes 再現 contract 用・§5.2） |
+| placeholders | JSONB | 差込プレースホルダ集合 |
+| **created_by / approved_by** | Text | 登録者・承認者 |
 | status | Text | draft / active / retired |
-| activated_at | DateTime(tz) | |
+| activated_at / retired_at | DateTime(tz) | |
 
-### 5.2 既存資産との接続
-- 現状 `config.EXPECTED_DOCX_TEMPLATES` と `hub/docx_builder.validate_template`（daily_healthcheck
-  監視項目C）がテンプレのプレースホルダを静的検査済み。TemplateVersion はこれを**DB化して版と
-  activ状態を持たせる**もの。content_hash で「テンプレが編集されたら version 更新を強制」。
-- 登録フロー案: テンプレ追加/更新 → migration or 管理スクリプトで registry に登録
-  （active は1 template_key につき1版）→ 生成時は active 版のみ使用。
-- P1〜P4テンプレ（実物）の登録: **BLOCKED_NEEDS_HUMAN**（どのテンプレを正本とするか・
-  Drive上の実体の確定は大野）。
+### 5.2 bytes 再現 contract（HIGH）
+- 「同じ template_version ＋ 同じ差込データ → 同じ出力 bytes」を contract とする。テンプレ実体を
+  content_hash＋content_bytes_ref で固定し、生成器のバージョンも記録。**再現テスト**（golden bytes）
+  で固定（フォント埋め込み・タイムスタンプ等の非決定要素を排除する方式を含む）。
 
-### 5.3 Phase 5（成果物生成）への接続点
-- 生成器（zaisan_mokuroku.py 等）は active TemplateVersion を引く → docx_builder で差込 →
-  Drive/App添付。**前提ゲート**: App36（相続人確定）＋App37（割付確定）＋App35（財産）が
-  揃い、かつ「戸籍確認済=yes（弁護士）」であること（souzoku-shorui設計のゲートと同じ）。
-- DerivationRun.provisional=True（要弁護士フラグ）なら生成拒否（安全側）。
+### 5.3 単一 active 制約（HIGH: 実装方式）
+- 1 template_key につき active は1版のみ。**部分ユニーク制約**（`UNIQUE(template_key) WHERE
+  status='active'`）で DB レベル強制、または active 化を「旧 active を retired にする条件付き
+  遷移＋トランザクション」で保証。叩き台推奨: 部分ユニークインデックス（PostgreSQL 対応）。
 
-## 6. 論点・BLOCKED
-- 【論点1】DerivationRun.result に氏名を保存するか（RV-10・person_id のみが安全）
-- 【論点2】DerivationRun/TemplateVersion の metadata（inbound_event.Base 相乗り or 別Base）
-- 【論点3】App36 起票の起動経路（R4-1後続の自動封筒 or 指示Bot語彙）
-- 【論点4】App36 の続柄「甥姪（代襲）」等とderive出力の写像の網羅性（凍結47ケースで検証）
-- 【論点5】App37割付を指示Botで入れるか kintone直接入力か
+### 5.4 Phase 5（成果物生成）接続点
+- 生成器は active TemplateVersion を引く → docx_builder 差込 → Drive/App添付。
+- **前提ゲート**: App36（相続人確定）＋App37（割付確定・承認者あり）＋App35（財産）＋
+  「戸籍確認済=yes（弁護士）」＋DerivationRun.human_state=confirmed。
+- DerivationRun.provisional=True なら生成拒否。生成時は App37 snapshot を凍結（§4）。
+
+## 6. OPEN・BLOCKED
+- 【OPEN・owner=大野（弁護士承認）】放棄→順位繰上げの凍結表追補（§3.6）。
+- 【OPEN・owner=司令塔】metadata 分離（§2）・App36 起動経路（§3.7）。
+- 【OPEN・owner=大野】App37 割付の入力運用（§4）。
 - BLOCKED_NEEDS_HUMAN:
-  - App36/App37 の env（`APP_SOUZOKUNIN`/`TOKEN_SOUZOKUNIN`/`APP_WARITSUKE`/`TOKEN_WARITSUKE`）
-    本番投入・実番号確定（現状 optional で未投入なら監視スキップ）
-  - App36トークンの権限（create/update・KINTONE_TOKEN_MATRIX の要確認と同列）
-  - TemplateVersion に載せる P1〜P4 テンプレ実物の正本確定（Drive）
-  - 遺産分割協議の割付を誰がどう入力する運用か（事務所フロー）
+  - App36/App37 env（`APP_SOUZOKUNIN`/`TOKEN_SOUZOKUNIN`/`APP_WARITSUKE`/`TOKEN_WARITSUKE`）
+    本番投入・実番号確定・**App36トークン権限**（KINTONE_TOKEN_MATRIX と同列）。
+  - App37 への新規フィールド（承認者/revision/snapshot）の実機追加（CU/kintone）。
+  - TemplateVersion に載せる P1〜P4 テンプレ実物の正本確定＋bytes 再現の非決定要素排除（Drive）。
