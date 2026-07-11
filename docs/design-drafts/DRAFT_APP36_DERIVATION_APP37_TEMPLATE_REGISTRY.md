@@ -66,8 +66,9 @@
   再導出は**新 run を作り supersedes_run_id で連鎖**。`supersedes` 連鎖の検証（循環禁止・
   同一 case で active head は1つ）をテストで固定。
 - migration は alembic 第4弾（P1-004基盤・手動DDL禁止）。
-- 【OPEN・owner=司令塔】DerivationRun/TemplateVersion の metadata（inbound_event.Base 相乗り or
-  別 Base）。判断材料: マイグレーション autogenerate の分離度。
+- **【裁定済み・2026-07-12 司令塔】** DerivationRun/TemplateVersion は **専用モジュールの
+  別 metadata**（inbound_event.Base への相乗りはしない・L03 準拠）。app-state のモデル群を
+  用途別モジュールに分け、alembic の target_metadata は各 Base を統合して autogenerate する。
 
 ## 3. App36 起票設計（R4-3b・封筒→関所・projection 保護更新）
 
@@ -115,8 +116,9 @@
 2. `derive_heirs` 出力 → App36 fields 変換（純関数・schema allowlist 準拠）
 3. RESOLVERS ハンドラ（heir_derivation）
 4. env flag（`HEIR_DERIVATION_ENABLED`・既定OFF）
-5. 起動経路: R4-1 後続 or 指示Bot語彙「相続人を導出して」
-   【OPEN・owner=司令塔】起動経路の選択。
+5. 起動経路: **【裁定済み・2026-07-12 司令塔】初版=指示Bot語彙「相続人を導出して」**。
+   R4-1（人物確定）後続の自動導出は**運用安定後の追加候補**（初版では自動起動しない・
+   人が明示的に導出を指示する）。
 
 ## 4. App37 割付の入力正本化（承認者・revision・snapshot）
 
@@ -138,18 +140,27 @@
 | id | BigInteger PK | |
 | template_key | Text | 論理名（zaisan_mokuroku 等） |
 | version | Text | セマンティック版 |
+| **artifact_type** | Text | 成果物種別（財産目録 / 遺産分割協議書 / 遺言 等） |
+| **unit_type** | Text | ユニット種別（時効援用 / 相続放棄 / 相続一般 / 補助金）。§8.15 のユニット別テンプレ非混在を列で強制（生成時に案件 unit と一致するテンプレのみ選択可） |
+| **purpose** | Text | 適用範囲・用途（例「4社目以降用」「法テラス案件用」等の適用条件） |
 | **file_ref** | Text | repo path or Drive fileId |
 | **content_hash** | Text | テンプレ実体 SHA-256 |
 | **content_bytes_ref** | Text | **バイト再現の保存先**（生成物の bytes 再現 contract 用・§5.2） |
 | placeholders | JSONB | 差込プレースホルダ集合 |
+| **mapping_version** | Text | データ→差込フィールドの写像ルール版（生成 rule。bytes 再現の対象・§5.2） |
+| **clause_library_version** | Text | 条項ライブラリ版（協議書等の条項雛形。生成 rule。bytes 再現の対象・§5.2） |
 | **created_by / approved_by** | Text | 登録者・承認者 |
 | status | Text | draft / active / retired |
-| activated_at / retired_at | DateTime(tz) | |
+| **activated_at** | DateTime(tz) | active 化時刻。**＝正本 §9.23 の effective_from 相当**（この版が有効になった発効時刻） |
+| **approved_at** | DateTime(tz) | 承認時刻（approved_by と対） |
+| retired_at | DateTime(tz) | retired 化時刻 |
 
 ### 5.2 bytes 再現 contract（HIGH）
-- 「同じ template_version ＋ 同じ差込データ → 同じ出力 bytes」を contract とする。テンプレ実体を
-  content_hash＋content_bytes_ref で固定し、生成器のバージョンも記録。**再現テスト**（golden bytes）
-  で固定（フォント埋め込み・タイムスタンプ等の非決定要素を排除する方式を含む）。
+- 「同じ template_version ＋ **同じ mapping_version ＋ 同じ clause_library_version** ＋
+  同じ差込データ → 同じ出力 bytes」を contract とする。テンプレ実体を content_hash＋
+  content_bytes_ref で固定し、生成 rule（mapping・条項ライブラリの版）と生成器のバージョンも
+  記録する。**再現テスト**（golden bytes）で固定（フォント埋め込み・タイムスタンプ等の
+  非決定要素を排除する方式を含む）。
 
 ### 5.3 単一 active 制約（HIGH: 実装方式）
 - 1 template_key につき active は1版のみ。**部分ユニーク制約**（`UNIQUE(template_key) WHERE
@@ -164,8 +175,9 @@
 
 ## 6. OPEN・BLOCKED
 - 【OPEN・owner=大野（弁護士承認）】放棄→順位繰上げの凍結表追補（§3.6）。
-- 【OPEN・owner=司令塔】metadata 分離（§2）・App36 起動経路（§3.7）。
 - 【OPEN・owner=大野】App37 割付の入力運用（§4）。
+- 【裁定済み・2026-07-12】metadata 分離＝専用モジュールの別 metadata（§2）／
+  App36 起動経路＝初版は指示Bot語彙（§3.7）。
 - BLOCKED_NEEDS_HUMAN:
   - App36/App37 env（`APP_SOUZOKUNIN`/`TOKEN_SOUZOKUNIN`/`APP_WARITSUKE`/`TOKEN_WARITSUKE`）
     本番投入・実番号確定・**App36トークン権限**（KINTONE_TOKEN_MATRIX と同列）。
