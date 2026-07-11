@@ -16,11 +16,14 @@
 """
 
 import ast
+import asyncio
 import os
 import subprocess
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
+
+from sqlalchemy.ext.asyncio import AsyncEngine
 
 import hub.db as db
 
@@ -194,25 +197,142 @@ class TestCredentialNonLeak(unittest.TestCase):
 
 
 class TestDisposeAll(unittest.TestCase):
-    """L01: dispose_all / reset_for_tests が async engine も同期的に閉じる"""
+    """L01 正規解消（D6・P1-004c）: dispose の実効性と文脈判定の二値性。
+
+    実 async ドライバ不在のため「await AsyncEngine.dispose() が実際に実行される」
+    ことは AsyncEngine.dispose への AsyncMock spy（await_count）で検証する。
+    実接続込みの dispose 統合テストは P1-005 の実DB使用時に追加する。
+    仕様の固定: ループ内の同期呼び出し=明示例外／dispose中の例外=キャッシュは
+    必ず空にしたうえで例外を送出（黙った不正 close・黙った握りつぶしは存在しない）
+    """
 
     DUMMY_URL = "postgresql://u:p@127.0.0.1:1/d"
 
     def tearDown(self):
         db.reset_for_tests()
 
-    def test_reset_disposes_async_engine_and_clears_cache(self):
+    def test_sync_reset_awaits_async_dispose(self):
+        """2a+2d: 参照破棄だけでは PASS しない——await dispose() の実行を要求"""
         with patch.dict(os.environ, {"DATABASE_URL": self.DUMMY_URL}):
-            a1 = db.get_async_engine()
-            db.reset_for_tests()  # イベントループ外から呼んでも例外なし（L01）
-            self.assertIsNone(db._async_engine)
-            self.assertIsNone(db._async_session_factory)
-            a2 = db.get_async_engine()
-        self.assertIsNot(a1, a2)
+            db.get_async_engine()
+            with patch.object(AsyncEngine, "dispose",
+                              new_callable=AsyncMock) as spy:
+                db.reset_for_tests()
+            self.assertEqual(spy.await_count, 1,
+                             "AsyncEngine.dispose() が await されていない")
+        self.assertIsNone(db._async_engine)
+        self.assertIsNone(db._async_session_factory)
+
+    def test_sync_engine_dispose_executed(self):
+        """sync engine 側も dispose 実行を spy で要求（参照破棄だけを許さない）"""
+        with patch.dict(os.environ, {"DATABASE_URL": self.DUMMY_URL}):
+            engine = db.get_engine()
+            with patch.object(type(engine), "dispose") as spy:
+                db.reset_for_tests()
+            spy.assert_called_once()
+        self.assertIsNone(db._engine)
+
+    def test_calling_sync_reset_inside_event_loop_raises(self):
+        """2b: ループ内からの同期呼び出しは明示例外（案内つき）"""
+        async def inner():
+            with self.assertRaises(RuntimeError) as ctx:
+                db.reset_for_tests()
+            self.assertIn("adispose_all", str(ctx.exception))
+        asyncio.run(inner())
+
+    def test_cache_cleared_even_if_dispose_raises(self):
+        """2c: dispose 中の例外でもキャッシュは残らない（仕様固定）。
+        例外自体は握りつぶさず送出される"""
+        with patch.dict(os.environ, {"DATABASE_URL": self.DUMMY_URL}):
+            db.get_async_engine()
+            with patch.object(AsyncEngine, "dispose", new_callable=AsyncMock,
+                              side_effect=RuntimeError("boom")):
+                with self.assertRaises(RuntimeError):
+                    db.reset_for_tests()
+        self.assertIsNone(db._async_engine)
+        self.assertIsNone(db._async_session_factory)
+
+    def test_adispose_all_is_canonical_async_api(self):
+        """D6: async 文脈の正規 API。await adispose_all() が async/sync 両エンジンを
+        閉じてキャッシュを空にする（P1-005 の shutdown 経路もこれを使う）"""
+        with patch.dict(os.environ, {"DATABASE_URL": self.DUMMY_URL}):
+            db.get_engine()
+            db.get_async_engine()
+            with patch.object(AsyncEngine, "dispose",
+                              new_callable=AsyncMock) as aspy:
+                asyncio.run(db.adispose_all())
+            self.assertEqual(aspy.await_count, 1)
+        self.assertIsNone(db._engine)
+        self.assertIsNone(db._async_engine)
 
     def test_dispose_all_idempotent(self):
         db.dispose_all()
         db.dispose_all()  # 何も生成していない状態で複数回呼んでも安全
+
+
+class TestNoUrlStringificationInAppCode(unittest.TestCase):
+    """M02一部（P1-004c）: 接続URLの不用意な文字列化・出力の素朴なAST禁止。
+
+    検出対象（素朴な一致のみ・網羅は求めない）:
+      - str(X.url) 形（.url 属性への str() 適用。SQLAlchemy の str(URL) は
+        hide_password=False 描画のため）
+      - render_as_string(hide_password=False)
+      - database_url() の戻り値 または X.url を、print / logger系メソッド
+        （debug/info/warning/error/exception/critical）/ 名前が Error/Exception で
+        終わる呼び出し（例外constructor）へ**直接**渡す形
+    限界（明記）: 変数に代入してから渡す・f-string / % / .format 経由・
+    エイリアス関数経由などの間接パターンは検出しない（P1-005 で log capture
+    検査を追加予定）。
+    除外: hub/db.py（URLを扱う唯一の場所）・alembic/ 配下・本テスト自身。
+    """
+
+    EXCLUDED_PREFIXES = ("alembic/",)
+    EXCLUDED_POSIX = {"hub/db.py"}
+
+    _LOG_SINKS = {"print", "debug", "info", "warning", "error", "exception",
+                  "critical"}
+
+    @staticmethod
+    def _is_url_expr(node: ast.AST) -> bool:
+        if isinstance(node, ast.Attribute) and node.attr == "url":
+            return True
+        return isinstance(node, ast.Call) and _call_name(node) == "database_url"
+
+    def test_no_url_stringification_or_direct_logging(self):
+        violations = []
+        scanned = 0
+        for path in _tracked_py():
+            posix = path.as_posix()
+            if posix.startswith(self.EXCLUDED_PREFIXES) or \
+                    posix in self.EXCLUDED_POSIX or path.name == SELF:
+                continue
+            tree = ast.parse((REPO / path).read_text(encoding="utf-8"),
+                             filename=posix)
+            scanned += 1
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                name = _call_name(node)
+                if name == "str" and node.args and \
+                        self._is_url_expr(node.args[0]):
+                    violations.append(f"{posix}:{node.lineno} str(...url)")
+                if name == "render_as_string" and any(
+                        kw.arg == "hide_password"
+                        and isinstance(kw.value, ast.Constant)
+                        and kw.value.value is False
+                        for kw in node.keywords):
+                    violations.append(
+                        f"{posix}:{node.lineno} "
+                        "render_as_string(hide_password=False)")
+                is_sink = name in self._LOG_SINKS or \
+                    name.endswith(("Error", "Exception"))
+                if is_sink and any(self._is_url_expr(a) for a in node.args):
+                    violations.append(f"{posix}:{node.lineno} {name}(...url...)")
+        self.assertGreater(scanned, 10, "走査対象が少なすぎる")
+        self.assertEqual(violations, [],
+                         "接続URL（credential含みうる値）を文字列化・ログ・例外へ"
+                         "直接渡さない（M02一部・安全な描画は render_as_string()"
+                         "既定 / repr のみ）")
 
 
 if __name__ == "__main__":

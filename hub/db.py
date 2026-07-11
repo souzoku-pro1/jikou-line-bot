@@ -13,6 +13,7 @@
   postgresql+psycopg:// へ正規化する
 """
 
+import asyncio
 import os
 from contextlib import asynccontextmanager
 
@@ -98,21 +99,44 @@ async def session_scope():
             raise
 
 
-def dispose_all() -> None:
-    """生成済みエンジンを全て破棄しキャッシュを空にする（CLI終了時・テスト用。
-    アプリの通常経路では呼ばない——エンジンはプロセス生存中共有が前提）。
+async def adispose_all() -> None:
+    """正規の cleanup API（D6・P1-004c）。async 文脈からはこれを使う
+    （P1-005 以降の shutdown 経路もこれ）。
 
-    AsyncEngine.dispose() はコルーチンだが、ここでは同期文脈（alembic CLI・
-    テスト teardown）から呼ばれるため、内包する sync_engine の dispose で
-    プールを同期的に閉じる（SQLAlchemy 公式の同期側 API・イベントループ不要）"""
+    async engine は await AsyncEngine.dispose()（async ドライバの正規手順）、
+    sync engine は同期 dispose。dispose 中に例外が出てもキャッシュは必ず
+    空にする（finally・壊れかけのエンジンを再利用させない）。例外自体は
+    握りつぶさず送出する"""
     global _engine, _async_engine, _async_session_factory
-    if _engine is not None:
-        _engine.dispose()
-    if _async_engine is not None:
-        _async_engine.sync_engine.dispose()
-    _engine = None
-    _async_engine = None
-    _async_session_factory = None
+    try:
+        if _async_engine is not None:
+            await _async_engine.dispose()
+        if _engine is not None:
+            _engine.dispose()
+    finally:
+        _engine = None
+        _async_engine = None
+        _async_session_factory = None
+
+
+def dispose_all() -> None:
+    """同期文脈からの cleanup（alembic CLI 終了時・テスト teardown 用）。
+
+    イベントループ外: asyncio.run(adispose_all()) で正しく閉じる。
+    イベントループ内から呼ばれた場合は**明示例外**——黙って参照破棄や
+    sync_engine.dispose() に落ちない（D6。「sync_engine.dispose() で足りる」
+    という P1-004a 時点の前提は撤回済み）"""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        running_in_loop = False
+    else:
+        running_in_loop = True
+    if running_in_loop:
+        raise RuntimeError(
+            "dispose_all()/reset_for_tests() はイベントループ内から呼べません。"
+            "async 文脈では `await adispose_all()` を使ってください（D6）")
+    asyncio.run(adispose_all())
 
 
 def reset_for_tests() -> None:
