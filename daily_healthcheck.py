@@ -11,6 +11,8 @@
      （config.EXPECTED_DOCX_TEMPLATES と照合・T0-3 で追加）
   D. App 32（同封物ブロックマスタ）の有効ブロックキーが App 30『同封物選択』の
      選択肢と同期しているか検証する（docs/architecture/02 §4.2・T2-1 で追加）
+  E. inbound_event journal の滞留（processing/failed の24時間超残留）を検知する
+     （P1-005d で追加・journal 未開通/DB未設定時は静かにスキップ）
 
 異常時のみ LINE Push で管理者に通知する。正常時はログのみ。
 
@@ -164,6 +166,72 @@ def check_templates() -> list[str]:
 
 
 # ══════════════════════════════════════════════════════════════
+# 監視項目E: inbound_event journal の滞留検知（P1-005d）
+# ══════════════════════════════════════════════════════════════
+
+async def check_journal_backlog() -> list[str]:
+    """journal（inbound_event）の滞留を検知し、問題のリストを返す。
+
+    検知対象:
+      - state=processing で claimed_at が24時間超過（NULL=列追加前の行も対象）
+      - state=failed で received_at が24時間超過
+    閾値24hの根拠: Stripeの自動再送（指数バックオフ・最大3日）が生きている間は
+    503→再送→stale再claim の自己回復が期待できるため即異常ではないが、
+    丸1日の残留は「再送が来ていない／来るたび失敗している」の早期シグナル。
+
+    静かにスキップする条件（既存監視を壊さない・D3のlazy原則）:
+      - STRIPE_EVENT_JOURNAL_ENABLED != "1"（journal未開通）
+      - DATABASE_URL 未設定
+      - inbound_event テーブル不在（migration未適用）
+    警報文面は件数とPKのみ（event ID・dedup_key を出さない・D17流儀）。
+    """
+    if os.environ.get("STRIPE_EVENT_JOURNAL_ENABLED") != "1":
+        return []
+    if not os.environ.get("DATABASE_URL"):
+        return []
+
+    import sqlalchemy as sa
+
+    from hub.db import session_scope
+    from hub.inbound_event import InboundEvent
+
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
+    try:
+        async with session_scope() as session:
+            stuck = (await session.execute(
+                sa.select(InboundEvent.id).where(
+                    InboundEvent.state == "processing",
+                    sa.or_(InboundEvent.claimed_at.is_(None),
+                           InboundEvent.claimed_at < cutoff)))).scalars().all()
+            failed = (await session.execute(
+                sa.select(InboundEvent.id).where(
+                    InboundEvent.state == "failed",
+                    InboundEvent.received_at < cutoff))).scalars().all()
+    except (sa.exc.ProgrammingError, sa.exc.OperationalError) as e:
+        # テーブル不在（migration未適用）は静かにスキップ。それ以外のDB異常は
+        # 実行失敗として上位に伝える（分類のみ・本文を握りつぶさない）
+        if "inbound_event" in str(e).lower():
+            logger.info("journal backlog check skipped (table not ready)")
+            return []
+        raise
+
+    problems: list[str] = []
+    if stuck:
+        problems.append(
+            f"journal滞留: processing が24時間超 {len(stuck)}件 "
+            f"(PK={sorted(stuck)[:10]}) — runbook: docs/runbooks/"
+            "stripe-journal-recovery.md")
+    if failed:
+        problems.append(
+            f"journal滞留: failed が24時間超 {len(failed)}件 "
+            f"(PK={sorted(failed)[:10]}) — runbook: docs/runbooks/"
+            "stripe-journal-recovery.md")
+    if not problems:
+        logger.info("journal backlog OK")
+    return problems
+
+
+# ══════════════════════════════════════════════════════════════
 # 実行本体
 # ══════════════════════════════════════════════════════════════
 
@@ -189,6 +257,11 @@ async def run_healthcheck() -> list[str]:
         problems += await check_block_sync()
     except Exception as e:
         problems.append(f"App30/32同期監視の実行自体が失敗: {str(e)[:150]}")
+    try:
+        problems += await check_journal_backlog()  # 監視項目E（P1-005d）
+    except Exception as e:
+        # DB接続情報が例外本文に含まれ得るため分類のみ（RCF-M05流儀）
+        problems.append(f"journal滞留監視の実行自体が失敗: {type(e).__name__}")
 
     if problems:
         logger.error("healthcheck NG (%d problems): %s", len(problems), problems)
