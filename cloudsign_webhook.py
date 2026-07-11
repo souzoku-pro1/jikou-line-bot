@@ -4,7 +4,9 @@
 役割:
   1. クラウドサインから「締結完了」の通知（Webhook）を受け取る
   2. なりすまし防止のため URL に埋めた合言葉を検証
-  3. 書類詳細 API を叩いて通知の真正性を確認（締結情報も取得）
+  3. 書類詳細 API を叩いて通知の真正性を確認（締結情報も取得）。
+     確認できない場合は fail-closed（P0B-002 / R0A-B03）: 受任遷移も
+     顧客向け通知も行わず、業務指示Botチャネルで要人手確認を警報する
   4. documentID で kintone の案件レコードを検索し、ステータスを「締結済み」に更新
   5. LINE で管理者に通知
 
@@ -98,6 +100,44 @@ def fetch_document(document_id: str) -> dict:
     return resp.json()
 
 
+def _classify_fetch_error(exc: Exception) -> str:
+    """安全ログ用の失敗分類（識別子のみ。本文・PII・token・生レスポンスを含めない）"""
+    if isinstance(exc, requests.HTTPError):
+        code = getattr(getattr(exc, "response", None), "status_code", None)
+        return f"api_http_{code}" if code else "api_http_error"
+    if isinstance(exc, requests.Timeout):
+        return "api_timeout"
+    if isinstance(exc, requests.RequestException):
+        return "api_request_error"
+    return f"error_{type(exc).__name__}"
+
+
+def verify_completed_document(document_id: str) -> tuple[dict | None, str]:
+    """書類詳細 API で webhook の真正性を確認する（fail-closed 化・P0B-002）。
+
+    戻り値: (書類dict, "") 成功 ／ (None, 失敗分類) 失敗。
+    失敗と判定する条件（いずれも受任遷移させない）:
+      - fetch_document の例外（HTTPエラー・タイムアウト・接続失敗ほか）
+      - レスポンスが dict でない（想定外レスポンス）
+      - レスポンスの id が webhook の documentID と一致しない（id キーがある場合）
+      - レスポンスの status が STATUS_COMPLETED(2) でない
+        ※書類詳細 API の status 値は webhook と同体系（:50-53 の注のとおり
+          実環境/サンドボックスで要確認）。キー欠落も安全側で失敗扱いにする
+    """
+    try:
+        doc = fetch_document(document_id)
+    except Exception as exc:
+        return None, _classify_fetch_error(exc)
+    if not isinstance(doc, dict):
+        return None, "unexpected_response_type"
+    doc_id = doc.get("id")
+    if doc_id is not None and str(doc_id) != str(document_id):
+        return None, "document_id_mismatch"
+    if doc.get("status") != STATUS_COMPLETED:
+        return None, f"status_mismatch_{doc.get('status')}"
+    return doc, ""
+
+
 # ============================================================
 # kintone 更新
 # ============================================================
@@ -163,6 +203,35 @@ def notify_line(message: str) -> None:
         logger.exception("LINE通知失敗")
 
 
+def notify_business_line(message: str) -> None:
+    """業務通知（照合失敗の要人手確認）を業務指示Botチャネルで管理者へ送る。
+
+    DISPATCHBOT_CHANNEL_ACCESS_TOKEN 未設定なら送信しない（警告ログのみ）。
+    顧客Bot（LINE_CHANNEL_ACCESS_TOKEN）へのフォールバックは行わない
+    （P0B-002 指示: 照合失敗の警報を顧客Botチャネルに乗せない。
+    hub/notify.business_token_env のフォールバックはここでは使わない）。
+    """
+    token = os.environ.get("DISPATCHBOT_CHANNEL_ACCESS_TOKEN", "")
+    to = (os.environ.get("LINE_ADMIN_USER_ID", "")
+          or os.environ.get("ATTORNEY_LINE_USER_ID", ""))
+    if not (token and to):
+        logger.warning(
+            "business LINE notify skipped (DISPATCHBOT token or admin id unset)")
+        return
+    try:
+        requests.post(
+            "https://api.line.me/v2/bot/message/push",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+            json={"to": to, "messages": [{"type": "text", "text": message[:4900]}]},
+            timeout=10,
+        )
+    except Exception:
+        logger.exception("business LINE通知失敗")
+
+
 # ============================================================
 # コア処理（フレームワーク非依存）
 #   返り値: (HTTPステータスコード, レスポンスdict)
@@ -177,18 +246,36 @@ def handle_webhook(secret: str, payload: dict) -> tuple[int, dict]:
     logger.info("CloudSign webhook受信 doc=%s status=%s", document_id, status)
 
     if status == STATUS_COMPLETED and document_id:
-        title = ""
-        try:
-            doc = fetch_document(document_id)  # 真正性確認＆タイトル取得
-            title = doc.get("title", "")
-        except Exception:
-            logger.exception("書類取得失敗 doc=%s", document_id)
+        doc, failure = verify_completed_document(document_id)
+        if doc is None:
+            # fail-closed（P0B-002 / R0A-B03）: 真正性を確認できないイベントでは
+            # 業務 state（受任）を進めない・顧客チャネルの通知も出さない。
+            # ログは correlation 用の documentID と失敗分類のみ
+            # （本文・PII・token・ベンダー生レスポンスは出さない）
+            logger.warning("CloudSign照合失敗のため受任へ遷移せず doc=%s reason=%s",
+                           document_id, failure)
+            notify_business_line(
+                "【CloudSign照合失敗・要人手確認】\n"
+                f"documentID: {document_id}\n"
+                f"失敗分類: {failure}\n"
+                "受任への自動遷移は行っていません。"
+                "CloudSign管理画面で締結状況を確認してください。")
+            # 再送方針: CloudSign が非2xx応答時に再送するか・何回で打ち切るか・
+            # webhook を自動無効化するかは、リポジトリ内資料からは確定できない
+            # （BLOCKED_NEEDS_HUMAN）。不用意に非2xxを返すと再送ループや配信停止を
+            # 招き得るため、受理応答は従来どおり 200 を維持する。
+            # 「業務 state を進めていない」ことは state=verification_failed と
+            # 上記ログで判別できる（イベントの永続 journal 化は Phase 1）。
+            return 200, {"ok": True, "state": "verification_failed"}
 
+        title = doc.get("title", "")
         update_kintone_status(document_id, "受任")
         notify_line(f"【締結完了】{title}\ndocumentID: {document_id}")
+        return 200, {"ok": True, "state": "processed"}
 
+    # 締結完了以外のイベント（却下・取消等）は従来どおり何もしない
     # クラウドサインには常に200を返す（再送ループを防ぐ）
-    return 200, {"ok": True}
+    return 200, {"ok": True, "state": "skipped"}
 
 
 # ============================================================
