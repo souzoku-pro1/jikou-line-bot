@@ -64,9 +64,12 @@ _ALLOWED_PAIRS = frozenset({
 })
 
 # ── 値域検証（R-P1-101） ──────────────────────────────────────────────────
-# record_id は kintone 内部レコード番号（英数・_・- のみ・長さ上限）
-_RECORD_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
-_DIGITS_RE = re.compile(r"^[0-9]{1,18}$")
+# record_id は kintone 内部レコード番号（英数・_・- のみ・64桁上限）。
+# count は非負整数（18桁上限）。いずれも fullmatch（末尾改行等を拒否・NM01）。
+_RECORD_ID_MAX = 64
+_COUNT_MAX_DIGITS = 18
+_RECORD_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,%d}" % _RECORD_ID_MAX)
+_DIGITS_RE = re.compile(r"[0-9]{1,%d}" % _COUNT_MAX_DIGITS)
 
 # ── 固定文言（原文を含まない・縮退用） ────────────────────────────────────
 _SUPPRESSED_GENERIC = "（非表示）"
@@ -99,9 +102,10 @@ def _valid_record_id(value) -> bool:
     if isinstance(value, bool):
         return False
     if isinstance(value, int):
-        return value >= 0
+        # NL01: int にも桁上限を文字列と同一適用（65桁以上は拒否）
+        return value >= 0 and len(str(value)) <= _RECORD_ID_MAX
     if isinstance(value, str):
-        return bool(_RECORD_ID_RE.match(value))
+        return _RECORD_ID_RE.fullmatch(value) is not None  # NM01: 末尾改行拒否
     return False
 
 
@@ -109,9 +113,10 @@ def _valid_count(value) -> bool:
     if isinstance(value, bool):
         return False
     if isinstance(value, int):
-        return value >= 0
+        # NL01: int count は 18 桁上限（19桁以上は拒否）
+        return value >= 0 and len(str(value)) <= _COUNT_MAX_DIGITS
     if isinstance(value, str):
-        return bool(_DIGITS_RE.match(value))
+        return _DIGITS_RE.fullmatch(value) is not None  # NM01: 末尾改行拒否
     return False
 
 

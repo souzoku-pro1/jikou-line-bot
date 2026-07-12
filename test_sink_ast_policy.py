@@ -1,18 +1,22 @@
-"""sink 出力の AST 方針検査（P1-101 / P1-101a・DRAFT §5 の土台）
+"""sink 出力の AST 方針検査（P1-101 / P1-101a / P1-101b・DRAFT §5 の土台）
 
-検査対象（アプリ本体 *.py・test_/legacy/alembic 除外）:
-- 直接出力の sink 境界（H01）: `print`（別名代入・別名 import 経由含む）/
-  `sys.stdout.write`・`sys.stderr.write` / module 直呼びの `logging.<level>(...)`。
-- raw error/PII 迂回（H02）: `print` / logger 系（`logger.<level>` / `logger.log`）/
-  `HTTPException`（`from fastapi import HTTPException as X` の別名・`fastapi.HTTPException`
-  の module 修飾を含む）の **引数内** に、`str()` / `repr()` / `.format()` / `"%s" % x` /
-  f-string の変数埋め込み / `.text` / `.content` / `.json()` を検出。
-  過検知は絞らず全検出し、現状分は allowlist に凍結（台帳が増えるのは現状債務の可視化）。
+**ホワイトリスト方式（P1-101b・根治）**: sink 呼び出し（print/別名・logger 系
+〔logger.<level> / logger.log / logging.<level>〕・HTTPException〔別名・module 修飾含む〕・
+sys.stdout/stderr.write）の **全引数（位置・keyword 双方。exc_info 等も対象）** が
+次のみで構成される場合に限り合格:
+  (a) 定数（ast.Constant）
+  (b) 変数埋込のない定数 f-string
+  (c) `emit(...)`（hub.redact.emit）呼び出し
+  (d) (a)〜(c) のみからなる結合（`+` 連結・タプル/リスト）
+それ以外の要素（変数参照・属性参照・emit 以外の関数呼び出し・`%`/`.format()` 等の演算）を
+1つでも含めば違反。logger の %スタイル `logger.info("msg %s", emit(...))` は
+第1引数が定数・以降が全て(a)〜(c)なので合格。
 
-移行期は **許可リスト方式**（redaction_sink_allowlist.json）:
-- entries に無い **新規違反はゼロ**（新規追加を阻止）。
-- 総数は baseline_count を **上限**（単調減少のみ許可・S1〜S4 で減らす）。
-- H03: parse/read 失敗は**黙殺せずテスト失敗**にする。
+移行期は許可リスト方式（redaction_sink_allowlist.json）。3 検査を併存（目的が別）:
+- **no_new**: entries に無い新規違反はゼロ。
+- **stale（M02）**: entries にあるが現存しない違反はゼロ（解消時の削除漏れを検知）。
+- **monotonic**: 総数は baseline_count を上限（単調減少のみ許可）。
+- **H03**: parse/read 失敗は黙殺せずテスト失敗。
 
 この許可リストが S1〜S4 切替の作業台帳そのものである。
 """
@@ -34,23 +38,50 @@ _LOGGER_LEVELS = {"debug", "info", "warning", "error", "exception", "critical"}
 
 
 # ══════════════════════════════════════════════════════════════
-# スキャナ本体（source → 違反リスト）。fixture テストのため関数化。
+# ホワイトリスト判定
+# ══════════════════════════════════════════════════════════════
+
+def _is_emit_call(node: ast.Call) -> bool:
+    f = node.func
+    if isinstance(f, ast.Name):
+        return f.id == "emit"
+    if isinstance(f, ast.Attribute):
+        return f.attr == "emit"
+    return False
+
+
+def _arg_is_safe(node: ast.AST) -> bool:
+    """引数が (a) 定数 / (b) 定数 f-string / (c) emit(...) / (d) それらの結合 のみか"""
+    if isinstance(node, ast.Constant):
+        return True
+    if isinstance(node, ast.JoinedStr):
+        # 変数埋込（FormattedValue）が無い定数 f-string のみ合格
+        return all(isinstance(v, ast.Constant) for v in node.values)
+    if isinstance(node, ast.Call):
+        return _is_emit_call(node)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        return _arg_is_safe(node.left) and _arg_is_safe(node.right)
+    if isinstance(node, (ast.Tuple, ast.List)):
+        return all(_arg_is_safe(e) for e in node.elts)
+    return False
+
+
+# ══════════════════════════════════════════════════════════════
+# sink 識別 + 走査
 # ══════════════════════════════════════════════════════════════
 
 def _print_aliases_and_httpexc(tree: ast.AST):
-    """ファイル内の print 別名・HTTPException 別名を収集する"""
     print_aliases = set()
     httpexc_names = {"HTTPException"}
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom):
             for a in node.names:
                 local = a.asname or a.name
-                if a.name == "print":            # from builtins import print as p
+                if a.name == "print":
                     print_aliases.add(local)
-                if a.name == "HTTPException":     # from fastapi import HTTPException as X
+                if a.name == "HTTPException":
                     httpexc_names.add(local)
         elif isinstance(node, ast.Assign):
-            # p = print
             if isinstance(node.value, ast.Name) and node.value.id == "print":
                 for tgt in node.targets:
                     if isinstance(tgt, ast.Name):
@@ -58,45 +89,31 @@ def _print_aliases_and_httpexc(tree: ast.AST):
     return print_aliases, httpexc_names
 
 
-def _is_stdio_write(func: ast.AST) -> bool:
-    """sys.stdout.write / sys.stderr.write を検出（stdout/stderr.write でも可）"""
-    if not (isinstance(func, ast.Attribute) and func.attr == "write"):
-        return False
-    v = func.value
-    return isinstance(v, ast.Attribute) and v.attr in ("stdout", "stderr")
-
-
-def _is_logging_module_level(func: ast.AST) -> bool:
-    """logging.<level>(...) の module 直呼び（logger インスタンスでない）"""
-    return (isinstance(func, ast.Attribute) and func.attr in _LOGGER_LEVELS
-            and isinstance(func.value, ast.Name) and func.value.id == "logging")
-
-
-def _arg_has_raw(node: ast.AST) -> bool:
-    """引数 subtree に raw error/PII 迂回パターンが含まれるか"""
-    for sub in ast.walk(node):
-        if isinstance(sub, ast.Call):
-            f = sub.func
-            if isinstance(f, ast.Name) and f.id in ("str", "repr"):
-                return True
-            if isinstance(f, ast.Attribute) and f.attr in ("format", "json"):
-                return True
-        elif isinstance(sub, ast.Attribute) and sub.attr in ("text", "content"):
-            return True
-        elif isinstance(sub, ast.BinOp) and isinstance(sub.op, ast.Mod) \
-                and isinstance(sub.left, ast.Constant) \
-                and isinstance(sub.left.value, str):
-            return True  # "%s" % x
-        elif isinstance(sub, ast.JoinedStr):
-            # f-string の変数埋め込み（定数のみでない）
-            if any(isinstance(v, ast.FormattedValue) for v in sub.values):
-                return True
-    return False
+def _sink_kind(node: ast.Call, print_aliases, httpexc_names):
+    f = node.func
+    if isinstance(f, ast.Name):
+        if f.id == "print" or f.id in print_aliases:
+            return "print"
+        if f.id in httpexc_names:
+            return "httpexception"
+    if isinstance(f, ast.Attribute):
+        if f.attr == "HTTPException":
+            return "httpexception"
+        if f.attr in _LOGGER_LEVELS:
+            if isinstance(f.value, ast.Name) and f.value.id == "logging":
+                return "logging_module"
+            return "logger"
+        if f.attr == "log":
+            return "logger_log"
+        if f.attr == "write" and isinstance(f.value, ast.Attribute) \
+                and f.value.attr in ("stdout", "stderr"):
+            return "stdio_write"
+    return None
 
 
 def scan_source(src: str, name: str) -> list[str]:
     """source 文字列を解析し違反リストを返す（parse 失敗は例外送出＝H03）"""
-    tree = ast.parse(src, filename=name)   # 失敗は SyntaxError を送出（黙殺しない）
+    tree = ast.parse(src, filename=name)
     print_aliases, httpexc_names = _print_aliases_and_httpexc(tree)
     violations = []
 
@@ -112,41 +129,15 @@ def scan_source(src: str, name: str) -> list[str]:
 
         if not isinstance(node, ast.Call):
             continue
-        f = node.func
-
-        # 直接出力 sink（無条件違反）
-        if isinstance(f, ast.Name) and (f.id == "print" or f.id in print_aliases):
-            violations.append(f"{name}:{node.lineno}:print")
+        kind = _sink_kind(node, print_aliases, httpexc_names)
+        if kind is None:
             continue
-        if _is_stdio_write(f):
-            violations.append(f"{name}:{node.lineno}:stdio_write")
-            continue
-        if _is_logging_module_level(f):
-            violations.append(f"{name}:{node.lineno}:logging_module")
-            continue
-
-        # raw error を運ぶ可能性のある sink（引数に raw があれば違反）
-        sink = None
-        if isinstance(f, ast.Name) and f.id in httpexc_names:
-            sink = "httpexception"
-        elif isinstance(f, ast.Attribute):
-            if f.attr == "HTTPException":            # fastapi.HTTPException(...)
-                sink = "httpexception"
-            elif f.attr in _LOGGER_LEVELS:
-                sink = "logger"
-            elif f.attr == "log":                    # logger.log(level, ...)
-                sink = "logger_log"
-        if sink is not None:
-            args = list(node.args) + [kw.value for kw in node.keywords]
-            if any(_arg_has_raw(a) for a in args):
-                violations.append(f"{name}:{node.lineno}:raw_error:{sink}")
+        args = list(node.args) + [kw.value for kw in node.keywords]
+        if not all(_arg_is_safe(a) for a in args):
+            violations.append(f"{name}:{node.lineno}:sink:{kind}")
 
     return sorted(set(violations))
 
-
-# ══════════════════════════════════════════════════════════════
-# リポジトリ全体の走査
-# ══════════════════════════════════════════════════════════════
 
 def _tracked_py():
     out = subprocess.run(["git", "ls-files", "*.py"], capture_output=True,
@@ -163,7 +154,6 @@ def _tracked_py():
 
 
 def scan_repo():
-    """全対象ファイルを走査。(violations, parse_errors) を返す（H03: 失敗を可視化）"""
     violations, errors = [], []
     for path in _tracked_py():
         posix = path.as_posix()
@@ -180,49 +170,81 @@ def scan_repo():
 # ══════════════════════════════════════════════════════════════
 
 class TestScannerDetection(unittest.TestCase):
-    CASES = [
-        # (説明, source, 期待 rule 集合)
-        ("print", "print('x')\n", {"print"}),
-        ("print_alias_assign", "p = print\np('x')\n", {"print_alias", "print"}),
+    # 違反になるべき（ホワイトリスト外の要素を含む）
+    VIOLATION_CASES = [
+        ("print_var", "print(x)\n", {"sink:print"}),
+        ("print_alias_assign", "p = print\np(x)\n",
+         {"print_alias", "sink:print"}),
         ("print_alias_import",
-         "from builtins import print as pp\npp('x')\n", {"print_alias", "print"}),
-        ("stdout_write", "import sys\nsys.stdout.write('x')\n", {"stdio_write"}),
-        ("stderr_write", "import sys\nsys.stderr.write('x')\n", {"stdio_write"}),
-        ("logging_module", "import logging\nlogging.info('x')\n",
-         {"logging_module"}),
-        ("logger_str", "logger.info('a %s', str(e))\n", {"raw_error:logger"}),
-        ("logger_fstring", "logger.error(f'boom {e}')\n", {"raw_error:logger"}),
-        ("logger_percent", "logger.warning('x %s' % e)\n", {"raw_error:logger"}),
-        ("logger_format", "logger.info('{}'.format(e))\n", {"raw_error:logger"}),
-        ("logger_repr", "logger.info(repr(e))\n", {"raw_error:logger"}),
-        ("logger_text", "logger.error(resp.text)\n", {"raw_error:logger"}),
-        ("logger_content", "logger.error(resp.content)\n", {"raw_error:logger"}),
-        ("logger_json", "logger.error(resp.json())\n", {"raw_error:logger"}),
-        ("logger_log", "logger.log(level, str(e))\n", {"raw_error:logger_log"}),
-        ("httpexc_plain",
-         "raise HTTPException(status_code=500, detail=str(e))\n",
-         {"raw_error:httpexception"}),
+         "from builtins import print as pp\npp(x)\n",
+         {"print_alias", "sink:print"}),
+        ("stdout_write_var", "import sys\nsys.stdout.write(x)\n",
+         {"sink:stdio_write"}),
+        ("logging_module_var", "import logging\nlogging.info(x)\n",
+         {"sink:logging_module"}),
+        # Codex 提案分
+        ("logger_customer_name", "logger.info(customer_name)\n", {"sink:logger"}),
+        ("logger_error", "logger.error(error)\n", {"sink:logger"}),
+        ("httpexc_detail_var",
+         "raise HTTPException(detail=error_detail)\n",
+         {"sink:httpexception"}),
+        ("logger_exc_info", "logger.exception('x', exc_info=e)\n",
+         {"sink:logger"}),
+        ("logger_traceback", "logger.error(traceback.format_exc())\n",
+         {"sink:logger"}),
+        ("logger_eargs", "logger.error(e.args)\n", {"sink:logger"}),
+        # 迂回パターン（従来 raw_error 相当）
+        ("logger_str", "logger.info(str(e))\n", {"sink:logger"}),
+        ("logger_fstring_var", "logger.error(f'boom {e}')\n", {"sink:logger"}),
+        ("logger_percent_inline", "logger.warning('x %s' % e)\n",
+         {"sink:logger"}),
+        ("logger_format", "logger.info('{}'.format(e))\n", {"sink:logger"}),
+        ("logger_repr", "logger.info(repr(e))\n", {"sink:logger"}),
+        ("logger_text", "logger.error(resp.text)\n", {"sink:logger"}),
+        ("logger_json", "logger.error(resp.json())\n", {"sink:logger"}),
+        ("logger_log_var", "logger.log(level, str(e))\n", {"sink:logger_log"}),
+        ("httpexc_str",
+         "raise HTTPException(detail=str(e))\n", {"sink:httpexception"}),
         ("httpexc_alias",
-         "from fastapi import HTTPException as H\n"
-         "raise H(detail=f'{e}')\n", {"raw_error:httpexception"}),
+         "from fastapi import HTTPException as H\nraise H(detail=f'{e}')\n",
+         {"sink:httpexception"}),
         ("httpexc_module",
          "import fastapi\nraise fastapi.HTTPException(detail=resp.text)\n",
-         {"raw_error:httpexception"}),
-        ("safe_logger_no_raw", "logger.info('static message')\n", set()),
-        ("safe_logger_constant_fstring", "logger.info(f'no vars here')\n", set()),
+         {"sink:httpexception"}),
+    ]
+    # 合格すべき（全引数が定数 / 定数 f-string / emit / それらの結合）
+    SAFE_CASES = [
+        ("print_static", "print('x')\n"),
+        ("stdout_write_static", "import sys\nsys.stdout.write('x')\n"),
+        ("logging_module_static", "import logging\nlogging.info('x')\n"),
+        ("logger_static", "logger.info('static message')\n"),
+        ("logger_const_fstring", "logger.info(f'no vars here')\n"),
+        ("logger_emit",
+         "logger.info(emit(x, 'name', 'log', 'operator'))\n"),
+        ("logger_percent_emit",
+         "logger.info('case %s', emit(cid, 'record_id', 'log', 'operator'))\n"),
+        ("httpexc_const",
+         "raise HTTPException(status_code=500, detail='not found')\n"),
+        ("logger_exc_info_true", "logger.error('x', exc_info=True)\n"),
+        ("logger_concat_const_emit",
+         "logger.info('p:' + emit(x, 'name', 'log', 'operator'))\n"),
     ]
 
-    def test_each_pattern(self):
-        for desc, src, expected_rules in self.CASES:
+    def test_violation_patterns(self):
+        for desc, src, expected in self.VIOLATION_CASES:
             with self.subTest(case=desc):
                 found = scan_source(src, "fx.py")
-                # entry = "name:lineno:rule[:extra]" → rule 部分（index 2 以降）
                 rules = {":".join(v.split(":")[2:]) for v in found}
-                self.assertEqual(rules, expected_rules,
-                                 f"{desc}: got {found}")
+                self.assertEqual(rules, expected, f"{desc}: got {found}")
+
+    def test_safe_patterns(self):
+        for desc, src in self.SAFE_CASES:
+            with self.subTest(case=desc):
+                found = scan_source(src, "fx.py")
+                # print_alias 生成が無い純合格ケースなので空
+                self.assertEqual(found, [], f"{desc}: got {found}")
 
     def test_parse_error_raises(self):
-        """H03: parse 失敗は黙殺せず例外（scan_source は握りつぶさない）"""
         with self.assertRaises(SyntaxError):
             scan_source("def bad(:\n", "fx.py")
 
@@ -239,7 +261,6 @@ class TestSinkAllowlist(unittest.TestCase):
         self.current, self.errors = scan_repo()
 
     def test_no_parse_errors(self):
-        """H03: 走査中の parse/read 失敗を黙殺しない"""
         self.assertEqual(self.errors, [],
                          "AST 走査で解析失敗が発生した:\n" + "\n".join(self.errors))
 
@@ -253,19 +274,26 @@ class TestSinkAllowlist(unittest.TestCase):
                          "emit() 経由にするか、正当なら allowlist に追記して理由を"
                          "レビューで明示すること:\n" + "\n".join(new))
 
+    def test_no_stale_entries(self):
+        """M02: 解消済み（現存しない）違反が allowlist に残っていないこと"""
+        stale = sorted(self.allow - set(self.current))
+        self.assertEqual(stale, [],
+                         "解消済みの違反が allowlist に残っている（削除漏れ）。"
+                         "S1〜S4 で直したら当該行を allowlist から削除すること:\n"
+                         + "\n".join(stale))
+
     def test_monotonic_decrease_only(self):
-        """総数は baseline_count を上限（単調減少のみ許可・S1〜S4 で減らす）"""
         self.assertLessEqual(len(self.current), self.baseline,
                              f"違反総数が基準 {self.baseline} を超えた"
                              f"（現在 {len(self.current)}）。新規 sink 直書きの疑い。")
 
     def test_allowlist_entries_are_well_formed(self):
-        rules = {"print", "print_alias", "stdio_write", "logging_module",
-                 "raw_error"}
+        ok_rules = {"print_alias", "sink:print", "sink:logger",
+                    "sink:logger_log", "sink:logging_module",
+                    "sink:httpexception", "sink:stdio_write"}
         for e in self.allow:
-            parts = e.split(":")
-            self.assertGreaterEqual(len(parts), 3, e)
-            self.assertIn(parts[2], rules, e)
+            rule = ":".join(e.split(":")[2:])
+            self.assertIn(rule, ok_rules, e)
 
 
 if __name__ == "__main__":

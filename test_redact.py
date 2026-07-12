@@ -193,6 +193,26 @@ class TestValueValidation(unittest.TestCase):
             out = emit(bad, "count", "log", "operator")
             self.assertEqual(out, "（count・非表示）", repr(bad))
 
+    def test_trailing_newline_rejected(self):
+        """NM01: fullmatch により末尾改行付きは無効→抑止"""
+        self.assertEqual(emit("42\n", "record_id", "log", "operator"),
+                         "（record_id・非表示）")
+        self.assertEqual(emit("7\n", "count", "log", "operator"),
+                         "（count・非表示）")
+
+    def test_int_length_caps(self):
+        """NL01: int にも桁上限を適用（record_id 64桁・count 18桁）"""
+        # 65桁 int record_id → 抑止 / 64桁 → 許容
+        self.assertEqual(emit(int("9" * 65), "record_id", "log", "operator"),
+                         "（record_id・非表示）")
+        self.assertEqual(emit(int("9" * 64), "record_id", "log", "operator"),
+                         "9" * 64)
+        # 19桁 int count → 抑止 / 18桁 → 許容
+        self.assertEqual(emit(int("9" * 19), "count", "log", "operator"),
+                         "（count・非表示）")
+        self.assertEqual(emit(int("9" * 18), "count", "log", "operator"),
+                         "9" * 18)
+
 
 class TestSinkAudienceMatrix(unittest.TestCase):
     """M04: 許可ペア行列の外は完全抑止"""
