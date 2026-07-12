@@ -493,7 +493,10 @@ def handle_webhook(secret: str, payload: dict) -> tuple[int, dict]:
 
     document_id = payload.get("documentID")
     status = payload.get("status")
-    logger.info("CloudSign webhook受信 doc=%s status=%s", document_id, status)
+    # H01: documentID は external_ref のため抑止（INFO 配線後は log が可視のため）
+    logger.info("CloudSign webhook受信 doc=%s status=%s",
+                emit(document_id, "external_ref", "log", "operator"),
+                emit(status, "count", "log", "operator"))
 
     if status == STATUS_COMPLETED and document_id:
         doc, failure = verify_completed_document(document_id)

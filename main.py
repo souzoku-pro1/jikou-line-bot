@@ -71,12 +71,15 @@ def _configure_app_logging() -> None:
       洪水にするため WARNING へ引き上げる（app 由来の INFO 可視化が目的のため）。
     """
     root = logging.getLogger()
-    if not root.handlers:
-        handler = logging.StreamHandler(sys.stdout)
-        handler.setFormatter(logging.Formatter(
-            "%(asctime)s %(levelname)s %(name)s %(message)s"))
-        root.addHandler(handler)
-    root.setLevel(logging.INFO)
+    if root.handlers:
+        # M01: 既に誰か（uvicorn --log-config / basicConfig 等）が root を設定済み。
+        # level も handler も触らず既存挙動を尊重する（二重付与・level 上書きをしない）。
+        return
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(logging.Formatter(
+        "%(asctime)s %(levelname)s %(name)s %(message)s"))
+    root.addHandler(handler)
+    root.setLevel(logging.INFO)   # handler を付与した場合のみ level を設定
     # サードパーティの per-request INFO を抑制（洪水回避・app INFO は残す）
     for _noisy in ("httpx", "httpcore", "urllib3"):
         logging.getLogger(_noisy).setLevel(logging.WARNING)
