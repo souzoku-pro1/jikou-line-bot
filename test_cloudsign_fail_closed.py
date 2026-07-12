@@ -250,7 +250,7 @@ class TestBusinessNotifyChannelPolicy(unittest.TestCase):
 
 
 class TestMismatchEnvelope(unittest.TestCase):
-    """P1-102b/c: 失敗経路の App 30「要確認」封筒起票（M06/M07/H03）"""
+    """P1-102b/c/d: 失敗経路の App 30「要確認」封筒起票（M06/M07/H03）"""
 
     APP30 = {"APP_SHIPPING": "30", "TOKEN_SHIPPING": "sh_tok"}
 
@@ -262,17 +262,25 @@ class TestMismatchEnvelope(unittest.TestCase):
         return r
 
     @classmethod
-    def _records(cls, *pairs):
-        """(record_id, document_id) から kintone レコード（$id＋チャネル固有データ）を作る"""
+    def _records(cls, *rows):
+        """(record_id, document_id[, 発送ステータス]) から kintone レコードを作る
+        （省略時ステータス=要確認）。$id＋チャネル固有データ＋発送ステータスを持つ。"""
         recs = []
-        for rid, doc in pairs:
+        for row in rows:
+            rid, doc = row[0], row[1]
+            status = row[2] if len(row) > 2 else "要確認"
             key = f"cloudsign_mismatch:{doc}"
             chan = json.dumps(
                 {"cloudsign_mismatch": {"冪等キー": key, "documentID": doc,
                                         "失敗理由": "x"}}, ensure_ascii=False)
             recs.append({"$id": {"value": rid},
-                         "チャネル固有データ": {"value": chan}})
+                         "チャネル固有データ": {"value": chan},
+                         "発送ステータス": {"value": status}})
         return cls._resp({"records": recs})
+
+    @staticmethod
+    def _put_ids(rq):
+        return sorted(c.kwargs["json"]["id"] for c in rq.put.call_args_list)
 
     def test_files_envelope_when_no_existing(self):
         with patch.dict("os.environ", self.APP30, clear=False), \
@@ -291,13 +299,14 @@ class TestMismatchEnvelope(unittest.TestCase):
         self.assertIn("doc1", chan)
         self.assertIn("kintone_no_match", chan)
 
-    def test_idempotent_reuses_min_existing_envelope(self):
+    def test_idempotent_reuses_single_existing(self):
         with patch.dict("os.environ", self.APP30, clear=False), \
              patch.object(mod, "requests") as rq:
-            rq.get.return_value = self._records(("9", "doc1"), ("7", "doc1"))
+            rq.get.return_value = self._records(("7", "doc1"))     # 既存1件
             no = mod.file_mismatch_envelope("doc1", "kintone_no_match")
-        self.assertEqual(no, "7")                                  # 最小 No を再利用
+        self.assertEqual(no, "7")                                  # 再利用
         rq.post.assert_not_called()                                # 二重起票しない
+        rq.put.assert_not_called()                                 # 単一なら収束不要
 
     def test_exact_match_excludes_substring_false_positive(self):
         """M07: like は部分一致。冪等キー完全一致で別 documentID(doc12)を誤採用しない。"""
@@ -319,38 +328,74 @@ class TestMismatchEnvelope(unittest.TestCase):
         query = rq.get.call_args.kwargs["params"]["query"]
         self.assertIn('doc\\"1', query)                            # " が \" へエスケープ
 
-    def test_compensation_loser_closes_self_and_uses_min(self):
-        """H03: create 後の再検索で自分より小さい No があれば自封筒を却下し最小 No へ収束。"""
+    # ── H03: 相互不可視 race の後続再送で収束（既存検索での compensation・P1-102d）──
+    def test_presearch_convergence_after_invisible_race(self):
+        """A:create=3/post=[3]・B:create=8/post=[8] で両者生存 → 後続再送の既存検索で
+        [3,8] が見え、winner=3 へ収束。No.8 を却下・No.3(winner)は無変更・通知は No.3。"""
+        with patch.dict("os.environ", self.APP30, clear=False), \
+             patch.object(mod, "requests") as rq:
+            rq.get.return_value = self._records(("3", "doc1"), ("8", "doc1"))
+            rq.put.return_value = self._resp({})
+            no = mod.file_mismatch_envelope("doc1", "kintone_no_match")
+        self.assertEqual(no, "3")                                  # 通知は winner No.3
+        rq.post.assert_not_called()                                # 再起票しない
+        self.assertEqual(self._put_ids(rq), ["8"])                # 敗者8のみ却下・3は無変更
+        self.assertEqual(rq.put.call_args.kwargs["json"]
+                         ["record"]["発送ステータス"]["value"], "却下")
+
+    def test_presearch_convergence_close_failure_keeps_winner(self):
+        """No.8 のクローズが失敗しても winner No.3 を返し通知を維持する。"""
+        with patch.dict("os.environ", self.APP30, clear=False), \
+             patch.object(mod, "requests") as rq:
+            rq.get.return_value = self._records(("3", "doc1"), ("8", "doc1"))
+            rq.put.side_effect = RuntimeError("update failed")
+            no = mod.file_mismatch_envelope("doc1", "kintone_no_match")
+        self.assertEqual(no, "3")                                  # 一部失敗でも winner 継続
+
+    def test_processed_records_are_not_rewritten(self):
+        """処理済み(完了)record は敗者でも書き換えない。要確認の敗者のみ却下する。"""
+        with patch.dict("os.environ", self.APP30, clear=False), \
+             patch.object(mod, "requests") as rq:
+            rq.get.return_value = self._records(
+                ("3", "doc1", "要確認"),      # winner（最小・無変更）
+                ("5", "doc1", "完了"),        # 人処理済み・敗者だが触らない
+                ("8", "doc1", "要確認"))      # 要確認の敗者・却下対象
+            rq.put.return_value = self._resp({})
+            no = mod.file_mismatch_envelope("doc1", "kintone_no_match")
+        self.assertEqual(no, "3")
+        self.assertEqual(self._put_ids(rq), ["8"])                # 8のみ（3=winner,5=完了は不変）
+
+    # ── H03: create 後の再検索での compensation（可視な並行）──
+    def test_postcreate_loser_closes_and_converges(self):
+        """自 No=8 で create 後、再検索で 3 が見えたら 8 を却下し winner=3 へ収束。"""
         with patch.dict("os.environ", self.APP30, clear=False), \
              patch.object(mod, "requests") as rq:
             rq.get.side_effect = [
                 self._resp({"records": []}),                       # create 前=無し
-                self._records(("3", "doc1"), ("8", "doc1")),       # create 後=並行の3が出現
+                self._records(("3", "doc1"), ("8", "doc1")),       # create 後=並行の3が可視
             ]
-            rq.post.return_value = self._resp({"id": "8"})         # 自封筒=8
+            rq.post.return_value = self._resp({"id": "8"})
             rq.put.return_value = self._resp({})
             no = mod.file_mismatch_envelope("doc1", "kintone_no_match")
-        self.assertEqual(no, "3")                                  # 最小 No へ収束
-        rq.put.assert_called_once()                                # 自封筒(8)を却下
-        put_body = rq.put.call_args.kwargs["json"]
-        self.assertEqual(put_body["id"], "8")
-        self.assertEqual(put_body["record"]["発送ステータス"]["value"], "却下")
+        self.assertEqual(no, "3")
+        self.assertEqual(self._put_ids(rq), ["8"])                # 敗者8を却下・3は無変更
 
-    def test_compensation_winner_keeps_own_no(self):
-        """H03: 自分が最小 No なら誰もクローズせず自 No を通知（収束点）。"""
+    def test_postcreate_winner_closes_loser(self):
+        """自 No=3（最小）で create 後、敗者 8 を却下する（winner は自分を閉じない）。"""
         with patch.dict("os.environ", self.APP30, clear=False), \
              patch.object(mod, "requests") as rq:
             rq.get.side_effect = [
                 self._resp({"records": []}),
                 self._records(("3", "doc1"), ("8", "doc1")),
             ]
-            rq.post.return_value = self._resp({"id": "3"})         # 自封筒=最小
+            rq.post.return_value = self._resp({"id": "3"})
+            rq.put.return_value = self._resp({})
             no = mod.file_mismatch_envelope("doc1", "kintone_no_match")
         self.assertEqual(no, "3")
-        rq.put.assert_not_called()                                 # 勝者はクローズしない
+        self.assertEqual(self._put_ids(rq), ["8"])                # 敗者8のみ・自封筒3は閉じない
 
-    def test_close_failure_falls_back_to_own_no(self):
-        """H03: 収束クローズ失敗時は warning＋自 No のまま通知（通知は必ず出る）。"""
+    def test_postcreate_close_failure_returns_winner(self):
+        """create 後の収束クローズが失敗しても winner No を返す（通知は必ず出る）。"""
         with patch.dict("os.environ", self.APP30, clear=False), \
              patch.object(mod, "requests") as rq:
             rq.get.side_effect = [
@@ -360,7 +405,7 @@ class TestMismatchEnvelope(unittest.TestCase):
             rq.post.return_value = self._resp({"id": "8"})
             rq.put.side_effect = RuntimeError("update failed")
             no = mod.file_mismatch_envelope("doc1", "kintone_no_match")
-        self.assertEqual(no, "8")                                  # 自 No で通知継続
+        self.assertEqual(no, "3")                                  # winner を維持
 
     def test_returns_none_when_app30_unset(self):
         env_wo = {"APP_SHIPPING": "", "TOKEN_SHIPPING": ""}

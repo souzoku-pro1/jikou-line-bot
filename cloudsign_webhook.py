@@ -219,12 +219,14 @@ def _escape_kintone_query_value(value: str) -> str:
     return value.replace("\\", "\\\\").replace('"', '\\"')
 
 
-def _find_mismatch_envelopes(app_id: str, token: str, key: str) -> list[int]:
-    """冪等キー key の要確認封筒 record No（int 昇順）を返す（M07）。
+def _find_mismatch_envelopes(app_id: str, token: str,
+                             key: str) -> list[tuple[int, str]]:
+    """冪等キー key の要確認封筒 (record No int, 発送ステータス) を No 昇順で返す（M07）。
 
     like で絞り込んだ後、各レコードのチャネル固有データ JSON をコード側でパースし、
-    トップキー cloudsign_mismatch の「冪等キー」が **完全一致** するものだけ採用する
-    （部分文字列 like の誤マッチ＝別 documentID の封筒を確実に排除する）。
+    トップキー cloudsign_mismatch が存在し「冪等キー」が **完全一致** するものだけ採用する
+    （部分文字列 like の誤マッチ＝別 documentID の封筒を確実に排除する）。発送ステータスは
+    収束（H03）で「要確認」の敗者だけを閉じるために持ち回る。
     """
     esc = _escape_kintone_query_value(key)
     r = requests.get(
@@ -233,11 +235,12 @@ def _find_mismatch_envelopes(app_id: str, token: str, key: str) -> list[int]:
         params={"app": app_id,
                 "query": f'{FIELD_CHANNEL_DATA} like "{esc}"',
                 "fields[0]": "$id",
-                "fields[1]": FIELD_CHANNEL_DATA},
+                "fields[1]": FIELD_CHANNEL_DATA,
+                "fields[2]": "発送ステータス"},
         timeout=10,
     )
     r.raise_for_status()
-    ids: list[int] = []
+    out: list[tuple[int, str]] = []
     for rec in r.json().get("records", []):
         raw = rec.get(FIELD_CHANNEL_DATA, {}).get("value", "")
         try:
@@ -247,12 +250,13 @@ def _find_mismatch_envelopes(app_id: str, token: str, key: str) -> list[int]:
         mm = data.get("cloudsign_mismatch") if isinstance(data, dict) else None
         if isinstance(mm, dict) and mm.get("冪等キー") == key:
             rid = rec.get("$id", {}).get("value")
+            status = rec.get("発送ステータス", {}).get("value", "")
             if rid is not None:
                 try:
-                    ids.append(int(rid))
+                    out.append((int(rid), status))
                 except (ValueError, TypeError):
                     continue
-    return sorted(ids)
+    return sorted(out, key=lambda t: t[0])
 
 
 def _close_envelope(app_id: str, token: str, record_id: int) -> None:
@@ -267,13 +271,40 @@ def _close_envelope(app_id: str, token: str, record_id: int) -> None:
     u.raise_for_status()
 
 
-def file_mismatch_envelope(document_id: str, failure_reason: str):
-    """失敗経路で App 30 へ「要確認」封筒を起票し record No（str）を返す。
+def _converge_envelopes(app_id: str, token: str,
+                        matches: list[tuple[int, str]]) -> str:
+    """完全一致封筒群を最小 No（winner）1 件へ収束させ、winner の No（str）を返す（H03）。
 
-    並行時も**通知が指す生存封筒は 1 件に収束する**（compensation・H03）:
-    like 絞り込み＋JSON パースで冪等キー完全一致（M07）を検証して既存を再利用し、
-    新規 create 後は同キーを再検索して自分より小さい record No があれば自封筒を
-    「却下」でクローズし最小 No を通知に使う。完全一意（重複を作らせない）は
+    遵守事項（R-P1-102 3巡目レビューの安全条件）:
+      - winner（最小 No）は絶対に閉じない・更新しない。
+      - 敗者クローズ対象は「要確認」状態のもののみ（完了・却下・人処理済みは書き換えない）。
+      - クローズの一部が失敗しても winner No を返し通知を維持する（warning のみ）。
+    """
+    matches = sorted(matches, key=lambda t: t[0])
+    winner = matches[0][0]
+    close_failed = False
+    for rid, status in matches:
+        if rid == winner:
+            continue                 # winner は絶対に閉じない
+        if status != "要確認":
+            continue                 # 人処理済み（完了・却下・実行済み等）は触らない
+        try:
+            _close_envelope(app_id, token, rid)
+        except Exception:
+            close_failed = True
+    if close_failed:
+        logger.warning("要確認封筒の収束クローズに一部失敗（winner No で通知継続）")
+    return str(winner)
+
+
+def file_mismatch_envelope(document_id: str, failure_reason: str):
+    """失敗経路で App 30 へ「要確認」封筒を起票し、通知に使う record No（str）を返す。
+
+    並行時も**後続再送を含め最終的に winner（最小 No）1 件へ収束する**（compensation・H03）:
+    冪等キー完全一致（M07）で封筒を検索し、**複数一致した全ての時点**（既存検索でも
+    create 後の再検索でも）で最小 No を winner とし、winner 以外の「要確認」封筒を却下で
+    クローズする。相互不可視な race（A/B が互いの封筒を見ずに create）でも、次の再送の
+    既存検索で両方が見えた時点で winner 1 件へ収束する。完全一意（重複を作らせない）は
     RCF-M07（App 30 専用フィールド＋重複禁止設定・CU 作業）で DEFER。
 
     App 30 未設定・起票/検索失敗は None を返す（呼び出し側で縮退通知へフォールバック）。
@@ -285,10 +316,12 @@ def file_mismatch_envelope(document_id: str, failure_reason: str):
         return None
     key = _mismatch_key(document_id)
     try:
-        # M07: 冪等キー完全一致で既存封筒を検索（状態不問）→ 最小 No を再利用
+        # M07/H03: 冪等キー完全一致で既存封筒を検索。複数あれば（後続再送の収束点）
+        # winner へ収束、1 件ならそれを再利用（CloudSign 再送で封筒が増えない）。
         existing = _find_mismatch_envelopes(app_id, token, key)
         if existing:
-            rid = str(existing[0])
+            rid = (_converge_envelopes(app_id, token, existing)
+                   if len(existing) > 1 else str(existing[0][0]))
             logger.info("要確認封筒は起票済み No=%s doc=%s",
                         emit(rid, "record_id", "log", "operator"),
                         emit(document_id, "external_ref", "log", "operator"))
@@ -321,24 +354,25 @@ def file_mismatch_envelope(document_id: str, failure_reason: str):
         c.raise_for_status()
         my_id = int(c.json()["id"])
 
-        # H03（compensation）: create 後に再検索し、自分より小さい同キー封筒があれば
-        # 自封筒を却下でクローズして最小 No へ収束する。収束処理の失敗は致命でなく、
-        # 自 No のまま通知する（通知は必ず出す）。
-        winner = my_id
+        # H03（compensation）: create 後に再検索して見えた同キー封筒で収束する。
+        # 読み後れで自レコードが検索に出ない場合に備え、自 No（要確認）を必ず含める。
+        # 再検索が失敗した場合のみ自 No で通知する（個々のクローズ失敗は _converge_envelopes
+        # 内で warning 記録し winner No を維持する＝通知は必ず出る）。
+        winner = str(my_id)
         try:
-            others = [i for i in _find_mismatch_envelopes(app_id, token, key)
-                      if i < my_id]
-            if others:
-                _close_envelope(app_id, token, my_id)   # 敗者=自封筒を却下
-                winner = min(others)
+            matches = _find_mismatch_envelopes(app_id, token, key)
+            if my_id not in [m[0] for m in matches]:
+                matches.append((my_id, "要確認"))
+            if len(matches) > 1:
+                winner = _converge_envelopes(app_id, token, matches)
         except Exception:
             logger.warning("要確認封筒の収束処理に失敗、自Noで通知します")
-            winner = my_id
+            winner = str(my_id)
 
         logger.info("要確認封筒を起票 No=%s doc=%s",
-                    emit(str(winner), "record_id", "log", "operator"),
+                    emit(winner, "record_id", "log", "operator"),
                     emit(document_id, "external_ref", "log", "operator"))
-        return str(winner)
+        return winner
     except Exception:
         # 起票・検索の失敗は致命ではない（通知は必ず出す・縮退へフォールバック）
         logger.error("要確認封筒の起票に失敗 (request failed)")  # 固定分類・L01
