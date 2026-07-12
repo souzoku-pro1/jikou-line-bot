@@ -878,10 +878,13 @@ async def save_to_approval_queue(
             json=body,
         )
     if not resp.is_success:
-        print(f"[APP29] save failed: {resp.status_code} {resp.text[:300]}")
+        logger.info("[APP29] save failed: status=%s body=%s",
+                    emit(resp.status_code, "count", "log", "operator"),
+                    emit(resp.text, "vendor_raw", "log", "operator"))
         return None
     record_id = resp.json().get("id")
-    print(f"[APP29] saved record_id={record_id}")
+    logger.info("[APP29] saved record_id=%s",
+                emit(record_id, "record_id", "log", "operator"))
     return record_id
 
 
@@ -944,9 +947,12 @@ async def send_line_push(to: str, text: str) -> None:
             },
             json={"to": to, "messages": [{"type": "text", "text": text}]},
         )
-    print(f"[LINE_PUSH] to={to} status={resp.status_code}")
+    logger.info("[LINE_PUSH] to=%s status=%s",
+                emit(to, "external_ref", "log", "operator"),
+                emit(resp.status_code, "count", "log", "operator"))
     if not resp.is_success:
-        print(f"[LINE_PUSH] ERROR: {resp.text[:300]}")
+        logger.error("[LINE_PUSH] ERROR: %s",
+                     emit(resp.text, "vendor_raw", "log", "operator"))
 
 
 def build_attorney_notification(
@@ -998,12 +1004,13 @@ async def _notify_attorney(
 ) -> None:
     """弁護士に承認依頼（緊急時は【緊急・要即時対応】）を LINE Push で通知する"""
     if not ATTORNEY_LINE_USER_ID:
-        print("[ATTORNEY] ATTORNEY_LINE_USER_ID not set, skipping")
+        logger.info("[ATTORNEY] ATTORNEY_LINE_USER_ID not set, skipping")
         return
     rid = approval_record_id or "（未取得）"
-    print(
-        f"[ATTORNEY] notifying to={ATTORNEY_LINE_USER_ID} approval_id={rid} "
-        f"category={category} urgent={urgent_kind or '-'}"
+    logger.info(
+        "[ATTORNEY] notifying to=%s approval_id=%s",
+        emit(ATTORNEY_LINE_USER_ID, "external_ref", "log", "operator"),
+        emit(rid, "record_id", "log", "operator"),
     )
     msg = build_attorney_notification(
         user_id, customer_name, approval_record_id, category,
@@ -1085,7 +1092,9 @@ async def handle_claude_outage(
     await save_to_chatlog(user_id, "user", user_message, OUTAGE_CATEGORY, "no")
     await save_to_chatlog(user_id, "assistant", PENDING_REPLY, OUTAGE_CATEGORY, "yes")
     await _notify_attorney(user_id, customer_name, approval_id, OUTAGE_CATEGORY)
-    print(f"[OUTAGE] queued user_id={user_id} approval_id={approval_id}")
+    logger.info("[OUTAGE] queued user_id=%s approval_id=%s",
+                emit(user_id, "external_ref", "log", "operator"),
+                emit(approval_id, "record_id", "log", "operator"))
 
 
 # ── メインハンドラ ─────────────────────────────────────────────────────────────
@@ -1160,12 +1169,16 @@ async def handle_customer_message(
     category   = result["category"]
     auto_send  = result["auto_send"]
     reason     = result.get("reason", "")
-    print(f"[COMPOSE_REPLY] user_id={user_id} category={category!r} auto_send={auto_send} reason={reason!r}")
+    logger.info("[COMPOSE_REPLY] user_id=%s reason=%s",
+                emit(user_id, "external_ref", "log", "operator"),
+                emit(reason, "freetext", "log", "operator"))
 
     # サーバー側二重チェック（カテゴリ許可リスト＋禁止語・必須文言・留保文言）
     guard = apply_server_guards(result, history, user_message)
     if guard.demotion_reasons:
-        print(f"[GUARD] demoted user_id={user_id} reasons={guard.demotion_reasons}")
+        logger.info("[GUARD] demoted user_id=%s reasons=%s",
+                    emit(user_id, "external_ref", "log", "operator"),
+                    emit(guard.demotion_reasons, "freetext", "log", "operator"))
 
     # ユーザーメッセージをチャットログに保存
     await save_to_chatlog(user_id, "user", user_message, category, "no")
@@ -1173,7 +1186,9 @@ async def handle_customer_message(
     if guard.can_auto_send:
         await reply_func(reply_token, reply_text)
         await save_to_chatlog(user_id, "assistant", reply_text, category, "yes")
-        print(f"[AUTO_SEND] user_id={user_id} category={category} len={len(reply_text)}")
+        logger.info("[AUTO_SEND] user_id=%s len=%s",
+                    emit(user_id, "external_ref", "log", "operator"),
+                    emit(len(reply_text), "count", "log", "operator"))
     else:
         # 承認キューに下書きを保存（ガードで降格した場合は理由を併記）
         queue_reason = reason
@@ -1197,7 +1212,8 @@ async def handle_customer_message(
             urgent_kind=URGENT_NOTICE_KINDS.get(guard.immediate_notice, ""),
             customer_message=user_message,
         )
-        print(
-            f"[APPROVAL] queued user_id={user_id} category={category} "
-            f"approval_id={approval_id} notice={guard.immediate_notice}"
+        logger.info(
+            "[APPROVAL] queued user_id=%s approval_id=%s",
+            emit(user_id, "external_ref", "log", "operator"),
+            emit(approval_id, "record_id", "log", "operator"),
         )

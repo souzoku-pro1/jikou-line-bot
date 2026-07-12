@@ -24,6 +24,7 @@
 
 import hashlib
 import json
+import logging
 import os
 import re
 import unicodedata
@@ -37,7 +38,10 @@ from bank_reader import (
     validate_reading,
 )
 from hub import kintone
+from hub.redact import emit
 from hub.webhook_auth import verify_token
+
+logger = logging.getLogger("bank_ingest")
 
 router = APIRouter()
 
@@ -92,7 +96,8 @@ async def _attach(app: kintone.KintoneApp, filename: str, content: bytes,
         key = await kintone.upload_file(app, filename, content, mime)
         return {"fileKey": key}
     except Exception as e:
-        print(f"[BANK_INGEST] 添付に失敗（処理続行）: {e}")
+        logger.info("[BANK_INGEST] 添付に失敗（処理続行） cls=%s: %s",
+                    type(e).__name__, emit(str(e), "vendor_raw", "log", "operator"))
         return None
 
 
@@ -100,7 +105,7 @@ async def _file_needs_review(reason: str, detail: dict,
                              pdf_bytes: bytes, filename: str) -> str | None:
     """App 30 要確認キュー起票（S5 封筒・トップキー=bank_ingest）"""
     if not (APP_SHIPPING.app_id() and APP_SHIPPING.token()):
-        print(f"[BANK_INGEST] 要確認起票スキップ（APP_SHIPPING 未設定）: {reason}")
+        logger.info("[BANK_INGEST] 要確認起票スキップ（APP_SHIPPING 未設定）")
         return None
     fields = {
         "発送ステータス": "要確認",
@@ -275,8 +280,9 @@ async def ingest_bank_pdf(pdf_bytes: bytes, filename: str, *,
             result["case_record_id"] = case_id
         results.append(result)
 
-    print(f"[BANK_INGEST] done file={filename} 形態={doc_form} "
-          f"口座={len(results)} 全体確信度={overall}")
+    logger.info("[BANK_INGEST] done file=%s 口座=%s",
+                emit(filename, "freetext", "log", "operator"),
+                emit(len(results), "count", "log", "operator"))
     return {"status": "ok", "書類形態": doc_form, "全体確信度": overall,
             "results": results, "ocr_chars": len(ocr_text)}
 

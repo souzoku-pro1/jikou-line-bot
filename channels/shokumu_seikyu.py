@@ -675,6 +675,8 @@ _SAMPLE_DATA = {
 }
 
 if __name__ == "__main__":
+    from hub.logging_setup import configure_app_logging
+    configure_app_logging()   # CLI 起動時も INFO を stdout へ（PR-4b）
     import sys
     from pathlib import Path
 
@@ -691,6 +693,8 @@ if __name__ == "__main__":
         outputs[prefix + name.removeprefix("職務上請求書_")] = pdf
     for name, content in outputs.items():
         (out_dir / name).write_bytes(content)
-        print(f"出力: {out_dir / name}")
-    print(f"座標表: 様式1={len(FORM1_COORDS)}項目 / 様式2={len(FORM2_COORDS)}項目 / 版: {FORM_VERSION}")
-    print("次の手順: docs/architecture/04a-shokumu-seikyu-calibration.md")
+        logger.info("出力: %s", emit(str(out_dir / name), "freetext", "log", "operator"))
+    logger.info("座標表: 様式1=%s項目 / 様式2=%s項目",
+                emit(len(FORM1_COORDS), "count", "log", "operator"),
+                emit(len(FORM2_COORDS), "count", "log", "operator"))
+    logger.info("次の手順: docs/architecture/04a-shokumu-seikyu-calibration.md")

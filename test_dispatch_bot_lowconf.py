@@ -125,12 +125,16 @@ class TestPromptAndLogging(unittest.TestCase):
         self.assertIn("low の理由にしない", prompt)
         self.assertIn("task_type が特定できないときのみ confidence=low", prompt)
 
-    def test_parsed_log_includes_params_and_raw_conf(self):
-        """修正3: parsed ログに raw confidence と task_params 要約（ソース検査）"""
+    def test_parsed_log_redacts_params_and_drops_raw_conf(self):
+        """P1-107b（仕様変更・RV-10 redaction）: print→logger 移送に伴い、parsed ログの
+        task_params と customer_name は emit 契約経由で抑止し、raw confidence（controlled
+        status・素通し kind なし）は出力から drop する。2026-07-04 の生値ログ
+        （raw_conf=/params= の生値埋め込み）は PII 露出のため廃止した（緩和ではなく仕様変更）。"""
         import pathlib
         src = pathlib.Path(parser.__file__).read_text(encoding="utf-8")
-        self.assertIn("raw_conf=", src)
-        self.assertIn("params=", src)
+        self.assertNotIn("raw_conf=", src)                    # 生 confidence は drop
+        self.assertIn('emit(parsed["customer_name"], "name"', src)  # 氏名は emit 抑止
+        self.assertIn("emit(params,", src)                    # params も emit 経由
 
 
 if __name__ == "__main__":

@@ -28,6 +28,7 @@
 
 import hashlib
 import json
+import logging
 import os
 import re
 import unicodedata
@@ -35,6 +36,7 @@ import unicodedata
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 
 from hub import kintone
+from hub.redact import emit
 from hub.webhook_auth import verify_token
 from registry_reader import (
     overall_confidence,
@@ -44,6 +46,7 @@ from registry_reader import (
 )
 
 router = APIRouter()
+logger = logging.getLogger("registry_ingest")
 
 APP_ZAISAN = kintone.KintoneApp("App 財産", "APP_ZAISAN", "TOKEN_ZAISAN")
 APP_FUDOSAN = kintone.KintoneApp(
@@ -245,7 +248,8 @@ async def _attach(app: kintone.KintoneApp, filename: str,
             app, filename or "登記事項証明.pdf", pdf_bytes, "application/pdf")
         return [{"fileKey": key}]
     except Exception as e:
-        print(f"[REGISTRY_INGEST] 原本添付に失敗（処理続行）: {e}")
+        logger.warning("[REGISTRY_INGEST] 原本添付に失敗（処理続行）: %s",
+                       emit(str(e), "vendor_raw", "log", "operator"))
         return None
 
 
@@ -253,7 +257,8 @@ async def _file_needs_review(reason: str, detail: dict,
                              pdf_bytes: bytes, filename: str) -> str | None:
     """App 30 要確認キューへの起票（S4 の先例と同型）。env 未設定はスキップ縮退"""
     if not (APP_SHIPPING.app_id() and APP_SHIPPING.token()):
-        print(f"[REGISTRY_INGEST] 要確認キュー起票スキップ（APP_SHIPPING 未設定）: {reason}")
+        logger.info("[REGISTRY_INGEST] 要確認キュー起票スキップ（APP_SHIPPING 未設定）: %s",
+                    emit(reason, "freetext", "log", "operator"))
         return None
     fields = {
         "発送ステータス": "要確認",
@@ -353,7 +358,7 @@ async def ingest_registry_pdf(pdf_bytes: bytes, filename: str, *,
             return {"status": "skip", "reason": "既処理（冪等キー一致）",
                     "zaisan_record_id": str(existing[0]["$id"]["value"])}
     else:
-        print("[REGISTRY_INGEST] APP_ZAISAN 未設定: 冪等チェックと財産行転記をスキップ")
+        logger.info("[REGISTRY_INGEST] APP_ZAISAN 未設定: 冪等チェックと財産行転記をスキップ")
 
     try:
         ocr_text = _ocr_pdf(pdf_bytes, vision_key)
@@ -406,7 +411,7 @@ async def ingest_registry_pdf(pdf_bytes: bytes, filename: str, *,
                 results.append(result)
                 continue
         else:
-            print("[REGISTRY_INGEST] KINTONE_FUDOSAN_APP_ID 未設定: 不動産25転記をスキップ")
+            logger.info("[REGISTRY_INGEST] KINTONE_FUDOSAN_APP_ID 未設定: 不動産25転記をスキップ")
 
         if zaisan_enabled:
             case_id = await _resolve_case(case_hint, fudosan_id)
@@ -424,8 +429,10 @@ async def ingest_registry_pdf(pdf_bytes: bytes, filename: str, *,
                 result["case_record_id"] = case_id
         results.append(result)
 
-    print(f"[REGISTRY_INGEST] done file={filename} 物件={len(results)} "
-          f"全体確信度={overall}")
+    logger.info("[REGISTRY_INGEST] done file=%s 物件=%s 全体確信度=%s",
+                emit(filename, "freetext", "log", "operator"),
+                emit(len(results), "count", "log", "operator"),
+                emit(overall, "freetext", "log", "operator"))
     return {"status": "ok", "全体確信度": overall, "results": results,
             "ocr_chars": len(ocr_text)}
 

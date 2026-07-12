@@ -37,8 +37,13 @@ import sys
 import os
 import json
 import re
+import logging
 import urllib.request
 import urllib.error
+
+from hub.redact import emit
+
+logger = logging.getLogger("registry_to_kintone")
 
 
 # ── ヘルパー関数 ──────────────────────────────────────────
@@ -46,7 +51,8 @@ import urllib.error
 def get_env(name: str) -> str:
     val = os.environ.get(name, "").strip()
     if not val:
-        print(f"エラー: 環境変数 {name} が設定されていません")
+        logger.error("エラー: 環境変数 %s が設定されていません",
+                     emit(name, "freetext", "log", "operator"))
         sys.exit(1)
     return val
 
@@ -224,7 +230,9 @@ def post_records_chunked(subdomain: str, app_id: str, api_token: str,
         result = post_records(subdomain, app_id, api_token, chunk)
         ids = result.get("ids", [])
         all_ids.extend(ids)
-        print(f"  登録完了: {len(ids)} 件 (レコードID: {ids})")
+        logger.info("  登録完了: %s 件 (レコードID: %s)",
+                    emit(len(ids), "count", "log", "operator"),
+                    emit(ids, "record_id", "log", "operator"))
     return all_ids
 
 
@@ -232,12 +240,14 @@ def post_records_chunked(subdomain: str, app_id: str, api_token: str,
 
 def main():
     if len(sys.argv) < 2:
-        print(f"使い方: python {sys.argv[0]} <registry_json_file>")
+        logger.info("使い方: python %s <registry_json_file>",
+                    emit(sys.argv[0], "freetext", "log", "operator"))
         sys.exit(1)
 
     json_path = sys.argv[1]
     if not os.path.exists(json_path):
-        print(f"エラー: ファイルが見つかりません: {json_path}")
+        logger.error("エラー: ファイルが見つかりません: %s",
+                     emit(json_path, "freetext", "log", "operator"))
         sys.exit(1)
 
     subdomain  = get_env("KINTONE_SUBDOMAIN")
@@ -251,13 +261,15 @@ def main():
     ocr_note   = data.get("OCR品質メモ", "")
 
     if not properties:
-        print("エラー: JSONに properties が見つかりません")
+        logger.error("エラー: JSONに properties が見つかりません")
         sys.exit(1)
 
-    print(f"入力ファイル : {json_path}")
-    print(f"物件数       : {len(properties)} 件")
-    print(f"登録先アプリ : https://{subdomain}.cybozu.com/k/{app_id}/")
-    print("-" * 60)
+    logger.info("入力ファイル : %s", emit(json_path, "freetext", "log", "operator"))
+    logger.info("物件数       : %s 件", emit(len(properties), "count", "log", "operator"))
+    logger.info("登録先アプリ : https://%s.cybozu.com/k/%s/",
+                emit(subdomain, "freetext", "log", "operator"),
+                emit(app_id, "record_id", "log", "operator"))
+    logger.info("------------------------------------------------------------")
 
     # kintoneレコードに変換
     records = []
@@ -266,30 +278,35 @@ def main():
         records.append(rec)
         owner_entry = get_latest_owner(prop.get("甲区_所有権", []))
         owner_name = (owner_entry["所有者"]["氏名_名称"] if owner_entry else "不明")
-        print(f"  [{i+1}] {prop.get('種別','?')} / "
-              f"{prop.get('表題部',{}).get('所在','?')} "
-              f"{prop.get('表題部',{}).get('地番') or prop.get('表題部',{}).get('家屋番号','?')} / "
-              f"所有者: {owner_name}")
+        logger.info("  [%s] / %s %s / 所有者: %s",
+                    emit(i + 1, "count", "log", "operator"),
+                    emit(prop.get('表題部', {}).get('所在', '?'), "address", "log", "operator"),
+                    emit(prop.get('表題部', {}).get('地番') or prop.get('表題部', {}).get('家屋番号', '?'), "address", "log", "operator"),
+                    emit(owner_name, "name", "log", "operator"))
 
-    print(f"\nkintoneに登録中...")
+    logger.info("\nkintoneに登録中...")
 
     try:
         ids = post_records_chunked(subdomain, app_id, api_token, records)
-        print(f"\n完了: 合計 {len(ids)} 件を登録しました")
-        print(f"登録レコードID: {ids}")
+        logger.info("\n完了: 合計 %s 件を登録しました",
+                    emit(len(ids), "count", "log", "operator"))
+        logger.info("登録レコードID: %s", emit(ids, "record_id", "log", "operator"))
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8")
-        print(f"\nHTTPエラー {e.code}:")
+        logger.error("\nHTTPエラー %s:", emit(e.code, "count", "log", "operator"))
         try:
             err = json.loads(body)
-            print(json.dumps(err, ensure_ascii=False, indent=2))
+            logger.error("%s", emit(json.dumps(err, ensure_ascii=False, indent=2),
+                                    "vendor_raw", "log", "operator"))
         except Exception:
-            print(body)
+            logger.error("%s", emit(body, "vendor_raw", "log", "operator"))
         sys.exit(1)
     except Exception as e:
-        print(f"\nエラー: {e}")
+        logger.error("\nエラー: %s", emit(str(e), "vendor_raw", "log", "operator"))
         sys.exit(1)
 
 
 if __name__ == "__main__":
+    from hub.logging_setup import configure_app_logging
+    configure_app_logging()   # CLI 起動時も INFO を stdout へ（PR-4b）
     main()

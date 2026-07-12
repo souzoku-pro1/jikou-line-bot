@@ -12,11 +12,16 @@ docx_templates/souzoku/財産目録.docx を生成する。
 実行: python make_zaisan_mokuroku_template.py
 """
 
+import logging
 from pathlib import Path
 
 from docx import Document
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.shared import Pt
+
+from hub.redact import emit
+
+logger = logging.getLogger("make_zaisan_mokuroku_template")
 
 OUT = Path("docx_templates") / "souzoku" / "財産目録.docx"
 
@@ -90,6 +95,8 @@ def build() -> Document:
 
 
 if __name__ == "__main__":
+    from hub.logging_setup import configure_app_logging
+    configure_app_logging()   # CLI 起動時も INFO を stdout へ（PR-4b）
     OUT.parent.mkdir(parents=True, exist_ok=True)
     build().save(str(OUT))
-    print(f"generated: {OUT}")
+    logger.info("generated: %s", emit(str(OUT), "freetext", "log", "operator"))

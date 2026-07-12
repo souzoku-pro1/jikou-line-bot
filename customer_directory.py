@@ -12,10 +12,14 @@
   kintone API エラーは KintoneError のまま送出する（呼び出し側が縮退可否を決める）
 """
 
+import logging
 from dataclasses import dataclass
 from typing import Callable
 
 from hub import kintone
+from hub.redact import emit
+
+logger = logging.getLogger("customer_directory")
 
 # kintone records.json の1リクエスト上限（これ未満の件数が返ったら最終ページ）
 _PAGE_SIZE = 500
@@ -118,7 +122,8 @@ async def list_candidates() -> list[Candidate]:
     for source in _SOURCES:
         app_id = source.app.app_id()
         if not (app_id and source.app.token()):
-            print(f"[CUSTOMER_DIRECTORY] {source.app.label} は env 未設定のためスキップ")
+            logger.info("[CUSTOMER_DIRECTORY] %s は env 未設定のためスキップ",
+                        emit(source.app.label, "freetext", "log", "operator"))
             continue
         for record in await _fetch_all(source):
             candidate = source.to_candidate(record, app_id)

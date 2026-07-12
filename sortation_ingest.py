@@ -28,6 +28,7 @@ token 認証: ?token=（env SORTATION_INGEST_TOKEN）。不一致・env 未設�
 
 import hashlib
 import json
+import logging
 import os
 from datetime import datetime, timedelta, timezone
 
@@ -38,9 +39,12 @@ from claude_gateway import create_message_with_fallback
 from customer_directory import Candidate, list_candidates
 from hub import kintone
 from hub.notify import push_line_message
+from hub.redact import emit
 from hub.webhook_auth import verify_token
 
 router = APIRouter()
+
+logger = logging.getLogger("sortation_ingest")
 
 # 仕分けログ（App 38・第2段②）。ask 判定の台帳＝Bot仕分け指示（照会中→確定）の対象
 APP_SORTATION_LOG = kintone.KintoneApp(
@@ -134,20 +138,27 @@ async def _try_split_analysis(pdf_bytes: bytes, vision_key: str,
         from main import _ocr_pdf_pages  # 実行時 import（循環回避）
         page_texts = _ocr_pdf_pages(pdf_bytes, vision_key)
     except Exception as e:
-        print(f"[SORTATION] ページ別OCRに失敗（従来経路へ） file={file_name}: {e}")
+        logger.info("[SORTATION] ページ別OCRに失敗（従来経路へ） file=%s: %s %s",
+                    emit(file_name, "external_ref", "log", "operator"),
+                    type(e).__name__,
+                    emit(e, "vendor_raw", "log", "operator"))
         return None, None
     ocr_text = "\n\n".join(page_texts)
     try:
         from document_splitter import analyze_segments  # 実行時 import（循環回避）
         result = await analyze_segments(page_texts)
     except Exception as e:
-        print(f"[SORTATION] 区間判定に失敗（従来経路へ） file={file_name}: {e}")
+        logger.info("[SORTATION] 区間判定に失敗（従来経路へ） file=%s: %s %s",
+                    emit(file_name, "external_ref", "log", "operator"),
+                    type(e).__name__,
+                    emit(e, "vendor_raw", "log", "operator"))
         return ocr_text, None
     if result.get("status") != "ok":
         # 分割不能の明示シグナル: 分割せず全体を従来経路へ（ask に落ちるかは
         # 従来判定に委ねる・裁定どおり）
-        print(f"[SORTATION] 分割不能（従来経路へ） file={file_name}: "
-              f"{result.get('reason')}")
+        logger.info("[SORTATION] 分割不能（従来経路へ） file=%s: %s",
+                    emit(file_name, "external_ref", "log", "operator"),
+                    emit(result.get('reason'), "freetext", "log", "operator"))
         return ocr_text, None
     if not result.get("needs_split"):
         return ocr_text, None  # 単一区間 = 高速パス（従来経路そのまま）
@@ -163,8 +174,10 @@ async def _forward_fragments(segments: list[dict], pdf_bytes: bytes,
         from document_splitter import split_pdf  # 実行時 import（循環回避）
         fragments = split_pdf(pdf_bytes, segments)
     except Exception as e:
-        print(f"[SORTATION] 断片化に失敗（回送なし・仕分け結果は不変）"
-              f" file={file_name}: {e}")
+        logger.info("[SORTATION] 断片化に失敗（回送なし・仕分け結果は不変） file=%s: %s %s",
+                    emit(file_name, "external_ref", "log", "operator"),
+                    type(e).__name__,
+                    emit(e, "vendor_raw", "log", "operator"))
         return [{"status": "error", "error": f"断片化失敗: {str(e)[:150]}"}]
     forwarded: list[dict] = []
     for seg, fragment in zip(segments, fragments):
@@ -214,12 +227,14 @@ async def _forward_to_line(doc_type: str, doc_type_conf: float,
         for key in ("kintone_record_id", "results"):
             if key in result:
                 forwarded[key] = result[key]
-        print(f"[SORTATION] forwarded file={file_name} line={line} "
-              f"status={forwarded['status']}")
+        logger.info("[SORTATION] forwarded file=%s",
+                    emit(file_name, "external_ref", "log", "operator"))
         return forwarded
     except Exception as e:
-        print(f"[SORTATION] 回送に失敗（仕分け結果は不変） line={line} "
-              f"file={file_name}: {e}")
+        logger.info("[SORTATION] 回送に失敗（仕分け結果は不変） file=%s: %s %s",
+                    emit(file_name, "external_ref", "log", "operator"),
+                    type(e).__name__,
+                    emit(e, "vendor_raw", "log", "operator"))
         return {"line": line, "status": "error", "error": str(e)[:200]}
 
 
@@ -302,8 +317,8 @@ async def _log_ask(file_name: str, drive_file_id: str, drive_file_url: str,
     env 未設定は登録スキップ（None）＝従来どおり LINE 通知のみの縮退。
     登録失敗も None（照会通知を壊さない）"""
     if not (APP_SORTATION_LOG.app_id() and APP_SORTATION_LOG.token()):
-        print("[SORTATION] 仕分けログ登録スキップ"
-              "（APP_SORTATION_LOG / TOKEN_SORTATION_LOG 未設定）")
+        logger.info("[SORTATION] 仕分けログ登録スキップ"
+                    "（APP_SORTATION_LOG / TOKEN_SORTATION_LOG 未設定）")
         return None
     try:
         record_id = await kintone.create_record(APP_SORTATION_LOG, {
@@ -317,7 +332,9 @@ async def _log_ask(file_name: str, drive_file_id: str, drive_file_url: str,
             "状態": "照会中",
         })
     except Exception as e:
-        print(f"[SORTATION] 仕分けログ登録に失敗（照会通知は継続）: {e}")
+        logger.info("[SORTATION] 仕分けログ登録に失敗（照会通知は継続）: %s %s",
+                    type(e).__name__,
+                    emit(e, "vendor_raw", "log", "operator"))
         return None
     return (f"{kintone._base_url()}/k/{APP_SORTATION_LOG.app_id()}"
             f"/show#record={record_id}")
@@ -330,8 +347,8 @@ async def _notify_ask(file_name: str, drive_file_url: str, doc_type: str,
     宛先未解決・送信失敗は縮退（応答を壊さない）"""
     attorney_id = _ask_recipient()
     if not attorney_id:
-        print("[SORTATION] 照会通知スキップ（SORTATION_ASK_TO / "
-              "DISPATCHBOT_ALLOWED_USER_IDS / ATTORNEY_LINE_USER_ID すべて未設定）")
+        logger.info("[SORTATION] 照会通知スキップ（SORTATION_ASK_TO / "
+                    "DISPATCHBOT_ALLOWED_USER_IDS / ATTORNEY_LINE_USER_ID すべて未設定）")
         return
     lines = [
         "【書類仕分け照会】自動仕分けできませんでした",
@@ -352,7 +369,9 @@ async def _notify_ask(file_name: str, drive_file_url: str, doc_type: str,
         await push_line_message(attorney_id, "\n".join(lines),
                                 token_env="DISPATCHBOT_CHANNEL_ACCESS_TOKEN")
     except Exception as e:
-        print(f"[SORTATION] 照会通知に失敗（応答は継続）: {e}")
+        logger.info("[SORTATION] 照会通知に失敗（応答は継続）: %s %s",
+                    type(e).__name__,
+                    emit(e, "vendor_raw", "log", "operator"))
 
 
 def _customer_payload(c: Candidate) -> dict:
@@ -387,7 +406,8 @@ async def sortation_ingest(token: str = "",
     fid = (drive_file_id or "").strip()
     if fid:
         if fid in _seen_drive_file_ids:
-            print(f"[SORTATION] duplicate drive_file_id={fid}（再判定して同一契約で応答）")
+            logger.info("[SORTATION] duplicate drive_file_id=%s（再判定して同一契約で応答）",
+                        emit(fid, "external_ref", "log", "operator"))
         _seen_drive_file_ids.add(fid)
 
     # D1-2: 分割層（フラグ配下）。ページ別 OCR→区間判定。単一区間・分割不能・
@@ -411,7 +431,10 @@ async def sortation_ingest(token: str = "",
         judged = await _judge_with_claude(ocr_text, candidates)
     except Exception as e:
         failure = str(e)[:200]
-        print(f"[SORTATION] 判定不能のため照会へ縮退 file={file_name}: {e}")
+        logger.info("[SORTATION] 判定不能のため照会へ縮退 file=%s: %s %s",
+                    emit(file_name, "external_ref", "log", "operator"),
+                    type(e).__name__,
+                    emit(e, "vendor_raw", "log", "operator"))
 
     if judged is None:
         doc_type, confidence, doc_type_conf = DOC_TYPE_UNKNOWN, 0.0, 0.0
@@ -446,8 +469,9 @@ async def sortation_ingest(token: str = "",
         doc_type = main_seg["doc_type"]
 
     action = "auto" if customer is not None and confidence >= _threshold() else "ask"
-    print(f"[SORTATION] judged file={file_name} action={action} doc_type={doc_type} "
-          f"customer={customer.record_id if customer else None} conf={confidence}")
+    logger.info("[SORTATION] judged file=%s customer=%s",
+                emit(file_name, "external_ref", "log", "operator"),
+                emit(customer.record_id if customer else None, "record_id", "log", "operator"))
 
     if action == "ask":
         top = _top_candidates(candidates, ocr_text, customer)

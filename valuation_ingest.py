@@ -21,11 +21,13 @@
 
 import hashlib
 import json
+import logging
 import os
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 
 from hub import kintone
+from hub.redact import emit
 from hub.webhook_auth import verify_token
 from registry_ingest import KIND_TO_APP25, _find_fudosan
 from valuation_reader import (
@@ -34,6 +36,8 @@ from valuation_reader import (
     reread_threshold,
     validate_reading,
 )
+
+logger = logging.getLogger("valuation_ingest")
 
 router = APIRouter()
 
@@ -135,7 +139,8 @@ async def _attach(app: kintone.KintoneApp, filename: str,
             app, filename or "課税明細.pdf", pdf_bytes, "application/pdf")
         return [{"fileKey": key}]
     except Exception as e:
-        print(f"[VALUATION_INGEST] 原本添付に失敗（処理続行）: {e}")
+        logger.info("[VALUATION_INGEST] 原本添付に失敗（処理続行） cls=%s: %s",
+                    type(e).__name__, emit(str(e), "vendor_raw", "log", "operator"))
         return None
 
 
@@ -144,7 +149,7 @@ async def _file_needs_review(reason: str, detail: dict,
     """App 30 要確認キュー起票（S5 封筒・トップキー=valuation_ingest）。
     env 未設定はスキップ縮退"""
     if not (APP_SHIPPING.app_id() and APP_SHIPPING.token()):
-        print(f"[VALUATION_INGEST] 要確認起票スキップ（APP_SHIPPING 未設定）: {reason}")
+        logger.info("[VALUATION_INGEST] 要確認起票スキップ（APP_SHIPPING 未設定）")
         return None
     fields = {
         "発送ステータス": "要確認",
@@ -256,9 +261,9 @@ async def ingest_valuation_pdf(pdf_bytes: bytes, filename: str, *,
     zaisan_enabled = bool(APP_ZAISAN.app_id() and APP_ZAISAN.token())
     fudosan_enabled = bool(APP_FUDOSAN.app_id() and APP_FUDOSAN.token())
     if not zaisan_enabled:
-        print("[VALUATION_INGEST] APP_ZAISAN 未設定: 財産行転記をスキップ")
+        logger.info("[VALUATION_INGEST] APP_ZAISAN 未設定: 財産行転記をスキップ")
     if not fudosan_enabled:
-        print("[VALUATION_INGEST] KINTONE_FUDOSAN_APP_ID 未設定: 不動産25転記をスキップ")
+        logger.info("[VALUATION_INGEST] KINTONE_FUDOSAN_APP_ID 未設定: 不動産25転記をスキップ")
 
     def _ocr(pdf: bytes, key: str) -> str:
         from main import _ocr_pdf_bytes  # 実行時 import（循環 import 回避）
@@ -369,8 +374,9 @@ async def ingest_valuation_pdf(pdf_bytes: bytes, filename: str, *,
                                "case_record_id": case_id})
         results.append(result)
 
-    print(f"[VALUATION_INGEST] done file={filename} 物件={len(results)} "
-          f"全体確信度={overall}")
+    logger.info("[VALUATION_INGEST] done file=%s 物件=%s",
+                emit(filename, "freetext", "log", "operator"),
+                emit(len(results), "count", "log", "operator"))
     return {"status": "ok", "全体確信度": overall, "書類種別": reading.get("書類種別"),
             "results": results, "ocr_chars": len(ocr_text)}
 

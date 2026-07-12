@@ -21,9 +21,13 @@
 
 import hashlib
 import json
+import logging
 import os
 
 from hub import kintone
+from hub.redact import emit
+
+logger = logging.getLogger("units.souzoku.zaisan_sync")
 
 APP_ZAISAN = kintone.KintoneApp("App 財産", "APP_ZAISAN", "TOKEN_ZAISAN")
 APP_FUDOSAN = kintone.KintoneApp(
@@ -85,7 +89,8 @@ async def _attach(app: kintone.KintoneApp, filename: str | None,
             app, filename or "課税明細.pdf", pdf_bytes, "application/pdf")
         return [{"fileKey": key}]
     except Exception as e:
-        print(f"[ZAISAN_SYNC] 原本添付に失敗（処理続行）: {e}")
+        logger.info("[ZAISAN_SYNC] 原本添付に失敗（処理続行） cls=%s: %s",
+                    type(e).__name__, emit(str(e), "vendor_raw", "log", "operator"))
         return None
 
 
@@ -119,7 +124,7 @@ async def sync_fixed_asset(*, fudosan_record_id: str, extracted: dict,
     """
     enabled, why = _enabled()
     if not enabled:
-        print(f"[ZAISAN_SYNC] skipped: {why}")
+        logger.info("[ZAISAN_SYNC] skipped")
         return None
 
     # 複数ヒットの記録用に既存検索と同条件で件数を取る（先頭1件採用の既存挙動は不変）

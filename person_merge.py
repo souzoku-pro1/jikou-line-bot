@@ -29,12 +29,16 @@ env PERSON_MERGE_ENABLED=1 のときのみ動く（既定無効・無効時は�
 """
 
 import json
+import logging
 import os
 import re
 import unicodedata
 from dataclasses import dataclass, field
 
 from hub import kintone
+from hub.redact import emit
+
+logger = logging.getLogger("person_merge")
 
 APP_KOSEKI_PERSON = kintone.KintoneApp(
     "App 34 (人物)", "APP_KOSEKI_PERSON", "TOKEN_KOSEKI_PERSON")
@@ -354,6 +358,7 @@ async def detect_merge_candidates() -> dict:
             await _mark_auto_candidate(by_id[lo])
             await _mark_auto_candidate(by_id[hi])
         results["candidates"].append(entry)
-        print(f"[PERSON_MERGE] candidate {key} signals={score['signals']} "
-              f"保留={score['pending']} review={review_id}")
+        logger.info("[PERSON_MERGE] candidate %s review=%s",
+                    emit(key, "record_id", "log", "operator"),
+                    emit(review_id, "record_id", "log", "operator"))
     return results

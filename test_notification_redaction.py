@@ -109,6 +109,8 @@ class TestHealthcheckNotificationsNoLeak(unittest.IsolatedAsyncioTestCase):
             with self.subTest(check=failing):
                 admin_body, alt_body = await self._run(failing, is_async)
                 self.assertTrue(admin_body)                    # 通常通知は出る
+                self.assertTrue(alt_body,                      # dead-man 代替通知が実際に生成される
+                                "dead-man 代替通知が生成されること")
                 self.assertNotIn(_SENTINEL, admin_body)        # 例外本文なし
                 self.assertNotIn(_SENTINEL, alt_body)          # dead-man 代替にもなし
 
@@ -173,6 +175,22 @@ class TestThrottleLogNoIdLeak(unittest.IsolatedAsyncioTestCase):
         self.assertIn("throttled", out)
         self.assertIn("prepare_deferred", out)      # 種別は可視
         self.assertNotIn(id_sentinel, out)           # ID は出さない
+
+    async def test_unknown_throttle_prefix_shows_only_unknown_kind(self):
+        env = {"LINE_ADMIN_USER_ID": "Uadmin",
+               "DISPATCHBOT_CHANNEL_ACCESS_TOKEN": "t"}
+        id_sentinel = "UNKNOWN_ID_SENTINEL_555"
+        key = f"totally_unknown_prefix:{id_sentinel}"
+        with patch.dict(os.environ, env), \
+             patch("hub.notify.push_line_message",
+                   new_callable=AsyncMock, return_value=True):
+            with self.assertLogs("hub.notify", level="INFO") as cm:
+                await hub_notify.notify_admin_line("x", throttle_key=key)
+                await hub_notify.notify_admin_line("x", throttle_key=key)
+        out = "\n".join(cm.output)
+        self.assertIn("unknown_kind", out)               # 未知頭は unknown_kind 固定文言
+        self.assertNotIn(id_sentinel, out)               # ID は出さない
+        self.assertNotIn("totally_unknown_prefix", out)  # 未知頭そのものも出さない
 
 
 class TestSoufuCheckFixedClassification(unittest.IsolatedAsyncioTestCase):

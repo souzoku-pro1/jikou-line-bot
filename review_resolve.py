@@ -24,17 +24,21 @@
 """
 
 import json
+import logging
 import os
 import re
 from dataclasses import dataclass, field
 
 from hub import kintone
+from hub.redact import emit
 from registry_ingest import (
     APP_FUDOSAN,
     APP_SHIPPING,
     APP_ZAISAN,
     _upsert_zaisan,
 )
+
+logger = logging.getLogger("review_resolve")
 
 APP_KOSEKI_BOOK = kintone.KintoneApp(
     "App 33 (戸籍読解)", "APP_KOSEKI_BOOK", "TOKEN_KOSEKI_BOOK")
@@ -95,7 +99,7 @@ async def list_pending_reviews() -> list[ReviewGroup]:
     ここでは検索不能として空を返すのみ）。
     """
     if not (APP_SHIPPING.app_id() and APP_SHIPPING.token()):
-        print("[REVIEW_RESOLVE] APP_SHIPPING 未設定のため要確認を取得できません")
+        logger.info("[REVIEW_RESOLVE] APP_SHIPPING 未設定のため要確認を取得できません")
         return []
     records = await kintone.search_records(
         APP_SHIPPING,
@@ -190,7 +194,9 @@ async def _resolve_registry(group: ReviewGroup, case_record_id: str) -> dict:
                 pdf_bytes = await kintone.download_file(
                     APP_SHIPPING, item.file_keys[0])
             except Exception as e:
-                print(f"[REVIEW_RESOLVE] 原本の取得に失敗（添付なしで続行）: {e}")
+                logger.info("[REVIEW_RESOLVE] 原本の取得に失敗（添付なしで続行）: %s: %s",
+                            type(e).__name__,
+                            emit(str(e), "vendor_raw", "log", "operator"))
         outcome = await _upsert_zaisan(
             _pseudo_property(fudosan), fudosan_id, case_record_id,
             str(item.detail.get("冪等キー") or ""), pdf_bytes,
@@ -201,9 +207,12 @@ async def _resolve_registry(group: ReviewGroup, case_record_id: str) -> dict:
         })
         results.append({"review_record_id": item.record_id,
                         "fudosan_record_id": fudosan_id, **outcome})
-        print(f"[REVIEW_RESOLVE] resolved review=No.{item.record_id} "
-              f"fudosan={fudosan_id} zaisan={outcome.get('zaisan_record_id')} "
-              f"case={case_record_id}")
+        logger.info("[REVIEW_RESOLVE] resolved review=No.%s fudosan=%s zaisan=%s "
+                    "case=%s",
+                    emit(item.record_id, "record_id", "log", "operator"),
+                    emit(fudosan_id, "record_id", "log", "operator"),
+                    emit(outcome.get("zaisan_record_id"), "record_id", "log", "operator"),
+                    emit(case_record_id, "record_id", "log", "operator"))
     return {"status": "resolved", "case_record_id": case_record_id,
             "items": results}
 
@@ -258,12 +267,17 @@ async def _resolve_koseki(group: ReviewGroup, case_record_id: str) -> dict:
             if sync_enabled():
                 result["persons"] = await sync_persons_from_koseki(koseki_id)
         except Exception as e:
-            print(f"[REVIEW_RESOLVE] 人物化に失敗（紐付けは完了済み）"
-                  f" koseki={koseki_id}: {e}")
+            logger.info("[REVIEW_RESOLVE] 人物化に失敗（紐付けは完了済み） koseki=%s: "
+                        "%s: %s",
+                        emit(koseki_id, "record_id", "log", "operator"),
+                        type(e).__name__,
+                        emit(str(e), "vendor_raw", "log", "operator"))
             result["persons"] = {"status": "error", "reason": str(e)[:200]}
         results.append(result)
-        print(f"[REVIEW_RESOLVE] koseki linked review=No.{item.record_id} "
-              f"koseki={koseki_id} case={case_record_id}")
+        logger.info("[REVIEW_RESOLVE] koseki linked review=No.%s koseki=%s case=%s",
+                    emit(item.record_id, "record_id", "log", "operator"),
+                    emit(koseki_id, "record_id", "log", "operator"),
+                    emit(case_record_id, "record_id", "log", "operator"))
     return {"status": "resolved", "case_record_id": case_record_id,
             "items": results}
 
@@ -301,7 +315,9 @@ async def _resolve_valuation(group: ReviewGroup, case_record_id: str) -> dict:
                 pdf_bytes = await kintone.download_file(
                     APP_SHIPPING, item.file_keys[0])
             except Exception as e:
-                print(f"[REVIEW_RESOLVE] 原本の取得に失敗（添付なしで続行）: {e}")
+                logger.info("[REVIEW_RESOLVE] 原本の取得に失敗（添付なしで続行）: %s: %s",
+                            type(e).__name__,
+                            emit(str(e), "vendor_raw", "log", "operator"))
         outcome = await upsert_zaisan_from_fudosan(
             fudosan_id, case_record_id,
             str(item.detail.get("冪等キー") or ""),
@@ -313,9 +329,12 @@ async def _resolve_valuation(group: ReviewGroup, case_record_id: str) -> dict:
         })
         results.append({"review_record_id": item.record_id,
                         "fudosan_record_id": fudosan_id, **outcome})
-        print(f"[REVIEW_RESOLVE] valuation resolved review=No.{item.record_id} "
-              f"fudosan={fudosan_id} zaisan={outcome.get('zaisan_record_id')} "
-              f"case={case_record_id}")
+        logger.info("[REVIEW_RESOLVE] valuation resolved review=No.%s fudosan=%s "
+                    "zaisan=%s case=%s",
+                    emit(item.record_id, "record_id", "log", "operator"),
+                    emit(fudosan_id, "record_id", "log", "operator"),
+                    emit(outcome.get("zaisan_record_id"), "record_id", "log", "operator"),
+                    emit(case_record_id, "record_id", "log", "operator"))
     return {"status": "resolved", "case_record_id": case_record_id,
             "items": results}
 
@@ -351,7 +370,9 @@ async def _resolve_bank(group: ReviewGroup, case_record_id: str) -> dict:
                 pdf_bytes = await kintone.download_file(
                     APP_SHIPPING, item.file_keys[0])
             except Exception as e:
-                print(f"[REVIEW_RESOLVE] 原本の取得に失敗（添付なしで続行）: {e}")
+                logger.info("[REVIEW_RESOLVE] 原本の取得に失敗（添付なしで続行）: %s: %s",
+                            type(e).__name__,
+                            emit(str(e), "vendor_raw", "log", "operator"))
         outcome = await upsert_account_row(
             account, str(item.detail.get("書類形態") or "不明"), case_record_id,
             pdf_bytes=pdf_bytes, filename=item.file_name or "残高証明.pdf")
@@ -360,8 +381,10 @@ async def _resolve_bank(group: ReviewGroup, case_record_id: str) -> dict:
             "実行済み": "yes",
         })
         results.append({"review_record_id": item.record_id, **outcome})
-        print(f"[REVIEW_RESOLVE] bank resolved review=No.{item.record_id} "
-              f"zaisan={outcome.get('zaisan_record_id')} case={case_record_id}")
+        logger.info("[REVIEW_RESOLVE] bank resolved review=No.%s zaisan=%s case=%s",
+                    emit(item.record_id, "record_id", "log", "operator"),
+                    emit(outcome.get("zaisan_record_id"), "record_id", "log", "operator"),
+                    emit(case_record_id, "record_id", "log", "operator"))
     return {"status": "resolved", "case_record_id": case_record_id,
             "items": results}
 
