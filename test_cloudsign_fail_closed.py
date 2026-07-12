@@ -399,6 +399,33 @@ class TestMismatchEnvelope(unittest.TestCase):
         # 409 応答で raise_for_status を呼ばない＝例外化せず人更新優先で握る
         rq.put.return_value.raise_for_status.assert_not_called()
 
+    def test_missing_revision_skips_close_presearch(self):
+        """revision 必須（P1-102f）: 検索時 No.8=要確認だが revision 欠落
+        → 却下 PUT を送らず（無条件 PUT なし）、固定 warning のみ・winner No.3 通知継続。"""
+        with patch.dict("os.environ", self.APP30, clear=False), \
+             patch.object(mod, "requests") as rq:
+            rq.get.return_value = self._records(
+                ("3", "doc1", "要確認", "2"), ("8", "doc1", "要確認", ""))
+            with self.assertLogs("cloudsign", level="WARNING") as cm:
+                no = mod.file_mismatch_envelope("doc1", "kintone_no_match")
+        self.assertEqual(no, "3")                    # winner 継続（通知 No.3）
+        rq.put.assert_not_called()                   # PUT 0（無条件更新しない）
+        self.assertTrue(any("revision欠落" in m for m in cm.output))  # 固定 warning
+
+    def test_missing_revision_skips_close_postcreate(self):
+        """create 応答で自 revision 欠落＋再検索にも自レコード未反映 → 自 No を収束対象に
+        含めても revision 欠落で却下 PUT せず、winner No.3 通知を維持する。"""
+        with patch.dict("os.environ", self.APP30, clear=False), \
+             patch.object(mod, "requests") as rq:
+            rq.get.side_effect = [
+                self._resp({"records": []}),                     # create 前=無し
+                self._records(("3", "doc1", "要確認", "2")),      # 再検索に自(8)未反映
+            ]
+            rq.post.return_value = self._resp({"id": "8"})       # 自 revision 欠落
+            no = mod.file_mismatch_envelope("doc1", "kintone_no_match")
+        self.assertEqual(no, "3")                    # winner 継続
+        rq.put.assert_not_called()                   # 自(8)は revision 欠落で却下せず
+
     # ── H03: create 後の再検索での compensation（可視な並行）──
     def test_postcreate_loser_closes_and_converges(self):
         """自 No=8 で create 後、再検索で 3 が見えたら 8 を却下し winner=3 へ収束。"""

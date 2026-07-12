@@ -266,19 +266,20 @@ def _close_envelope(app_id: str, token: str, record_id: int,
                     revision: str) -> bool:
     """要確認封筒を revision 楽観ロック付きで「却下」クローズする（H03 TOCTOU）。
 
+    revision は **必須**。取得できていない（None/""）ときは楽観ロックが張れないため
+    PUT を送らず False を返す（revision 無指定の無条件 PUT フォールバックはしない＝
+    更新しない側へ縮退し、人確認に委ねる）。
     検索時に取得した revision を PUT に指定し、検索〜PUT の間に人が更新していれば
-    kintone は 409（GAIA_CO02）を返す。その場合は **人更新優先** として却下せず
-    False を返す（再試行や revision 無指定の無条件更新はしない）。True=却下成功。
-    409 以外の失敗は例外を送出（呼び出し側で非致命に扱う）。
+    kintone は 409（GAIA_CO02）を返す。その場合も **人更新優先** として却下せず
+    False を返す（再試行しない）。True=却下成功。409 以外の失敗は例外を送出。
     """
-    body: dict = {"app": app_id, "id": str(record_id),
-                  "record": {"発送ステータス": {"value": "却下"}}}
-    if revision not in (None, ""):
-        body["revision"] = str(revision)
+    if revision in (None, ""):
+        return False              # revision 欠落＝楽観ロック不可 → 却下しない
     u = requests.put(
         f"{KINTONE_BASE}/k/v1/record.json",
         headers={"X-Cybozu-API-Token": token, "Content-Type": "application/json"},
-        json=body,
+        json={"app": app_id, "id": str(record_id), "revision": str(revision),
+              "record": {"発送ステータス": {"value": "却下"}}},
         timeout=10,
     )
     if u.status_code == 409:      # revision 競合＝人が先に更新（楽観ロック衝突）
@@ -291,11 +292,12 @@ def _converge_envelopes(app_id: str, token: str,
                         matches: list[tuple[int, str, str]]) -> str:
     """完全一致封筒群を最小 No（winner）1 件へ収束させ、winner の No（str）を返す（H03）。
 
-    遵守事項（R-P1-102 3巡目/4巡目レビューの安全条件）:
+    遵守事項（R-P1-102 3〜5巡目レビューの安全条件）:
       - winner（最小 No）は絶対に閉じない・更新しない。
       - 敗者クローズ対象は「要確認」状態のもののみ（検索時 status で保護）。
-      - 却下 PUT は検索時 revision の楽観ロック付き。検索〜PUT の間に人が更新した敗者は
-        revision 競合で却下せず人更新優先（再試行・無条件更新はしない）。
+      - 却下 PUT は検索時 revision の楽観ロック付き（revision 必須）。revision が
+        取得できない敗者は却下せず人確認へ委ねる（無条件 PUT はしない）。
+      - 検索〜PUT の間に人が更新した敗者は revision 競合で却下せず人更新優先（再試行なし）。
       - クローズの一部が失敗しても winner No を返し通知を維持する（warning のみ）。
     """
     matches = sorted(matches, key=lambda t: t[0])
@@ -306,6 +308,10 @@ def _converge_envelopes(app_id: str, token: str,
             continue                 # winner は絶対に閉じない
         if status != "要確認":
             continue                 # 人処理済み（完了・却下・実行済み等）は触らない
+        if revision in (None, ""):
+            # revision 欠落＝楽観ロック不可 → 却下せず人確認に委ねる
+            logger.warning("要確認封筒: revision欠落・却下スキップ・人確認へ")
+            continue
         try:
             if not _close_envelope(app_id, token, rid, revision):
                 # 検索後に人が更新（revision 競合）→ 人更新優先で却下しない
@@ -330,6 +336,8 @@ def file_mismatch_envelope(document_id: str, failure_reason: str):
     **人処理済みの保護は二段で保証する**: (1) 検索時の発送ステータスで「要確認」の敗者
     だけを対象にし、(2) 却下 PUT に検索時 revision を指定する楽観ロックで、検索〜PUT の
     間に人が更新した敗者（TOCTOU）は revision 競合として却下せず人更新を優先する。
+    楽観ロックは必須で、revision が取得できない場合は却下せず人確認に委ねる（欠落時は
+    更新しない側へ縮退する）。
 
     App 30 未設定・起票/検索失敗は None を返す（呼び出し側で縮退通知へフォールバック）。
     """
