@@ -53,22 +53,30 @@ kintone webhook 由来の3本には**適用不能**。§3 の代替に分岐。
 
 ## 2. GAS群（5本）: header HMAC v1
 
-### 2.1 canonical encoding（BLOCKER: 曖昧さの排除）
-各フィールドを **length-prefix 化**して連結する（区切り文字の注入・境界曖昧を排除）:
+### 2.1 canonical encoding（BLOCKER: 曖昧さの排除／NM01: v1 は単一方式）
+**NM01（検証裁定）**: **length-prefix 方式を唯一の v1 とする**。厳格文字集合方式は「代替」
+ではなく**別 version（v2）**として version 識別子で分離する（**同一 version 内に二方式を
+併存させない**＝検証側が version から一意に方式を決められる）。v1 の凍結は §7 の
+multipart PoC 完了後（PoC で content 対象が確定してから golden を固定）。
+
+v1 canonical（length-prefix）:
 ```
 canonical = concat_for each field f in ORDER:
               ascii(len(utf8(f))) || ":" || utf8(f) || "\n"
 ORDER = [ "v1", key_id, caller_id, method_upper, normalized_path,
           timestamp_str, nonce_hex, content_sha256_hex ]
 ```
-- 代替（length-prefixが GAS で困難な場合）: 各フィールドを**厳格文字集合に限定**
-  （key_id/caller_id=`[a-z0-9-]`、method=`[A-Z]`、path=正規化後の`[a-z0-9/._-]`、
-  timestamp=`[0-9]`、nonce/hash=`[0-9a-f]`）した上で `\n` 連結。区切り注入不能を集合で保証。
-- **normalized_path**: クエリ除去・末尾スラッシュ除去・小文字化・`.` `..` 排除（path転用防止）。
+- 参考（将来 v2 候補・v1 では使わない）: 厳格文字集合限定＋`\n` 連結。採用時は
+  `X-Sig-Version: v2` として別扱いにし、サーバは version ごとに検証器を分ける。
+- **normalized_path（H02: 規則を確定）**: **decode 前の raw path** を対象にする（%エンコード
+  デコードで path を再解釈しない）。正規化は **末尾 slash 除去のみ**。以下は**拒否（400）**:
+  `%2F`（エンコード slash）・dot segment（`.`/`..`）・連続 slash（`//`）・非 ASCII 生バイト。
+  → 「正規化で意味が変わる余地」をゼロにし、署名対象 path と実ルーティング path のズレを排除。
 - 署名 = `hex(HMAC_SHA256(key=<key_id が解決する secret>, msg=utf8(canonical)))`。
 - **cross-language テストベクトル節（HIGH）**: server(Python)・client(GAS/JS)双方で同一
   canonical→同一署名になることを、固定入力→固定署名の golden ベクトル（最低5本・
-  ASCII/日本語ファイル名/空body/multipart/境界長）で相互検証する。これを v1 contract の一部にする。
+  ASCII/日本語ファイル名/空body/multipart/境界長）で相互検証する。**加えて path 異常形の
+  拒否ケース（%2F・`..`・`//`・非ASCII）を testベクトルに追加**（H02）。これを v1 contract の一部にする。
 
 ### 2.2 送信ヘッダ
 ```
@@ -132,8 +140,10 @@ status        : active / retiring / revoked
   再判定）③kintone 側の再照合（受信 recordId を kintone から取り直して検証）④source
   restriction（可能なら kintone/CloudSign の送信元 IP レンジ制限）⑤詳細ログ抑止（reason code のみ）。
   この5点セットが揃わない K1 は不可。
-- **案K2（中継GAS化）**: 中継を挟んで署名を付け直す。**中継入口自体の認証を改善する
-  （中継が誰でも叩ける口にならない）ことを採用条件とする**（MEDIUM）。
+- **案K2（中継GAS化）**: 中継を挟んで署名を付け直す。**採用時の成立条件（H05・全て満たすこと）**:
+  ①中継入口自体の認証方式（中継が誰でも叩ける口にならない・中継→本サーバは §2 の署名を付ける）
+  ②kintone 再照合（受信 recordId を kintone から取り直して検証）③イベント dedup（inbound_event）
+  ④payload allowlist（中継が転送する payload のキーを許可制にし、想定外フィールドを落とす）。
 - **案K3（ポーリング化）**: webhook 廃止し GAS/scheduler が kintone をポーリング→署名付き
   エンドポイントへ。**M04（条件付き）**: リアルタイム性低下の許容・ポーリング間隔・
   取りこぼし防止（カーソル/更新時刻）・kintone API レート・二重処理防止（dedup）を
@@ -166,8 +176,10 @@ status        : active / retiring / revoked
 - multipart body hash は §7 PoC 成立を前提。
 
 ## 7. 論点・OPEN・BLOCKED
-- 【OPEN・owner=大野/司令塔】nonce ストア（案A/B）・kintone webhook 代替（K1/K2/K3）・
-  key_id 保管（env `SIG_KEY_*` / 将来 secret manager）。
+- 【OPEN・owner=大野/司令塔】nonce ストア（案A/B）・kintone webhook 代替（K1/K2/K3）。
+- 【OPEN・owner=大野/司令塔】key_id 保管方式（Railway env `SIG_KEY_*` / 将来の secret manager）。
+  判断材料: Railway env の管理容易さ vs secret manager の監査/rotation 機能・rotation 運用コスト
+  （§2.5 lifecycle を env 手運用で回すか managed で回すか）。
 - **multipart body-hash PoC を v1 contract 成立の先行条件として別票化**（M11 段3）:
   GAS UrlFetchApp で `blob.getBytes()` を含む最終 payload の SHA-256 が、サーバ受信生body の
   hash と一致することを実証。不一致なら content 対象の定義を再設計（例: フィールド別 hash）。

@@ -36,10 +36,15 @@
 - グラフ連携: `required_persons(graph, decedent)`（:709）が Z1 ゲート絞り込み。
 - flags が1つでもあれば `provisional`。**確定は弁護士**。
 
-## 2. DerivationRun テーブル（app-state DB・§9.21 全field・immutable）
+## 2. DerivationRun ＋ HeirConfirmationDecision（app-state DB・§9.21・NH01: 純粋immutable分離）
 
-導出の実行を **immutable な監査レコード**として残す（HIGH: 正本 §9.21 全 field 反映）:
+**NH01（検証裁定）**: DerivationRun に人の確定状態（human_state/decided_by）を混ぜると
+「run は immutable」と「確定は可変な人の操作」が同一テーブルで衝突する。→ **DerivationRun は
+機械の導出事実だけを持つ純粋 immutable レコードとし、人の確定は別テーブル
+HeirConfirmationDecision に切り出す**。正本 §9.21 の human_state 等の field は
+「**run ＋ 最新 decision の join projection**」として解決する（テーブルには持たない）。
 
+### 2.1 DerivationRun（機械の導出事実のみ・純粋 immutable）
 | 列 | 型 | 内容 |
 |---|---|---|
 | id | BigInteger PK | |
@@ -49,26 +54,41 @@
 | **frozen_case_version** | Text | 導出時の案件/凍結表バージョン（再現性・§9.21） |
 | **input_person_revisions** | JSONB | App34 各 record の `$revision` 集合（後で人物が変わったら検知） |
 | input_person_ids | JSONB | 使った App34 record id 集合 |
-| **input_hash** | Text | **正規化SHA-256。対象＝persons ＋ input_person_revisions ＋ kosekis ＋ declarations ＋ at_date ＋ engine_version ＋ frozen_case_version**（HIGH: 同一入力の厳密同定） |
+| **input_hash** | Text | **正規化SHA-256。対象＝persons ＋ input_person_revisions ＋ kosekis ＋ declarations ＋ at_date ＋ engine_version ＋ frozen_case_version** |
 | status | Text | derived / held / error |
 | rank | Integer | 1/2/3/0 |
-| **result_payload** | JSONB | **person_id のみ**の shares/heirs（§4・氏名非保持・facts最小化・schema allowlist） |
+| **result_payload** | JSONB | **person_id のみ**の shares/heirs（§4・氏名非保持・schema allowlist） |
 | **result_hash** | Text | result_payload の SHA-256（改ざん検知・run 比較） |
 | **lawyer_flags** | JSONB | 要弁護士フラグ（flags を構造化・provisional 由来） |
 | provisional | Boolean | フラグ有無 |
-| **human_state** | Text | pending / confirmed / rejected（人の確定状態） |
-| **decided_by** | Text | 確定した弁護士識別（人の操作者） |
 | **supersedes_run_id** | BigInteger | この run が置き換える旧 run（再導出の連鎖） |
-| engine_version | Text | heir_derivation バージョン（テスト版 v0.1 等） |
+| engine_version | Text | heir_derivation バージョン |
 | created_at | DateTime(tz) | |
 
-- **immutable（HIGH）**: DerivationRun は **UPDATE/DELETE を拒否**（追記のみ）。人の確定や
-  再導出は**新 run を作り supersedes_run_id で連鎖**。`supersedes` 連鎖の検証（循環禁止・
-  同一 case で active head は1つ）をテストで固定。
+- **純粋 immutable**: DerivationRun は UPDATE/DELETE を拒否。human_state/decided_by/decided_at は
+  **持たない**（人の確定は §2.2）。再導出は新 run＋supersedes_run_id で連鎖（循環禁止・
+  同一 case で active head は1つ）。
+
+### 2.2 HeirConfirmationDecision（人の確定・追記のみ）
+| 列 | 型 | 内容 |
+|---|---|---|
+| id | BigInteger PK | |
+| **derivation_run_id** | BigInteger FK → DerivationRun.id | 対象の導出 run |
+| **decision** | Text | confirmed / held / rejected |
+| **decided_by** | Text | 確定した弁護士識別（人の操作者） |
+| **decided_at** | DateTime(tz) | 確定時刻 |
+| **修正内容** | JSONB | 人が run 結果に加えた修正（あれば・監査用） |
+| **supersedes_decision_id** | BigInteger | 置き換える旧 decision（確定のやり直し連鎖） |
+
+- decision も**追記のみ**（訂正は新 decision＋supersedes_decision_id）。
+- **§9.21 human_state 等への写像**: 正本の human_state / decided_by / decided_at フィールドは
+  「run ＋ その run に紐づく最新 decision」の **join projection** として算出する（例:
+  最新 decision.decision=confirmed → human_state=confirmed）。テーブルに冗長保持しない。
+
 - migration は alembic 第4弾（P1-004基盤・手動DDL禁止）。
-- **【裁定済み・2026-07-12 司令塔】** DerivationRun/TemplateVersion は **専用モジュールの
-  別 metadata**（inbound_event.Base への相乗りはしない・L03 準拠）。app-state のモデル群を
-  用途別モジュールに分け、alembic の target_metadata は各 Base を統合して autogenerate する。
+- **【裁定済み・2026-07-12 司令塔】** DerivationRun/HeirConfirmationDecision/TemplateVersion は
+  **専用モジュールの別 metadata**（inbound_event.Base 相乗りせず・L03 準拠）。alembic の
+  target_metadata は各 Base を統合して autogenerate する。
 
 ## 3. App36 起票設計（R4-3b・封筒→関所・projection 保護更新）
 
@@ -82,23 +102,37 @@
 - `review_resolve.RESOLVERS`（review_resolve.py:371）にトップキー `"heir_derivation"` ＋ ハンドラ ＋
   env（`APP_SOUZOKUNIN`/`TOKEN_SOUZOKUNIN`）追加 → `resolve_group` 経由。
 - ハンドラは既存 `_resolve_koseki` 型（phase1: 全件再読の二重確定ガード → phase2: App36 upsert →
-  App30 を `完了`/`実行済み:yes` クローズ）。**確定時に DerivationRun.human_state=confirmed・
-  decided_by を新 run で記録**。
+  App30 を `完了`/`実行済み:yes` クローズ）。**確定時は DerivationRun を書き換えず、
+  HeirConfirmationDecision を1行起票**（decision=confirmed/held/rejected・decided_by・decided_at・
+  修正内容）。human_state は run＋最新 decision の projection で読む（§2.2）。
 
-### 3.3 App36 を current projection とする（HIGH: run 比較＋human_state 保護）
-- **projection 更新は run の新旧比較に基づく**: 新 run の result と現 App36 を突合し、
-  **差分のみ**更新（全消し再作成しない）。
+### 3.3 App36 を current projection とする（HIGH/H10: run 比較＋human_state 保護＋run参照）
+- **App36 に `current_derivation_run_id` フィールドを追加**（H10）: 各 App36 人物レコードが
+  「どの run 由来か」を保持する。実機フィールド追加が要る（BLOCKED・§6 CU）。
+- **条件付き更新規則（H10）**: projection 更新は、対象 App36 の `current_derivation_run_id` の
+  **supersedes 連鎖上の後続 run のみ**が行える（＝古い run や無関係 run が新しい確定を
+  上書きできない）。更新成功時に `current_derivation_run_id` を新 run に進める。
+- **projection 更新は run の新旧比較に基づく**: 新 run の result と現 App36 を突合し、**差分のみ**
+  更新（全消し再作成しない）。
 - **human_state 保護**: App36 の人が触ったフィールド（特に `戸籍確認済=yes`・`状態` の手修正）は
-  **機械の再導出で上書きしない**（人の確定を機械が壊さない）。上書き対象は機械由来フィールド
-  （続柄/法定相続分/データ源）に限定。
+  **機械の再導出で上書きしない**。上書き対象は機械由来フィールド（続柄/法定相続分/データ源）に限定。
 - 冪等キー＝case_record_id＋person_id。registry_ingest._upsert_zaisan（:275）が既存の型。
 
 ### 3.4 「戸籍確認済=yes」遷移表（HIGH: 弁護士のみ・逆遷移禁止）
 | from | to | 許可主体 | 記録 |
 |---|---|---|---|
-| no | yes | **弁護士のみ** | decided_by＋decided_at を記録 |
+| no | yes | **弁護士のみ** | decision(decided_by＋decided_at) を記録 |
 | yes | no | **禁止**（逆遷移不可） | — |
 | （機械の再導出） | yes を維持 | 機械は yes を no に落とさない | 3.3 の保護と一致 |
+
+**実装点（H11: 防御と検知の分離）**:
+- **防御（機械経路）**: RESOLVERS ハンドラで `戸籍確認済=yes` を書くのは、decision の
+  `decided_by` が **`ATTORNEY_ALLOWLIST`（env・許可された弁護士識別の集合）に含まれる**場合のみ。
+  allowlist 外の decided_by による yes 遷移は拒否。
+- **検知（人の kintone 直接編集）**: kintone 画面での直接編集はコードから拒否できない。→
+  **daily_healthcheck に監査を追加**: 「対応する decision（decided_by あり）が無いのに
+  `戸籍確認済=yes` になっている App36 レコード」を検出したら業務LINE警報（件数＋recordID のみ・
+  RV10 policy 準拠）。防御不能な経路は検知で担保する。
 
 ### 3.5 result_payload の schema allowlist（HIGH: 氏名非保持）
 - result_payload は **person_id のみ**（氏名・住所・生年月日を保持しない）。氏名等は App34/36
@@ -181,5 +215,7 @@
 - BLOCKED_NEEDS_HUMAN:
   - App36/App37 env（`APP_SOUZOKUNIN`/`TOKEN_SOUZOKUNIN`/`APP_WARITSUKE`/`TOKEN_WARITSUKE`）
     本番投入・実番号確定・**App36トークン権限**（KINTONE_TOKEN_MATRIX と同列）。
+  - **App36 への新規フィールド `current_derivation_run_id` の実機追加（H10・CU/kintone）**。
   - App37 への新規フィールド（承認者/revision/snapshot）の実機追加（CU/kintone）。
+  - `ATTORNEY_ALLOWLIST`（env）に載せる弁護士識別の確定（H11・大野）。
   - TemplateVersion に載せる P1〜P4 テンプレ実物の正本確定＋bytes 再現の非決定要素排除（Drive）。

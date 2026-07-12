@@ -10,7 +10,8 @@
 
 （RV04/RV10/App36 で同一。詳細は DRAFT_RV04_HMAC_MIGRATION §共有節）
 1. redaction contract 確定（本書 §1・OPEN の伏字水準を大野裁定で埋める）
-2. RV10 S1 切替＋notify fail-closed
+2. RV10 S1 切替＋notify fail-closed＋**最小 dead-man 同梱**（NM02/H08/H09: daily_healthcheck に
+   業務通知経路の synthetic 送信＋成否検証を追加。fail-closed で通知が止まっても気付ける）
 3. RV04 multipart body-hash PoC（別票）
 4. RV04 GAS群 header HMAC＋dual-accept Phase A（downgrade 禁止）
 5. RV10 S2/S3/S4 段階解消＋AST 機械強制
@@ -44,6 +45,9 @@ secret 露出は現状0件（evidence確認済み）なので対象は PII。H04
 `contract`（契約書本文）/`fax`（FAX本文）/`qa`（Q&A本文）/`vendor_raw`（kintone/LINE/Claude/
 Stripe の生レスポンス）。これらは **log/exception には常に完全抑止**（line_customer 本人宛の
 正当ケースを除く）。
+- **L02: `document_metadata` 分類を新設**（従来「document title を name 分類で扱う」を廃止）。
+  書類タイトル等の書類メタは氏名を含み得るが氏名そのものではない → 専用分類とし、
+  **既定＝完全非表示（record ID のみ）**。業務LINE で書類を指す必要があるときも document ID で参照する。
 
 ### 1.3 unknown kind・構造化値の扱い（HIGH: fail-closed）
 - **unknown kind（未登録の分類）→ 完全抑止**（`（分類不明・非表示）`）。素通しにしない。
@@ -67,7 +71,7 @@ Stripe の生レスポンス）。これらは **log/exception には常に完�
 |---|---|---|
 | chat_responder.py:996 `_notify_attorney` | 顧客Bot固定・氏名＋相談本文[:200] | line_business へ移送＋freetext は要約。urgent_kind は分類として残す |
 | main.py:389-393 人対応通知 | 顧客Bot固定・氏名＋会話全文 | line_business へ移送＋name 最小＋freetext 要約。全文送信廃止 |
-| cloudsign_webhook.py:294 notify_line | 顧客Bot・書類タイトル | notify_business_line（業務Bot）へ統一＋タイトルは name 扱い |
+| cloudsign_webhook.py:294 notify_line | 顧客Bot・書類タイトル | notify_business_line（業務Bot）へ統一＋タイトルは **document_metadata 分類**（L02・§1.2）で扱う |
 | business_token_env フォールバック | 未設定時顧客Botへ | §4 fail-closed 化で解消 |
 
 ## 3. S2/S3/S4 の解消（policy 適用）
@@ -85,7 +89,11 @@ Stripe の生レスポンス）。これらは **log/exception には常に完�
 `DISPATCHBOT_CHANNEL_ACCESS_TOKEN` が無ければ**送信しない＋警告ログ**（顧客Botに業務PIIを
 乗せない）。欠落を埋める代替が §4.2。
 
-### 4.2 dead-man 監視（HIGH: 外部主体 heartbeat・別 credential・宛先 allowlist）
+### 4.2 dead-man 監視（2段構え）
+- **最小版（PR-2 同梱・NM02/H08/H09）**: daily_healthcheck が業務通知経路へ **synthetic 送信
+  （テスト用の無害な1通）を行い成否を検証**する。fail-closed 化（§4.1）で通知が止まった場合、
+  この synthetic の失敗で検知できる。プロセス内だが「fail-closed を無音化させない」最小担保。
+- **本格版（段8・HIGH: 外部主体 heartbeat・別 credential・宛先 allowlist）**:
 自プロセス内の監視では「プロセスごと落ちた」場合に気付けない。**外部主体**が生存を監視する:
 - 通知経路が「最後に業務通知に成功した時刻」を app-state に記録。
 - **外部の heartbeat 主体**（別プロセス/cron/外形監視）が N 時間ごとにこの値を確認し、
@@ -107,11 +115,13 @@ Stripe の生レスポンス）。これらは **log/exception には常に完�
 ## 6. 段階PR案（順序を再編: contract 先行）
 1. **PR-1: redaction contract（emit + policy + kind + §13.1禁止 + unknown/構造化=完全抑止 +
    失敗縮退）** ＋ AST 土台。**伏字水準 OPEN の既定=完全抑止で先行可**（緩めるのは裁定後）。
-2. **PR-2: S1（4経路）＋§4 fail-closed**（顧客への機微漏れ停止）。
+2. **PR-2: S1（4経路）＋§4 fail-closed＋最小 dead-man 同梱**（NM02/H08/H09）。fail-closed で
+   業務通知が止まったときに気付けるよう、**daily_healthcheck に業務通知経路の synthetic 送信
+   （テスト送信）＋成否検証を追加**して同 PR に含める（fail-closed 単独リリースで無音化しない）。
 3. **PR-3: S2 応答body最小化＋例外分類化**。
 4. **PR-4: S3 print全廃＋document_webhook redact**。
 5. **PR-5: S4 str(e)分類化＋AST 機械強制の本格化**。
-6. **PR-6: dead-man 監視（外部主体・別credential・allowlist）**。
+6. **PR-6: dead-man 監視の本格版（外部主体・別credential・allowlist）**（段8）。
 各 PR で全 suite 回帰・既存テスト無変更を維持。
 
 ## 7. OPEN・BLOCKED
@@ -121,5 +131,8 @@ Stripe の生レスポンス）。これらは **log/exception には常に完�
   直接出力のテスト固定まで。PII 変数名検出は対象外（レビュー規律・§5）。
 - 【OPEN・owner=大野】**過去ログの裁定**（既に Railway 集約ログに残った PII の保持/削除方針・
   保持期間・アクセス権）。判断材料: ログ基盤の保持設定・法務。
+  → **M06: 過去ログ調査を独立タスク（P1-008 候補）として定義**。実施=PC-A・READ_ONLY。
+  調査対象＝ログの保存先・保持設定・アクセス権・export 先。完了条件＝**大野が保持/削除を
+  裁定できる材料の提出**（この裁定そのものは大野・材料集めは PC-A）。
 - BLOCKED_NEEDS_HUMAN: DISPATCHBOT_CHANNEL_ACCESS_TOKEN 本番投入有無（fallback 発火の現況）・
   Railway ログ保持期間/アクセス権。
