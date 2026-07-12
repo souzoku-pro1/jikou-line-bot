@@ -762,7 +762,9 @@ async def get_app21_record(user_id: str) -> Optional[dict]:
             params=params,
         )
     if not resp.is_success:
-        logger.error("App21 search failed: %s %s", resp.status_code, resp.text)
+        logger.error("App21 search failed: status=%s body=%s",
+                     emit(resp.status_code, "count", "log", "operator"),
+                     emit(resp.text, "vendor_raw", "log", "operator"))
         return None
     records = resp.json().get("records", [])
     return records[0] if records else None
@@ -797,7 +799,9 @@ async def save_to_chatlog(
             json=body,
         )
     if not resp.is_success:
-        logger.warning("chatlog save failed: %s %s", resp.status_code, resp.text)
+        logger.warning("chatlog save failed: status=%s body=%s",
+                       emit(resp.status_code, "count", "log", "operator"),
+                       emit(resp.text, "vendor_raw", "log", "operator"))
 
 
 async def get_recent_chat_history(user_id: str, limit: int = 10) -> list[dict]:
@@ -824,7 +828,9 @@ async def get_recent_chat_history(user_id: str, limit: int = 10) -> list[dict]:
             params=params,
         )
     if not resp.is_success:
-        logger.warning("chatlog fetch failed: %s %s", resp.status_code, resp.text)
+        logger.warning("chatlog fetch failed: status=%s body=%s",
+                       emit(resp.status_code, "count", "log", "operator"),
+                       emit(resp.text, "vendor_raw", "log", "operator"))
         return []
     records = resp.json().get("records", [])
     # desc で取得しているので reversed で古い順に並べ直す
@@ -892,8 +898,9 @@ async def get_approval_record(record_id: str) -> Optional[dict]:
         )
     if not resp.is_success:
         logger.error(
-            "approval record fetch failed: %s %s", resp.status_code, resp.text
-        )
+            "approval record fetch failed: status=%s body=%s",
+            emit(resp.status_code, "count", "log", "operator"),
+            emit(resp.text, "vendor_raw", "log", "operator"))
         return None
     return resp.json().get("record")
 
@@ -919,8 +926,9 @@ async def mark_approval_sent(record_id: str) -> None:
         )
     if not resp.is_success:
         logger.error(
-            "mark_approval_sent failed: %s %s", resp.status_code, resp.text
-        )
+            "mark_approval_sent failed: status=%s body=%s",
+            emit(resp.status_code, "count", "log", "operator"),
+            emit(resp.text, "vendor_raw", "log", "operator"))
 
 
 # ── LINE 送信 ──────────────────────────────────────────────────────────────────
