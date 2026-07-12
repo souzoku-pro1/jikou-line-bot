@@ -21,10 +21,10 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 # ── main.py / chat_responder.py は import 時に多数の module-level env を要求する。
-#    test_bank_ingest.py と同一の env-setup preamble を踏襲して import を通す。
-_DUMMY_ANTHROPIC_KEY = "dummy_key_for_import_only"
-os.environ.setdefault("ANTHROPIC_API_KEY", _DUMMY_ANTHROPIC_KEY)
-os.environ.update({
+#    M01: os.environ を恒久汚染しないよう、上書きする全キーの原状（値/未設定）を
+#    保存し、import 後に完全復元する（元未設定なら削除・設定済みなら元値）。
+_ENV_OVERRIDES = {
+    "ANTHROPIC_API_KEY": "dummy_key_for_import_only",
     "LINE_CHANNEL_SECRET": "dummy_secret",
     "LINE_CHANNEL_ACCESS_TOKEN": "dummy_token",
     "KINTONE_SUBDOMAIN": "testsub",
@@ -41,21 +41,32 @@ os.environ.update({
     "APP_CHATLOG": "40",
     "TOKEN_CHATLOG": "dummy",
     "GOOGLE_VISION_API_KEY": "dummy_vision",
-    # /ocr/fixed-asset の env チェックを通すため（KINTONE_FUDOSAN_DOMAIN は
-    # KINTONE_SUBDOMAIN にフォールバック）
+    # /ocr/fixed-asset の env チェック用（KINTONE_FUDOSAN_DOMAIN は SUBDOMAIN へフォールバック）
     "KINTONE_FUDOSAN_APP_ID": "50",
     "KINTONE_FUDOSAN_API_TOKEN": "dummy",
     "STRIPE_WEBHOOK_SECRET": "whsec_dummy",
     "HEALTHCHECK_DISABLED": "1",
-})
+}
+# import 前に原状を保存（None=未設定）
+_ENV_SAVED = {k: os.environ.get(k) for k in _ENV_OVERRIDES}
+os.environ.update(_ENV_OVERRIDES)
 
 from fastapi.testclient import TestClient  # noqa: E402
 
 import chat_responder  # noqa: E402
 import main  # noqa: E402
 
-if os.environ.get("ANTHROPIC_API_KEY") == _DUMMY_ANTHROPIC_KEY:
-    del os.environ["ANTHROPIC_API_KEY"]
+
+def _restore_env() -> None:
+    """import 時に投入したダミー env を原状へ完全復元する（M01）。"""
+    for k, original in _ENV_SAVED.items():
+        if original is None:
+            os.environ.pop(k, None)
+        else:
+            os.environ[k] = original
+
+
+_restore_env()
 
 client = TestClient(main.app)
 
@@ -204,6 +215,14 @@ class Item10ScanOcrFailureBranches(unittest.TestCase):
             p = patch.object(main, name, val)
             p.start()
             self.addCleanup(p.stop)
+        # /scan は env を request 時に読む（module 定数でない）。M01 の env 復元で
+        # 消えるため、対象フォルダ「相談カード」の app_id/token を patch.dict で供給。
+        pe = patch.dict(os.environ, {
+            "SOUZOKU_KINTONE_APP_ID": "26",
+            "SOUZOKU_KINTONE_API_TOKEN": "dummy",
+        })
+        pe.start()
+        self.addCleanup(pe.stop)
 
     # ── /scan ─────────────────────────────────────────────────────────────────
 
@@ -270,6 +289,31 @@ class Item10ScanOcrFailureBranches(unittest.TestCase):
         self.assertNotIn(
             _SENTINEL, resp.text,
             f"[LEAK] /ocr ocr-error: 生例外がレスポンスに露出:\n{resp.text}")
+
+
+class TestEnvRestoreMechanism(unittest.TestCase):
+    """M01: import 時の env 上書きを原状へ戻す復元ロジックを専用プローブキーで
+    決定的に検証する（os.environ の最終状態は他 test モジュールの import にも
+    左右され相等を主張できないため、ロジック自体を検証）。"""
+
+    def test_restore_removes_unset_and_restores_set(self):
+        k_unset, k_set = "_P1110_PROBE_UNSET", "_P1110_PROBE_SET"
+        os.environ.pop(k_unset, None)
+        os.environ[k_set] = "orig"
+        saved = {k_unset: os.environ.get(k_unset), k_set: os.environ.get(k_set)}
+        try:
+            os.environ[k_unset] = "dummyA"      # 元未設定を上書き
+            os.environ[k_set] = "dummyB"        # 元設定済みを上書き
+            for k, original in saved.items():   # _restore_env と同一ロジック
+                if original is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = original
+            self.assertNotIn(k_unset, os.environ)          # 元未設定 → 削除
+            self.assertEqual(os.environ.get(k_set), "orig")  # 元設定済み → 元値
+        finally:
+            os.environ.pop(k_unset, None)
+            os.environ.pop(k_set, None)
 
 
 if __name__ == "__main__":

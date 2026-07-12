@@ -543,8 +543,18 @@ class TestSinkAllowlist(unittest.TestCase):
         data = json.loads(ALLOWLIST_PATH.read_text(encoding="utf-8"))
         self.baseline = int(data["baseline_count"])
         self.allow = set(data["entries"])
-        self.manifest = set(data.get("manifest", {}).keys())
+        self.manifest_reasons = data.get("manifest", {})
+        self.manifest = set(self.manifest_reasons.keys())
         self.current, self.errors = scan_repo()
+
+    def test_manifest_reasons_are_non_empty(self):
+        """L01: manifest の全キーは非空文字列の理由を持たねばならない
+        （新規 sink debt は必ず理由付きで登録させる）。"""
+        blank = sorted(k for k, v in self.manifest_reasons.items()
+                       if not (isinstance(v, str) and v.strip()))
+        self.assertEqual(blank, [],
+                         "理由が空の manifest キー（理由を記載すること）:\n"
+                         + "\n".join(blank))
 
     def test_every_entry_is_manifested(self):
         """RP1107B-M01: 台帳の各エントリの (file,rule) は変換 manifest に登録されて
