@@ -177,6 +177,8 @@ async def amain() -> int:
 
 
 if __name__ == "__main__":
+    from hub.logging_setup import configure_app_logging
+    configure_app_logging()   # CLI 起動時も INFO を stdout へ（PR-4b）
     try:
         import truststore
         truststore.inject_into_ssl()

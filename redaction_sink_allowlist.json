@@ -1,6 +1,6 @@
 {
   "baseline_count": 211,
-  "generated_by": "P1-107b-print-migration",
+  "generated_by": "P1-107b-fix",
   "note": "sink 直書き債務台帳。baseline_count=211(上限・単調減少)。P1-107b(PR-4b)で sink:print 134件を emit/logger へ移送(daily_healthcheck/scheduler 分は PR-4c へ凍結・据置)。例外print→logger は type(e).__name__ 可視(fix2裁定準拠)＋emit(vendor_raw)抑止で sink:logger 25件が計上。logger.exception/logging.exceptionは引数不問でlogger_exception違反(L01)。信頼emitは from hub.redact import emit(1形式)。",
   "entries": [
     "bank_ingest.py:243:sink:httpexception",
@@ -44,8 +44,8 @@
     "koseki_person_sync.py:287:sink:logger",
     "koseki_reader.py:397:sink:logger",
     "koseki_second_opinion.py:309:sink:logger",
-    "main.py:635:sink:logger",
-    "main.py:918:sink:logger",
+    "main.py:611:sink:logger",
+    "main.py:894:sink:logger",
     "person_confirm.py:144:sink:logger",
     "registry_ingest.py:356:sink:httpexception",
     "registry_ingest.py:366:sink:httpexception",

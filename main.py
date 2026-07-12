@@ -1,5 +1,4 @@
 import os
-import sys
 import stripe
 import re
 import json
@@ -58,32 +57,9 @@ import logging
 logger = logging.getLogger("main")
 
 
-def _configure_app_logging() -> None:
-    """app ロガーの出力配線（RV-10 PR-4a・1点集約）。
-
-    uvicorn 配下では root ロガーに handler が付かず、モジュールロガーの INFO は
-    lastResort（WARNING 以上のみ・stderr）で握り潰される。ここで root に stdout
-    handler を1つだけ付け、INFO 以上を timestamp/level/logger名/message 形式で出す。
-
-    - 二重付与ガード: 既に root へ handler がある場合（uvicorn --log-config /
-      daily_healthcheck.py の __main__ basicConfig 等）は付与せず INFO 化のみに留める。
-    - 多弁なサードパーティ（httpx/httpcore/urllib3）の per-request INFO は本番ログを
-      洪水にするため WARNING へ引き上げる（app 由来の INFO 可視化が目的のため）。
-    """
-    root = logging.getLogger()
-    if root.handlers:
-        # M01: 既に誰か（uvicorn --log-config / basicConfig 等）が root を設定済み。
-        # level も handler も触らず既存挙動を尊重する（二重付与・level 上書きをしない）。
-        return
-    handler = logging.StreamHandler(sys.stdout)
-    handler.setFormatter(logging.Formatter(
-        "%(asctime)s %(levelname)s %(name)s %(message)s"))
-    root.addHandler(handler)
-    root.setLevel(logging.INFO)   # handler を付与した場合のみ level を設定
-    # サードパーティの per-request INFO を抑制（洪水回避・app INFO は残す）
-    for _noisy in ("httpx", "httpcore", "urllib3"):
-        logging.getLogger(_noisy).setLevel(logging.WARNING)
-
+# ロガー出力配線は hub/logging_setup へ集約（PR-4b: CLI と共有）。従来名 alias で
+# 既存参照（test_logging_wiring.py の main._configure_app_logging）を維持する。
+from hub.logging_setup import configure_app_logging as _configure_app_logging  # noqa: E402
 
 # uvicorn が `main:app` を import した時点で1回だけ配線する（起動経路で必ず通る）
 _configure_app_logging()

@@ -95,6 +95,8 @@ def build() -> Document:
 
 
 if __name__ == "__main__":
+    from hub.logging_setup import configure_app_logging
+    configure_app_logging()   # CLI 起動時も INFO を stdout へ（PR-4b）
     OUT.parent.mkdir(parents=True, exist_ok=True)
     build().save(str(OUT))
     logger.info("generated: %s", emit(str(OUT), "freetext", "log", "operator"))
