@@ -274,6 +274,14 @@ def scan_source(src: str, name: str) -> list[str]:
         kind = _sink_kind(node, b)
         if kind is None:
             continue
+        # L01: logger.exception / logging.exception は exc_info=True 相当で
+        # 例外本文（PII を含みうる）を無条件に出力する。引数が定数でも危険なので
+        # sink 種別として恒久禁止し、logger.error＋固定分類メッセージへ移行させる。
+        f = node.func
+        if kind in ("logger", "logging_module") \
+                and isinstance(f, ast.Attribute) and f.attr == "exception":
+            violations.append(f"{name}:{node.lineno}:logger_exception")
+            continue
         required = _SINK_REQUIRED_POLICY[kind]
         # H03: exc_info / stack_info keyword は値が True でも違反（例外本文が出る）
         bad_kw = any(kw.arg in _UNSAFE_KEYWORDS for kw in node.keywords)
@@ -334,8 +342,15 @@ class TestScannerDetection(unittest.TestCase):
         ("httpexc_detail_var",
          "raise HTTPException(detail=error_detail)\n",
          {"sink:httpexception"}),
+        # L01: logger.exception は引数に関わらず logger_exception 違反（exc_info 相当）
         ("logger_exc_info", "logger.exception('x', exc_info=e)\n",
-         {"sink:logger"}),
+         {"logger_exception"}),
+        ("logger_exception_const", "logger.exception('constant only')\n",
+         {"logger_exception"}),
+        ("logger_exception_var", "logger.exception('m %s', v)\n",
+         {"logger_exception"}),
+        ("logging_module_exception",
+         "import logging\nlogging.exception('x')\n", {"logger_exception"}),
         ("logger_traceback", "logger.error(traceback.format_exc())\n",
          {"sink:logger"}),
         ("logger_eargs", "logger.error(e.args)\n", {"sink:logger"}),
@@ -553,6 +568,7 @@ class TestSinkAllowlist(unittest.TestCase):
 
     def test_allowlist_entries_are_well_formed(self):
         ok_rules = {"print_alias", "emit_shadow", "dynamic_name_op",
+                    "logger_exception",
                     "sink:print", "sink:logger", "sink:logger_log",
                     "sink:logging_module", "sink:httpexception",
                     "sink:stdio_write"}

@@ -55,7 +55,7 @@ class TestVerificationSuccessUnchanged(unittest.TestCase):
 
     def test_success_transitions_and_notifies(self):
         with patch.object(mod, "fetch_document", return_value=dict(COMPLETED_DOC)) as mock_fetch, \
-             patch.object(mod, "update_kintone_status", return_value=True) as mock_update, \
+             patch.object(mod, "update_kintone_status", return_value="42") as mock_update, \
              patch.object(mod, "notify_line") as mock_notify, \
              patch.object(mod, "notify_business_line") as mock_biz:
             code, body = mod.handle_webhook(SECRET, dict(COMPLETED_EVENT))
@@ -65,14 +65,16 @@ class TestVerificationSuccessUnchanged(unittest.TestCase):
         self.assertEqual(body.get("state"), "processed")
         mock_fetch.assert_called_once_with("doc1")
         mock_update.assert_called_once_with("doc1", "受任")
-        # P1-102（RV-10 S1）: 締結完了通知は顧客Bot(notify_line)ではなく
-        # 業務チャネル(notify_business_line)へ・書類タイトルは redact される
+        # P1-102/102a（RV-10 S1・M06）: 締結完了通知は顧客Bot(notify_line)ではなく
+        # 業務チャネル(notify_business_line)へ。書類特定は kintone レコード No で行い、
+        # documentID は external_ref として抑止する（業務チャネルにも素で出さない）
         mock_notify.assert_not_called()
         mock_biz.assert_called_once()
         biz_msg = mock_biz.call_args.args[0]
         self.assertIn("【締結完了】", biz_msg)
-        self.assertIn("doc1", biz_msg)               # documentID は相関 ID として残す
-        self.assertNotIn("委任契約書", biz_msg)       # 書類タイトルは redact（非表示）
+        self.assertIn("42", biz_msg)                 # kintone レコード No で特定
+        self.assertNotIn("doc1", biz_msg)            # documentID は抑止（M06）
+        self.assertNotIn("委任契約書", biz_msg)       # 書類タイトルも非表示
 
     def test_wrong_secret_still_404(self):
         code, _ = mod.handle_webhook("wrong", dict(COMPLETED_EVENT))
@@ -118,7 +120,7 @@ class TestVerificationFailureFailClosed(unittest.TestCase):
                 mock_notify.assert_not_called()   # 顧客チャネル通知 0
                 mock_biz.assert_called_once()     # 要人手確認の業務警報
                 msg = mock_biz.call_args.args[0]
-                self.assertIn("doc1", msg)
+                self.assertNotIn("doc1", msg)     # M06: documentID は業務チャネルで抑止
                 self.assertIn("失敗分類", msg)
 
     def test_failure_reason_classification(self):
@@ -187,7 +189,7 @@ class TestKintoneUpdateFailed(unittest.TestCase):
         mock_notify.assert_not_called()   # 「締結完了」通知は出さない
         mock_biz.assert_called_once()     # 要人手確認の業務警報（顧客チャネルへは出さない）
         msg = mock_biz.call_args.args[0]
-        self.assertIn("doc1", msg)
+        self.assertNotIn("doc1", msg)     # M06: documentID は業務チャネルで抑止
         self.assertIn("kintone未更新", msg)
 
 

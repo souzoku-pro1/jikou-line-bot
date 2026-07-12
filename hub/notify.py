@@ -44,7 +44,7 @@ def business_token_env() -> str:
 
 
 def _business_recipients() -> frozenset[str]:
-    """業務通知の許可宛先（allowlist）。ATTORNEY_LINE_USER_ID と管理者 ID のみ。"""
+    """S1/dead-man 用の狭い allowlist（弁護士・管理者のみ）。notify_business が使う。"""
     out = set()
     attorney = os.environ.get("ATTORNEY_LINE_USER_ID", "")
     admin = get_admin_line_user_id()
@@ -52,6 +52,28 @@ def _business_recipients() -> frozenset[str]:
         out.add(attorney)
     if admin:
         out.add(admin)
+    return frozenset(out)
+
+
+def business_channel_allowlist() -> frozenset[str]:
+    """業務チャネル（DISPATCHBOT）で送信を許す全宛先（H02・push_line_message の関所）。
+
+    正当な直接 caller の宛先を用途つきで登録（それ以外への DISPATCHBOT 送信は拒否）:
+      - ATTORNEY_LINE_USER_ID    : 弁護士（S1 通知・承認依頼・sortation 照会の最終 fallback）
+      - 管理者（LINE_ADMIN_USER_ID / get_admin_line_user_id）: 死活監視・管理者警報
+      - LINE_USER_ID             : /ocr/fixed-asset の受領通知先（事務所 PC watcher 運用）
+      - SORTATION_ASK_TO         : 書類仕分け照会の宛先（sortation_ingest._ask_recipient）
+      - DISPATCHBOT_ALLOWED_USER_IDS : 指示Bot のホワイトリスト（仕分け照会の fallback 宛先）
+    """
+    out = set(_business_recipients())
+    for key in ("LINE_USER_ID", "SORTATION_ASK_TO"):
+        v = os.environ.get(key, "").strip()
+        if v:
+            out.add(v)
+    for u in os.environ.get("DISPATCHBOT_ALLOWED_USER_IDS", "").split(","):
+        u = u.strip()
+        if u:
+            out.add(u)
     return frozenset(out)
 
 
@@ -68,6 +90,10 @@ async def push_line_message(to: str, text: str,
     if not (to and line_token):
         logger.warning("LINE push skipped (no destination or token)")
         return False
+    # H02: 業務チャネルへの送信は allowlist を強制（宛先の迂回を防ぐ）
+    if token_env == _BUSINESS_TOKEN_ENV and to not in business_channel_allowlist():
+        logger.warning("business channel push skipped (recipient not allowlisted)")
+        return False
     try:
         async with httpx.AsyncClient() as client:
             resp = await client.post(
@@ -78,20 +104,27 @@ async def push_line_message(to: str, text: str,
                 },
                 json={"to": to, "messages": [{"type": "text", "text": text[:4900]}]},
             )
-        if not resp.is_success:
-            # vendor 生レスポンスは emit(vendor_raw) で完全抑止（P1-102・台帳 :69 解消）
-            logger.error(
-                "LINE push failed status=%s body=%s",
-                emit(resp.status_code, "count", "log", "operator"),
-                emit(resp.text, "vendor_raw", "log", "operator"))
-            return False
-        if token_env == _BUSINESS_TOKEN_ENV:
+    except Exception:
+        # 固定分類のみ（例外本文・token を出さない・logger.exception 不使用・L01）
+        logger.error("LINE push error (request failed)")
+        return False
+
+    if not resp.is_success:
+        # vendor 生レスポンスは emit(vendor_raw) で完全抑止（P1-102・台帳 :69 解消）
+        logger.error(
+            "LINE push failed status=%s body=%s",
+            emit(resp.status_code, "count", "log", "operator"),
+            emit(resp.text, "vendor_raw", "log", "operator"))
+        return False
+
+    # M01: heartbeat 記録は独立 best-effort（DB 失敗は warning のみ・HTTP 結果に影響させない）
+    if token_env == _BUSINESS_TOKEN_ENV:
+        try:
             from hub.notify_heartbeat import record_success
             await record_success("business")
-        return True
-    except Exception:
-        logger.exception("LINE push error")
-        return False
+        except Exception:
+            logger.warning("business heartbeat record failed (non-fatal)")
+    return True
 
 
 async def notify_business(to: str, text: str) -> bool:

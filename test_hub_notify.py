@@ -6,7 +6,7 @@ claude_gateway からの re-export 互換。
 
 import json
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from hub import notify
 
@@ -156,9 +156,14 @@ class TestPushLineMessage(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(kw["headers"]["Authorization"], "Bearer line_tok")
 
     async def test_token_env_selects_channel(self):
-        """token_env 指定で送信チャネル（Authorization ヘッダ）が切り替わる"""
-        env = {"DISPATCHBOT_CHANNEL_ACCESS_TOKEN": "bot_tok"}
+        """token_env 指定で送信チャネル（Authorization ヘッダ）が切り替わる。
+        H02: 業務チャネル送信は宛先 allowlist を強制するため、宛先を登録済み
+        （DISPATCHBOT_ALLOWED_USER_IDS）にして channel 選択のみを検証する。"""
+        env = {"DISPATCHBOT_CHANNEL_ACCESS_TOKEN": "bot_tok",
+               "DISPATCHBOT_ALLOWED_USER_IDS": "U1"}
         with patch.dict("os.environ", env, clear=False), \
+                patch("hub.notify_heartbeat.record_success",
+                      new_callable=AsyncMock), \
                 use_fake([FakeResponse(200)]):
             ok = await notify.push_line_message(
                 "U1", "hello", token_env="DISPATCHBOT_CHANNEL_ACCESS_TOKEN")

@@ -154,8 +154,9 @@ def verify_completed_document(document_id: str) -> tuple[dict | None, str]:
 # ============================================================
 # kintone 更新
 # ============================================================
-def update_kintone_status(document_id: str, new_status: str) -> bool:
-    """documentID で案件を探し、ステータスフィールドを更新する。"""
+def update_kintone_status(document_id: str, new_status: str):
+    """documentID で案件を探し、ステータスフィールドを更新する。
+    成功で kintone レコード No（str）・該当なし/未更新で None を返す（M06: 通知の書類特定用）。"""
     # 1. documentID で検索
     r = requests.get(
         f"{KINTONE_BASE}/k/v1/records.json",
@@ -169,8 +170,9 @@ def update_kintone_status(document_id: str, new_status: str) -> bool:
     r.raise_for_status()
     records = r.json().get("records", [])
     if not records:
-        logger.warning("kintoneに該当案件なし document_id=%s", document_id)
-        return False
+        logger.warning("kintoneに該当案件なし document_id=%s",
+                       emit(document_id, "external_ref", "log", "operator"))
+        return None
 
     record_id = records[0]["$id"]["value"]
 
@@ -189,8 +191,9 @@ def update_kintone_status(document_id: str, new_status: str) -> bool:
         timeout=10,
     )
     u.raise_for_status()
-    logger.info("kintone更新完了 record_id=%s status=%s", record_id, new_status)
-    return True
+    logger.info("kintone更新完了 record_id=%s",
+                emit(record_id, "record_id", "log", "operator"))
+    return record_id
 
 
 # ============================================================
@@ -213,17 +216,20 @@ def notify_line(message: str) -> None:
             timeout=10,
         )
     except Exception:
-        logger.exception("LINE通知失敗")
+        logger.error("LINE通知失敗 (request failed)")  # 固定分類・L01
 
 
 def notify_business_line(message: str) -> None:
-    """業務通知（照合失敗の要人手確認）を業務指示Botチャネルで管理者へ送る。
+    """業務通知（締結完了・照合失敗の要人手確認）を業務指示Botチャネルで送る。
 
-    DISPATCHBOT_CHANNEL_ACCESS_TOKEN 未設定なら送信しない（警告ログのみ）。
-    顧客Bot（LINE_CHANNEL_ACCESS_TOKEN）へのフォールバックは行わない
-    （P0B-002 指示: 照合失敗の警報を顧客Botチャネルに乗せない。
-    hub/notify.business_token_env のフォールバックはここでは使わない）。
+    M03: 共通アダプタ相当の防御を sync 経路にも適用する:
+      - 宛先 allowlist（hub.notify.business_channel_allowlist・迂回防止）
+      - 非2xx の確認（従来は status を見ていなかった）＋vendor 生値の emit 抑止
+      - 送信成功で dead-man heartbeat を記録（sync 版・best-effort）
+    DISPATCHBOT 未設定/宛先未許可なら送信しない（顧客Bot へのフォールバックはしない）。
     """
+    from hub.notify import business_channel_allowlist
+
     token = os.environ.get("DISPATCHBOT_CHANNEL_ACCESS_TOKEN", "")
     to = (os.environ.get("LINE_ADMIN_USER_ID", "")
           or os.environ.get("ATTORNEY_LINE_USER_ID", ""))
@@ -231,8 +237,11 @@ def notify_business_line(message: str) -> None:
         logger.warning(
             "business LINE notify skipped (DISPATCHBOT token or admin id unset)")
         return
+    if to not in business_channel_allowlist():
+        logger.warning("business LINE notify skipped (recipient not allowlisted)")
+        return
     try:
-        requests.post(
+        resp = requests.post(
             "https://api.line.me/v2/bot/message/push",
             headers={
                 "Authorization": f"Bearer {token}",
@@ -242,7 +251,18 @@ def notify_business_line(message: str) -> None:
             timeout=10,
         )
     except Exception:
-        logger.exception("business LINE通知失敗")
+        logger.error("business LINE通知失敗 (request failed)")  # 固定分類・L01
+        return
+    if not resp.ok:
+        logger.error("business LINE通知失敗 status=%s body=%s",
+                     emit(resp.status_code, "count", "log", "operator"),
+                     emit(resp.text, "vendor_raw", "log", "operator"))
+        return
+    try:
+        from hub.notify_heartbeat import record_success_sync
+        record_success_sync("business")
+    except Exception:
+        logger.warning("business heartbeat record failed (non-fatal)")
 
 
 # ============================================================
@@ -267,9 +287,11 @@ def handle_webhook(secret: str, payload: dict) -> tuple[int, dict]:
             # （本文・PII・token・ベンダー生レスポンスは出さない）
             logger.warning("CloudSign照合失敗のため受任へ遷移せず doc=%s reason=%s",
                            document_id, failure)
+            # M06: 業務チャネル（弁護士のLINE）へ出す documentID は external_ref
+            # として抑止する。相関は operator 向けの上記ログ（Railway）で行う。
             notify_business_line(
                 "【CloudSign照合失敗・要人手確認】\n"
-                f"documentID: {document_id}\n"
+                f"参照ID: {emit(document_id, 'external_ref', 'line_business', 'attorney')}\n"
                 f"失敗分類: {failure}\n"
                 "受任への自動遷移は行っていません。"
                 "CloudSign管理画面で締結状況を確認してください。")
@@ -281,24 +303,33 @@ def handle_webhook(secret: str, payload: dict) -> tuple[int, dict]:
             # 上記ログで判別できる（イベントの永続 journal 化は Phase 1）。
             return 200, {"ok": True, "state": "verification_failed"}
 
-        title = doc.get("title", "")
-        if not update_kintone_status(document_id, "受任"):
+        record_no = update_kintone_status(document_id, "受任")
+        if not record_no:
             # RCF-M04: 照合は成功したが kintone に一致案件がない（未更新）。
             # 受任は成立していないので「締結完了」通知は出さず、要人手確認を
-            # 業務チャネルで警報する（顧客チャネルへは出さない）
-            logger.warning("CloudSign照合成功だがkintone未更新 doc=%s", document_id)
+            # 業務チャネルで警報する（顧客チャネルへは出さない）。
+            # M06: この経路は kintone レコード No が引けない＝documentID を抑止すると
+            # 相関手段が無くなる（司令塔裁定待ち・COMPLETION_REPORT に BLOCKED 記載）。
+            # M06 BLOCKED: この経路は kintone レコード No が引けず、documentID は
+            # external_ref として抑止する設計。抑止すると相関ハンドルが無くなり
+            # 人手確認が困難になる（fail-closed を優先し raw ID は出さない）。
+            # 「失敗経路でも documentID を業務チャネルに出してよいか」は司令塔裁定待ち
+            # （COMPLETION_REPORT に BLOCKED 記載）。現状は抑止＋手動突合を指示する。
+            logger.warning("CloudSign照合成功だがkintone未更新 doc=%s",
+                           emit(document_id, "external_ref", "log", "operator"))
             notify_business_line(
                 "【CloudSign照合成功・kintone未更新・要人手確認】\n"
-                f"documentID: {document_id}\n"
+                f"参照ID: {emit(document_id, 'external_ref', 'line_business', 'attorney')}\n"
                 "documentID に一致する案件レコードが見つからず、受任へ更新できて"
-                "いません。kintone の cloudsign_document_id を確認してください。")
+                "いません。CloudSign の直近の締結完了と kintone の "
+                "cloudsign_document_id を突合してください。")
             return 200, {"ok": True, "state": "kintone_update_failed"}
-        # P1-102（RV-10 S1）: 顧客Bot（notify_line）ではなく業務チャネル
-        # （notify_business_line）へ。書類タイトルは document_metadata で redact
-        # （既定=完全抑止）。documentID は不透明な相関 ID として残す。
-        safe_title = emit(title, "document_metadata", "line_business", "attorney")
+        # P1-102/102a（RV-10 S1・M06）: 業務チャネルへ。documentID は external_ref
+        # で抑止し、書類特定は kintone レコード No（内部参照）で行う。
         notify_business_line(
-            f"【締結完了】{safe_title}\ndocumentID: {document_id}")
+            f"【締結完了】案件レコードNo: {record_no}\n"
+            f"参照ID: {emit(document_id, 'external_ref', 'line_business', 'attorney')}\n"
+            "kintone の該当案件（受任へ更新済）を確認してください。")
         return 200, {"ok": True, "state": "processed"}
 
     # 締結完了以外のイベント（却下・取消等）は従来どおり何もしない

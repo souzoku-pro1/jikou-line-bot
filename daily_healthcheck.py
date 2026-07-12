@@ -244,18 +244,21 @@ async def check_business_notify_liveness() -> list[str]:
     可能性」を検知する（送信自体を synthetic 検証とする統合形・新規メッセージ追加なし）。
     静かにスキップ: DATABASE_URL 未設定 / heartbeat テーブル未適用（初回記録前）。
     """
-    if not os.environ.get("DATABASE_URL"):
-        return []
+    # M04: token 未設定は DATABASE_URL より先に検知（fail-closed で全業務通知が無音）
     if not os.environ.get("DISPATCHBOT_CHANNEL_ACCESS_TOKEN"):
-        # fail-closed により業務通知が一切送信されない状態 → 検知（env 投入要）
         return ["業務通知チャネル(DISPATCHBOT_CHANNEL_ACCESS_TOKEN)未設定: "
                 "業務通知が送信されません（要env投入）"]
 
-    from hub.notify_heartbeat import get_last_success
-    last = await get_last_success("business")
-    if last is None:
-        logger.info("business notify heartbeat: no record yet (skip)")
+    from hub.notify_heartbeat import get_heartbeat_status
+    status, last = await get_heartbeat_status("business")
+    if status in ("db_unset", "table_missing"):
+        # H01: DB 未設定 / migration 未適用は許容（静かにスキップ）
+        logger.info("business notify heartbeat check skipped (db未設定 or table未適用)")
         return []
+    if status == "empty":
+        # H01: テーブルはあるが成功記録が1件も無い＝異常として返す
+        return ["業務通知の成功記録が1件もありません（dead-man）: "
+                "DISPATCHBOTチャネルの死活を確認してください"]
     if last.tzinfo is None:
         last = last.replace(tzinfo=timezone.utc)
     try:
@@ -344,7 +347,7 @@ async def _deadman_alt_alert() -> None:
             "【要確認】業務通知チャネルの死活通知に失敗しました。"
             "Railwayログと DISPATCHBOT チャネルを確認してください。")
     except Exception:
-        logger.exception("dead-man 代替警報の送信にも失敗")
+        logger.error("dead-man 代替警報の送信にも失敗 (request failed)")  # 固定分類・L01
 
 
 # ══════════════════════════════════════════════════════════════
