@@ -1,7 +1,7 @@
 {
   "baseline_count": 211,
-  "generated_by": "P1-102a-deadman-allowlist",
-  "note": "sink 直書き債務台帳。baseline_count=211は上限据え置き(単調減少のみ)。P1-102a: L01でlogger.exception/logging.exceptionを引数不問のlogger_exception違反として恒久禁止(既存9件を凍結)。S1/dead-man経路の3件(cloudsign notify_line/notify_business_line, daily_healthcheck dead-man代替警報)はlogger.error+固定分類へ移行。M06でcloudsign update_kintone_statusのrecord_id/document_idをemit経由化し172/192/289を解消。現行207件。信頼emitは from hub.redact import emit(1形式)。sink全引数が 定数/定数f-string/信頼emit(policy一致)/結合 のみで合格。logger.exceptionは定数でも違反。新規禁止・stale削除必須。",
+  "generated_by": "P1-102b-cloudsign-envelope",
+  "note": "sink 直書き債務台帳。baseline_count=211は上限据え置き(単調減少のみ)。P1-102bでcloudsign要確認封筒起票を追加(operator向けdoc/statusログ2件は行番号のみ移動・総数不変207)。logger.exception/logging.exceptionは引数不問でlogger_exception違反(L01)。信頼emitは from hub.redact import emit(1形式)。sink全引数が 定数/定数f-string/信頼emit(policy一致)/結合 のみで合格。新規禁止・stale削除必須。",
   "entries": [
     "bank_ingest.py:103:sink:print",
     "bank_ingest.py:238:sink:httpexception",
@@ -32,8 +32,8 @@
     "claude_gateway.py:115:sink:logger",
     "claude_gateway.py:134:logger_exception",
     "claude_gateway.py:71:sink:logger",
-    "cloudsign_webhook.py:279:sink:logger",
-    "cloudsign_webhook.py:288:sink:logger",
+    "cloudsign_webhook.py:365:sink:logger",
+    "cloudsign_webhook.py:374:sink:logger",
     "customer_directory.py:121:sink:print",
     "daily_healthcheck.py:137:sink:logger",
     "daily_healthcheck.py:166:sink:logger",

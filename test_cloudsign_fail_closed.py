@@ -248,5 +248,106 @@ class TestBusinessNotifyChannelPolicy(unittest.TestCase):
             mod.notify_business_line("警報テスト")  # 例外が漏れないこと
 
 
+class TestMismatchEnvelope(unittest.TestCase):
+    """P1-102b: 失敗経路の App 30「要確認」封筒起票（M06 App30封筒方式）"""
+
+    APP30 = {"APP_SHIPPING": "30", "TOKEN_SHIPPING": "sh_tok"}
+
+    @staticmethod
+    def _resp(payload):
+        r = MagicMock()
+        r.raise_for_status = MagicMock()
+        r.json.return_value = payload
+        return r
+
+    def test_files_envelope_when_no_existing(self):
+        with patch.dict("os.environ", self.APP30, clear=False), \
+             patch.object(mod, "requests") as rq:
+            rq.get.return_value = self._resp({"records": []})     # 冪等検索=無し
+            rq.post.return_value = self._resp({"id": "555"})
+            no = mod.file_mismatch_envelope("doc1", "kintone_no_match")
+        self.assertEqual(no, "555")
+        rq.post.assert_called_once()
+        record = rq.post.call_args.kwargs["json"]["record"]
+        self.assertEqual(record["発送ステータス"]["value"], "要確認")
+        self.assertEqual(record["チャネル"]["value"], "スキャン受領")
+        # トップキー "cloudsign_mismatch" ＋ documentID ＋ 冪等キー ＋ 失敗理由
+        chan = record["チャネル固有データ"]["value"]
+        self.assertIn("cloudsign_mismatch", chan)
+        self.assertIn("doc1", chan)
+        self.assertIn("kintone_no_match", chan)
+
+    def test_idempotent_reuses_existing_envelope(self):
+        with patch.dict("os.environ", self.APP30, clear=False), \
+             patch.object(mod, "requests") as rq:
+            rq.get.return_value = self._resp(
+                {"records": [{"$id": {"value": "777"}}]})          # 既存封筒あり
+            no = mod.file_mismatch_envelope("doc1", "kintone_no_match")
+        self.assertEqual(no, "777")
+        rq.post.assert_not_called()                                # 二重起票しない
+
+    def test_returns_none_when_app30_unset(self):
+        env_wo = {"APP_SHIPPING": "", "TOKEN_SHIPPING": ""}
+        with patch.dict("os.environ", env_wo, clear=False), \
+             patch.object(mod, "requests") as rq:
+            no = mod.file_mismatch_envelope("doc1", "kintone_no_match")
+        self.assertIsNone(no)                                      # 縮退へフォールバック
+        rq.get.assert_not_called()
+        rq.post.assert_not_called()
+
+    def test_returns_none_on_filing_error(self):
+        with patch.dict("os.environ", self.APP30, clear=False), \
+             patch.object(mod, "requests") as rq:
+            rq.get.return_value = self._resp({"records": []})
+            rq.post.side_effect = RuntimeError("kintone down")
+            no = mod.file_mismatch_envelope("doc1", "kintone_no_match")
+        self.assertIsNone(no)                                      # 起票失敗も縮退へ
+
+
+class TestFailurePathUsesEnvelope(unittest.TestCase):
+    """失敗経路の LINE 本文が封筒 record No のみを載せ、documentID/タイトルを載せない"""
+
+    def test_verification_failed_references_envelope_no(self):
+        with patch.object(mod, "fetch_document", side_effect=_http_error(404)), \
+             patch.object(mod, "update_kintone_status") as mock_update, \
+             patch.object(mod, "file_mismatch_envelope", return_value="555") as mock_file, \
+             patch.object(mod, "notify_business_line") as mock_biz:
+            code, body = mod.handle_webhook(SECRET, dict(COMPLETED_EVENT))
+        self.assertEqual(body.get("state"), "verification_failed")
+        mock_update.assert_not_called()
+        mock_file.assert_called_once()
+        self.assertEqual(mock_file.call_args.args[0], "doc1")      # documentID を封筒へ
+        msg = mock_biz.call_args.args[0]
+        self.assertIn("555", msg)                                  # 封筒 record No
+        self.assertNotIn("doc1", msg)                              # documentID は非表示
+        self.assertNotIn("委任契約書", msg)                         # タイトルは非表示
+
+    def test_kintone_update_failed_references_envelope_no(self):
+        with patch.object(mod, "fetch_document", return_value=dict(COMPLETED_DOC)), \
+             patch.object(mod, "update_kintone_status", return_value=None), \
+             patch.object(mod, "file_mismatch_envelope", return_value="556") as mock_file, \
+             patch.object(mod, "notify_business_line") as mock_biz:
+            code, body = mod.handle_webhook(SECRET, dict(COMPLETED_EVENT))
+        self.assertEqual(body.get("state"), "kintone_update_failed")
+        mock_file.assert_called_once_with("doc1", "kintone_no_match")
+        msg = mock_biz.call_args.args[0]
+        self.assertIn("556", msg)
+        self.assertNotIn("doc1", msg)
+
+    def test_falls_back_to_degraded_when_filing_fails(self):
+        """封筒起票が失敗(None)でも通知は必ず出す（縮退動作へフォールバック）"""
+        with patch.object(mod, "fetch_document", side_effect=_http_error(404)), \
+             patch.object(mod, "update_kintone_status"), \
+             patch.object(mod, "file_mismatch_envelope", return_value=None), \
+             patch.object(mod, "notify_business_line") as mock_biz:
+            code, body = mod.handle_webhook(SECRET, dict(COMPLETED_EVENT))
+        self.assertEqual(body.get("state"), "verification_failed")
+        mock_biz.assert_called_once()                              # 通知は必ず出る
+        msg = mock_biz.call_args.args[0]
+        self.assertIn("失敗分類", msg)
+        self.assertNotIn("doc1", msg)                              # 縮退でも documentID 抑止
+        self.assertNotIn("record No", msg)                        # 封筒 No は無い
+
+
 if __name__ == "__main__":
     unittest.main()
