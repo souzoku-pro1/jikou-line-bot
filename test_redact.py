@@ -70,12 +70,21 @@ class TestFailClosed(unittest.TestCase):
                          "（非表示）")
 
 
+# sink → 許可 audience（M04 行列に一致させる）
+_SINK_AUD = {
+    "log": "operator",
+    "http_response": "caller",
+    "line_business": "attorney",
+    "line_customer": "customer",
+    "exception_detail": "caller",
+}
+
+
 class TestPassthrough(unittest.TestCase):
     def test_record_id_and_count_passthrough_all_sinks(self):
-        for sink in redact.SINKS:
-            aud = "customer" if sink == "line_customer" else "operator"
-            self.assertEqual(emit("42", "record_id", sink, aud), "42")
-            self.assertEqual(emit(7, "count", sink, aud), "7")
+        for sink, aud in _SINK_AUD.items():
+            self.assertEqual(emit("42", "record_id", sink, aud), "42", sink)
+            self.assertEqual(emit(7, "count", sink, aud), "7", sink)
 
     def test_structured_record_id_still_suppressed(self):
         out = emit(["42", "43"], "record_id", "http_response", "caller")
@@ -134,6 +143,77 @@ class TestDocumentMetadata(unittest.TestCase):
                    "attorney")
         self.assertNotIn("田中", out)
         self.assertEqual(out, "（document_metadata・非表示）")
+
+
+class TestSecretKinds(unittest.TestCase):
+    """token/secret は全 sink で常時抑止（本人宛でも出さない）"""
+
+    def test_secret_suppressed_all_sinks(self):
+        for kind in ("token", "secret"):
+            for sink, aud in (("log", "operator"), ("http_response", "caller"),
+                              ("line_business", "attorney"),
+                              ("line_customer", "customer"),
+                              ("exception_detail", "caller")):
+                out = emit("Xw3pKm-supersecret", kind, sink, aud)
+                self.assertNotIn("Xw3pKm", out, f"{kind}/{sink}")
+                self.assertIn("非表示", out)
+
+
+class TestExternalRef(unittest.TestCase):
+    """external_ref（document ID/LINE user ID/追跡番号）は既定=完全抑止"""
+
+    def test_external_ref_suppressed_including_customer(self):
+        for sink, aud in (("log", "operator"), ("line_business", "attorney"),
+                          ("line_customer", "customer")):
+            out = emit("U1234567890abcdef", "external_ref", sink, aud)
+            self.assertNotIn("U1234567890abcdef", out, sink)
+            self.assertEqual(out, "（external_ref・非表示）")
+
+
+class TestValueValidation(unittest.TestCase):
+    """record_id=英数字等の値域・count=非負整数。外れる値は抑止側へ"""
+
+    def test_record_id_valid_passthrough(self):
+        self.assertEqual(emit("42", "record_id", "log", "operator"), "42")
+        self.assertEqual(emit(42, "record_id", "log", "operator"), "42")
+        self.assertEqual(emit("rec_A-9", "record_id", "log", "operator"), "rec_A-9")
+
+    def test_record_id_invalid_suppressed(self):
+        # 記号混じり・空白・PII 混入・負数・巨大長は record_id として無効→抑止
+        for bad in ("田中太郎", "42; DROP", "", "a" * 100, -1, True):
+            out = emit(bad, "record_id", "log", "operator")
+            self.assertEqual(out, "（record_id・非表示）", repr(bad))
+
+    def test_count_valid_passthrough(self):
+        self.assertEqual(emit(0, "count", "log", "operator"), "0")
+        self.assertEqual(emit("123", "count", "log", "operator"), "123")
+
+    def test_count_invalid_suppressed(self):
+        for bad in (-1, "abc", "3.5", True, "田中"):
+            out = emit(bad, "count", "log", "operator")
+            self.assertEqual(out, "（count・非表示）", repr(bad))
+
+
+class TestSinkAudienceMatrix(unittest.TestCase):
+    """M04: 許可ペア行列の外は完全抑止"""
+
+    def test_allowed_pairs_only(self):
+        allowed = {("log", "operator"), ("http_response", "caller"),
+                   ("line_business", "attorney"), ("line_customer", "customer"),
+                   ("exception_detail", "caller")}
+        for sink in redact.SINKS:
+            for aud in redact.AUDIENCES:
+                out = emit("42", "record_id", sink, aud)
+                if (sink, aud) in allowed:
+                    self.assertEqual(out, "42", f"{sink}/{aud}")
+                else:
+                    self.assertEqual(out, "（非表示）", f"{sink}/{aud} 行列外")
+
+    def test_pii_in_wrong_pair_suppressed(self):
+        # line_business × customer は行列外 → 抑止
+        out = emit("田中太郎", "name", "line_business", "customer")
+        self.assertNotIn("田中", out)
+        self.assertEqual(out, "（非表示）")
 
 
 class TestCustomerOwnInfo(unittest.TestCase):
