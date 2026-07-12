@@ -504,7 +504,10 @@ class TestCrisisAndUrgentNotices(unittest.TestCase):
                 )
                 self.assertIn("【緊急・要即時対応】", msg)
                 self.assertIn(kind, msg)
-                self.assertIn("明日差し押さえられる", msg)
+                # P1-102（RV-10 S1）: 顧客氏名・相談本文は redact される（record No で参照）
+                self.assertNotIn("テスト太郎", msg)
+                self.assertNotIn("明日差し押さえられる", msg)
+                self.assertIn("42", msg)
                 self.assertNotIn("【承認依頼】", msg)
 
     def test_normal_notification_format_unchanged(self):

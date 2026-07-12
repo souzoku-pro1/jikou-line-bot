@@ -18,6 +18,7 @@ import time
 import httpx
 
 from config import get_admin_line_user_id
+from hub.redact import emit
 
 logger = logging.getLogger("hub.notify")
 
@@ -27,20 +28,53 @@ _last_notify_at: dict[str, float] = {}
 
 _PUSH_URL = "https://api.line.me/v2/bot/message/push"
 
+_BUSINESS_TOKEN_ENV = "DISPATCHBOT_CHANNEL_ACCESS_TOKEN"
+
 
 def business_token_env() -> str:
-    """業務通知（管理者警報・承認通知・受領通知）の送信チャネル（2026-07-07 裁定）。
+    """業務通知（管理者警報・承認通知・受領通知・弁護士通知）の送信チャネル。
 
-    業務通知は業務指示Bot（DISPATCHBOT_CHANNEL_ACCESS_TOKEN）から送る。
-    未設定の環境では既定（顧客Bot）へフォールバック＋警告ログ
-    （警報の欠落防止を優先）。顧客向け送信はこの関数を使わない（現状のまま）。
+    **fail-closed（P1-102・RV-10 §4）**: 業務通知は業務指示Bot
+    （DISPATCHBOT_CHANNEL_ACCESS_TOKEN）**のみ**から送る。未設定でも顧客Bot へは
+    フォールバックしない（顧客チャネルに業務/顧客 PII を乗せない）。未設定時は
+    この env 名を返すだけで、実送信は push_line_message 側が token 空でスキップする
+    （＝送信ゼロ＋警告ログ）。欠落検知は daily_healthcheck の dead-man（heartbeat）が担う。
     """
-    if os.environ.get("DISPATCHBOT_CHANNEL_ACCESS_TOKEN", ""):
-        return "DISPATCHBOT_CHANNEL_ACCESS_TOKEN"
-    logger.warning(
-        "DISPATCHBOT_CHANNEL_ACCESS_TOKEN unset; "
-        "business notification falls back to LINE_CHANNEL_ACCESS_TOKEN")
-    return "LINE_CHANNEL_ACCESS_TOKEN"
+    return _BUSINESS_TOKEN_ENV
+
+
+def _business_recipients() -> frozenset[str]:
+    """S1/dead-man 用の狭い allowlist（弁護士・管理者のみ）。notify_business が使う。"""
+    out = set()
+    attorney = os.environ.get("ATTORNEY_LINE_USER_ID", "")
+    admin = get_admin_line_user_id()
+    if attorney:
+        out.add(attorney)
+    if admin:
+        out.add(admin)
+    return frozenset(out)
+
+
+def business_channel_allowlist() -> frozenset[str]:
+    """業務チャネル（DISPATCHBOT）で送信を許す全宛先（H02・push_line_message の関所）。
+
+    正当な直接 caller の宛先を用途つきで登録（それ以外への DISPATCHBOT 送信は拒否）:
+      - ATTORNEY_LINE_USER_ID    : 弁護士（S1 通知・承認依頼・sortation 照会の最終 fallback）
+      - 管理者（LINE_ADMIN_USER_ID / get_admin_line_user_id）: 死活監視・管理者警報
+      - LINE_USER_ID             : /ocr/fixed-asset の受領通知先（事務所 PC watcher 運用）
+      - SORTATION_ASK_TO         : 書類仕分け照会の宛先（sortation_ingest._ask_recipient）
+      - DISPATCHBOT_ALLOWED_USER_IDS : 指示Bot のホワイトリスト（仕分け照会の fallback 宛先）
+    """
+    out = set(_business_recipients())
+    for key in ("LINE_USER_ID", "SORTATION_ASK_TO"):
+        v = os.environ.get(key, "").strip()
+        if v:
+            out.add(v)
+    for u in os.environ.get("DISPATCHBOT_ALLOWED_USER_IDS", "").split(","):
+        u = u.strip()
+        if u:
+            out.add(u)
+    return frozenset(out)
 
 
 async def push_line_message(to: str, text: str,
@@ -50,10 +84,15 @@ async def push_line_message(to: str, text: str,
     token_env: 送信チャネルのアクセストークン env 名。既定は顧客Bot
     （LINE_CHANNEL_ACCESS_TOKEN）。業務指示Bot名義で送るときは
     DISPATCHBOT_CHANNEL_ACCESS_TOKEN を指定する（例: 仕分け照会通知）。
+    業務チャネルの送信成功時は dead-man 用 heartbeat を記録する（P1-102）。
     """
     line_token = os.environ.get(token_env, "")
     if not (to and line_token):
         logger.warning("LINE push skipped (no destination or token)")
+        return False
+    # H02: 業務チャネルへの送信は allowlist を強制（宛先の迂回を防ぐ）
+    if token_env == _BUSINESS_TOKEN_ENV and to not in business_channel_allowlist():
+        logger.warning("business channel push skipped (recipient not allowlisted)")
         return False
     try:
         async with httpx.AsyncClient() as client:
@@ -65,39 +104,65 @@ async def push_line_message(to: str, text: str,
                 },
                 json={"to": to, "messages": [{"type": "text", "text": text[:4900]}]},
             )
-        if not resp.is_success:
-            logger.error("LINE push failed: %s %s", resp.status_code, resp.text[:200])
-            return False
-        return True
     except Exception:
-        logger.exception("LINE push error")
+        # 固定分類のみ（例外本文・token を出さない・logger.exception 不使用・L01）
+        logger.error("LINE push error (request failed)")
         return False
 
+    if not resp.is_success:
+        # vendor 生レスポンスは emit(vendor_raw) で完全抑止（P1-102・台帳 :69 解消）
+        logger.error(
+            "LINE push failed status=%s body=%s",
+            emit(resp.status_code, "count", "log", "operator"),
+            emit(resp.text, "vendor_raw", "log", "operator"))
+        return False
 
-async def notify_admin_line(text: str, throttle_key: str = "") -> None:
+    # M01: heartbeat 記録は独立 best-effort（DB 失敗は warning のみ・HTTP 結果に影響させない）
+    if token_env == _BUSINESS_TOKEN_ENV:
+        try:
+            from hub.notify_heartbeat import record_success
+            await record_success("business")
+        except Exception:
+            logger.warning("business heartbeat record failed (non-fatal)")
+    return True
+
+
+async def notify_business(to: str, text: str) -> bool:
+    """業務チャネル（DISPATCHBOT）への送信（宛先 allowlist 検証つき・P1-102）。
+
+    宛先が allowlist（ATTORNEY_LINE_USER_ID / 管理者）外なら送信しない（fail-closed）。
+    本文は呼び出し側で emit 済みであること（PII を素で渡さない）。
+    """
+    if to not in _business_recipients():
+        logger.warning("business notify skipped (recipient not in allowlist)")
+        return False
+    return await push_line_message(to, text, token_env=business_token_env())
+
+
+async def notify_admin_line(text: str, throttle_key: str = "") -> bool:
     """管理者に LINE Push で通知する。失敗しても本処理には影響させない。
+    送信できたら True・スキップ/失敗/スロットルは False（P1-102 dead-man 検証用）。
 
-    claude_gateway から移設（挙動不変）:
-      - 管理者 ID / トークン未設定ならスキップ（警告ログのみ）
+    claude_gateway から移設（挙動は不変・戻り値のみ追加）:
+      - 管理者 ID 未設定ならスキップ（警告ログのみ）
       - throttle_key 指定時は同一キーの通知を _NOTIFY_MIN_INTERVAL_SEC 秒に1回へ抑制
       - 本文は 4900 文字で切り詰め
     """
     admin_id = get_admin_line_user_id()
-    line_token = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
-    if not (admin_id and line_token):
-        logger.warning("admin LINE notify skipped (no admin id or token): %s", text[:100])
-        return
+    if not admin_id:
+        logger.warning("admin LINE notify skipped (no admin id)")
+        return False
 
     if throttle_key:
         now = time.monotonic()
         last = _last_notify_at.get(throttle_key, 0.0)
         if now - last < _NOTIFY_MIN_INTERVAL_SEC:
             logger.info("admin LINE notify throttled key=%s", throttle_key)
-            return
+            return False
         _last_notify_at[throttle_key] = now
 
-    # 業務通知は指示Botチャネルから（2026-07-07 裁定・14呼び出し元は無変更）
-    await push_line_message(admin_id, text, token_env=business_token_env())
+    # 業務通知は指示Botチャネルから（fail-closed・P1-102）
+    return await push_line_message(admin_id, text, token_env=business_token_env())
 
 
 async def notify_attorney_approval(record: dict) -> None:

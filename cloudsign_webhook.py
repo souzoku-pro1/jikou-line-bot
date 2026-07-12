@@ -17,9 +17,12 @@
 import os
 import time
 import hmac
+import json
 import logging
 
 import requests
+
+from hub.redact import emit
 
 logger = logging.getLogger("cloudsign")
 
@@ -152,8 +155,9 @@ def verify_completed_document(document_id: str) -> tuple[dict | None, str]:
 # ============================================================
 # kintone 更新
 # ============================================================
-def update_kintone_status(document_id: str, new_status: str) -> bool:
-    """documentID で案件を探し、ステータスフィールドを更新する。"""
+def update_kintone_status(document_id: str, new_status: str):
+    """documentID で案件を探し、ステータスフィールドを更新する。
+    成功で kintone レコード No（str）・該当なし/未更新で None を返す（M06: 通知の書類特定用）。"""
     # 1. documentID で検索
     r = requests.get(
         f"{KINTONE_BASE}/k/v1/records.json",
@@ -167,8 +171,9 @@ def update_kintone_status(document_id: str, new_status: str) -> bool:
     r.raise_for_status()
     records = r.json().get("records", [])
     if not records:
-        logger.warning("kintoneに該当案件なし document_id=%s", document_id)
-        return False
+        logger.warning("kintoneに該当案件なし document_id=%s",
+                       emit(document_id, "external_ref", "log", "operator"))
+        return None
 
     record_id = records[0]["$id"]["value"]
 
@@ -187,8 +192,225 @@ def update_kintone_status(document_id: str, new_status: str) -> bool:
         timeout=10,
     )
     u.raise_for_status()
-    logger.info("kintone更新完了 record_id=%s status=%s", record_id, new_status)
+    logger.info("kintone更新完了 record_id=%s",
+                emit(record_id, "record_id", "log", "operator"))
+    return record_id
+
+
+# ============================================================
+# App 30（発送管理）— 要確認封筒（P1-102b/c・M06 App30封筒方式・司令塔裁定）
+#   照合失敗・kintone未更新の失敗経路で documentID を業務チャネルに載せずに
+#   人手確認のハンドルを復元する。人は App 30 の「要確認」封筒を kintone 画面で
+#   確認しクローズする運用（RESOLVERS ハンドラは作らない＝OUT_OF_SCOPE）。
+#   起票は person_merge._file_candidate と同型（単票 API・トップキー付き
+#   チャネル固有データ）。cloudsign は sync 経路なので requests で起票する。
+# ============================================================
+FIELD_CHANNEL_DATA = "チャネル固有データ"
+
+
+def _mismatch_key(document_id: str) -> str:
+    """要確認封筒の冪等キー。"""
+    return f"cloudsign_mismatch:{document_id}"
+
+
+def _escape_kintone_query_value(value: str) -> str:
+    """kintone クエリ文字列リテラル用のエスケープ（M07: documentID の特殊文字）。
+    二重引用符・バックスラッシュを無害化し、like 構文の破壊・誤マッチを防ぐ。"""
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _find_mismatch_envelopes(app_id: str, token: str,
+                             key: str) -> list[tuple[int, str, str]]:
+    """冪等キー key の要確認封筒 (record No int, 発送ステータス, $revision) を No 昇順で返す（M07）。
+
+    like で絞り込んだ後、各レコードのチャネル固有データ JSON をコード側でパースし、
+    トップキー cloudsign_mismatch が存在し「冪等キー」が **完全一致** するものだけ採用する
+    （部分文字列 like の誤マッチ＝別 documentID の封筒を確実に排除する）。発送ステータスは
+    収束（H03）で「要確認」の敗者だけを閉じるため、$revision は却下 PUT の楽観ロック
+    （H03 TOCTOU: 検索から PUT までの間の人更新を弾く）のために持ち回る。
+    """
+    esc = _escape_kintone_query_value(key)
+    r = requests.get(
+        f"{KINTONE_BASE}/k/v1/records.json",
+        headers={"X-Cybozu-API-Token": token},
+        params={"app": app_id,
+                "query": f'{FIELD_CHANNEL_DATA} like "{esc}"',
+                "fields[0]": "$id",
+                "fields[1]": FIELD_CHANNEL_DATA,
+                "fields[2]": "発送ステータス",
+                "fields[3]": "$revision"},
+        timeout=10,
+    )
+    r.raise_for_status()
+    out: list[tuple[int, str, str]] = []
+    for rec in r.json().get("records", []):
+        raw = rec.get(FIELD_CHANNEL_DATA, {}).get("value", "")
+        try:
+            data = json.loads(raw)
+        except (ValueError, TypeError):
+            continue
+        mm = data.get("cloudsign_mismatch") if isinstance(data, dict) else None
+        if isinstance(mm, dict) and mm.get("冪等キー") == key:
+            rid = rec.get("$id", {}).get("value")
+            status = rec.get("発送ステータス", {}).get("value", "")
+            revision = rec.get("$revision", {}).get("value", "")
+            if rid is not None:
+                try:
+                    out.append((int(rid), status, revision))
+                except (ValueError, TypeError):
+                    continue
+    return sorted(out, key=lambda t: t[0])
+
+
+def _close_envelope(app_id: str, token: str, record_id: int,
+                    revision: str) -> bool:
+    """要確認封筒を revision 楽観ロック付きで「却下」クローズする（H03 TOCTOU）。
+
+    revision は **必須**。取得できていない（None/""）ときは楽観ロックが張れないため
+    PUT を送らず False を返す（revision 無指定の無条件 PUT フォールバックはしない＝
+    更新しない側へ縮退し、人確認に委ねる）。
+    検索時に取得した revision を PUT に指定し、検索〜PUT の間に人が更新していれば
+    kintone は 409（GAIA_CO02）を返す。その場合も **人更新優先** として却下せず
+    False を返す（再試行しない）。True=却下成功。409 以外の失敗は例外を送出。
+    """
+    if revision in (None, ""):
+        return False              # revision 欠落＝楽観ロック不可 → 却下しない
+    u = requests.put(
+        f"{KINTONE_BASE}/k/v1/record.json",
+        headers={"X-Cybozu-API-Token": token, "Content-Type": "application/json"},
+        json={"app": app_id, "id": str(record_id), "revision": str(revision),
+              "record": {"発送ステータス": {"value": "却下"}}},
+        timeout=10,
+    )
+    if u.status_code == 409:      # revision 競合＝人が先に更新（楽観ロック衝突）
+        return False
+    u.raise_for_status()
     return True
+
+
+def _converge_envelopes(app_id: str, token: str,
+                        matches: list[tuple[int, str, str]]) -> str:
+    """完全一致封筒群を最小 No（winner）1 件へ収束させ、winner の No（str）を返す（H03）。
+
+    遵守事項（R-P1-102 3〜5巡目レビューの安全条件）:
+      - winner（最小 No）は絶対に閉じない・更新しない。
+      - 敗者クローズ対象は「要確認」状態のもののみ（検索時 status で保護）。
+      - 却下 PUT は検索時 revision の楽観ロック付き（revision 必須）。revision が
+        取得できない敗者は却下せず人確認へ委ねる（無条件 PUT はしない）。
+      - 検索〜PUT の間に人が更新した敗者は revision 競合で却下せず人更新優先（再試行なし）。
+      - クローズの一部が失敗しても winner No を返し通知を維持する（warning のみ）。
+    """
+    matches = sorted(matches, key=lambda t: t[0])
+    winner = matches[0][0]
+    close_failed = False
+    for rid, status, revision in matches:
+        if rid == winner:
+            continue                 # winner は絶対に閉じない
+        if status != "要確認":
+            continue                 # 人処理済み（完了・却下・実行済み等）は触らない
+        if revision in (None, ""):
+            # revision 欠落＝楽観ロック不可 → 却下せず人確認に委ねる
+            logger.warning("要確認封筒: revision欠落・却下スキップ・人確認へ")
+            continue
+        try:
+            if not _close_envelope(app_id, token, rid, revision):
+                # 検索後に人が更新（revision 競合）→ 人更新優先で却下しない
+                logger.warning("要確認封筒の却下を人更新優先でスキップ（revision競合）")
+        except Exception:
+            close_failed = True
+    if close_failed:
+        logger.warning("要確認封筒の収束クローズに一部失敗（winner No で通知継続）")
+    return str(winner)
+
+
+def file_mismatch_envelope(document_id: str, failure_reason: str):
+    """失敗経路で App 30 へ「要確認」封筒を起票し、通知に使う record No（str）を返す。
+
+    並行時も**後続再送を含め最終的に winner（最小 No）1 件へ収束する**（compensation・H03）:
+    冪等キー完全一致（M07）で封筒を検索し、**複数一致した全ての時点**（既存検索でも
+    create 後の再検索でも）で最小 No を winner とし、winner 以外の「要確認」封筒を却下で
+    クローズする。相互不可視な race（A/B が互いの封筒を見ずに create）でも、次の再送の
+    既存検索で両方が見えた時点で winner 1 件へ収束する。完全一意（重複を作らせない）は
+    RCF-M07（App 30 専用フィールド＋重複禁止設定・CU 作業）で DEFER。
+
+    **人処理済みの保護は二段で保証する**: (1) 検索時の発送ステータスで「要確認」の敗者
+    だけを対象にし、(2) 却下 PUT に検索時 revision を指定する楽観ロックで、検索〜PUT の
+    間に人が更新した敗者（TOCTOU）は revision 競合として却下せず人更新を優先する。
+    楽観ロックは必須で、revision が取得できない場合は却下せず人確認に委ねる（欠落時は
+    更新しない側へ縮退する）。
+
+    App 30 未設定・起票/検索失敗は None を返す（呼び出し側で縮退通知へフォールバック）。
+    """
+    app_id = os.environ.get("APP_SHIPPING", "")
+    token = os.environ.get("TOKEN_SHIPPING", "")
+    if not (app_id and token):
+        logger.warning("App30(発送管理)未設定のため要確認封筒を起票できず縮退します")
+        return None
+    key = _mismatch_key(document_id)
+    try:
+        # M07/H03: 冪等キー完全一致で既存封筒を検索。複数あれば（後続再送の収束点）
+        # winner へ収束、1 件ならそれを再利用（CloudSign 再送で封筒が増えない）。
+        existing = _find_mismatch_envelopes(app_id, token, key)
+        if existing:
+            rid = (_converge_envelopes(app_id, token, existing)
+                   if len(existing) > 1 else str(existing[0][0]))
+            logger.info("要確認封筒は起票済み No=%s doc=%s",
+                        emit(rid, "record_id", "log", "operator"),
+                        emit(document_id, "external_ref", "log", "operator"))
+            return rid
+
+        detail = {
+            "冪等キー": key,
+            "documentID": document_id,
+            "失敗理由": failure_reason,
+        }
+        record = {
+            "発送ステータス": {"value": "要確認"},
+            "方向": {"value": "受領"},
+            "チャネル": {"value": "スキャン受領"},
+            "ユニット種別": {"value": "時効援用"},
+            "件名": {"value": "CloudSign照合失敗・要確認（自動起票）"},
+            "エラー詳細": {"value": json.dumps(detail, ensure_ascii=False)[:500]},
+            FIELD_CHANNEL_DATA: {"value": json.dumps(
+                {"cloudsign_mismatch": detail}, ensure_ascii=False)},
+            "実行済み": {"value": "no"},
+        }
+        # 単票 API（record.json）で起票（一括 API は Webhook 非送信・app30_filer 準拠）
+        c = requests.post(
+            f"{KINTONE_BASE}/k/v1/record.json",
+            headers={"X-Cybozu-API-Token": token,
+                     "Content-Type": "application/json"},
+            json={"app": app_id, "record": record},
+            timeout=10,
+        )
+        c.raise_for_status()
+        created = c.json()
+        my_id = int(created["id"])
+        my_rev = created.get("revision", "")   # 自レコードの却下クローズ用 revision
+
+        # H03（compensation）: create 後に再検索して見えた同キー封筒で収束する。
+        # 読み後れで自レコードが検索に出ない場合に備え、自 No（要確認・自 revision）を含める。
+        # 再検索が失敗した場合のみ自 No で通知する（個々のクローズ失敗は _converge_envelopes
+        # 内で warning 記録し winner No を維持する＝通知は必ず出る）。
+        winner = str(my_id)
+        try:
+            matches = _find_mismatch_envelopes(app_id, token, key)
+            if my_id not in [m[0] for m in matches]:
+                matches.append((my_id, "要確認", my_rev))
+            if len(matches) > 1:
+                winner = _converge_envelopes(app_id, token, matches)
+        except Exception:
+            logger.warning("要確認封筒の収束処理に失敗、自Noで通知します")
+            winner = str(my_id)
+
+        logger.info("要確認封筒を起票 No=%s doc=%s",
+                    emit(winner, "record_id", "log", "operator"),
+                    emit(document_id, "external_ref", "log", "operator"))
+        return winner
+    except Exception:
+        # 起票・検索の失敗は致命ではない（通知は必ず出す・縮退へフォールバック）
+        logger.error("要確認封筒の起票に失敗 (request failed)")  # 固定分類・L01
+        return None
 
 
 # ============================================================
@@ -211,17 +433,20 @@ def notify_line(message: str) -> None:
             timeout=10,
         )
     except Exception:
-        logger.exception("LINE通知失敗")
+        logger.error("LINE通知失敗 (request failed)")  # 固定分類・L01
 
 
 def notify_business_line(message: str) -> None:
-    """業務通知（照合失敗の要人手確認）を業務指示Botチャネルで管理者へ送る。
+    """業務通知（締結完了・照合失敗の要人手確認）を業務指示Botチャネルで送る。
 
-    DISPATCHBOT_CHANNEL_ACCESS_TOKEN 未設定なら送信しない（警告ログのみ）。
-    顧客Bot（LINE_CHANNEL_ACCESS_TOKEN）へのフォールバックは行わない
-    （P0B-002 指示: 照合失敗の警報を顧客Botチャネルに乗せない。
-    hub/notify.business_token_env のフォールバックはここでは使わない）。
+    M03: 共通アダプタ相当の防御を sync 経路にも適用する:
+      - 宛先 allowlist（hub.notify.business_channel_allowlist・迂回防止）
+      - 非2xx の確認（従来は status を見ていなかった）＋vendor 生値の emit 抑止
+      - 送信成功で dead-man heartbeat を記録（sync 版・best-effort）
+    DISPATCHBOT 未設定/宛先未許可なら送信しない（顧客Bot へのフォールバックはしない）。
     """
+    from hub.notify import business_channel_allowlist
+
     token = os.environ.get("DISPATCHBOT_CHANNEL_ACCESS_TOKEN", "")
     to = (os.environ.get("LINE_ADMIN_USER_ID", "")
           or os.environ.get("ATTORNEY_LINE_USER_ID", ""))
@@ -229,8 +454,11 @@ def notify_business_line(message: str) -> None:
         logger.warning(
             "business LINE notify skipped (DISPATCHBOT token or admin id unset)")
         return
+    if to not in business_channel_allowlist():
+        logger.warning("business LINE notify skipped (recipient not allowlisted)")
+        return
     try:
-        requests.post(
+        resp = requests.post(
             "https://api.line.me/v2/bot/message/push",
             headers={
                 "Authorization": f"Bearer {token}",
@@ -240,7 +468,18 @@ def notify_business_line(message: str) -> None:
             timeout=10,
         )
     except Exception:
-        logger.exception("business LINE通知失敗")
+        logger.error("business LINE通知失敗 (request failed)")  # 固定分類・L01
+        return
+    if not resp.ok:
+        logger.error("business LINE通知失敗 status=%s body=%s",
+                     emit(resp.status_code, "count", "log", "operator"),
+                     emit(resp.text, "vendor_raw", "log", "operator"))
+        return
+    try:
+        from hub.notify_heartbeat import record_success_sync
+        record_success_sync("business")
+    except Exception:
+        logger.warning("business heartbeat record failed (non-fatal)")
 
 
 # ============================================================
@@ -265,12 +504,24 @@ def handle_webhook(secret: str, payload: dict) -> tuple[int, dict]:
             # （本文・PII・token・ベンダー生レスポンスは出さない）
             logger.warning("CloudSign照合失敗のため受任へ遷移せず doc=%s reason=%s",
                            document_id, failure)
-            notify_business_line(
-                "【CloudSign照合失敗・要人手確認】\n"
-                f"documentID: {document_id}\n"
-                f"失敗分類: {failure}\n"
-                "受任への自動遷移は行っていません。"
-                "CloudSign管理画面で締結状況を確認してください。")
+            # P1-102b（M06 App30封筒方式・司令塔裁定）: documentID は業務チャネルに
+            # 載せず、App 30 へ「要確認」封筒を起票して record No でハンドルを復元する。
+            # 起票失敗時は通知を必ず出す縮退動作へフォールバック（内容は抑止・fail-closed）。
+            env_no = file_mismatch_envelope(document_id, failure)
+            if env_no:
+                notify_business_line(
+                    "【CloudSign照合失敗・要確認】\n"
+                    f"要確認封筒 record No: {env_no}\n"
+                    f"失敗分類: {failure}\n"
+                    "受任への自動遷移は行っていません。"
+                    "App 30（発送管理）の当該封筒を確認してください。")
+            else:
+                notify_business_line(
+                    "【CloudSign照合失敗・要人手確認】\n"
+                    f"参照ID: {emit(document_id, 'external_ref', 'line_business', 'attorney')}\n"
+                    f"失敗分類: {failure}\n"
+                    "受任への自動遷移は行っていません。"
+                    "CloudSign管理画面で締結状況を確認してください。")
             # 再送方針: CloudSign が非2xx応答時に再送するか・何回で打ち切るか・
             # webhook を自動無効化するかは、リポジトリ内資料からは確定できない
             # （BLOCKED_NEEDS_HUMAN）。不用意に非2xxを返すと再送ループや配信停止を
@@ -279,19 +530,40 @@ def handle_webhook(secret: str, payload: dict) -> tuple[int, dict]:
             # 上記ログで判別できる（イベントの永続 journal 化は Phase 1）。
             return 200, {"ok": True, "state": "verification_failed"}
 
-        title = doc.get("title", "")
-        if not update_kintone_status(document_id, "受任"):
+        record_no = update_kintone_status(document_id, "受任")
+        if not record_no:
             # RCF-M04: 照合は成功したが kintone に一致案件がない（未更新）。
             # 受任は成立していないので「締結完了」通知は出さず、要人手確認を
-            # 業務チャネルで警報する（顧客チャネルへは出さない）
-            logger.warning("CloudSign照合成功だがkintone未更新 doc=%s", document_id)
-            notify_business_line(
-                "【CloudSign照合成功・kintone未更新・要人手確認】\n"
-                f"documentID: {document_id}\n"
-                "documentID に一致する案件レコードが見つからず、受任へ更新できて"
-                "いません。kintone の cloudsign_document_id を確認してください。")
+            # 業務チャネルで警報する（顧客チャネルへは出さない）。
+            # M06: この経路は kintone レコード No が引けない＝documentID を抑止すると
+            # 相関手段が無くなる（司令塔裁定待ち・COMPLETION_REPORT に BLOCKED 記載）。
+            # P1-102b（M06 App30封筒方式・司令塔裁定）: record No が引けない失敗経路も
+            # documentID を業務チャネルに載せず、App 30 の「要確認」封筒でハンドルを復元。
+            # 起票失敗時は通知を必ず出す縮退動作へフォールバック（内容は抑止・fail-closed）。
+            logger.warning("CloudSign照合成功だがkintone未更新 doc=%s",
+                           emit(document_id, "external_ref", "log", "operator"))
+            env_no = file_mismatch_envelope(document_id, "kintone_no_match")
+            if env_no:
+                notify_business_line(
+                    "【CloudSign締結・kintone未更新・要確認】\n"
+                    f"要確認封筒 record No: {env_no}\n"
+                    "失敗分類: kintone_no_match\n"
+                    "documentID に一致する案件レコードが見つかりませんでした。"
+                    "App 30（発送管理）の当該封筒を確認してください。")
+            else:
+                notify_business_line(
+                    "【CloudSign照合成功・kintone未更新・要人手確認】\n"
+                    f"参照ID: {emit(document_id, 'external_ref', 'line_business', 'attorney')}\n"
+                    "documentID に一致する案件レコードが見つからず、受任へ更新できて"
+                    "いません。CloudSign の直近の締結完了と kintone の "
+                    "cloudsign_document_id を突合してください。")
             return 200, {"ok": True, "state": "kintone_update_failed"}
-        notify_line(f"【締結完了】{title}\ndocumentID: {document_id}")
+        # P1-102/102a（RV-10 S1・M06）: 業務チャネルへ。documentID は external_ref
+        # で抑止し、書類特定は kintone レコード No（内部参照）で行う。
+        notify_business_line(
+            f"【締結完了】案件レコードNo: {record_no}\n"
+            f"参照ID: {emit(document_id, 'external_ref', 'line_business', 'attorney')}\n"
+            "kintone の該当案件（受任へ更新済）を確認してください。")
         return 200, {"ok": True, "state": "processed"}
 
     # 締結完了以外のイベント（却下・取消等）は従来どおり何もしない

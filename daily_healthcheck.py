@@ -13,6 +13,8 @@
      選択肢と同期しているか検証する（docs/architecture/02 §4.2・T2-1 で追加）
   E. inbound_event journal の滞留（processing/failed の24時間超残留）を検知する
      （P1-005d で追加・journal 未開通/DB未設定時は静かにスキップ）
+  F. 業務通知チャネル（DISPATCHBOT）の dead-man。heartbeat の鮮度を検証し、
+     長時間無音/未設定を検知する（P1-102 で追加・DB/heartbeat未適用時はスキップ）
 
 異常時のみ LINE Push で管理者に通知する。正常時はログのみ。
 
@@ -232,6 +234,45 @@ async def check_journal_backlog() -> list[str]:
 
 
 # ══════════════════════════════════════════════════════════════
+# 監視項目F: 業務通知チャネルの dead-man（P1-102・RV-10 §4.2 最小版・統合形）
+# ══════════════════════════════════════════════════════════════
+
+async def check_business_notify_liveness() -> list[str]:
+    """業務通知（DISPATCHBOT）チャネルの死活を heartbeat の鮮度で検証する。
+
+    毎朝の健診がこの鮮度を見ることで、「業務通知が長時間無音＝経路が死んでいる
+    可能性」を検知する（送信自体を synthetic 検証とする統合形・新規メッセージ追加なし）。
+    静かにスキップ: DATABASE_URL 未設定 / heartbeat テーブル未適用（初回記録前）。
+    """
+    # M04: token 未設定は DATABASE_URL より先に検知（fail-closed で全業務通知が無音）
+    if not os.environ.get("DISPATCHBOT_CHANNEL_ACCESS_TOKEN"):
+        return ["業務通知チャネル(DISPATCHBOT_CHANNEL_ACCESS_TOKEN)未設定: "
+                "業務通知が送信されません（要env投入）"]
+
+    from hub.notify_heartbeat import get_heartbeat_status
+    status, last = await get_heartbeat_status("business")
+    if status in ("db_unset", "table_missing"):
+        # H01: DB 未設定 / migration 未適用は許容（静かにスキップ）
+        logger.info("business notify heartbeat check skipped (db未設定 or table未適用)")
+        return []
+    if status == "empty":
+        # H01: テーブルはあるが成功記録が1件も無い＝異常として返す
+        return ["業務通知の成功記録が1件もありません（dead-man）: "
+                "DISPATCHBOTチャネルの死活を確認してください"]
+    if last.tzinfo is None:
+        last = last.replace(tzinfo=timezone.utc)
+    try:
+        hours = float(os.environ.get("BUSINESS_NOTIFY_STALE_HOURS", "25") or "25")
+    except ValueError:
+        hours = 25.0
+    age = datetime.now(timezone.utc) - last
+    if age > timedelta(hours=hours):
+        return [f"業務通知経路が約{int(age.total_seconds() // 3600)}時間無音"
+                "（dead-man）: DISPATCHBOTチャネルの死活を確認してください"]
+    return []
+
+
+# ══════════════════════════════════════════════════════════════
 # 実行本体
 # ══════════════════════════════════════════════════════════════
 
@@ -262,22 +303,51 @@ async def run_healthcheck() -> list[str]:
     except Exception as e:
         # DB接続情報が例外本文に含まれ得るため分類のみ（RCF-M05流儀）
         problems.append(f"journal滞留監視の実行自体が失敗: {type(e).__name__}")
+    try:
+        problems += await check_business_notify_liveness()  # 監視項目F（P1-102）
+    except Exception as e:
+        problems.append(f"業務通知dead-man監視の実行自体が失敗: {type(e).__name__}")
 
     if problems:
         logger.error("healthcheck NG (%d problems): %s", len(problems), problems)
         body = "\n".join(f"・{p}" for p in problems)
-        await notify_admin_line(
+        sent_ok = await notify_admin_line(
             "【日次死活監視: 異常検知】\n"
             f"時刻: {now}\n"
             f"{body}\n"
             "対応手順は README「日次死活監視」を参照してください。",
             throttle_key="",  # 日次実行なのでスロットルしない
         )
+        # dead-man（統合形）: 業務通知の送信自体が失敗＝経路が死んでいる。
+        # 例外相当の警告ログ＋可能な範囲の代替警報（顧客Botは絶対に使わない）。
+        if not sent_ok:
+            logger.error(
+                "業務通知チャネルへの死活通知送信に失敗（dead-man発火）。"
+                "DISPATCHBOTチャネルの死活を確認すること。")
+            await _deadman_alt_alert()
     else:
         logger.info("healthcheck OK (%s) models=%s/%s", now, PRIMARY_MODEL, FALLBACK_MODEL)
         print(f"[HEALTHCHECK] OK {now} models={PRIMARY_MODEL}/{FALLBACK_MODEL}")
 
     return problems
+
+
+async def _deadman_alt_alert() -> None:
+    """業務通知が送れないときの代替警報（best-effort・顧客Botは使わない）。
+    宛先は ATTORNEY_LINE_USER_ID 固定・allowlist 検証は notify_business が担う。
+    同じ DISPATCHBOT 経路なので届かない可能性はあるが、一次シグナルは上の
+    exception ログ（Railway 監視で拾う）。外部主体の本格 dead-man は Phase 1 段8。"""
+    attorney = os.environ.get("ATTORNEY_LINE_USER_ID", "")
+    if not attorney:
+        return
+    try:
+        from hub.notify import notify_business
+        await notify_business(
+            attorney,
+            "【要確認】業務通知チャネルの死活通知に失敗しました。"
+            "Railwayログと DISPATCHBOT チャネルを確認してください。")
+    except Exception:
+        logger.error("dead-man 代替警報の送信にも失敗 (request failed)")  # 固定分類・L01
 
 
 # ══════════════════════════════════════════════════════════════

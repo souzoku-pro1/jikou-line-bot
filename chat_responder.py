@@ -30,6 +30,7 @@ from claude_gateway import (
     create_message_with_fallback,
 )
 from config import HEARING_STATUSES, POST_ENGAGEMENT_STATUSES
+from hub.redact import emit
 
 logger = logging.getLogger("chat_responder")
 
@@ -948,24 +949,31 @@ def build_attorney_notification(
     urgent_kind: str = "",
     customer_message: str = "",
 ) -> str:
-    """弁護士向け通知文を組み立てる。
+    """弁護士向け（業務チャネル）通知文を組み立てる。
 
     urgent_kind が指定された場合（希死念慮・差押え切迫）は
     【緊急・要即時対応】フォーマット、それ以外は従来の【承認依頼】。
+
+    P1-102（RV-10 S1）: 顧客氏名・相談本文は emit 経由で redact（既定=完全抑止）。
+    弁護士は本文中の record No で kintone 承認キューを開いて実体を確認する
+    （PII は LINE に載せず record No で参照）。urgent_kind / category は
+    統制値なのでそのまま載せる。
     """
     rid = approval_record_id or "（未取得）"
+    safe_name = emit(customer_name, "name", "line_business", "attorney")
+    safe_msg = emit(customer_message, "freetext", "line_business", "attorney")
     if urgent_kind:
         return (
             f"【緊急・要即時対応】\n"
             f"種別: {urgent_kind}\n"
-            f"顧客: {customer_name or user_id}\n"
-            f"顧客メッセージ: {customer_message[:200]}\n"
+            f"顧客: {safe_name}\n"
+            f"顧客メッセージ: {safe_msg}\n"
             f"承認キューレコードNo: {rid}\n"
-            f"至急、内容を確認して直接ご連絡ください。"
+            f"至急、kintone 承認キュー No.{rid} を開いて内容を確認しご連絡ください。"
         )
     return (
         f"【承認依頼】\n"
-        f"顧客: {customer_name or user_id}\n"
+        f"顧客: {safe_name}\n"
         f"カテゴリ: {category}\n"
         f"承認キューレコードNo: {rid}\n"
         f"kintone承認キューを確認し、ステータスを「承認済」に変更してください。"
@@ -993,7 +1001,9 @@ async def _notify_attorney(
         user_id, customer_name, approval_record_id, category,
         urgent_kind=urgent_kind, customer_message=customer_message,
     )
-    await send_line_push(ATTORNEY_LINE_USER_ID, msg)
+    # P1-102（RV-10 S1）: 顧客Bot ではなく業務チャネル（DISPATCHBOT）へ・宛先 allowlist 検証
+    from hub.notify import notify_business
+    await notify_business(ATTORNEY_LINE_USER_ID, msg)
 
 
 # ── Claude 呼び出し ────────────────────────────────────────────────────────────

@@ -6,7 +6,7 @@ claude_gateway からの re-export 互換。
 
 import json
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from hub import notify
 
@@ -156,9 +156,14 @@ class TestPushLineMessage(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(kw["headers"]["Authorization"], "Bearer line_tok")
 
     async def test_token_env_selects_channel(self):
-        """token_env 指定で送信チャネル（Authorization ヘッダ）が切り替わる"""
-        env = {"DISPATCHBOT_CHANNEL_ACCESS_TOKEN": "bot_tok"}
+        """token_env 指定で送信チャネル（Authorization ヘッダ）が切り替わる。
+        H02: 業務チャネル送信は宛先 allowlist を強制するため、宛先を登録済み
+        （DISPATCHBOT_ALLOWED_USER_IDS）にして channel 選択のみを検証する。"""
+        env = {"DISPATCHBOT_CHANNEL_ACCESS_TOKEN": "bot_tok",
+               "DISPATCHBOT_ALLOWED_USER_IDS": "U1"}
         with patch.dict("os.environ", env, clear=False), \
+                patch("hub.notify_heartbeat.record_success",
+                      new_callable=AsyncMock), \
                 use_fake([FakeResponse(200)]):
             ok = await notify.push_line_message(
                 "U1", "hello", token_env="DISPATCHBOT_CHANNEL_ACCESS_TOKEN")
@@ -178,8 +183,9 @@ class TestPushLineMessage(unittest.IsolatedAsyncioTestCase):
 
 
 class TestBusinessChannel(unittest.IsolatedAsyncioTestCase):
-    """業務通知の送信チャネル（2026-07-07 裁定）: 指示Botから送る・
-    DISPATCHBOT 未設定は既定へフォールバック＋警告ログ（警報の欠落防止）"""
+    """業務通知の送信チャネル: 指示Botから送る。
+    **P1-102（RV-10 §4・H04「イ」）で fail-closed 化**: DISPATCHBOT 未設定でも
+    顧客Bot へフォールバックしない（未設定時は送信ゼロ）。欠落検知は dead-man が担う。"""
 
     def setUp(self):
         self._env = patch.dict("os.environ", _ENV, clear=False)
@@ -203,25 +209,25 @@ class TestBusinessChannel(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(kw["headers"]["Authorization"], "Bearer bot_tok",
                          "承認依頼は指示Botチャネル（ヘッダのピン留め）")
 
-    async def test_fallback_to_customer_bot_with_warning_when_unset(self):
+    async def test_no_fallback_when_dispatchbot_unset(self):
+        """P1-102 fail-closed: DISPATCHBOT 未設定なら送信ゼロ（顧客Botへ落とさない）"""
         with patch.dict("os.environ",
                         {"DISPATCHBOT_CHANNEL_ACCESS_TOKEN": ""}, clear=False):
-            with self.assertLogs("hub.notify", level="WARNING") as logs:
+            with self.assertLogs("hub.notify", level="WARNING"):
                 with use_fake([FakeResponse(200)]):
-                    await notify.notify_admin_line("警報")
-        _, kw = FakeClient.calls[0]
-        self.assertEqual(kw["headers"]["Authorization"], "Bearer line_tok",
-                         "未設定時は既定へフォールバック（警報の欠落防止）")
-        self.assertTrue(any("falls back" in m for m in logs.output))
+                    sent = await notify.notify_admin_line("警報")
+        self.assertFalse(sent)
+        self.assertEqual(FakeClient.calls, [],
+                         "未設定時は LINE 送信を行わない（顧客Botへ乗せない）")
 
     def test_business_token_env_values(self):
+        """P1-102: 常に DISPATCHBOT を返す（未設定でも顧客Bot へフォールバックしない）"""
         self.assertEqual(notify.business_token_env(),
                          "DISPATCHBOT_CHANNEL_ACCESS_TOKEN")
         with patch.dict("os.environ",
                         {"DISPATCHBOT_CHANNEL_ACCESS_TOKEN": ""}, clear=False):
-            with self.assertLogs("hub.notify", level="WARNING"):
-                self.assertEqual(notify.business_token_env(),
-                                 "LINE_CHANNEL_ACCESS_TOKEN")
+            self.assertEqual(notify.business_token_env(),
+                             "DISPATCHBOT_CHANNEL_ACCESS_TOKEN")
 
 
 class TestReExport(unittest.TestCase):
