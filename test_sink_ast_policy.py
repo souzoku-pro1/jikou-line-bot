@@ -532,12 +532,48 @@ class TestScannerDetection(unittest.TestCase):
 # 許可リスト（台帳）検査
 # ══════════════════════════════════════════════════════════════
 
+def _file_rule(entry: str) -> str:
+    """entry 'file:line:rule...' から (file, rule) 結合キー 'file:rule...' を得る。"""
+    parts = entry.split(":")
+    return parts[0] + ":" + ":".join(parts[2:])
+
+
 class TestSinkAllowlist(unittest.TestCase):
     def setUp(self):
         data = json.loads(ALLOWLIST_PATH.read_text(encoding="utf-8"))
         self.baseline = int(data["baseline_count"])
         self.allow = set(data["entries"])
+        self.manifest_reasons = data.get("manifest", {})
+        self.manifest = set(self.manifest_reasons.keys())
         self.current, self.errors = scan_repo()
+
+    def test_manifest_reasons_are_non_empty(self):
+        """L01: manifest の全キーは非空文字列の理由を持たねばならない
+        （新規 sink debt は必ず理由付きで登録させる）。"""
+        blank = sorted(k for k, v in self.manifest_reasons.items()
+                       if not (isinstance(v, str) and v.strip()))
+        self.assertEqual(blank, [],
+                         "理由が空の manifest キー（理由を記載すること）:\n"
+                         + "\n".join(blank))
+
+    def test_every_entry_is_manifested(self):
+        """RP1107B-M01: 台帳の各エントリの (file,rule) は変換 manifest に登録されて
+        いなければならない。manifest なしの新規 (file,rule) 追加は FAIL（silent な
+        新規 sink debt の混入を防ぐ）。"""
+        unmanifested = sorted({_file_rule(e) for e in self.allow}
+                              - self.manifest)
+        self.assertEqual(unmanifested, [],
+                         "manifest 未登録の (file,rule) が台帳にある。理由を添えて "
+                         "redaction_sink_allowlist.json の manifest に登録すること:\n"
+                         + "\n".join(unmanifested))
+
+    def test_manifest_has_no_stale_keys(self):
+        """manifest にあるが台帳に対応エントリが無いキーは削除漏れとして FAIL。"""
+        live = {_file_rule(e) for e in self.allow}
+        stale = sorted(self.manifest - live)
+        self.assertEqual(stale, [],
+                         "台帳に対応の無い manifest キー（削除漏れ）:\n"
+                         + "\n".join(stale))
 
     def test_no_parse_errors(self):
         self.assertEqual(self.errors, [],

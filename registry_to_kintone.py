@@ -306,7 +306,9 @@ def main():
         sys.exit(1)
 
 
+from hub.logging_setup import configure_app_logging  # PR-4b: CLI 起動時の logging 配線
+
+
 if __name__ == "__main__":
-    from hub.logging_setup import configure_app_logging
-    configure_app_logging()   # CLI 起動時も INFO を stdout へ（PR-4b）
+    configure_app_logging()   # __main__ の最初に配線（PR-5: 順序固定）
     main()
