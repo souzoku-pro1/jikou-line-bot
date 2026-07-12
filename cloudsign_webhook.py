@@ -21,6 +21,8 @@ import logging
 
 import requests
 
+from hub.redact import emit
+
 logger = logging.getLogger("cloudsign")
 
 # ============================================================
@@ -291,7 +293,12 @@ def handle_webhook(secret: str, payload: dict) -> tuple[int, dict]:
                 "documentID に一致する案件レコードが見つからず、受任へ更新できて"
                 "いません。kintone の cloudsign_document_id を確認してください。")
             return 200, {"ok": True, "state": "kintone_update_failed"}
-        notify_line(f"【締結完了】{title}\ndocumentID: {document_id}")
+        # P1-102（RV-10 S1）: 顧客Bot（notify_line）ではなく業務チャネル
+        # （notify_business_line）へ。書類タイトルは document_metadata で redact
+        # （既定=完全抑止）。documentID は不透明な相関 ID として残す。
+        safe_title = emit(title, "document_metadata", "line_business", "attorney")
+        notify_business_line(
+            f"【締結完了】{safe_title}\ndocumentID: {document_id}")
         return 200, {"ok": True, "state": "processed"}
 
     # 締結完了以外のイベント（却下・取消等）は従来どおり何もしない

@@ -117,18 +117,18 @@ class TestHandleWebhookSecretCheck(unittest.TestCase):
         self.assertEqual(code, 404)
 
     def test_correct_secret_proceeds(self):
-        """正しい secret なら処理が進む（RCF-M03 で強化: 照合成功 fixture を
-        id/status 込みにし、受任更新・通知・state=processed まで明示 assert）"""
+        """正しい secret なら処理が進む（受任更新・state=processed）。
+        P1-102: 締結完了通知は業務チャネル notify_business_line 経由へ変更。"""
         with patch.object(mod, "fetch_document",
                           return_value={"id": "doc1", "title": "test", "status": 2}), \
              patch.object(mod, "update_kintone_status", return_value=True) as mock_update, \
-             patch.object(mod, "notify_line") as mock_notify:
+             patch.object(mod, "notify_business_line") as mock_biz:
             code, body = mod.handle_webhook("test_secret", {"documentID": "doc1", "status": 2})
         self.assertEqual(code, 200)
         self.assertTrue(body.get("ok"))
         self.assertEqual(body.get("state"), "processed")
         mock_update.assert_called_once_with("doc1", "受任")
-        mock_notify.assert_called_once()
+        mock_biz.assert_called_once()
 
 
 class TestHandleWebhookStatusNotCompleted(unittest.TestCase):

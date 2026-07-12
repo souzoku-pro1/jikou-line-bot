@@ -65,9 +65,14 @@ class TestVerificationSuccessUnchanged(unittest.TestCase):
         self.assertEqual(body.get("state"), "processed")
         mock_fetch.assert_called_once_with("doc1")
         mock_update.assert_called_once_with("doc1", "受任")
-        mock_notify.assert_called_once()
-        self.assertIn("委任契約書", mock_notify.call_args.args[0])
-        mock_biz.assert_not_called()
+        # P1-102（RV-10 S1）: 締結完了通知は顧客Bot(notify_line)ではなく
+        # 業務チャネル(notify_business_line)へ・書類タイトルは redact される
+        mock_notify.assert_not_called()
+        mock_biz.assert_called_once()
+        biz_msg = mock_biz.call_args.args[0]
+        self.assertIn("【締結完了】", biz_msg)
+        self.assertIn("doc1", biz_msg)               # documentID は相関 ID として残す
+        self.assertNotIn("委任契約書", biz_msg)       # 書類タイトルは redact（非表示）
 
     def test_wrong_secret_still_404(self):
         code, _ = mod.handle_webhook("wrong", dict(COMPLETED_EVENT))

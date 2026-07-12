@@ -385,11 +385,17 @@ async def _process_line_event(reply_token: str, user_id: str, user_text: str) ->
                     #     方向=user / 本文=user_text / userId=user_id / timestamp はApp28側で自動付与。
                     #     category は App28 に新たな選択肢要件を持ち込まないよう空で記録する。
                     await save_to_chatlog(user_id, "user", user_text, "", "no")
-                    # (c) 管理者へLINE push通知
+                    # (c) 弁護士へ通知（P1-102・RV-10 S1）: 顧客Bot ではなく
+                    #     業務チャネル（DISPATCHBOT）へ・氏名/本文は emit で redact
+                    #     （既定=完全抑止）。弁護士は App28 で実体を確認する。
                     if ATTORNEY_LINE_USER_ID:
-                        await send_line_push(
+                        from hub.notify import notify_business
+                        from hub.redact import emit
+                        await notify_business(
                             ATTORNEY_LINE_USER_ID,
-                            f"【人対応中】{display_name}：{user_text}",
+                            f"【人対応中】"
+                            f"{emit(display_name, 'name', 'line_business', 'attorney')}"
+                            f"：{emit(user_text, 'freetext', 'line_business', 'attorney')}",
                         )
                     else:
                         print(
