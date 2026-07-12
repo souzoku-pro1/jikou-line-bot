@@ -36,65 +36,140 @@ EXCLUDE_NAMES = {"conftest.py", "redact.py", "test_redact.py",
 
 _LOGGER_LEVELS = {"debug", "info", "warning", "error", "exception", "critical"}
 
+# 例外情報を出力する keyword（値が True でも例外本文が出るため安全扱いしない・H03）
+_UNSAFE_KEYWORDS = {"exc_info", "stack_info"}
 
-# ══════════════════════════════════════════════════════════════
-# ホワイトリスト判定
-# ══════════════════════════════════════════════════════════════
-
-def _is_emit_call(node: ast.Call) -> bool:
-    f = node.func
-    if isinstance(f, ast.Name):
-        return f.id == "emit"
-    if isinstance(f, ast.Attribute):
-        return f.attr == "emit"
-    return False
-
-
-def _arg_is_safe(node: ast.AST) -> bool:
-    """引数が (a) 定数 / (b) 定数 f-string / (c) emit(...) / (d) それらの結合 のみか"""
-    if isinstance(node, ast.Constant):
-        return True
-    if isinstance(node, ast.JoinedStr):
-        # 変数埋込（FormattedValue）が無い定数 f-string のみ合格
-        return all(isinstance(v, ast.Constant) for v in node.values)
-    if isinstance(node, ast.Call):
-        return _is_emit_call(node)
-    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
-        return _arg_is_safe(node.left) and _arg_is_safe(node.right)
-    if isinstance(node, (ast.Tuple, ast.List)):
-        return all(_arg_is_safe(e) for e in node.elts)
-    return False
+# 外側 sink → emit に必須の (sink, audience) policy（H02）
+_SINK_REQUIRED_POLICY = {
+    "print": ("log", "operator"),
+    "logger": ("log", "operator"),
+    "logger_log": ("log", "operator"),
+    "logging_module": ("log", "operator"),
+    "stdio_write": ("log", "operator"),
+    "httpexception": ("exception_detail", "caller"),
+    # 将来の LINE sink 関数が対象になった際の拡張ポイント:
+    #   "line_customer_fn": ("line_customer", "customer"),
+    #   "line_business_fn": ("line_business", "attorney"),
+}
 
 
 # ══════════════════════════════════════════════════════════════
-# sink 識別 + 走査
+# ファイルごとの束縛収集（emit / print別名 / HTTPException別名）
 # ══════════════════════════════════════════════════════════════
 
-def _print_aliases_and_httpexc(tree: ast.AST):
-    print_aliases = set()
-    httpexc_names = {"HTTPException"}
+class _Bindings:
+    """H01: 信頼できる emit 束縛のみを収集する。
+
+    - `from hub.redact import emit [as X]` → local 名（emit / X）を emit_names へ
+    - `import hub.redact` → hub.redact.emit を許可（emit_module_attrs に ('hub.redact',)）
+    - `from hub import redact` / `import hub.redact as r` → <alias>.emit を許可
+    束縛外の同名 emit（ローカル def・別 module の .emit）は信頼しない。
+    """
+
+    def __init__(self):
+        self.emit_names = set()          # 直接 emit(...) を許すローカル名
+        self.emit_module_aliases = set()  # <alias>.emit(...) を許す module 別名
+        self.print_aliases = set()
+        self.httpexc_names = {"HTTPException"}
+
+
+def _dotted(node: ast.AST) -> str | None:
+    """a.b.c の attribute/name チェーンを 'a.b.c' に（それ以外は None）"""
+    parts = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if isinstance(node, ast.Name):
+        parts.append(node.id)
+        return ".".join(reversed(parts))
+    return None
+
+
+def collect_bindings(tree: ast.AST) -> _Bindings:
+    b = _Bindings()
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom):
+            mod = node.module or ""
             for a in node.names:
                 local = a.asname or a.name
                 if a.name == "print":
-                    print_aliases.add(local)
+                    b.print_aliases.add(local)
                 if a.name == "HTTPException":
-                    httpexc_names.add(local)
+                    b.httpexc_names.add(local)
+                # from hub.redact import emit [as X]
+                if mod == "hub.redact" and a.name == "emit":
+                    b.emit_names.add(local)
+                # from hub import redact [as r] → r.emit
+                if mod == "hub" and a.name == "redact":
+                    b.emit_module_aliases.add(local)
+        elif isinstance(node, ast.Import):
+            for a in node.names:
+                # import hub.redact [as r]
+                if a.name == "hub.redact":
+                    b.emit_module_aliases.add(a.asname or "hub.redact")
         elif isinstance(node, ast.Assign):
             if isinstance(node.value, ast.Name) and node.value.id == "print":
                 for tgt in node.targets:
                     if isinstance(tgt, ast.Name):
-                        print_aliases.add(tgt.id)
-    return print_aliases, httpexc_names
+                        b.print_aliases.add(tgt.id)
+    return b
 
 
-def _sink_kind(node: ast.Call, print_aliases, httpexc_names):
+def _is_trusted_emit(node: ast.Call, b: _Bindings) -> bool:
+    """H01: hub.redact の emit 束縛に一致する呼び出しだけを emit と認める"""
     f = node.func
     if isinstance(f, ast.Name):
-        if f.id == "print" or f.id in print_aliases:
+        return f.id in b.emit_names
+    if isinstance(f, ast.Attribute) and f.attr == "emit":
+        base = _dotted(f.value)
+        return base in b.emit_module_aliases  # <alias>.emit / hub.redact.emit
+    return False
+
+
+def _const_str(node: ast.AST):
+    """定数文字列なら値を返す（そうでなければ None）"""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    return None
+
+
+def _emit_policy_ok(call: ast.Call, required) -> bool:
+    """H02: emit(value, kind, sink, audience) の sink/audience が定数かつ
+    外側 sink の必須 policy と一致するか。位置引数・keyword 双方に対応。"""
+    req_sink, req_aud = required
+    sink_node = call.args[2] if len(call.args) > 2 else None
+    aud_node = call.args[3] if len(call.args) > 3 else None
+    for kw in call.keywords:
+        if kw.arg == "sink":
+            sink_node = kw.value
+        elif kw.arg == "audience":
+            aud_node = kw.value
+    return _const_str(sink_node) == req_sink and _const_str(aud_node) == req_aud
+
+
+def _arg_is_safe(node: ast.AST, b: _Bindings, required) -> bool:
+    """引数が (a) 定数 / (b) 定数 f-string / (c) 信頼 emit で policy 一致 /
+    (d) それらの結合 のみか（外側 sink の required policy 文脈で判定）"""
+    if isinstance(node, ast.Constant):
+        return True
+    if isinstance(node, ast.JoinedStr):
+        return all(isinstance(v, ast.Constant) for v in node.values)
+    if isinstance(node, ast.Call):
+        return _is_trusted_emit(node, b) and _emit_policy_ok(node, required)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        return (_arg_is_safe(node.left, b, required)
+                and _arg_is_safe(node.right, b, required))
+    if isinstance(node, (ast.Tuple, ast.List)):
+        return all(_arg_is_safe(e, b, required) for e in node.elts)
+    return False
+
+
+def _sink_kind(node: ast.Call, b: _Bindings):
+    f = node.func
+    if isinstance(f, ast.Name):
+        if f.id == "print" or f.id in b.print_aliases:
             return "print"
-        if f.id in httpexc_names:
+        if f.id in b.httpexc_names:
             return "httpexception"
     if isinstance(f, ast.Attribute):
         if f.attr == "HTTPException":
@@ -114,7 +189,7 @@ def _sink_kind(node: ast.Call, print_aliases, httpexc_names):
 def scan_source(src: str, name: str) -> list[str]:
     """source 文字列を解析し違反リストを返す（parse 失敗は例外送出＝H03）"""
     tree = ast.parse(src, filename=name)
-    print_aliases, httpexc_names = _print_aliases_and_httpexc(tree)
+    b = collect_bindings(tree)
     violations = []
 
     for node in ast.walk(tree):
@@ -129,11 +204,15 @@ def scan_source(src: str, name: str) -> list[str]:
 
         if not isinstance(node, ast.Call):
             continue
-        kind = _sink_kind(node, print_aliases, httpexc_names)
+        kind = _sink_kind(node, b)
         if kind is None:
             continue
-        args = list(node.args) + [kw.value for kw in node.keywords]
-        if not all(_arg_is_safe(a) for a in args):
+        required = _SINK_REQUIRED_POLICY[kind]
+        # H03: exc_info / stack_info keyword は値が True でも違反（例外本文が出る）
+        bad_kw = any(kw.arg in _UNSAFE_KEYWORDS for kw in node.keywords)
+        args = list(node.args) + [kw.value for kw in node.keywords
+                                  if kw.arg not in _UNSAFE_KEYWORDS]
+        if bad_kw or not all(_arg_is_safe(a, b, required) for a in args):
             violations.append(f"{name}:{node.lineno}:sink:{kind}")
 
     return sorted(set(violations))
@@ -211,22 +290,68 @@ class TestScannerDetection(unittest.TestCase):
         ("httpexc_module",
          "import fastapi\nraise fastapi.HTTPException(detail=resp.text)\n",
          {"sink:httpexception"}),
+        # H01: 束縛外 emit（偽 emit・ローカル def）は信頼しない
+        ("fake_module_emit",
+         "logger.info(fake.emit(customer_name))\n", {"sink:logger"}),
+        ("local_def_emit",
+         "def emit(v):\n    return v\nlogger.info(emit(customer_name))\n",
+         {"sink:logger"}),
+        ("bare_emit_no_import",
+         "logger.info(emit(customer_name))\n", {"sink:logger"}),
+        # H02: 正規 emit でも policy 不一致（logger に line_customer 指定）は違反
+        ("policy_mismatch_logger",
+         "from hub.redact import emit\n"
+         "logger.info(emit(name, 'name', 'line_customer', 'customer'))\n",
+         {"sink:logger"}),
+        ("policy_mismatch_httpexc",
+         "from hub.redact import emit\n"
+         "raise HTTPException(detail=emit(x, 'name', 'log', 'operator'))\n",
+         {"sink:httpexception"}),
+        ("emit_nonconst_policy",
+         "from hub.redact import emit\n"
+         "logger.info(emit(x, 'name', sink_var, 'operator'))\n",
+         {"sink:logger"}),
+        # H03: exc_info / stack_info は True でも違反
+        ("exc_info_true", "logger.error('x', exc_info=True)\n", {"sink:logger"}),
+        ("stack_info_true", "logger.error('x', stack_info=True)\n",
+         {"sink:logger"}),
     ]
-    # 合格すべき（全引数が定数 / 定数 f-string / emit / それらの結合）
+    # 合格すべき（全引数が定数 / 定数 f-string / 信頼 emit で policy 一致 / 結合）
     SAFE_CASES = [
         ("print_static", "print('x')\n"),
         ("stdout_write_static", "import sys\nsys.stdout.write('x')\n"),
         ("logging_module_static", "import logging\nlogging.info('x')\n"),
         ("logger_static", "logger.info('static message')\n"),
         ("logger_const_fstring", "logger.info(f'no vars here')\n"),
-        ("logger_emit",
-         "logger.info(emit(x, 'name', 'log', 'operator'))\n"),
-        ("logger_percent_emit",
-         "logger.info('case %s', emit(cid, 'record_id', 'log', 'operator'))\n"),
         ("httpexc_const",
          "raise HTTPException(status_code=500, detail='not found')\n"),
-        ("logger_exc_info_true", "logger.error('x', exc_info=True)\n"),
+        # H01: 3 束縛それぞれの正規 emit（policy 一致）は合格
+        ("emit_from_import",
+         "from hub.redact import emit\n"
+         "logger.info(emit(x, 'name', 'log', 'operator'))\n"),
+        ("emit_from_import_as",
+         "from hub.redact import emit as R\n"
+         "logger.info(R(x, 'name', 'log', 'operator'))\n"),
+        ("emit_import_module",
+         "import hub.redact\n"
+         "logger.info(hub.redact.emit(x, 'name', 'log', 'operator'))\n"),
+        ("emit_from_hub_import_redact",
+         "from hub import redact\n"
+         "logger.info(redact.emit(x, 'name', 'log', 'operator'))\n"),
+        # H02: httpexception には exception_detail/caller policy の emit なら合格
+        ("emit_httpexc_policy",
+         "from hub.redact import emit\n"
+         "raise HTTPException(detail=emit(x, 'name', 'exception_detail', "
+         "'caller'))\n"),
+        # keyword での sink/audience 指定・%スタイル・結合
+        ("emit_kwargs_policy",
+         "from hub.redact import emit\n"
+         "logger.info(emit(x, 'name', sink='log', audience='operator'))\n"),
+        ("logger_percent_emit",
+         "from hub.redact import emit\n"
+         "logger.info('case %s', emit(cid, 'record_id', 'log', 'operator'))\n"),
         ("logger_concat_const_emit",
+         "from hub.redact import emit\n"
          "logger.info('p:' + emit(x, 'name', 'log', 'operator'))\n"),
     ]
 

@@ -1,7 +1,7 @@
 {
   "baseline_count": 211,
-  "generated_by": "P1-101b-sink-boundary",
-  "note": "sink 直書き債務台帳（ホワイトリスト方式）。sink 呼び出しの全引数が定数/定数f-string/emit()/それらの結合のみなら合格、それ以外は違反。新規追加禁止・stale削除必須・総数は baseline_count を上限（単調減少のみ）。S1〜S4 で解消したら該当 entry を削除すること。",
+  "generated_by": "P1-101c-emit-binding",
+  "note": "sink 直書き債務台帳（ホワイトリスト方式・emit束縛/policy一致/exc_info検査つき）。sink 呼び出しの全引数が 定数/定数f-string/hub.redact束縛の信頼emit(policy一致)/それらの結合 のみなら合格。exc_info/stack_info keywordは値True含め違反。新規追加禁止・stale削除必須・総数は baseline_count 上限（単調減少のみ）。",
   "entries": [
     "bank_ingest.py:103:sink:print",
     "bank_ingest.py:238:sink:httpexception",
