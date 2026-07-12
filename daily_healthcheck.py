@@ -65,7 +65,7 @@ async def check_models() -> list[str]:
                 "（廃止された可能性。config.py の更新が必要）"
             )
         except Exception as e:
-            problems.append(f"モデル {label}={model_id} の確認に失敗: {str(e)[:150]}")
+            problems.append(f"モデル {label}={model_id} の確認に失敗: {type(e).__name__}")
     return problems
 
 
@@ -152,10 +152,10 @@ def check_templates() -> list[str]:
         try:
             missing = validate_template(path, keys)
         except TemplateNotFound as e:
-            problems.append(f"テンプレート検査: {e}")
+            problems.append(f"テンプレート検査（種別: {type(e).__name__}）")
             continue
         except Exception as e:
-            problems.append(f"テンプレート {path} の検査に失敗: {str(e)[:150]}")
+            problems.append(f"テンプレート {path} の検査に失敗: {type(e).__name__}")
             continue
         if missing:
             problems.append(
@@ -284,20 +284,20 @@ async def run_healthcheck() -> list[str]:
     try:
         problems += await check_models()
     except Exception as e:
-        problems.append(f"モデル監視の実行自体が失敗: {str(e)[:150]}")
+        problems.append(f"モデル監視の実行自体が失敗: {type(e).__name__}")
     try:
         problems += await check_kintone_schema()
     except Exception as e:
-        problems.append(f"kintone監視の実行自体が失敗: {str(e)[:150]}")
+        problems.append(f"kintone監視の実行自体が失敗: {type(e).__name__}")
     try:
         problems += check_templates()
     except Exception as e:
-        problems.append(f"テンプレート監視の実行自体が失敗: {str(e)[:150]}")
+        problems.append(f"テンプレート監視の実行自体が失敗: {type(e).__name__}")
     try:
         from channels.soufu_annai import check_block_sync  # 監視項目D（T2-1）
         problems += await check_block_sync()
     except Exception as e:
-        problems.append(f"App30/32同期監視の実行自体が失敗: {str(e)[:150]}")
+        problems.append(f"App30/32同期監視の実行自体が失敗: {type(e).__name__}")
     try:
         problems += await check_journal_backlog()  # 監視項目E（P1-005d）
     except Exception as e:

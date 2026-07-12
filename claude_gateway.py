@@ -142,15 +142,18 @@ async def create_message_with_fallback(
                 "【Claude応答不能・要対応】\n"
                 f"時刻: {_now_jst()}\n"
                 f"呼び出し元: {context or '不明'}\n"
-                f"PRIMARY({PRIMARY_MODEL}): {str(primary_exc)[:200]}\n"
-                f"FALLBACK({FALLBACK_MODEL}): {str(fallback_exc)[:200]}\n"
+                f"PRIMARY({PRIMARY_MODEL}): {type(primary_exc).__name__}\n"
+                f"FALLBACK({FALLBACK_MODEL}): {type(fallback_exc).__name__}\n"
                 "顧客には定型の「確認中」応答を返し、承認キュー(App 29)に"
                 "要対応レコードを作成します。",
                 throttle_key="fallback_failed",
             )
+            # H02: 例外本文は message へ載せない（クラス名のみ）。呼び出し側は str(e) を
+            # handle_claude_outage(error=...) → 弁護士通知/App29 に流すため、本文混入を根で断つ。
+            # 詳細は from fallback_exc の chain（＝logger.exception のみが握る）。
             raise ClaudeUnavailableError(
-                f"primary={PRIMARY_MODEL}: {primary_exc} / "
-                f"fallback={FALLBACK_MODEL}: {fallback_exc}"
+                f"primary={PRIMARY_MODEL}: {type(primary_exc).__name__} / "
+                f"fallback={FALLBACK_MODEL}: {type(fallback_exc).__name__}"
             ) from fallback_exc
 
 
