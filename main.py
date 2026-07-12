@@ -51,6 +51,10 @@ from daily_healthcheck import start_healthcheck_scheduler
 from hub import kintone as hub_kintone
 from hub import notify as hub_notify
 from hub.webhook_auth import extract_record_id, verify_token
+from hub.redact import emit  # RV-10: sink 出力は emit 契約経由（1形式）
+
+import logging
+logger = logging.getLogger("main")
 
 # App 29（承認キュー）のハブ経由接続（T0-1。挙動は従来の get_approval_record と同等）
 _APP_APPROVAL = hub_kintone.KintoneApp("App 29 (承認キュー)", "APP_APPROVAL", "TOKEN_APPROVAL")
@@ -761,7 +765,7 @@ async def ocr_fixed_asset(file: UploadFile = File(...),
     }.items() if not v]
     if missing:
         raise HTTPException(status_code=500,
-                            detail=f"環境変数が未設定です: {', '.join(missing)}")
+                            detail="サーバの環境変数が未設定です（管理者へ連絡してください）")
 
     if not file.filename or not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="PDFファイルを送信してください")
@@ -773,7 +777,7 @@ async def ocr_fixed_asset(file: UploadFile = File(...),
     try:
         ocr_text = _ocr_pdf_bytes(pdf_bytes, GOOGLE_VISION_API_KEY)
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"OCRエラー: {e}")
+        raise HTTPException(status_code=502, detail="OCRエラー（画像認識に失敗しました）")
 
     if not ocr_text.strip():
         raise HTTPException(status_code=422, detail="OCRでテキストを取得できませんでした")
@@ -782,7 +786,7 @@ async def ocr_fixed_asset(file: UploadFile = File(...),
     try:
         extracted = await _extract_fixed_asset(ocr_text)
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Claude抽出エラー: {e}")
+        raise HTTPException(status_code=502, detail="Claude抽出エラー（項目抽出に失敗しました）")
 
     print(f"[DEBUG] extracted: {extracted}")
 
@@ -790,7 +794,7 @@ async def ocr_fixed_asset(file: UploadFile = File(...),
     chiban        = extracted.get("地番")   or ""
     if not shozaichi_raw or not chiban:
         raise HTTPException(status_code=422,
-                            detail=f"所在地または地番を抽出できませんでした: {extracted}")
+                            detail="所在地または地番を抽出できませんでした")
 
     shozaichi = _normalize_shozaichi(shozaichi_raw)
     print(f"[DEBUG] 所在地: {shozaichi_raw!r} → {shozaichi!r}")
@@ -799,17 +803,17 @@ async def ocr_fixed_asset(file: UploadFile = File(...),
     try:
         record_id = await _search_kintone_record(shozaichi)
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"kintone検索エラー: {e}")
+        raise HTTPException(status_code=502, detail="kintone検索エラー")
 
     if record_id is None:
         raise HTTPException(status_code=404,
-                            detail=f"kintoneに一致するレコードが見つかりません（所在地: {shozaichi} / 地番: {chiban}）")
+                            detail="kintoneに一致するレコードが見つかりません")
 
     # 5. 一致レコードの評価額・年度を更新
     try:
         await _update_kintone_record(record_id, extracted)
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"kintone更新エラー: {e}")
+        raise HTTPException(status_code=502, detail="kintone更新エラー")
 
     # 6. LINEで完了通知
     notify_text = (
@@ -960,7 +964,7 @@ async def scan(req: ScanRequest):
     if req.folder_name not in _SCAN_FOLDER_CONFIG:
         raise HTTPException(
             status_code=400,
-            detail=f"未対応のフォルダ名: {req.folder_name}。対応値: {list(_SCAN_FOLDER_CONFIG.keys())}",
+            detail="未対応のフォルダ名です（対応: 相談カード / 戸籍謄本 / 通帳）",
         )
 
     config = _SCAN_FOLDER_CONFIG[req.folder_name]
@@ -973,19 +977,19 @@ async def scan(req: ScanRequest):
         config["token_env"]: api_token,
     }.items() if not v]
     if missing:
-        raise HTTPException(status_code=500, detail=f"環境変数が未設定です: {', '.join(missing)}")
+        raise HTTPException(status_code=500, detail="サーバの環境変数が未設定です（管理者へ連絡してください）")
 
     # 1. base64デコード
     try:
         pdf_bytes = base64.b64decode(req.pdf_base64)
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"base64デコードエラー: {e}")
+        raise HTTPException(status_code=400, detail="base64デコードエラー")
 
     # 2. Google Vision API でOCR
     try:
         ocr_text = _ocr_pdf_bytes(pdf_bytes, GOOGLE_VISION_API_KEY)
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"OCRエラー: {e}")
+        raise HTTPException(status_code=502, detail="OCRエラー（画像認識に失敗しました）")
 
     if not ocr_text.strip():
         raise HTTPException(status_code=422, detail="OCRでテキストを取得できませんでした")
@@ -994,7 +998,7 @@ async def scan(req: ScanRequest):
     try:
         extracted = await _extract_by_folder(ocr_text, req.folder_name)
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Claude抽出エラー: {e}")
+        raise HTTPException(status_code=502, detail="Claude抽出エラー（項目抽出に失敗しました）")
 
     print(f"[DEBUG] scan extracted ({req.folder_name}): {extracted}")
 
@@ -1008,7 +1012,7 @@ async def scan(req: ScanRequest):
     try:
         record_id = await _post_scan_to_kintone(app_id, api_token, extracted)
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"kintone登録エラー: {e}")
+        raise HTTPException(status_code=502, detail="kintone登録エラー")
 
     return {
         "status": "ok",
@@ -1033,7 +1037,11 @@ async def stripe_webhook(request: Request):
             payload, sig_header, webhook_secret
         )
     except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        # 未認証 caller（誰でも POST 可）へ内部詳細を返さない。署名検証の生の例外文言は
+        # emit 契約経由で構造化 log へ（既定=完全抑止）・応答は固定メッセージ＋400 のみ。
+        logger.warning("stripe webhook signature verification failed: %s",
+                       emit(str(e), "vendor_raw", "log", "operator"))
+        raise HTTPException(status_code=400, detail="署名の検証に失敗しました")
 
     # ── InboundEvent journal（P1-005a・D9: 入口の関所。業務ロジックは不変）──
     # DB到達不能時はここで例外→FastAPIが500を返し、Stripeの自動リトライに
