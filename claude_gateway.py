@@ -33,6 +33,7 @@ from config import (
 # notify_admin_line は T0-2 で hub/notify.py に移設。
 # 既存の import 経路（from claude_gateway import notify_admin_line）互換のため re-export
 from hub.notify import notify_admin_line  # noqa: F401
+from hub.redact import emit  # RV-10: sink 出力は emit 契約経由（1形式）
 
 logger = logging.getLogger("claude_gateway")
 
@@ -68,7 +69,10 @@ def _is_billing_error(exc: Exception) -> bool:
 
 async def _notify_billing_error(context: str, exc: Exception) -> None:
     """クレジット残高系エラーを管理者に LINE Push で警報する（スロットル付き）"""
-    logger.error("Anthropic billing error: %s", exc)
+    # 例外クラス名は可視・本文は emit(vendor_raw) で抑止（裁定・level 不変）
+    logger.error("Anthropic billing error cls=%s detail=%s",
+                 type(exc).__name__,
+                 emit(str(exc), "vendor_raw", "log", "operator"))
     await notify_admin_line(
         "【Anthropicクレジット残高不足・要対応】\n"
         f"時刻: {_now_jst()}\n"
@@ -112,9 +116,11 @@ async def create_message_with_fallback(
             raise
         if not _is_model_error(primary_exc):
             raise
+        # 例外クラス名は可視・本文は emit(vendor_raw) で抑止（裁定・level 不変）
         logger.error(
-            "PRIMARY model %s failed (%s), falling back to %s",
-            PRIMARY_MODEL, primary_exc, FALLBACK_MODEL,
+            "PRIMARY model %s failed cls=%s (detail=%s), falling back to %s",
+            PRIMARY_MODEL, type(primary_exc).__name__,
+            emit(str(primary_exc), "vendor_raw", "log", "operator"), FALLBACK_MODEL,
         )
         await notify_admin_line(
             "【Claudeフォールバック発動】\n"

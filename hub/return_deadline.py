@@ -18,6 +18,7 @@ from datetime import date, datetime, timedelta, timezone
 from config import UNIT_CONFIG
 from hub import kintone, notify
 from hub import scheduler as hub_scheduler
+from hub.redact import emit  # RV-10: sink 出力は emit 契約経由（1形式）
 
 logger = logging.getLogger("hub.return_deadline")
 
@@ -52,7 +53,8 @@ async def return_deadline_check() -> list[str]:
             fields=["$id", "件名", "チャネル", "顧客名表示用", "返送期限", "追跡番号"],
         )
     except kintone.KintoneError as e:
-        logger.error("return_deadline_check fetch failed: %s", e)
+        logger.error("return_deadline_check fetch failed cls=%s: %s",
+                     type(e).__name__, emit(str(e), "vendor_raw", "log", "operator"))
         await notify.notify_admin_line(
             "【返送期限監視: 実行失敗】\n"
             f"App 30 の検索に失敗しました: {str(e)[:200]}",

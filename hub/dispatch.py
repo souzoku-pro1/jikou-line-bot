@@ -24,6 +24,7 @@ from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 import channels
 from hub import approval, kintone, notify
 from hub.webhook_auth import extract_record_id, verify_token
+from hub.redact import emit  # RV-10: sink 出力は emit 契約経由（1形式）
 
 logger = logging.getLogger("hub.dispatch")
 
@@ -57,7 +58,8 @@ async def process_dispatch(record_id: str) -> None:
         try:
             record = await kintone.get_record(APP_SHIPPING, record_id)
         except kintone.KintoneError as e:
-            logger.error("record fetch failed record=%s: %s", record_id, e)
+            logger.error("record fetch failed record=%s cls=%s: %s", record_id,
+                     type(e).__name__, emit(str(e), "vendor_raw", "log", "operator"))
             return
 
         status = record.get("発送ステータス", {}).get("value", "")
@@ -163,7 +165,8 @@ async def _handle_prepare(record: dict) -> None:
             extra["成果物"] = [{"fileKey": k} for k in file_keys]
     except channels.base.PrepareDeferred as e:
         # エラーではない中断（マスタ登録待ち等）: 状態を変えず登録依頼の警報のみ
-        logger.info("prepare deferred record=%s: %s", record_id, e)
+        logger.info("prepare deferred record=%s cls=%s: %s", record_id,
+                    type(e).__name__, emit(str(e), "vendor_raw", "log", "operator"))
         await notify.notify_admin_line(
             "【発送管理: 対応依頼（エラーではありません）】\n"
             f"レコードNo: {record_id}\n{_summary(record)}\n"
