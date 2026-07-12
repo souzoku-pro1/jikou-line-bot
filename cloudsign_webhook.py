@@ -220,13 +220,14 @@ def _escape_kintone_query_value(value: str) -> str:
 
 
 def _find_mismatch_envelopes(app_id: str, token: str,
-                             key: str) -> list[tuple[int, str]]:
-    """冪等キー key の要確認封筒 (record No int, 発送ステータス) を No 昇順で返す（M07）。
+                             key: str) -> list[tuple[int, str, str]]:
+    """冪等キー key の要確認封筒 (record No int, 発送ステータス, $revision) を No 昇順で返す（M07）。
 
     like で絞り込んだ後、各レコードのチャネル固有データ JSON をコード側でパースし、
     トップキー cloudsign_mismatch が存在し「冪等キー」が **完全一致** するものだけ採用する
     （部分文字列 like の誤マッチ＝別 documentID の封筒を確実に排除する）。発送ステータスは
-    収束（H03）で「要確認」の敗者だけを閉じるために持ち回る。
+    収束（H03）で「要確認」の敗者だけを閉じるため、$revision は却下 PUT の楽観ロック
+    （H03 TOCTOU: 検索から PUT までの間の人更新を弾く）のために持ち回る。
     """
     esc = _escape_kintone_query_value(key)
     r = requests.get(
@@ -236,11 +237,12 @@ def _find_mismatch_envelopes(app_id: str, token: str,
                 "query": f'{FIELD_CHANNEL_DATA} like "{esc}"',
                 "fields[0]": "$id",
                 "fields[1]": FIELD_CHANNEL_DATA,
-                "fields[2]": "発送ステータス"},
+                "fields[2]": "発送ステータス",
+                "fields[3]": "$revision"},
         timeout=10,
     )
     r.raise_for_status()
-    out: list[tuple[int, str]] = []
+    out: list[tuple[int, str, str]] = []
     for rec in r.json().get("records", []):
         raw = rec.get(FIELD_CHANNEL_DATA, {}).get("value", "")
         try:
@@ -251,45 +253,63 @@ def _find_mismatch_envelopes(app_id: str, token: str,
         if isinstance(mm, dict) and mm.get("冪等キー") == key:
             rid = rec.get("$id", {}).get("value")
             status = rec.get("発送ステータス", {}).get("value", "")
+            revision = rec.get("$revision", {}).get("value", "")
             if rid is not None:
                 try:
-                    out.append((int(rid), status))
+                    out.append((int(rid), status, revision))
                 except (ValueError, TypeError):
                     continue
     return sorted(out, key=lambda t: t[0])
 
 
-def _close_envelope(app_id: str, token: str, record_id: int) -> None:
-    """要確認封筒を「却下」でクローズする（H03: 敗者封筒の収束）。"""
+def _close_envelope(app_id: str, token: str, record_id: int,
+                    revision: str) -> bool:
+    """要確認封筒を revision 楽観ロック付きで「却下」クローズする（H03 TOCTOU）。
+
+    検索時に取得した revision を PUT に指定し、検索〜PUT の間に人が更新していれば
+    kintone は 409（GAIA_CO02）を返す。その場合は **人更新優先** として却下せず
+    False を返す（再試行や revision 無指定の無条件更新はしない）。True=却下成功。
+    409 以外の失敗は例外を送出（呼び出し側で非致命に扱う）。
+    """
+    body: dict = {"app": app_id, "id": str(record_id),
+                  "record": {"発送ステータス": {"value": "却下"}}}
+    if revision not in (None, ""):
+        body["revision"] = str(revision)
     u = requests.put(
         f"{KINTONE_BASE}/k/v1/record.json",
         headers={"X-Cybozu-API-Token": token, "Content-Type": "application/json"},
-        json={"app": app_id, "id": str(record_id),
-              "record": {"発送ステータス": {"value": "却下"}}},
+        json=body,
         timeout=10,
     )
+    if u.status_code == 409:      # revision 競合＝人が先に更新（楽観ロック衝突）
+        return False
     u.raise_for_status()
+    return True
 
 
 def _converge_envelopes(app_id: str, token: str,
-                        matches: list[tuple[int, str]]) -> str:
+                        matches: list[tuple[int, str, str]]) -> str:
     """完全一致封筒群を最小 No（winner）1 件へ収束させ、winner の No（str）を返す（H03）。
 
-    遵守事項（R-P1-102 3巡目レビューの安全条件）:
+    遵守事項（R-P1-102 3巡目/4巡目レビューの安全条件）:
       - winner（最小 No）は絶対に閉じない・更新しない。
-      - 敗者クローズ対象は「要確認」状態のもののみ（完了・却下・人処理済みは書き換えない）。
+      - 敗者クローズ対象は「要確認」状態のもののみ（検索時 status で保護）。
+      - 却下 PUT は検索時 revision の楽観ロック付き。検索〜PUT の間に人が更新した敗者は
+        revision 競合で却下せず人更新優先（再試行・無条件更新はしない）。
       - クローズの一部が失敗しても winner No を返し通知を維持する（warning のみ）。
     """
     matches = sorted(matches, key=lambda t: t[0])
     winner = matches[0][0]
     close_failed = False
-    for rid, status in matches:
+    for rid, status, revision in matches:
         if rid == winner:
             continue                 # winner は絶対に閉じない
         if status != "要確認":
             continue                 # 人処理済み（完了・却下・実行済み等）は触らない
         try:
-            _close_envelope(app_id, token, rid)
+            if not _close_envelope(app_id, token, rid, revision):
+                # 検索後に人が更新（revision 競合）→ 人更新優先で却下しない
+                logger.warning("要確認封筒の却下を人更新優先でスキップ（revision競合）")
         except Exception:
             close_failed = True
     if close_failed:
@@ -306,6 +326,10 @@ def file_mismatch_envelope(document_id: str, failure_reason: str):
     クローズする。相互不可視な race（A/B が互いの封筒を見ずに create）でも、次の再送の
     既存検索で両方が見えた時点で winner 1 件へ収束する。完全一意（重複を作らせない）は
     RCF-M07（App 30 専用フィールド＋重複禁止設定・CU 作業）で DEFER。
+
+    **人処理済みの保護は二段で保証する**: (1) 検索時の発送ステータスで「要確認」の敗者
+    だけを対象にし、(2) 却下 PUT に検索時 revision を指定する楽観ロックで、検索〜PUT の
+    間に人が更新した敗者（TOCTOU）は revision 競合として却下せず人更新を優先する。
 
     App 30 未設定・起票/検索失敗は None を返す（呼び出し側で縮退通知へフォールバック）。
     """
@@ -352,17 +376,19 @@ def file_mismatch_envelope(document_id: str, failure_reason: str):
             timeout=10,
         )
         c.raise_for_status()
-        my_id = int(c.json()["id"])
+        created = c.json()
+        my_id = int(created["id"])
+        my_rev = created.get("revision", "")   # 自レコードの却下クローズ用 revision
 
         # H03（compensation）: create 後に再検索して見えた同キー封筒で収束する。
-        # 読み後れで自レコードが検索に出ない場合に備え、自 No（要確認）を必ず含める。
+        # 読み後れで自レコードが検索に出ない場合に備え、自 No（要確認・自 revision）を含める。
         # 再検索が失敗した場合のみ自 No で通知する（個々のクローズ失敗は _converge_envelopes
         # 内で warning 記録し winner No を維持する＝通知は必ず出る）。
         winner = str(my_id)
         try:
             matches = _find_mismatch_envelopes(app_id, token, key)
             if my_id not in [m[0] for m in matches]:
-                matches.append((my_id, "要確認"))
+                matches.append((my_id, "要確認", my_rev))
             if len(matches) > 1:
                 winner = _converge_envelopes(app_id, token, matches)
         except Exception:

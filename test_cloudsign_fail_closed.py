@@ -255,25 +255,29 @@ class TestMismatchEnvelope(unittest.TestCase):
     APP30 = {"APP_SHIPPING": "30", "TOKEN_SHIPPING": "sh_tok"}
 
     @staticmethod
-    def _resp(payload):
+    def _resp(payload, status_code=200):
         r = MagicMock()
+        r.status_code = status_code
         r.raise_for_status = MagicMock()
         r.json.return_value = payload
         return r
 
     @classmethod
     def _records(cls, *rows):
-        """(record_id, document_id[, 発送ステータス]) から kintone レコードを作る
-        （省略時ステータス=要確認）。$id＋チャネル固有データ＋発送ステータスを持つ。"""
+        """(record_id, document_id[, 発送ステータス[, $revision]]) からレコードを作る
+        （省略時 ステータス=要確認・revision=1）。$id/$revision/チャネル固有データ/
+        発送ステータスを持つ。"""
         recs = []
         for row in rows:
             rid, doc = row[0], row[1]
             status = row[2] if len(row) > 2 else "要確認"
+            rev = row[3] if len(row) > 3 else "1"
             key = f"cloudsign_mismatch:{doc}"
             chan = json.dumps(
                 {"cloudsign_mismatch": {"冪等キー": key, "documentID": doc,
                                         "失敗理由": "x"}}, ensure_ascii=False)
             recs.append({"$id": {"value": rid},
+                         "$revision": {"value": rev},
                          "チャネル固有データ": {"value": chan},
                          "発送ステータス": {"value": status}})
         return cls._resp({"records": recs})
@@ -364,6 +368,36 @@ class TestMismatchEnvelope(unittest.TestCase):
             no = mod.file_mismatch_envelope("doc1", "kintone_no_match")
         self.assertEqual(no, "3")
         self.assertEqual(self._put_ids(rq), ["8"])                # 8のみ（3=winner,5=完了は不変）
+
+    def test_close_uses_search_time_revision(self):
+        """H03 TOCTOU: 却下 PUT に検索時 revision を指定する（楽観ロック）。"""
+        with patch.dict("os.environ", self.APP30, clear=False), \
+             patch.object(mod, "requests") as rq:
+            rq.get.return_value = self._records(
+                ("3", "doc1", "要確認", "2"), ("8", "doc1", "要確認", "4"))
+            rq.put.return_value = self._resp({})
+            no = mod.file_mismatch_envelope("doc1", "kintone_no_match")
+        self.assertEqual(no, "3")
+        put_body = rq.put.call_args.kwargs["json"]
+        self.assertEqual(put_body["id"], "8")
+        self.assertEqual(put_body["revision"], "4")               # No.8 検索時 revision
+
+    def test_revision_conflict_is_human_wins(self):
+        """H03 TOCTOU: 検索時 No.8=要確認/revision=4 だが PUT で revision 競合(409)
+        → 再試行・無条件更新なしで却下せず、winner No.3 通知継続・No.8 不変。"""
+        with patch.dict("os.environ", self.APP30, clear=False), \
+             patch.object(mod, "requests") as rq:
+            rq.get.return_value = self._records(
+                ("3", "doc1", "要確認", "2"), ("8", "doc1", "要確認", "4"))
+            rq.put.return_value = self._resp({}, status_code=409)  # revision 競合
+            no = mod.file_mismatch_envelope("doc1", "kintone_no_match")
+        self.assertEqual(no, "3")                                 # winner 継続（通知 No.3）
+        rq.put.assert_called_once()                               # 再試行しない（1回のみ）
+        put_body = rq.put.call_args.kwargs["json"]
+        self.assertEqual(put_body["id"], "8")
+        self.assertEqual(put_body["revision"], "4")               # 無条件更新でない
+        # 409 応答で raise_for_status を呼ばない＝例外化せず人更新優先で握る
+        rq.put.return_value.raise_for_status.assert_not_called()
 
     # ── H03: create 後の再検索での compensation（可視な並行）──
     def test_postcreate_loser_closes_and_converges(self):
