@@ -13,6 +13,7 @@
   （flow_fn / flow_reply_fn / execute_fn）で結線する
 """
 
+import logging
 import re
 from dataclasses import asdict
 
@@ -20,6 +21,7 @@ from customer_directory import Candidate, list_candidates
 from dispatch_bot.case_search import CaseHit
 from dispatch_bot.sortation_assign import _CANCEL_WORDS, _match_customers
 from hub import kintone
+from hub.redact import emit
 from review_resolve import (
     APP_FUDOSAN,
     ReviewGroup,
@@ -27,6 +29,8 @@ from review_resolve import (
     list_pending_reviews,
     resolve_group,
 )
+
+logger = logging.getLogger("dispatch_bot.review_resolve_task")
 
 TASK_TYPE = "review_resolve"
 
@@ -67,7 +71,9 @@ async def _group_kinds(group: ReviewGroup) -> list[str]:
             if kind:
                 kinds.append(kind)
         except Exception as e:
-            print(f"[REVIEW_RESOLVE_TASK] 種別取得に失敗（省略表記で続行）: {e}")
+            logger.info("[REVIEW_RESOLVE_TASK] 種別取得に失敗（省略表記で続行）: %s: %s",
+                        type(e).__name__,
+                        emit(str(e), "vendor_raw", "log", "operator"))
     return kinds
 
 

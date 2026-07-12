@@ -23,7 +23,12 @@ import argparse
 import asyncio
 import csv
 import io
+import logging
 import sys
+
+from hub.redact import emit
+
+logger = logging.getLogger("import_city_master")
 
 # ── パース・検証（テスト対象の純粋関数） ─────────────────────────────────────
 
@@ -133,31 +138,41 @@ async def amain() -> int:
     rows = parse_rows(read_csv_text(args.csv_path))
     problems = validate_rows(rows)
 
-    print(f"パース結果      : {len(rows)}件（市区町村。都道府県行は除外済み）")
-    print(f"検証            : {'OK' if not problems else f'★問題 {len(problems)}件'}")
-    for p in problems[:20]:
-        print(f"  - {p}")
+    logger.info("パース結果      : %s件（市区町村。都道府県行は除外済み）",
+                emit(len(rows), "count", "log", "operator"))
     if problems:
-        print("検証 NG のため中止します（CSV を確認してください）")
+        logger.info("検証            : ★問題 %s件",
+                    emit(len(problems), "count", "log", "operator"))
+    else:
+        logger.info("検証            : OK")
+    for p in problems[:20]:
+        logger.info("  - %s", emit(p, "freetext", "log", "operator"))
+    if problems:
+        logger.info("検証 NG のため中止します（CSV を確認してください）")
         return 1
 
     existing = await fetch_existing_codes(app)
     to_insert, skipped = plan_insert(rows, existing)
-    print(f"kintone 既存    : {len(existing)}件 / 今回スキップ（登録済み）: {skipped}件")
-    print(f"投入対象        : {len(to_insert)}件")
-    print("サンプル（先頭5件）:")
+    logger.info("kintone 既存    : %s件 / 今回スキップ（登録済み）: %s件",
+                emit(len(existing), "count", "log", "operator"),
+                emit(skipped, "count", "log", "operator"))
+    logger.info("投入対象        : %s件", emit(len(to_insert), "count", "log", "operator"))
+    logger.info("サンプル（先頭5件）:")
     for r in to_insert[:5]:
-        print(f"  {r['団体コード']} {r['都道府県']} {r['市区町村名']}")
+        logger.info("  %s %s %s",
+                    emit(r['団体コード'], "record_id", "log", "operator"),
+                    emit(r['都道府県'], "freetext", "log", "operator"),
+                    emit(r['市区町村名'], "freetext", "log", "operator"))
 
     if not args.execute:
-        print("\n[dry-run] 書き込みは行っていません。内容を確認のうえ --execute で本実行してください。")
+        logger.info("\n[dry-run] 書き込みは行っていません。内容を確認のうえ --execute で本実行してください。")
         return 0
 
     if not to_insert:
-        print("投入対象がありません（すべて登録済み）")
+        logger.info("投入対象がありません（すべて登録済み）")
         return 0
     n = await insert_rows(app, to_insert)
-    print(f"\n本実行完了: {n}件を登録しました")
+    logger.info("\n本実行完了: %s件を登録しました", emit(n, "count", "log", "operator"))
     return 0
 
 

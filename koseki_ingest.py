@@ -25,14 +25,18 @@
 
 import hashlib
 import json
+import logging
 import os
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 
 from hub import kintone
+from hub.redact import emit
 from hub.webhook_auth import verify_token
 
 router = APIRouter()
+
+logger = logging.getLogger("koseki_ingest")
 
 APP_KOSEKI_BOOK = kintone.KintoneApp(
     "App 33 (戸籍読解)", "APP_KOSEKI_BOOK", "TOKEN_KOSEKI_BOOK")
@@ -49,7 +53,7 @@ async def _file_case_link_review(record_id: str, fid: str, pdf_bytes: bytes,
     env 未設定はスキップ・起票失敗は ingest の成功応答を壊さない（ログのみ）
     """
     if not (APP_SHIPPING.app_id() and APP_SHIPPING.token()):
-        print("[KOSEKI_INGEST] 要確認起票スキップ（APP_SHIPPING 未設定）")
+        logger.info("[KOSEKI_INGEST] 要確認起票スキップ（APP_SHIPPING 未設定）")
         return None
     detail = {"理由": "案件紐付け不能", "戸籍レコードID": record_id, "冪等キー": fid}
     fields = {
@@ -69,13 +73,18 @@ async def _file_case_link_review(record_id: str, fid: str, pdf_bytes: bytes,
                 APP_SHIPPING, filename or "戸籍.pdf", pdf_bytes, "application/pdf")
             fields["成果物"] = [{"fileKey": key}]
         except Exception as e:
-            print(f"[KOSEKI_INGEST] 要確認への原本添付に失敗（起票は続行）: {e}")
+            logger.info("[KOSEKI_INGEST] 要確認への原本添付に失敗（起票は続行）: %s: %s",
+                        type(e).__name__,
+                        emit(str(e), "vendor_raw", "log", "operator"))
         review_id = str(await kintone.create_record(APP_SHIPPING, fields))
-        print(f"[KOSEKI_INGEST] 案件紐付け不能を要確認起票 record={record_id} "
-              f"review={review_id}")
+        logger.info("[KOSEKI_INGEST] 案件紐付け不能を要確認起票 record=%s review=%s",
+                    emit(record_id, "record_id", "log", "operator"),
+                    emit(review_id, "record_id", "log", "operator"))
         return review_id
     except Exception as e:
-        print(f"[KOSEKI_INGEST] 要確認起票に失敗（登録は成功済み・処理続行）: {e}")
+        logger.info("[KOSEKI_INGEST] 要確認起票に失敗（登録は成功済み・処理続行）: %s: %s",
+                    type(e).__name__,
+                    emit(str(e), "vendor_raw", "log", "operator"))
         return None
 
 
@@ -92,7 +101,7 @@ def _render_page_images(pdf_bytes: bytes) -> list[bytes]:
     try:
         import fitz  # PyMuPDF
     except ImportError:
-        print("[KOSEKI_INGEST] PyMuPDF が利用できないためページ画像なしで続行")
+        logger.info("[KOSEKI_INGEST] PyMuPDF が利用できないためページ画像なしで続行")
         return []
     images = []
     with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
@@ -172,10 +181,15 @@ async def ingest_koseki_pdf(pdf_bytes: bytes, filename: str, *,
     try:
         from koseki_reader import process_record
         reading = await process_record(record_id)
-        print(f"[KOSEKI_INGEST] 読解結果 record={record_id}: {reading}")
+        logger.info("[KOSEKI_INGEST] 読解結果 record=%s: %s",
+                    emit(record_id, "record_id", "log", "operator"),
+                    emit(reading, "koseki", "log", "operator"))
     except Exception as e:
-        print(f"[KOSEKI_INGEST] 読解に失敗（未読解のまま・核関数で回収可能）"
-              f" record={record_id}: {e}")
+        logger.info("[KOSEKI_INGEST] 読解に失敗（未読解のまま・核関数で回収可能）"
+                    " record=%s: %s: %s",
+                    emit(record_id, "record_id", "log", "operator"),
+                    type(e).__name__,
+                    emit(str(e), "vendor_raw", "log", "operator"))
 
     # R4-0（2026-07-07 裁定）: 案件参照が埋まらなかった戸籍は App 30 要確認へ。
     # 確定（案件紐付け＋クローズ）は S5-2.5 の関所が行う
@@ -198,8 +212,11 @@ async def ingest_koseki_pdf(pdf_bytes: bytes, filename: str, *,
             if sync_enabled():
                 response["persons"] = await sync_persons_from_koseki(record_id)
         except Exception as e:
-            print(f"[KOSEKI_INGEST] 人物化に失敗（登録は成功済み・"
-                  f"sync_missing_persons で回収可能） record={record_id}: {e}")
+            logger.info("[KOSEKI_INGEST] 人物化に失敗（登録は成功済み・"
+                        "sync_missing_persons で回収可能） record=%s: %s: %s",
+                        emit(record_id, "record_id", "log", "operator"),
+                        type(e).__name__,
+                        emit(str(e), "vendor_raw", "log", "operator"))
             response["persons"] = {"status": "error", "reason": str(e)[:200]}
     return response
 

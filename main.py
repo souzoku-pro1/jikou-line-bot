@@ -158,18 +158,23 @@ async def _line_reply_with_fallback(reply_token: str, user_id: str, text: str) -
             json={"replyToken": reply_token, "messages": [{"type": "text", "text": text}]},
         )
     if resp.is_success:
-        print(f"[LINE] reply OK user_id={user_id}")
+        logger.info("[LINE] reply OK user_id=%s",
+                    emit(user_id, "external_ref", "log", "operator"))
         return
-    print(f"[LINE] reply failed {resp.status_code} {resp.text[:200]}, trying push")
+    logger.warning("[LINE] reply failed %s %s, trying push",
+                   emit(resp.status_code, "count", "log", "operator"),
+                   emit(resp.text[:200], "vendor_raw", "log", "operator"))
     async with httpx.AsyncClient() as client:
         push_resp = await client.post(
             PUSH_URL,
             headers={"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"},
             json={"to": user_id, "messages": [{"type": "text", "text": text}]},
         )
-    print(f"[LINE] push fallback status={push_resp.status_code}")
+    logger.info("[LINE] push fallback status=%s",
+                emit(push_resp.status_code, "count", "log", "operator"))
     if not push_resp.is_success:
-        print(f"[LINE] push fallback error: {push_resp.text[:200]}")
+        logger.error("[LINE] push fallback error: %s",
+                     emit(push_resp.text[:200], "vendor_raw", "log", "operator"))
 
 # OCR固定資産エンドポイント用の環境変数（起動時ではなくリクエスト時にチェック）
 GOOGLE_VISION_API_KEY        = os.environ.get("GOOGLE_VISION_API_KEY")
@@ -335,21 +340,29 @@ async def update_kintone_record(record_id: str, fields: dict) -> None:
     record_fields = {key: {"value": value} for key, value in fields.items()}
     body = {"app": KINTONE_APP_ID, "id": record_id, "record": record_fields}
 
-    print(f"[DEBUG] update url: {url}")
-    print(f"[DEBUG] update record_id: {record_id!r}")
-    print(f"[DEBUG] update fields keys: {list(fields.keys())}")
-    print(f"[DEBUG] update body: {json.dumps(body, ensure_ascii=False)}")
+    logger.info("[DEBUG] update url: %s",
+                emit(url, "freetext", "log", "operator"))
+    logger.info("[DEBUG] update record_id: %s",
+                emit(record_id, "record_id", "log", "operator"))
+    logger.info("[DEBUG] update fields keys: %s",
+                emit(list(fields.keys()), "freetext", "log", "operator"))
+    logger.info("[DEBUG] update body (redacted)")
 
     async with httpx.AsyncClient() as client:
         response = await client.put(url, headers=headers, json=body)
-        print(f"[DEBUG] update status: {response.status_code}")
-        print(f"[DEBUG] update response: {response.text}")
+        logger.info("[DEBUG] update status: %s",
+                    emit(response.status_code, "count", "log", "operator"))
+        logger.info("[DEBUG] update response: %s",
+                    emit(response.text, "vendor_raw", "log", "operator"))
         if not response.is_success:
             try:
                 err = response.json()
-                print(f"[DEBUG] update error code: {err.get('code')}")
-                print(f"[DEBUG] update error message: {err.get('message')}")
-                print(f"[DEBUG] update error errors: {err.get('errors')}")
+                logger.error("[DEBUG] update error code: %s",
+                             emit(err.get('code'), "vendor_raw", "log", "operator"))
+                logger.error("[DEBUG] update error message: %s",
+                             emit(err.get('message'), "vendor_raw", "log", "operator"))
+                logger.error("[DEBUG] update error errors: %s",
+                             emit(err.get('errors'), "vendor_raw", "log", "operator"))
             except Exception:
                 pass
         response.raise_for_status()
@@ -390,7 +403,9 @@ async def ask_claude(user_id: str, user_message: str) -> str:
 
 async def _process_line_event(reply_token: str, user_id: str, user_text: str) -> None:
     """LINEイベントの重い処理（BackgroundTasksで非同期実行）"""
-    print(f"[PROCESS] start user_id={user_id} text={user_text[:30]!r}")
+    logger.info("[PROCESS] start user_id=%s text=%s",
+                emit(user_id, "external_ref", "log", "operator"),
+                emit(user_text[:30], "freetext", "log", "operator"))
     try:
         # ── ルーティング判定 ──────────────────────────────────────────────
         in_hearing_session = (
@@ -414,8 +429,9 @@ async def _process_line_event(reply_token: str, user_id: str, user_text: str) ->
                     display_name = (
                         app21_record.get("顧客名", {}).get("value", "") or user_id
                     )
-                    print(
-                        f"[HUMAN_MODE] user_id={user_id} mode=人対応 → silent early-return"
+                    logger.info(
+                        "[HUMAN_MODE] user_id=%s mode=人対応 → silent early-return",
+                        emit(user_id, "external_ref", "log", "operator"),
                     )
                     # (b) App28（チャットログ）に受信内容を記録（顧客へは送信しない）
                     #     方向=user / 本文=user_text / userId=user_id / timestamp はApp28側で自動付与。
@@ -434,14 +450,15 @@ async def _process_line_event(reply_token: str, user_id: str, user_text: str) ->
                             f"：{emit(user_text, 'freetext', 'line_business', 'attorney')}",
                         )
                     else:
-                        print(
+                        logger.info(
                             "[HUMAN_MODE] ATTORNEY_LINE_USER_ID not set, admin notify skipped"
                         )
                     return
 
                 status = app21_record.get("status", {}).get("value", "")
                 routing = classify_routing(status)
-                print(f"[ROUTING] user_id={user_id} App21 status={status!r} routing={routing}")
+                logger.info("[ROUTING] user_id=%s App21 (status/routing redacted)",
+                            emit(user_id, "external_ref", "log", "operator"))
                 if routing != "hearing":
                     async def _reply_func(token: str, text: str) -> None:
                         await _line_reply_with_fallback(token, user_id, text)
@@ -453,11 +470,14 @@ async def _process_line_event(reply_token: str, user_id: str, user_text: str) ->
                         reply_func=_reply_func,
                     )
                     return
-                print(f"[ROUTING] user_id={user_id} → hearing (status={status!r})")
+                logger.info("[ROUTING] user_id=%s → hearing (status redacted)",
+                            emit(user_id, "external_ref", "log", "operator"))
             else:
-                print(f"[ROUTING] user_id={user_id} → hearing (no App21 record)")
+                logger.info("[ROUTING] user_id=%s → hearing (no App21 record)",
+                            emit(user_id, "external_ref", "log", "operator"))
         else:
-            print(f"[ROUTING] user_id={user_id} → hearing (in_session)")
+            logger.info("[ROUTING] user_id=%s → hearing (in_session)",
+                        emit(user_id, "external_ref", "log", "operator"))
 
         # ── 既存ヒアリングフロー ──────────────────────────────────────────
         try:
@@ -487,14 +507,16 @@ async def _process_line_event(reply_token: str, user_id: str, user_text: str) ->
             user_business_names[user_id] = kintone_record.get("問い合わせ業者名", "")
             record_id = await post_to_kintone(kintone_record)
             kintone_record_ids[user_id] = record_id
-            print(f"[KINTONE] RECORD created record_id={record_id}")
+            logger.info("[KINTONE] RECORD created record_id=%s",
+                        emit(record_id, "record_id", "log", "operator"))
             claude_reply = clean_reply
 
         # 第2段階：既存レコードを更新
         clean_reply2, update_fields = extract_marker(claude_reply, "KINTONE_UPDATE")
         if update_fields:
-            print(f"[DEBUG] KINTONE_UPDATE detected: {update_fields}")
-            print(f"[DEBUG] stored record_id for user: {kintone_record_ids.get(user_id)!r}")
+            logger.info("[DEBUG] KINTONE_UPDATE detected (redacted)")
+            logger.info("[DEBUG] stored record_id for user: %s",
+                        emit(kintone_record_ids.get(user_id), "record_id", "log", "operator"))
         if update_fields and user_id in kintone_record_ids:
             await update_kintone_record(kintone_record_ids[user_id], update_fields)
             claude_reply = clean_reply2
@@ -504,8 +526,10 @@ async def _process_line_event(reply_token: str, user_id: str, user_text: str) ->
 
     except Exception:
         import traceback
-        print(f"[ERROR] _process_line_event failed user_id={user_id}:")
-        print(traceback.format_exc())
+        logger.error("[ERROR] _process_line_event failed user_id=%s:",
+                     emit(user_id, "external_ref", "log", "operator"))
+        logger.error("[ERROR] traceback: %s",
+                     emit(traceback.format_exc(), "vendor_raw", "log", "operator"))
 
 
 @app.post("/webhook")
@@ -529,7 +553,9 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
         user_text = event["message"]["text"]
 
         background_tasks.add_task(_process_line_event, reply_token, user_id, user_text)
-        print(f"[WEBHOOK] queued user_id={user_id} text={user_text[:20]!r}")
+        logger.info("[WEBHOOK] queued user_id=%s text=%s",
+                    emit(user_id, "external_ref", "log", "operator"),
+                    emit(user_text[:20], "freetext", "log", "operator"))
 
     return {"status": "ok"}
 
@@ -606,7 +632,9 @@ def _pdf_page_count(pdf_bytes: bytes) -> int | None:
         with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
             return doc.page_count
     except Exception as e:
-        print(f"[OCR] ページ数の取得に失敗（従来の単発リクエストへ縮退）: {e}")
+        logger.warning("[OCR] ページ数の取得に失敗（従来の単発リクエストへ縮退）: %s: %s",
+                       type(e).__name__,
+                       emit(str(e), "vendor_raw", "log", "operator"))
         return None
 
 
@@ -744,10 +772,13 @@ async def _search_kintone_record(shozaichi: str) -> str | None:
         "fields[0]": "$id",
     })
     url = f"https://{KINTONE_FUDOSAN_DOMAIN}.cybozu.com/k/v1/records.json?{params}"
-    print(f"[DEBUG] kintone search query: {query}")
+    logger.info("[DEBUG] kintone search query: 所在 like %s",
+                emit(shozaichi, "address", "log", "operator"))
     async with httpx.AsyncClient() as client:
         resp = await client.get(url, headers=headers)
-        print(f"[DEBUG] kintone search status: {resp.status_code} / response: {resp.text}")
+        logger.info("[DEBUG] kintone search status: %s / response: %s",
+                    emit(resp.status_code, "count", "log", "operator"),
+                    emit(resp.text, "vendor_raw", "log", "operator"))
         if not resp.is_success:
             raise Exception(f"kintone検索エラー {resp.status_code}: {resp.text}")
         records = resp.json().get("records", [])
@@ -768,11 +799,13 @@ async def _update_kintone_record(record_id: str, extracted: dict) -> None:
         "固定資産税評価年度": {"value": str(extracted["年度"])   if extracted.get("年度")   is not None else ""},
     }
     body = {"app": KINTONE_FUDOSAN_APP_ID_OCR, "id": record_id, "record": record}
-    print(f"[DEBUG] kintone PUT body: {json.dumps(body, ensure_ascii=False)}")
+    logger.info("[DEBUG] kintone PUT body (redacted)")
     async with httpx.AsyncClient() as client:
         resp = await client.put(url, headers=headers, json=body)
-        print(f"[DEBUG] kintone PUT status: {resp.status_code}")
-        print(f"[DEBUG] kintone PUT response: {resp.text}")
+        logger.info("[DEBUG] kintone PUT status: %s",
+                    emit(resp.status_code, "count", "log", "operator"))
+        logger.info("[DEBUG] kintone PUT response: %s",
+                    emit(resp.text, "vendor_raw", "log", "operator"))
         if not resp.is_success:
             raise Exception(f"kintone更新エラー {resp.status_code}: {resp.text}")
 
@@ -820,7 +853,7 @@ async def ocr_fixed_asset(file: UploadFile = File(...),
     except Exception as e:
         raise HTTPException(status_code=502, detail="Claude抽出エラー（項目抽出に失敗しました）")
 
-    print(f"[DEBUG] extracted: {extracted}")
+    logger.info("[DEBUG] extracted (redacted)")
 
     shozaichi_raw = extracted.get("所在地") or ""
     chiban        = extracted.get("地番")   or ""
@@ -829,7 +862,9 @@ async def ocr_fixed_asset(file: UploadFile = File(...),
                             detail="所在地または地番を抽出できませんでした")
 
     shozaichi = _normalize_shozaichi(shozaichi_raw)
-    print(f"[DEBUG] 所在地: {shozaichi_raw!r} → {shozaichi!r}")
+    logger.info("[DEBUG] 所在地: %s → %s",
+                emit(shozaichi_raw, "address", "log", "operator"),
+                emit(shozaichi, "address", "log", "operator"))
 
     # 4. kintoneで所在地・地番が一致するレコードを検索
     try:
@@ -864,9 +899,9 @@ async def ocr_fixed_asset(file: UploadFile = File(...),
         ok = await hub_notify.push_line_message(
             LINE_USER_ID, notify_text, token_env=hub_notify.business_token_env())
         if not ok:
-            print("[WARN] LINE通知失敗（push_line_message が False）")
+            logger.warning("[WARN] LINE通知失敗（push_line_message が False）")
     else:
-        print("[INFO] LINE_USER_ID未設定のためLINE通知をスキップ")
+        logger.info("[INFO] LINE_USER_ID未設定のためLINE通知をスキップ")
 
     # 7. S4 追記型拡張（souzoku-shorui/02 §3）: App 財産への財産行 upsert。
     #    既存処理（1〜6）成功後にのみ実行。無効時（ZAISAN_SYNC_DISABLED=1 /
@@ -880,7 +915,9 @@ async def ocr_fixed_asset(file: UploadFile = File(...),
             shozaichi=shozaichi, pdf_bytes=pdf_bytes,
             filename=file.filename, case_hint=case_hint)
     except Exception as e:
-        print(f"[WARN] 財産行同期に失敗（既存処理は完了済み）: {e}")
+        logger.warning("[WARN] 財産行同期に失敗（既存処理は完了済み）: %s: %s",
+                       type(e).__name__,
+                       emit(str(e), "vendor_raw", "log", "operator"))
         zaisan_sync = {"status": "error", "detail": str(e)[:200]}
 
     response = {
@@ -977,10 +1014,12 @@ async def _post_scan_to_kintone(app_id: str, api_token: str, fields: dict) -> st
     # None のフィールドは送信しない（DATE/DATETIME型フィールドで400エラーになるため）
     record = {k: {"value": str(v)} for k, v in fields.items() if v is not None}
     body = {"app": app_id, "record": record}
-    print(f"[DEBUG] scan kintone POST body: {json.dumps(body, ensure_ascii=False)}")
+    logger.info("[DEBUG] scan kintone POST body (redacted)")
     async with httpx.AsyncClient() as client:
         resp = await client.post(url, headers=headers, json=body)
-        print(f"[DEBUG] scan kintone POST status: {resp.status_code} / {resp.text}")
+        logger.info("[DEBUG] scan kintone POST status: %s / %s",
+                    emit(resp.status_code, "count", "log", "operator"),
+                    emit(resp.text, "vendor_raw", "log", "operator"))
         resp.raise_for_status()
         return resp.json()["id"]
 
@@ -1032,7 +1071,7 @@ async def scan(req: ScanRequest):
     except Exception as e:
         raise HTTPException(status_code=502, detail="Claude抽出エラー（項目抽出に失敗しました）")
 
-    print(f"[DEBUG] scan extracted ({req.folder_name}): {extracted}")
+    logger.info("[DEBUG] scan extracted (redacted)")
 
     # 相談カード・戸籍謄本: ファイル名・登録日時を付加
     if req.folder_name in ("相談カード", "戸籍謄本"):
@@ -1084,7 +1123,7 @@ async def stripe_webhook(request: Request):
         from hub.inbound_event import record_stripe_event
         outcome, journal_pk = await record_stripe_event(event, payload)
         if outcome == "skipped_duplicate":
-            print("[STRIPE] duplicate delivery skipped (already done)")
+            logger.info("[STRIPE] duplicate delivery skipped (already done)")
             return {"status": "ok", "journal": "skipped_duplicate"}
         if outcome == "in_progress":
             # D14（P1-005c・H01）: 実行中(15分以内)の重複は 200 で飲まず 503。
@@ -1104,7 +1143,7 @@ async def stripe_webhook(request: Request):
             if await _stripe_session_already_filed(session_id):
                 from hub.inbound_event import mark_done
                 await mark_done(journal_pk)
-                print("[STRIPE] reconciled: record already filed")
+                logger.info("[STRIPE] reconciled: record already filed")
                 return {"status": "ok", "journal": "reconciled"}
         await _process_stripe_event(event)
     except HTTPException:
@@ -1145,7 +1184,10 @@ async def _process_stripe_event(event: dict) -> None:
         customer_name = session.get("customer_details", {}).get("name")
         customer_email = session.get("customer_details", {}).get("email")
         amount = session.get("amount_total")
-        print(f"決済完了: {customer_name} / {customer_email} / {amount}円")
+        logger.info("決済完了: %s / %s / %s円",
+                    emit(customer_name, "name", "log", "operator"),
+                    emit(customer_email, "email", "log", "operator"),
+                    emit(amount, "count", "log", "operator"))
         # kintoneに新規レコード作成
         kintone_url = f"https://{os.environ.get('KINTONE_SUBDOMAIN')}.cybozu.com/k/v1/record.json"
         kintone_headers = {

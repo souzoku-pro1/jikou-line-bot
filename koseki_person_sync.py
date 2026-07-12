@@ -21,10 +21,14 @@
 """
 
 import json
+import logging
 import os
 import re
 
 from hub import kintone
+from hub.redact import emit
+
+logger = logging.getLogger("koseki_person_sync")
 
 APP_KOSEKI_BOOK = kintone.KintoneApp(
     "App 33 (戸籍読解)", "APP_KOSEKI_BOOK", "TOKEN_KOSEKI_BOOK")
@@ -241,8 +245,10 @@ async def sync_persons_from_koseki(koseki_record_id: str) -> dict:
         await _create_or_skip(p, reading, koseki_record, koseki_record_id, role,
                               parent_ids if role == "子" else {}, results)
 
-    print(f"[KOSEKI_PERSON_SYNC] koseki={koseki_record_id} "
-          f"created={len(results['created'])} skipped={len(results['skipped'])}")
+    logger.info("[KOSEKI_PERSON_SYNC] koseki=%s created=%s skipped=%s",
+                emit(koseki_record_id, "record_id", "log", "operator"),
+                emit(len(results["created"]), "count", "log", "operator"),
+                emit(len(results["skipped"]), "count", "log", "operator"))
     return results
 
 
@@ -255,7 +261,7 @@ async def sync_missing_persons(limit: int = 20) -> list[dict]:
     KOSEKI_PERSON_SYNC_ENABLED フラグには依存しない（手動呼び出し自体が明示承認）。
     """
     if not (APP_KOSEKI_PERSON.app_id() and APP_KOSEKI_PERSON.token()):
-        print("[KOSEKI_PERSON_SYNC] 回収スキップ（APP_KOSEKI_PERSON 未設定）")
+        logger.info("[KOSEKI_PERSON_SYNC] 回収スキップ（APP_KOSEKI_PERSON 未設定）")
         return []
     records = await kintone.search_records(
         APP_KOSEKI_BOOK,
@@ -278,8 +284,11 @@ async def sync_missing_persons(limit: int = 20) -> list[dict]:
                 continue
             results.append(await sync_persons_from_koseki(koseki_id))
         except Exception as e:
-            print(f"[KOSEKI_PERSON_SYNC] 回収失敗（他の戸籍は継続）"
-                  f" koseki={koseki_id}: {e}")
+            logger.info("[KOSEKI_PERSON_SYNC] 回収失敗（他の戸籍は継続）"
+                        " koseki=%s: %s: %s",
+                        emit(koseki_id, "record_id", "log", "operator"),
+                        type(e).__name__,
+                        emit(str(e), "vendor_raw", "log", "operator"))
             results.append({"status": "error", "koseki_record_id": koseki_id,
                             "detail": str(e)[:200]})
     return results

@@ -24,12 +24,16 @@
 
 import base64
 import json
+import logging
 import os
 import re
 import unicodedata
 
 from config import KOSEKI_SECOND_OPINION_PROMPT
 from hub import kintone
+from hub.redact import emit
+
+logger = logging.getLogger("koseki_second_opinion")
 
 AGREE_CONFIDENCE = 0.95  # 一致時の引き上げ先（max(現値, これ)）
 
@@ -297,9 +301,12 @@ async def maybe_second_opinion(record: dict, reading: dict) -> dict:
         second = await read_pdf_with_claude(pdf_bytes)
         merged = merge_second_opinion(reading, second)
         so = merged[SO_KEY]
-        print(f"[SECOND_OPINION] done 一致={so['一致']} "
-              f"不一致={len(so['不一致'])} 要目視={so['要目視']}")
+        logger.info("[SECOND_OPINION] done 一致=%s 不一致=%s",
+                    emit(so["一致"], "count", "log", "operator"),
+                    emit(len(so["不一致"]), "count", "log", "operator"))
         return merged
     except Exception as e:
-        print(f"[SECOND_OPINION] 再読解に失敗（一次読解のまま続行）: {e}")
+        logger.info("[SECOND_OPINION] 再読解に失敗（一次読解のまま続行）: %s: %s",
+                    type(e).__name__,
+                    emit(str(e), "vendor_raw", "log", "operator"))
         return {**reading, SO_KEY: {"実施": False, "エラー": str(e)[:200]}}

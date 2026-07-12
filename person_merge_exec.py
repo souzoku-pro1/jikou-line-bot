@@ -27,16 +27,20 @@
 """
 
 import json
+import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
 from hub import kintone
+from hub.redact import emit
 from person_merge import (
     APP_KOSEKI_PERSON,
     APP_SHIPPING,
     merge_enabled,
     _v,
 )
+
+logger = logging.getLogger("person_merge_exec")
 
 STATUS_PENDING = "要確認"
 STATUS_DONE = "完了"
@@ -93,7 +97,7 @@ async def list_merge_candidates() -> list[MergeCandidate]:
     """未処理（要確認・未実行）の person_merge 封筒を取得する。
     env 未設定は空リスト（上位=T2 が明示メッセージを出す）"""
     if not (APP_SHIPPING.app_id() and APP_SHIPPING.token()):
-        print("[PERSON_MERGE_EXEC] APP_SHIPPING 未設定のため候補を取得できません")
+        logger.info("[PERSON_MERGE_EXEC] APP_SHIPPING 未設定のため候補を取得できません")
         return []
     records = await kintone.search_records(
         APP_SHIPPING,
@@ -288,9 +292,12 @@ async def execute_merge(cand: MergeCandidate) -> dict:
         "発送ステータス": STATUS_DONE,
         "実行済み": "yes",
     })
-    print(f"[PERSON_MERGE_EXEC] merged winner=No.{cand.winner_id} "
-          f"loser=No.{cand.loser_id}(deleted) review=No.{cand.review_record_id} "
-          f"repointed={len(repoint_plans)}")
+    logger.info("[PERSON_MERGE_EXEC] merged winner=No.%s loser=No.%s(deleted) "
+                "review=No.%s repointed=%s",
+                emit(cand.winner_id, "record_id", "log", "operator"),
+                emit(cand.loser_id, "record_id", "log", "operator"),
+                emit(cand.review_record_id, "record_id", "log", "operator"),
+                emit(len(repoint_plans), "count", "log", "operator"))
     return {"status": "merged", "winner_id": cand.winner_id,
             "loser_id": cand.loser_id, "repointed": repoint_plans,
             "review_record_id": cand.review_record_id}
@@ -325,7 +332,8 @@ async def reject_pair(cand: MergeCandidate) -> dict:
         "発送ステータス": STATUS_DONE,
         "実行済み": "yes",
     })
-    print(f"[PERSON_MERGE_EXEC] rejected pair={cand.pair_key} "
-          f"review=No.{cand.review_record_id}（再起票を恒久抑止）")
+    logger.info("[PERSON_MERGE_EXEC] rejected pair=%s review=No.%s（再起票を恒久抑止）",
+                emit(cand.pair_key, "record_id", "log", "operator"),
+                emit(cand.review_record_id, "record_id", "log", "operator"))
     return {"status": "rejected", "pair_key": cand.pair_key,
             "review_record_id": cand.review_record_id}

@@ -11,11 +11,16 @@
 
 
 import json
+import logging
 
 import anthropic
 
 from claude_gateway import create_message_with_fallback
 from dispatch_bot import registry
+from hub.redact import emit
+
+
+logger = logging.getLogger("dispatch_bot.parser")
 
 
 _client: anthropic.AsyncAnthropic | None = None
@@ -117,10 +122,11 @@ async def parse_instruction(text: str) -> dict:
             # raw confidence（正規化前）と task_params 要約も出す（2026-07-04 調査で
             # 「正規化発動の有無」「抽出結果」がログから判別できなかったため）
             params = json.dumps(parsed["task_params"], ensure_ascii=False)[:300]
-            print(f"[DISPATCHBOT] parsed intent={parsed['intent']} "
-                  f"task={parsed['task_type']} conf={parsed['confidence']} "
-                  f"(raw_conf={raw.get('confidence')!r}) "
-                  f"customer={parsed['customer_name']!r} params={params}")
+            # intent / task_type / confidence / raw_conf は controlled status enum
+            # （素通し kind なし）→ 出力から drop。customer/params は emit 契約経由で抑止。
+            logger.info("[DISPATCHBOT] parsed customer=%s params=%s",
+                        emit(parsed["customer_name"], "name", "log", "operator"),
+                        emit(params, "freetext", "log", "operator"))
             return parsed
     raise ValueError("parse_instruction の tool_use ブロックがありません "
                      f"(stop_reason={response.stop_reason})")

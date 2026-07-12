@@ -16,13 +16,17 @@
 - env フラグは PERSON_MERGE_ENABLED を共用（名寄せ系と同じ有効化単位・既定無効）
 """
 
+import logging
 import os
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from hub import kintone
+from hub.redact import emit
 from person_merge import APP_KOSEKI_PERSON, merge_enabled, _v
+
+logger = logging.getLogger("person_confirm")
 
 # 語彙から書き込める確認フィールド（裁定1のスコープ）
 CONFIRM_FIELDS = ("名寄せ確定", "確認状態", "生死区分", "死亡日", "被相続人フラグ")
@@ -67,7 +71,7 @@ def _hints(record: dict) -> list[str]:
 async def list_case_persons(case_record_id: str) -> list[PersonRow]:
     """案件の人物一覧（読み取りのみ）。env 未設定は空リスト"""
     if not (APP_KOSEKI_PERSON.app_id() and APP_KOSEKI_PERSON.token()):
-        print("[PERSON_CONFIRM] APP_KOSEKI_PERSON 未設定のため人物を取得できません")
+        logger.info("[PERSON_CONFIRM] APP_KOSEKI_PERSON 未設定のため人物を取得できません")
         return []
     records = await kintone.search_records(
         APP_KOSEKI_PERSON,
@@ -131,10 +135,13 @@ async def apply_confirmations(changes_list: list[dict]) -> list[dict]:
             await kintone.update_record(APP_KOSEKI_PERSON, rid, payload)
             results.append({"record_id": rid, "name": name,
                             "status": "updated", "fields": payload})
-            print(f"[PERSON_CONFIRM] updated No.{rid} {name} "
-                  f"fields={sorted(payload)}")
+            logger.info("[PERSON_CONFIRM] updated No.%s %s",
+                        emit(rid, "record_id", "log", "operator"),
+                        emit(name, "name", "log", "operator"))
         except Exception as e:
             results.append({"record_id": rid, "name": name, "status": "error",
                             "reason": str(e)[:200]})
-            print(f"[PERSON_CONFIRM] 更新失敗（他の人物は継続） No.{rid}: {e}")
+            logger.info("[PERSON_CONFIRM] 更新失敗（他の人物は継続） No.%s cls=%s: %s",
+                        emit(rid, "record_id", "log", "operator"),
+                        type(e).__name__, emit(str(e), "vendor_raw", "log", "operator"))
     return results

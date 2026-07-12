@@ -12,12 +12,17 @@
 """
 
 import json
+import logging
 import os
 from datetime import datetime, timedelta, timezone
 
 from dispatch_bot.case_search import APP_CASE
 from dispatch_bot.confirm import Pending
 from hub import kintone
+from hub.redact import emit
+
+
+logger = logging.getLogger("dispatch_bot.app30_filer")
 
 
 _JST = timezone(timedelta(hours=9))
@@ -96,7 +101,9 @@ async def file_from_pending(pending: Pending) -> tuple[str, str, bool]:
     """
     existing = await find_existing(pending.command_id)
     if existing:
-        print(f"[DISPATCHBOT] duplicate filing blocked cmd={pending.command_id[:8]} -> No.{existing}")
+        logger.info("[DISPATCHBOT] duplicate filing blocked cmd=%s -> No.%s",
+                    emit(pending.command_id[:8], "record_id", "log", "operator"),
+                    emit(existing, "record_id", "log", "operator"))
         return existing, record_url(existing), True
 
     # 宛先・顧客名は App 21 の案件データから（05 §3.1: 宛先は案件から解決）
@@ -119,5 +126,7 @@ async def file_from_pending(pending: Pending) -> tuple[str, str, bool]:
     # 発射されず、/hub/dispatch → prepare が走らない（2026-07-04 実機不具合の原因。
     # サイボウズ 2025-03-21 障害告知でも一括APIは Webhook 非送信が正規仕様と示されている）
     rid = str(await kintone.create_record(APP_SHIPPING, fields))
-    print(f"[DISPATCHBOT] filed App30 No.{rid} cmd={pending.command_id[:8]}")
+    logger.info("[DISPATCHBOT] filed App30 No.%s cmd=%s",
+                emit(rid, "record_id", "log", "operator"),
+                emit(pending.command_id[:8], "record_id", "log", "operator"))
     return rid, record_url(rid), False

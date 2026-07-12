@@ -28,6 +28,7 @@
 """
 
 import json
+import logging
 import os
 import statistics
 
@@ -36,6 +37,9 @@ import anthropic
 from claude_gateway import create_message_with_fallback
 from config import KOSEKI_READER_PROMPTS
 from hub import kintone
+from hub.redact import emit
+
+logger = logging.getLogger("koseki_reader")
 
 APP_KOSEKI_BOOK = kintone.KintoneApp(
     "App 33 (戸籍読解)", "APP_KOSEKI_BOOK", "TOKEN_KOSEKI_BOOK")
@@ -390,7 +394,10 @@ async def process_unread_records(limit: int = 20) -> list[dict]:
         try:
             results.append(await process_record(record_id))
         except Exception as e:
-            print(f"[KOSEKI_READER] record {record_id} の読解に失敗（未読解のまま）: {e}")
+            logger.info("[KOSEKI_READER] record %s の読解に失敗（未読解のまま）: %s: %s",
+                        emit(record_id, "record_id", "log", "operator"),
+                        type(e).__name__,
+                        emit(str(e), "vendor_raw", "log", "operator"))
             results.append({"status": "error", "record_id": record_id,
                             "detail": str(e)[:200]})
     return results
