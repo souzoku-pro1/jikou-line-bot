@@ -58,36 +58,41 @@ _SINK_REQUIRED_POLICY = {
 # ══════════════════════════════════════════════════════════════
 
 class _Bindings:
-    """H01: 信頼できる emit 束縛のみを収集する。
+    """H01/NH01: 信頼できる emit 束縛を **1 形式のみ** に限定 + shadow 全面禁止。
 
-    - `from hub.redact import emit [as X]` → local 名（emit / X）を emit_names へ
-    - `import hub.redact` → hub.redact.emit を許可（emit_module_attrs に ('hub.redact',)）
-    - `from hub import redact` / `import hub.redact as r` → <alias>.emit を許可
-    束縛外の同名 emit（ローカル def・別 module の .emit）は信頼しない。
+    信頼する唯一の形式:
+        from hub.redact import emit        # alias 無しのみ
+
+    - `from hub.redact import emit as X` / `import hub.redact`（→hub.redact.emit）/
+      `from hub import redact`（→redact.emit）等の module 修飾・別名は **信頼しない**。
+      これらの呼び出しは untrusted＝引数として安全でない（外側 sink が違反になる）。
+    - **shadow 禁止**: ファイル内に `emit` という名前の他の束縛が1つでもあれば、
+      その束縛を `emit_shadow` 違反として記録し、**そのファイルの全 emit 呼び出しを
+      信頼しない**（trusted=False）。
     """
 
     def __init__(self):
-        self.emit_names = set()          # 直接 emit(...) を許すローカル名
-        self.emit_module_aliases = set()  # <alias>.emit(...) を許す module 別名
+        self.trusted = False        # 信頼 emit 呼び出しを許すか
+        self.shadow_lines = set()   # emit shadow 束縛の行番号
         self.print_aliases = set()
         self.httpexc_names = {"HTTPException"}
 
 
-def _dotted(node: ast.AST) -> str | None:
-    """a.b.c の attribute/name チェーンを 'a.b.c' に（それ以外は None）"""
-    parts = []
-    while isinstance(node, ast.Attribute):
-        parts.append(node.attr)
-        node = node.value
-    if isinstance(node, ast.Name):
-        parts.append(node.id)
-        return ".".join(reversed(parts))
-    return None
+def _iter_arg_nodes(arguments: ast.arguments):
+    for a in (list(arguments.posonlyargs) + list(arguments.args)
+              + list(arguments.kwonlyargs)):
+        yield a
+    if arguments.vararg:
+        yield arguments.vararg
+    if arguments.kwarg:
+        yield arguments.kwarg
 
 
 def collect_bindings(tree: ast.AST) -> _Bindings:
     b = _Bindings()
+    trusted_import = False
     for node in ast.walk(tree):
+        # ── import 群 ──
         if isinstance(node, ast.ImportFrom):
             mod = node.module or ""
             for a in node.names:
@@ -96,34 +101,52 @@ def collect_bindings(tree: ast.AST) -> _Bindings:
                     b.print_aliases.add(local)
                 if a.name == "HTTPException":
                     b.httpexc_names.add(local)
-                # from hub.redact import emit [as X]
-                if mod == "hub.redact" and a.name == "emit":
-                    b.emit_names.add(local)
-                # from hub import redact [as r] → r.emit
-                if mod == "hub" and a.name == "redact":
-                    b.emit_module_aliases.add(local)
+                # 唯一の信頼形式: from hub.redact import emit（alias 無し）
+                if mod == "hub.redact" and a.name == "emit" and a.asname is None:
+                    trusted_import = True
+                # 上記以外で 'emit' を束縛する import は shadow
+                elif a.asname == "emit" or (a.asname is None and a.name == "emit"):
+                    b.shadow_lines.add(node.lineno)
         elif isinstance(node, ast.Import):
             for a in node.names:
-                # import hub.redact [as r]
-                if a.name == "hub.redact":
-                    b.emit_module_aliases.add(a.asname or "hub.redact")
-        elif isinstance(node, ast.Assign):
-            if isinstance(node.value, ast.Name) and node.value.id == "print":
-                for tgt in node.targets:
-                    if isinstance(tgt, ast.Name):
-                        b.print_aliases.add(tgt.id)
+                if a.name == "emit" or a.asname == "emit":
+                    b.shadow_lines.add(node.lineno)
+        # ── print 別名の代入 ──
+        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Name) \
+                and node.value.id == "print":
+            for tgt in node.targets:
+                if isinstance(tgt, ast.Name):
+                    b.print_aliases.add(tgt.id)
+        # ── shadow: def / class / async def emit ──
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
+                             ast.ClassDef)) and node.name == "emit":
+            b.shadow_lines.add(node.lineno)
+        # ── shadow: 関数/lambda の parameter 名 emit ──
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            for arg in _iter_arg_nodes(node.args):
+                if arg.arg == "emit":
+                    b.shadow_lines.add(arg.lineno)
+        # ── shadow: except as emit ──
+        if isinstance(node, ast.ExceptHandler) and node.name == "emit":
+            b.shadow_lines.add(node.lineno)
+        # ── shadow: global / nonlocal emit ──
+        if isinstance(node, (ast.Global, ast.Nonlocal)) and "emit" in node.names:
+            b.shadow_lines.add(node.lineno)
+        # ── shadow: Store される Name 'emit'（代入・for・with as・
+        #    comprehension 変数・walrus・aug 代入 を一括カバー） ──
+        if isinstance(node, ast.Name) and node.id == "emit" \
+                and isinstance(node.ctx, ast.Store):
+            b.shadow_lines.add(node.lineno)
+
+    b.trusted = trusted_import and not b.shadow_lines
     return b
 
 
 def _is_trusted_emit(node: ast.Call, b: _Bindings) -> bool:
-    """H01: hub.redact の emit 束縛に一致する呼び出しだけを emit と認める"""
+    """H01/NH01: 信頼形式（alias 無し import）由来の `emit(...)` 直接呼び出しのみ。
+    shadow があるファイルでは b.trusted=False なので全て untrusted。"""
     f = node.func
-    if isinstance(f, ast.Name):
-        return f.id in b.emit_names
-    if isinstance(f, ast.Attribute) and f.attr == "emit":
-        base = _dotted(f.value)
-        return base in b.emit_module_aliases  # <alias>.emit / hub.redact.emit
-    return False
+    return isinstance(f, ast.Name) and f.id == "emit" and b.trusted
 
 
 def _const_str(node: ast.AST):
@@ -191,6 +214,10 @@ def scan_source(src: str, name: str) -> list[str]:
     tree = ast.parse(src, filename=name)
     b = collect_bindings(tree)
     violations = []
+
+    # emit shadow 束縛（NH01・全面禁止）を記録
+    for ln in b.shadow_lines:
+        violations.append(f"{name}:{ln}:emit_shadow")
 
     for node in ast.walk(tree):
         # print 別名の生成（p = print / import as）を境界違反として記録
@@ -290,15 +317,17 @@ class TestScannerDetection(unittest.TestCase):
         ("httpexc_module",
          "import fastapi\nraise fastapi.HTTPException(detail=resp.text)\n",
          {"sink:httpexception"}),
-        # H01: 束縛外 emit（偽 emit・ローカル def）は信頼しない
+        # H01: 束縛外 emit（偽 module.emit・無 import）は信頼しない
         ("fake_module_emit",
          "logger.info(fake.emit(customer_name))\n", {"sink:logger"}),
-        ("local_def_emit",
-         "def emit(v):\n    return v\nlogger.info(emit(customer_name))\n",
-         {"sink:logger"}),
         ("bare_emit_no_import",
          "logger.info(emit(customer_name))\n", {"sink:logger"}),
-        # H02: 正規 emit でも policy 不一致（logger に line_customer 指定）は違反
+        # H01: module 修飾形は信頼廃止（1 形式のみ）
+        ("module_qualified_emit",
+         "import hub.redact\n"
+         "logger.info(hub.redact.emit(x, 'name', 'log', 'operator'))\n",
+         {"sink:logger"}),
+        # H02: 正規 emit でも policy 不一致は違反
         ("policy_mismatch_logger",
          "from hub.redact import emit\n"
          "logger.info(emit(name, 'name', 'line_customer', 'customer'))\n",
@@ -315,6 +344,42 @@ class TestScannerDetection(unittest.TestCase):
         ("exc_info_true", "logger.error('x', exc_info=True)\n", {"sink:logger"}),
         ("stack_info_true", "logger.error('x', stack_info=True)\n",
          {"sink:logger"}),
+        # NH01: shadow（正規 import があっても poison）——束縛=emit_shadow・呼出=distrust
+        ("shadow_def_emit",
+         "from hub.redact import emit\ndef emit(v):\n    return v\n"
+         "logger.info(emit(x, 'name', 'log', 'operator'))\n",
+         {"emit_shadow", "sink:logger"}),
+        ("shadow_assign_fake",
+         "from hub.redact import emit\nemit = fake_emit\n"
+         "logger.info(emit(x, 'name', 'log', 'operator'))\n",
+         {"emit_shadow", "sink:logger"}),
+        ("shadow_param",
+         "from hub.redact import emit\ndef f(emit, x):\n"
+         "    logger.info(emit(x, 'name', 'log', 'operator'))\n",
+         {"emit_shadow", "sink:logger"}),
+        ("shadow_evil_import_then_valid",
+         "from evil import emit\nfrom hub.redact import emit\n"
+         "logger.info(emit(x, 'name', 'log', 'operator'))\n",
+         {"emit_shadow", "sink:logger"}),
+        ("shadow_comprehension",
+         "from hub.redact import emit\nys = [emit for emit in xs]\n"
+         "logger.info(emit(x, 'name', 'log', 'operator'))\n",
+         {"emit_shadow", "sink:logger"}),
+        ("shadow_except_as",
+         "from hub.redact import emit\ntry:\n    pass\n"
+         "except Exception as emit:\n"
+         "    logger.info(emit(x, 'name', 'log', 'operator'))\n",
+         {"emit_shadow", "sink:logger"}),
+        ("shadow_walrus",
+         "from hub.redact import emit\nif (emit := f()):\n"
+         "    logger.info(emit(x, 'name', 'log', 'operator'))\n",
+         {"emit_shadow", "sink:logger"}),
+        ("shadow_import_as",
+         "from hub.redact import emit\nimport json as emit\n"
+         "logger.info(emit(x, 'name', 'log', 'operator'))\n",
+         {"emit_shadow", "sink:logger"}),
+        ("shadow_only_no_call",
+         "def emit(v):\n    return v\n", {"emit_shadow"}),
     ]
     # 合格すべき（全引数が定数 / 定数 f-string / 信頼 emit で policy 一致 / 結合）
     SAFE_CASES = [
@@ -325,19 +390,10 @@ class TestScannerDetection(unittest.TestCase):
         ("logger_const_fstring", "logger.info(f'no vars here')\n"),
         ("httpexc_const",
          "raise HTTPException(status_code=500, detail='not found')\n"),
-        # H01: 3 束縛それぞれの正規 emit（policy 一致）は合格
+        # H01/NH01: 唯一の信頼形式（alias 無し import・shadow 無し）だけ合格
         ("emit_from_import",
          "from hub.redact import emit\n"
          "logger.info(emit(x, 'name', 'log', 'operator'))\n"),
-        ("emit_from_import_as",
-         "from hub.redact import emit as R\n"
-         "logger.info(R(x, 'name', 'log', 'operator'))\n"),
-        ("emit_import_module",
-         "import hub.redact\n"
-         "logger.info(hub.redact.emit(x, 'name', 'log', 'operator'))\n"),
-        ("emit_from_hub_import_redact",
-         "from hub import redact\n"
-         "logger.info(redact.emit(x, 'name', 'log', 'operator'))\n"),
         # H02: httpexception には exception_detail/caller policy の emit なら合格
         ("emit_httpexc_policy",
          "from hub.redact import emit\n"
@@ -413,7 +469,7 @@ class TestSinkAllowlist(unittest.TestCase):
                              f"（現在 {len(self.current)}）。新規 sink 直書きの疑い。")
 
     def test_allowlist_entries_are_well_formed(self):
-        ok_rules = {"print_alias", "sink:print", "sink:logger",
+        ok_rules = {"print_alias", "emit_shadow", "sink:print", "sink:logger",
                     "sink:logger_log", "sink:logging_module",
                     "sink:httpexception", "sink:stdio_write"}
         for e in self.allow:
