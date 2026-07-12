@@ -1,7 +1,7 @@
 {
   "baseline_count": 211,
-  "generated_by": "P1-101d-shadow-ban",
-  "note": "sink 直書き債務台帳。信頼emitは from hub.redact import emit（alias無し）の1形式のみ。emit名の他束縛(def/代入/param/for/with/except/comprehension/walrus/global/nonlocal/別import)は emit_shadow 違反かつ同ファイルの全emit呼出を信頼しない。sink全引数が 定数/定数f-string/信頼emit(policy一致)/結合 のみで合格、exc_info/stack_infoはTrue含め違反。新規禁止・stale削除必須・総数は baseline_count 上限。",
+  "generated_by": "P1-101e-match-star-del",
+  "note": "sink 直書き債務台帳。信頼emitは from hub.redact import emit(alias無し)1形式のみ。emit名の他束縛(def/代入/param/for/with/except/comprehension/walrus/global/nonlocal/別import/match capture〔MatchAs/MatchStar/MatchMapping.rest〕/信頼emit同居のstar import/del emit)は emit_shadow+poison。信頼emitファイル内のexec()/globals()[]=/locals()[]=は dynamic_name_op+poison。完全動的経路(builtins fallback等)は静的解析の原理的限界で対象外。sink全引数が 定数/定数f-string/信頼emit(policy一致)/結合 のみで合格、exc_info/stack_infoはTrue含め違反。新規禁止・stale削除必須・総数は baseline_count 上限。",
   "entries": [
     "bank_ingest.py:103:sink:print",
     "bank_ingest.py:238:sink:httpexception",

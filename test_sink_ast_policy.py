@@ -63,17 +63,28 @@ class _Bindings:
     信頼する唯一の形式:
         from hub.redact import emit        # alias 無しのみ
 
-    - `from hub.redact import emit as X` / `import hub.redact`（→hub.redact.emit）/
-      `from hub import redact`（→redact.emit）等の module 修飾・別名は **信頼しない**。
-      これらの呼び出しは untrusted＝引数として安全でない（外側 sink が違反になる）。
-    - **shadow 禁止**: ファイル内に `emit` という名前の他の束縛が1つでもあれば、
-      その束縛を `emit_shadow` 違反として記録し、**そのファイルの全 emit 呼び出しを
-      信頼しない**（trusted=False）。
+    - module 修飾・別名（`emit as X` / `hub.redact.emit` / `redact.emit`）は信頼しない。
+    - **shadow 全面禁止**: ファイル内に `emit` という名前の他束縛が1つでもあれば、
+      その束縛を `emit_shadow` 違反として記録し、そのファイルの全 emit 呼び出しを
+      信頼しない（poison・trusted=False）。検出する束縛（P1-101d/e）:
+        def/class/async def・代入/annotated/walrus/aug・関数/lambda param・
+        for/with as/except as/comprehension/global/nonlocal・別 import/import as emit・
+        **match capture（MatchAs/MatchStar/MatchMapping.rest・P1-101e H01）**・
+        **信頼 emit と同居する star import `from x import *`（P1-101e H02）**・
+        **del emit（P1-101e M01）**。
+    - **dynamic_name_op（P1-101e・別規則）**: 信頼 emit import を持つファイル内の
+      `exec(...)` 呼び出し・`globals()[...]=` / `locals()[...]=` 代入を検出・poison。
+
+    **静的解析の原理的限界（明記）**: 完全に動的な名前操作
+    （`builtins.emit=...` 経由の fallback、`__import__`/属性経由の間接束縛、
+    文字列連結して `exec` に渡す等）は AST から静的に確定できず、本スキャナの
+    対象外。上記 `exec`/`globals()`/`locals()` の直接形のみを別規則で塞ぐ。
     """
 
     def __init__(self):
-        self.trusted = False        # 信頼 emit 呼び出しを許すか
-        self.shadow_lines = set()   # emit shadow 束縛の行番号
+        self.trusted = False          # 信頼 emit 呼び出しを許すか
+        self.shadow_lines = set()     # emit_shadow 束縛の行番号
+        self.dynamic_lines = set()    # dynamic_name_op（exec/globals/locals）の行
         self.print_aliases = set()
         self.httpexc_names = {"HTTPException"}
 
@@ -91,12 +102,17 @@ def _iter_arg_nodes(arguments: ast.arguments):
 def collect_bindings(tree: ast.AST) -> _Bindings:
     b = _Bindings()
     trusted_import = False
+    star_lines = set()      # 信頼 emit がある場合のみ poison する star import 行
+    dynamic_cand = set()    # 同上・exec/globals/locals の候補行
     for node in ast.walk(tree):
         # ── import 群 ──
         if isinstance(node, ast.ImportFrom):
             mod = node.module or ""
             for a in node.names:
                 local = a.asname or a.name
+                if a.name == "*":                     # from x import *（H02）
+                    star_lines.add(node.lineno)
+                    continue
                 if a.name == "print":
                     b.print_aliases.add(local)
                 if a.name == "HTTPException":
@@ -132,19 +148,40 @@ def collect_bindings(tree: ast.AST) -> _Bindings:
         # ── shadow: global / nonlocal emit ──
         if isinstance(node, (ast.Global, ast.Nonlocal)) and "emit" in node.names:
             b.shadow_lines.add(node.lineno)
-        # ── shadow: Store される Name 'emit'（代入・for・with as・
-        #    comprehension 変数・walrus・aug 代入 を一括カバー） ──
-        if isinstance(node, ast.Name) and node.id == "emit" \
-                and isinstance(node.ctx, ast.Store):
+        # ── shadow: match capture（H01）──
+        if isinstance(node, ast.MatchAs) and node.name == "emit":
             b.shadow_lines.add(node.lineno)
+        if isinstance(node, ast.MatchStar) and node.name == "emit":
+            b.shadow_lines.add(node.lineno)
+        if isinstance(node, ast.MatchMapping) and node.rest == "emit":
+            b.shadow_lines.add(node.lineno)
+        # ── shadow: Store / Del される Name 'emit'（代入・for・with as・
+        #    comprehension・walrus・aug 代入・del emit〔M01〕を一括カバー）──
+        if isinstance(node, ast.Name) and node.id == "emit" \
+                and isinstance(node.ctx, (ast.Store, ast.Del)):
+            b.shadow_lines.add(node.lineno)
+        # ── dynamic_name_op 候補: exec(...) ──
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) \
+                and node.func.id == "exec":
+            dynamic_cand.add(node.lineno)
+        # ── dynamic_name_op 候補: globals()[...]= / locals()[...]= ──
+        if isinstance(node, ast.Subscript) and isinstance(node.ctx, ast.Store) \
+                and isinstance(node.value, ast.Call) \
+                and isinstance(node.value.func, ast.Name) \
+                and node.value.func.id in ("globals", "locals"):
+            dynamic_cand.add(node.lineno)
 
-    b.trusted = trusted_import and not b.shadow_lines
+    # star import / dynamic は「信頼 emit import を持つファイル」に限り poison
+    if trusted_import:
+        b.shadow_lines |= star_lines
+        b.dynamic_lines |= dynamic_cand
+    b.trusted = trusted_import and not b.shadow_lines and not b.dynamic_lines
     return b
 
 
 def _is_trusted_emit(node: ast.Call, b: _Bindings) -> bool:
     """H01/NH01: 信頼形式（alias 無し import）由来の `emit(...)` 直接呼び出しのみ。
-    shadow があるファイルでは b.trusted=False なので全て untrusted。"""
+    shadow / dynamic があるファイルでは b.trusted=False なので全て untrusted。"""
     f = node.func
     return isinstance(f, ast.Name) and f.id == "emit" and b.trusted
 
@@ -218,6 +255,9 @@ def scan_source(src: str, name: str) -> list[str]:
     # emit shadow 束縛（NH01・全面禁止）を記録
     for ln in b.shadow_lines:
         violations.append(f"{name}:{ln}:emit_shadow")
+    # 動的名前操作（P1-101e・別規則）を記録
+    for ln in b.dynamic_lines:
+        violations.append(f"{name}:{ln}:dynamic_name_op")
 
     for node in ast.walk(tree):
         # print 別名の生成（p = print / import as）を境界違反として記録
@@ -380,6 +420,42 @@ class TestScannerDetection(unittest.TestCase):
          {"emit_shadow", "sink:logger"}),
         ("shadow_only_no_call",
          "def emit(v):\n    return v\n", {"emit_shadow"}),
+        # P1-101e H01: match capture
+        ("shadow_match_capture",
+         "from hub.redact import emit\nmatch x:\n    case emit:\n"
+         "        logger.info(emit(v, 'name', 'log', 'operator'))\n",
+         {"emit_shadow", "sink:logger"}),
+        ("shadow_match_as",
+         "from hub.redact import emit\nmatch x:\n    case [y] as emit:\n"
+         "        logger.info(emit(v, 'name', 'log', 'operator'))\n",
+         {"emit_shadow", "sink:logger"}),
+        ("shadow_match_star",
+         "from hub.redact import emit\nmatch x:\n    case [*emit]:\n"
+         "        logger.info(emit(v, 'name', 'log', 'operator'))\n",
+         {"emit_shadow", "sink:logger"}),
+        ("shadow_match_mapping_rest",
+         "from hub.redact import emit\nmatch x:\n    case {'k': _, **emit}:\n"
+         "        logger.info(emit(v, 'name', 'log', 'operator'))\n",
+         {"emit_shadow", "sink:logger"}),
+        # P1-101e H02: star import（信頼 emit と同居）
+        ("shadow_star_import",
+         "from hub.redact import emit\nfrom evil import *\n"
+         "logger.info(emit(v, 'name', 'log', 'operator'))\n",
+         {"emit_shadow", "sink:logger"}),
+        # P1-101e M01: del emit
+        ("shadow_del_emit",
+         "from hub.redact import emit\ndel emit\n"
+         "logger.info(emit(v, 'name', 'log', 'operator'))\n",
+         {"emit_shadow", "sink:logger"}),
+        # P1-101e 別規則: dynamic_name_op
+        ("dynamic_globals_assign",
+         "from hub.redact import emit\nglobals()['emit'] = fake\n"
+         "logger.info(emit(v, 'name', 'log', 'operator'))\n",
+         {"dynamic_name_op", "sink:logger"}),
+        ("dynamic_exec",
+         "from hub.redact import emit\nexec('emit = fake')\n"
+         "logger.info(emit(v, 'name', 'log', 'operator'))\n",
+         {"dynamic_name_op", "sink:logger"}),
     ]
     # 合格すべき（全引数が定数 / 定数 f-string / 信頼 emit で policy 一致 / 結合）
     SAFE_CASES = [
@@ -409,6 +485,13 @@ class TestScannerDetection(unittest.TestCase):
         ("logger_concat_const_emit",
          "from hub.redact import emit\n"
          "logger.info('p:' + emit(x, 'name', 'log', 'operator'))\n"),
+        # 信頼 emit を持たないファイルの star import / exec / globals は台帳ノイズにしない
+        ("star_import_no_trusted_emit",
+         "from evil import *\nlogger.info('static')\n"),
+        ("exec_no_trusted_emit",
+         "exec('x = 1')\nlogger.info('static')\n"),
+        ("globals_assign_no_trusted_emit",
+         "globals()['x'] = 1\nlogger.info('static')\n"),
     ]
 
     def test_violation_patterns(self):
@@ -469,9 +552,10 @@ class TestSinkAllowlist(unittest.TestCase):
                              f"（現在 {len(self.current)}）。新規 sink 直書きの疑い。")
 
     def test_allowlist_entries_are_well_formed(self):
-        ok_rules = {"print_alias", "emit_shadow", "sink:print", "sink:logger",
-                    "sink:logger_log", "sink:logging_module",
-                    "sink:httpexception", "sink:stdio_write"}
+        ok_rules = {"print_alias", "emit_shadow", "dynamic_name_op",
+                    "sink:print", "sink:logger", "sink:logger_log",
+                    "sink:logging_module", "sink:httpexception",
+                    "sink:stdio_write"}
         for e in self.allow:
             rule = ":".join(e.split(":")[2:])
             self.assertIn(rule, ok_rules, e)
