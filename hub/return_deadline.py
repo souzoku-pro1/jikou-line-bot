@@ -57,7 +57,7 @@ async def return_deadline_check() -> list[str]:
                      type(e).__name__, emit(str(e), "vendor_raw", "log", "operator"))
         await notify.notify_admin_line(
             "【返送期限監視: 実行失敗】\n"
-            f"App 30 の検索に失敗しました: {str(e)[:200]}",
+            f"App 30 の検索に失敗しました（種別: {type(e).__name__}）",  # H02: 例外本文は載せない
             throttle_key="return_deadline_fetch_error",
         )
         return []

@@ -77,7 +77,7 @@ async def _notify_billing_error(context: str, exc: Exception) -> None:
         "【Anthropicクレジット残高不足・要対応】\n"
         f"時刻: {_now_jst()}\n"
         f"呼び出し元: {context or '不明'}\n"
-        f"エラー: {str(exc)[:300]}\n"
+        f"エラー種別: {type(exc).__name__}\n"  # H02: 例外本文は通知に載せない（クラス名のみ）
         "Claude API が全停止しています（フォールバックモデルも同一アカウントの"
         "ため復旧しません）。console.anthropic.com の Plans & Billing で"
         "クレジットを補充してください。\n"
@@ -127,7 +127,7 @@ async def create_message_with_fallback(
             f"時刻: {_now_jst()}\n"
             f"呼び出し元: {context or '不明'}\n"
             f"失敗モデル: {PRIMARY_MODEL}\n"
-            f"エラー: {str(primary_exc)[:300]}\n"
+            f"エラー種別: {type(primary_exc).__name__}\n"  # H02: 例外本文は載せない
             f"→ {FALLBACK_MODEL} で自動リトライします。\n"
             "config.py の PRIMARY_MODEL 更新を検討してください（README参照）。",
             throttle_key="fallback_activated",

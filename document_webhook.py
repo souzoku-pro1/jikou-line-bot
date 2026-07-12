@@ -107,7 +107,9 @@ async def document_webhook(secret: str, request: Request):
         status_in_webhook = None
 
     if status_in_webhook != TRIGGER_VALUE:
-        logger.info("トリガー値不一致のためスキップ record_id=%s status=%r", record_id, status_in_webhook)
+        # H01: record_id は emit(record_id) 経由・webhook 外部入力の status echo は抑止（drop）
+        logger.info("トリガー値不一致のためスキップ record_id=%s",
+                    emit(record_id, "record_id", "log", "operator"))
         return JSONResponse(status_code=200, content={"ok": True, "skip": "not_triggered"})
 
     try:
@@ -117,7 +119,8 @@ async def document_webhook(secret: str, request: Request):
         # ループ防止：既に完了済みなら何もしない
         current_status = record.get(FIELD_STATUS, {}).get("value", "")
         if current_status == COMPLETED_VALUE:
-            logger.info("送付状作成済みのためスキップ record_id=%s", record_id)
+            logger.info("送付状作成済みのためスキップ record_id=%s",
+                        emit(record_id, "record_id", "log", "operator"))
             return JSONResponse(status_code=200, content={"ok": True, "skip": "already_done"})
 
         # 5. 差し込みデータを組み立て
@@ -149,7 +152,8 @@ async def document_webhook(secret: str, request: Request):
             FIELD_ATTACHMENT: [{"fileKey": file_key}],
             FIELD_STATUS:     COMPLETED_VALUE,
         })
-        logger.info("レコード更新完了 record_id=%s", record_id)
+        logger.info("レコード更新完了 record_id=%s",
+                    emit(record_id, "record_id", "log", "operator"))
 
     except Exception:
         logger.exception("document_webhook処理エラー record_id=%s", record_id)

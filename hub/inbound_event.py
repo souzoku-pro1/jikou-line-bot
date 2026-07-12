@@ -41,6 +41,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from hub.db import session_scope
+from hub.redact import emit  # RV-10: sink 出力は emit 契約経由（1形式）
 
 logger = logging.getLogger("hub.inbound_event")
 
@@ -166,7 +167,8 @@ async def record_stripe_event(event: dict, payload: bytes) -> tuple[str, int | N
         if claimed_id is not None:
             # D17: ログは PK のみ（dedup_key・event ID を出さない）
             logger.warning(
-                "stale processing row reclaimed pk=%s (RCF-M06)", claimed_id)
+                "stale processing row reclaimed pk=%s (RCF-M06)",
+                emit(claimed_id, "record_id", "log", "operator"))
             return "reprocess", claimed_id
 
         # (3) done / 実行中(15分以内)の processing → 再送回数を記録し状態で分岐
@@ -195,7 +197,8 @@ async def mark_done(event_pk: int) -> None:
             .where(InboundEvent.id == event_pk)
             .values(state="done", processed_at=_utcnow(), last_error=None))
         if result.rowcount == 0:
-            logger.warning("mark_done: journal row missing pk=%s", event_pk)
+            logger.warning("mark_done: journal row missing pk=%s",
+                           emit(event_pk, "record_id", "log", "operator"))
             raise JournalRowMissing(f"mark_done: pk={event_pk}")
 
 
@@ -210,5 +213,6 @@ async def mark_failed(event_pk: int, error_class: str) -> None:
             .values(state="failed", processed_at=_utcnow(),
                     last_error=(error_class or "unknown")[:100]))
         if result.rowcount == 0:
-            logger.warning("mark_failed: journal row missing pk=%s", event_pk)
+            logger.warning("mark_failed: journal row missing pk=%s",
+                           emit(event_pk, "record_id", "log", "operator"))
             raise JournalRowMissing(f"mark_failed: pk={event_pk}")

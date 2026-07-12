@@ -102,13 +102,13 @@ async def check_kintone_schema() -> list[str]:
                 )
             if not resp.is_success:
                 problems.append(
-                    f"{app_label}: フォーム設計取得失敗 "
-                    f"{resp.status_code} {resp.text[:100]}"
-                )
+                    f"{app_label}: フォーム設計取得失敗 (status {resp.status_code})"
+                )  # H02/§13.1: vendor 応答本文(resp.text)は problems へ載せない
                 continue
             actual_fields = resp.json().get("properties", {})
         except Exception as e:
-            problems.append(f"{app_label}: フォーム設計取得エラー: {str(e)[:150]}")
+            # H02: 例外本文は problems へ載せない（クラス名のみ）
+            problems.append(f"{app_label}: フォーム設計取得エラー: {type(e).__name__}")
             continue
 
         for code, expected in spec["fields"].items():
