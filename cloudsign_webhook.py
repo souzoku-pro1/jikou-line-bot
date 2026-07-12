@@ -493,17 +493,21 @@ def handle_webhook(secret: str, payload: dict) -> tuple[int, dict]:
 
     document_id = payload.get("documentID")
     status = payload.get("status")
-    logger.info("CloudSign webhook受信 doc=%s status=%s", document_id, status)
+    # H01: documentID は external_ref のため抑止（INFO 配線後は log が可視のため）
+    logger.info("CloudSign webhook受信 doc=%s status=%s",
+                emit(document_id, "external_ref", "log", "operator"),
+                emit(status, "count", "log", "operator"))
 
     if status == STATUS_COMPLETED and document_id:
         doc, failure = verify_completed_document(document_id)
         if doc is None:
             # fail-closed（P0B-002 / R0A-B03）: 真正性を確認できないイベントでは
             # 業務 state（受任）を進めない・顧客チャネルの通知も出さない。
-            # ログは correlation 用の documentID と失敗分類のみ
-            # （本文・PII・token・ベンダー生レスポンスは出さない）
+            # H01 裁定: documentID は external_ref のため抑止（この時点で封筒 record No は
+            # 未取得＝抑止のみ。取得後は file_mismatch_envelope 側が record No を emit で残す）。
+            # ログは失敗分類のみ可視（本文・PII・token・ベンダー生レスポンスは出さない）。
             logger.warning("CloudSign照合失敗のため受任へ遷移せず doc=%s reason=%s",
-                           document_id, failure)
+                           emit(document_id, "external_ref", "log", "operator"), failure)
             # P1-102b（M06 App30封筒方式・司令塔裁定）: documentID は業務チャネルに
             # 載せず、App 30 へ「要確認」封筒を起票して record No でハンドルを復元する。
             # 起票失敗時は通知を必ず出す縮退動作へフォールバック（内容は抑止・fail-closed）。

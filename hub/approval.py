@@ -12,6 +12,7 @@
 import logging
 
 from hub import kintone, notify
+from hub.redact import emit  # RV-10: sink 出力は emit 契約経由（1形式）
 
 logger = logging.getLogger("hub.approval")
 
@@ -69,7 +70,9 @@ async def transition(app: kintone.KintoneApp, record_id: str,
     if extra_fields:
         fields.update(extra_fields)
     await kintone.update_record(app, record_id, fields)
-    logger.info("transition record=%s %s -> %s", record_id, from_status, to_status)
+    # H01: record_id は emit(record_id) 経由・status enum の生 echo は抑止（固定文言化）
+    logger.info("transition record=%s (status 遷移)",
+                emit(record_id, "record_id", "log", "operator"))
 
 
 async def claim_execution(app: kintone.KintoneApp, record: dict) -> bool:
@@ -87,6 +90,7 @@ async def claim_execution(app: kintone.KintoneApp, record: dict) -> bool:
     try:
         await kintone.update_record(app, record_id, {"実行済み": "yes"}, revision=revision)
     except kintone.KintoneConflict:
-        logger.info("claim conflict record=%s (already claimed by another process)", record_id)
+        logger.info("claim conflict record=%s (already claimed by another process)",
+                    emit(record_id, "record_id", "log", "operator"))
         return False
     return True

@@ -35,6 +35,7 @@ from datetime import date
 from channels.base import PDF_MIME, Artifact, ChannelAdapter, DispatchResult, PrepareDeferred, PrepareResult
 from config import get_office_info
 from hub import kintone
+from hub.redact import emit  # RV-10: sink 出力は emit 契約経由（1形式）
 from hub.address_label import (
     TextAt,
     render_letterpack_label,
@@ -627,7 +628,8 @@ class ShokumuSeikyuAdapter(ChannelAdapter):
             label_note = ("返信用ラベル未生成（環境変数 OFFICE_NAME/ZIP/ADDRESS 未設定）。"
                           "返信用レターパックの宛先は手書きしてください")
             logger.warning("office info unset: reply label skipped record=%s",
-                           record.get("$id", {}).get("value", ""))
+                           emit(record.get("$id", {}).get("value", ""),
+                                "record_id", "log", "operator"))
 
         checklist = _build_checklist_pdf(record, muni, data, total, breakdown,
                                          label_note, [n for n, _ in form_pdfs])

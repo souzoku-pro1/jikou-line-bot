@@ -24,6 +24,7 @@ from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 import channels
 from hub import approval, kintone, notify
 from hub.webhook_auth import extract_record_id, verify_token
+from hub.redact import emit  # RV-10: sink 出力は emit 契約経由（1形式）
 
 logger = logging.getLogger("hub.dispatch")
 
@@ -57,7 +58,9 @@ async def process_dispatch(record_id: str) -> None:
         try:
             record = await kintone.get_record(APP_SHIPPING, record_id)
         except kintone.KintoneError as e:
-            logger.error("record fetch failed record=%s: %s", record_id, e)
+            logger.error("record fetch failed record=%s cls=%s: %s",
+                     emit(record_id, "record_id", "log", "operator"),
+                     type(e).__name__, emit(str(e), "vendor_raw", "log", "operator"))
             return
 
         status = record.get("発送ステータス", {}).get("value", "")
@@ -70,7 +73,9 @@ async def process_dispatch(record_id: str) -> None:
         elif status == "要確認":
             await _handle_reprocess(record)
         else:
-            logger.info("skip record=%s status=%r (server 処理対象外)", record_id, status)
+            # H01: record_id は emit・status enum の生 echo は抑止（固定文言化）
+            logger.info("skip record=%s (server 処理対象外)",
+                        emit(record_id, "record_id", "log", "operator"))
     except approval.TransitionError:
         pass  # transition() 内で警報済み
     except Exception as e:
@@ -78,7 +83,7 @@ async def process_dispatch(record_id: str) -> None:
         await notify.notify_admin_line(
             "【発送管理: 処理エラー】\n"
             f"レコードNo: {record_id}\n"
-            f"エラー: {str(e)[:300]}",
+            f"エラー種別: {type(e).__name__}",  # H02: 例外本文は載せない（クラス名のみ）
             throttle_key="hub_dispatch_error",
         )
 
@@ -163,7 +168,9 @@ async def _handle_prepare(record: dict) -> None:
             extra["成果物"] = [{"fileKey": k} for k in file_keys]
     except channels.base.PrepareDeferred as e:
         # エラーではない中断（マスタ登録待ち等）: 状態を変えず登録依頼の警報のみ
-        logger.info("prepare deferred record=%s: %s", record_id, e)
+        logger.info("prepare deferred record=%s cls=%s: %s",
+                    emit(record_id, "record_id", "log", "operator"),
+                    type(e).__name__, emit(str(e), "vendor_raw", "log", "operator"))
         await notify.notify_admin_line(
             "【発送管理: 対応依頼（エラーではありません）】\n"
             f"レコードNo: {record_id}\n{_summary(record)}\n"
@@ -189,7 +196,8 @@ async def _handle_dispatch(record: dict) -> None:
     record_id = _rid(record)
 
     if not await approval.claim_execution(APP_SHIPPING, record):
-        logger.info("skip record=%s (already executed / claim conflict)", record_id)
+        logger.info("skip record=%s (already executed / claim conflict)",
+                    emit(record_id, "record_id", "log", "operator"))
         return
 
     await approval.transition(APP_SHIPPING, record_id, "承認済", "発送処理中")
@@ -265,10 +273,12 @@ async def _handle_shipped(record: dict) -> None:
             APP_SHIPPING, record_id, "発送済", "返送待ち",
             extra_fields={"返送期限": compute_deadline(unit)},
         )
-        logger.info("shipped record=%s -> 返送待ち (needs_return)", record_id)
+        logger.info("shipped record=%s -> 返送待ち (needs_return)",
+                    emit(record_id, "record_id", "log", "operator"))
     else:
         await approval.transition(APP_SHIPPING, record_id, "発送済", "完了")
-        logger.info("shipped record=%s -> 完了 (返送想定なし)", record_id)
+        logger.info("shipped record=%s -> 完了 (返送想定なし)",
+                    emit(record_id, "record_id", "log", "operator"))
 
 
 async def _handle_reprocess(record: dict) -> None:

@@ -139,6 +139,38 @@ async def notify_business(to: str, text: str) -> bool:
     return await push_line_message(to, text, token_env=business_token_env())
 
 
+def _log_throttled(throttle_key: str) -> None:
+    """throttle INFO を出す（H01）。throttle_key は `kind:{id}` 形（例
+    prepare_deferred:{record_id} / dispatchbot_unauthorized:{user_id}）を取り得るため、
+    key 全体は出さず **種別プレフィックスのみ**を固定語彙の定数として可視化する
+    （ID＝record_id/user_id 等の混入を排除）。未知の頭は unknown_kind 固定文言。"""
+    head = throttle_key.split(":", 1)[0]
+    if head == "prepare_deferred":
+        logger.info("admin LINE notify throttled kind=prepare_deferred")
+    elif head == "dispatchbot_unauthorized":
+        logger.info("admin LINE notify throttled kind=dispatchbot_unauthorized")
+    elif head == "dispatchbot_filing_error":
+        logger.info("admin LINE notify throttled kind=dispatchbot_filing_error")
+    elif head == "invalid_transition":
+        logger.info("admin LINE notify throttled kind=invalid_transition")
+    elif head == "no_adapter":
+        logger.info("admin LINE notify throttled kind=no_adapter")
+    elif head == "billing_error":
+        logger.info("admin LINE notify throttled kind=billing_error")
+    elif head == "fallback_activated":
+        logger.info("admin LINE notify throttled kind=fallback_activated")
+    elif head == "fallback_failed":
+        logger.info("admin LINE notify throttled kind=fallback_failed")
+    elif head == "hub_dispatch_error":
+        logger.info("admin LINE notify throttled kind=hub_dispatch_error")
+    elif head == "return_deadline_fetch_error":
+        logger.info("admin LINE notify throttled kind=return_deadline_fetch_error")
+    elif head == "return_deadline_check":
+        logger.info("admin LINE notify throttled kind=return_deadline_check")
+    else:
+        logger.info("admin LINE notify throttled kind=unknown_kind")
+
+
 async def notify_admin_line(text: str, throttle_key: str = "") -> bool:
     """管理者に LINE Push で通知する。失敗しても本処理には影響させない。
     送信できたら True・スキップ/失敗/スロットルは False（P1-102 dead-man 検証用）。
@@ -157,7 +189,7 @@ async def notify_admin_line(text: str, throttle_key: str = "") -> bool:
         now = time.monotonic()
         last = _last_notify_at.get(throttle_key, 0.0)
         if now - last < _NOTIFY_MIN_INTERVAL_SEC:
-            logger.info("admin LINE notify throttled key=%s", throttle_key)
+            _log_throttled(throttle_key)   # 種別のみ可視（key 内の ID は出さない）
             return False
         _last_notify_at[throttle_key] = now
 

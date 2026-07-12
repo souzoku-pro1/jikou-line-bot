@@ -111,7 +111,7 @@ async def _execute_confirmed(user_id: str) -> str:
             "【指示Bot: 起票失敗】\n"
             f"タスク: {pending.parsed.get('task_type')} / 案件No.{pending.case.record_id}\n"
             f"指示原文: {pending.instruction_text[:100]}\n"
-            f"エラー: {str(e)[:300]}",
+            f"エラー種別: {type(e).__name__}",  # H02: 例外本文は載せない（クラス名のみ）
             throttle_key="dispatchbot_filing_error",
         )
         return MSG_FILE_FAILED

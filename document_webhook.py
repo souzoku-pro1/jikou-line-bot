@@ -18,6 +18,8 @@ import os
 from datetime import date
 
 import httpx
+
+from hub.redact import emit  # RV-10: sink 出力は emit 契約経由（1形式）
 from docx import Document
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
@@ -105,7 +107,9 @@ async def document_webhook(secret: str, request: Request):
         status_in_webhook = None
 
     if status_in_webhook != TRIGGER_VALUE:
-        logger.info("トリガー値不一致のためスキップ record_id=%s status=%r", record_id, status_in_webhook)
+        # H01: record_id は emit(record_id) 経由・webhook 外部入力の status echo は抑止（drop）
+        logger.info("トリガー値不一致のためスキップ record_id=%s",
+                    emit(record_id, "record_id", "log", "operator"))
         return JSONResponse(status_code=200, content={"ok": True, "skip": "not_triggered"})
 
     try:
@@ -115,7 +119,8 @@ async def document_webhook(secret: str, request: Request):
         # ループ防止：既に完了済みなら何もしない
         current_status = record.get(FIELD_STATUS, {}).get("value", "")
         if current_status == COMPLETED_VALUE:
-            logger.info("送付状作成済みのためスキップ record_id=%s", record_id)
+            logger.info("送付状作成済みのためスキップ record_id=%s",
+                        emit(record_id, "record_id", "log", "operator"))
             return JSONResponse(status_code=200, content={"ok": True, "skip": "already_done"})
 
         # 5. 差し込みデータを組み立て
@@ -128,21 +133,27 @@ async def document_webhook(secret: str, request: Request):
             "{{依頼者氏名}}": fv("氏名"),
             "{{被相続人名}}": fv("被相続人名"),
         }
-        logger.info("差し込みデータ record_id=%s data=%s", record_id, data)
+        # H01: data は 住所/氏名/被相続人名 を含む PII のため log に出さない（record_id のみ）
+        logger.info("差し込みデータ組立完了 record_id=%s",
+                    emit(record_id, "record_id", "log", "operator"))
 
         # 6. テンプレート置換
         docx_bytes = fill_template(TEMPLATE_PATH, data)
 
         # 7a. kintone にファイルアップロード
         file_key = await _upload_file("送付状_委任契約書.docx", docx_bytes)
-        logger.info("ファイルアップロード完了 record_id=%s fileKey=%s", record_id, file_key)
+        # H01: fileKey は kintone の生 external_ref のため抑止（record_id のみ素通し）
+        logger.info("ファイルアップロード完了 record_id=%s fileKey=%s",
+                    emit(record_id, "record_id", "log", "operator"),
+                    emit(file_key, "external_ref", "log", "operator"))
 
         # 7b. 添付フィールド書き戻し + ステータス更新（1回の PUT にまとめる）
         await _update_record(record_id, {
             FIELD_ATTACHMENT: [{"fileKey": file_key}],
             FIELD_STATUS:     COMPLETED_VALUE,
         })
-        logger.info("レコード更新完了 record_id=%s", record_id)
+        logger.info("レコード更新完了 record_id=%s",
+                    emit(record_id, "record_id", "log", "operator"))
 
     except Exception:
         logger.exception("document_webhook処理エラー record_id=%s", record_id)

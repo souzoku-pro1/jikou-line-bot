@@ -319,7 +319,7 @@ async def check_block_sync() -> list[str]:
         records = await kintone.search_records(
             APP_ENCLOSURE, '有効 in ("yes")', fields=["ブロックキー"])
     except kintone.KintoneError as e:
-        return [f"App30/32 同期検査の実行に失敗: {str(e)[:150]}"]
+        return [f"App30/32 同期検査の実行に失敗（種別: {type(e).__name__}）"]
 
     for r in records:
         key = r.get("ブロックキー", {}).get("value", "")

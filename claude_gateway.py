@@ -33,6 +33,7 @@ from config import (
 # notify_admin_line は T0-2 で hub/notify.py に移設。
 # 既存の import 経路（from claude_gateway import notify_admin_line）互換のため re-export
 from hub.notify import notify_admin_line  # noqa: F401
+from hub.redact import emit  # RV-10: sink 出力は emit 契約経由（1形式）
 
 logger = logging.getLogger("claude_gateway")
 
@@ -68,12 +69,15 @@ def _is_billing_error(exc: Exception) -> bool:
 
 async def _notify_billing_error(context: str, exc: Exception) -> None:
     """クレジット残高系エラーを管理者に LINE Push で警報する（スロットル付き）"""
-    logger.error("Anthropic billing error: %s", exc)
+    # 例外クラス名は可視・本文は emit(vendor_raw) で抑止（裁定・level 不変）
+    logger.error("Anthropic billing error cls=%s detail=%s",
+                 type(exc).__name__,
+                 emit(str(exc), "vendor_raw", "log", "operator"))
     await notify_admin_line(
         "【Anthropicクレジット残高不足・要対応】\n"
         f"時刻: {_now_jst()}\n"
         f"呼び出し元: {context or '不明'}\n"
-        f"エラー: {str(exc)[:300]}\n"
+        f"エラー種別: {type(exc).__name__}\n"  # H02: 例外本文は通知に載せない（クラス名のみ）
         "Claude API が全停止しています（フォールバックモデルも同一アカウントの"
         "ため復旧しません）。console.anthropic.com の Plans & Billing で"
         "クレジットを補充してください。\n"
@@ -112,16 +116,18 @@ async def create_message_with_fallback(
             raise
         if not _is_model_error(primary_exc):
             raise
+        # 例外クラス名は可視・本文は emit(vendor_raw) で抑止（裁定・level 不変）
         logger.error(
-            "PRIMARY model %s failed (%s), falling back to %s",
-            PRIMARY_MODEL, primary_exc, FALLBACK_MODEL,
+            "PRIMARY model %s failed cls=%s (detail=%s), falling back to %s",
+            PRIMARY_MODEL, type(primary_exc).__name__,
+            emit(str(primary_exc), "vendor_raw", "log", "operator"), FALLBACK_MODEL,
         )
         await notify_admin_line(
             "【Claudeフォールバック発動】\n"
             f"時刻: {_now_jst()}\n"
             f"呼び出し元: {context or '不明'}\n"
             f"失敗モデル: {PRIMARY_MODEL}\n"
-            f"エラー: {str(primary_exc)[:300]}\n"
+            f"エラー種別: {type(primary_exc).__name__}\n"  # H02: 例外本文は載せない
             f"→ {FALLBACK_MODEL} で自動リトライします。\n"
             "config.py の PRIMARY_MODEL 更新を検討してください（README参照）。",
             throttle_key="fallback_activated",
@@ -136,15 +142,18 @@ async def create_message_with_fallback(
                 "【Claude応答不能・要対応】\n"
                 f"時刻: {_now_jst()}\n"
                 f"呼び出し元: {context or '不明'}\n"
-                f"PRIMARY({PRIMARY_MODEL}): {str(primary_exc)[:200]}\n"
-                f"FALLBACK({FALLBACK_MODEL}): {str(fallback_exc)[:200]}\n"
+                f"PRIMARY({PRIMARY_MODEL}): {type(primary_exc).__name__}\n"
+                f"FALLBACK({FALLBACK_MODEL}): {type(fallback_exc).__name__}\n"
                 "顧客には定型の「確認中」応答を返し、承認キュー(App 29)に"
                 "要対応レコードを作成します。",
                 throttle_key="fallback_failed",
             )
+            # H02: 例外本文は message へ載せない（クラス名のみ）。呼び出し側は str(e) を
+            # handle_claude_outage(error=...) → 弁護士通知/App29 に流すため、本文混入を根で断つ。
+            # 詳細は from fallback_exc の chain（＝logger.exception のみが握る）。
             raise ClaudeUnavailableError(
-                f"primary={PRIMARY_MODEL}: {primary_exc} / "
-                f"fallback={FALLBACK_MODEL}: {fallback_exc}"
+                f"primary={PRIMARY_MODEL}: {type(primary_exc).__name__} / "
+                f"fallback={FALLBACK_MODEL}: {type(fallback_exc).__name__}"
             ) from fallback_exc
 
 
