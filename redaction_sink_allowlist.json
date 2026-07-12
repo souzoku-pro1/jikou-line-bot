@@ -1,7 +1,7 @@
 {
   "baseline_count": 211,
-  "generated_by": "P1-102b-cloudsign-envelope",
-  "note": "sink 直書き債務台帳。baseline_count=211は上限据え置き(単調減少のみ)。P1-102bでcloudsign要確認封筒起票を追加(operator向けdoc/statusログ2件は行番号のみ移動・総数不変207)。logger.exception/logging.exceptionは引数不問でlogger_exception違反(L01)。信頼emitは from hub.redact import emit(1形式)。sink全引数が 定数/定数f-string/信頼emit(policy一致)/結合 のみで合格。新規禁止・stale削除必須。",
+  "generated_by": "P1-102c-envelope-idempotency",
+  "note": "sink 直書き債務台帳。baseline_count=211は上限据え置き(単調減少のみ)。P1-102cでcloudsign封筒のM07完全一致/H03 compensationを追加(operator向けdoc/statusログ2件は行番号のみ移動・総数不変207)。logger.exception/logging.exceptionは引数不問でlogger_exception違反(L01)。信頼emitは from hub.redact import emit(1形式)。sink全引数が 定数/定数f-string/信頼emit(policy一致)/結合 のみで合格。新規禁止・stale削除必須。",
   "entries": [
     "bank_ingest.py:103:sink:print",
     "bank_ingest.py:238:sink:httpexception",
@@ -32,8 +32,8 @@
     "claude_gateway.py:115:sink:logger",
     "claude_gateway.py:134:logger_exception",
     "claude_gateway.py:71:sink:logger",
-    "cloudsign_webhook.py:365:sink:logger",
-    "cloudsign_webhook.py:374:sink:logger",
+    "cloudsign_webhook.py:428:sink:logger",
+    "cloudsign_webhook.py:437:sink:logger",
     "customer_directory.py:121:sink:print",
     "daily_healthcheck.py:137:sink:logger",
     "daily_healthcheck.py:166:sink:logger",

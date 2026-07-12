@@ -198,27 +198,85 @@ def update_kintone_status(document_id: str, new_status: str):
 
 
 # ============================================================
-# App 30（発送管理）— 要確認封筒（P1-102b・M06 App30封筒方式・司令塔裁定）
+# App 30（発送管理）— 要確認封筒（P1-102b/c・M06 App30封筒方式・司令塔裁定）
 #   照合失敗・kintone未更新の失敗経路で documentID を業務チャネルに載せずに
 #   人手確認のハンドルを復元する。人は App 30 の「要確認」封筒を kintone 画面で
 #   確認しクローズする運用（RESOLVERS ハンドラは作らない＝OUT_OF_SCOPE）。
 #   起票は person_merge._file_candidate と同型（単票 API・トップキー付き
-#   チャネル固有データ・冪等）。cloudsign は sync 経路なので requests で起票する。
+#   チャネル固有データ）。cloudsign は sync 経路なので requests で起票する。
 # ============================================================
 FIELD_CHANNEL_DATA = "チャネル固有データ"
 
 
 def _mismatch_key(document_id: str) -> str:
-    """要確認封筒の冪等キー（同一 documentID の再送で二重起票しない）。"""
+    """要確認封筒の冪等キー。"""
     return f"cloudsign_mismatch:{document_id}"
+
+
+def _escape_kintone_query_value(value: str) -> str:
+    """kintone クエリ文字列リテラル用のエスケープ（M07: documentID の特殊文字）。
+    二重引用符・バックスラッシュを無害化し、like 構文の破壊・誤マッチを防ぐ。"""
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _find_mismatch_envelopes(app_id: str, token: str, key: str) -> list[int]:
+    """冪等キー key の要確認封筒 record No（int 昇順）を返す（M07）。
+
+    like で絞り込んだ後、各レコードのチャネル固有データ JSON をコード側でパースし、
+    トップキー cloudsign_mismatch の「冪等キー」が **完全一致** するものだけ採用する
+    （部分文字列 like の誤マッチ＝別 documentID の封筒を確実に排除する）。
+    """
+    esc = _escape_kintone_query_value(key)
+    r = requests.get(
+        f"{KINTONE_BASE}/k/v1/records.json",
+        headers={"X-Cybozu-API-Token": token},
+        params={"app": app_id,
+                "query": f'{FIELD_CHANNEL_DATA} like "{esc}"',
+                "fields[0]": "$id",
+                "fields[1]": FIELD_CHANNEL_DATA},
+        timeout=10,
+    )
+    r.raise_for_status()
+    ids: list[int] = []
+    for rec in r.json().get("records", []):
+        raw = rec.get(FIELD_CHANNEL_DATA, {}).get("value", "")
+        try:
+            data = json.loads(raw)
+        except (ValueError, TypeError):
+            continue
+        mm = data.get("cloudsign_mismatch") if isinstance(data, dict) else None
+        if isinstance(mm, dict) and mm.get("冪等キー") == key:
+            rid = rec.get("$id", {}).get("value")
+            if rid is not None:
+                try:
+                    ids.append(int(rid))
+                except (ValueError, TypeError):
+                    continue
+    return sorted(ids)
+
+
+def _close_envelope(app_id: str, token: str, record_id: int) -> None:
+    """要確認封筒を「却下」でクローズする（H03: 敗者封筒の収束）。"""
+    u = requests.put(
+        f"{KINTONE_BASE}/k/v1/record.json",
+        headers={"X-Cybozu-API-Token": token, "Content-Type": "application/json"},
+        json={"app": app_id, "id": str(record_id),
+              "record": {"発送ステータス": {"value": "却下"}}},
+        timeout=10,
+    )
+    u.raise_for_status()
 
 
 def file_mismatch_envelope(document_id: str, failure_reason: str):
     """失敗経路で App 30 へ「要確認」封筒を起票し record No（str）を返す。
 
-    冪等キー = cloudsign_mismatch:{document_id}。同一 documentID の封筒が既にあれば
-    その No を再利用する（CloudSign の再送で封筒が増えない）。App 30 未設定・起票失敗・
-    検索失敗は None を返す（呼び出し側で現行の縮退通知へフォールバックする）。
+    並行時も**通知が指す生存封筒は 1 件に収束する**（compensation・H03）:
+    like 絞り込み＋JSON パースで冪等キー完全一致（M07）を検証して既存を再利用し、
+    新規 create 後は同キーを再検索して自分より小さい record No があれば自封筒を
+    「却下」でクローズし最小 No を通知に使う。完全一意（重複を作らせない）は
+    RCF-M07（App 30 専用フィールド＋重複禁止設定・CU 作業）で DEFER。
+
+    App 30 未設定・起票/検索失敗は None を返す（呼び出し側で縮退通知へフォールバック）。
     """
     app_id = os.environ.get("APP_SHIPPING", "")
     token = os.environ.get("TOKEN_SHIPPING", "")
@@ -227,19 +285,10 @@ def file_mismatch_envelope(document_id: str, failure_reason: str):
         return None
     key = _mismatch_key(document_id)
     try:
-        # 冪等: 同一 documentID の封筒（状態を問わず）を検索して再利用
-        r = requests.get(
-            f"{KINTONE_BASE}/k/v1/records.json",
-            headers={"X-Cybozu-API-Token": token},
-            params={"app": app_id,
-                    "query": f'{FIELD_CHANNEL_DATA} like "{key}"',
-                    "fields[0]": "$id"},
-            timeout=10,
-        )
-        r.raise_for_status()
-        existing = r.json().get("records", [])
+        # M07: 冪等キー完全一致で既存封筒を検索（状態不問）→ 最小 No を再利用
+        existing = _find_mismatch_envelopes(app_id, token, key)
         if existing:
-            rid = str(existing[0]["$id"]["value"])
+            rid = str(existing[0])
             logger.info("要確認封筒は起票済み No=%s doc=%s",
                         emit(rid, "record_id", "log", "operator"),
                         emit(document_id, "external_ref", "log", "operator"))
@@ -270,12 +319,26 @@ def file_mismatch_envelope(document_id: str, failure_reason: str):
             timeout=10,
         )
         c.raise_for_status()
-        rid = str(c.json()["id"])
-        # 失敗理由は封筒（チャネル固有データ）に格納済み。ログには載せない（sink 債務回避）
+        my_id = int(c.json()["id"])
+
+        # H03（compensation）: create 後に再検索し、自分より小さい同キー封筒があれば
+        # 自封筒を却下でクローズして最小 No へ収束する。収束処理の失敗は致命でなく、
+        # 自 No のまま通知する（通知は必ず出す）。
+        winner = my_id
+        try:
+            others = [i for i in _find_mismatch_envelopes(app_id, token, key)
+                      if i < my_id]
+            if others:
+                _close_envelope(app_id, token, my_id)   # 敗者=自封筒を却下
+                winner = min(others)
+        except Exception:
+            logger.warning("要確認封筒の収束処理に失敗、自Noで通知します")
+            winner = my_id
+
         logger.info("要確認封筒を起票 No=%s doc=%s",
-                    emit(rid, "record_id", "log", "operator"),
+                    emit(str(winner), "record_id", "log", "operator"),
                     emit(document_id, "external_ref", "log", "operator"))
-        return rid
+        return str(winner)
     except Exception:
         # 起票・検索の失敗は致命ではない（通知は必ず出す・縮退へフォールバック）
         logger.error("要確認封筒の起票に失敗 (request failed)")  # 固定分類・L01
