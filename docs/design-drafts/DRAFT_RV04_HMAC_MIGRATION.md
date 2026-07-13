@@ -59,6 +59,19 @@ kintone webhook 由来の3本には**適用不能**。§3 の代替に分岐。
 併存させない**＝検証側が version から一意に方式を決められる）。v1 の凍結は §7 の
 multipart PoC 完了後（PoC で content 対象が確定してから golden を固定）。
 
+> **NM01 v1 = FROZEN（2026-07-13・司令塔裁定・PoC=P1-103）**
+> - **content 対象を「送出最終バイト列全体の SHA-256」と確定**（＝クライアントが実際に
+>   wire へ載せる body 全バイトの SHA-256。multipart の場合は boundary を含む body 全体）。
+>   PoC（`test_hmac_multipart_poc.py`）で hash 一致・改変検知(401)・boundary 吸収・
+>   `body()`先読みと`form()`受理の共存を実証。§7 が警戒した「フィールド別 hash への再設計」は不要。
+> - **実装制約（GAS caller）**: GAS caller は multipart を**手組み**すること（固定 boundary を
+>   自ら選定・`Content-Type: multipart/form-data; boundary=…` を明示 set・content_sha256 は
+>   その**同一バイト列**を対象に計算）。UrlFetchApp の payload(Blob) 自動組立に依存しない
+>   （自動採番 boundary を含む最終バイトを送出前に読めず hash 不能になるリスクの排除）。
+>   **GAS 実地確認は caller 移行段階の[人]実機検分に統合**（本 PoC はサーバ契約と wire 形式を
+>   実証・GAS 実体は OUT_OF_SCOPE のため未実行）。
+> - **canonical / §2.3 検証順は変更なしのまま凍結**。
+
 v1 canonical（length-prefix）:
 ```
 canonical = concat_for each field f in ORDER:
@@ -77,6 +90,10 @@ ORDER = [ "v1", key_id, caller_id, method_upper, normalized_path,
   canonical→同一署名になることを、固定入力→固定署名の golden ベクトル（最低5本・
   ASCII/日本語ファイル名/空body/multipart/境界長）で相互検証する。**加えて path 異常形の
   拒否ケース（%2F・`..`・`//`・非ASCII）を testベクトルに追加**（H02）。これを v1 contract の一部にする。
+  - **golden 固定時は P1-103 PoC の生 body 入力を流用する**（`test_hmac_multipart_poc.py` の
+    日本語ファイル名 multipart・手組み固定 boundary body・空 body 等を固定入力ベクトルとして
+    server↔GAS で同一署名を確認）。PoC で content 対象＝送出生 body 全体と確定済みのため、
+    golden はこの固定バイト列の SHA-256 を content_sha256 として据える。
 
 ### 2.2 送信ヘッダ
 ```
@@ -180,9 +197,11 @@ status        : active / retiring / revoked
 - 【OPEN・owner=大野/司令塔】key_id 保管方式（Railway env `SIG_KEY_*` / 将来の secret manager）。
   判断材料: Railway env の管理容易さ vs secret manager の監査/rotation 機能・rotation 運用コスト
   （§2.5 lifecycle を env 手運用で回すか managed で回すか）。
-- **multipart body-hash PoC を v1 contract 成立の先行条件として別票化**（M11 段3）:
-  GAS UrlFetchApp で `blob.getBytes()` を含む最終 payload の SHA-256 が、サーバ受信生body の
-  hash と一致することを実証。不一致なら content 対象の定義を再設計（例: フィールド別 hash）。
+- **multipart body-hash PoC（M11 段3）→ RESOLVED（P1-103・2026-07-13）**:
+  サーバ受信生 body の SHA-256 が送出最終バイト列の SHA-256 と一致することを実証
+  （`test_hmac_multipart_poc.py`・10 tests / 全 suite 1,276 passed）。content 対象＝送出生 body
+  全体で確定・フィールド別 hash への再設計は**不要**。残る実務確認は GAS 手組み multipart の
+  実地成立のみ（§2.1 実装制約に記載・caller 移行段階の[人]実機検分に統合）。
 - **認証ログ方針（HIGH）**: 認証失敗ログは **固定 reason code（`bad_sig`/`skew`/`key_revoked`/
   `path_denied`/`replay` 等）＋caller_id＋key_id＋相関ID(nonce or request id)** に限定。
   secret・body・PII・vendor 生値を出さない（RV10 §禁止と統合）。
