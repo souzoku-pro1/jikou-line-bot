@@ -59,6 +59,25 @@ kintone webhook 由来の3本には**適用不能**。§3 の代替に分岐。
 併存させない**＝検証側が version から一意に方式を決められる）。v1 の凍結は §7 の
 multipart PoC 完了後（PoC で content 対象が確定してから golden を固定）。
 
+> **NM01 v1 = FROZEN（2026-07-13・司令塔裁定・PoC=P1-103）**
+> **凍結範囲は「① content 対象の定義」と「② canonical 形式」に限定する**（③ §2.3 検証順の
+> 実装詳細と ④ GAS 適用性は凍結対象外＝下記のとおり P1-103-fix で更に硬化／条件付き解決）。
+> - **① content 対象を「送出最終バイト列全体の SHA-256」と確定（FROZEN）**（＝クライアントが
+>   実際に wire へ載せる body 全バイトの SHA-256。multipart の場合は boundary を含む body 全体）。
+>   PoC（`test_hmac_multipart_poc.py`）で hash 一致・改変検知(401)・boundary 吸収・
+>   `body()`先読みと`form()`受理の共存を実証。§7 が警戒した「フィールド別 hash への再設計」は不要。
+> - **② canonical 形式（§2.1 length-prefix・ORDER）を確定（FROZEN）**。version は v1 単一方式。
+> - **③ §2.3 検証順（実装詳細）は凍結対象外・P1-103-fix で硬化**: 署名対象 path は
+>   **実 routing path**で再計算し client 指定の path 系ヘッダは非信用（H01）／key lifecycle の
+>   reason を分離（`key_unknown`/`key_revoked`/`key_not_yet_valid`/`key_expired`・retiring は
+>   受理+警告〔H02〕）。§6 の 403/401 ケース分けを参照。
+> - **④ GAS 適用性 = CONDITIONALLY_RESOLVED**（§7）。条件 = (i) GAS caller が multipart を
+>   **手組み**すること（固定 boundary を自ら選定・`Content-Type: multipart/form-data; boundary=…`
+>   を明示 set・content_sha256 はその**同一バイト列**を対象に計算。UrlFetchApp の payload(Blob)
+>   自動組立に依存しない＝自動採番 boundary を送出前に読めず hash 不能になるリスクを排除）／
+>   (ii) **caller 移行段階の[人]実機検分**で GAS 実体の payload hash 一致を確認（本 PoC は
+>   サーバ契約と wire 形式を実証・GAS 実体は OUT_OF_SCOPE のため未実行）。
+
 v1 canonical（length-prefix）:
 ```
 canonical = concat_for each field f in ORDER:
@@ -77,6 +96,10 @@ ORDER = [ "v1", key_id, caller_id, method_upper, normalized_path,
   canonical→同一署名になることを、固定入力→固定署名の golden ベクトル（最低5本・
   ASCII/日本語ファイル名/空body/multipart/境界長）で相互検証する。**加えて path 異常形の
   拒否ケース（%2F・`..`・`//`・非ASCII）を testベクトルに追加**（H02）。これを v1 contract の一部にする。
+  - **golden 固定時は P1-103 PoC の生 body 入力を流用する**（`test_hmac_multipart_poc.py` の
+    日本語ファイル名 multipart・手組み固定 boundary body・空 body 等を固定入力ベクトルとして
+    server↔GAS で同一署名を確認）。PoC で content 対象＝送出生 body 全体と確定済みのため、
+    golden はこの固定バイト列の SHA-256 を content_sha256 として据える。
 
 ### 2.2 送信ヘッダ
 ```
@@ -128,7 +151,11 @@ status        : active / retiring / revoked
   (2) GAS を新 key_id に切替 → (3) 旧 key_id を `retiring`（受理はするが警告ログ）→
   (4) 一定期間後 `revoked`（受理停止）。**key_id は失効後も再利用しない**（過去署名の
   取り違え防止）。rollback は「新 key_id を revoked にし旧を active に戻す」で対応。
-- 失効/revoked 鍵での署名は 401（reason=`key_revoked`）。
+- **status / 時刻に対する (status, reason) の期待値は §6.2 を単一の契約とする**（本節に
+  reason を二重定義しない＝期待値の分岐を防ぐ）。要点のみ: unknown=`key_unknown` /
+  revoked=`key_revoked` / not_before 前=`key_not_yet_valid` / expired=`key_expired`（各 401）、
+  `retiring`=受理 + **warning ログ 1 回**（key_id・caller_id のみ可視・secret/署名/nonce/body
+  非混入）。詳細と網羅表は §6.2 を参照。
 
 ## 3. kintone webhook群（3本）: 代替設計（採用条件つき）
 
@@ -168,21 +195,87 @@ status        : active / retiring / revoked
 - GAS は1ファイルに全 fetch 集約 → **署名付与ヘルパを GAS 内に1つ**作り共用（大野・BLOCKED）。
 
 ## 6. テスト戦略
-- replay（同一nonce=409）／path転用（署名の path 流用=401）／body改変（content_sha256不一致=401）／
-  期限外（timestamp SKEW超過=401）／unknown/expired/revoked key（=401・reason別）／
-  method/path 非許可（=403）／**downgrade（署名ヘッダあり+署名不正で token 併記→401、tokenに落ちない）**／
-  skew境界／dual-accept 3系（署名OK・token OK・両方無=401）。
-- **cross-language golden ベクトル**（§2.1・server/client一致）を contract テストに固定。
-- multipart body hash は §7 PoC 成立を前提。
+
+### 6.1 403 と 401 のケース分け（M03: status を混同しない）
+検証は §2.3 の**段順**で最初に不成立になった段の status/reason を返す（fail-closed）。
+特に **path 不許可（4段）と署名不一致（7段）を status で分離**する:
+
+| 契機 | 段 | status | reason | 備考 |
+|---|---|---|---|---|
+| method 非許可 | 4 | **403** | `method_denied` | registry の `allowed_methods` 外 |
+| **実 path が allowlist 外** | 4 | **403** | `path_denied` | 実 routing path が `allowed_paths` に無い。**署名検証に到達しない** |
+| path 正規化違反（%2F・`..`・`//`・非ASCII） | 4 | **400** | `bad_path` | §2.1 H02 |
+| **署名不一致（実 path で再計算）** | 7 | **401** | `bad_sig` | 実 path が allowlist 内でも、署名 path≠実 path なら 7 段で露見 |
+| content_sha256 不一致 | 6 | 401 | `body_mismatch` | body 改変 |
+| timestamp SKEW 超過 | 5 | 401 | `skew` | ±SKEW 境界 |
+| replay（nonce 再利用） | 8 | 409 | `replay` | |
+
+**H01 の要点**: 署名対象 path は **ASGI `scope["raw_path"]`（decode 前生バイト）**で再計算し、
+client 指定の path 系ヘッダ（旧 X-Sig-Path 相当）も **decode 済み path** も検証の真実源にしない。
+decode 済み path を使うと `%2F` が `/` に化けて separator を smuggling され path 拘束が破れる
+（例: 実 raw `/koseki%2Fingest` が decode 後 `/koseki/ingest` として許可されてしまう）。
+→ allowlist 外の実 path へ正規署名を転用しても**4 段 path deny=403**、allowlist 内の別実 path へ
+転用しても**7 段署名不一致=401 bad_sig**、`%2F`/`%2e`/`%252F`/`//`/非 ASCII 生バイトは**400 bad_path**、
+`raw_path` 欠落は**fail-closed（受理しない）**。
+
+### 6.2 key lifecycle の reason 分離（H02・**reason contract の単一の正**）
+§2.5 はここを参照する（reason を二重定義しない）。段は §2.3 の検証段番号。
+
+| status/時刻 | 段 | status | reason |
+|---|---|---|---|
+| 未登録 key_id | 2 | 401 | `key_unknown` |
+| `revoked` | 2 | 401 | `key_revoked` |
+| `now < not_before` | 2 | 401 | `key_not_yet_valid` |
+| `now > expires_at` | 2 | 401 | `key_expired` |
+| `retiring` | 2→8 全通過 | **200** | `ok_retiring`（**受理+警告**） |
+| `active` | 2→8 全通過 | 200 | `ok` |
+
+- **retiring の warning ログ（M01）**: 受理時に warning を**1 回**出力。可視は **key_id・caller_id のみ**。
+  secret・署名・nonce・body（およびその hash）は**混入させない**（§7 認証ログ方針と統合）。
+- 判定順の帰結: revoked は時刻窓より先に判定（revoked 鍵は期限内でも `key_revoked`）。
+  not_before / expires_at 違反は status に依らず時刻 reason を返す。
+
+### 6.3 本体実装（RV-04 body）で必須のテスト一覧（M01: Codex 提案の不足分を全数反映）
+PoC で実証済みの項目に加え、本体実装は下記を**全数**テスト化すること:
+- **署名検証段（§2.3 各段）**: caller 不一致=401 `caller_mismatch`／version 欠落・不正（`v1`以外）=401 `bad_version`／
+  timestamp 形式不正（非数値）=401 `bad_ts`／future skew（`now+SKEW` 超過）=401 `skew`／
+  **skew ±300 境界**（`now±300` は受理・`now±301` は拒否の両側）／required header 欠落
+  （各 `X-Sig-*` 欠落で個別に拒否・欠落 header 名で挙動が変わらないこと）。
+- **downgrade 防止**: 署名ヘッダ在＋query token 併記時に token へ落ちない（署名不正なら 401・
+  token では受理しない）／dual-accept 3系（署名OK・token OK・両方無=401）。
+- **status–reason table**: §6.1/§6.2 の (status, reason) 表を 1 対 1 で網羅する parametrized テスト。
+- **canonical / cross-language**: canonical golden ベクトル固定（§2.1・最低5本＝ASCII/日本語
+  ファイル名/空 body/multipart/境界長）／server(Python)↔client(GAS/JS) の cross-language 一致。
+- **multipart 生 body 形状**: boundary 衝突（body 内に boundary 類似列）／filename の quote/escape／
+  CRLF 正規化（`\r\n` 固定）／空 body／複数 field（file+meta）で content hash が生 body 全体基準で
+  一致すること。
+- **GAS 実機**: GAS UrlFetchApp が送出する最終 payload の SHA-256 が server 受信生 body の hash と
+  一致することを実機で比較（手組み multipart 前提・§2.1 実装制約／§7・caller 移行段階の[人]検分）。
+- **path 拘束（H01）**: 署名対象 path は **ASGI `scope["raw_path"]`（decode 前生バイト）**で
+  再計算（decode 済み path は %2F separator smuggling を許すため不可）。allowlist 外実 path=403
+  `path_denied`／allowlist 内別実 path 転用=401 `bad_sig`／`%2F`・`%2e`・`%252F`・`//`・非 ASCII
+  生バイト=400 `bad_path`／`raw_path` 欠落=fail-closed（受理しない）。
+- **key lifecycle（H02）**: unknown/revoked/expired/not_before の reason 分離・retiring 受理+警告。
+
+> **PoC 実証済み（P1-103 / -fix / -fix2・`test_hmac_multipart_poc.py`・21 tests）**:
+> content hash 一致(a)／boundary 非依存(b)／1byte 改変拒否(c)／replay・skew・unknown key(d)／
+> GAS 相当 httpx multipart(e)／raw body 取得／body()×form() 共存／H01 path 拘束（foreign=403・
+> 別実 path=bad_sig・raw_path %2F/%2e/%252F/// 拒否・raw_path 欠落 fail-closed・normalize 単体）／
+> H02 lifecycle 5 系／M01 retiring warning（1 回・機微ゼロ）／§6.1・§6.2 status–reason table。
+> 本体実装は上記 6.3 の残り（downgrade・cross-language golden・GAS 実機 等）を本番経路で全数化する。
 
 ## 7. 論点・OPEN・BLOCKED
 - 【OPEN・owner=大野/司令塔】nonce ストア（案A/B）・kintone webhook 代替（K1/K2/K3）。
 - 【OPEN・owner=大野/司令塔】key_id 保管方式（Railway env `SIG_KEY_*` / 将来の secret manager）。
   判断材料: Railway env の管理容易さ vs secret manager の監査/rotation 機能・rotation 運用コスト
   （§2.5 lifecycle を env 手運用で回すか managed で回すか）。
-- **multipart body-hash PoC を v1 contract 成立の先行条件として別票化**（M11 段3）:
-  GAS UrlFetchApp で `blob.getBytes()` を含む最終 payload の SHA-256 が、サーバ受信生body の
-  hash と一致することを実証。不一致なら content 対象の定義を再設計（例: フィールド別 hash）。
+- **multipart body-hash PoC（M11 段3）→ CONDITIONALLY_RESOLVED（P1-103／P1-103-fix・2026-07-13）**:
+  サーバ受信生 body の SHA-256 が送出最終バイト列の SHA-256 と一致することを実証
+  （`test_hmac_multipart_poc.py`・15 tests）。content 対象＝送出生 body 全体で確定・
+  フィールド別 hash への再設計は**不要**（§2.1 ①②を FROZEN）。**条件**（未充足なら freeze の
+  GAS 適用は保留）: (i) GAS caller が multipart を手組み（固定 boundary 自選・Content-Type 明示 set・
+  hash は同一バイト列）／(ii) **caller 移行段階の[人]実機検分**で GAS 実体 payload の hash 一致を
+  確認。サーバ契約・wire 形式・path 拘束(H01)・key lifecycle(H02) は PoC で実証済み。
 - **認証ログ方針（HIGH）**: 認証失敗ログは **固定 reason code（`bad_sig`/`skew`/`key_revoked`/
   `path_denied`/`replay` 等）＋caller_id＋key_id＋相関ID(nonce or request id)** に限定。
   secret・body・PII・vendor 生値を出さない（RV10 §禁止と統合）。
