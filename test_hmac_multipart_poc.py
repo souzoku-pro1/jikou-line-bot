@@ -84,16 +84,24 @@ def verify_v1(headers, raw_body: bytes, method: str, raw_path: str,
     nonce = headers.get("X-Sig-Nonce", "")
     csha = headers.get("X-Sig-Content-SHA256", "")
     sig = headers.get("X-Sig-Signature", "")
-    # 2. key registry（unknown/expired/revoked=401）
+    # 2. key registry（§2.5 lifecycle・reason 分離: unknown/revoked/not-before/expired）
     key = registry.get(key_id)
-    if key is None or key["status"] != "active":
-        return 401, "key_unknown_or_revoked"
-    if not (key["not_before"] <= now <= key["expires_at"]):
-        return 401, "key_time"
+    if key is None:
+        return 401, "key_unknown"
+    if key["status"] == "revoked":
+        return 401, "key_revoked"
+    if now < key["not_before"]:
+        return 401, "key_not_yet_valid"
+    if now > key["expires_at"]:
+        return 401, "key_expired"
+    if key["status"] not in ("active", "retiring"):
+        return 401, "key_unknown"      # 未定義 status は保守的に拒否（fail-closed）
+    key_retiring = key["status"] == "retiring"   # §2.5: retiring=受理+警告
     # 3. caller 一致
     if caller != key["caller"]:
         return 401, "caller_mismatch"
-    # 4. method/normalized_path 許可
+    # 4. method/normalized_path 許可（H01: raw_path は実 request path・クライアント
+    #    指定の path 系ヘッダは検証対象にしない）
     npath = normalize_path(raw_path)
     if npath is None:
         return 400, "bad_path"
@@ -120,19 +128,33 @@ def verify_v1(headers, raw_body: bytes, method: str, raw_path: str,
     # 8. nonce 一回性（再利用=409）
     if not nonce_store.add(nonce, key_id, caller, ts_i + skew):
         return 409, "replay"
-    return 200, "ok"
+    # 全通過。retiring 鍵は受理しつつ警告シグナル（§2.5: 受理するが警告ログ）。
+    return (200, "ok_retiring") if key_retiring else (200, "ok")
 
 
 # ── 隔離 app（本番 router に結線しない・PoC 専用） ───────────────────────────
 
 _SECRET = b"poc-hmac-secret-v1-do-not-use-in-prod"
+_TS = 1_700_000_000          # 固定時刻（registry の lifecycle 境界もこれ基準）
 _NOW_HOLDER = {"now": None}   # テストで時刻を固定するためのフック
-_REGISTRY = {
-    "kid-1": {
+
+
+def _key(status="active", not_before=0, expires_at=2 ** 31, paths=None):
+    return {
         "secret": _SECRET, "caller": "gas-koseki",
-        "allowed_methods": {"POST"}, "allowed_paths": {"/koseki/ingest"},
-        "not_before": 0, "expires_at": 2 ** 31, "status": "active",
-    },
+        "allowed_methods": {"POST"},
+        "allowed_paths": paths or {"/koseki/ingest", "/koseki/ingest2"},
+        "not_before": not_before, "expires_at": expires_at, "status": status,
+    }
+
+
+# §2.5 lifecycle を網羅する registry（active/retiring/revoked/expired/not-before）
+_REGISTRY = {
+    "kid-1":        _key(status="active"),
+    "kid-retiring": _key(status="retiring"),                     # 受理+警告
+    "kid-revoked":  _key(status="revoked"),                      # 受理停止
+    "kid-expired":  _key(status="active", expires_at=_TS - 1),   # 失効済
+    "kid-future":   _key(status="active", not_before=_TS + 1),   # 有効化前
 }
 _NONCE = NonceStore()
 
@@ -144,9 +166,10 @@ def _build_app():
     async def poc(full_path: str, request: Request):
         raw = await request.body()   # ← STOP条件検証: multipart raw bytes 取得
         now = _NOW_HOLDER["now"] or int(time.time())
-        # 署名対象 path は X-Sig-Path（PoC では明示・本番は request の raw path）
-        sig_path = request.headers.get("X-Sig-Path", "/" + full_path)
-        status, reason = verify_v1(request.headers, raw, request.method, sig_path,
+        # H01: 署名対象 path は「実 routing path」。クライアント指定の path 系ヘッダ
+        # （旧 X-Sig-Path）は一切信用しない。PoC の mount prefix "/poc" を除いた実 path。
+        effective_path = "/" + full_path
+        status, reason = verify_v1(request.headers, raw, request.method, effective_path,
                                    _REGISTRY, _NONCE, now)
         return JSONResponse(status_code=status,
                             content={"reason": reason,
@@ -194,6 +217,8 @@ def multipart_via_httpx(filename: str, filedata: bytes, ctype="application/pdf")
 
 
 def sign_headers(key_id, caller, method, sig_path, raw_body, ts, nonce):
+    # sig_path は「クライアントが署名した path」。H01 後はサーバが実 request path で
+    # 再計算するため、実 path と食い違えば bad_sig/path_denied になる（path 系ヘッダは送らない）。
     csha = hashlib.sha256(raw_body).hexdigest()
     canon = canonical_v1(key_id, caller, method, sig_path, str(ts), nonce, csha)
     return {
@@ -201,12 +226,10 @@ def sign_headers(key_id, caller, method, sig_path, raw_body, ts, nonce):
         "X-Sig-Timestamp": str(ts), "X-Sig-Nonce": nonce,
         "X-Sig-Content-SHA256": csha,
         "X-Sig-Signature": sign_v1(_SECRET, canon),
-        "X-Sig-Path": sig_path,
     }
 
 
 _PDF = b"%PDF-1.4\n" + b"\x00\x01\x02\x03binary body \xff\xfe payload\n" * 40 + b"%%EOF"
-_TS = 1_700_000_000
 _client = TestClient(_build_app())
 
 
@@ -223,6 +246,12 @@ class TestHmacMultipartPoC(unittest.TestCase):
         h = dict(headers)
         h["Content-Type"] = ctype
         return _client.post("/poc/koseki/ingest", content=body, headers=h)
+
+    def _post_to(self, url, ctype, body, headers):
+        """実 request path を明示指定して POST（H01: path 拘束の検証用）。"""
+        h = dict(headers)
+        h["Content-Type"] = ctype
+        return _client.post(url, content=body, headers=h)
 
     # a. 同一 PDF バイト列で送受信の content hash 一致
     def test_a_content_hash_matches(self):
@@ -282,7 +311,7 @@ class TestHmacMultipartPoC(unittest.TestCase):
         h["X-Sig-Key-Id"] = "kid-UNKNOWN"                  # 未知 key_id
         r = self._post(ct, body, h)
         self.assertEqual(r.status_code, 401)
-        self.assertEqual(r.json()["reason"], "key_unknown_or_revoked")
+        self.assertEqual(r.json()["reason"], "key_unknown")
 
     # e. GAS UrlFetchApp 相当（httpx/requests の multipart 自動境界付与）で成立
     def test_e_gas_httpx_multipart(self):
@@ -304,14 +333,63 @@ class TestHmacMultipartPoC(unittest.TestCase):
         # server が raw body の sha256 を返せている＝request.body() で生バイト取得可
         self.assertEqual(r.json()["server_body_sha256"], hashlib.sha256(body).hexdigest())
 
-    # 追加: path 転用（署名 path と実 path のズレ）→ path_denied
-    def test_path_reuse_denied(self):
-        ct, body = multipart_manual("BND-P", "x.pdf", _PDF)
-        n = _fresh_nonce("p")
-        h = sign_headers("kid-1", "gas-koseki", "POST", "/other/path", body, _TS, n)
-        r = self._post(ct, body, h)
+    # ── [H01] 実 path 拘束（署名は実 routing path で再計算・path 系ヘッダ非信用） ──
+    # allowlist 外の実 path へ、正規 path の署名を転用 → 403 path_denied
+    # （実 path が allowlist に無い時点で 4段 path deny・署名検証に至らない）
+    def test_h01_foreign_real_path_denied(self):
+        ct, body = multipart_manual("BND-H1A", "x.pdf", _PDF)
+        n = _fresh_nonce("h1a")
+        h = sign_headers("kid-1", "gas-koseki", "POST", "/koseki/ingest", body, _TS, n)
+        r = self._post_to("/poc/not/allowed", ct, body, h)   # 実 path=/not/allowed
         self.assertEqual(r.status_code, 403)
         self.assertEqual(r.json()["reason"], "path_denied")
+
+    # allowlist 内の別実 path へ署名を転用 → 実 path で再計算し 401 bad_sig
+    # （4段 path deny は通過するが、7段で署名 path≠実 path が露見する）
+    def test_h01_allowed_real_path_reuse_bad_sig(self):
+        ct, body = multipart_manual("BND-H1B", "x.pdf", _PDF)
+        n = _fresh_nonce("h1b")
+        h = sign_headers("kid-1", "gas-koseki", "POST", "/koseki/ingest", body, _TS, n)
+        r = self._post_to("/poc/koseki/ingest2", ct, body, h)  # 実 path=/koseki/ingest2(許可)
+        self.assertEqual(r.status_code, 401)
+        self.assertEqual(r.json()["reason"], "bad_sig")
+
+    # ── [H02] key lifecycle（§2.5・reason 分離） ──
+    # retiring = 受理 + 警告（reason=ok_retiring）
+    def test_h02_retiring_accepted_with_warning(self):
+        ct, body = multipart_manual("BND-RET", "x.pdf", _PDF)
+        n = _fresh_nonce("ret")
+        h = sign_headers("kid-retiring", "gas-koseki", "POST", "/koseki/ingest", body, _TS, n)
+        r = self._post(ct, body, h)
+        self.assertEqual(r.status_code, 200, r.json())
+        self.assertEqual(r.json()["reason"], "ok_retiring")
+
+    # revoked = 受理停止（401 key_revoked・unknown と reason 分離）
+    def test_h02_revoked_key(self):
+        ct, body = multipart_manual("BND-REV", "x.pdf", _PDF)
+        n = _fresh_nonce("rev")
+        h = sign_headers("kid-revoked", "gas-koseki", "POST", "/koseki/ingest", body, _TS, n)
+        r = self._post(ct, body, h)
+        self.assertEqual(r.status_code, 401)
+        self.assertEqual(r.json()["reason"], "key_revoked")
+
+    # expired = 有効期限切れ（401 key_expired）
+    def test_h02_expired_key(self):
+        ct, body = multipart_manual("BND-EXP", "x.pdf", _PDF)
+        n = _fresh_nonce("exp")
+        h = sign_headers("kid-expired", "gas-koseki", "POST", "/koseki/ingest", body, _TS, n)
+        r = self._post(ct, body, h)
+        self.assertEqual(r.status_code, 401)
+        self.assertEqual(r.json()["reason"], "key_expired")
+
+    # not-before = 有効化前（401 key_not_yet_valid）
+    def test_h02_not_yet_valid_key(self):
+        ct, body = multipart_manual("BND-FUT", "x.pdf", _PDF)
+        n = _fresh_nonce("fut")
+        h = sign_headers("kid-future", "gas-koseki", "POST", "/koseki/ingest", body, _TS, n)
+        r = self._post(ct, body, h)
+        self.assertEqual(r.status_code, 401)
+        self.assertEqual(r.json()["reason"], "key_not_yet_valid")
 
     # 追加: 署名検証の body() 先読みと、後続の form-parse（本番 ingest 群が使う）が
     # 同一 multipart で共存できること（Starlette の body キャッシュ）。
