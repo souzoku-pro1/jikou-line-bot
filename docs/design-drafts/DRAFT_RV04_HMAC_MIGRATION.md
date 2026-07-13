@@ -60,17 +60,23 @@ kintone webhook 由来の3本には**適用不能**。§3 の代替に分岐。
 multipart PoC 完了後（PoC で content 対象が確定してから golden を固定）。
 
 > **NM01 v1 = FROZEN（2026-07-13・司令塔裁定・PoC=P1-103）**
-> - **content 対象を「送出最終バイト列全体の SHA-256」と確定**（＝クライアントが実際に
->   wire へ載せる body 全バイトの SHA-256。multipart の場合は boundary を含む body 全体）。
+> **凍結範囲は「① content 対象の定義」と「② canonical 形式」に限定する**（③ §2.3 検証順の
+> 実装詳細と ④ GAS 適用性は凍結対象外＝下記のとおり P1-103-fix で更に硬化／条件付き解決）。
+> - **① content 対象を「送出最終バイト列全体の SHA-256」と確定（FROZEN）**（＝クライアントが
+>   実際に wire へ載せる body 全バイトの SHA-256。multipart の場合は boundary を含む body 全体）。
 >   PoC（`test_hmac_multipart_poc.py`）で hash 一致・改変検知(401)・boundary 吸収・
 >   `body()`先読みと`form()`受理の共存を実証。§7 が警戒した「フィールド別 hash への再設計」は不要。
-> - **実装制約（GAS caller）**: GAS caller は multipart を**手組み**すること（固定 boundary を
->   自ら選定・`Content-Type: multipart/form-data; boundary=…` を明示 set・content_sha256 は
->   その**同一バイト列**を対象に計算）。UrlFetchApp の payload(Blob) 自動組立に依存しない
->   （自動採番 boundary を含む最終バイトを送出前に読めず hash 不能になるリスクの排除）。
->   **GAS 実地確認は caller 移行段階の[人]実機検分に統合**（本 PoC はサーバ契約と wire 形式を
->   実証・GAS 実体は OUT_OF_SCOPE のため未実行）。
-> - **canonical / §2.3 検証順は変更なしのまま凍結**。
+> - **② canonical 形式（§2.1 length-prefix・ORDER）を確定（FROZEN）**。version は v1 単一方式。
+> - **③ §2.3 検証順（実装詳細）は凍結対象外・P1-103-fix で硬化**: 署名対象 path は
+>   **実 routing path**で再計算し client 指定の path 系ヘッダは非信用（H01）／key lifecycle の
+>   reason を分離（`key_unknown`/`key_revoked`/`key_not_yet_valid`/`key_expired`・retiring は
+>   受理+警告〔H02〕）。§6 の 403/401 ケース分けを参照。
+> - **④ GAS 適用性 = CONDITIONALLY_RESOLVED**（§7）。条件 = (i) GAS caller が multipart を
+>   **手組み**すること（固定 boundary を自ら選定・`Content-Type: multipart/form-data; boundary=…`
+>   を明示 set・content_sha256 はその**同一バイト列**を対象に計算。UrlFetchApp の payload(Blob)
+>   自動組立に依存しない＝自動採番 boundary を送出前に読めず hash 不能になるリスクを排除）／
+>   (ii) **caller 移行段階の[人]実機検分**で GAS 実体の payload hash 一致を確認（本 PoC は
+>   サーバ契約と wire 形式を実証・GAS 実体は OUT_OF_SCOPE のため未実行）。
 
 v1 canonical（length-prefix）:
 ```
@@ -185,23 +191,72 @@ status        : active / retiring / revoked
 - GAS は1ファイルに全 fetch 集約 → **署名付与ヘルパを GAS 内に1つ**作り共用（大野・BLOCKED）。
 
 ## 6. テスト戦略
-- replay（同一nonce=409）／path転用（署名の path 流用=401）／body改変（content_sha256不一致=401）／
-  期限外（timestamp SKEW超過=401）／unknown/expired/revoked key（=401・reason別）／
-  method/path 非許可（=403）／**downgrade（署名ヘッダあり+署名不正で token 併記→401、tokenに落ちない）**／
-  skew境界／dual-accept 3系（署名OK・token OK・両方無=401）。
-- **cross-language golden ベクトル**（§2.1・server/client一致）を contract テストに固定。
-- multipart body hash は §7 PoC 成立を前提。
+
+### 6.1 403 と 401 のケース分け（M03: status を混同しない）
+検証は §2.3 の**段順**で最初に不成立になった段の status/reason を返す（fail-closed）。
+特に **path 不許可（4段）と署名不一致（7段）を status で分離**する:
+
+| 契機 | 段 | status | reason | 備考 |
+|---|---|---|---|---|
+| method 非許可 | 4 | **403** | `method_denied` | registry の `allowed_methods` 外 |
+| **実 path が allowlist 外** | 4 | **403** | `path_denied` | 実 routing path が `allowed_paths` に無い。**署名検証に到達しない** |
+| path 正規化違反（%2F・`..`・`//`・非ASCII） | 4 | **400** | `bad_path` | §2.1 H02 |
+| **署名不一致（実 path で再計算）** | 7 | **401** | `bad_sig` | 実 path が allowlist 内でも、署名 path≠実 path なら 7 段で露見 |
+| content_sha256 不一致 | 6 | 401 | `body_mismatch` | body 改変 |
+| timestamp SKEW 超過 | 5 | 401 | `skew` | ±SKEW 境界 |
+| replay（nonce 再利用） | 8 | 409 | `replay` | |
+
+**H01 の要点**: 署名対象 path は**実 routing path**で再計算し、client 指定の path 系ヘッダ
+（旧 X-Sig-Path 相当）は検証対象にしない。→ allowlist 外の実 path へ正規署名を転用しても
+**4 段 path deny=403**、allowlist 内の別実 path へ転用しても**7 段署名不一致=401 bad_sig**。
+
+### 6.2 key lifecycle の reason 分離（H02・§2.5 準拠）
+
+| status/時刻 | 段 | status | reason |
+|---|---|---|---|
+| 未登録 key_id | 2 | 401 | `key_unknown` |
+| `revoked` | 2 | 401 | `key_revoked` |
+| `now < not_before` | 2 | 401 | `key_not_yet_valid` |
+| `now > expires_at` | 2 | 401 | `key_expired` |
+| `retiring` | 2→8 全通過 | **200** | `ok_retiring`（**受理+警告**） |
+| `active` | 2→8 全通過 | 200 | `ok` |
+
+### 6.3 本体実装（RV-04 body）で必須のテスト一覧（M01: Codex 提案の不足分を全数反映）
+PoC で実証済みの項目に加え、本体実装は下記を**全数**テスト化すること:
+- **署名検証段（§2.3 各段）**: caller 不一致=401 `caller_mismatch`／version 欠落・不正（`v1`以外）=401 `bad_version`／
+  timestamp 形式不正（非数値）=401 `bad_ts`／future skew（`now+SKEW` 超過）=401 `skew`／
+  **skew ±300 境界**（`now±300` は受理・`now±301` は拒否の両側）／required header 欠落
+  （各 `X-Sig-*` 欠落で個別に拒否・欠落 header 名で挙動が変わらないこと）。
+- **downgrade 防止**: 署名ヘッダ在＋query token 併記時に token へ落ちない（署名不正なら 401・
+  token では受理しない）／dual-accept 3系（署名OK・token OK・両方無=401）。
+- **status–reason table**: §6.1/§6.2 の (status, reason) 表を 1 対 1 で網羅する parametrized テスト。
+- **canonical / cross-language**: canonical golden ベクトル固定（§2.1・最低5本＝ASCII/日本語
+  ファイル名/空 body/multipart/境界長）／server(Python)↔client(GAS/JS) の cross-language 一致。
+- **multipart 生 body 形状**: boundary 衝突（body 内に boundary 類似列）／filename の quote/escape／
+  CRLF 正規化（`\r\n` 固定）／空 body／複数 field（file+meta）で content hash が生 body 全体基準で
+  一致すること。
+- **GAS 実機**: GAS UrlFetchApp が送出する最終 payload の SHA-256 が server 受信生 body の hash と
+  一致することを実機で比較（手組み multipart 前提・§2.1 実装制約／§7・caller 移行段階の[人]検分）。
+- **path 拘束（H01）**: allowlist 外実 path=403 `path_denied`／allowlist 内別実 path 転用=401 `bad_sig`。
+- **key lifecycle（H02）**: unknown/revoked/expired/not_before の reason 分離・retiring 受理+警告。
+
+> **PoC 実証済み（P1-103 / P1-103-fix・`test_hmac_multipart_poc.py`・15 tests）**:
+> content hash 一致(a)／boundary 非依存(b)／1byte 改変拒否(c)／replay・skew・unknown key(d)／
+> GAS 相当 httpx multipart(e)／raw body 取得／body()×form() 共存／H01 path 拘束 2 系／
+> H02 lifecycle 5 系。本体実装は上記 6.3 の残りを本番経路で全数化する。
 
 ## 7. 論点・OPEN・BLOCKED
 - 【OPEN・owner=大野/司令塔】nonce ストア（案A/B）・kintone webhook 代替（K1/K2/K3）。
 - 【OPEN・owner=大野/司令塔】key_id 保管方式（Railway env `SIG_KEY_*` / 将来の secret manager）。
   判断材料: Railway env の管理容易さ vs secret manager の監査/rotation 機能・rotation 運用コスト
   （§2.5 lifecycle を env 手運用で回すか managed で回すか）。
-- **multipart body-hash PoC（M11 段3）→ RESOLVED（P1-103・2026-07-13）**:
+- **multipart body-hash PoC（M11 段3）→ CONDITIONALLY_RESOLVED（P1-103／P1-103-fix・2026-07-13）**:
   サーバ受信生 body の SHA-256 が送出最終バイト列の SHA-256 と一致することを実証
-  （`test_hmac_multipart_poc.py`・10 tests / 全 suite 1,276 passed）。content 対象＝送出生 body
-  全体で確定・フィールド別 hash への再設計は**不要**。残る実務確認は GAS 手組み multipart の
-  実地成立のみ（§2.1 実装制約に記載・caller 移行段階の[人]実機検分に統合）。
+  （`test_hmac_multipart_poc.py`・15 tests）。content 対象＝送出生 body 全体で確定・
+  フィールド別 hash への再設計は**不要**（§2.1 ①②を FROZEN）。**条件**（未充足なら freeze の
+  GAS 適用は保留）: (i) GAS caller が multipart を手組み（固定 boundary 自選・Content-Type 明示 set・
+  hash は同一バイト列）／(ii) **caller 移行段階の[人]実機検分**で GAS 実体 payload の hash 一致を
+  確認。サーバ契約・wire 形式・path 拘束(H01)・key lifecycle(H02) は PoC で実証済み。
 - **認証ログ方針（HIGH）**: 認証失敗ログは **固定 reason code（`bad_sig`/`skew`/`key_revoked`/
   `path_denied`/`replay` 等）＋caller_id＋key_id＋相関ID(nonce or request id)** に限定。
   secret・body・PII・vendor 生値を出さない（RV10 §禁止と統合）。
