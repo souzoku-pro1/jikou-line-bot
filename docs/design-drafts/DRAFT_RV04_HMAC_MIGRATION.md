@@ -151,7 +151,11 @@ status        : active / retiring / revoked
   (2) GAS を新 key_id に切替 → (3) 旧 key_id を `retiring`（受理はするが警告ログ）→
   (4) 一定期間後 `revoked`（受理停止）。**key_id は失効後も再利用しない**（過去署名の
   取り違え防止）。rollback は「新 key_id を revoked にし旧を active に戻す」で対応。
-- 失効/revoked 鍵での署名は 401（reason=`key_revoked`）。
+- **status / 時刻に対する (status, reason) の期待値は §6.2 を単一の契約とする**（本節に
+  reason を二重定義しない＝期待値の分岐を防ぐ）。要点のみ: unknown=`key_unknown` /
+  revoked=`key_revoked` / not_before 前=`key_not_yet_valid` / expired=`key_expired`（各 401）、
+  `retiring`=受理 + **warning ログ 1 回**（key_id・caller_id のみ可視・secret/署名/nonce/body
+  非混入）。詳細と網羅表は §6.2 を参照。
 
 ## 3. kintone webhook群（3本）: 代替設計（採用条件つき）
 
@@ -206,11 +210,16 @@ status        : active / retiring / revoked
 | timestamp SKEW 超過 | 5 | 401 | `skew` | ±SKEW 境界 |
 | replay（nonce 再利用） | 8 | 409 | `replay` | |
 
-**H01 の要点**: 署名対象 path は**実 routing path**で再計算し、client 指定の path 系ヘッダ
-（旧 X-Sig-Path 相当）は検証対象にしない。→ allowlist 外の実 path へ正規署名を転用しても
-**4 段 path deny=403**、allowlist 内の別実 path へ転用しても**7 段署名不一致=401 bad_sig**。
+**H01 の要点**: 署名対象 path は **ASGI `scope["raw_path"]`（decode 前生バイト）**で再計算し、
+client 指定の path 系ヘッダ（旧 X-Sig-Path 相当）も **decode 済み path** も検証の真実源にしない。
+decode 済み path を使うと `%2F` が `/` に化けて separator を smuggling され path 拘束が破れる
+（例: 実 raw `/koseki%2Fingest` が decode 後 `/koseki/ingest` として許可されてしまう）。
+→ allowlist 外の実 path へ正規署名を転用しても**4 段 path deny=403**、allowlist 内の別実 path へ
+転用しても**7 段署名不一致=401 bad_sig**、`%2F`/`%2e`/`%252F`/`//`/非 ASCII 生バイトは**400 bad_path**、
+`raw_path` 欠落は**fail-closed（受理しない）**。
 
-### 6.2 key lifecycle の reason 分離（H02・§2.5 準拠）
+### 6.2 key lifecycle の reason 分離（H02・**reason contract の単一の正**）
+§2.5 はここを参照する（reason を二重定義しない）。段は §2.3 の検証段番号。
 
 | status/時刻 | 段 | status | reason |
 |---|---|---|---|
@@ -220,6 +229,11 @@ status        : active / retiring / revoked
 | `now > expires_at` | 2 | 401 | `key_expired` |
 | `retiring` | 2→8 全通過 | **200** | `ok_retiring`（**受理+警告**） |
 | `active` | 2→8 全通過 | 200 | `ok` |
+
+- **retiring の warning ログ（M01）**: 受理時に warning を**1 回**出力。可視は **key_id・caller_id のみ**。
+  secret・署名・nonce・body（およびその hash）は**混入させない**（§7 認証ログ方針と統合）。
+- 判定順の帰結: revoked は時刻窓より先に判定（revoked 鍵は期限内でも `key_revoked`）。
+  not_before / expires_at 違反は status に依らず時刻 reason を返す。
 
 ### 6.3 本体実装（RV-04 body）で必須のテスト一覧（M01: Codex 提案の不足分を全数反映）
 PoC で実証済みの項目に加え、本体実装は下記を**全数**テスト化すること:
@@ -237,13 +251,18 @@ PoC で実証済みの項目に加え、本体実装は下記を**全数**テス
   一致すること。
 - **GAS 実機**: GAS UrlFetchApp が送出する最終 payload の SHA-256 が server 受信生 body の hash と
   一致することを実機で比較（手組み multipart 前提・§2.1 実装制約／§7・caller 移行段階の[人]検分）。
-- **path 拘束（H01）**: allowlist 外実 path=403 `path_denied`／allowlist 内別実 path 転用=401 `bad_sig`。
+- **path 拘束（H01）**: 署名対象 path は **ASGI `scope["raw_path"]`（decode 前生バイト）**で
+  再計算（decode 済み path は %2F separator smuggling を許すため不可）。allowlist 外実 path=403
+  `path_denied`／allowlist 内別実 path 転用=401 `bad_sig`／`%2F`・`%2e`・`%252F`・`//`・非 ASCII
+  生バイト=400 `bad_path`／`raw_path` 欠落=fail-closed（受理しない）。
 - **key lifecycle（H02）**: unknown/revoked/expired/not_before の reason 分離・retiring 受理+警告。
 
-> **PoC 実証済み（P1-103 / P1-103-fix・`test_hmac_multipart_poc.py`・15 tests）**:
+> **PoC 実証済み（P1-103 / -fix / -fix2・`test_hmac_multipart_poc.py`・21 tests）**:
 > content hash 一致(a)／boundary 非依存(b)／1byte 改変拒否(c)／replay・skew・unknown key(d)／
-> GAS 相当 httpx multipart(e)／raw body 取得／body()×form() 共存／H01 path 拘束 2 系／
-> H02 lifecycle 5 系。本体実装は上記 6.3 の残りを本番経路で全数化する。
+> GAS 相当 httpx multipart(e)／raw body 取得／body()×form() 共存／H01 path 拘束（foreign=403・
+> 別実 path=bad_sig・raw_path %2F/%2e/%252F/// 拒否・raw_path 欠落 fail-closed・normalize 単体）／
+> H02 lifecycle 5 系／M01 retiring warning（1 回・機微ゼロ）／§6.1・§6.2 status–reason table。
+> 本体実装は上記 6.3 の残り（downgrade・cross-language golden・GAS 実機 等）を本番経路で全数化する。
 
 ## 7. 論点・OPEN・BLOCKED
 - 【OPEN・owner=大野/司令塔】nonce ストア（案A/B）・kintone webhook 代替（K1/K2/K3）。
