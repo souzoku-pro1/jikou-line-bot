@@ -15,6 +15,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Awaitable, Callable
 
+from hub.redact import emit  # RV-10: sink 出力は emit 契約経由（1形式）
+
 logger = logging.getLogger("hub.scheduler")
 
 _JST = timezone(timedelta(hours=9))
@@ -94,10 +96,13 @@ async def _job_loop(job: _Job) -> None:
     while True:
         if job.kind == "daily":
             wait = _seconds_until_next_run(job.hour_jst)
-            # Railway ログで起動登録を確認できるよう print も出す（uvicorn 配下では
-            # モジュールロガーの INFO がハンドラ未設定で出力されないため・従来と同形式）
-            print(f"[{job.name}] scheduler registered: next run in {wait:.0f} sec "
-                  f"(daily {job.hour_jst:02d}:00 JST)", flush=True)
+            # PR-4c: 従来の print を app ロガーへ移送（INFO 配線済み〔P1-107a〕で本番
+            # Railway に出力される）。値は emit 契約経由（job 名/秒/時は非機微だが素通し
+            # 禁止のため record_id/count で値域検証つき素通し）。
+            logger.info("[%s] scheduler registered: next run in %s sec (daily %s:00 JST)",
+                        emit(job.name, "record_id", "log", "operator"),
+                        emit(int(wait), "count", "log", "operator"),
+                        emit(job.hour_jst, "count", "log", "operator"))
         else:
             wait = job.minutes * 60
         await asyncio.sleep(wait)

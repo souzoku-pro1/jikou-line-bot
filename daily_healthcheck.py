@@ -326,8 +326,9 @@ async def run_healthcheck() -> list[str]:
                 "DISPATCHBOTチャネルの死活を確認すること。")
             await _deadman_alt_alert()
     else:
+        # PR-4c: 従来の print による二重出力を廃止。OK ログは上の logger.info に一本化
+        # （INFO 配線済み〔P1-107a〕で本番 Railway に出力される）。
         logger.info("healthcheck OK (%s) models=%s/%s", now, PRIMARY_MODEL, FALLBACK_MODEL)
-        print(f"[HEALTHCHECK] OK {now} models={PRIMARY_MODEL}/{FALLBACK_MODEL}")
 
     return problems
 
@@ -353,8 +354,8 @@ async def _deadman_alt_alert() -> None:
 # ══════════════════════════════════════════════════════════════
 # アプリ内スケジューラ（FastAPI startup から呼ぶ）
 #   T0-2 でループ実装を hub/scheduler（ジョブレジストリ）に移設。
-#   登録名 "HEALTHCHECK" により Railway ログの登録行は従来と同一書式:
-#     [HEALTHCHECK] scheduler registered: next run in N sec (daily HH:00 JST)
+#   登録名 "HEALTHCHECK" により Railway ログの登録行（PR-4c 以降は app ロガー経由）:
+#     [HEALTHCHECK] scheduler registered: next run in N sec (daily H:00 JST)
 # ══════════════════════════════════════════════════════════════
 
 from hub import scheduler as hub_scheduler  # noqa: E402
