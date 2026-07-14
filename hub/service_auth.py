@@ -24,7 +24,8 @@ import hmac
 import json
 import logging
 import os
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 import sqlalchemy as sa
@@ -41,6 +42,13 @@ _DEFAULT_SKEW = 300
 _REGISTRY_ENV = "SERVICE_HMAC_KEY_REGISTRY"
 _SKEW_ENV = "SIG_MAX_SKEW_SEC"
 
+# §2.2: 署名経路で必須の 7 ヘッダ。欠落は第1段で missing_header（bad_sig 任せにしない）。
+_REQUIRED_HEADERS = ("X-Sig-Version", "X-Sig-Key-Id", "X-Sig-Caller",
+                     "X-Sig-Timestamp", "X-Sig-Nonce", "X-Sig-Content-SHA256",
+                     "X-Sig-Signature")
+_NONCE_RE = re.compile(r"[0-9a-fA-F]{32}")   # §2.2: nonce は 128bit hex 固定
+_NONCE_HEX_LEN = 32
+
 
 # ── nonce store（DB・案B）: signature_nonce 表 ──────────────────────────────
 # app-state 専用 metadata（alembic env.py の target_metadata list に統合する）。
@@ -53,6 +61,8 @@ signature_nonce = sa.Table(
     sa.Column("caller", sa.Text, nullable=False),
     sa.Column("seen_at", sa.DateTime(timezone=True), nullable=False),
     sa.Column("expires_at", sa.DateTime(timezone=True), nullable=False),
+    # H-02: 128bit hex（32 文字）固定を DB でも保証（検証層の bad_nonce と二重の防御）
+    sa.CheckConstraint("length(nonce) = 32", name="ck_signature_nonce_len"),
 )
 
 
@@ -70,13 +80,23 @@ class ServiceAuthConfigError(RuntimeError):
 @dataclass(frozen=True)
 class KeyEntry:
     key_id: str
-    secret: bytes                 # HMAC 鍵（hex 復号済み・ログ/例外に出さない）
-    caller: str
-    allowed_methods: frozenset    # {"POST"} 等（大文字化済み）
-    allowed_paths: frozenset      # {"/koseki/ingest"} 等
-    not_before: int               # unix 秒
-    expires_at: int               # unix 秒
-    status: str                   # active / retiring / revoked
+    secret: bytes = field(repr=False)   # HMAC 鍵（H-01: repr/ログ/例外に出さない）
+    caller: str = ""
+    allowed_methods: frozenset = frozenset()   # {"POST"} 等（大文字化済み）
+    allowed_paths: frozenset = frozenset()     # {"/koseki/ingest"} 等
+    not_before: int = 0           # unix 秒
+    expires_at: int = 0           # unix 秒
+    status: str = "active"        # active / retiring / revoked
+    # NB: secret に既定が無い（field(repr=False)）ため後続フィールドにも既定を付与して
+    #     dataclass の "non-default after default なし" を満たす（構築は常に全指定）。
+
+    def __repr__(self) -> str:
+        # H-01: secret は値・hex を一切出さず <redacted> に固定。%r/f"{x!r}"/str も同じ。
+        return (f"KeyEntry(key_id={self.key_id!r}, secret=<redacted>, "
+                f"caller={self.caller!r}, allowed_methods={sorted(self.allowed_methods)!r}, "
+                f"allowed_paths={sorted(self.allowed_paths)!r}, "
+                f"not_before={self.not_before}, expires_at={self.expires_at}, "
+                f"status={self.status!r})")
 
 
 def _parse_entry(key_id: str, raw: dict) -> KeyEntry:
@@ -215,10 +235,18 @@ def verify_signature(headers, raw_body: bytes, method: str, raw_path,
     """§2.3 の 1〜7 段（署名まで）を検証する純粋関数。
     Returns: (status:int, reason:str, ctx:VerifyContext|None)。
     200/"ok"（or "ok_retiring"）のとき ctx を返す（呼び出し側が 8 段 nonce を処理）。"""
-    # 1. 署名ヘッダが存在すれば署名経路（token fallback 禁止）。version!=v1=401。
+    # 1. 署名ヘッダが存在すれば署名経路（token fallback 禁止）。
     if any(k.lower().startswith("x-sig-") for k in headers):
+        # §2.2: 必須 7 ヘッダの欠落/空は第1段で missing_header（bad_sig 任せにしない・H-02）
+        for h in _REQUIRED_HEADERS:
+            if not headers.get(h):
+                return 401, "missing_header", None
+        # version!=v1（present だが値違反）は downgrade として bad_version
         if headers.get("X-Sig-Version") != "v1":
             return 401, "bad_version", None
+        # nonce 形式（128bit hex 固定）。欠落は上で missing_header・形式違反は bad_nonce
+        if not _NONCE_RE.fullmatch(headers.get("X-Sig-Nonce", "")):
+            return 401, "bad_nonce", None
     else:
         return 401, "no_signature", None
     key_id = headers.get("X-Sig-Key-Id", "")

@@ -11,6 +11,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import shutil
 import tempfile
 import unittest
@@ -46,7 +47,17 @@ _REG_JSON = json.dumps({
 REGISTRY = svc.parse_registry(_REG_JSON)
 
 
+_HEX32 = re.compile(r"[0-9a-fA-F]{32}")
+
+
+def _mknonce(seed):
+    """テスト seed を 128bit hex nonce に正規化（H-02 のヘッダ検証を通す）。"""
+    s = str(seed)
+    return s if _HEX32.fullmatch(s) else hashlib.sha256(s.encode()).hexdigest()[:32]
+
+
 def _sign(key_id, caller, method, path, body, ts, nonce, secret=SECRET, version="v1"):
+    nonce = _mknonce(nonce)   # 128bit hex 固定（署名対象と一致・§2.2）
     csha = hashlib.sha256(body).hexdigest()
     canon = svc.canonical_v1(key_id, caller, method, path, str(ts), nonce, csha)
     return {"X-Sig-Version": version, "X-Sig-Key-Id": key_id, "X-Sig-Caller": caller,
@@ -173,18 +184,111 @@ class TestSkewBoundary(unittest.TestCase):
                     self.assertEqual((st, rs), (401, "skew"))
 
 
-# ── required header 欠落（いずれも受理しない） ──────────────────────────────
+# ── required header 欠落（H-02: 第1段で missing_header・bad_sig 任せにしない） ──
 class TestRequiredHeaders(unittest.TestCase):
-    def test_each_missing_header_rejected(self):
+    def test_each_missing_header_is_missing_header(self):
         base = _sign("kid-1", "gas-koseki", "POST", "/koseki/ingest", b"b", TS, "reqh")
-        for drop in ["X-Sig-Version", "X-Sig-Key-Id", "X-Sig-Caller",
-                     "X-Sig-Timestamp", "X-Sig-Nonce", "X-Sig-Content-SHA256",
-                     "X-Sig-Signature"]:
+        for drop in svc._REQUIRED_HEADERS:
             with self.subTest(drop=drop):
                 h = {k: v for k, v in base.items() if k != drop}
                 st, rs, ctx = _vsig(h, b"b", "POST", "/koseki/ingest")
-                self.assertNotEqual(st, 200, f"{drop} 欠落で受理してはならない")
+                self.assertEqual((st, rs), (401, "missing_header"), drop)
                 self.assertIsNone(ctx)
+
+    def test_empty_header_value_is_missing_header(self):
+        base = _sign("kid-1", "gas-koseki", "POST", "/koseki/ingest", b"b", TS, "reqh2")
+        for empty in svc._REQUIRED_HEADERS:
+            with self.subTest(empty=empty):
+                h = {**base, empty: ""}
+                st, rs, _ = _vsig(h, b"b", "POST", "/koseki/ingest")
+                self.assertEqual((st, rs), (401, "missing_header"), empty)
+
+
+# ── H-02: nonce 形式（128bit hex 固定・bad_nonce） ──────────────────────────
+class TestNonceFormat(unittest.TestCase):
+    def _hdr_with_raw_nonce(self, nonce):
+        # 生の nonce 値でヘッダを組む（署名も同じ nonce で作る＝bad_sig ではなく
+        # bad_nonce を狙う）。_sign を通さず手組みして正規化を回避する。
+        body = b"b"
+        csha = hashlib.sha256(body).hexdigest()
+        canon = svc.canonical_v1("kid-1", "gas-koseki", "POST", "/koseki/ingest",
+                                 str(TS), nonce, csha)
+        return {"X-Sig-Version": "v1", "X-Sig-Key-Id": "kid-1",
+                "X-Sig-Caller": "gas-koseki", "X-Sig-Timestamp": str(TS),
+                "X-Sig-Nonce": nonce, "X-Sig-Content-SHA256": csha,
+                "X-Sig-Signature": svc.sign_v1(SECRET, canon)}
+
+    def test_bad_nonce_forms_rejected(self):
+        bad = [
+            "short",                              # 短い・非 hex
+            "z" * 32,                             # 32 文字だが非 hex
+            "ab" * 8,                             # 16 文字（64bit・長さ不足）
+            "ab" * 32,                            # 64 文字（256bit・長すぎ）
+            "0123456789abcdef0123456789abcde",    # 31 文字
+            "0123456789abcdef0123456789abcdef0",  # 33 文字
+        ]
+        for n in bad:
+            with self.subTest(nonce=n):
+                st, rs, ctx = _vsig(self._hdr_with_raw_nonce(n), b"b", "POST", "/koseki/ingest")
+                self.assertEqual((st, rs), (401, "bad_nonce"), n)
+                self.assertIsNone(ctx)
+
+    def test_valid_128bit_hex_accepted(self):
+        for n in ["0123456789abcdef0123456789abcdef", "AB" * 16, "0" * 32]:
+            with self.subTest(nonce=n):
+                st, rs, _ = _vsig(self._hdr_with_raw_nonce(n), b"b", "POST", "/koseki/ingest")
+                self.assertEqual((st, rs), (200, "ok"), n)
+
+
+# ── H-01: KeyEntry.secret が repr / str / %r に出ない ───────────────────────
+class TestSecretNotInRepr(unittest.TestCase):
+    def test_secret_masked_everywhere(self):
+        entry = REGISTRY["kid-1"]
+        forms = [repr(entry), str(entry), f"{entry!r}", "%r" % (entry,),
+                 repr(REGISTRY), f"{REGISTRY!r}"]
+        for s in forms:
+            with self.subTest(form=s[:40]):
+                self.assertNotIn(SECRET_HEX, s)           # hex 表現なし
+                self.assertNotIn(SECRET.hex(), s)
+                self.assertNotIn(str(SECRET), s)          # bytes repr（b'...'）なし
+                self.assertNotIn("\\xab", s)              # バイト列断片なし
+                self.assertIn("<redacted>", s)            # マスクが入っている
+
+
+# ── M-01: raw_path 境界を本番モジュール（effective_signed_path / verify）で固定 ──
+class TestRawPathProduction(unittest.TestCase):
+    def test_effective_signed_path_from_scope(self):
+        self.assertEqual(svc.effective_signed_path({"raw_path": b"/koseki/ingest"}),
+                         "/koseki/ingest")
+        self.assertIsNone(svc.effective_signed_path({}))               # 欠落=fail-closed
+        self.assertIsNone(svc.effective_signed_path({"raw_path": None}))
+
+    def test_mount_prefix_strip_keeps_raw_bytes(self):
+        # prefix 除去後も生バイト基準（%2F は decode されない）
+        self.assertEqual(
+            svc.effective_signed_path({"raw_path": b"/mnt/koseki/ingest"}, prefix="/mnt"),
+            "/koseki/ingest")
+        self.assertEqual(
+            svc.effective_signed_path({"raw_path": b"/mnt/koseki%2Fingest"}, prefix="/mnt"),
+            "/koseki%2Fingest")   # 生バイト保持（後段 normalize が %2F を 400 で弾く）
+
+    def test_malformed_raw_path_400_via_verify(self):
+        for rp in ["/koseki%2Fingest", "/a/%2e%2e/b", "/koseki/%252F",
+                   "/a//b", "/koseki/／ingest"]:
+            with self.subTest(rp=rp):
+                # decode 後の許可 path で正しく署名しても、生 raw_path 基準で 400 bad_path
+                h = _sign("kid-1", "gas-koseki", "POST", "/koseki/ingest", b"b", TS, "rp" + rp)
+                st, rs, ctx = _vsig(h, b"b", "POST", rp)
+                self.assertEqual((st, rs), (400, "bad_path"), rp)
+                self.assertIsNone(ctx)
+
+    def test_normalize_path_unit(self):
+        self.assertIsNone(svc.normalize_path("/koseki%2fingest"))
+        self.assertIsNone(svc.normalize_path("/a/../b"))
+        self.assertIsNone(svc.normalize_path("/a//b"))
+        self.assertIsNone(svc.normalize_path("/koseki/／ingest"))
+        self.assertIsNone(svc.normalize_path(None))
+        self.assertEqual(svc.normalize_path("/koseki/ingest/"), "/koseki/ingest")
 
 
 # ── canonical golden（fixture 照合・cross-language） ─────────────────────────
@@ -305,7 +409,7 @@ class TestNoncePersistenceDB(_SqliteDbMixin):
         rows = asyncio.run(_fetch())
         db.reset_for_tests()
         self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0]["nonce"], "row-check")
+        self.assertEqual(rows[0]["nonce"], h["X-Sig-Nonce"])   # DB に格納された nonce=送信 nonce
         self.assertEqual(rows[0]["key_id"], "kid-1")
 
 
@@ -328,6 +432,44 @@ class TestRetiringWarningDB(_SqliteDbMixin):
         self.assertNotIn(h["X-Sig-Nonce"], joined)
         self.assertNotIn(h["X-Sig-Content-SHA256"], joined)
         self.assertNotIn(SECRET_HEX, joined)
+
+
+# ── L-01: nonce 同時競合（UNIQUE 違反で片方が敗者＝409） ─────────────────────
+class TestNonceConcurrency(_SqliteDbMixin):
+    _NOW = datetime.fromtimestamp(TS, tz=timezone.utc)
+    _EXP = datetime.fromtimestamp(TS + 300, tz=timezone.utc)
+
+    def test_same_nonce_second_consume_is_false(self):
+        import asyncio
+        nonce = "cc" + "0" * 30    # 128bit hex
+
+        async def _flow():
+            first = await svc.consume_nonce(nonce, "kid-1", "gas-koseki", self._EXP, now=self._NOW)
+            second = await svc.consume_nonce(nonce, "kid-1", "gas-koseki", self._EXP, now=self._NOW)
+            return first, second
+        first, second = asyncio.run(_flow())
+        db.reset_for_tests()
+        # 先着＝True・後着は UNIQUE 違反を握って False（例外は verify 側で 409 に写る）
+        self.assertEqual((first, second), (True, False))
+
+    def test_direct_unique_violation_yields_409(self):
+        import asyncio
+        nonce = "dd" + "0" * 30
+
+        async def _preinsert():   # 先着（勝者）を直接 INSERT
+            async with db.session_scope() as s:
+                await s.execute(sa.insert(svc.signature_nonce).values(
+                    nonce=nonce, key_id="kid-1", caller="gas-koseki",
+                    seen_at=self._NOW, expires_at=self._EXP))
+        asyncio.run(_preinsert())
+        db.reset_for_tests()
+        # 敗者: 同一 nonce で verify_request → UNIQUE 違反→False→409 replay
+        h = _sign("kid-1", "gas-koseki", "POST", "/koseki/ingest", b"body", TS, nonce)
+        self.assertEqual(h["X-Sig-Nonce"], nonce)   # nonce が先着と一致していること
+        r = asyncio.run(svc.verify_request(h, b"body", "POST", "/koseki/ingest",
+                                           registry=REGISTRY, now=TS, skew=300))
+        db.reset_for_tests()
+        self.assertEqual(r, (409, "replay"))
 
 
 # NB: signature_nonce migration の up/down 往復（実 sqlite）は、alembic 起動を

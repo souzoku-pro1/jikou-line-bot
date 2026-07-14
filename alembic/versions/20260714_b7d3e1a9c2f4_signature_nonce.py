@@ -29,6 +29,8 @@ def upgrade() -> None:
         sa.Column("caller", sa.Text(), nullable=False),
         sa.Column("seen_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("expires_at", sa.DateTime(timezone=True), nullable=False),
+        # H-02（RV-04a-fix）: 128bit hex（32 文字）固定を DB でも保証
+        sa.CheckConstraint("length(nonce) = 32", name="ck_signature_nonce_len"),
     )
     # lazy cleanup（expires_at < now の一括削除）の走査を支える
     op.create_index("ix_signature_nonce_expires_at", "signature_nonce", ["expires_at"])
