@@ -61,6 +61,7 @@ ingestion_receipt(
 ```
 - **claimed_at 方式は廃止**し `epoch INTEGER` に置換（新表なので **ALTER 0** 維持）。`last_heartbeat_at` の鮮度が「処理中の request が生きているか」の lease 相当。
 - **状態正本＝receipt 行に一本化（H-D4-02）**: `last_outcome` が**唯一の権威ある state 値**で、`received / processing / vendor_pre / SENDING / completed / PENDING_RETRY / failed / UNKNOWN / duplicate_suspect` を取る（vendor_pre/SENDING も **attempt.phase ではなく receipt.last_outcome の値**）。**判定は receipt 行のみで行い、processing_attempt は参照しない**（§2.3）。
+  - **表記対応注記（L-01）**: 本文の大文字表記（`SENDING`/`PENDING_RETRY`/`UNKNOWN`）は可読性のための表示名であり、**DB 実値・実装正本は全て小文字**（`sending`/`pending_retry`/`unknown`）。実装の状態定数（`hub/ingestion_receipt.py` の `ST_*`）と DB `last_outcome` 値が正本で、本 DRAFT の大小混在はそれらのエイリアス表示にすぎない。
 
 ### 2.3 processing_attempt（新表・**監査専用**・FK 直参照＝M-D4-06）
 **polymorphic（target_kind/target_id）を廃止**し、`ingestion_receipt` を FK で直参照する（sortation 専用・監査ログ）:
