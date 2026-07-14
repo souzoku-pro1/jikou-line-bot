@@ -1,245 +1,253 @@
-# DRAFT: RV-05/RV-13 durable InboundEvent / IngestionReceipt 横展開（rev2）
+# DRAFT: RV-05/RV-13 durable InboundEvent / IngestionReceipt 横展開（rev3・最終）
 
-- 状態: **DRAFT rev2（R-RV-05-13-D 全所見反映・設計固定・実装は次票）**
-- 対象: RV-05（BackgroundTasks 再起動消失）・RV-13（sortation process-memory 重複防止・失敗の成功ACK飲み込み）・RCF-M10（顧客Bot返信の観測性）
-- 正本: 製品設計master v2.4 **§9.17**（InboundEvent・IngestionReceipt）・**§9.17.1**（ConversationSession・PendingCommand＝本票 OUT_OF_SCOPE）・**§8.8**（durable worker 運用契約・原則のみ流用）／G1・G3
-- rev2 差分: §0 スコープ再構成を新設。B-01〜B-03/H-01〜H-05/M-01〜M-03/L-01 を反映（末尾「所見対応表」）。
+- 状態: **DRAFT rev3（R-RV-05-13-D2 全所見・司令塔具体裁定 14 件反映・設計固定）**
+- 対象: RV-05（BackgroundTasks 再起動消失）・RV-13（sortation process-memory・失敗の成功ACK飲み込み）・RCF-M10（顧客Bot返信の観測性）
+- 正本: 製品設計master v2.4 **§9.17 / §9.17.1 / §8.8**（引用は下記）／G1・G3
+- rev3 差分: B-01/B-02・H-01〜H-07・M-01〜M-04・L-01 を反映（末尾「所見対応表」）。**Stripe 状態機械は source 実測で転記**（`hub/inbound_event.py` + `main.py::stripe_webhook`）。
 
-> **master §9.17 引用（FIXED）**: 「public webhook、GAS、watcher から受けた request を、ACK 後の process memory へ預けない。InboundEvent 必須field= provider、external_event_id、caller_id、payload_ref／hash、received_at、signature_result、state、attempt_count。IngestionReceipt 必須field= source_file_id、source_sha256、ingest_type、case_hint、first_seen_at、last_outcome、downstream_refs、idempotency_key。external event ID または caller＋source ID＋hash へ unique 制約。payload に顧客 data がある場合は暗号化／不変参照と retention を定義し、通常 log へ複製しない。」
-> **master §8.8 引用（FIXED・原則のみ）**: 「外部実行を request 内処理／BackgroundTasks／process-memory queue／browser request の寿命へ結び付けない。durable DB を読む継続 worker として起動し再開。startup と定期で expired lease 回収。vendor call 開始前を証明できる job だけ再 queue、開始後/不明は UNKNOWN。claim は atomic update/lock と lease、concurrency 上限、同一 idempotency key を二 worker が実行しない。graceful shutdown は新規 lease 停止＋実行中 attempt の durable marker 確定。health は poll/成功/queue lag/expired lease/UNKNOWN を返す。」
-> （注: §8.8 は Phase 6 の Outbox worker 契約。本票は **lease/atomic claim/startup reconciliation/graceful shutdown/fencing の原則だけ流用し、OutboxJob 自体は作らない**。）
+> **master §9.17（FIXED）**: 「public webhook、GAS、watcher の request を ACK 後 process memory へ預けない。InboundEvent 必須field= provider、external_event_id、caller_id、payload_ref／hash、received_at、signature_result、state、attempt_count。IngestionReceipt 必須field= source_file_id、source_sha256、ingest_type、case_hint、first_seen_at、last_outcome、downstream_refs、idempotency_key。external event ID または caller＋source ID＋hash へ unique。payload に顧客 data がある場合は暗号化／不変参照と retention を定義し、通常 log へ複製しない。」
+> **master §8.8（FIXED・原則のみ流用）**: 「外部実行を request 内/BackgroundTasks/process-memory queue へ結び付けない。durable DB を読む継続 worker で再開。startup と定期で expired lease 回収。vendor call 開始前を証明できる job だけ再 queue、開始後/不明は UNKNOWN。claim は atomic update/lock と lease、concurrency 上限、同一 idempotency key を二 worker が実行しない。graceful shutdown は新規 lease 停止＋実行中 attempt の durable marker 確定。health は poll/成功/queue lag/expired lease/UNKNOWN を返す。」
+> （§8.8 は Phase 6 Outbox worker 契約。本票は lease/atomic claim/startup reconciliation/graceful shutdown/fencing の**原則のみ**流用し OutboxJob は作らない。）
 
 ---
 
-## §0 スコープ再構成【rev2 新設・最重要】
+## §0 スコープ再構成（経路別・段階分離）
 
-「durable 化」は経路ごとに**安全に到達できる範囲が異なる**。特に**顧客Bot の自動 replay は ConversationSession/PendingCommand（§9.17.1・RV-06）が無いと二重返信を生む**ため、本票では自動 replay を行わない。経路別に段階を分離する:
-
-| 経路 | 本票 Phase A の範囲 | 自動 replay | 再送主体 | 前提 |
+| 経路 | Phase A の範囲 | 自動 replay | 再送主体 | §9.17 準拠 |
 |---|---|---|---|---|
-| **顧客Bot `/webhook`** | **記録＋観測のみ**（InboundEvent durable insert・返信結果カウンタ・**crash した未処理 event を可視化**） | **なし**（startup 自動再実行しない） | なし（RV-06 導入後に durable replay を別票で） | RV-06 の session/command 表（本票では**依存表を明記して塞がない**） |
-| **業務Bot 通知（LINE）** | 記録＋観測のみ（同上・provider="line"/event_type で区別） | なし | なし | 同上 |
-| **sortation `/sortation/ingest`** | **完全 durable 化**（IngestionReceipt 冪等・PENDING_RETRY 可視化・**GAS が再送主体**） | consumer が未処理を処理／GAS が 5xx で再送 | **GAS（5xx 契約）** | なし（file ingest は再送安全） |
-| **Stripe（既存 P1-005a）** | **不変**（provider="stripe"・D14 の 503/再送は Stripe 主体） | 既存どおり | Stripe | provider 別に分離（本票で触れない） |
+| **顧客Bot `/webhook`** | 記録＋観測のみ（durable insert・返信結果カウンタ・未処理可視化） | **なし** | なし（RV-06 後に別票） | **限定逸脱**（§H-01） |
+| **業務Bot 通知（LINE）** | 同上 | なし | なし | 限定逸脱 |
+| **sortation `/sortation/ingest`** | 完全 durable（IngestionReceipt 冪等・PENDING_RETRY・SENDING/UNKNOWN） | consumer 処理 / GAS 5xx 再送 | **GAS（5xx 契約）** | 準拠 |
+| **Stripe（既存 P1-005a）** | **不変** | 既存 | Stripe | 準拠 |
 
-**帰結**:
-- 顧客/業務Bot は Phase A で**「受理済み未処理 event を捨てない・可視化する」**までを達成（HOTFIX-01 型の 31.7h 沈黙障害を**カウンタ＋dead-man で検知可能**にする＝RV-05 の主目的の前半）。**自動再返信は RV-06 後**（二重返信リスクを持たない範囲に限定）。
-- sortation は Phase A で**完全 durable**（GAS 再送で lost 0・RV-13 の重複防止/失敗飲み込み解消）。
-- この分離により「LINE には自動再送主体がない」問題を、**顧客Bot=観測先行／sortation=GAS 再送**で吸収する。
+## §H-01 LINE Phase A の限定逸脱宣言【独立節・rev3】
 
-## §1 統合方針（H-03/H-05: 同居 vs 別表の再比較・attempt/fencing 込み）
+**明示宣言**: 顧客/業務Bot の Phase A は **§9.17 の「process restart 後は durable state から再構成」原則への一時的・限定的逸脱**である。
+- **逸脱の内容**: InboundEvent へ durable 記録はするが、**crash 後の未処理 event を自動 replay しない**（＝durable state からの再実行を保留する）。
+- **逸脱の理由**: 顧客Bot 返信の安全な再開には ConversationSession/PendingCommand（§9.17.1）が必要で、無いまま自動 replay すると**二重返信**を生む（§9.17.1「memory fallback で成功 ACK しない／別 user/channel/case への転用拒否」を満たせない）。
+- **逸脱で失うもの・代替**: 自動回復は得られないが、**未処理 event を「滞留」として観測可能にし、収束率低下・dead-man で検知**する（HOTFIX-01 型沈黙障害の**検知**は達成）。回復（再返信）は人手 or RV-06。
+- **解消条件**: **RV-06（session/command durable 化）完了で本逸脱を解消**し、顧客Bot も durable replay へ移行（別票・K4 が前提＝§9.2）。
+- 本節は逸脱を**隠さず宣言**し、G3「LINE event replay で遷移一回」を Phase A では「replay しない（＝遷移も再実行もしない）」形で満たす（冪等記録のみ）ことを明記する。
 
-§9.17 の必須 field は既存 `inbound_event`（P1-005a）が**全保持**。fencing/attempt 履歴は**新表 `inbound_event_attempt`**に分離（既存表 ALTER 回避）。
+## §1 統合方針（H-03/H-05: 同居＋汎用 attempt 表）
 
 | 選択肢 | InboundEvent 本体 | attempt/fencing | 判定 |
 |---|---|---|---|
-| **A. 同居＋attempt別表（推奨）** | 既存 `inbound_event` に provider="line" 行（**ALTER 0**） | **新表 `inbound_event_attempt`**（fencing token・lease・attempt 履歴） | **採用**。既存 durable 基盤再利用・ALTER 0・fencing を ALTER なしで足せる |
-| B. LINE 専用別表 | `line_inbound_event` 新設 | 同上 | 不採用（同一ロジック二重管理・§9.17「1 model」から乖離） |
-
-**採用理由（H-03/H-05）**: InboundEvent 本体は provider 列で同居（状態機械は §5.1 で provider 別に分岐）。**fencing（stale worker が新 claim 後に commit するのを防ぐ）を既存表に ALTER で足せない**ため、`inbound_event_attempt`（新表）に **fencing token（単調増加 lease epoch）**を持たせ、consumer は「自分の attempt が最新である」ことを条件に commit する（§4.3）。これで ALTER 0 と fencing を両立。
+| **A. 同居＋汎用 attempt 別表（推奨）** | 既存 `inbound_event` に provider 行（**ALTER 0**） | **新表 `processing_attempt`（汎用・target_kind/target_id）** | **採用** |
+| B. LINE 専用別表 | 新設 | 同上 | 不採用 |
 
 ## §2 schema
 
 ### 2.1 InboundEvent（同居・**ALTER なし**）
-既存列で収容: `provider="line"` / `external_event_id=webhookEventId` / `dedup_key`（§2.3）/ `caller_id` / `signature_result`（X-Line-Signature 結果）/ `payload_hash` / `state`（§5.1）/ `attempts` / `claimed_at` / `processed_at` / `last_error`。
+既存列で収容。**LINE の userId は既存 `caller_id` 列に保存**（H-02）: `provider="line"` / `external_event_id=webhookEventId` / `caller_id=LINE userId` / `signature_result` / `payload_hash` / `state`（§5.1）/ `attempts` / `claimed_at`（=fence token・§B-02）/ `processed_at` / `last_error`。
 
-### 2.2 IngestionReceipt（**新表**・file 系 ingest 専用・LINE 不使用）
-§9.17 必須 field ＋ 最小 unique:
+### 2.2 IngestionReceipt（新表・file ingest 専用・LINE 不使用）
 ```
-ingestion_receipt(
-  id PK, source_file_id TEXT NOT NULL, source_sha256 TEXT NOT NULL,
+ingestion_receipt(id PK, source_file_id TEXT NOT NULL, source_sha256 TEXT NOT NULL,
   ingest_type TEXT NOT NULL, caller_id TEXT NOT NULL, case_hint TEXT,
-  first_seen_at ts NOT NULL, last_outcome TEXT NOT NULL,
-  downstream_refs TEXT,           -- 起票 record_id 等・非PII参照のみ
-  idempotency_key TEXT NOT NULL,  -- §2.3 の escape 規則で生成
-  UNIQUE(idempotency_key)
-)
+  first_seen_at ts NOT NULL, last_outcome TEXT NOT NULL, downstream_refs TEXT,
+  idempotency_key TEXT NOT NULL, claimed_at ts, UNIQUE(idempotency_key))
 ```
 
-### 2.3 冪等キー contract（H-04: escape・NULL 禁止・衝突）
-- **NULL 禁止**: 冪等キー構成要素（caller_id・source_file_id・source_sha256／LINE は webhookEventId）は**全て NOT NULL・空文字禁止**。いずれか欠落なら **durable insert を拒否し 5xx**（受理しない・fail-close）。
-- **delimiter injection の排除（escape）**: 素の `":"` 連結は要素内の `":"` で衝突する。**length-prefix 連結**（NM01 canonical と同方式）で生成:
-  `key = sha256( for f in fields: ascii(len(utf8(f)))||":"||utf8(f)||"\n" )` の hex。
-  - LINE: fields=`["line", webhookEventId]` → `dedup_key="line:"+hex`（provider prefix は表示用・unique は hex 部）。
-  - sortation: fields=`["sortation", caller_id, source_file_id, source_sha256]`。
-  - これで要素内 `":"`/改行があっても衝突・偽装不能。
-- **衝突 contract**: `UNIQUE` 違反（INSERT 失敗）は **冪等 skip**（重複配送/再投入＝一回処理）であり**エラーにしない**（IntegrityError→既存行の state で分岐・§5.3）。
-
-### 2.4 inbound_event_attempt（**新表**・fencing・H-03/H-05）
+### 2.3 processing_attempt（**汎用・新表**・B-01/H-03/H-05）
+親（InboundEvent でも IngestionReceipt でも）を **target_kind/target_id** で汎用参照:
 ```
-inbound_event_attempt(
+processing_attempt(
   id PK,
-  inbound_event_id  BIGINT NOT NULL,   -- inbound_event.id 参照（論理・FK は任意）
-  attempt_no        INT NOT NULL,      -- 単調増加（= fencing token）
-  lease_epoch       INT NOT NULL,      -- claim ごとに増加。commit 時に「最新 epoch か」を検証
-  claimed_at        ts NOT NULL,
-  lease_expires_at  ts NOT NULL,
-  phase             TEXT NOT NULL,     -- claimed / vendor_pre / SENDING / terminal
-  outcome           TEXT,              -- §H-02 封筒（completed/failed/reply_fail/no_reply_intended/UNKNOWN）
-  UNIQUE(inbound_event_id, attempt_no)
+  target_kind  TEXT NOT NULL,   -- "inbound_event" | "ingestion_receipt"
+  target_id    BIGINT NOT NULL, -- 親行 id
+  attempt_no   INT NOT NULL,    -- 親ごと単調増加（履歴・観測用）
+  fence_token  TEXT NOT NULL,   -- claim 時の親 claimed_at 値（§B-02 の epoch）
+  claimed_at   ts NOT NULL,
+  lease_expires_at ts NOT NULL,
+  phase        TEXT NOT NULL,   -- claimed / vendor_pre / SENDING / terminal
+  outcome      TEXT,            -- §H-07 terminal 集合
+  UNIQUE(target_kind, target_id, attempt_no)
 )
 ```
-- **fencing**: consumer は claim 時に `attempt_no=max+1, lease_epoch++` の行を insert。terminal commit は「この attempt が当該 event の最新 attempt」を条件に UPDATE（stale worker の後追い commit を弾く）。
-- **ALTER 0**: fencing/lease/attempt 履歴を InboundEvent 本体を触らず別表で表現。RV-06 の session 系とも独立。
+- B-01: **汎用表**にすることで InboundEvent/IngestionReceipt 双方の attempt/fencing を1表で扱う（将来 provider 追加も target_kind で吸収）。
 
-### 2.5 migration 方針・RV-06 余地
-- InboundEvent は migration なし（同居）。**新規 migration = `ingestion_receipt` ＋ `inbound_event_attempt`**（`down_revision=<現head b7d3e1a9c2f4>`・create/drop）。適用は大野（PUBLIC URL）。model は `hub/` 新モジュール＋専用 metadata を `alembic/env.py` list へ統合。
-- **RV-06 余地（§2.4 塞がない）**: InboundEvent に session 固有列を足さない。会話 state/command は RV-06 の別表（ConversationSession/PendingCommand・§9.17.1）に持たせ、InboundEvent の `external_event_id` を last_event_id 参照の起点にできる形を残す。
+### 2.4 冪等キー contract（H-04: escape・NULL 禁止・衝突→case_hint 比較）
+- **NULL/空 禁止**: 構成要素が1つでも NULL/空なら **durable insert 拒否＝5xx**（fail-close）。
+- **escape**: 素の `":"` 連結は禁止。**length-prefix 連結の sha256**（NM01 canonical 方式）:
+  `key = hex(sha256( for f in fields: ascii(len(utf8(f)))||":"||utf8(f)||"\n" ))`。
+  LINE: `["line", webhookEventId]`／sortation: `["sortation", caller_id, source_file_id, source_sha256]`。
+- **衝突 contract（H-04・duplicate_suspect）**: `UNIQUE(idempotency_key)` 違反時、
+  1. 既存行の **`case_hint`（及び source_sha256）を新規要求と比較**。
+  2. **一致 → dedup skip**（同一物の重複配送＝一回処理・冪等）。
+  3. **不一致 → `duplicate_suspect`**（同一 file_id/sha だが case_hint 等が食い違う＝取り違え疑い）を last_outcome に立て、**人手確認へ**（自動処理しない）。§6 で `duplicate_suspect` を alert。
 
-## §2.6 B-01: payload 保存設計（DB 列・log 複製禁止・retention）
-- **本文 payload は DB 列に保存しない**（§9.17「顧客 data は暗号化/不変参照・通常 log へ複製しない」）。保存は **`payload_hash`（生 body sha256）＋最小抽出（event_type 等・非 PII）**のみ（P1-005a D8 継承）。
-- **log 複製禁止**: emit 契約でカウンタ/lifecycle のみ。payload 本文・顧客氏名・本文は emit で suppress される kind のみ通す（vendor_raw/name/freetext は出さない）。
-- **retention = OPEN（P16）**: 暗号化保存が将来必要になった場合の retention 期限は **P16 で確定**。本票は**仮運用として本文非保存**（hash＋最小抽出）で開始し、監査要件が出たら P16 で暗号化列＋retention を設計（別票）。
+## §2.6 payload / PII 方針（B-01 の retention・H-02 の userId）
+- **payload 本文は保存しない**（§9.17）。`payload_hash`＋最小抽出（event_type 等・非PII）のみ。**log へ複製しない**（emit で vendor_raw/name/freetext は suppress）。
+- **H-02: LINE userId は `caller_id` 列に保存する**（人手確認に必須）。userId は擬似匿名 ID だが PII 相当として扱う:
+  - **DB 列にのみ保存・log には出さない**（lifecycle ログは `emit(caller_id, "external_ref", ...)` で **suppress**＝表示されない）。
+  - **retention = OPEN（P16）**。本票は仮運用として userId を列保持（暗号化列＋retention は監査要件時に P16 別票）。
+- **人手確認 runbook（H-02）**: `state ∈ {UNKNOWN, duplicate_suspect}` の行 →（管理者が DB で）`caller_id`(userId)/`external_event_id` を取得 → **App 28（照会/レビューキュー）で該当顧客レコードを照合** → 手動対応（再返信要否の判断）。userId→顧客の対応付けは App 28 側で行い、**DB とログには氏名/本文を持ち込まない**。
 
-## §3 ACK 契約（経路別・§0 と整合）
+### 2.7 migration・RV-06 余地
+- InboundEvent は migration なし。**新規 migration = `ingestion_receipt` ＋ `processing_attempt`**（`down_revision=<現head b7d3e1a9c2f4>`）。適用は大野（PUBLIC URL）。
+- RV-06 余地: InboundEvent に session 固有列を足さない（§9.17.1 は別表・別票）。
 
-**共通（G1/G3）**: durable commit 前に 200 を返さない。event store 停止時は 5xx（vendor retry 可能 response）。**process-memory fallback 禁止**。
+## §B-02 claim / terminal の atomic SQL 契約（fencing・疑似コード）
 
-### 3.1 LINE webhook（顧客/業務Bot・Phase A=記録+観測）
+**epoch = 親行の単一カウンタ = 親行 `claimed_at`**（親ごとに1つ）。claim/terminal は**単一 atomic SQL**で行い、**「事前 SELECT → 判断 → UPDATE」の read-modify-write は禁止**（race）。
+
+**claim（atomic・no pre-SELECT）**:
+```sql
+-- 未処理 or lease 切れの1行を条件付き UPDATE で奪う。claimed_at が fence token。
+UPDATE inbound_event
+   SET claimed_at = :now, attempts = attempts + 1, state = 'processing'
+ WHERE id = :id
+   AND state IN ('received','processing')
+   AND (claimed_at IS NULL OR claimed_at < :stale_cutoff)
+RETURNING id, claimed_at AS fence_token;   -- 0 行 = 他 worker が保持中 → 諦める
+-- 併せて processing_attempt に (attempt_no, fence_token=claimed_at, phase='claimed') を INSERT
 ```
-1. X-Line-Signature 検証（既存・不変）
-2. events[] を 1 event=1 InboundEvent 行 durable insert
-   （external_event_id=webhookEventId・UNIQUE(dedup_key) で delivery 重複冪等）
-   ├ 冪等キー要素 NULL/空 → 5xx（§2.3・受理しない）
-   └ DB 停止 → 5xx（memory fallback 禁止）
-3. insert 完了後に 200
-4. 【Phase A】consumer は返信生成を実行するが、**crash 後の startup 自動 replay はしない**
-   （二重返信回避・RV-06 後に durable replay 化）。未処理で残った event は §6 で「滞留」として可視化。
+
+**terminal commit（fencing・atomic）**:
+```sql
+-- 自分の fence_token（claim 時の claimed_at）と一致する時だけ terminal 化。
+UPDATE inbound_event
+   SET state = :terminal, processed_at = :now, last_error = :err
+ WHERE id = :id AND claimed_at = :fence_token;   -- 0 行 = 新 worker が再claim済み → stale → abort（commit しない）
 ```
-- **B-02: K4 前提条件化**: 顧客Bot の**自動 replay を有効化する将来票の前提条件**として K4（LINE 再配送設定確認）を**ブロッキング前提**に格上げ。Phase A（観測のみ）は K4 未確定でも可（再送しないため）。
-- **B-02: insert 失敗/到達差分カウンタ**: durable insert **前**に落ちた event（署名 OK だが insert 失敗＝5xx 返却）を `inbound_insert_fail` として計上。LINE 側「到達したはずの webhookEventId」との差分観測で「受理前喪失」を可視化（K4 OFF 時の喪失も数で捕捉）。
+- **fence の意味**: 新しい worker が再claim すると親 `claimed_at` が変わる → 旧 worker の terminal UPDATE は 0 行 → **stale worker の後追い commit を弾く**（§8.8 fencing）。
+- **禁止の明文化**: `SELECT state FROM inbound_event WHERE id=?` で読んでからアプリ側で分岐して UPDATE、は**禁止**（並行で state が動く）。必ず `UPDATE ... WHERE <条件> RETURNING` の rowcount/RETURNING で判定する。
+- IngestionReceipt も同型（`claimed_at` を fence に、`UPDATE ingestion_receipt ... WHERE claimed_at=:fence`）。
 
-### 3.2 sortation（RV-13・完全 durable・GAS 再送主体）
-- `_seen_drive_file_ids`（process-memory）→ **IngestionReceipt 冪等**へ置換。
-- **B-03: SENDING marker・UNKNOWN・自動再送禁止**: forward/ask など downstream の**vendor 呼出前に `phase=vendor_pre`、呼出中に `phase=SENDING` を durable marker**。crash 復帰時、
-  - `vendor_pre` まで（呼出前を証明）→ 再実行可。
-  - `SENDING`（呼出後/不明）→ **UNKNOWN**（自動再送せず `last_outcome=UNKNOWN`・**人手確認**へ）。二重 forward を作らない。
-- **ask task 保存失敗を成功 ACK にしない**（RV-13）: `last_outcome=PENDING_RETRY` で可視化。GAS は 5xx で再送（再送主体=GAS）。
+## §3 ACK 契約
 
-## §4 consumer / lease / startup 回収 / graceful shutdown / fencing（§8.8 原則）
+**共通（G1/G3）**: durable commit 前に 200 を返さない・event store 停止は 5xx・process-memory fallback 禁止。
 
-- **専用 worker なし**（[裁定2]）。アプリ内**非同期 consumer**（asyncio・startup 起動・flag ON 時のみ）。
-- **§4.1 atomic claim + lease**: 条件付き UPDATE + RETURNING で1行を1 consumer が取得。`inbound_event_attempt` に attempt 行 insert（`attempt_no++`・`lease_epoch++`）。同一 dedup_key/idempotency_key を二重実行しない（[裁定2]）。
-- **§4.2 startup reconciliation**: 起動時、lease 期限切れの未処理を回収。**但し §0 の範囲**:
-  - **sortation**: 再実行可（GAS 再送安全・vendor_pre まで）。SENDING は UNKNOWN。
-  - **顧客/業務Bot（Phase A）**: **自動再実行しない**（観測のみ）。滞留を §6 で可視化し、必要なら人手。
-- **§4.3 fencing（H-03/H-05）**: terminal commit は「自 attempt が当該 event の最新 attempt（最大 attempt_no・最新 lease_epoch）」を条件に UPDATE。stale worker（古い lease）の commit を弾く。
-- **§4.4 concurrency 上限**: env で consumer 並列度を上限化。
-- **§4.5 graceful shutdown**: shutdown で新規 claim 停止＋実行中 attempt の durable marker（phase/outcome）確定後に終了。強制終了後も startup reconciliation で回復（sortation）／可視化（Bot）。
+### 3.1 LINE webhook（Phase A=記録+観測）
+`署名検証→events[] を 1 event=1 InboundEvent durable insert→200→consumer 処理（自動 replay なし）`。冪等要素 NULL/空→5xx・DB 停止→5xx。
 
-## §5 状態機械・冪等・replay・attempt 上限
+### 3.2 sortation（完全 durable・GAS 再送主体）
+`_seen_drive_file_ids`→IngestionReceipt 冪等。**vendor 呼出前 `phase=vendor_pre`・呼出中 `phase=SENDING` を durable marker**。crash 復帰は vendor_pre まで再実行可・SENDING は **UNKNOWN（自動再送せず人手）**。ask 保存失敗→`PENDING_RETRY`（成功 ACK にしない）→GAS 5xx 再送。
 
-### 5.1 provider 別 状態機械表（H-03）
-| provider | states | 遷移の要点 | 再送主体 | startup 自動 replay |
+### §H-06 sortation: GAS 再送時 state 別 応答表（8 状態）
+GAS は 5xx で再送する。同一 idempotency_key の再投入が既存 receipt の各 state に当たった時の応答/claim 可否:
+
+| # | state | GAS が受ける HTTP | claim 可否 | 備考 |
 |---|---|---|---|---|
-| **line（Bot・Phase A）** | received→processing→{completed / failed / reply_fail / no_reply_intended} ／ SENDING→UNKNOWN | 返信結果は §H-02 封筒で terminal 分類。crash 中 SENDING は UNKNOWN | なし | **なし**（観測のみ） |
-| **sortation** | received→processing→{completed / PENDING_RETRY / failed} ／ vendor_pre→SENDING→UNKNOWN | ask 保存失敗=PENDING_RETRY・SENDING crash=UNKNOWN | **GAS（5xx）** | あり（vendor_pre まで） |
-| **stripe（既存）** | received→processing→{done / failed}（in_progress=503・D14） | **不変** | Stripe | 既存どおり |
+| 1 | received | 200（記録済・consumer が処理） | consumer が保持 | 再投入は冪等 |
+| 2 | processing（lease 有効） | 200（処理中・冪等） | 不可（leased） | 二重処理しない |
+| 3 | processing（lease 切れ=stale） | 再claim→処理→200/5xx | **可** | stale 回収 |
+| 4 | vendor_pre（stale） | 再claim→処理→200/5xx | **可** | 呼出前を証明→安全 |
+| 5 | SENDING（stale） | 200（UNKNOWN 化・人手待ち） | **不可** | 自動再送禁止＝二重forward回避 |
+| 6 | completed | 200（skip・冪等） | 不可 | terminal |
+| 7 | PENDING_RETRY | 再claim→再試行→200/5xx | **可** | downstream 失敗の再試行 |
+| 8 | failed（attempt 上限） | 200（terminal・§6 で alert） | 不可 | 無限再送しない |
+（`duplicate_suspect` は §2.4 の衝突経路で別処理＝人手。上表 8 状態とは別軸。）
 
-### 5.2 H-02: wrapper 結果封筒 contract（terminal 分類）
-処理 wrapper は必ず terminal outcome を1つ返す（sink で握り潰さない）:
-- **completed**: 返信送信成功（reply API 2xx）＋ downstream 完了。
-- **failed**: 例外/恒久失敗（attempt 上限内で reprocess 可能なら processing へ戻す・上限超で failed 確定）。
-- **reply_fail**: 返信 API が失敗（送信不達）。※Phase A は自動再送しない＝可視化のみ。
-- **no_reply_intended**: 返信を意図しない event（既読/フォロー解除等）＝正常終了（沈黙障害と区別）。
-封筒により「返信すべきだったのに沈黙」（reply_fail/failed）と「正常な無返信」（no_reply_intended）を**明確に分離**（HOTFIX-01 の再発検知に必須）。
+## §4 consumer / lease / 回収 / shutdown / fencing
+- 専用 worker なし・アプリ内非同期 consumer（flag ON 時のみ startup 起動）。
+- claim/terminal は §B-02 の atomic SQL・fencing。concurrency は env 上限。
+- **startup reconciliation**: sortation は vendor_pre まで再実行可・SENDING は UNKNOWN。**顧客/業務Bot（Phase A）は自動再実行しない**（滞留可視化のみ・§H-01）。
+- graceful shutdown: 新規 claim 停止＋実行中 attempt の durable marker 確定後に終了。
 
-### 5.3 冪等・replay・attempt 上限
-- 重複配送/再投入 → UNIQUE 衝突 → 既存行 state で分岐（completed=skip・failed=reprocess）。**replay で遷移一回**（G3）。
-- `attempt_count` 上限超 → `failed`（無限リトライ禁止・§6 で可視化）。
+## §5 状態機械（provider 別・§5.3 廃止＝H-05）
 
-## §6 観測性設計【H-01: 全面改訂】
+**§5.3（旧・汎用冪等節）は廃止**し、provider 別規則に分割する。terminal 集合は §H-07 に統一。
 
-**目的**: HOTFIX-01 型「背景処理全滅が沈黙」を**構造的に検知**する。全出力は **emit 契約経由・PII/本文/payload 非混入**（record_id/count 等の値域検証型のみ）。ログ集計でよい（dashboard 不要）。
+### 5.1 provider 別 状態機械表
+**Stripe（source 実測・`hub/inbound_event.py`＋`main.py::stripe_webhook`）**:
+| 項目 | 実測値 |
+|---|---|
+| state 値 | `processing` / `done` / `failed`（この3値のみ） |
+| record_stripe_event outcome | `new`（INSERT→processing）/ `reprocess`（既存 failed を claim・または stale processing を再claim→processing）/ `skipped_duplicate`（既存 done）/ `in_progress`（既存 processing・15分以内） |
+| HTTP 応答 | `skipped_duplicate`→**200** `{"journal":"skipped_duplicate"}` / `in_progress`→**503**（D14）/ `reprocess`→reconciliation（App21 照合・既起票なら mark_done→200 `reconciled`）→未起票なら処理→mark_done→**200** / `new`→処理→mark_done→**200** / 処理中例外→mark_failed→**再送出（5xx）** |
+| 遷移 | INSERT→`processing`／`failed`+再配送→claim→`processing`／`processing`(stale: claimed_at NULL or <15分cutoff)→再claim→`processing`／`processing`(15分以内)→(不変)+attempts+1→`in_progress`(503)／`done`+再配送→(不変)+attempts+1→`skipped_duplicate`(200)／mark_done→`done`／mark_failed→`failed` |
+| 再送主体 | **Stripe**（指数バックオフ最大3日）。stale 再claim の起動主体も Stripe 再配送 |
+| startup 自動 replay | なし（回収の起動主体＝Stripe 再配送・既存設計 D14/D15 不変） |
 
-### 6.1 カウンタ（RCF-M10・状態遷移 + 返信結果）
-- 状態遷移: `received / processing / completed / failed`（＋ `inbound_insert_fail`＝受理前喪失・B-02）。
-- 返信結果封筒: `reply_ok(completed) / reply_fail / exception(failed) / no_reply_intended`。
-- sortation: `PENDING_RETRY / UNKNOWN` の件数。
+**LINE（Bot・Phase A）**: `received→processing→{completed / failed / reply_fail / no_reply_intended}`／`SENDING→UNKNOWN`。**自動 replay なし**。再送主体なし。
 
-### 6.2 heartbeat / lag / 滞留 / 収束率 / alert / dead-man
-- **heartbeat**: consumer の最終 poll・最終成功時刻を app-state（既存 notify_heartbeat 方式）に記録。
-- **queue lag**: `received` から `processing` までの滞留時間・未処理（received/processing で lease 切れ）件数。
-- **滞留（backlog）**: 一定時間 `completed/failed` に至らない event 数。
-- **収束率**: 受理数に対する terminal 到達率（completed+failed+no_reply_intended）/received。低下＝処理停止の兆候。
-- **alert 経路 / dead-man**: 既存 daily_healthcheck / notify_heartbeat の dead-man に **「consumer 最終成功の鮮度」「滞留閾値超過」「reply_fail/UNKNOWN 増加」**を統合（新規メッセージ増やさず既存経路へ）。HOTFIX-01 の教訓（webhook 200 だけでは沈黙を検知不可）を、**返信結果封筒＋収束率＋dead-man**で塞ぐ。
-- health（§8.8 準拠・参考値）: 最終 poll / 最終成功 / queue lag / expired lease / UNKNOWN 件数を返せる形にする（Phase A はログでよい）。
+**sortation**: `received→processing→{completed / PENDING_RETRY / failed}`／`vendor_pre→SENDING→UNKNOWN`／衝突時 `duplicate_suspect`。再送主体 **GAS（5xx）**。startup 再実行は vendor_pre まで。
 
-## §7 feature flag・段階導入・rollback【M-01: flag OFF 機械的担保】
+### 5.2 H-02 wrapper 結果封筒（terminal 分類）
+処理 wrapper は必ず1つの terminal を返す（sink で握らない）: `completed` / `failed` / `reply_fail` / `no_reply_intended`。**「返信すべきだったのに沈黙（reply_fail/failed）」と「正常な無返信（no_reply_intended）」を分離**（HOTFIX-01 再発検知の要）。
 
-- **flag `INBOUND_EVENT_DURABLE_ENABLED`（既定 OFF）**。
-- **M-01 機械的担保**:
-  1. **最上段短絡**: webhook/sortation 受理部の**最上段で flag 判定**。OFF なら**現行 BackgroundTasks 経路へ即分岐**（durable insert/consumer コードに一切入らない＝byte 同一）。
-  2. **startup/shutdown hook 非接触**: consumer の startup 起動・graceful shutdown marker は **flag ON 時のみ登録/実行**。OFF 時は startup/shutdown の既存挙動に一切追加しない（scheduler 等と干渉しない）。
-  3. **AST 検査**: 「durable insert / consumer 起動が flag 判定の内側からのみ到達可能」「flag OFF 経路に durable 呼出が無い」ことを静的テストで機械強制（RV-04b の `_has_signature_headers` 検査に倣う）。「durable commit 前に 200 を返す経路が存在しない」も source 検査。
-- **段階導入**: sortation（GAS 再送・観測性先行）→ 業務Bot → 顧客Bot（観測のみ）。provider 別 sub-gate（env）で細分化可（OPEN-3）。
-- **rollback = flag OFF**（env 切替のみ）。
+## §6 観測性設計（H-01 全面改訂・H-07 alert 軸分離）
 
-## §8 テスト計画【M-03/L-01 改訂】
+全出力 emit 契約・PII/本文/payload 非混入・ログ集計でよい。
 
-**方針**: 各テストは **naive 実装（現行＝event 消失/二重処理/失敗飲み込み）が FAIL する形**で書く（検証力担保）。列挙ケースを網羅。
+### 6.1 §H-07 terminal 集合の統一
+- **terminal（完了）集合** = `{ completed, failed, no_reply_intended, skipped_duplicate }`（＝それ以上処理しない状態）。
+- **非terminal（要注意/中間）** = `{ received, processing, vendor_pre, SENDING, PENDING_RETRY }`。
+- **警戒（人手/alert）集合** = `{ reply_fail, UNKNOWN, duplicate_suspect }`（terminal ではないが放置不可）。
+- **収束率** = terminal 到達数 / received（低下＝処理停止兆候）。
 
-### 8.1 unit / contract
-- durable insert→200→consumer 処理の順序固定。
-- 冪等キー escape（要素内 `":"`/改行/空/NULL）・衝突 contract（UNIQUE 違反=skip）・NULL→5xx。
-- 状態機械（§5.1 provider 別）・封筒 terminal 分類（§5.2 の completed/failed/reply_fail/no_reply_intended を各々）。
-- fencing: stale attempt の commit 拒否（古い lease_epoch は terminal 更新不可）。
+### 6.2 §H-07 alert 軸の分離
+alert を混同しないよう軸を分ける:
+- **軸A 処理停止**: consumer heartbeat（最終 poll/最終成功）鮮度・queue lag・収束率低下・滞留（一定時間 non-terminal）。
+- **軸B 要人手**: 警戒集合（reply_fail / UNKNOWN / duplicate_suspect）の件数増。
+- **軸C 受理前喪失**: `inbound_insert_fail`（B-02→本節で §H-03 と接続）。
+- 各軸を daily_healthcheck / notify_heartbeat の dead-man に統合（新規メッセージ増やさない）。
 
-### 8.2 negative（crash / replay / 保存失敗）— **naive が FAIL する形**
-- **crash 回収（sortation）**: insert 後・処理前 crash → startup reconciliation で1回だけ処理。**現行（BackgroundTasks）は event 消失**を実証（§8.4）。
-- **crash 中 SENDING → UNKNOWN**: 二重 forward を作らない（自動再送しない）。
-- **顧客Bot Phase A**: crash した未処理 event が **§6 で滞留として可視化**される（自動 replay は**しない**＝二重返信ゼロ）。
-- **replay**: 同一 webhookEventId 再配送 → 遷移一回（completed は skip）。
-- **ask 保存失敗**: 成功 ACK にせず `PENDING_RETRY`（現行は成功 response で飲み込む＝FAIL 実証）。
+### 6.3 §H-03 喪失検知範囲の正直な限定（3層）
+「lost event 0」は**達成範囲を正直に限定**する:
+| 層 | 検知対象 | 手段 | 限界 |
+|---|---|---|---|
+| L1 **直接検知** | durable insert に失敗した event（署名OK・5xx 返却） | `inbound_insert_fail` カウンタ | サーバに**到達した**もののみ |
+| L2 **間接検知** | サーバ**停止中**に到達し受理されなかった event | 外部監視（uptime/LB 5xx 率・Railway メトリクス）で「停止窓」を検知→その窓に来た event は喪失疑い | 件数は**推定**（正確な欠番は不明） |
+| L3 **完全差分** | LINE が送った webhookEventId 全量との差分 | **K4（再配送 or 監査 API）確定後**に照合 | K4 未確定では**不可能** |
+→ 本票は L1 を確実に・L2 を運用監視で・**L3 は K4 後**と明記。「lost 0」は L1（受理後 crash）に限り達成、L2/L3 は限定と宣言。
 
-### 8.3 regression / flag OFF
-- 全 suite（現行 1,328+）維持・**顧客Bot handler smoke 必須**（`_process_line_event` 先頭ログ通過）。
-- **flag OFF 完全同一**: 既存 LINE/sortation テスト＋handler smoke が flag OFF で不変。§7 の AST 検査（durable 呼出が OFF 経路に無い）。
+## §7 feature flag・段階導入・rollback（M-01 機械的担保）
+- flag `INBOUND_EVENT_DURABLE_ENABLED`（既定 OFF）。
+- **M-01**: (1)受理部**最上段で flag 判定・OFF は現行 BackgroundTasks へ即分岐**（durable コードに入らない）(2)consumer startup/graceful shutdown は **flag ON 時のみ登録**(3)**AST 検査**で「durable insert/consumer 起動が flag 判定内側からのみ到達」「commit 前 200 経路の不在」「OFF 経路に durable 呼出なし」を機械強制。
+- 段階導入: sortation→業務Bot→顧客Bot（観測のみ）。rollback=flag OFF。
 
-### 8.4 レイテンシ（M-03: 呼出回数/timeout 固定）
-- **durable insert は 1 回のみ追加**（§3）。テストは**曖昧な ms 実測ではなく「DB 書込呼出回数 = 受理あたり 1」を固定アサート**＋consumer とは非同期（webhook 応答は insert+200 のみ）。timeout は固定値でアサート（環境差に依存しない）。LINE 応答要件超過の懸念が出たら**設計持ち帰り（STOP）**。
+## §8 テスト計画（M-03/L-01・naive FAIL 形）
+- **unit/contract**: ACK 順序・冪等 escape（要素内`:`/改行/空/NULL→5xx）・衝突（一致=skip / 不一致=duplicate_suspect）・状態機械（§5.1 provider 別）・封筒 terminal（§5.2 各）・fencing（stale の terminal UPDATE=0 行で abort）・atomic claim（pre-SELECT 方式が無いこと＝§7 AST）。
+- **negative（naive が FAIL する形）**: crash 回収（sortation・現行は event 消失を実証）／SENDING crash→UNKNOWN（二重forward なし）／顧客Bot Phase A crash→**滞留可視化（自動 replay しない）**／replay 一回／ask 保存失敗→PENDING_RETRY（現行は成功 response 飲み込みを実証）。
+- **Stripe 非破壊**: 既存 Stripe テスト（`test_inbound_event_stripe.py` 等）が **不変で通る**（§5.1 の Stripe 欄は現行実装のまま）。
+- **regression/flag OFF**: 全 suite（1,328+）維持・**顧客Bot handler smoke 必須**・flag OFF 完全同一。
+- **レイテンシ（M-03）**: durable insert=受理あたり **DB 書込呼出 1 回を固定アサート**（曖昧な ms 実測でなく呼出回数）＋webhook 応答は insert+200 のみ（consumer 非同期）。timeout は固定値。超過懸念で STOP。
+- **修正前 FAIL 実測**: 現行 event 消失を再現するスクリプトを **work-log(.md)に本文＋実出力全文**で固定（追跡 .py に print 禁止）。実測は実装票。
 
-### 8.5 修正前 FAIL 実測（現行が event 消失することの実証）
-- flag OFF（現行 BackgroundTasks）で「200 を返した後に処理タスクが crash 相当で失われる」ことを再現するスクリプトを **work-log(.md) に本文＋実出力全文で固定**（追跡 .py に print 禁止・RV-04b 規律）。independent に再現可能な形。実測コードは実装票で採取（本 DRAFT は方法規定）。
+## §9 OPEN / K4 / 計上境界表（M-02）
 
-## §9 OPEN / [人]確認（K4）/ 計上境界表（M-02）
-
-### 9.1 M-02: 3カウント境界表（全ケースの計上先を確定）
-| ケース | received | insert_fail | processing | completed | reply_fail | failed | no_reply_intended | dedup_skip | UNKNOWN | PENDING_RETRY |
-|---|---|---|---|---|---|---|---|---|---|---|
-| 署名OK・durable insert 成功 | ✓ | | | | | | | | | |
-| 署名OK・insert 失敗(DB停止)→5xx | | ✓ | | | | | | | | |
-| consumer 処理開始 | | | ✓ | | | | | | | |
-| 返信送信成功＋downstream 完了 | | | | ✓ | | | | | | |
-| 返信 API 不達 | | | | | ✓ | | | | | |
-| handler 例外(上限超) | | | | | | ✓ | | | | |
-| 返信不要 event(既読等) | | | | | | | ✓ | | | |
-| 重複配送(既存 completed) | | | | | | | | ✓ | | |
-| crash 中 SENDING→復帰 | | | | | | | | | ✓ | |
-| ask 保存失敗(sortation) | | | | | | | | | | ✓ |
-（1 event は複数行に計上され得る：received→processing→completed の遷移は各段で1回ずつ。dedup_skip は received に含めない＝重複を二重計上しない。）
+### 9.1 M-02 計上境界表（各ケースの計上先を確定）
+| ケース | received | insert_fail | processing | completed | reply_fail | failed | no_reply_intended | dedup_skip | UNKNOWN | PENDING_RETRY | duplicate_suspect |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 署名OK・insert 成功 | ✓ | | | | | | | | | | |
+| insert 失敗(DB停止)→5xx | | ✓ | | | | | | | | | |
+| consumer 処理開始 | | | ✓ | | | | | | | | |
+| 返信成功＋downstream 完了 | | | | ✓ | | | | | | | |
+| 返信API 不達 | | | | | ✓ | | | | | | |
+| handler 例外(上限超) | | | | | | ✓ | | | | | |
+| 返信不要 event | | | | | | | ✓ | | | | |
+| 重複配送(既存 completed・要素一致) | | | | | | | | ✓ | | | |
+| crash 中 SENDING→復帰 | | | | | | | | | ✓ | | |
+| ask 保存失敗(sortation) | | | | | | | | | | ✓ | |
+| 同一 file_id/sha・case_hint 不一致 | | | | | | | | | | | ✓ |
+（1 event は遷移各段で1回ずつ計上。dedup_skip は received に含めない＝二重計上しない。）
 
 ### 9.2 OPEN / K4
-- **K4（[人]/大野・B-02 で前提条件化）**: LINE Developers コンソールの **webhook 再配送設定の有無を確認**。**顧客Bot の自動 replay を将来有効化する票のブロッキング前提**。Phase A（観測のみ）は不要。
-- **OPEN-1**: startup reconciliation の「vendor call 開始前を証明」粒度（sortation の vendor_pre/SENDING marker 実装位置）。→ 実装票（二重 forward ゼロが要件）。
-- **OPEN-2**: consumer concurrency 既定値・graceful shutdown 待機上限。→ 実装票。
+- **K4（[人]/大野・前提条件）**: LINE Developers の webhook 再配送設定確認。**顧客Bot 自動 replay 有効化票（RV-06 後）のブロッキング前提**。Phase A（観測のみ）は不要。§H-03 L3 の完全差分も K4 後。
+- **OPEN-1**: vendor_pre/SENDING marker の実装位置（二重 forward ゼロが要件）。→ 実装票。
+- **OPEN-2**: consumer concurrency 既定・shutdown 待機上限。→ 実装票。
 - **OPEN-3**: 段階導入 sub-gate（provider 別 env か単一 flag か）。→ 実装票。
-- **OPEN-4（RV-06 連携）**: 顧客Bot durable replay は RV-06（session/command）導入後の別票。本票は §2.4/§0 で余地を塞がないことのみ担保。
-- **OPEN-P16**: payload 暗号化保存＋retention（B-01）。監査要件が出たら別票。
+- **OPEN-P16**: userId/payload の暗号化保存＋retention（B-01/H-02）。監査要件時に別票。
 
 ---
 
-### 所見対応表（R-RV-05-13-D → rev2 反映箇所）
+### 所見対応表（R-RV-05-13-D2 → rev3）
 | 所見 | 反映箇所 |
 |---|---|
-| §0 スコープ再構成（顧客Bot=記録+観測のみ/sortation=GAS再送/Stripe不変） | §0・§3・§5.1 |
-| B-01 payload 保存設計（列/log複製禁止/retention=OPEN P16/仮運用） | §2.6・§9.2 |
-| B-02 K4 前提条件化＋insert失敗/到達差分カウンタ | §3.1・§6.1・§9.2 |
-| B-03 SENDING marker・UNKNOWN 人手・自動再送禁止 | §3.2・§4.2・§4.3・§5.1 |
-| H-01 §6 観測性設計 全面改訂（heartbeat/lag/滞留/収束率/alert/dead-man） | §6 |
-| H-02 wrapper 結果封筒（completed/failed/reply_fail/no_reply_intended） | §5.2 |
-| H-03/H-05 provider別状態機械表＋inbound_event_attempt新表・fencing・同居再比較 | §1・§2.4・§4.3・§5.1 |
-| H-04 冪等キー escape・NULL禁止・衝突contract | §2.3 |
-| M-01 flag OFF 機械的担保（最上段短絡/hook非接触/AST検査） | §7 |
-| M-02 3カウント境界表 | §9.1 |
-| M-03/L-01 §8 テスト計画改訂（naive FAIL形・網羅・レイテンシ呼出回数/timeout固定） | §8 |
+| B-01 processing_attempt 汎用表（target_kind/target_id） | §2.3 |
+| B-02 epoch=親行単一カウンタ・atomic SQL 契約疑似コード・事前SELECT禁止 | §B-02 |
+| H-01 LINE Phase A 限定逸脱宣言（独立節） | §H-01 |
+| H-02 userId DB列保存＋PII方針＋App28 人手 runbook | §2.1・§2.6 |
+| H-03 喪失検知の3層限定（直接/間接/K4後） | §6.3 |
+| H-04 衝突contract（case_hint比較→skip/conflict）＋duplicate_suspect | §2.4 |
+| H-05 §5.3廃止・provider別分割・Stripe欄を実測修正 | §5・§5.1 |
+| H-06 GAS再送時 state別応答表（8状態×HTTP×claim可否） | §H-06 |
+| H-07 terminal集合統一＋alert軸分離 | §6.1・§6.2 |
+| M-01 flag OFF 機械的担保（最上段/hook非接触/AST） | §7 |
+| M-02 計上境界表 | §9.1 |
+| M-03 レイテンシ=呼出回数/timeout固定 | §8 |
+| M-04 Stripe 非破壊（既存テスト不変） | §8（Stripe 非破壊）・§5.1 |
+| L-01 用語/terminal 集合の一貫化・所見対応表 | §6.1・本表 |
