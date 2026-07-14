@@ -1,9 +1,9 @@
-# DRAFT: RV-05/RV-13 durable InboundEvent / IngestionReceipt 横展開（rev4）
+# DRAFT: RV-05/RV-13 durable InboundEvent / IngestionReceipt 横展開（rev5・最終）
 
-- 状態: **DRAFT rev4（R-RV-05-13-D3 全所見・sortation=同期処理モデルへ確定）**
+- 状態: **DRAFT rev5（R-RV-05-13-D4 の HIGH 2 件＋設計数理を確定・実装票発行可の想定）**
 - 対象: RV-05（BackgroundTasks 再起動消失）・RV-13（sortation process-memory・失敗の成功ACK飲み込み）・RCF-M10（顧客Bot返信の観測性）
 - 正本: 製品設計master v2.4 **§9.17 / §9.17.1 / §8.8**（引用は下記）／G1・G3
-- rev4 差分: **B-NEW-01（sortation 同期モデル確定）**・H-NEW-01〜04・M-01〜M-06・L-NEW-01 を反映（末尾「所見対応表」）。**Stripe 状態機械は source 実測で転記**（`hub/inbound_event.py`+`main.py::stripe_webhook`）。
+- rev5 差分: **H-D4-01（epoch 不変条件・単一 UPDATE 統一）**・**H-D4-02（状態正本=receipt 行一本化・attempt 監査専用）**・M-D4-01〜07・L-D4-01 を反映（末尾「所見対応表」）。sortation=同期モデル（rev4・B-NEW-01）を前提。Stripe は source 実測のまま非破壊。
 
 > **master §9.17（FIXED）**: 「public webhook、GAS、watcher の request を ACK 後 process memory へ預けない。InboundEvent 必須field= provider、external_event_id、caller_id、payload_ref／hash、received_at、signature_result、state、attempt_count。IngestionReceipt 必須field= source_file_id、source_sha256、ingest_type、case_hint、first_seen_at、last_outcome、downstream_refs、idempotency_key。external event ID または caller＋source ID＋hash へ unique。payload に顧客 data がある場合は暗号化／不変参照と retention を定義し、通常 log へ複製しない。」
 > **master §8.8（FIXED・原則のみ流用）**: 「外部実行を request 内/BackgroundTasks/process-memory queue へ結び付けない。durable DB を読む継続 worker で再開。startup と定期で expired lease 回収。vendor call 開始前を証明できる job だけ再 queue、開始後/不明は UNKNOWN。claim は atomic update/lock と lease、concurrency 上限、同一 idempotency key を二 worker が実行しない。graceful shutdown は新規 lease 停止＋実行中 attempt の durable marker 確定。health は poll/成功/queue lag/expired lease/UNKNOWN を返す。」
@@ -41,7 +41,7 @@
 |---|---|---|
 | `inbound_event`（既存） | LINE を provider="line" 行で**同居**（Stripe と同表・§9.17 field 充足） | **0** |
 | `ingestion_receipt`（新表） | sortation の冪等/可視化/fencing 台帳（**epoch 列**・§2.2） | 新規 |
-| `processing_attempt`（新表・**sortation 専用**） | epoch 毎の claim 履歴・heartbeat（`UNIQUE(target_kind,target_id,epoch)`） | 新規 |
+| `processing_attempt`（新表・**sortation 専用・監査**） | epoch 毎の claim 履歴（`FK(receipt_id)`・`UNIQUE(receipt_id,epoch)`・判定に使わない＝H-D4-02） | 新規 |
 
 ## §2 schema
 
@@ -60,22 +60,24 @@ ingestion_receipt(
   UNIQUE(idempotency_key))
 ```
 - **claimed_at 方式は廃止**し `epoch INTEGER` に置換（新表なので **ALTER 0** 維持）。`last_heartbeat_at` の鮮度が「処理中の request が生きているか」の lease 相当。
+- **状態正本＝receipt 行に一本化（H-D4-02）**: `last_outcome` が**唯一の権威ある state 値**で、`received / processing / vendor_pre / SENDING / completed / PENDING_RETRY / failed / UNKNOWN / duplicate_suspect` を取る（vendor_pre/SENDING も **attempt.phase ではなく receipt.last_outcome の値**）。**判定は receipt 行のみで行い、processing_attempt は参照しない**（§2.3）。
 
-### 2.3 processing_attempt（新表・**sortation 専用**・target_kind CHECK＝L-NEW-01）
+### 2.3 processing_attempt（新表・**監査専用**・FK 直参照＝M-D4-06）
+**polymorphic（target_kind/target_id）を廃止**し、`ingestion_receipt` を FK で直参照する（sortation 専用・監査ログ）:
 ```
 processing_attempt(
   id PK,
-  target_kind TEXT NOT NULL,   -- 現状 'ingestion_receipt' のみ（CHECK 制約で限定）
-  target_id   BIGINT NOT NULL,
-  epoch       INTEGER NOT NULL, -- ingestion_receipt.epoch に対応（fence）
-  attempted_at ts NOT NULL,     -- この attempt の記録時刻（監査用・fence は epoch）
-  phase       TEXT NOT NULL,    -- claimed / vendor_pre / SENDING / terminal
+  receipt_id  BIGINT NOT NULL REFERENCES ingestion_receipt(id) ON DELETE CASCADE,
+  epoch       INTEGER NOT NULL,  -- receipt.epoch のスナップショット（監査）
+  attempted_at ts NOT NULL,      -- 記録時刻（DB clock）
+  phase       TEXT NOT NULL,     -- claimed / vendor_pre / SENDING / terminal（監査）
   outcome     TEXT,
-  CHECK (target_kind IN ('ingestion_receipt')),   -- L-NEW-01: 値域を機械制約
-  UNIQUE(target_kind, target_id, epoch))           -- 同一 epoch の並行 claim を弾く
+  UNIQUE(receipt_id, epoch))      -- epoch あたり1行（監査整合）
 )
 ```
-- **LINE（inbound_event）は attempt を作らない**（fencing 不要・§H-01）。将来 provider 追加時は CHECK に値を足す。
+- **監査専用・判定には使わない（H-D4-02）**: fencing/状態判定は **receipt.epoch / receipt.last_outcome のみ**で行う。processing_attempt は「いつ どの epoch で どの phase を試みたか」の履歴のみ。
+- **ON DELETE CASCADE**: receipt を（retention/監査で）削除する場合、attempt も追随（孤児行を残さない）。
+- **LINE（inbound_event）は attempt を作らない**（fencing 不要・§H-01）。将来 provider 追加は別 attempt 表 or 別票で扱う（polymorphic に戻さない）。
 
 ### 2.4 冪等キー contract（H-04）
 - **NULL/空 禁止** → durable insert 拒否＝5xx。
@@ -96,38 +98,33 @@ processing_attempt(
 - InboundEvent は migration なし。**新規 migration = `ingestion_receipt` ＋ `processing_attempt`**（`down_revision=<現head b7d3e1a9c2f4>`）。適用は大野（PUBLIC URL）。
 - RV-06 余地: inbound_event に session 列を足さない（§9.17.1 は別表・別票）。
 
-## §B-02 epoch fencing の atomic SQL 契約【H-NEW-01・claimed_at 方式廃止】
+## §B-02 epoch fencing の atomic SQL 契約【H-D4-01・単一 UPDATE パターンへ統一】
 
-**fencing = `ingestion_receipt.epoch`（親行の単一カウンタ）**。全時刻は **DB clock（`now()`）**。claim と attempt 記録は**同一 transaction**。**事前 SELECT→判断→UPDATE は禁止**。
+**不変条件（H-D4-01・最重要）**: **「epoch を進めない state 変更は存在しない」**。`last_outcome` を変える遷移（claim / terminal / reconciliation / 人手 reset）は**すべて `epoch = epoch + 1` を伴う単一 atomic UPDATE**で行う。これにより epoch は receipt の**版番号（version）兼 fence**になり、任意の in-flight request の `my_epoch` は次の遷移で必ず無効化される。全時刻は **DB clock（`now()`）**・**事前 SELECT→判断→UPDATE は禁止**。
 
-**claim（同一 tx・DB clock・no pre-SELECT）**:
-```sql
-BEGIN;
-  -- claim 可能状態のみ epoch を進める。last_heartbeat_at 鮮度で「放置」を判定（lease 相当）。
-  UPDATE ingestion_receipt
-     SET epoch = epoch + 1, last_heartbeat_at = now(), last_outcome = 'processing'
-   WHERE id = :receipt_id
-     AND last_outcome IN ('received','PENDING_RETRY')
-   RETURNING epoch AS my_epoch;          -- 0 行 = 別 request が処理中/terminal → claim せず
-  -- 同一 tx で attempt を記録。UNIQUE(target_kind,target_id,epoch) が並行 claim の敗者を弾く。
-  INSERT INTO processing_attempt(target_kind, target_id, epoch, attempted_at, phase)
-       VALUES ('ingestion_receipt', :receipt_id, :my_epoch, now(), 'claimed');
-COMMIT;
-```
-**heartbeat（同期処理中・fencing 付き）**:
-```sql
-UPDATE ingestion_receipt SET last_heartbeat_at = now()
- WHERE id = :receipt_id AND epoch = :my_epoch;   -- 0 行 = 再claim された = stale → 中断
-```
-**terminal commit（fencing）**:
+**統一パターン（全 state 遷移）**:
 ```sql
 UPDATE ingestion_receipt
-   SET last_outcome = :terminal, downstream_refs = :refs
- WHERE id = :receipt_id AND epoch = :my_epoch;    -- 0 行 = epoch 進んだ = stale → abort（commit しない）
+   SET epoch = epoch + 1, last_outcome = :new_state, last_heartbeat_at = now() [, downstream_refs=…]
+ WHERE id = :receipt_id
+   AND <guard>            -- 現 last_outcome / epoch / heartbeat 鮮度に対する条件
+ RETURNING epoch AS new_epoch;   -- 0 行 = guard 不成立（他遷移が先着）→ 何もしない
 ```
-- **fence の意味**: 新 request が再claim すると `epoch` が進む → 旧 request の heartbeat/terminal は `WHERE epoch=:my_epoch` が 0 行 → **stale request の後追い commit/heartbeat を弾く**（二重処理回避）。
-- **DB clock**: app プロセス時計に依存せず `now()`（DB 側）で lease 鮮度を判定（多インスタンス/時計ずれに強い）。
-- **禁止の明文化**: `SELECT last_outcome … ` で読んでアプリ側で分岐して UPDATE、は禁止。必ず `UPDATE … WHERE … RETURNING`／rowcount で判定。
+各遷移は `<guard>` だけが異なる:
+
+| 遷移 | new_state | guard | 意味 |
+|---|---|---|---|
+| **claim** | `processing` | `last_outcome IN ('received','PENDING_RETRY')` | 未処理を1つだけ奪う。RETURNING の epoch が my_epoch（fence） |
+| **terminal** | `completed`/`failed` | `epoch = :my_epoch` | 自分の epoch のままなら確定。0 行=再claim済み=stale→abort |
+| **PENDING_RETRY** | `PENDING_RETRY` | `epoch = :my_epoch` | downstream 失敗の可視化（自分の epoch のみ） |
+| **reconciliation（可視化）** | `PENDING_RETRY` / `UNKNOWN` | `last_outcome IN ('received','processing','vendor_pre'[/'SENDING']) AND last_heartbeat_at < :stale_cutoff` | 放置行を可視化遷移（epoch++ で in-flight を無効化・**再処理しない**） |
+| **人手 reset** | `received` | `last_outcome IN ('UNKNOWN','duplicate_suspect')` | 人手解決後の再投入許可（epoch++） |
+
+- 各遷移の直後、**同一 tx で `processing_attempt` に監査行を INSERT**（`receipt_id, epoch=new_epoch, phase`）。attempt は監査のみで判定に使わない（§2.3・H-D4-02）。
+- **heartbeat は state 遷移ではない**（`last_outcome` を変えない）→ epoch を進めない唯一の書込。ただし fence 付き: `UPDATE … SET last_heartbeat_at=now() WHERE id=? AND epoch=:my_epoch`（0 行=stale→中断）。
+- **fence の帰結**: 新 request が claim/reconciliation すると epoch++ → 旧 request の terminal/heartbeat（`WHERE epoch=:my_epoch`）は 0 行 → **stale の後追い commit を弾く**（二重処理回避）。
+- **DB clock**: `now()`（DB 側）で lease 鮮度判定（多インスタンス/時計ずれに強い）。
+- **禁止**: `SELECT last_outcome …` で読んで分岐して UPDATE は禁止。必ず `UPDATE … WHERE <guard> RETURNING`／rowcount で判定。
 
 ## §3 ACK 契約
 
@@ -149,22 +146,24 @@ UPDATE ingestion_receipt
 - **非同期 consumer なし**（処理は request 内で完結）。receipt は冪等/可視化/fencing 台帳。
 - **ask 保存失敗を成功 ACK にしない**（RV-13）→ `PENDING_RETRY`→5xx→GAS 再送で同期再試行。
 
-### §H-06 sortation: GAS 再送 state 別 応答表【H-NEW-02: +4 行】
-GAS は 5xx で bytes を再持参して再送する。既存 receipt の各 state に当たった時の応答/**同期再処理（claim）可否**:
+### §H-06 sortation: GAS 再送への応答【H-D4-01: receipt.last_outcome × lease 鮮度の排他表】
+GAS は 5xx で bytes を再持参して再送する。判定は **receipt.last_outcome（状態正本）× lease 鮮度（`last_heartbeat_at` の stale 判定）のみ**で行う（排他・重複しない行）。lease 鮮度が無関係な行は「—」。
 
-| # | state（heartbeat 鮮度） | GAS 再送への応答 | 同期再処理(claim)可否 | 備考 |
-|---|---|---|---|---|
-| 1 | received | claim→同期処理→200/5xx | 可 | 初回相当 |
-| 2 | processing（heartbeat **鮮度あり**＝別 request 処理中） | 200（処理中・冪等）or 409 | **不可** | 二重処理回避 |
-| 3 | processing/vendor_pre（heartbeat **stale**＝放置） | 再claim(epoch++)→同期再処理→200/5xx | **可**（vendor 前を証明） | 安全に再処理 |
-| 4 | SENDING（heartbeat stale） | **UNKNOWN 化**→200（人手待ち） | **不可** | 二重 forward 回避 |
-| 5 | completed | 200 skip（冪等） | 不可 | terminal |
-| 6 | PENDING_RETRY | 再claim→同期再試行→200/5xx | 可 | downstream 再試行 |
-| 7 | failed（attempt 上限） | 200 terminal＋§6 alert | 不可 | 無限再送しない |
-| 8 | **UNKNOWN**（H-NEW-02） | 200（人手解決待ち） | **不可**（人手 reset まで） | SENDING 由来・自動再処理せず |
-| 9 | **duplicate_suspect（held）**（H-NEW-02） | 200（人手・held） | **不可** | case_hint 相違・§2.4 |
-| 10 | **vendor_pre/SENDING（heartbeat 鮮度あり＝lease 有効）**（H-NEW-02） | 200（処理中・冪等）or 409 | **不可**（lease 有効） | #2 の vendor 段版 |
-| 11 | **人手解決後 reset**（H-NEW-02） | reset で `received`/`PENDING_RETRY` へ戻す → 次再送で claim 可 | **可**（reset 後） | 人手が UNKNOWN/duplicate_suspect を解消 |
+| # | last_outcome | lease 鮮度 | claim UPDATE の guard 成否 | GAS 再送への応答 | 同期再処理 |
+|---|---|---|---|---|---|
+| 1 | `received` | — | 成立（`IN (received,PENDING_RETRY)`） | claim→同期処理→200/5xx | **する** |
+| 2 | `PENDING_RETRY` | — | 成立 | claim→同期再試行→200/5xx | **する** |
+| 3 | `processing` / `vendor_pre` | **fresh** | 不成立（processing で guard 外） | 200（処理中・冪等）or 409 | しない（別 request 実行中） |
+| 4 | `processing` / `vendor_pre` | **stale** | reconciliation が先に `PENDING_RETRY` へ→行#2 で claim | 再claim→同期再処理→200/5xx | **する**（vendor 前を証明） |
+| 5 | `SENDING` | **fresh** | 不成立 | 200（処理中・冪等）or 409 | しない |
+| 6 | `SENDING` | **stale** | reconciliation が `UNKNOWN` へ（行#8） | 200（人手待ち・UNKNOWN） | **しない**（二重 forward 回避） |
+| 7 | `completed` / `failed` | — | 不成立（terminal） | 200 skip（冪等）／failed は §6 alert | しない |
+| 8 | `UNKNOWN` | — | 不成立 | 200（人手解決待ち） | **しない**（人手 reset まで） |
+| 9 | `duplicate_suspect`（held） | — | 不成立 | 200（人手・held・§2.4） | **しない** |
+
+**遷移操作（state ではなく操作・別掲）**:
+- **reconciliation**: stale の `processing/vendor_pre → PENDING_RETRY`、`SENDING → UNKNOWN`（§B-02・可視化のみ・再処理なし）。上表の #4/#6 はこの遷移の帰結。
+- **人手 reset**: `UNKNOWN / duplicate_suspect → received`（§B-02・epoch++）。以後の GAS 再送は行#1 として claim 可能になる。**reset は「受信した state」ではなく管理操作**なので表の行にしない。
 
 ## §4 処理モデル・fencing・startup reconciliation・shutdown【B-NEW-01: consumer 廃止】
 
@@ -207,10 +206,18 @@ GAS は 5xx で bytes を再持参して再送する。既存 receipt の各 sta
   - reply_fail(LINE)・UNKNOWN(sortation) は terminal かつ**軸B 警戒**の二重分類（終端だが放置不可）。
 - **held 集合** = `{ duplicate_suspect }`（人手解決待ち＝自動は止まるが「既知状態に到達」）。
 - **非terminal（要処理/進行中）** = `{ received, processing, vendor_pre, SENDING, PENDING_RETRY }`。
-- **収束率（H-NEW-03）** = **(terminal 到達数 ＋ held 数) / unique received**。
+- **収束率（H-NEW-03 / M-D4）** = **(terminal 到達数 ＋ held 数) / distinct receipt**。
   - 分子に **held を含める**（既知状態に収束済み・stuck ではない）。
-  - 分母は **unique received**（`dedup_skip`/`skipped_duplicate` を含めない＝同一物の重複で率を歪めない）。
+  - 分母は **distinct receipt**（同一 idempotency_key の receipt は1件・`dedup_skip`/`skipped_duplicate` や再送・reset で二重計上しない）。
   - §5.1・§9.1・本節で terminal/held の集合定義を**完全一致**させる。
+
+**カウンタ3系列の分離（M-D4）**: 二重計上を避けるため計数を3系列に分ける。**収束率は系列B/系列A のみで算出**し、系列C（運用操作）は率に混ぜない:
+| 系列 | 計数 | 用途 |
+|---|---|---|
+| **A 受理（distinct）** | distinct receipt 成立数・`inbound_insert_fail`・`dedup_skip`（=同一物の重複配送・分母に含めない） | 分母（distinct）と受理前喪失 |
+| **B 終端/held（1 receipt 1回）** | `completed`・`reply_fallback_ok`(内数)・`reply_fail`・`failed`・`no_reply_intended`・`UNKNOWN`・`duplicate_suspect(held)` | 分子（terminal+held） |
+| **C 運用操作（再入・非計率）** | `manual_reset`・`concurrent_reject`（並行再送の敗者）・`PENDING_RETRY 遷移回数` | 運用監視のみ（**収束率に入れない**・同一 receipt を何度でも通り得る） |
+`manual_reset` は**専用カウンタ**（人手 reset 回数）で、reset された receipt は系列A では新規計上せず、次の terminal 到達で系列B に1回だけ計上する。
 
 ### 6.2 alert 軸の分離（H-07・consumer 前提を除去）
 - **軸A 処理停止**: **収束率低下・滞留（一定時間 non-terminal のまま）・最古 non-terminal の滞留時間**（sortation は heartbeat stale 件数・LINE は processing 滞留）。※**poll/consumer heartbeat 前提の記述は削除**（継続 worker を持たないため。sortation の生存指標は receipt の heartbeat/遷移レート、LINE は state 遷移レート）。
@@ -236,9 +243,9 @@ GAS は 5xx で bytes を再持参して再送する。既存 receipt の各 sta
 ### 8.1 §M-06 テスト条件表（7 件・各々 naive がFAILする形）
 | # | 条件 | 期待（本設計） | naive（現行）が FAIL する点 |
 |---|---|---|---|
-| 1 | sortation 同期処理中に request 死亡（vendor_pre） | 次 GAS 再送 or startup が再claim/可視化・**一回だけ処理** | 現行は process-memory で重複判定が消え二重処理 or 喪失 |
-| 2 | SENDING 中に death | `UNKNOWN`・**自動再送しない**（二重 forward なし） | 現行は再送で二重 forward |
-| 3 | 並行 GAS 再送（同一 idempotency_key） | epoch fencing で1つだけ処理・敗者は UNIQUE(epoch) で弾かれる | 現行は process-memory 競合で二重 |
+| 1 | sortation 同期処理中に request 死亡（vendor_pre） | **startup reconciliation は `PENDING_RETRY` 可視化のみ（再処理しない）**／**GAS 再送が claim して一回だけ処理**（epoch++ で旧 in-flight は無効化） | 現行は process-memory で重複判定が消え二重処理 or 喪失（M-D4-04: startup が再処理しない点を固定） |
+| 2 | SENDING 中に death | stale→reconciliation で `UNKNOWN`・**自動再送しない**（二重 forward なし） | 現行は再送で二重 forward |
+| 3 | 並行 GAS 再送（同一 idempotency_key） | claim UPDATE の **guard（`last_outcome IN (received,PENDING_RETRY)`）で先着1つだけ成立**・敗者は rowcount 0 で claim せず **`concurrent_reject`（=系列C・dedup ではない）**＝200/409 | 現行は process-memory 競合で二重（M-D4-05: 敗者は receipt-state guard で弾かれる／UNIQUE(epoch) は監査整合の副次） |
 | 4 | stale epoch の terminal commit | `WHERE epoch=:my_epoch` 0 行で **abort** | naive は上書きして stale 結果を確定 |
 | 5 | ask 保存失敗 | `PENDING_RETRY`→5xx（成功 ACK にしない） | 現行は成功 response で飲み込み |
 | 6 | 冪等キー要素 NULL/空 or 要素内 `:` | 5xx（NULL）/ escape で衝突しない | naive は `:` 連結で衝突・NULL で誤一致 |
@@ -259,27 +266,29 @@ sortation は元々同期処理のため durable 化の追加=**receipt upsert�
 ## §9 OPEN / K4 / 計上境界表（M-02＋M-05）
 
 ### 9.1 計上境界表（M-05: +6 行）
-| ケース | received | insert_fail | processing | completed | reply_fallback_ok | reply_fail | failed | no_reply_intended | dedup_skip | UNKNOWN | PENDING_RETRY | duplicate_suspect |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| 署名OK/receipt 成立 | ✓ | | | | | | | | | | | |
-| insert 失敗(DB停止)→5xx | | ✓ | | | | | | | | | | |
-| 処理開始(claim) | | | ✓ | | | | | | | | | |
-| Reply 成功＋完了 | | | | ✓ | | | | | | | | |
-| Reply 失敗→Push 成功 | | | | ✓ | ✓ | | | | | | | |
-| Reply/Push 双方失敗 | | | | | | ✓ | | | | | | |
-| handler 例外(上限超) | | | | | | | ✓ | | | | | |
-| 返信不要 event(LINE) | | | | | | | | ✓ | | | | |
-| 重複配送(要素一致) | | | | | | | | | ✓ | | | |
-| SENDING death→UNKNOWN | | | | | | | | | | ✓ | | |
-| ask 保存失敗→PENDING_RETRY | | | | | | | | | | | ✓ | |
-| file_id/sha 一致・case_hint 相違→duplicate_suspect | | | | | | | | | | | | ✓ |
-| **[M-05] 並行 GAS 再送・敗者(UNIQUE epoch)** | | | | | | | | | ✓ | | | |
-| **[M-05] stale epoch terminal abort** | | | ✓ | | | | | | | | | |
-| **[M-05] vendor_pre stale→再claim→completed** | | | | ✓ | | | | | | | | |
-| **[M-05] UNKNOWN に GAS 再送(人手前)** | | | | | | | | | ✓ | | | |
-| **[M-05] 人手 reset→received 相当** | ✓ | | | | | | | | | | | |
-| **[M-05] PENDING_RETRY に再送→completed** | | | | ✓ | | | | | | | | |
-（収束率分子=terminal＋held〔duplicate_suspect〕。分母=unique received（dedup_skip/skipped_duplicate 除外）。SENDING/UNKNOWN/epoch は sortation 専用。）
+系列: **A受理**（received/insert_fail/dedup_skip）・**B終端held**（completed/reply_fallback_ok/reply_fail/failed/no_reply_intended/UNKNOWN/duplicate_suspect）・**C運用**（concurrent_reject/manual_reset・**収束率に入れない**）。processing は中間状態（B到達で解消）。
+
+| ケース | received | insert_fail | processing | completed | reply_fallback_ok | reply_fail | failed | no_reply_intended | dedup_skip | UNKNOWN | PENDING_RETRY | duplicate_suspect | concurrent_reject | manual_reset |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 署名OK/receipt 成立 | ✓ | | | | | | | | | | | | | |
+| insert 失敗(DB停止)→5xx | | ✓ | | | | | | | | | | | | |
+| 処理開始(claim) | | | ✓ | | | | | | | | | | | |
+| Reply 成功＋完了 | | | | ✓ | | | | | | | | | | |
+| Reply 失敗→Push 成功 | | | | ✓ | ✓ | | | | | | | | | |
+| Reply/Push 双方失敗 | | | | | | ✓ | | | | | | | | |
+| handler 例外(上限超) | | | | | | | ✓ | | | | | | | |
+| 返信不要 event(LINE) | | | | | | | | ✓ | | | | | | |
+| 重複配送(要素一致) | | | | | | | | | ✓ | | | | | |
+| SENDING death→UNKNOWN | | | | | | | | | | ✓ | | | | |
+| ask 保存失敗→PENDING_RETRY | | | | | | | | | | | ✓ | | | |
+| case_hint 相違→duplicate_suspect | | | | | | | | | | | | ✓ | | |
+| **[M-05] 並行 GAS 再送・敗者（guard 不成立）** | | | | | | | | | | | | | ✓ | |
+| **[M-05] stale epoch terminal abort** | | | | | | | | | | | | | ✓ | |
+| **[M-05] vendor_pre stale→reconciliation→再claim→completed** | | | | ✓ | | | | | | | | | | |
+| **[M-05] UNKNOWN に GAS 再送（人手前）** | | | | | | | | | | | | | ✓ | |
+| **[M-05] 人手 reset（UNKNOWN/dup_suspect→received）** | | | | | | | | | | | | | | ✓ |
+| **[M-05] PENDING_RETRY に再送→completed** | | | | ✓ | | | | | | | | | | |
+（**収束率分子=terminal＋held（duplicate_suspect）。分母=distinct receipt**（dedup_skip/skipped_duplicate/再送/reset で二重計上しない）。**concurrent_reject/manual_reset=系列C＝収束率に入れない**。SENDING/UNKNOWN/epoch は sortation 専用。同一 receipt は B系列に1回だけ計上。）
 
 ### 9.2 OPEN / K4
 - **K4（[人]/大野・前提条件）**: LINE 再配送設定確認（顧客Bot 自動 replay 有効化票=RV-06 後のブロッキング前提・§H-03 L3 も K4 後）。Phase A（観測）は不要。
@@ -288,20 +297,27 @@ sortation は元々同期処理のため durable 化の追加=**receipt upsert�
 - **OPEN-3**: 段階導入 sub-gate（provider 別 env か単一 flag か）。
 - **OPEN-P16**: userId/payload の暗号化保存＋retention。
 
+**持ち越し OPEN（実装票の着手条件として列挙・M-D4-07/L-D4-01）**:
+1. **stale 判定閾値の確定**: `last_heartbeat_at` の stale_cutoff 秒数（vision/forward の最大所要時間＋余裕）。短すぎると生存中を再claim、長すぎると回復遅延。実装票で env 化＋既定値裁定。
+2. **並行再送応答の 409 vs 200**: guard 不成立の敗者へ 200（冪等・処理中）か 409（明示競合）か。GAS のバックオフ挙動と整合させて確定。
+3. **reconciliation の起動契機**: startup のみか定期 tick か。定期 tick は「継続 worker を作らない」原則との整合を明記（軽量 sweep=単発 UPDATE で consumer ではない旨）。
+4. **attempt 表 retention**: 監査ログの保持期間・肥大化対策（epoch あたり1行）。ON DELETE CASCADE と retention（P16）の関係。
+5. **duplicate_suspect の自動判定粒度**: case_hint 相違のみか、source_sha256 一致・file_id 一致の組合せ条件を厳密化（誤検知/見逃しの境界）。
+6. **failed 上限（attempt_count）の値**: 何回で `failed` 終端にするか。GAS 再送の指数バックオフとの兼ね合い。
+7. **LINE Phase A の「滞留」閾値**: processing のまま何分で軸A alert とするか（返信生成の最大所要時間基準）。RV-06 で durable replay 化するまでの暫定監視値。
+（上記は本 DRAFT で設計を固定せず、**実装票で数値/契機を裁定**する条件。設計構造は本 DRAFT で確定済み。）
+
 ---
 
-### 所見対応表（R-RV-05-13-D3 → rev4）
+### 所見対応表（R-RV-05-13-D4 → rev5）
 | 所見 | 反映箇所 |
 |---|---|
-| **B-NEW-01** sortation 同期モデル確定（GAS 運び手・receipt=台帳・PDF/consumer なし・startup=可視化のみ・回復=GAS 再送） | §0・§2.2・§3.2・§4・§H-06 |
-| **H-NEW-01** claimed_at 廃止→epoch INTEGER・atomic SQL（DB clock/同一tx/UNIQUE(receipt_id,epoch)/terminal WHERE epoch/heartbeat）・LINE fencing 不要 | §2.2・§2.3・§B-02・§H-01 |
-| **H-NEW-02** §H-06 に +4 行（UNKNOWN/duplicate_suspect/lease有効vendor_pre・SENDING/人手 reset） | §H-06 |
-| **H-NEW-03** terminal 再定義（skipped_duplicate 除外・duplicate_suspect=held・収束率=(terminal+held)/unique received）§5.1/§6.1/§6.2/§9.1 一致 | §6.1・§5.1・§9.1 |
-| **H-NEW-04** runbook 限定（本文復元不能・聞き直し/再送依頼） | §2.6 |
-| **M-01** flag OFF 機械的担保／Reply→Push fallback | §7・§5.2・§9.1 |
-| **M-02** 計上境界表 | §9.1 |
-| **M-03** レイテンシ=呼出回数固定／transaction 契約 | §8.4・§3.1 |
-| **M-04** Stripe 非破壊／LINE から SENDING/UNKNOWN 除去 | §5.1・§6.1・§8.3 |
-| **M-05** 計上境界表に +6 行（並行再送敗者/stale abort/vendor_pre 再claim/UNKNOWN 再送/reset/PENDING_RETRY 再送） | §9.1 |
-| **M-06** §8 テスト条件表 7 件（naive FAIL 形） | §8.1 |
-| **L-NEW-01** target_kind CHECK 制約・用語/集合の一貫化・§8 番号化 | §2.3・§6.1・§8 |
+| **H-D4-01（HIGH）** 不変条件「epoch を進めない state 変更は存在しない」を明文化・claim/reconciliation/人手reset を全て `epoch=epoch+1` の**単一 atomic UPDATE パターンに統一**（疑似SQL置換） | §B-02・§H-06 |
+| **H-D4-02（HIGH）** 状態正本＝親 receipt 行へ一本化（vendor_pre/SENDING を `last_outcome` 値に・**attempt 表は監査専用**・判定に使わない） | §2.2・§2.3・§5.1 |
+| **M-D4-01** §H-06 を「receipt.last_outcome × lease 鮮度」の**排他表**へ書き直し・reset は遷移操作として別掲 | §H-06 |
+| **M-D4-02** 収束率 分母=**distinct receipt**・**reset 専用カウンタ**・**カウンタ3系列（A受理/B終端held/C運用）の分離** | §6.1・§9.1 |
+| **M-D4-04** テスト#1 期待値修正（startup は PENDING_RETRY 可視化のみ・再処理は GAS 再送） | §8.1 |
+| **M-D4-05** テスト#3 期待値修正（敗者は receipt-state guard で rowcount 0＝`concurrent_reject`・UNIQUE(epoch) は監査副次） | §8.1・§9.1 |
+| **M-D4-06** attempt 表の polymorphic 廃止 → **FK(receipt_id)＋ON DELETE CASCADE** | §2.3 |
+| **M-D4-07 / L-D4-01 / 持ち越し OPEN 7 件** を §9 OPEN へ列挙（実装票の着手条件） | §9.2 |
+| （前提）B-NEW-01 sortation 同期モデル・H-NEW-01〜04・M-01〜M-06・L-NEW-01（rev4） | §0/§2/§3/§4/§5/§6/§7/§8/§9 |
