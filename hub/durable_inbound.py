@@ -23,14 +23,13 @@ logger = logging.getLogger("hub.durable_inbound")
 _FLAG = "INBOUND_EVENT_DURABLE_ENABLED"
 _FLAG_TRUE = frozenset({"1", "true", "on", "yes"})
 _STALE_ENV = "INBOUND_RECONCILE_STALE_SECONDS"
-# M-NEW-01: Claude read timeout 600s × (1+SDK retry 2) = 1800s（単一 judge 呼出の
-# retry 展開）を吸収する値。fix1 の 600 は SDK retry 乗数を数えておらず過小だった。
-# 根拠の完全列挙は work-log §5。
-_DEFAULT_STALE_SECONDS = 1800
+# M-01(fix3): Vision(120×最大バッチ)＋Claude primary(1800)＋fallback(1800)＋backoff/前後処理の
+# 最悪合計 ≈ 4500s（完全列挙は work-log §5）。fencing が最終防衛・lease は誤 stale 低減の値。
+_DEFAULT_STALE_SECONDS = 4500
 _LINE_MAX_ATTEMPTS_ENV = "INBOUND_LINE_MAX_ATTEMPTS"
 _DEFAULT_LINE_MAX_ATTEMPTS = 5   # H-NEW-01: poison event の無限 re-attempt を止める上限
-# LINE Phase A の終端 state（ここへ到達済みのみ重複配送を skip＝二重返信を遮断）
-_LINE_TERMINAL = frozenset({"done"})
+# LINE Phase A の終端 state（ここへ到達済みは重複配送を skip＝二重返信を遮断・attempts 加算停止）
+_LINE_TERMINAL = frozenset({"done", "failed_exhausted"})
 
 
 def durable_enabled() -> bool:
@@ -84,11 +83,11 @@ async def record_line_event(*, webhook_event_id: str, user_id: str,
 
     戻り値（呼び出し側は "duplicate" のみ処理登録を skip・他は登録）:
       "new"       — 初回 insert。
-      "reattempt" — 重複配送だが**未終端**（received／failed・attempt 上限内）。
-                    INSERT 後クラッシュ／部分 insert 失敗（他 event の 503）による
-                    永久滞留を断つため再処理を登録する（H-NEW-01）。
-      "duplicate" — 重複配送かつ **terminal（done）到達済み**、または processing（実行中）、
-                    または attempt 上限超。処理登録を skip（二重返信を遮断＝H-03 回帰維持）。
+      "reattempt" — 重複配送だが**未終端**（received／failed・attempt 上限内）を**排他 claim**
+                    （state→processing）できた1者のみ。INSERT 後クラッシュ／部分 insert 失敗
+                    （他 event の 503）による永久滞留を断つため再処理を登録する（H-NEW-01-R）。
+      "duplicate" — terminal（done／failed_exhausted）到達済み、または processing（実行中・
+                    claim 敗者含む）、または attempts 上限到達。処理登録を skip（二重返信を遮断）。
     **自動 replay はしない**（登録先は既存 BackgroundTasks）。"""
     if not webhook_event_id:
         raise ValueError("webhook_event_id is empty")
@@ -105,30 +104,46 @@ async def record_line_event(*, webhook_event_id: str, user_id: str,
         count("A", "received", webhook_event_id)
         return "new"
     except IntegrityError:
-        pass  # dedup_key 衝突＝重複配送。以降で **DB 最新 state** に応じて分岐（H-NEW-01）
+        pass  # dedup_key 衝突＝重複配送。以降で **DB 最新 state** に応じて分岐
 
-    # H-NEW-01: terminal（done）到達済みのみ skip。未終端（received／failed・上限内）は
-    # 条件付き atomic UPDATE で再処理権を取り re-attempt。processing（実行中）・上限超は skip。
+    _max = line_max_attempts()
     async with session_scope() as s:
+        # H-NEW-01-R: 排他 claim。未終端（received／failed・上限内）を state→processing で
+        # 奪う。target=processing のため、同時 2 配送が両方 guard へ来ても勝者は 1 者だけ
+        # （敗者は state が processing に変わり guard 不成立＝rowcount 0）。
         claimed = await s.execute(
             sa.update(InboundEvent)
             .where(InboundEvent.dedup_key == dedup,
                    InboundEvent.state.in_(("received", "failed")),
-                   InboundEvent.attempts < line_max_attempts())
-            .values(state="received", attempts=InboundEvent.attempts + 1)
+                   InboundEvent.attempts < _max)
+            .values(state="processing", attempts=InboundEvent.attempts + 1)
             .returning(InboundEvent.id))
-        reattempt_id = claimed.scalar_one_or_none()
-        if reattempt_id is None:
-            # done / processing / attempt 上限超 → 再送回数だけ記録して skip
-            await s.execute(
+        if claimed.scalar_one_or_none() is not None:
+            outcome, series_name = "reattempt", "reattempt"
+        else:
+            # M-02: 上限到達（received／failed・attempts>=max）→ failed_exhausted terminal
+            # （理由付き）。以後の重複再送では guard 不成立となり attempts 加算も止まる。
+            exhausted = await s.execute(
                 sa.update(InboundEvent)
-                .where(InboundEvent.dedup_key == dedup)
-                .values(attempts=InboundEvent.attempts + 1))
-    if reattempt_id is not None:
-        count("A", "reattempt", webhook_event_id)
-        return "reattempt"
-    count("A", "dedup_skip", webhook_event_id)
-    return "duplicate"
+                .where(InboundEvent.dedup_key == dedup,
+                       InboundEvent.state.in_(("received", "failed")),
+                       InboundEvent.attempts >= _max)
+                .values(state="failed_exhausted", processed_at=sa.func.now(),
+                        last_error="attempts_exhausted")
+                .returning(InboundEvent.id))
+            if exhausted.scalar_one_or_none() is not None:
+                outcome, series_name = "duplicate", "failed_exhausted"
+            else:
+                # done／failed_exhausted（terminal）→ 加算停止。processing（実行中・claim 敗者）
+                # のみ再送圧の観測として attempts を bump（terminal は WHERE で除外）。
+                await s.execute(
+                    sa.update(InboundEvent)
+                    .where(InboundEvent.dedup_key == dedup,
+                           InboundEvent.state == "processing")
+                    .values(attempts=InboundEvent.attempts + 1))
+                outcome, series_name = "duplicate", "dedup_skip"
+    count("B" if series_name == "failed_exhausted" else "A", series_name, webhook_event_id)
+    return outcome
 
 
 async def mark_line_processing(webhook_event_id: str) -> None:
