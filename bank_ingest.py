@@ -29,7 +29,7 @@ import os
 import re
 import unicodedata
 
-from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 
 from bank_reader import (
     overall_confidence,
@@ -39,11 +39,11 @@ from bank_reader import (
 )
 from hub import kintone
 from hub.redact import emit
-from hub.webhook_auth import verify_token
+from hub.service_auth import BodyCachingRoute, ingest_guard  # RV-04b dual-accept 結線
 
 logger = logging.getLogger("bank_ingest")
 
-router = APIRouter()
+router = APIRouter(route_class=BodyCachingRoute)
 
 APP_ZAISAN = kintone.KintoneApp("App 財産", "APP_ZAISAN", "TOKEN_ZAISAN")
 APP_SHIPPING = kintone.KintoneApp("App 30 (発送管理)", "APP_SHIPPING", "TOKEN_SHIPPING")
@@ -288,7 +288,7 @@ async def ingest_bank_pdf(pdf_bytes: bytes, filename: str, *,
 
 
 @router.post("/bank/ingest")
-async def bank_ingest(token: str = "",
+async def bank_ingest(_auth: None = Depends(ingest_guard("BANK_INGEST_TOKEN")),
                       # file は意図的に optional: File(...) だと探信に 422 が
                       # 返り 404 偽装より先に存在が漏れる（koseki_ingest と同じ）
                       file: UploadFile | None = File(default=None),
@@ -297,11 +297,8 @@ async def bank_ingest(token: str = "",
                       drive_file_id: str | None = Form(default=None)):
     """通帳・残高証明 PDF を受領し、読解→App 財産（1口座=1行）へ転記する。
 
-    既存 /scan（通帳→App 27）は不変で並存。
+    認証は前段の ingest_guard（RV-04b dual-accept）が担う。既存 /scan（通帳→App 27）は不変で並存。
     """
-    if not verify_token(token, "BANK_INGEST_TOKEN"):
-        raise HTTPException(status_code=404, detail="Not Found")
-
     if file is None or not file.filename or not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="PDFファイルを送信してください")
 

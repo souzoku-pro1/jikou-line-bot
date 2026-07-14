@@ -28,13 +28,13 @@ import json
 import logging
 import os
 
-from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 
 from hub import kintone
 from hub.redact import emit
-from hub.webhook_auth import verify_token
+from hub.service_auth import BodyCachingRoute, ingest_guard  # RV-04b dual-accept 結線
 
-router = APIRouter()
+router = APIRouter(route_class=BodyCachingRoute)
 
 logger = logging.getLogger("koseki_ingest")
 
@@ -222,7 +222,7 @@ async def ingest_koseki_pdf(pdf_bytes: bytes, filename: str, *,
 
 
 @router.post("/koseki/ingest")
-async def koseki_ingest(token: str = "",
+async def koseki_ingest(_auth: None = Depends(ingest_guard("KOSEKI_INGEST_TOKEN")),
                         # file は意図的に optional: 必須（File(...)）にすると
                         # ファイル無しの探信に FastAPI が 422 を返してしまい、
                         # token 検証（404 の存在しないフリ）より先に
@@ -233,13 +233,10 @@ async def koseki_ingest(token: str = "",
                         drive_file_id: str | None = Form(default=None)):
     """戸籍 PDF（複数ページ可）を受領し App 33 に 1 レコード登録する。
 
-    case_hint: 案件レコードID（省略可）。case_app_hint: 案件アプリID（省略可）。
-    drive_file_id: 冪等キー（省略時は PDF の SHA-256 から生成）。
-    処理の中核は ingest_koseki_pdf（仕分けからの回送と共用・S5-3）。
+    認証は前段の ingest_guard（RV-04b dual-accept）が担う。case_hint: 案件レコードID
+    （省略可）。case_app_hint: 案件アプリID（省略可）。drive_file_id: 冪等キー
+    （省略時は PDF の SHA-256 から生成）。処理の中核は ingest_koseki_pdf。
     """
-    if not verify_token(token, "KOSEKI_INGEST_TOKEN"):
-        raise HTTPException(status_code=404, detail="Not Found")
-
     if file is None or not file.filename or not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="PDFファイルを送信してください")
 

@@ -24,11 +24,11 @@ import json
 import logging
 import os
 
-from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 
 from hub import kintone
 from hub.redact import emit
-from hub.webhook_auth import verify_token
+from hub.service_auth import BodyCachingRoute, ingest_guard  # RV-04b dual-accept 結線
 from registry_ingest import KIND_TO_APP25, _find_fudosan
 from valuation_reader import (
     overall_confidence,
@@ -39,7 +39,7 @@ from valuation_reader import (
 
 logger = logging.getLogger("valuation_ingest")
 
-router = APIRouter()
+router = APIRouter(route_class=BodyCachingRoute)
 
 APP_ZAISAN = kintone.KintoneApp("App 財産", "APP_ZAISAN", "TOKEN_ZAISAN")
 APP_FUDOSAN = kintone.KintoneApp(
@@ -382,7 +382,7 @@ async def ingest_valuation_pdf(pdf_bytes: bytes, filename: str, *,
 
 
 @router.post("/valuation/ingest")
-async def valuation_ingest(token: str = "",
+async def valuation_ingest(_auth: None = Depends(ingest_guard("VALUATION_INGEST_TOKEN")),
                            # file は意図的に optional: File(...) だと探信に 422 が
                            # 返り 404 偽装より先に存在が漏れる（koseki_ingest と同じ）
                            file: UploadFile | None = File(default=None),
@@ -391,12 +391,9 @@ async def valuation_ingest(token: str = "",
                            drive_file_id: str | None = Form(default=None)):
     """評価証明・課税明細 PDF を受領し、読解→不動産25・App 財産へ転記する。
 
-    既存 /ocr/fixed-asset は不変で並存（同一PDFが両経路から入っても
-    upsert 冪等で二重行はできない）。
+    認証は前段の ingest_guard（RV-04b dual-accept）が担う。既存 /ocr/fixed-asset は不変で並存
+    （同一PDFが両経路から入っても upsert 冪等で二重行はできない）。
     """
-    if not verify_token(token, "VALUATION_INGEST_TOKEN"):
-        raise HTTPException(status_code=404, detail="Not Found")
-
     if file is None or not file.filename or not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="PDFファイルを送信してください")
 

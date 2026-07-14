@@ -282,6 +282,20 @@ PoC で実証済みの項目に加え、本体実装は下記を**全数**テス
 > `test_db_foundation.py` で実証。**未結線**（RV-04b で ingest 群へ結線）。
 > 6.3 の残り（**downgrade 禁止＝query token 併記**は RV-04b 結線の必須テスト・GAS 実機）を次段で回収。
 
+> **結線済み（RV-04b・§4 Phase A dual-accept・`test_rv04b_dual_accept.py`・11 tests）**:
+> `verify_request` を新 ingest 5 入口（koseki/registry/bank/sortation/valuation）の前段へ
+> `ingest_guard`（Depends）で結線。form parse 前の生 body 取得は **`BodyCachingRoute`**（ingest
+> 5 入口のみに適用・顧客 Bot /webhook には不適用）で担保。
+> - **feature flag `SERVICE_AUTH_DUAL_ACCEPT_ENABLED`（既定 OFF）**。OFF＝旧 query token のみ
+>   （署名ヘッダは無視・現行挙動と byte 同一）。ON＝署名ヘッダ在は署名経路のみ（token へ
+>   fallback しない＝downgrade 防止）／署名ヘッダ皆無は旧 query token（Phase A 併存）。
+> - **downgrade 禁止（§6.3）実証**: ①有効 token 併記でも不正署名は拒否 ②署名失敗が token へ
+>   fallback しない ③3系（署名OK=通過 / token OK=通過 / 両方無=拒否）。検証力の実測は
+>   `docs/work-logs/2026-07-14_RV-04b_downgrade-evidence.md`（naive fallback 実装なら同テストが FAIL・実出力全文つき）。
+> - 署名経路の判定は emit 契約でログ（key_id/caller/reason のみ・secret/署名値/顧客情報なし）。
+>   拒否レスポンス body は固定文字列（reason 素通しなし）。migration は不要（RV-04a の nonce 表を使用）。
+> - 未回収（次段）: 旧 token 停止（Phase C）・GAS caller 側の署名付与＋[人]実機・legacy /scan・/ocr。
+
 ## 7. 論点・OPEN・BLOCKED
 - 【OPEN・owner=大野/司令塔】nonce ストア（案A/B）・kintone webhook 代替（K1/K2/K3）。
 - 【OPEN・owner=大野/司令塔】key_id 保管方式（Railway env `SIG_KEY_*` / 将来の secret manager）。
