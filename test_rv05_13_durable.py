@@ -175,6 +175,60 @@ class TestLineDurable(_DbMixin):
             _client.post("/webhook", content=body, headers={"X-Line-Signature": sig})  # done→skip
         self.assertEqual(proc.await_count, 1)              # terminal は再登録しない
 
+    def test_hnew01r_reattempt_is_exclusive_claim(self):
+        # H-NEW-01-R / M-03: 未終端の重複を re-attempt する際は排他 claim。
+        # 2 配送が両方 guard 到達（received）しても "reattempt" は1者のみ
+        # （旧コード=state→received では両方 reattempt になり登録2回で FAIL）。
+        import hub.durable_inbound as _di
+        kw = dict(user_id="U", signature_result="verified",
+                  payload=b"p", event_type="message")
+
+        async def _scenario():
+            o0 = await _di.record_line_event(webhook_event_id="excl", **kw)  # new(received)
+            # タスクは走らせない（滞留を模擬）→ 2 つの再配送が両方 received を見て claim 競合
+            o1 = await _di.record_line_event(webhook_event_id="excl", **kw)
+            o2 = await _di.record_line_event(webhook_event_id="excl", **kw)
+            return o0, o1, o2
+
+        with patch.dict(os.environ, {_FLAG: "1"}):
+            o0, o1, o2 = _run(_scenario())
+        db.reset_for_tests()
+        self.assertEqual(o0, "new")
+        self.assertEqual([o1, o2].count("reattempt"), 1)   # 排他: 登録は一回だけ
+        self.assertEqual([o1, o2].count("duplicate"), 1)   # 敗者は skip
+
+    def test_m02_attempts_exhaust_to_failed_terminal(self):
+        # M-02: attempts 上限到達で failed_exhausted terminal（理由付き）へ。
+        # 以後の重複再送は attempts 加算停止（terminal）。
+        import hub.durable_inbound as _di
+        kw = dict(user_id="U", signature_result="verified",
+                  payload=b"p", event_type="message")
+
+        async def _read():
+            async with db.session_scope() as s:
+                r = (await s.execute(sa.select(InboundEvent.state, InboundEvent.attempts)
+                     .where(InboundEvent.external_event_id == "ex"))).one()
+                return r.state, r.attempts
+
+        async def _scenario():
+            o1 = await _di.record_line_event(webhook_event_id="ex", **kw)   # new(received,1)
+            o2 = await _di.record_line_event(webhook_event_id="ex", **kw)   # reattempt(processing,2)
+            await _di.mark_line_failed("ex", "BoomError")                    # →failed(2)
+            o3 = await _di.record_line_event(webhook_event_id="ex", **kw)   # 上限到達→failed_exhausted
+            st3, at3 = await _read()
+            o4 = await _di.record_line_event(webhook_event_id="ex", **kw)   # skip・加算停止
+            st4, at4 = await _read()
+            return o1, o2, o3, o4, st3, at3, st4, at4
+
+        with patch.dict(os.environ, {_FLAG: "1", "INBOUND_LINE_MAX_ATTEMPTS": "2"}):
+            o1, o2, o3, o4, st3, at3, st4, at4 = _run(_scenario())
+        db.reset_for_tests()
+        self.assertEqual([o1, o2, o3, o4], ["new", "reattempt", "duplicate", "duplicate"])
+        self.assertEqual(st3, "failed_exhausted")          # 上限到達で terminal
+        self.assertEqual(at3, 2)
+        self.assertEqual(st4, "failed_exhausted")
+        self.assertEqual(at4, 2)                           # duplicate 再送で加算停止
+
     def test_flag_on_background_crash_marks_failed(self):
         # HOTFIX-01 型: 背景タスクが（内部 try の外で）crash → failed で可視化
         body, sig = _line_body(event_id="crash-1")
