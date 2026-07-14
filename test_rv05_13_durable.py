@@ -229,6 +229,51 @@ class TestLineDurable(_DbMixin):
         self.assertEqual(st4, "failed_exhausted")
         self.assertEqual(at4, 2)                           # duplicate 再送で加算停止
 
+    def test_mtest01_fresh_processing_within_threshold_skips(self):
+        # M-TEST-01 ①: claim 後（fresh processing）の即再配送は skip（stale 閾値内）
+        import hub.durable_inbound as _di
+        kw = dict(user_id="U", signature_result="verified",
+                  payload=b"p", event_type="message")
+
+        async def _scenario():
+            o1 = await _di.record_line_event(webhook_event_id="fp", **kw)  # new(received)
+            o2 = await _di.record_line_event(webhook_event_id="fp", **kw)  # claim→processing(fresh)
+            o3 = await _di.record_line_event(webhook_event_id="fp", **kw)  # 即再配送→fresh→skip
+            return o1, o2, o3
+
+        with patch.dict(os.environ, {_FLAG: "1"}):
+            o1, o2, o3 = _run(_scenario())
+        db.reset_for_tests()
+        self.assertEqual([o1, o2, o3], ["new", "reattempt", "duplicate"])
+
+    def test_mtest01_stale_processing_reclaims_once(self):
+        # M-TEST-01 ②: claimed_at を閾値超に細工→再配送で再 claim・登録は1回だけ
+        import hub.durable_inbound as _di
+        kw = dict(user_id="U", signature_result="verified",
+                  payload=b"p", event_type="message")
+
+        async def _make_stale():
+            async with db.session_scope() as s:
+                await s.execute(sa.update(InboundEvent)
+                                .where(InboundEvent.external_event_id == "sp")
+                                .values(claimed_at=sa.func.datetime(sa.func.now(),
+                                                                    "-7200 seconds")))
+
+        async def _scenario():
+            o1 = await _di.record_line_event(webhook_event_id="sp", **kw)  # new
+            o2 = await _di.record_line_event(webhook_event_id="sp", **kw)  # claim→processing
+            await _make_stale()                                            # claimed_at 閾値超に細工
+            o3 = await _di.record_line_event(webhook_event_id="sp", **kw)  # stale→再claim
+            o4 = await _di.record_line_event(webhook_event_id="sp", **kw)  # 直後 fresh→skip
+            return o1, o2, o3, o4
+
+        with patch.dict(os.environ, {_FLAG: "1"}):
+            o1, o2, o3, o4 = _run(_scenario())
+        db.reset_for_tests()
+        self.assertEqual([o1, o2], ["new", "reattempt"])
+        self.assertEqual(o3, "reattempt")   # stale processing を再 claim（回収・登録）
+        self.assertEqual(o4, "duplicate")   # 再 claim 直後は fresh → 登録は1回だけ
+
     def test_flag_on_background_crash_marks_failed(self):
         # HOTFIX-01 型: 背景タスクが（内部 try の外で）crash → failed で可視化
         body, sig = _line_body(event_id="crash-1")
@@ -349,6 +394,24 @@ class TestSortationDurable(_DbMixin):
                              data={"drive_file_id": "FT"})
         self.assertEqual(r.status_code, 409)                 # 成功 ACK にしない
         self.assertNotIn(ir.ST_COMPLETED, self._receipt_states())
+
+    def test_mnew01r_page_cap_forces_ask_no_ocr(self):
+        # M-01-R: Vision ページ上限超過 → OCR せず安全側で ask 縮退（沈黙処理にしない）
+        ocr = MagicMock(return_value="should-not-run")
+        with patch("main._pdf_page_count", new=MagicMock(return_value=999)), \
+             patch("sortation_ingest._ocr_pdf", new=ocr), \
+             patch("sortation_ingest.list_candidates", new=AsyncMock(return_value=[])), \
+             patch("sortation_ingest._judge_with_claude",
+                   new=AsyncMock(return_value={"doc_type": "その他", "confidence": 0.9, "reason": "r"})), \
+             patch("sortation_ingest._log_ask", new=AsyncMock(return_value="url")), \
+             patch("sortation_ingest._notify_ask", new=AsyncMock(return_value=None)), \
+             patch.dict(os.environ, {**_ENV}):
+            r = _client.post("/sortation/ingest?token=sort-token",
+                             files={"file": ("x.pdf", b"%PDF big", "application/pdf")},
+                             data={"drive_file_id": "FBIG"})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json().get("action"), "ask")   # 安全側 ask へ縮退
+        ocr.assert_not_called()                           # 上限超過は OCR を回さない
 
     def test_mnew03_claim_unavailable_response_contract(self):
         # M-NEW-03: claim 不可→state 別応答が §H-06 状態表内に収まる契約テスト
