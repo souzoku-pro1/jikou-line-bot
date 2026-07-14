@@ -268,4 +268,43 @@ Vision（`urllib`）に**明示 timeout が無い**ため、ハングした sock
 
 ## 7. テスト・全 suite 実出力
 
-（本節は実行後に §7.1/§7.2 の実出力で確定する。）
+### 7.1 RV-05-13 対象 suite
+```
+$ PYTHONUTF8=1 python -m pytest test_ingestion_receipt.py test_rv05_13_durable.py -q
+26 passed, 5 warnings, 2 subtests passed in 4.91s
+```
+内訳: `test_ingestion_receipt.py` 14（ledger／fencing／M-01／M-04）・
+`test_rv05_13_durable.py` 12（LINE Phase A／sortation 同期／flag OFF 機械担保／
+H-02／H-03／H-04）。
+
+### 7.2 sink 方針・sentinel（RV-10 台帳 resync 後）
+```
+$ PYTHONUTF8=1 python -m pytest test_sink_ast_policy.py test_redaction_sentinels.py -q
+17 passed, 89 subtests passed in 7.02s
+```
+台帳 resync は `sink:logger` 9 件の行移動のみ（total 61 不変・baseline 211 の
+単調減少維持・manifest 不変・新規違反ゼロ）。
+
+### 7.3 全 suite
+```
+$ PYTHONUTF8=1 python -m pytest -q
+1 failed, 1359 passed, 5 warnings, 439 subtests passed in 43.17s
+FAILED test_triage_classification.py::TestTriageClassification::test_classification_accuracy
+```
+
+**唯一の FAIL は本修正と無関係の既存アーティファクト**。`test_classification_accuracy`
+は `@skipUnless(ANTHROPIC_API_KEY)` の**実 Claude API 呼出テスト**で、単体実行では
+skip される。full suite では先行テストモジュールが `os.environ` に
+`ANTHROPIC_API_KEY="dummy"` を残すため skip 条件が外れ、dummy キーで実 API を叩いて
+失敗する（accuracy < 閾値）。
+
+- **修正前 SHA 8dfb2d3 でも同一 FAIL を実測**（下記）ため、本修正が原因でない:
+```
+# worktree 8dfb2d3（clean base）
+$ PYTHONUTF8=1 python -m pytest -q
+1 failed, 1354 passed, 5 warnings, 439 subtests passed in 46.82s
+FAILED test_triage_classification.py::TestTriageClassification::test_classification_accuracy
+```
+- Δ = base 1,354 → 本ブランチ 1,359 = **+5 passed（本修正の新規テスト）・回帰ゼロ・
+  同一 pre-existing FAIL 1**。実 `ANTHROPIC_API_KEY` を与える `railway run` 実行では
+  この行も pass する（実装 work-log の 1,347 passed は real key 実行時の値）。
