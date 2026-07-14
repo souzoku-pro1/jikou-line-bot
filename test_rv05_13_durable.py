@@ -116,6 +116,16 @@ class TestLineDurable(_DbMixin):
             _client.post("/webhook", content=body, headers={"X-Line-Signature": sig})
         self.assertEqual(len(self._inbound_rows()), 1)     # UNIQUE(dedup_key) 冪等
 
+    def test_h03_duplicate_delivery_no_double_reply(self):
+        # H-03: 重複配送は BackgroundTasks を登録しない（二重返信の遮断）
+        body, sig = _line_body(event_id="h03-dup")
+        proc = AsyncMock(return_value=None)
+        with patch.dict(os.environ, {_FLAG: "1"}), \
+             patch.object(main, "_process_line_event", new=proc):
+            _client.post("/webhook", content=body, headers={"X-Line-Signature": sig})
+            _client.post("/webhook", content=body, headers={"X-Line-Signature": sig})
+        self.assertEqual(proc.await_count, 1)   # 2回配送でも処理は1回だけ
+
     def test_flag_on_background_crash_marks_failed(self):
         # HOTFIX-01 型: 背景タスクが（内部 try の外で）crash → failed で可視化
         body, sig = _line_body(event_id="crash-1")
@@ -162,21 +172,66 @@ class TestSortationDurable(_DbMixin):
         self.assertEqual(r.status_code, 200, r.text)
         self.assertEqual(len(self._receipt_states()), 0)   # flag OFF: 台帳に入らない
 
+    def test_h02_completed_duplicate_skips_processing(self):
+        # H-02: 既に completed の receipt に再送 → claim 不可 → **同期処理全体 skip**（200 skip）
+        pdf = b"%PDF fake sortation"
+        sha = hashlib.sha256(pdf).hexdigest()
+
+        async def _pre():
+            rid = await ir.upsert_receipt(ingest_type="sortation", caller_id="gas",
+                                          source_file_id="F1", source_sha256=sha, case_hint=None)
+            ep = await ir.claim(rid)
+            await ir.mark_terminal(rid, ep, ir.ST_COMPLETED)
+        _run(_pre()); db.reset_for_tests()
+        ocr = MagicMock(return_value="x")   # 呼ばれてはいけない
+        with patch("sortation_ingest._ocr_pdf", new=ocr), \
+             patch.dict(os.environ, {**_ENV, _FLAG: "1"}):
+            r = _client.post("/sortation/ingest?token=sort-token",
+                             files={"file": ("x.pdf", pdf, "application/pdf")},
+                             data={"drive_file_id": "F1"})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json().get("action"), "skip")
+        ocr.assert_not_called()   # OCR/Claude/ask を実行しない（H-02）
+
+    def test_h04_ask_save_failure_pending_retry_5xx(self):
+        # H-04: ask 保存失敗 → PENDING_RETRY → 5xx（成功 ACK にしない）
+        ocr = MagicMock(return_value="調査結果通知書")
+        judge = AsyncMock(return_value={"doc_type": "その他", "confidence": 0.1, "reason": "r"})
+        nr_client = TestClient(main.app, raise_server_exceptions=False)
+        with patch("sortation_ingest._ocr_pdf", new=ocr), \
+             patch("sortation_ingest.list_candidates", new=AsyncMock(return_value=[])), \
+             patch("sortation_ingest._judge_with_claude", new=judge), \
+             patch("sortation_ingest._log_ask", new=AsyncMock(side_effect=RuntimeError("kintone down"))), \
+             patch("sortation_ingest._notify_ask", new=AsyncMock(return_value=None)), \
+             patch.dict(os.environ, {**_ENV, _FLAG: "1"}):
+            r = nr_client.post("/sortation/ingest?token=sort-token",
+                               files={"file": ("x.pdf", b"%PDF ask", "application/pdf")},
+                               data={"drive_file_id": "FA"})
+        self.assertGreaterEqual(r.status_code, 500)          # 5xx（成功 ACK にしない）
+        self.assertEqual(self._receipt_states(), [ir.ST_PENDING_RETRY])
+
 
 # ── M-01: flag OFF 機械的担保（durable 呼出は flag 判定の内側のみ） ──────────
 class TestFlagOffMechanical(unittest.TestCase):
     def test_durable_calls_guarded_by_flag(self):
         import pathlib
         repo = pathlib.Path(__file__).parent
-        webhook = (repo / "main.py").read_text(encoding="utf-8")
-        # webhook 内: record_line_event は `if _durable:` の内側からのみ呼ぶ
-        self.assertIn("_durable = durable_enabled()", webhook)
-        self.assertIn("if _durable:", webhook)
-        sort = (repo / "sortation_ingest.py").read_text(encoding="utf-8")
-        # sortation: durable 呼出（upsert_receipt/claim）は durable_enabled() の内側
-        self.assertIn("if durable_enabled():", sort)
-        # upsert_receipt は durable_enabled() ブロック以降にのみ現れる
-        self.assertLess(sort.index("if durable_enabled():"), sort.index("upsert_receipt"))
+        main_src = (repo / "main.py").read_text(encoding="utf-8")
+        sort_src = (repo / "sortation_ingest.py").read_text(encoding="utf-8")
+        # M-06: durable_inbound を module top-level（非インデント）で import しない
+        # （flag OFF は import 経路に入らない。flag ON 内の関数ローカル import は可）。
+        for src, name in [(main_src, "main.py"), (sort_src, "sortation_ingest.py")]:
+            for line in src.splitlines():
+                if (line.startswith("import ") or line.startswith("from ")) \
+                        and "hub.durable_inbound" in line:
+                    self.fail(f"{name}: durable_inbound を top-level import している: {line}")
+        # webhook: env 直読みの flag ゲート＋record_line_event は if _durable: 内
+        self.assertIn('os.environ.get("INBOUND_EVENT_DURABLE_ENABLED"', main_src)
+        self.assertIn("if _durable:", main_src)
+        self.assertLess(main_src.index("if _durable:"), main_src.index("record_line_event("))
+        # sortation: _durable_enabled() ゲートの内側でのみ upsert_receipt/claim
+        self.assertIn("if _durable_enabled():", sort_src)
+        self.assertLess(sort_src.index("if _durable_enabled():"), sort_src.index("upsert_receipt"))
 
     def test_no_durable_write_when_flag_off(self):
         # 挙動: flag OFF は durable モジュールを呼んでも書かない（durable_enabled=False）

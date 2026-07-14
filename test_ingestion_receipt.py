@@ -56,6 +56,22 @@ class _DbMixin(unittest.TestCase):
         db.reset_for_tests()
         return r.last_outcome, r.epoch
 
+    def _make_stale(self, rid):
+        # DB clock（H-05）は秒解像度のため、テストは heartbeat を NULL にして stale を強制
+        async def _u():
+            async with db.session_scope() as s:
+                await s.execute(sa.update(ir.ingestion_receipt)
+                                .where(ir.ingestion_receipt.c.id == rid)
+                                .values(last_heartbeat_at=None))
+        _run(_u()); db.reset_for_tests()
+
+    def _attempt_count(self, rid):
+        async def _q():
+            async with db.session_scope() as s:
+                return (await s.execute(sa.select(sa.func.count(ir.processing_attempt.c.id))
+                        .where(ir.processing_attempt.c.receipt_id == rid))).scalar_one()
+        r = _run(_q()); db.reset_for_tests(); return r
+
 
 class TestIdempotencyKey(unittest.TestCase):
     def test_length_prefix_no_collision(self):
@@ -117,7 +133,8 @@ class TestFencing(_DbMixin):
         rid = self._new_receipt()
         ep = _run(ir.claim(rid)); db.reset_for_tests()
         _run(ir.mark_phase(rid, ep, ir.ST_SENDING)); db.reset_for_tests()
-        stats = _run(ir.reconcile_stale(stale_seconds=0)); db.reset_for_tests()  # 即 stale
+        self._make_stale(rid)
+        stats = _run(ir.reconcile_stale(stale_seconds=600)); db.reset_for_tests()
         self.assertEqual(stats["to_unknown"], 1)
         self.assertEqual(self._state(rid)[0], ir.ST_UNKNOWN)
 
@@ -126,12 +143,36 @@ class TestFencing(_DbMixin):
         rid = self._new_receipt()
         ep = _run(ir.claim(rid)); db.reset_for_tests()
         _run(ir.mark_phase(rid, ep, ir.ST_VENDOR_PRE)); db.reset_for_tests()
-        stats = _run(ir.reconcile_stale(stale_seconds=0)); db.reset_for_tests()
+        self._make_stale(rid)
+        stats = _run(ir.reconcile_stale(stale_seconds=600)); db.reset_for_tests()
         self.assertEqual(stats["to_pending_retry"], 1)
         self.assertEqual(self._state(rid)[0], ir.ST_PENDING_RETRY)
         # PENDING_RETRY は再 claim 可能（GAS 再送）
         ep2 = _run(ir.claim(rid)); db.reset_for_tests()
         self.assertIsNotNone(ep2)
+
+    def test_m01_reconciliation_writes_audit_row(self):
+        # M-01: reconciliation も epoch++ ＋ 同一 tx で監査行を残す
+        rid = self._new_receipt()
+        ep = _run(ir.claim(rid)); db.reset_for_tests()          # attempt#1
+        _run(ir.mark_phase(rid, ep, ir.ST_SENDING)); db.reset_for_tests()   # attempt#2
+        before = self._attempt_count(rid)
+        self._make_stale(rid)
+        _run(ir.reconcile_stale(stale_seconds=600)); db.reset_for_tests()   # attempt#3(unknown)
+        self.assertEqual(self._attempt_count(rid), before + 1)  # 監査行が増える
+
+    def test_m04_reconcile_invalidates_inflight_epoch(self):
+        # M-04 barrier: in-flight（my_epoch）中に reconciliation が走ると、in-flight の
+        # terminal/heartbeat は fence 喪失（False）＝処理中断すべき
+        rid = self._new_receipt()
+        ep = _run(ir.claim(rid)); db.reset_for_tests()
+        _run(ir.mark_phase(rid, ep, ir.ST_VENDOR_PRE)); db.reset_for_tests()
+        cur = self._state(rid)[1]   # in-flight の最新 epoch
+        self._make_stale(rid)
+        _run(ir.reconcile_stale(stale_seconds=600)); db.reset_for_tests()   # epoch++（PENDING_RETRY）
+        # in-flight の cur epoch では heartbeat も terminal も 0 行（fence 喪失）
+        self.assertFalse(_run(ir.heartbeat(rid, cur))); db.reset_for_tests()
+        self.assertFalse(_run(ir.mark_terminal(rid, cur, ir.ST_COMPLETED))); db.reset_for_tests()
 
     def test_condition7_duplicate_suspect(self):
         # DRAFT §8 #7: 同 file_id/sha・case_hint 相違 → duplicate_suspect（held・人手）
@@ -155,7 +196,8 @@ class TestFencing(_DbMixin):
         rid = self._new_receipt()
         ep = _run(ir.claim(rid)); db.reset_for_tests()
         _run(ir.mark_phase(rid, ep, ir.ST_SENDING)); db.reset_for_tests()
-        _run(ir.reconcile_stale(0)); db.reset_for_tests()   # → UNKNOWN
+        self._make_stale(rid)
+        _run(ir.reconcile_stale(600)); db.reset_for_tests()   # → UNKNOWN
         self.assertTrue(_run(ir.manual_reset(rid))); db.reset_for_tests()
         self.assertEqual(self._state(rid)[0], ir.ST_RECEIVED)
 
@@ -164,7 +206,8 @@ class TestFencing(_DbMixin):
         rid = self._new_receipt()
         ep = _run(ir.claim(rid)); db.reset_for_tests()
         _run(ir.mark_phase(rid, ep, ir.ST_SENDING)); db.reset_for_tests()
-        _run(ir.reconcile_stale(0)); db.reset_for_tests()          # UNKNOWN
+        self._make_stale(rid)
+        _run(ir.reconcile_stale(600)); db.reset_for_tests()       # UNKNOWN
         _run(ir.manual_reset(rid)); db.reset_for_tests()           # received
         ep2 = _run(ir.claim(rid)); db.reset_for_tests()
         _run(ir.mark_terminal(rid, ep2, ir.ST_COMPLETED)); db.reset_for_tests()
