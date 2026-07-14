@@ -418,7 +418,6 @@ async def _process_line_event(reply_token: str, user_id: str, user_text: str) ->
                     #     （既定=完全抑止）。弁護士は App28 で実体を確認する。
                     if ATTORNEY_LINE_USER_ID:
                         from hub.notify import notify_business
-                        from hub.redact import emit
                         await notify_business(
                             ATTORNEY_LINE_USER_ID,
                             f"【人対応中】"
