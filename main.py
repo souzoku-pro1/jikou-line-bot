@@ -578,7 +578,10 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
             except Exception:
                 raise HTTPException(status_code=503, detail="event store unavailable")
             if outcome == "duplicate":
-                # H-03: 重複配送は既に処理済み → 二重返信を遮断（BackgroundTasks 登録しない）
+                # H-NEW-01: "duplicate" は **terminal 到達済み or 実行中 or 上限超** のみ。
+                # 二重返信を遮断（BackgroundTasks 登録しない）。未終端の重複は
+                # record_line_event が "reattempt" を返し、下で再処理を登録する
+                # （INSERT 後クラッシュ／部分 insert 失敗の永久滞留を断つ）。
                 continue
             background_tasks.add_task(_process_line_event_durable,
                                      reply_token, user_id, user_text, webhook_event_id)
@@ -669,6 +672,19 @@ def _pdf_page_count(pdf_bytes: bytes) -> int | None:
         return None
 
 
+def _vision_timeout_seconds() -> float:
+    """Vision files:annotate の per-request timeout（env VISION_ANNOTATE_TIMEOUT_SECONDS・
+    既定120秒）。5ページ/リクエストの同期 annotate は実測で数秒オーダー。120秒は通常の
+    ~20-40× 余裕で遅い大判スキャンも吸収しつつ、明示 timeout の無い urlopen が socket
+    ハング時に無限滞留する経路（M-NEW-01）を断つ。"""
+    raw = os.environ.get("VISION_ANNOTATE_TIMEOUT_SECONDS", "").strip()
+    try:
+        v = float(raw)
+    except ValueError:
+        return 120.0
+    return v if v > 0 else 120.0
+
+
 def _vision_annotate(pdf_bytes: bytes, api_key: str,
                      pages: list[int] | None = None) -> list[str]:
     """Vision files:annotate を1回呼び、ページごとのテキストのリストを返す。
@@ -687,7 +703,7 @@ def _vision_annotate(pdf_bytes: bytes, api_key: str,
     req = urllib.request.Request(url, data=body,
                                   headers={"Content-Type": "application/json"})
     try:
-        with urllib.request.urlopen(req) as resp:
+        with urllib.request.urlopen(req, timeout=_vision_timeout_seconds()) as resp:
             result = json.loads(resp.read())
     except urllib.error.HTTPError as e:
         err_body = e.read().decode("utf-8", errors="replace")
