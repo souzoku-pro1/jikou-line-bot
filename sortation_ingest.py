@@ -137,6 +137,19 @@ def _durable_enabled() -> bool:
         in ("1", "true", "on", "yes")
 
 
+def _sortation_max_pages() -> int:
+    """Vision OCR にかけるページ上限（env SORTATION_MAX_PAGES・既定25＝5バッチ×5ページ）。
+    M-01-R: lease 定量が前提とする運用上限（≤25ページ）を実装で強制する。D1 の
+    「Vision files:annotate は 1req 最大5ページ」制約と整合（上限＝バッチ数×5）。超過は
+    OCR を回さず安全側で ask 縮退（doc_type=不明で人手へ）。"""
+    raw = os.environ.get("SORTATION_MAX_PAGES", "").strip()
+    try:
+        v = int(raw)
+    except ValueError:
+        return 25
+    return v if v > 0 else 25
+
+
 async def _try_split_analysis(pdf_bytes: bytes, vision_key: str,
                               file_name: str) -> tuple[str | None, dict | None]:
     """D1-2: ページ別 OCR → 区間判定。失敗・分割不能は (結合テキスト or None, None)
@@ -449,11 +462,18 @@ async def sortation_ingest(_auth: None = Depends(ingest_guard("SORTATION_INGEST_
                         emit(fid, "external_ref", "log", "operator"))
         _seen_drive_file_ids.add(fid)
 
+    # M-01-R: Vision ページ上限の強制。lease 定量の運用前提（≤バッチ数×5ページ）を超える
+    # PDF は OCR/split を回さず安全側で ask 縮退（下の OCR try で ValueError→doc_type=不明）。
+    # 判定不能（None＝PyMuPDF 不在等）は従来どおり（Vision 既定5ページに縮退）。
+    from main import _pdf_page_count
+    _page_count = _pdf_page_count(pdf_bytes)
+    _over_page_cap = _page_count is not None and _page_count > _sortation_max_pages()
+
     # D1-2: 分割層（フラグ配下）。ページ別 OCR→区間判定。単一区間・分割不能・
     # 失敗は split_result=None（従来経路そのまま＝高速パス/安全側）
     split_result: dict | None = None
     pre_text: str | None = None
-    if _split_enabled():
+    if _split_enabled() and not _over_page_cap:
         pre_text, split_result = await _try_split_analysis(
             pdf_bytes, vision_key, file_name)
 
@@ -475,6 +495,10 @@ async def sortation_ingest(_auth: None = Depends(ingest_guard("SORTATION_INGEST_
     ocr_text = ""
     failure = ""
     try:
+        if _over_page_cap:
+            # M-01-R: ページ上限超過 → OCR せず ask 安全側縮退（沈黙処理より人手検知が安全）
+            raise ValueError(
+                f"ページ数 {_page_count} が上限 {_sortation_max_pages()} を超過")
         ocr_text = pre_text if pre_text is not None else \
             _ocr_pdf(pdf_bytes, vision_key)
         candidates = await list_candidates()
