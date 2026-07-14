@@ -128,12 +128,13 @@ X-Sig-Signature: <hex>
 - **保持期限 = 署名 timestamp + SKEW**（受理し得る最遅時刻）まで。この時刻を過ぎた nonce は
   そもそも §2.3-5 で timestamp 超過 401 になるため、期限切れ nonce 行は安全に削除できる。
   → nonce 行に `expires_at = timestamp + SKEW` を持たせ、`expires_at < now` を定期削除。
-- **案A（inbound_event 流用）** / **案B（専用 signature_nonce テーブル）**。
-  - 叩き台推奨: **案B**（nonce は署名検証レイヤの関心事・inbound_event の業務意味を濁さない。
-    保持窓が SKEW=5分と小さくテーブルも小さい）。schema 案:
-    `signature_nonce(nonce TEXT PK, key_id TEXT, caller TEXT, seen_at ts, expires_at ts)`。
-    INSERT の UNIQUE 衝突＝replay→409。
-- 【OPEN・owner=大野/司令塔】案A/B（判断材料: inbound_event の運用一体化 vs レイヤ分離）。
+- **裁定（司令塔 2026-07-14）= 案B（専用 `signature_nonce` テーブル）を採用**（nonce は署名検証
+  レイヤの関心事・inbound_event の業務意味を濁さない。保持窓が SKEW=5分と小さくテーブルも小さい）。
+  schema: `signature_nonce(nonce TEXT PK, key_id TEXT, caller TEXT, seen_at ts, expires_at ts)`＋
+  `ix_signature_nonce_expires_at`。INSERT の UNIQUE(nonce) 衝突＝replay→409。**RV-04a で実装済み**
+  （migration `b7d3e1a9c2f4`・`hub/service_auth.py::consume_nonce`。process-memory 実装は禁止＝
+  再起動/多インスタンスで replay をすり抜けさせない。DB 到達不能は fail-closed）。
+  期限切れ（`expires_at < now`）行は検証時 lazy 削除する。
 
 ### 2.5 key registry モデル（BLOCKER: 鍵管理の構造化）
 key_id 単位で以下を持つ（保管先は env or 将来の secret manager・§7）:
@@ -151,11 +152,9 @@ status        : active / retiring / revoked
   (2) GAS を新 key_id に切替 → (3) 旧 key_id を `retiring`（受理はするが警告ログ）→
   (4) 一定期間後 `revoked`（受理停止）。**key_id は失効後も再利用しない**（過去署名の
   取り違え防止）。rollback は「新 key_id を revoked にし旧を active に戻す」で対応。
-- **status / 時刻に対する (status, reason) の期待値は §6.2 を単一の契約とする**（本節に
-  reason を二重定義しない＝期待値の分岐を防ぐ）。要点のみ: unknown=`key_unknown` /
-  revoked=`key_revoked` / not_before 前=`key_not_yet_valid` / expired=`key_expired`（各 401）、
-  `retiring`=受理 + **warning ログ 1 回**（key_id・caller_id のみ可視・secret/署名/nonce/body
-  非混入）。詳細と網羅表は §6.2 を参照。
+- **status / 時刻に対する (status, reason) の期待値・retiring の warning ログ要件は §6.2 を
+  単一の契約とする**（L01: 本節には reason を一切再掲しない＝期待値の分岐を根絶）。
+  → 網羅表・reason code・warning の可視/非混入ルールはすべて **§6.2 を参照**。
 
 ## 3. kintone webhook群（3本）: 代替設計（採用条件つき）
 
@@ -262,7 +261,16 @@ PoC で実証済みの項目に加え、本体実装は下記を**全数**テス
 > GAS 相当 httpx multipart(e)／raw body 取得／body()×form() 共存／H01 path 拘束（foreign=403・
 > 別実 path=bad_sig・raw_path %2F/%2e/%252F/// 拒否・raw_path 欠落 fail-closed・normalize 単体）／
 > H02 lifecycle 5 系／M01 retiring warning（1 回・機微ゼロ）／§6.1・§6.2 status–reason table。
-> 本体実装は上記 6.3 の残り（downgrade・cross-language golden・GAS 実機 等）を本番経路で全数化する。
+>
+> **本番モジュール化済み（RV-04a・`hub/service_auth.py` + `test_service_auth.py`・17 tests）**:
+> 検証器を本番移植（raw_path 基準・§6.2 reason contract・retiring warning）／key registry の env
+> パース + 起動時検証／**nonce を DB（`signature_nonce`・migration `b7d3e1a9c2f4`）で一回性担保**
+> （再接続跨ぎ replay=409・memory fallback 不在をソース検査）／canonical **golden 5本を JSON
+> fixture 固定**（`docs/design-drafts/rv04_hmac_golden_vectors.v1.json`・cross-language 照合材料）／
+> caller 不一致・version 欠落/不正・timestamp 形式不正・skew ±300 境界・required header 欠落・
+> boundary 衝突/filename quote/CRLF・status-reason table。migration up/down 往復は
+> `test_db_foundation.py` で実証。**未結線**（RV-04b で ingest 群へ結線）。
+> 6.3 の残り（**downgrade 禁止＝query token 併記**は RV-04b 結線の必須テスト・GAS 実機）を次段で回収。
 
 ## 7. 論点・OPEN・BLOCKED
 - 【OPEN・owner=大野/司令塔】nonce ストア（案A/B）・kintone webhook 代替（K1/K2/K3）。
