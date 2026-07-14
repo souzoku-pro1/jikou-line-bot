@@ -67,15 +67,15 @@ async def record_line_event(*, webhook_event_id: str, user_id: str,
     if not webhook_event_id:
         raise ValueError("webhook_event_id is empty")
     dedup = line_dedup_key(webhook_event_id)
-    row = InboundEvent(
-        provider="line", external_event_id=webhook_event_id, caller_id=user_id,
-        dedup_key=dedup, payload_hash=payload_sha256(payload),
-        event_type=event_type, signature_result=signature_result,
-        state="received")
+    # H-05: received_at は DB clock（now()）。既存 InboundEvent モデルの app-clock default を
+    # 使わず Core insert で SQL 側 now() を明示（Stripe 経路の default は不変）。
     try:
         async with session_scope() as s:
-            s.add(row)
-            await s.flush()
+            await s.execute(sa.insert(InboundEvent.__table__).values(
+                provider="line", external_event_id=webhook_event_id, caller_id=user_id,
+                dedup_key=dedup, payload_hash=payload_sha256(payload),
+                event_type=event_type, signature_result=signature_result,
+                state="received", received_at=sa.func.now(), attempts=1))
         count("A", "received", webhook_event_id)
         return "new"
     except IntegrityError:

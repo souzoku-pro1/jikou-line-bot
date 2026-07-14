@@ -130,6 +130,13 @@ def _split_enabled() -> bool:
     return os.environ.get("SORTATION_SPLIT_ENABLED") == "1"
 
 
+def _durable_enabled() -> bool:
+    """RV-05-13 flag（既定 OFF）。M-06: flag OFF 時は hub.durable_inbound を import しない
+    よう、env を直読みする（durable_enabled() の実体は durable_inbound と同一判定）。"""
+    return os.environ.get("INBOUND_EVENT_DURABLE_ENABLED", "").strip().lower() \
+        in ("1", "true", "on", "yes")
+
+
 async def _try_split_analysis(pdf_bytes: bytes, vision_key: str,
                               file_name: str) -> tuple[str | None, dict | None]:
     """D1-2: ページ別 OCR → 区間判定。失敗・分割不能は (結合テキスト or None, None)
@@ -312,10 +319,11 @@ def _ask_recipient() -> str:
 
 async def _log_ask(file_name: str, drive_file_id: str, drive_file_url: str,
                    doc_type: str, confidence: float, reason: str,
-                   top: list[Candidate]) -> str | None:
+                   top: list[Candidate], raise_on_error: bool = False) -> str | None:
     """ask 判定を仕分けログ（App 38）に登録し、レコード URL を返す。
     env 未設定は登録スキップ（None）＝従来どおり LINE 通知のみの縮退。
-    登録失敗も None（照会通知を壊さない）"""
+    登録失敗は raise_on_error=False（flag OFF）で None（縮退）・True（durable・H-04）で再送出
+    （呼び出し側が PENDING_RETRY→5xx を成立させる）。"""
     if not (APP_SORTATION_LOG.app_id() and APP_SORTATION_LOG.token()):
         logger.info("[SORTATION] 仕分けログ登録スキップ"
                     "（APP_SORTATION_LOG / TOKEN_SORTATION_LOG 未設定）")
@@ -332,6 +340,8 @@ async def _log_ask(file_name: str, drive_file_id: str, drive_file_url: str,
             "状態": "照会中",
         })
     except Exception as e:
+        if raise_on_error:
+            raise   # H-04: durable では握らず送出（ask 保存失敗→PENDING_RETRY→5xx）
         logger.info("[SORTATION] 仕分けログ登録に失敗（照会通知は継続）: %s %s",
                     type(e).__name__,
                     emit(e, "vendor_raw", "log", "operator"))
@@ -342,9 +352,10 @@ async def _log_ask(file_name: str, drive_file_id: str, drive_file_url: str,
 
 async def _notify_ask(file_name: str, drive_file_url: str, doc_type: str,
                       confidence: float, reason: str,
-                      top: list[Candidate], log_url: str | None = None) -> None:
-    """照会通知（T3）。業務指示Botチャネル名義で送る。
-    宛先未解決・送信失敗は縮退（応答を壊さない）"""
+                      top: list[Candidate], log_url: str | None = None,
+                      raise_on_error: bool = False) -> None:
+    """照会通知（T3）。業務指示Botチャネル名義で送る。宛先未解決はスキップ（縮退）。
+    送信失敗は raise_on_error=False（flag OFF）で縮退・True（durable・H-04）で再送出。"""
     attorney_id = _ask_recipient()
     if not attorney_id:
         logger.info("[SORTATION] 照会通知スキップ（SORTATION_ASK_TO / "
@@ -369,6 +380,8 @@ async def _notify_ask(file_name: str, drive_file_url: str, doc_type: str,
         await push_line_message(attorney_id, "\n".join(lines),
                                 token_env="DISPATCHBOT_CHANNEL_ACCESS_TOKEN")
     except Exception as e:
+        if raise_on_error:
+            raise   # H-04: durable では握らず送出
         logger.info("[SORTATION] 照会通知に失敗（応答は継続）: %s %s",
                     type(e).__name__,
                     emit(e, "vendor_raw", "log", "operator"))
@@ -404,10 +417,8 @@ async def sortation_ingest(_auth: None = Depends(ingest_guard("SORTATION_INGEST_
     # RV-05-13: flag ON は durable 台帳（ingestion_receipt）で冪等/可視化/fencing。
     # flag OFF は現行 process-memory（byte 同一）。台帳はレスポンス shape を変えない
     # （kintone upsert 冪等で再処理安全・shadow）。forward だけ claim で排他（二重forward回避）。
-    from hub.durable_inbound import durable_enabled
-    _receipt = None          # (receipt_id, epoch) or None
-    _can_forward = True      # flag ON で claim できた request のみ True（fencing）
-    if durable_enabled():
+    _receipt = None          # (receipt_id, epoch) or None（flag ON で claim 成功時のみ）
+    if _durable_enabled():
         from hub import ingestion_receipt as _ir
         _sha = hashlib.sha256(pdf_bytes).hexdigest()
         try:
@@ -425,9 +436,13 @@ async def sortation_ingest(_auth: None = Depends(ingest_guard("SORTATION_INGEST_
             raise HTTPException(status_code=503, detail="event store unavailable")
         _epoch = await _ir.claim(_rid)
         if _epoch is None:
-            _can_forward = False   # 並行/重複: 二重 forward を避ける（応答は返す）
-        else:
-            _receipt = (_rid, _epoch)
+            # H-02: claim 不可（並行/重複/terminal）→ **同期処理全体を skip**（§H-06）。
+            # OCR/Claude/ask 登録/LINE 通知/forward を一切実行しない。
+            _st = await _ir.get_state(_rid)
+            if _st in (_ir.ST_COMPLETED, _ir.ST_FAILED, _ir.ST_UNKNOWN):
+                return {"action": "skip", "status": _st}   # 200 skip（冪等・§H-06）
+            raise HTTPException(status_code=409, detail="in progress")  # 別 request 実行中
+        _receipt = (_rid, _epoch)
     elif fid:
         if fid in _seen_drive_file_ids:
             logger.info("[SORTATION] duplicate drive_file_id=%s（再判定して同一契約で応答）",
@@ -448,8 +463,10 @@ async def sortation_ingest(_auth: None = Depends(ingest_guard("SORTATION_INGEST_
     if _receipt is not None:
         from hub import ingestion_receipt as _ir
         _ep = await _ir.mark_phase(_receipt[0], _receipt[1], _ir.ST_VENDOR_PRE)
-        if _ep is not None:
-            _receipt = (_receipt[0], _ep)
+        if _ep is None:
+            # H-01: fence 喪失（reconciliation で再claim された）→ 外部作用へ進まず中断・200 も返さない
+            raise HTTPException(status_code=409, detail="fence lost (re-claimed)")
+        _receipt = (_receipt[0], _ep)
 
     # OCR → 候補注入 → Claude 判定。失敗はすべて ask の安全側縮退（doc_type=不明）
     # （複数区間でも顧客判定は親PDF全体で1回・裁定）
@@ -512,15 +529,19 @@ async def sortation_ingest(_auth: None = Depends(ingest_guard("SORTATION_INGEST_
         if _receipt is not None:
             from hub import ingestion_receipt as _ir
             _ep = await _ir.mark_phase(_receipt[0], _receipt[1], _ir.ST_SENDING)
-            if _ep is not None:
-                _receipt = (_receipt[0], _ep)
+            if _ep is None:
+                raise HTTPException(status_code=409, detail="fence lost (re-claimed)")  # H-01
+            _receipt = (_receipt[0], _ep)
 
         if action == "ask":
             top = _top_candidates(candidates, ocr_text, customer)
+            # H-04: durable（flag ON）では ask 保存/通知の失敗を握らず送出させ、
+            # 下の except で PENDING_RETRY→5xx を成立させる（RV-13）。flag OFF は従来の縮退。
+            _raise = _receipt is not None
             log_url = await _log_ask(file_name, fid, url, doc_type, confidence,
-                                     reason, top)
+                                     reason, top, raise_on_error=_raise)
             await _notify_ask(file_name, url, doc_type, confidence, reason, top,
-                              log_url)
+                              log_url, raise_on_error=_raise)
 
         # D1-2: 混在時の suggested_filename は「氏名_主種別ほかN件_日付」
         filename_doc = f"{doc_type}ほか{len(segments) - 1}件" if segments else doc_type
@@ -533,9 +554,8 @@ async def sortation_ingest(_auth: None = Depends(ingest_guard("SORTATION_INGEST_
                 f"{customer.customer_name}_{filename_doc}_{_today_jst()}.pdf"
                 if customer else None,
         }
-        # S5-3 T1/D1-2: auto（顧客確定）のみ読解ラインへ回送（既存キーは不変・追加キー
-        # のみ＝GAS 無変更）。RV-05-13: flag ON の並行/重複（claim 不可）は二重 forward 回避で回送しない。
-        if action == "auto" and _forward_enabled() and _can_forward:
+        # S5-3 T1/D1-2: auto（顧客確定）のみ読解ラインへ回送（既存キーは不変・GAS 無変更）。
+        if action == "auto" and _forward_enabled():
             if segments:
                 parent_fid = fid or f"sha256:{hashlib.sha256(pdf_bytes).hexdigest()}"
                 forwarded_list = await _forward_fragments(
@@ -547,7 +567,10 @@ async def sortation_ingest(_auth: None = Depends(ingest_guard("SORTATION_INGEST_
                                                    file_name, fid, customer)
                 if forwarded is not None:
                     response["forwarded"] = forwarded
+    except HTTPException:
+        raise   # fence 喪失(409)等は PENDING_RETRY にしない・そのまま
     except Exception:
+        # H-04: downstream（ask 保存/通知/forward）の失敗 → PENDING_RETRY→5xx（GAS 再送）
         if _receipt is not None:
             from hub import ingestion_receipt as _ir
             try:
@@ -558,7 +581,10 @@ async def sortation_ingest(_auth: None = Depends(ingest_guard("SORTATION_INGEST_
 
     if _receipt is not None:
         from hub import ingestion_receipt as _ir
-        await _ir.mark_terminal(_receipt[0], _receipt[1], _ir.ST_COMPLETED,
-                                downstream_refs=(response.get("customer") or {}).get("record_id")
-                                if isinstance(response.get("customer"), dict) else None)
+        _refs = (response.get("customer") or {}).get("record_id") \
+            if isinstance(response.get("customer"), dict) else None
+        if not await _ir.mark_terminal(_receipt[0], _receipt[1], _ir.ST_COMPLETED,
+                                       downstream_refs=_refs):
+            # H-01: terminal fence 喪失（処理中に再claim された）→ 200 を返さない
+            raise HTTPException(status_code=409, detail="fence lost at commit")
     return response

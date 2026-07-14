@@ -75,9 +75,9 @@ async def _on_startup():
     register_return_deadline_job()
     start_healthcheck_scheduler()
     # RV-05-13: flag ON のみ、放置 receipt の可視化 reconciliation を1回実行（再処理しない）。
-    # flag OFF は一切登録/実行しない（M-01: startup hook 非接触）。
-    from hub.durable_inbound import durable_enabled
-    if durable_enabled():
+    # M-06: flag OFF は hub.durable_inbound を import せず（env 直読み）一切実行しない。
+    if os.environ.get("INBOUND_EVENT_DURABLE_ENABLED", "").strip().lower() \
+            in ("1", "true", "on", "yes"):
         try:
             from hub.durable_inbound import reconcile_stale_seconds
             from hub.ingestion_receipt import reconcile_stale
@@ -550,9 +550,9 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
     data = json.loads(body)
 
     # RV-05-13: flag ON なら durable 記録（受理→200→既存 BackgroundTasks で処理）。
-    # flag OFF は現行挙動と byte 同一（durable コードに入らない）。
-    from hub.durable_inbound import durable_enabled
-    _durable = durable_enabled()
+    # M-06: flag OFF は hub.durable_inbound を import せず（env 直読み）現行挙動と byte 同一。
+    _durable = os.environ.get("INBOUND_EVENT_DURABLE_ENABLED", "").strip().lower() \
+        in ("1", "true", "on", "yes")
 
     for event in data.get("events", []):
         if event.get("type") != "message":
@@ -572,11 +572,14 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
                 ).hexdigest()[:32])
             try:
                 # durable commit 前に 200 を返さない（G3）。DB 停止は 5xx（memory fallback 禁止）。
-                await record_line_event(
+                outcome = await record_line_event(
                     webhook_event_id=webhook_event_id, user_id=user_id,
                     signature_result="verified", payload=body, event_type="message")
             except Exception:
                 raise HTTPException(status_code=503, detail="event store unavailable")
+            if outcome == "duplicate":
+                # H-03: 重複配送は既に処理済み → 二重返信を遮断（BackgroundTasks 登録しない）
+                continue
             background_tasks.add_task(_process_line_event_durable,
                                      reply_token, user_id, user_text, webhook_event_id)
         else:
