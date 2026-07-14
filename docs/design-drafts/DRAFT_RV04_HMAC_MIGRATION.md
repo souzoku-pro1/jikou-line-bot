@@ -291,7 +291,7 @@ PoC で実証済みの項目に加え、本体実装は下記を**全数**テス
 >   fallback しない＝downgrade 防止）／署名ヘッダ皆無は旧 query token（Phase A 併存）。
 > - **downgrade 禁止（§6.3）実証**: ①有効 token 併記でも不正署名は拒否 ②署名失敗が token へ
 >   fallback しない ③3系（署名OK=通過 / token OK=通過 / 両方無=拒否）。検証力の実測は
->   `docs/work-logs/rv04b_downgrade_detection_evidence.py`（naive fallback 実装なら同テストが FAIL）。
+>   `docs/work-logs/2026-07-14_RV-04b_downgrade-evidence.md`（naive fallback 実装なら同テストが FAIL・実出力全文つき）。
 > - 署名経路の判定は emit 契約でログ（key_id/caller/reason のみ・secret/署名値/顧客情報なし）。
 >   拒否レスポンス body は固定文字列（reason 素通しなし）。migration は不要（RV-04a の nonce 表を使用）。
 > - 未回収（次段）: 旧 token 停止（Phase C）・GAS caller 側の署名付与＋[人]実機・legacy /scan・/ocr。
