@@ -14,6 +14,7 @@
 
 import ast
 import os
+import shutil
 import subprocess
 import sys
 import unittest
@@ -213,6 +214,41 @@ class TestAlembicScaffold(unittest.TestCase):
         self.assertEqual(proc.returncode, 0,
                          f"stderr={proc.stderr[-500:]}")
         self.assertIn("alembic_version", proc.stdout + proc.stderr)
+
+    def test_signature_nonce_migration_round_trip(self):
+        """RV-04a: signature_nonce migration が空 DB で up→down 往復できること。
+        online モードで実 sqlite ファイルに適用し、テーブルの生成/削除を検証する
+        （alembic 起動が許可された本ファイルに置く・D2）。"""
+        import sqlite3
+        import tempfile
+        d = tempfile.mkdtemp(prefix="sig_nonce_mig_")
+        dbfile = f"{d}/mig.db"
+        env = {**os.environ, "DATABASE_URL": f"sqlite:///{dbfile}",
+               "PYTHONIOENCODING": "utf-8"}
+
+        def alembic(*args):
+            return subprocess.run(
+                [sys.executable, "-m", "alembic", *args],
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                cwd=REPO, env=env, timeout=120)
+
+        def tables():
+            con = sqlite3.connect(dbfile)
+            try:
+                return {r[0] for r in con.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'")}
+            finally:
+                con.close()
+
+        try:
+            up = alembic("upgrade", "head")
+            self.assertEqual(up.returncode, 0, f"stderr={up.stderr[-500:]}")
+            self.assertIn("signature_nonce", tables())
+            down = alembic("downgrade", "3e59f8270aa8")
+            self.assertEqual(down.returncode, 0, f"stderr={down.stderr[-500:]}")
+            self.assertNotIn("signature_nonce", tables())
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
 
     def test_ini_has_no_url(self):
         """接続URLを ini に書かない（secret を ini に置かない・D4）"""
