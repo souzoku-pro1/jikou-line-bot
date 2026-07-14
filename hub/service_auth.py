@@ -29,10 +29,13 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 import sqlalchemy as sa
+from fastapi import HTTPException, Request       # RV-04b 結線層で使用
+from fastapi.routing import APIRoute             # RV-04b BodyCachingRoute
 from sqlalchemy.exc import IntegrityError
 
 from hub.db import session_scope
 from hub.redact import emit  # RV-10: sink 出力は emit 契約経由（1形式）
+from hub.webhook_auth import verify_token  # RV-04b: dual-accept の旧 token 経路
 
 logger = logging.getLogger("hub.service_auth")
 
@@ -41,6 +44,9 @@ _VALID_STATUS = frozenset({"active", "retiring", "revoked"})
 _DEFAULT_SKEW = 300
 _REGISTRY_ENV = "SERVICE_HMAC_KEY_REGISTRY"
 _SKEW_ENV = "SIG_MAX_SKEW_SEC"
+# RV-04b dual-accept feature flag（既定 OFF＝完全に旧挙動。ON で署名経路併存）
+_DUAL_ACCEPT_ENV = "SERVICE_AUTH_DUAL_ACCEPT_ENABLED"
+_FLAG_TRUE = frozenset({"1", "true", "on", "yes"})
 
 # §2.2: 署名経路で必須の 7 ヘッダ。欠落は第1段で missing_header（bad_sig 任せにしない）。
 _REQUIRED_HEADERS = ("X-Sig-Version", "X-Sig-Key-Id", "X-Sig-Caller",
@@ -345,3 +351,83 @@ async def verify_request(headers, raw_body: bytes, method: str, raw_path, *,
                        emit(ctx.key_id, "record_id", "log", "operator"),
                        emit(ctx.caller, "record_id", "log", "operator"))
     return 200, reason
+
+
+# ── RV-04b: ingest 群への dual-accept 結線（薄い追加・verify_* 純関数は不変） ──
+# ここから下は「結線用の薄い追加」。canonical/verify_signature/verify_request は変更しない。
+
+def dual_accept_enabled() -> bool:
+    """RV-04b feature flag。既定 OFF（未設定/0）＝完全に旧 query token 挙動。"""
+    return os.environ.get(_DUAL_ACCEPT_ENV, "").strip().lower() in _FLAG_TRUE
+
+
+def _has_signature_headers(headers) -> bool:
+    return any(k.lower().startswith("x-sig-") for k in headers)
+
+
+def _log_ingest_decision(headers, reason: str) -> None:
+    """署名経路の判定結果を emit 契約でログ（key_id/caller_id/reason のみ可視・
+    secret/署名値/顧客情報は出さない）。reason は固定コード（record_id 値域で素通し）。"""
+    logger.info("service-auth ingest decision key_id=%s caller=%s reason=%s",
+                emit(headers.get("X-Sig-Key-Id", ""), "record_id", "log", "operator"),
+                emit(headers.get("X-Sig-Caller", ""), "record_id", "log", "operator"),
+                emit(reason, "record_id", "log", "operator"))
+
+
+class BodyCachingRoute(APIRoute):
+    """flag ON かつ署名ヘッダ在時のみ、form parse 前に生 body を読み込みキャッシュする
+    ルート。これにより署名検証（content_sha256）と後続の UploadFile/Form 受理が同一 body
+    で共存できる（Starlette の body キャッシュ）。**flag OFF/署名ヘッダ皆無時は完全な
+    passthrough**（生 body を読まない＝現行挙動と byte 同一）。適用は ingest 5 入口のみで、
+    顧客 Bot（/webhook 等）には一切適用しない。"""
+
+    def get_route_handler(self):
+        original = super().get_route_handler()
+
+        async def handler(request: Request):
+            if dual_accept_enabled() and _has_signature_headers(request.headers):
+                await request.body()   # form parse 前に _body をキャッシュ
+            return await original(request)
+
+        return handler
+
+
+async def authorize_ingest(request: Request, *, token: str, token_env: str) -> None:
+    """ingest 入口の dual-accept ゲート。受理なら None・拒否は HTTPException を送出。
+
+    - flag OFF: 旧 query token のみ（署名ヘッダは無視＝現行挙動と完全同一）。
+    - flag ON・署名ヘッダ在: **署名経路のみ**で判定（§2.3・token へ fallback しない
+      ＝downgrade 防止）。§6.1 の status/reason をそのまま返す。
+    - flag ON・署名ヘッダ皆無: 旧 query token（Phase A の併存）。
+    """
+    headers = request.headers
+    if not dual_accept_enabled():
+        if not verify_token(token, token_env):
+            raise HTTPException(status_code=404, detail="Not Found")
+        return
+    if _has_signature_headers(headers):
+        raw = await request.body()   # BodyCachingRoute がキャッシュ済み
+        registry = load_registry_from_env()
+        eff = effective_signed_path(request.scope)
+        status, reason = await verify_request(headers, raw, request.method, eff,
+                                              registry=registry)
+        _log_ingest_decision(headers, reason)
+        if status != 200:
+            # 署名経路の失敗は token へ落とさない（downgrade 防止）。
+            # status は §6.1 のとおり（401/403/400/409）。詳細 reason は上のログにのみ残し、
+            # レスポンス body には固定文字列のみ（reason 素通しで攻撃者に分岐情報を与えない）。
+            raise HTTPException(status_code=status, detail="signature verification rejected")
+        return
+    # 署名ヘッダ皆無 → 旧 query token（Phase A）
+    if not verify_token(token, token_env):
+        raise HTTPException(status_code=404, detail="Not Found")
+
+
+def ingest_guard(token_env: str):
+    """ingest エンドポイント用の依存を生成する（token_env ごと）。
+    使い方: `_auth: None = Depends(ingest_guard("KOSEKI_INGEST_TOKEN"))`。"""
+
+    async def _guard(request: Request, token: str = "") -> None:
+        await authorize_ingest(request, token=token, token_env=token_env)
+
+    return _guard

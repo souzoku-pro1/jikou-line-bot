@@ -58,9 +58,10 @@
     "sortation_ingest.py:234:sink:logger",
     "sortation_ingest.py:335:sink:logger",
     "sortation_ingest.py:372:sink:logger",
-    "sortation_ingest.py:434:sink:logger",
+    "sortation_ingest.py:432:sink:logger",
     "units/souzoku/zaisan_sync.py:92:sink:logger",
     "valuation_ingest.py:142:sink:logger",
+    "hub/service_auth.py:419:sink:httpexception",
     "valuation_ingest.py:275:sink:httpexception",
     "valuation_ingest.py:280:sink:httpexception"
   ],
@@ -92,6 +93,7 @@
     "review_resolve.py:sink:logger": "P1-107b print→logger 転換・type(e).__name__ 可視の受容債務（fix2 裁定・本文はemit抑止）",
     "sortation_ingest.py:sink:logger": "P1-107b print→logger 転換・type(e).__name__ 可視の受容債務（fix2 裁定・本文はemit抑止）",
     "units/souzoku/zaisan_sync.py:sink:logger": "P1-107b print→logger 転換・type(e).__name__ 可視の受容債務（fix2 裁定・本文はemit抑止）",
+    "hub/service_auth.py:sink:httpexception": "RV-04b dual-accept ゲートの署名経路拒否。status は §6.1（401/403/400/409）・detail は固定文字列で reason 素通しなし（分岐情報を攻撃者に与えない）。機微値は出さない",
     "valuation_ingest.py:sink:httpexception": "RV-10 移行前の ingest ルータ httpexception debt（別PRで回収）",
     "valuation_ingest.py:sink:logger": "P1-107b print→logger 転換・type(e).__name__ 可視の受容債務（fix2 裁定・本文はemit抑止）"
   },

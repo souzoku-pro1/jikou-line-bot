@@ -33,16 +33,16 @@ import os
 from datetime import datetime, timedelta, timezone
 
 import anthropic
-from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 
 from claude_gateway import create_message_with_fallback
 from customer_directory import Candidate, list_candidates
 from hub import kintone
 from hub.notify import push_line_message
 from hub.redact import emit
-from hub.webhook_auth import verify_token
+from hub.service_auth import BodyCachingRoute, ingest_guard  # RV-04b dual-accept 結線
 
-router = APIRouter()
+router = APIRouter(route_class=BodyCachingRoute)
 
 logger = logging.getLogger("sortation_ingest")
 
@@ -380,16 +380,14 @@ def _customer_payload(c: Candidate) -> dict:
 
 
 @router.post("/sortation/ingest")
-async def sortation_ingest(token: str = "",
+async def sortation_ingest(_auth: None = Depends(ingest_guard("SORTATION_INGEST_TOKEN")),
                            # file は意図的に optional: File(...) だと探信に 422 が
                            # 返り 404 偽装より先に存在が漏れる（koseki_ingest と同じ）
                            file: UploadFile | None = File(default=None),
                            drive_file_id: str | None = Form(default=None),
                            drive_file_url: str | None = Form(default=None)):
-    """未整理フォルダの PDF を受領し、仕分け判定を返す（auto=GAS が移動 / ask=照会通知済み）"""
-    if not verify_token(token, "SORTATION_INGEST_TOKEN"):
-        raise HTTPException(status_code=404, detail="Not Found")
-
+    """未整理フォルダの PDF を受領し、仕分け判定を返す（auto=GAS が移動 / ask=照会通知済み）。
+    認証は前段の ingest_guard（RV-04b dual-accept）が担う。"""
     vision_key = os.environ.get("GOOGLE_VISION_API_KEY", "")
     if not vision_key:
         raise HTTPException(status_code=500,
