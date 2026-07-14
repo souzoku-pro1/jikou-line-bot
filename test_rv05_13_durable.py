@@ -59,6 +59,16 @@ def _line_body(text="こんにちは", event_id="wev-1", user="Uabc"):
     return body, sig
 
 
+def _line_body_multi(events, user="Uabc"):
+    """events: [(event_id, text), ...] を1バッチに束ねた webhook body＋署名。"""
+    body = json.dumps({"events": [{
+        "type": "message", "webhookEventId": eid,
+        "replyToken": "rt-" + eid, "source": {"userId": user},
+        "message": {"type": "text", "text": txt}} for eid, txt in events]}).encode()
+    sig = base64.b64encode(hmac.new(b"dummy_secret", body, hashlib.sha256).digest()).decode()
+    return body, sig
+
+
 class _DbMixin(unittest.TestCase):
     def setUp(self):
         self._dir = tempfile.mkdtemp(prefix="rv0513_")
@@ -125,6 +135,45 @@ class TestLineDurable(_DbMixin):
             _client.post("/webhook", content=body, headers={"X-Line-Signature": sig})
             _client.post("/webhook", content=body, headers={"X-Line-Signature": sig})
         self.assertEqual(proc.await_count, 1)   # 2回配送でも処理は1回だけ
+
+    def test_hnew01_partial_insert_failure_reattempts_once(self):
+        # H-NEW-01 ①: event A 成功＋event B insert 失敗→503→再配送で
+        # A が「一回だけ」処理される（永久滞留なし・二重返信なし）。
+        import hub.durable_inbound as _di
+        real_rle = _di.record_line_event
+        fail_b = {"on": True}
+
+        async def _rle_side(**kw):
+            if kw["webhook_event_id"] == "evB" and fail_b["on"]:
+                raise RuntimeError("event store down for B")   # 部分 insert 失敗
+            return await real_rle(**kw)
+
+        proc = AsyncMock(return_value=None)
+        body, sig = _line_body_multi([("evA", "msgA"), ("evB", "msgB")])
+        with patch.dict(os.environ, {_FLAG: "1"}), \
+             patch.object(main, "_process_line_event", new=proc), \
+             patch.object(_di, "record_line_event", new=_rle_side):
+            r1 = _client.post("/webhook", content=body, headers={"X-Line-Signature": sig})
+            self.assertGreaterEqual(r1.status_code, 500)   # B 失敗で 503（部分失敗）
+            fail_b["on"] = False
+            r2 = _client.post("/webhook", content=body, headers={"X-Line-Signature": sig})
+            self.assertEqual(r2.status_code, 200)          # 再配送は成功
+        a = [c for c in proc.call_args_list if c.args[2] == "msgA"]
+        b = [c for c in proc.call_args_list if c.args[2] == "msgB"]
+        self.assertEqual(len(a), 1)   # A: 滞留せず・二重返信もなく一回だけ処理
+        self.assertEqual(len(b), 1)   # B: 再配送で一回処理
+
+    def test_hnew01_terminal_duplicate_skips(self):
+        # H-NEW-01 ②: terminal（done）到達済みの重複配送は登録 skip（H-03 回帰維持）
+        body, sig = _line_body(event_id="evT", text="msgT")
+        proc = AsyncMock(return_value=None)
+        with patch.dict(os.environ, {_FLAG: "1"}), \
+             patch.object(main, "_process_line_event", new=proc):
+            _client.post("/webhook", content=body, headers={"X-Line-Signature": sig})  # →done
+            rows = self._inbound_rows()
+            self.assertEqual(rows[0][1], "done")           # 1回目で terminal
+            _client.post("/webhook", content=body, headers={"X-Line-Signature": sig})  # done→skip
+        self.assertEqual(proc.await_count, 1)              # terminal は再登録しない
 
     def test_flag_on_background_crash_marks_failed(self):
         # HOTFIX-01 型: 背景タスクが（内部 try の外で）crash → failed で可視化
@@ -209,6 +258,89 @@ class TestSortationDurable(_DbMixin):
                                data={"drive_file_id": "FA"})
         self.assertGreaterEqual(r.status_code, 500)          # 5xx（成功 ACK にしない）
         self.assertEqual(self._receipt_states(), [ir.ST_PENDING_RETRY])
+
+    def test_mnew02_fence_lost_vendor_pre_no_side_effects(self):
+        # M-NEW-02: mark_phase=None（vendor_pre で fence 喪失）→ OCR/ask/forward 非実行・非200
+        ocr = MagicMock(return_value="x")
+        log_ask = AsyncMock(return_value="url")
+        forward = AsyncMock(return_value=None)
+        with patch("sortation_ingest._ocr_pdf", new=ocr), \
+             patch("sortation_ingest.list_candidates", new=AsyncMock(return_value=[])), \
+             patch("sortation_ingest._judge_with_claude",
+                   new=AsyncMock(return_value={"doc_type": "その他", "confidence": 0.1, "reason": "r"})), \
+             patch("sortation_ingest._log_ask", new=log_ask), \
+             patch("sortation_ingest._forward_to_line", new=forward), \
+             patch("hub.ingestion_receipt.mark_phase", new=AsyncMock(return_value=None)), \
+             patch.dict(os.environ, {**_ENV, _FLAG: "1"}):
+            r = _client.post("/sortation/ingest?token=sort-token",
+                             files={"file": ("x.pdf", b"%PDF fence", "application/pdf")},
+                             data={"drive_file_id": "FV"})
+        self.assertEqual(r.status_code, 409)                 # 非200（中断）
+        ocr.assert_not_called()                              # OCR 非実行
+        log_ask.assert_not_called()                          # ask 非実行
+        forward.assert_not_called()                          # forward 非実行
+
+    def test_mnew02_fence_lost_terminal_non_200(self):
+        # M-NEW-02: mark_terminal=False（commit で fence 喪失）→ 非200（成功 ACK にしない）
+        with patch("sortation_ingest._ocr_pdf", new=MagicMock(return_value="x")), \
+             patch("sortation_ingest.list_candidates", new=AsyncMock(return_value=[])), \
+             patch("sortation_ingest._judge_with_claude",
+                   new=AsyncMock(return_value={"doc_type": "その他", "confidence": 0.1, "reason": "r"})), \
+             patch("sortation_ingest._log_ask", new=AsyncMock(return_value="url")), \
+             patch("sortation_ingest._notify_ask", new=AsyncMock(return_value=None)), \
+             patch("hub.ingestion_receipt.mark_terminal", new=AsyncMock(return_value=False)), \
+             patch.dict(os.environ, {**_ENV, _FLAG: "1"}):
+            r = _client.post("/sortation/ingest?token=sort-token",
+                             files={"file": ("x.pdf", b"%PDF term", "application/pdf")},
+                             data={"drive_file_id": "FT"})
+        self.assertEqual(r.status_code, 409)                 # 成功 ACK にしない
+        self.assertNotIn(ir.ST_COMPLETED, self._receipt_states())
+
+    def test_mnew03_claim_unavailable_response_contract(self):
+        # M-NEW-03: claim 不可→state 別応答が §H-06 状態表内に収まる契約テスト
+        async def _set_state(rid, st):
+            async with db.session_scope() as s:
+                await s.execute(sa.update(ir.ingestion_receipt)
+                                .where(ir.ingestion_receipt.c.id == rid)
+                                .values(last_outcome=st))
+        # (state, expected_status, expect_action_skip, claim_succeeds)
+        cases = [
+            (ir.ST_PROCESSING, 409, False, False),          # 別 request 実行中 → 409
+            (ir.ST_VENDOR_PRE, 409, False, False),
+            (ir.ST_SENDING, 409, False, False),
+            (ir.ST_DUPLICATE_SUSPECT, 409, False, False),
+            (ir.ST_COMPLETED, 200, True, False),            # terminal → 200 skip
+            (ir.ST_FAILED, 200, True, False),
+            (ir.ST_UNKNOWN, 200, True, False),
+            (ir.ST_PENDING_RETRY, 200, False, True),        # claim 可 → 再処理（状態表内）
+        ]
+        for i, (st, code, skip, claimed) in enumerate(cases):
+            with self.subTest(state=st):
+                fid = f"FC{i}"
+                pdf = f"%PDF contract {i}".encode()
+
+                async def _pre():
+                    rid = await ir.upsert_receipt(
+                        ingest_type="sortation", caller_id="gas", source_file_id=fid,
+                        source_sha256=hashlib.sha256(pdf).hexdigest(), case_hint=None)
+                    await _set_state(rid, st)
+                _run(_pre()); db.reset_for_tests()
+                ocr = MagicMock(return_value="x")
+                with patch("sortation_ingest._ocr_pdf", new=ocr), \
+                     patch("sortation_ingest.list_candidates", new=AsyncMock(return_value=[])), \
+                     patch("sortation_ingest._judge_with_claude",
+                           new=AsyncMock(return_value={"doc_type": "その他", "confidence": 0.1, "reason": "r"})), \
+                     patch("sortation_ingest._log_ask", new=AsyncMock(return_value="url")), \
+                     patch("sortation_ingest._notify_ask", new=AsyncMock(return_value=None)), \
+                     patch.dict(os.environ, {**_ENV, _FLAG: "1"}):
+                    r = _client.post("/sortation/ingest?token=sort-token",
+                                     files={"file": (f"{fid}.pdf", pdf, "application/pdf")},
+                                     data={"drive_file_id": fid})
+                self.assertEqual(r.status_code, code, f"{st}: {r.text}")
+                if skip:
+                    self.assertEqual(r.json().get("action"), "skip")
+                if not claimed:
+                    ocr.assert_not_called()                  # claim 不可→外部作用に入らない
 
 
 # ── M-01: flag OFF 機械的担保（durable 呼出は flag 判定の内側のみ） ──────────
