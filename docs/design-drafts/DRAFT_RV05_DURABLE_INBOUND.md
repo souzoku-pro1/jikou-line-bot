@@ -122,6 +122,8 @@ UPDATE inbound_event
 ### 3.1 LINE webhook（Phase A=記録+観測）
 `署名検証→events[] を 1 event=1 InboundEvent durable insert→200→consumer 処理（自動 replay なし）`。冪等要素 NULL/空→5xx・DB 停止→5xx。
 
+**transaction 契約（M-03）**: **1 event = 1 insert・event ごとに独立 transaction**でコミットする（1 webhook 内の複数 event を1トランザクションに束ねない）。**一部 event の insert が失敗しても成功済み event 行はロールバックせず残し、webhook 全体は 5xx を返す**。LINE が再配送すると、既に insert 済みの event は `UNIQUE(dedup_key)` で冪等 skip され、未 insert の event だけが改めて記録される（成功分の二重処理も、失敗分の喪失も起こさない）。
+
 ### 3.2 sortation（完全 durable・GAS 再送主体）
 `_seen_drive_file_ids`→IngestionReceipt 冪等。**vendor 呼出前 `phase=vendor_pre`・呼出中 `phase=SENDING` を durable marker**。crash 復帰は vendor_pre まで再実行可・SENDING は **UNKNOWN（自動再送せず人手）**。ask 保存失敗→`PENDING_RETRY`（成功 ACK にしない）→GAS 5xx 再送。
 
@@ -161,22 +163,24 @@ GAS は 5xx で再送する。同一 idempotency_key の再投入が既存 recei
 | 再送主体 | **Stripe**（指数バックオフ最大3日）。stale 再claim の起動主体も Stripe 再配送 |
 | startup 自動 replay | なし（回収の起動主体＝Stripe 再配送・既存設計 D14/D15 不変） |
 
-**LINE（Bot・Phase A）**: `received→processing→{completed / failed / reply_fail / no_reply_intended}`／`SENDING→UNKNOWN`。**自動 replay なし**。再送主体なし。
+**LINE（Bot・Phase A）**: `received→processing→{completed / failed / reply_fail / no_reply_intended}`。**SENDING/UNKNOWN は持たない**（M-04: 返信中 crash は `processing` のまま＝**stale processing 滞留**として §6 の最古滞留・収束率で観測する。SENDING/UNKNOWN 系は **sortation 専用**）。**自動 replay なし**・再送主体なし。
 
 **sortation**: `received→processing→{completed / PENDING_RETRY / failed}`／`vendor_pre→SENDING→UNKNOWN`／衝突時 `duplicate_suspect`。再送主体 **GAS（5xx）**。startup 再実行は vendor_pre まで。
 
 ### 5.2 H-02 wrapper 結果封筒（terminal 分類）
 処理 wrapper は必ず1つの terminal を返す（sink で握らない）: `completed` / `failed` / `reply_fail` / `no_reply_intended`。**「返信すべきだったのに沈黙（reply_fail/failed）」と「正常な無返信（no_reply_intended）」を分離**（HOTFIX-01 再発検知の要）。
+- **M-01 返信 fallback**: Reply API 失敗→Push API 成功（`_line_reply_with_fallback` 相当）は**メッセージが届いた＝`completed`**とし、別カウンタ **`reply_fallback_ok`** で可視化（reply 側劣化の兆候を捕捉）。**Reply/Push 双方失敗のみ `reply_fail`**。
 
 ## §6 観測性設計（H-01 全面改訂・H-07 alert 軸分離）
 
 全出力 emit 契約・PII/本文/payload 非混入・ログ集計でよい。
 
-### 6.1 §H-07 terminal 集合の統一
-- **terminal（完了）集合** = `{ completed, failed, no_reply_intended, skipped_duplicate }`（＝それ以上処理しない状態）。
-- **非terminal（要注意/中間）** = `{ received, processing, vendor_pre, SENDING, PENDING_RETRY }`。
-- **警戒（人手/alert）集合** = `{ reply_fail, UNKNOWN, duplicate_suspect }`（terminal ではないが放置不可）。
-- **収束率** = terminal 到達数 / received（低下＝処理停止兆候）。
+### 6.1 §H-07 terminal 集合の統一（M-04 二重分類反映）
+- **terminal（終端）集合** = `{ completed, failed, no_reply_intended, skipped_duplicate, `**`reply_fail`（LINE）**`, `**`UNKNOWN`（sortation）**` }`（＝それ以上**自動**処理しない終端）。
+  - **二重分類（M-04・H-07 整合）**: **`reply_fail`（LINE の返信終端・不達）と `UNKNOWN`（sortation の SENDING crash・人手確認待ちの終端）は terminal でありつつ軸B 警戒でもある**（終端到達だが放置不可＝人手 alert）。
+- **非terminal（中間/要処理）** = `{ received, processing, vendor_pre, SENDING, PENDING_RETRY }`。
+- **警戒（軸B・人手/alert）集合** = `{ reply_fail, UNKNOWN, duplicate_suspect }`（うち reply_fail/UNKNOWN は terminal と**二重分類**）。
+- **収束率** = **terminal 到達数（reply_fail・UNKNOWN を含む）/ received**（低下＝処理停止兆候）。分子は本 terminal 集合と一致させる。
 
 ### 6.2 §H-07 alert 軸の分離
 alert を混同しないよう軸を分ける:
@@ -200,30 +204,40 @@ alert を混同しないよう軸を分ける:
 - 段階導入: sortation→業務Bot→顧客Bot（観測のみ）。rollback=flag OFF。
 
 ## §8 テスト計画（M-03/L-01・naive FAIL 形）
-- **unit/contract**: ACK 順序・冪等 escape（要素内`:`/改行/空/NULL→5xx）・衝突（一致=skip / 不一致=duplicate_suspect）・状態機械（§5.1 provider 別）・封筒 terminal（§5.2 各）・fencing（stale の terminal UPDATE=0 行で abort）・atomic claim（pre-SELECT 方式が無いこと＝§7 AST）。
-- **negative（naive が FAIL する形）**: crash 回収（sortation・現行は event 消失を実証）／SENDING crash→UNKNOWN（二重forward なし）／顧客Bot Phase A crash→**滞留可視化（自動 replay しない）**／replay 一回／ask 保存失敗→PENDING_RETRY（現行は成功 response 飲み込みを実証）。
-- **Stripe 非破壊**: 既存 Stripe テスト（`test_inbound_event_stripe.py` 等）が **不変で通る**（§5.1 の Stripe 欄は現行実装のまま）。
-- **regression/flag OFF**: 全 suite（1,328+）維持・**顧客Bot handler smoke 必須**・flag OFF 完全同一。
-- **レイテンシ（M-03）**: durable insert=受理あたり **DB 書込呼出 1 回を固定アサート**（曖昧な ms 実測でなく呼出回数）＋webhook 応答は insert+200 のみ（consumer 非同期）。timeout は固定値。超過懸念で STOP。
-- **修正前 FAIL 実測**: 現行 event 消失を再現するスクリプトを **work-log(.md)に本文＋実出力全文**で固定（追跡 .py に print 禁止）。実測は実装票。
+
+### 8.1 unit / contract
+ACK 順序・冪等 escape（要素内`:`/改行/空/NULL→5xx）・衝突（一致=skip / 不一致=duplicate_suspect）・状態機械（§5.1 provider 別）・封筒 terminal（§5.2 各）・fencing（stale の terminal UPDATE=0 行で abort）・atomic claim（pre-SELECT 方式が無いこと＝§7 AST）・transaction 契約（§3.1: 1 event=1 insert・一部失敗で成功分残し全体 5xx）。
+
+### 8.2 negative（naive が FAIL する形）
+crash 回収（sortation・現行は event 消失を実証＝**§8.5** の修正前 FAIL 実測で固定）／SENDING crash→UNKNOWN（sortation・二重forward なし）／**顧客Bot Phase A crash→`processing` 滞留として可視化（自動 replay しない）**／replay 一回／ask 保存失敗→PENDING_RETRY（現行は成功 response 飲み込みを実証）。
+
+### 8.3 regression / flag OFF / Stripe 非破壊
+全 suite（1,328+）維持・**顧客Bot handler smoke 必須**・flag OFF 完全同一（§7 AST）。既存 Stripe テスト（`test_inbound_event_stripe.py` 等）が **不変で通る**（§5.1 の Stripe 欄は現行実装のまま・M-04 非破壊）。
+
+### 8.4 レイテンシ（M-03）
+durable insert = **1 event あたり DB 書込呼出 1 回を固定アサート**（曖昧な ms 実測でなく**呼出回数**）＋webhook 応答は insert+200 のみ（consumer は非同期）。timeout は固定値でアサート。LINE 応答要件超過の懸念が出たら STOP（設計持ち帰り）。
+
+### 8.5 修正前 FAIL 実測（現行が event 消失することの実証）
+現行（flag OFF・BackgroundTasks）で「200 を返した後に処理タスクが crash 相当で失われる」ことを再現するスクリプトを **work-log(.md) に本文＋実出力全文**で固定（追跡 .py に print 禁止・RV-04b 規律）。§8.2 の crash 回収テストはこの実証（§8.5）を naive baseline として参照する。実測は実装票で採取。
 
 ## §9 OPEN / K4 / 計上境界表（M-02）
 
 ### 9.1 M-02 計上境界表（各ケースの計上先を確定）
-| ケース | received | insert_fail | processing | completed | reply_fail | failed | no_reply_intended | dedup_skip | UNKNOWN | PENDING_RETRY | duplicate_suspect |
-|---|---|---|---|---|---|---|---|---|---|---|---|
-| 署名OK・insert 成功 | ✓ | | | | | | | | | | |
-| insert 失敗(DB停止)→5xx | | ✓ | | | | | | | | | |
-| consumer 処理開始 | | | ✓ | | | | | | | | |
-| 返信成功＋downstream 完了 | | | | ✓ | | | | | | | |
-| 返信API 不達 | | | | | ✓ | | | | | | |
-| handler 例外(上限超) | | | | | | ✓ | | | | | |
-| 返信不要 event | | | | | | | ✓ | | | | |
-| 重複配送(既存 completed・要素一致) | | | | | | | | ✓ | | | |
-| crash 中 SENDING→復帰 | | | | | | | | | ✓ | | |
-| ask 保存失敗(sortation) | | | | | | | | | | ✓ | |
-| 同一 file_id/sha・case_hint 不一致 | | | | | | | | | | | ✓ |
-（1 event は遷移各段で1回ずつ計上。dedup_skip は received に含めない＝二重計上しない。）
+| ケース | received | insert_fail | processing | completed | reply_fallback_ok | reply_fail | failed | no_reply_intended | dedup_skip | UNKNOWN | PENDING_RETRY | duplicate_suspect |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 署名OK・insert 成功 | ✓ | | | | | | | | | | | |
+| insert 失敗(DB停止)→5xx | | ✓ | | | | | | | | | | |
+| consumer 処理開始 | | | ✓ | | | | | | | | | |
+| Reply 成功＋downstream 完了 | | | | ✓ | | | | | | | | |
+| **Reply 失敗→Push 成功(fallback)** | | | | ✓ | ✓ | | | | | | | |
+| **Reply/Push 双方失敗** | | | | | | ✓ | | | | | | |
+| handler 例外(上限超) | | | | | | | ✓ | | | | | |
+| 返信不要 event | | | | | | | | ✓ | | | | |
+| 重複配送(既存 completed・要素一致) | | | | | | | | | ✓ | | | |
+| crash 中 SENDING→復帰(sortation) | | | | | | | | | | ✓ | | |
+| ask 保存失敗(sortation) | | | | | | | | | | | ✓ | |
+| 同一 file_id/sha・case_hint 不一致 | | | | | | | | | | | | ✓ |
+（M-01: **Reply 失敗→Push 成功は `completed`（メッセージは届いた）＋別カウンタ `reply_fallback_ok` で可視化**・**Reply/Push 双方失敗は `reply_fail`**。1 event は遷移各段で1回ずつ計上。dedup_skip は received に含めない＝二重計上しない。SENDING/UNKNOWN 行は sortation 専用〔M-04〕。）
 
 ### 9.2 OPEN / K4
 - **K4（[人]/大野・前提条件）**: LINE Developers の webhook 再配送設定確認。**顧客Bot 自動 replay 有効化票（RV-06 後）のブロッキング前提**。Phase A（観測のみ）は不要。§H-03 L3 の完全差分も K4 後。
@@ -246,8 +260,8 @@ alert を混同しないよう軸を分ける:
 | H-05 §5.3廃止・provider別分割・Stripe欄を実測修正 | §5・§5.1 |
 | H-06 GAS再送時 state別応答表（8状態×HTTP×claim可否） | §H-06 |
 | H-07 terminal集合統一＋alert軸分離 | §6.1・§6.2 |
-| M-01 flag OFF 機械的担保（最上段/hook非接触/AST） | §7 |
-| M-02 計上境界表 | §9.1 |
-| M-03 レイテンシ=呼出回数/timeout固定 | §8 |
-| M-04 Stripe 非破壊（既存テスト不変） | §8（Stripe 非破壊）・§5.1 |
-| L-01 用語/terminal 集合の一貫化・所見対応表 | §6.1・本表 |
+| M-01 flag OFF 機械的担保（§7）／**Reply失敗→Push成功=completed＋reply_fallback_ok・双方失敗=reply_fail** | §7・§5.2・§9.1 |
+| M-02 計上境界表（reply_fallback_ok 列追加） | §9.1 |
+| M-03 レイテンシ=**1 event あたり**呼出回数/timeout固定／**transaction 契約（event独立tx・一部失敗で成功分残し全体5xx）** | §8.4・§3.1 |
+| M-04 Stripe 非破壊／**LINE から SENDING/UNKNOWN 除去（返信中crash=stale processing滞留で観測）・LINE terminal に reply_fail・sortation terminal に UNKNOWN（二重分類）** | §5.1・§6.1・§8.3 |
+| L-01 用語/terminal 集合の一貫化・**§8 subsection 番号化（§8.2 crash→§8.5 修正前FAIL 参照修正）** | §6.1・§8.2・§8.5 |
