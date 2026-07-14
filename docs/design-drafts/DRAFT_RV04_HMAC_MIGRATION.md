@@ -201,13 +201,23 @@ status        : active / retiring / revoked
 
 | 契機 | 段 | status | reason | 備考 |
 |---|---|---|---|---|
+| 署名ヘッダ皆無 | 1 | 401 | `no_signature` | token fallback 禁止（downgrade 防止） |
+| **必須 7 ヘッダの欠落/空**（§2.2） | 1 | 401 | `missing_header` | H-02: 第1段で拒否（bad_sig 任せにしない） |
+| version 値違反（present だが≠v1） | 1 | 401 | `bad_version` | downgrade 防止 |
+| **nonce 形式違反**（128bit hex 以外） | 1 | 401 | `bad_nonce` | H-02: 長さ/文字集合を第1段で検査 |
 | method 非許可 | 4 | **403** | `method_denied` | registry の `allowed_methods` 外 |
 | **実 path が allowlist 外** | 4 | **403** | `path_denied` | 実 routing path が `allowed_paths` に無い。**署名検証に到達しない** |
 | path 正規化違反（%2F・`..`・`//`・非ASCII） | 4 | **400** | `bad_path` | §2.1 H02 |
 | **署名不一致（実 path で再計算）** | 7 | **401** | `bad_sig` | 実 path が allowlist 内でも、署名 path≠実 path なら 7 段で露見 |
 | content_sha256 不一致 | 6 | 401 | `body_mismatch` | body 改変 |
 | timestamp SKEW 超過 | 5 | 401 | `skew` | ±SKEW 境界 |
-| replay（nonce 再利用） | 8 | 409 | `replay` | |
+| replay（nonce 再利用） | 8 | 409 | `replay` | UNIQUE(nonce) 違反。同時競合でも片方が敗者＝409 |
+
+**H-02 の要点（第1段のヘッダ検証・判定順は不変）**: 署名経路と判定した後、まず §2.2 の必須 7
+ヘッダの欠落/空を `missing_header` で、次に version 値違反を `bad_version`、nonce の 128bit hex
+形式違反を `bad_nonce` で拒否する。これらは **第1段の入力妥当性検査**であり、2〜8 段の判定順
+（key→caller→method/path→skew→content→sig→nonce 一回性）は変更していない。nonce は canonical の
+ORDER 要素だが、golden の nonce は既に 128bit hex のため canonical/署名は不変。
 
 **H01 の要点**: 署名対象 path は **ASGI `scope["raw_path"]`（decode 前生バイト）**で再計算し、
 client 指定の path 系ヘッダ（旧 X-Sig-Path 相当）も **decode 済み path** も検証の真実源にしない。
