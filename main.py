@@ -74,6 +74,19 @@ async def _on_startup():
     from hub.return_deadline import register_return_deadline_job
     register_return_deadline_job()
     start_healthcheck_scheduler()
+    # RV-05-13: flag ON のみ、放置 receipt の可視化 reconciliation を1回実行（再処理しない）。
+    # flag OFF は一切登録/実行しない（M-01: startup hook 非接触）。
+    from hub.durable_inbound import durable_enabled
+    if durable_enabled():
+        try:
+            from hub.durable_inbound import reconcile_stale_seconds
+            from hub.ingestion_receipt import reconcile_stale
+            stats = await reconcile_stale(reconcile_stale_seconds())
+            logger.info("[RV05] startup reconcile: to_pending_retry=%s to_unknown=%s",
+                        emit(stats["to_pending_retry"], "count", "log", "operator"),
+                        emit(stats["to_unknown"], "count", "log", "operator"))
+        except Exception:
+            logger.warning("[RV05] startup reconcile skipped (db not ready)")
 
 
 @app.on_event("shutdown")
@@ -507,6 +520,25 @@ async def _process_line_event(reply_token: str, user_id: str, user_text: str) ->
                      emit(traceback.format_exc(), "vendor_raw", "log", "operator"))
 
 
+async def _process_line_event_durable(reply_token: str, user_id: str, user_text: str,
+                                      webhook_event_id: str) -> None:
+    """RV-05-13 Phase A: coarse observe（received→processing→completed/failed）で
+    HOTFIX-01 型の背景タスク全滅を可視化する。**_process_line_event 本体は不変**（wrap のみ）。"""
+    from hub.durable_inbound import (mark_line_processing, mark_line_completed,
+                                     mark_line_failed)
+    try:
+        await mark_line_processing(webhook_event_id)
+        await _process_line_event(reply_token, user_id, user_text)
+        await mark_line_completed(webhook_event_id)
+    except Exception as e:
+        # 失敗を durable に可視化する（HOTFIX-01 型の沈黙を防ぐ）。記録後は握って背景
+        # タスクを静かに終える（flag OFF の「例外がログに出るだけ」より観測性が高い）。
+        try:
+            await mark_line_failed(webhook_event_id, type(e).__name__)
+        except Exception:
+            pass
+
+
 @app.post("/webhook")
 async def webhook(request: Request, background_tasks: BackgroundTasks):
     body = await request.body()
@@ -516,6 +548,11 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
         raise HTTPException(status_code=400, detail="Invalid signature")
 
     data = json.loads(body)
+
+    # RV-05-13: flag ON なら durable 記録（受理→200→既存 BackgroundTasks で処理）。
+    # flag OFF は現行挙動と byte 同一（durable コードに入らない）。
+    from hub.durable_inbound import durable_enabled
+    _durable = durable_enabled()
 
     for event in data.get("events", []):
         if event.get("type") != "message":
@@ -527,7 +564,23 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
         user_id = event["source"]["userId"]
         user_text = event["message"]["text"]
 
-        background_tasks.add_task(_process_line_event, reply_token, user_id, user_text)
+        if _durable:
+            from hub.durable_inbound import record_line_event
+            webhook_event_id = event.get("webhookEventId") or (
+                "evt-" + hashlib.sha256(
+                    json.dumps(event, sort_keys=True, ensure_ascii=False).encode()
+                ).hexdigest()[:32])
+            try:
+                # durable commit 前に 200 を返さない（G3）。DB 停止は 5xx（memory fallback 禁止）。
+                await record_line_event(
+                    webhook_event_id=webhook_event_id, user_id=user_id,
+                    signature_result="verified", payload=body, event_type="message")
+            except Exception:
+                raise HTTPException(status_code=503, detail="event store unavailable")
+            background_tasks.add_task(_process_line_event_durable,
+                                     reply_token, user_id, user_text, webhook_event_id)
+        else:
+            background_tasks.add_task(_process_line_event, reply_token, user_id, user_text)
         logger.info("[WEBHOOK] queued user_id=%s text=%s",
                     emit(user_id, "external_ref", "log", "operator"),
                     emit(user_text[:20], "freetext", "log", "operator"))

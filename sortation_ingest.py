@@ -400,9 +400,35 @@ async def sortation_ingest(_auth: None = Depends(ingest_guard("SORTATION_INGEST_
     file_name = file.filename
     url = (drive_file_url or "").strip()
 
-    # 冪等（第1段）: プロセス内の重複検知をログに残す。挙動は変えない
     fid = (drive_file_id or "").strip()
-    if fid:
+    # RV-05-13: flag ON は durable 台帳（ingestion_receipt）で冪等/可視化/fencing。
+    # flag OFF は現行 process-memory（byte 同一）。台帳はレスポンス shape を変えない
+    # （kintone upsert 冪等で再処理安全・shadow）。forward だけ claim で排他（二重forward回避）。
+    from hub.durable_inbound import durable_enabled
+    _receipt = None          # (receipt_id, epoch) or None
+    _can_forward = True      # flag ON で claim できた request のみ True（fencing）
+    if durable_enabled():
+        from hub import ingestion_receipt as _ir
+        _sha = hashlib.sha256(pdf_bytes).hexdigest()
+        try:
+            _rid = await _ir.upsert_receipt(
+                ingest_type="sortation", caller_id="gas",
+                source_file_id=fid or _sha, source_sha256=_sha,
+                case_hint=(drive_file_url or None))
+        except ValueError:
+            raise HTTPException(status_code=400, detail="冪等キー要素が不正です")
+        except _ir.ReceiptConflict:
+            raise HTTPException(status_code=409, detail="duplicate_suspect")
+        except HTTPException:
+            raise
+        except Exception:
+            raise HTTPException(status_code=503, detail="event store unavailable")
+        _epoch = await _ir.claim(_rid)
+        if _epoch is None:
+            _can_forward = False   # 並行/重複: 二重 forward を避ける（応答は返す）
+        else:
+            _receipt = (_rid, _epoch)
+    elif fid:
         if fid in _seen_drive_file_ids:
             logger.info("[SORTATION] duplicate drive_file_id=%s（再判定して同一契約で応答）",
                         emit(fid, "external_ref", "log", "operator"))
@@ -415,6 +441,15 @@ async def sortation_ingest(_auth: None = Depends(ingest_guard("SORTATION_INGEST_
     if _split_enabled():
         pre_text, split_result = await _try_split_analysis(
             pdf_bytes, vision_key, file_name)
+
+    # RV-05-13: flag ON は vendor 呼出前を durable marker（vendor_pre）。crash 復帰で
+    # 「vendor 前を証明」できる（reconciliation が PENDING_RETRY 可視化・再処理は GAS 再送）。
+    # 各遷移は epoch++（H-D4-01）のため、request は自身の最新 epoch を追跡する。
+    if _receipt is not None:
+        from hub import ingestion_receipt as _ir
+        _ep = await _ir.mark_phase(_receipt[0], _receipt[1], _ir.ST_VENDOR_PRE)
+        if _ep is not None:
+            _receipt = (_receipt[0], _ep)
 
     # OCR → 候補注入 → Claude 判定。失敗はすべて ask の安全側縮退（doc_type=不明）
     # （複数区間でも顧客判定は親PDF全体で1回・裁定）
@@ -471,37 +506,59 @@ async def sortation_ingest(_auth: None = Depends(ingest_guard("SORTATION_INGEST_
                 emit(file_name, "external_ref", "log", "operator"),
                 emit(customer.record_id if customer else None, "record_id", "log", "operator"))
 
-    if action == "ask":
-        top = _top_candidates(candidates, ocr_text, customer)
-        log_url = await _log_ask(file_name, fid, url, doc_type, confidence,
-                                 reason, top)
-        await _notify_ask(file_name, url, doc_type, confidence, reason, top,
-                          log_url)
+    # RV-05-13: flag ON は downstream（ask 保存/forward）を SENDING marker で囲み、
+    # 失敗は PENDING_RETRY（成功 ACK にしない・RV-13）→ 例外を再送出（5xx・GAS 再送）。
+    try:
+        if _receipt is not None:
+            from hub import ingestion_receipt as _ir
+            _ep = await _ir.mark_phase(_receipt[0], _receipt[1], _ir.ST_SENDING)
+            if _ep is not None:
+                _receipt = (_receipt[0], _ep)
 
-    # D1-2: 混在時の suggested_filename は「氏名_主種別ほかN件_日付」
-    filename_doc = f"{doc_type}ほか{len(segments) - 1}件" if segments else doc_type
-    response = {
-        "action": action,
-        "doc_type": doc_type,
-        "confidence": confidence,
-        "customer": _customer_payload(customer) if customer else None,
-        "suggested_filename":
-            f"{customer.customer_name}_{filename_doc}_{_today_jst()}.pdf"
-            if customer else None,
-    }
-    # S5-3 T1/D1-2: auto（顧客確定）のみ読解ラインへ回送（既存キーは不変・追加キー
-    # のみ＝GAS 無変更。フラグ既定無効・ゲート不通過時は forwarded キー自体なし）
-    if action == "auto" and _forward_enabled():
-        if segments:
-            # 複数区間: 各断片を種別ゲートに通して個別回送（冪等=親fid#pN-M）
-            parent_fid = fid or f"sha256:{hashlib.sha256(pdf_bytes).hexdigest()}"
-            forwarded_list = await _forward_fragments(
-                segments, pdf_bytes, file_name, parent_fid, customer)
-            if forwarded_list:
-                response["forwarded"] = forwarded_list
-        else:
-            forwarded = await _forward_to_line(doc_type, doc_type_conf, pdf_bytes,
-                                               file_name, fid, customer)
-            if forwarded is not None:
-                response["forwarded"] = forwarded
+        if action == "ask":
+            top = _top_candidates(candidates, ocr_text, customer)
+            log_url = await _log_ask(file_name, fid, url, doc_type, confidence,
+                                     reason, top)
+            await _notify_ask(file_name, url, doc_type, confidence, reason, top,
+                              log_url)
+
+        # D1-2: 混在時の suggested_filename は「氏名_主種別ほかN件_日付」
+        filename_doc = f"{doc_type}ほか{len(segments) - 1}件" if segments else doc_type
+        response = {
+            "action": action,
+            "doc_type": doc_type,
+            "confidence": confidence,
+            "customer": _customer_payload(customer) if customer else None,
+            "suggested_filename":
+                f"{customer.customer_name}_{filename_doc}_{_today_jst()}.pdf"
+                if customer else None,
+        }
+        # S5-3 T1/D1-2: auto（顧客確定）のみ読解ラインへ回送（既存キーは不変・追加キー
+        # のみ＝GAS 無変更）。RV-05-13: flag ON の並行/重複（claim 不可）は二重 forward 回避で回送しない。
+        if action == "auto" and _forward_enabled() and _can_forward:
+            if segments:
+                parent_fid = fid or f"sha256:{hashlib.sha256(pdf_bytes).hexdigest()}"
+                forwarded_list = await _forward_fragments(
+                    segments, pdf_bytes, file_name, parent_fid, customer)
+                if forwarded_list:
+                    response["forwarded"] = forwarded_list
+            else:
+                forwarded = await _forward_to_line(doc_type, doc_type_conf, pdf_bytes,
+                                                   file_name, fid, customer)
+                if forwarded is not None:
+                    response["forwarded"] = forwarded
+    except Exception:
+        if _receipt is not None:
+            from hub import ingestion_receipt as _ir
+            try:
+                await _ir.mark_pending_retry(_receipt[0], _receipt[1])
+            except Exception:
+                pass
+        raise   # 成功 ACK にしない（5xx・GAS 再送）
+
+    if _receipt is not None:
+        from hub import ingestion_receipt as _ir
+        await _ir.mark_terminal(_receipt[0], _receipt[1], _ir.ST_COMPLETED,
+                                downstream_refs=(response.get("customer") or {}).get("record_id")
+                                if isinstance(response.get("customer"), dict) else None)
     return response
