@@ -71,6 +71,12 @@ _APP_APPROVAL = hub_kintone.KintoneApp("App 29 (承認キュー)", "APP_APPROVAL
 @app.on_event("startup")
 async def _on_startup():
     """定期ジョブの登録・起動（日次死活監視 7:00 / 返送期限監視 8:00 JST）"""
+    # P1-114: service auth registry の起動時 fail-fast。dual-accept flag ON かつ
+    # SERVICE_HMAC_KEY_REGISTRY が壊れ JSON/構造違反なら ServiceAuthConfigError を
+    # そのまま送出して起動を失敗させる（署名リクエスト毎の沈黙 500 の排除）。
+    # flag OFF は registry 非参照＝現行挙動不変。
+    from hub.service_auth import validate_registry_startup
+    validate_registry_startup()
     from hub.return_deadline import register_return_deadline_job
     register_return_deadline_job()
     start_healthcheck_scheduler()
