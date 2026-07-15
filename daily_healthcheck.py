@@ -267,9 +267,35 @@ async def check_business_notify_liveness() -> list[str]:
         hours = 25.0
     age = datetime.now(timezone.utc) - last
     if age > timedelta(hours=hours):
-        return [f"業務通知経路が約{int(age.total_seconds() // 3600)}時間無音"
-                "（dead-man）: DISPATCHBOTチャネルの死活を確認してください"]
+        # RCF-M08 恒久修正: 低トラフィックでは「無音」は常態であり死の証拠ではない。
+        # 従来はここで即 dead-man 警報を返し、その警報送信自体が heartbeat を更新する
+        # ため〔警報→翌朝OK→翌々朝また警報〕の約2日周期の偽警報オシレーションに
+        # なっていた（P1-104 §5 の観察事項＝本再裁定）。恒久形: stale 時は同一チャネルへ
+        # synthetic heartbeat を1通実送して死活を**実測**する。送信成功＝生存証明
+        # （notify 層が heartbeat を更新・警報なし・「届く=チャネル生存の証明」は
+        # probe 自体が担う）。送信失敗のみ dead-man 警報（実障害）。
+        if await _send_heartbeat_probe(int(age.total_seconds() // 3600)):
+            logger.info("business notify synthetic heartbeat probe OK")
+            return []
+        return [f"業務通知経路が約{int(age.total_seconds() // 3600)}時間無音かつ"
+                "死活確認送信に失敗（dead-man）: DISPATCHBOTチャネルの死活を"
+                "確認してください"]
     return []
+
+
+async def _send_heartbeat_probe(silent_hours: int) -> bool:
+    """RCF-M08: 業務通知チャネルへの synthetic heartbeat 実送（stale 時のみ・応答不要の
+    定型文・throttle なし＝日次実行）。成功時は notify 層（hub/notify.py）が heartbeat を
+    記録するため、次回チェックは鮮度 OK になる。例外・失敗は False（呼び出し側が
+    dead-man 警報にする）。"""
+    try:
+        return await notify_admin_line(
+            "【定期死活確認】業務通知チャネルの synthetic heartbeat です（応答不要）。"
+            f"直近の業務通知成功から約{silent_hours}時間無音のため送信しています。",
+            throttle_key="")
+    except Exception:
+        logger.error("synthetic heartbeat probe の送信に失敗 (request failed)")  # 固定分類・L01
+        return False
 
 
 # ══════════════════════════════════════════════════════════════
