@@ -274,6 +274,38 @@ class TestLineDurable(_DbMixin):
         self.assertEqual(o3, "reattempt")   # stale processing を再 claim（回収・登録）
         self.assertEqual(o4, "duplicate")   # 再 claim 直後は fresh → 登録は1回だけ
 
+    def test_hnew02_fresh_processing_not_reclaimed_on_production_path(self):
+        # H-NEW-02: 本番経路（新規 insert→mark_line_processing→重複配送）で、処理中
+        # （fresh processing）への重複配送が skip され併走しないこと。
+        # 旧コード（mark_line_processing が claimed_at を書かない）では NULL stale 救済に
+        # 拾われて "reattempt"＝再 claim（併走）になり FAIL する形。
+        import hub.durable_inbound as _di
+        body, sig = _line_body(event_id="fresh-prod")
+        mid = {}
+
+        async def _proc(reply_token, user_id, user_text):
+            # 背景処理の実行中（mark_line_processing 通過後）に重複配送が到着した状況
+            mid["outcome"] = await _di.record_line_event(
+                webhook_event_id="fresh-prod", user_id="Uabc",
+                signature_result="verified", payload=b"p", event_type="message")
+
+        with patch.dict(os.environ, {_FLAG: "1"}), \
+             patch.object(main, "_process_line_event", new=_proc):
+            r = _client.post("/webhook", content=body, headers={"X-Line-Signature": sig})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(mid["outcome"], "duplicate")   # fresh processing → skip（併走なし）
+
+        async def _read():
+            async with db.session_scope() as s:
+                row = (await s.execute(
+                    sa.select(InboundEvent.state, InboundEvent.attempts, InboundEvent.claimed_at)
+                    .where(InboundEvent.external_event_id == "fresh-prod"))).one()
+                return row.state, row.attempts, row.claimed_at
+        st, at, ca = _run(_read()); db.reset_for_tests()
+        self.assertEqual(st, "done")                    # 本処理は完走
+        self.assertEqual(at, 1)                         # skip は加算しない（M-02-R 維持）
+        self.assertIsNotNone(ca)                        # mark_line_processing が claimed_at を設定
+
     def test_flag_on_background_crash_marks_failed(self):
         # HOTFIX-01 型: 背景タスクが（内部 try の外で）crash → failed で可視化
         body, sig = _line_body(event_id="crash-1")
@@ -397,21 +429,26 @@ class TestSortationDurable(_DbMixin):
 
     def test_mnew01r_page_cap_forces_ask_no_ocr(self):
         # M-01-R: Vision ページ上限超過 → OCR せず安全側で ask 縮退（沈黙処理にしない）
+        # L-TEST-01: split 解析（split flag ON でも）・Claude 判定の未呼出も明示 assert
         ocr = MagicMock(return_value="should-not-run")
+        split = AsyncMock(return_value=(None, None))
+        judge = AsyncMock(return_value={"doc_type": "その他", "confidence": 0.9, "reason": "r"})
         with patch("main._pdf_page_count", new=MagicMock(return_value=999)), \
              patch("sortation_ingest._ocr_pdf", new=ocr), \
+             patch("sortation_ingest._try_split_analysis", new=split), \
              patch("sortation_ingest.list_candidates", new=AsyncMock(return_value=[])), \
-             patch("sortation_ingest._judge_with_claude",
-                   new=AsyncMock(return_value={"doc_type": "その他", "confidence": 0.9, "reason": "r"})), \
+             patch("sortation_ingest._judge_with_claude", new=judge), \
              patch("sortation_ingest._log_ask", new=AsyncMock(return_value="url")), \
              patch("sortation_ingest._notify_ask", new=AsyncMock(return_value=None)), \
-             patch.dict(os.environ, {**_ENV}):
+             patch.dict(os.environ, {**_ENV, "SORTATION_SPLIT_ENABLED": "1"}):
             r = _client.post("/sortation/ingest?token=sort-token",
                              files={"file": ("x.pdf", b"%PDF big", "application/pdf")},
                              data={"drive_file_id": "FBIG"})
         self.assertEqual(r.status_code, 200, r.text)
         self.assertEqual(r.json().get("action"), "ask")   # 安全側 ask へ縮退
         ocr.assert_not_called()                           # 上限超過は OCR を回さない
+        split.assert_not_awaited()                        # L-TEST-01: split 解析も回さない
+        judge.assert_not_awaited()                        # L-TEST-01: Claude 判定も呼ばない
 
     def test_mnew03_claim_unavailable_response_contract(self):
         # M-NEW-03: claim 不可→state 別応答が §H-06 状態表内に収まる契約テスト
