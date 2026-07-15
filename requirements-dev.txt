@@ -1,3 +1,6 @@
 # 開発・テスト専用の追加依存（本番Railwayビルドは requirements.txt のみを使う）
 # P1-005a: InboundEvent系テストは async エンジンを sqlite で回すため aiosqlite が必要
 aiosqlite==0.22.1
+# RV-12: lock/SBOM 再生成ツール（scripts/regen_dependency_lock.py・runbook 参照）
+uv==0.11.28
+cyclonedx-bom==7.3.0
