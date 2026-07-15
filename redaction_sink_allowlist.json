@@ -32,7 +32,7 @@
     "hub/return_deadline.py:98:sink:logger",
     "hub/scheduler.py:65:sink:logger",
     "hub/scheduler.py:92:logger_exception",
-    "hub/service_auth.py:438:sink:httpexception",
+    "hub/service_auth.py:477:sink:httpexception",
     "koseki_ingest.py:142:sink:httpexception",
     "koseki_ingest.py:150:sink:httpexception",
     "koseki_ingest.py:175:sink:httpexception",

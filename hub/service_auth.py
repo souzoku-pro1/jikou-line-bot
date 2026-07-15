@@ -167,14 +167,50 @@ def load_registry_from_env(*, env_var: str = _REGISTRY_ENV, required: bool = Fal
     return parse_registry(raw)
 
 
+# RP1114-M01: 起動境界の固定文言（key_id・フィールド名・registry 断片を含めない）。
+# 詳細診断は既存 decision sink（redact 経由・request 時）のみに限定する。
+_CONFIG_ERROR_FIXED_MSG = "service auth registry configuration invalid"
+
+
+def _effective_key_count(registry: dict, now: int) -> int:
+    """RP1114-H01: 実効鍵数＝status が active/retiring かつ expires_at 以内の鍵の数。
+    revoked のみ・全鍵失効の registry は「鍵数>0 でも運用上ゼロ」なので fail-fast 対象。"""
+    return sum(1 for k in registry.values()
+               if k.status in ("active", "retiring") and now <= k.expires_at)
+
+
+def load_registry_strict(*, env_var: str = _REGISTRY_ENV,
+                         now: int | None = None) -> dict:
+    """RP1114-H01: flag ON 用の registry 読込（4象限 fail-fast）。いずれも
+    ServiceAuthConfigError を送出する:
+      ① env 欠損・空文字（「空 registry による署名拒否」へ流さない）
+      ② JSON 破損・非 object（parse_registry）
+      ③ entry 型不正（非 dict・必須 field 欠落・型違い＝_parse_entry）
+      ④ 実効鍵数 0（{}・全 revoked・全 expires_at 超過）
+    正常時は {key_id: KeyEntry} を返す。"""
+    raw = os.environ.get(env_var, "").strip()
+    if not raw:
+        raise ServiceAuthConfigError("registry is not configured")
+    reg = parse_registry(raw)
+    now = now if now is not None else int(_utcnow().timestamp())
+    if _effective_key_count(reg, now) == 0:
+        raise ServiceAuthConfigError("registry has no effective keys")
+    return reg
+
+
 def validate_registry_startup() -> int:
-    """P1-114: 起動時 fail-fast。dual-accept flag ON のとき registry env を検証し、
-    壊れ JSON/構造違反は ServiceAuthConfigError を送出して**起動を止める**
-    （署名リクエスト毎の沈黙 500 を排除する）。flag OFF は何もしない
-    （registry 非参照＝現行挙動不変）。戻り値=検証済み鍵数（起動ログ用）。"""
+    """P1-114: 起動時 fail-fast。dual-accept flag ON のとき registry env を 4象限
+    （欠損/空・JSON/構造不正・entry 型不正・実効鍵数0＝RP1114-H01）で検証し、不正なら
+    ServiceAuthConfigError で**起動を止める**（署名リクエスト毎の沈黙 500 を排除する）。
+    flag OFF は何もしない（registry 非参照＝現行挙動不変）。戻り値=実効鍵数（起動ログ用）。
+    RP1114-M01: 送出する例外は**固定文言のみ**（`from None` で元例外の詳細メッセージ
+    〔key_id・フィールド名・registry 断片〕を連鎖表示させない）。"""
     if not dual_accept_enabled():
         return 0
-    return len(load_registry_from_env())
+    try:
+        return len(load_registry_strict())
+    except ServiceAuthConfigError:
+        raise ServiceAuthConfigError(_CONFIG_ERROR_FIXED_MSG) from None
 
 
 def _max_skew() -> int:
@@ -418,7 +454,10 @@ async def authorize_ingest(request: Request, *, token: str, token_env: str) -> N
     if _has_signature_headers(headers):
         raw = await request.body()   # BodyCachingRoute がキャッシュ済み
         try:
-            registry = load_registry_from_env()
+            # RP1114-H01: 起動時と同じ 4象限（欠損/空・JSON 不正・entry 型不正・実効鍵0）
+            # の strict 読込。欠損・空が「空 registry による署名拒否（key_unknown 401）」へ
+            # 流れる経路を排除し、設定不備はすべて registry_config_error の 503 に統一する。
+            registry = load_registry_strict()
         except ServiceAuthConfigError:
             # P1-114: 壊れ registry を沈黙 500 にしない。起動時 fail-fast
             # （validate_registry_startup）の請求時防衛。固定 reason で明示ログし
