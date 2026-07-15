@@ -61,7 +61,7 @@ class _Bindings:
     """H01/NH01: 信頼できる emit 束縛を **1 形式のみ** に限定 + shadow 全面禁止。
 
     信頼する唯一の形式:
-        from hub.redact import emit        # alias 無しのみ
+        from hub.redact import emit        # alias 無し・**module-level のみ**（P1-113）
 
     - module 修飾・別名（`emit as X` / `hub.redact.emit` / `redact.emit`）は信頼しない。
     - **shadow 全面禁止**: ファイル内に `emit` という名前の他束縛が1つでもあれば、
@@ -71,7 +71,9 @@ class _Bindings:
         for/with as/except as/comprehension/global/nonlocal・別 import/import as emit・
         **match capture（MatchAs/MatchStar/MatchMapping.rest・P1-101e H01）**・
         **信頼 emit と同居する star import `from x import *`（P1-101e H02）**・
-        **del emit（P1-101e M01）**。
+        **del emit（P1-101e M01）**・
+        **関数スコープ内の `from hub.redact import emit`（P1-113・HOTFIX-01 型の
+        UnboundLocalError 時限爆弾＝module-level と関数内を区別し関数内は信頼しない）**。
     - **dynamic_name_op（P1-101e・別規則）**: 信頼 emit import を持つファイル内の
       `exec(...)` 呼び出し・`globals()[...]=` / `locals()[...]=` 代入を検出・poison。
 
@@ -104,6 +106,17 @@ def collect_bindings(tree: ast.AST) -> _Bindings:
     trusted_import = False
     star_lines = set()      # 信頼 emit がある場合のみ poison する star import 行
     dynamic_cand = set()    # 同上・exec/globals/locals の候補行
+    # P1-113: 関数スコープ内の import 文を先に収集し、module-level と区別する。
+    # 関数内の `from hub.redact import emit`（信頼形式と同形）は emit を**関数全体で
+    # ローカル変数化**し、「import 位置より前の emit 参照」を実行時 UnboundLocalError の
+    # 時限爆弾にする（HOTFIX-01 の真因型）。信頼形式とは認めず emit_shadow として
+    # poison する（module-level の alias 無し import のみが唯一の信頼形式）。
+    nested_import_ids = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for sub in ast.walk(node):
+                if isinstance(sub, (ast.Import, ast.ImportFrom)):
+                    nested_import_ids.add(id(sub))
     for node in ast.walk(tree):
         # ── import 群 ──
         if isinstance(node, ast.ImportFrom):
@@ -117,9 +130,13 @@ def collect_bindings(tree: ast.AST) -> _Bindings:
                     b.print_aliases.add(local)
                 if a.name == "HTTPException":
                     b.httpexc_names.add(local)
-                # 唯一の信頼形式: from hub.redact import emit（alias 無し）
+                # 唯一の信頼形式: **module-level の** from hub.redact import emit（alias 無し）
                 if mod == "hub.redact" and a.name == "emit" and a.asname is None:
-                    trusted_import = True
+                    if id(node) in nested_import_ids:
+                        # P1-113: 関数内は信頼せず shadow（HOTFIX-01 型の時限爆弾）
+                        b.shadow_lines.add(node.lineno)
+                    else:
+                        trusted_import = True
                 # 上記以外で 'emit' を束縛する import は shadow
                 elif a.asname == "emit" or (a.asname is None and a.name == "emit"):
                     b.shadow_lines.add(node.lineno)
@@ -461,6 +478,20 @@ class TestScannerDetection(unittest.TestCase):
         ("shadow_del_emit",
          "from hub.redact import emit\ndel emit\n"
          "logger.info(emit(v, 'name', 'log', 'operator'))\n",
+         {"emit_shadow", "sink:logger"}),
+        # P1-113: 関数内の信頼形式 import は emit_shadow（HOTFIX-01 型・名前の関数ローカル化）
+        ("nested_trusted_import_in_function",
+         "def f(x):\n    from hub.redact import emit\n"
+         "    logger.info(emit(x, 'name', 'log', 'operator'))\n",
+         {"emit_shadow", "sink:logger"}),
+        ("nested_import_with_module_level_trusted",
+         "from hub.redact import emit\n"
+         "def f(x):\n    from hub.redact import emit\n"
+         "    logger.info(emit(x, 'name', 'log', 'operator'))\n",
+         {"emit_shadow", "sink:logger"}),
+        ("nested_trusted_import_async_function",
+         "async def f(x):\n    from hub.redact import emit\n"
+         "    logger.info(emit(x, 'name', 'log', 'operator'))\n",
          {"emit_shadow", "sink:logger"}),
         # P1-101e 別規則: dynamic_name_op
         ("dynamic_globals_assign",
