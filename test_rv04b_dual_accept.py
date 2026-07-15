@@ -192,16 +192,18 @@ class TestFlagOnSignature(_DbMixin):
                 # ゲート通過（署名 OK・nonce 消費）→ endpoint file 無し 400
                 self.assertEqual(r.status_code, 400, (path, r.text))
 
-    def test_nonce_replay_409(self):
-        path = "/bank/ingest"
-        ct, body = _nofile_multipart()
-        n = _nonce("replay")
-        h = _sig_headers(path, body, n)
-        h["Content-Type"] = ct
-        r1 = _client.post(path, content=body, headers=h)
-        self.assertEqual(r1.status_code, 400, r1.text)   # 1回目: 通過→file無し400
-        r2 = _client.post(path, content=body, headers=h)  # 同一 nonce 再送
-        self.assertEqual(r2.status_code, 409, r2.text)   # replay
+    def test_nonce_replay_409_all_five(self):
+        # P1-114: replay 検証を ingest 5入口すべてに parametrize 展開（従来は /bank のみ）
+        for path in INGEST_PATHS:
+            with self.subTest(path=path):
+                ct, body = _nofile_multipart()
+                n = _nonce("replay" + path)
+                h = _sig_headers(path, body, n)
+                h["Content-Type"] = ct
+                r1 = _client.post(path, content=body, headers=h)
+                self.assertEqual(r1.status_code, 400, (path, r1.text))  # 1回目: 通過→file無し400
+                r2 = _client.post(path, content=body, headers=h)  # 同一 nonce 再送
+                self.assertEqual(r2.status_code, 409, (path, r2.text))  # replay
 
 
 # ── downgrade 禁止（§6.3・3系） ──────────────────────────────────────────────
@@ -253,6 +255,46 @@ class TestDowngradePrevention(_DbMixin):
         # 両方無
         self.assertEqual(_client.post(path, content=body,
                                       headers={"Content-Type": ct}).status_code, 404)
+
+
+# ── P1-114: 壊れ registry の fail-fast（沈黙 500 の排除） ────────────────────
+class TestRegistryFailFast(unittest.TestCase):
+    _BROKEN = '{"kid": {broken'   # JSON parse error を起こす値
+    _SCHED_OFF = {"HEALTHCHECK_DISABLED": "1", "RETURN_DEADLINE_DISABLED": "1"}
+
+    def test_startup_failfast_broken_json_flag_on(self):
+        # 起動時 fail-fast: flag ON + 壊れ JSON → startup が明示例外で停止
+        # （旧コード: 起動は成功し、署名リクエスト毎に沈黙 500 → FAIL する形）
+        with patch.dict(os.environ, {**self._SCHED_OFF, _FLAG: "1", _REGENV: self._BROKEN}):
+            with self.assertRaises(svc.ServiceAuthConfigError):
+                with TestClient(main.app):   # context 突入で startup event 実行
+                    pass
+
+    def test_startup_ok_when_flag_off_registry_unreferenced(self):
+        # flag OFF は registry 非参照＝壊れ JSON でも起動する（現行挙動不変）
+        with patch.dict(os.environ, {**self._SCHED_OFF, _REGENV: self._BROKEN}):
+            os.environ.pop(_FLAG, None)
+            with TestClient(main.app):
+                pass   # 起動成功（例外なし）
+
+    def test_startup_ok_valid_registry_flag_on(self):
+        # flag ON + 正常 registry → 起動成功（fail-fast の誤爆なし）
+        with patch.dict(os.environ, {**self._SCHED_OFF, _FLAG: "1", _REGENV: REG_JSON}):
+            with TestClient(main.app):
+                pass
+
+    def test_request_time_broken_registry_explicit_503_not_500(self):
+        # 初回参照時の防衛: 壊れ registry の署名リクエストは明示 503（沈黙 500 にしない）
+        # （旧コード: ServiceAuthConfigError 未捕捉 → 500 → FAIL する形）
+        path = "/koseki/ingest"
+        ct, body = _nofile_multipart()
+        h = _sig_headers(path, body, _nonce("ff503"))
+        h["Content-Type"] = ct
+        nr_client = TestClient(main.app, raise_server_exceptions=False)
+        with patch.dict(os.environ, {**_INGEST_ENV, _FLAG: "1", _REGENV: self._BROKEN}):
+            r = nr_client.post(path, content=body, headers=h)
+        self.assertEqual(r.status_code, 503, r.text)
+        self.assertEqual(r.json().get("detail"), "service auth configuration error")
 
 
 # ── 顧客Bot 経路 非干渉（handler smoke・顧客Bot経路規律） ────────────────────
