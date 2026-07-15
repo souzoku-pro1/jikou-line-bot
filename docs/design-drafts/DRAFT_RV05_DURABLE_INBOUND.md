@@ -32,6 +32,7 @@
 - **逸脱内容**: InboundEvent へ durable 記録するが **crash 後の未処理 event を自動 replay しない**。
 - **理由**: 安全な返信再開には ConversationSession/PendingCommand（§9.17.1・RV-06）が必要。無いまま replay すると**二重返信**。
 - **失うもの/代替**: 自動回復なし。未処理は「滞留」として収束率低下・dead-man で**検知**（HOTFIX-01 型沈黙障害の検知は達成）。回復は人手/RV-06。
+- **既知制約（H-NEW-01-R3・fix5 明文化）**: stale processing 回収（fix4）の駆動は **LINE 再配送のみ**。したがって **LINE 再配送が終了した後に stale 化した行は自動回収の契機を失う**——台帳上は人手 reset まで non-terminal のまま滞留し、顧客対応上は次のイベント（顧客の再発話等・別 dedup_key＝旧行は回収しない）まで沈黙する。検知は **§6 観測**（最古 non-terminal 滞留時間・収束率低下）、回収は**人手 reset**（runbook: work-log 2026-07-15_RV-05-13-fix5 §4）。K4 ON の LINE 再配送は指数バックオフで後期ほど疎になるため、stale 閾値 3600 秒（既定）を超える頃には再送が尽きていることがあり得る＝閾値は再配送ウィンドウ内の過剰併走を抑える下限であり、末尾再送による回収は保証しない。
 - **fencing 不要（H-NEW-01）**: **LINE Phase A は fencing/epoch を持たない**。処理は既存 BackgroundTasks が1回だけ実行し、競合 consumer が再claim しないため（sortation の epoch fencing は §B-02・LINE の inbound_event には epoch 列を足さない＝ALTER 0 維持）。
 - **解消条件**: RV-06 完了で逸脱解消 → 顧客Bot も durable replay へ（別票・K4 前提）。
 

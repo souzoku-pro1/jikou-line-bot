@@ -63,8 +63,12 @@ stale 回収は「真にクラッシュした処理」だけでなく「stale �
 - **裁定: 検知可能な 2 回返信（安全側）> 検知困難な 0 回沈黙**。stale 閾値を 3600s と長めに
   取ることで、健全処理を誤って併走させる確率は実務上小さい（LINE 応答は通常秒オーダー）。
 
-正しさの最終防衛は fencing（排他 claim・§4）であり、stale 回収は「滞留を沈黙のまま放置しない」
-ための可視・回収機構である。
+LINE 側の claim UPDATE が保証するのは**併走 claim 間の排他**（同時再配送が競合しても勝者1者）
+**のみ**であり、claim 済みで生存中の**旧 task を失効させる guard は無い**（LINE Phase A は
+epoch fencing を持たない・§H-01）。したがって stale 再 claim と旧 task の**まれな併走
+（二重返信）は排除されず、上記比較裁定どおり受容**する——2回返信は顧客・事務所に見えるため
+**検知可能**。stale 回収は「滞留を沈黙のまま放置しない」ための可視・回収機構である。
+（M-DOC-01・fix5 正確化: 旧記述「正しさの最終防衛は fencing」は LINE 経路には過大主張だった）
 
 ## 4. M-02-R（attempts は claim 成功時のみ加算）
 
@@ -83,9 +87,13 @@ fix1〜fix3 の §5 は lease 値（600→1800→4500）を「最悪合計」と
   「健全な処理中を誤って stale とみなさない」ための liveness 下限。外部 call の設定 timeout
   （Vision 120×バッチ・Claude primary 1800・fallback 1800・backoff/前後）の合算を目安に置くが、
   **これを超えても正しさは壊れない**。
-- **fencing が最終防衛**: 誤って stale 判定・再 claim（epoch++）が起きても、in-flight の
-  terminal/heartbeat は epoch guard で 0 行 abort（RV-05-13-fix §4.6・test_m04）。二重処理・
-  二重返信を実際に不可能にするのは fencing（および LINE 側の排他 claim）であって lease ではない。
+- **fencing の位置づけ（M-DOC-01・fix5 正確化）**: sortation の epoch fencing は、誤って
+  stale 判定・再 claim（epoch++）が起きても in-flight の terminal/heartbeat を epoch guard で
+  0 行 abort する（RV-05-13-fix §4.6・test_m04）。一方 **LINE 側の排他 claim UPDATE は併走
+  claim 間の排他のみ**で、claim 済みの旧 task を失効させる guard は無い（epoch なし・§H-01）
+  ——**まれな併走（二重返信）は §3.3 比較裁定どおり受容・検知可能**。旧記述の「二重処理・
+  二重返信を実際に不可能にする」は過大主張であり撤回する。lease はいずれの経路でも正しさの
+  根拠ではない（誤 stale の頻度を下げる運用値）。
 
 （fix1 §5＝600・fix2 §5＝1800・fix3 §5＝4500「最悪合計」。本 fix4 §5 が最新の正本＝
 lease は運用上限、正しさは fencing。値は 4500 のまま。）
