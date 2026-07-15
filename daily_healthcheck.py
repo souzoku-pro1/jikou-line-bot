@@ -271,9 +271,11 @@ async def check_business_notify_liveness() -> list[str]:
         # 従来はここで即 dead-man 警報を返し、その警報送信自体が heartbeat を更新する
         # ため〔警報→翌朝OK→翌々朝また警報〕の約2日周期の偽警報オシレーションに
         # なっていた（P1-104 §5 の観察事項＝本再裁定）。恒久形: stale 時は同一チャネルへ
-        # synthetic heartbeat を1通実送して死活を**実測**する。送信成功＝生存証明
-        # （notify 層が heartbeat を更新・警報なし・「届く=チャネル生存の証明」は
-        # probe 自体が担う）。送信失敗のみ dead-man 警報（実障害）。
+        # synthetic heartbeat を1通実送して死活を**実測**する。送信失敗のみ dead-man 警報
+        # （実障害）。
+        # RCFM08-M01「チャネル生存」の定義: probe 成功＝**LINE Push API の 2xx 受理**
+        # （token・宛先・通信経路の生存）であり、管理者端末での実表示・端末の通知設定・
+        # Bot のブロック有無までは保証しない（過大主張しない・work-log 参照）。
         if await _send_heartbeat_probe(int(age.total_seconds() // 3600)):
             logger.info("business notify synthetic heartbeat probe OK")
             return []
@@ -287,7 +289,10 @@ async def _send_heartbeat_probe(silent_hours: int) -> bool:
     """RCF-M08: 業務通知チャネルへの synthetic heartbeat 実送（stale 時のみ・応答不要の
     定型文・throttle なし＝日次実行）。成功時は notify 層（hub/notify.py）が heartbeat を
     記録するため、次回チェックは鮮度 OK になる。例外・失敗は False（呼び出し側が
-    dead-man 警報にする）。"""
+    dead-man 警報にする）。
+    RCFM08-M01: ここでの「成功＝チャネル生存」は **LINE Push API 2xx 受理**
+    （token・宛先・通信経路の生存）の意。端末での実表示・通知設定・Bot ブロックは
+    保証範囲外。"""
     try:
         return await notify_admin_line(
             "【定期死活確認】業務通知チャネルの synthetic heartbeat です（応答不要）。"
