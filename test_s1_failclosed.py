@@ -251,14 +251,49 @@ class TestDeadmanLiveness(_EnvMixin):
         with patch.dict(os.environ, env, clear=True):
             self.assertEqual(_run(hc.check_business_notify_liveness()), [])
 
-    def test_stale_heartbeat_reported(self):
+    def test_stale_heartbeat_probe_success_no_alarm(self):
+        # RCF-M08: stale でも probe（synthetic heartbeat 実送）が成功すれば警報なし。
+        # 旧コード（probe なしで即 dead-man 警報→送信が heartbeat を更新）では
+        # ここで問題が返り FAIL する形＝約2日周期オシレーションの根を断つ。
+        import daily_healthcheck as hc
+        from datetime import datetime, timezone
+        stale = datetime.now(timezone.utc) - timedelta(hours=30)
+        probe = AsyncMock(return_value=True)
+        with patch.dict(os.environ, {"DATABASE_URL": "sqlite://",
+                                     "DISPATCHBOT_CHANNEL_ACCESS_TOKEN": "t"}), \
+             patch("hub.notify_heartbeat.get_heartbeat_status",
+                   new_callable=AsyncMock, return_value=("ok", stale)), \
+             patch.object(hc, "notify_admin_line", new=probe):
+            problems = _run(hc.check_business_notify_liveness())
+        self.assertEqual(problems, [])            # 生存実証済み→偽警報を出さない
+        self.assertEqual(probe.await_count, 1)    # probe は1通だけ実送
+        self.assertIn("定期死活確認", probe.call_args.args[0])
+
+    def test_stale_heartbeat_probe_failure_reports_deadman(self):
+        # RCF-M08: probe 送信が失敗＝チャネル実死のときのみ dead-man 警報（実障害）。
         import daily_healthcheck as hc
         from datetime import datetime, timezone
         stale = datetime.now(timezone.utc) - timedelta(hours=30)
         with patch.dict(os.environ, {"DATABASE_URL": "sqlite://",
                                      "DISPATCHBOT_CHANNEL_ACCESS_TOKEN": "t"}), \
              patch("hub.notify_heartbeat.get_heartbeat_status",
-                   new_callable=AsyncMock, return_value=("ok", stale)):
+                   new_callable=AsyncMock, return_value=("ok", stale)), \
+             patch.object(hc, "notify_admin_line",
+                          new=AsyncMock(return_value=False)):
+            problems = _run(hc.check_business_notify_liveness())
+        self.assertTrue(any("dead-man" in p for p in problems))
+
+    def test_stale_heartbeat_probe_exception_reports_deadman(self):
+        # RCF-M08: probe 送信の例外も握って dead-man 警報（沈黙にしない）。
+        import daily_healthcheck as hc
+        from datetime import datetime, timezone
+        stale = datetime.now(timezone.utc) - timedelta(hours=30)
+        with patch.dict(os.environ, {"DATABASE_URL": "sqlite://",
+                                     "DISPATCHBOT_CHANNEL_ACCESS_TOKEN": "t"}), \
+             patch("hub.notify_heartbeat.get_heartbeat_status",
+                   new_callable=AsyncMock, return_value=("ok", stale)), \
+             patch.object(hc, "notify_admin_line",
+                          new=AsyncMock(side_effect=RuntimeError("boom"))):
             problems = _run(hc.check_business_notify_liveness())
         self.assertTrue(any("dead-man" in p for p in problems))
 
@@ -266,11 +301,14 @@ class TestDeadmanLiveness(_EnvMixin):
         import daily_healthcheck as hc
         from datetime import datetime, timezone
         fresh = datetime.now(timezone.utc) - timedelta(hours=1)
+        probe = AsyncMock(return_value=True)
         with patch.dict(os.environ, {"DATABASE_URL": "sqlite://",
                                      "DISPATCHBOT_CHANNEL_ACCESS_TOKEN": "t"}), \
              patch("hub.notify_heartbeat.get_heartbeat_status",
-                   new_callable=AsyncMock, return_value=("ok", fresh)):
+                   new_callable=AsyncMock, return_value=("ok", fresh)), \
+             patch.object(hc, "notify_admin_line", new=probe):
             self.assertEqual(_run(hc.check_business_notify_liveness()), [])
+        probe.assert_not_awaited()   # RCF-M08: 鮮度 OK なら probe も送らない
 
     def test_empty_table_is_abnormal(self):
         """H01: テーブルはあるが成功記録が1件も無い＝dead-man 異常として返す。"""
