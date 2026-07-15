@@ -258,9 +258,113 @@ class TestDowngradePrevention(_DbMixin):
 
 
 # ── P1-114: 壊れ registry の fail-fast（沈黙 500 の排除） ────────────────────
+def _entry(**over):
+    """正常 entry を base に一部だけ壊す fixture 用ヘルパ。"""
+    e = {"secret": SECRET_HEX, "caller": "gas-ingest", "allowed_methods": ["POST"],
+         "allowed_paths": INGEST_PATHS, "not_before": 0, "expires_at": 2 ** 31,
+         "status": "active"}
+    e.update(over)
+    return e
+
+
+# RP1114-H01: fail-fast 4象限（値 None は env 欠損＝unset を表す）
+_QUADRANTS = [
+    ("q1_env_unset", None),                                   # ① 欠損
+    ("q1_env_empty", ""),                                     # ① 空文字
+    ("q2_broken_json", '{"kid": {broken'),                    # ② JSON 破損
+    ("q2_non_object_json", "[]"),                             # ② 非 object
+    ("q3_entry_not_dict", json.dumps({"kid": "oops"})),       # ③ entry 非 dict
+    ("q3_missing_field", json.dumps({"kid": {"secret": SECRET_HEX}})),  # ③ 必須欠落
+    ("q3_type_violation", json.dumps({"kid": _entry(secret=12345)})),   # ③ 型違い
+    ("q4_zero_keys", "{}"),                                   # ④ 実効鍵 0（空 object）
+    ("q4_all_revoked", json.dumps({"kid": _entry(status="revoked")})),  # ④ 全 revoked
+    ("q4_all_expired", json.dumps({"kid": _entry(expires_at=1)})),      # ④ 全 expired
+]
+
+
 class TestRegistryFailFast(unittest.TestCase):
     _BROKEN = '{"kid": {broken'   # JSON parse error を起こす値
     _SCHED_OFF = {"HEALTHCHECK_DISABLED": "1", "RETURN_DEADLINE_DISABLED": "1"}
+
+    def _apply_quadrant(self, value):
+        """_REGENV へ象限値を適用（None=欠損）。patch.dict 内で呼ぶこと。"""
+        if value is None:
+            os.environ.pop(_REGENV, None)
+        else:
+            os.environ[_REGENV] = value
+
+    def test_h01_startup_failfast_all_quadrants(self):
+        # RP1114-H01: 4象限すべてで startup が固定文言の明示例外で停止
+        # （旧コードは欠損・空・実効鍵0で起動成功してしまう＝FAIL する形）
+        for desc, value in _QUADRANTS:
+            with self.subTest(quadrant=desc):
+                with patch.dict(os.environ, {**self._SCHED_OFF, _FLAG: "1"}):
+                    self._apply_quadrant(value)
+                    with self.assertRaises(svc.ServiceAuthConfigError) as ctx:
+                        with TestClient(main.app):
+                            pass
+                    # RP1114-M01: 起動境界の例外は固定文言のみ
+                    self.assertEqual(str(ctx.exception),
+                                     "service auth registry configuration invalid")
+
+    def test_h01_request_time_503_all_quadrants(self):
+        # RP1114-H01: 初回参照側も同じ4象限で registry_config_error の固定 503 に統一
+        # （旧コードは欠損・空・実効鍵0が「空 registry の署名拒否」= 401 に流れ FAIL する形）
+        nr_client = TestClient(main.app, raise_server_exceptions=False)
+        for desc, value in _QUADRANTS:
+            with self.subTest(quadrant=desc):
+                path = "/koseki/ingest"
+                ct, body = _nofile_multipart()
+                h = _sig_headers(path, body, _nonce("q" + desc))
+                h["Content-Type"] = ct
+                with patch.dict(os.environ, {**_INGEST_ENV, _FLAG: "1"}):
+                    self._apply_quadrant(value)
+                    r = nr_client.post(path, content=body, headers=h)
+                self.assertEqual(r.status_code, 503, (desc, r.text))
+                self.assertEqual(r.json().get("detail"),
+                                 "service auth configuration error")
+
+    def test_m01_sentinel_not_in_exception_log_or_body(self):
+        # RP1114-M01: 判別可能な sentinel を registry へ注入し、起動例外 repr／
+        # 整形 traceback／ログ出力／503 body のいずれにも不含を機械確認。
+        import logging
+        import traceback as tb
+        sent_kid = "SENTINEL-KID-73AF"
+        sent_secret = "SENTINEL-SECRET-5C4E"
+        reg = json.dumps({sent_kid: {"secret": sent_secret, "caller": 7}})  # 型不正×sentinel
+
+        records = []
+
+        class _Cap(logging.Handler):
+            def emit(self, record):
+                records.append(record.getMessage())
+
+        cap = _Cap()
+        root = logging.getLogger()
+        root.addHandler(cap)
+        try:
+            with patch.dict(os.environ, {**self._SCHED_OFF, **_INGEST_ENV,
+                                         _FLAG: "1", _REGENV: reg}):
+                with self.assertRaises(svc.ServiceAuthConfigError) as ctx:
+                    with TestClient(main.app):   # startup 停止側
+                        pass
+                path = "/koseki/ingest"          # 初回参照 503 側
+                ct, body = _nofile_multipart()
+                h = _sig_headers(path, body, _nonce("m01sent"))
+                h["Content-Type"] = ct
+                nr_client = TestClient(main.app, raise_server_exceptions=False)
+                r = nr_client.post(path, content=body, headers=h)
+        finally:
+            root.removeHandler(cap)
+        self.assertEqual(r.status_code, 503)
+        exc_repr = repr(ctx.exception)
+        exc_tb = "".join(tb.format_exception(ctx.exception))  # from None で詳細連鎖なし
+        logs = "\n".join(records)
+        for sentinel in (sent_kid, sent_secret):
+            self.assertNotIn(sentinel, exc_repr)   # 起動例外 repr
+            self.assertNotIn(sentinel, exc_tb)     # 整形 traceback（連鎖抑止の確認）
+            self.assertNotIn(sentinel, logs)       # 起動/請求時のログ出力
+            self.assertNotIn(sentinel, r.text)     # 503 body
 
     def test_startup_failfast_broken_json_flag_on(self):
         # 起動時 fail-fast: flag ON + 壊れ JSON → startup が明示例外で停止
