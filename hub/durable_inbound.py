@@ -132,8 +132,9 @@ async def record_line_event(*, webhook_event_id: str, user_id: str,
         pass  # dedup_key 衝突＝重複配送。以降で **DB 最新 state** に応じて分岐
 
     _max = line_max_attempts()
-    # H-NEW-01-R2: 未終端の claim 対象 = received／failed、または stale 秒を超えた processing
-    # （claimed_at NULL の旧行も回収対象）。claim 成功時のみ claimed_at=now() を更新。
+    # H-NEW-01-R2: 未終端の claim 対象 = received／failed、または stale 秒を超えた processing。
+    # claimed_at NULL の processing も回収対象だが、H-NEW-02 で mark_line_processing も
+    # claimed_at=now() を書くため NULL は fix5 以前の旧行のみ（旧行救済として維持）。
     stale_cutoff = _line_stale_cutoff(line_stale_processing_seconds())
     claimable = sa.or_(
         InboundEvent.state.in_(("received", "failed")),
@@ -174,13 +175,16 @@ async def record_line_event(*, webhook_event_id: str, user_id: str,
 
 
 async def mark_line_processing(webhook_event_id: str) -> None:
-    """coarse observe: 処理開始（received→processing）。HOTFIX-01 型の「processing に到達しない」
-    滞留を可視化する。fence 不要（Phase A は競合 consumer なし・§H-01）。"""
+    """coarse observe: 処理開始（received→processing・claimed_at=now()）。HOTFIX-01 型の
+    「processing に到達しない」滞留を可視化する。H-NEW-02: claimed_at を SQL 側 now() で
+    同時に設定し、本番経路（新規 insert→本 mark）の fresh processing が重複配送の
+    NULL stale 救済（旧行向け）に拾われて併走することを防ぐ。
+    fence 不要（Phase A は競合 consumer なし・§H-01）。"""
     async with session_scope() as s:
         await s.execute(sa.update(InboundEvent)
                         .where(InboundEvent.dedup_key == line_dedup_key(webhook_event_id),
                                InboundEvent.state == "received")
-                        .values(state="processing"))
+                        .values(state="processing", claimed_at=sa.func.now()))
     count("B", "processing", webhook_event_id)
 
 
