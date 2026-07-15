@@ -167,6 +167,16 @@ def load_registry_from_env(*, env_var: str = _REGISTRY_ENV, required: bool = Fal
     return parse_registry(raw)
 
 
+def validate_registry_startup() -> int:
+    """P1-114: 起動時 fail-fast。dual-accept flag ON のとき registry env を検証し、
+    壊れ JSON/構造違反は ServiceAuthConfigError を送出して**起動を止める**
+    （署名リクエスト毎の沈黙 500 を排除する）。flag OFF は何もしない
+    （registry 非参照＝現行挙動不変）。戻り値=検証済み鍵数（起動ログ用）。"""
+    if not dual_accept_enabled():
+        return 0
+    return len(load_registry_from_env())
+
+
 def _max_skew() -> int:
     raw = os.environ.get(_SKEW_ENV, "").strip()
     try:
@@ -407,16 +417,28 @@ async def authorize_ingest(request: Request, *, token: str, token_env: str) -> N
         return
     if _has_signature_headers(headers):
         raw = await request.body()   # BodyCachingRoute がキャッシュ済み
-        registry = load_registry_from_env()
-        eff = effective_signed_path(request.scope)
-        status, reason = await verify_request(headers, raw, request.method, eff,
-                                              registry=registry)
+        try:
+            registry = load_registry_from_env()
+        except ServiceAuthConfigError:
+            # P1-114: 壊れ registry を沈黙 500 にしない。起動時 fail-fast
+            # （validate_registry_startup）の請求時防衛。固定 reason で明示ログし
+            # 明示 503 を返す（下の共通 raise に合流＝新規 sink を増やさない・台帳 61 維持。
+            # reason は固定コードのみ＝secret/値の実体は出ない）。
+            status, reason = 503, "registry_config_error"
+        else:
+            eff = effective_signed_path(request.scope)
+            status, reason = await verify_request(headers, raw, request.method, eff,
+                                                  registry=registry)
         _log_ingest_decision(headers, reason)
         if status != 200:
             # 署名経路の失敗は token へ落とさない（downgrade 防止）。
-            # status は §6.1 のとおり（401/403/400/409）。詳細 reason は上のログにのみ残し、
-            # レスポンス body には固定文字列のみ（reason 素通しで攻撃者に分岐情報を与えない）。
-            raise HTTPException(status_code=status, detail="signature verification rejected")
+            # status は §6.1 のとおり（401/403/400/409・registry 破損は 503）。詳細 reason は
+            # 上のログにのみ残し、レスポンス body には固定文字列のみ（reason 素通しで
+            # 攻撃者に分岐情報を与えない）。
+            raise HTTPException(status_code=status,
+                                detail="service auth configuration error"
+                                if reason == "registry_config_error"
+                                else "signature verification rejected")
         return
     # 署名ヘッダ皆無 → 旧 query token（Phase A）
     if not verify_token(token, token_env):
