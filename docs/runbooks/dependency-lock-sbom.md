@@ -36,6 +36,11 @@ uv pip install -r requirements.lock --python <tmpdir>/venv/Scripts/python.exe --
 （Linux/CI では `Scripts` → `bin`。import 一式が通れば本番依存の再現ビルド成立。
 2026-07-15 に Windows 3.12 で実測済み＝work-log 参照。）
 
+- **再生成時の diff の見方（RV-12-fix1）**: 再生成時、`requirements.lock` は（PyPI に動きが
+  なければ）収束するが、`sbom/sbom.cdx.json` は **timestamp・serialNumber（UUID）の差分が
+  毎回発生する**。これは CycloneDX 仕様上の正常動作であり、**lock ⇔ SBOM の package 集合
+  一致**（components の name/version が lock の pin と一致）で整合を確認する。
+
 ## 4. 位置づけ・既知の限界
 
 - **Railway の本番ビルドは従来どおり `requirements.txt` を使う**（本タスクではビルド入力を
