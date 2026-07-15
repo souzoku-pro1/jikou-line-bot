@@ -68,35 +68,65 @@ dedup_key であり**旧行を回収しない**。
 
 DRAFT §H-01（逸脱宣言節）にも同旨を追記済み。
 
-## 4. 人手 reset runbook（LINE stale processing）
+## 4. 人手 reset runbook（LINE stale processing）（fix6 改訂）
 
 前提: 本番は Railway PostgreSQL。PC-A からは `DATABASE_PUBLIC_URL` 経由で接続する
 （P1-004 migration 基盤の work-log と同流儀・internal host は PC-A から不達・URL 値は表示しない）。**Phase A は payload 本文を保存しない（payload_hash のみ）ため、サーバ側
 からの本文再現・自動再処理は不可能**（DRAFT §H-NEW-04）。回復の実体は顧客への聞き直し（DRAFT
 §9.4「同じ質問を再提示」）であり、reset は台帳を収束させ再 claim 可能にする操作である。
 
-### 4.1 対象特定
+**注意（RRV05136-H01）**: stale 条件（`claimed_at < now()-3600s`）は**処理の死を保証しない**。
+処理中の task は claimed_at を更新しない（heartbeat なし）ため、**3600 秒を超えてまだ生きている
+task の行も stale 条件に合致する**。fix5 初版の「stale 条件を WHERE に残す＝生きている処理を
+誤って reset しない」「rowcount 0＝処理が生きていた」の主張は**誤りであり撤回**する（stale 条件は
+「SELECT 後に状態が動いた行を触らない」再確認に過ぎず、rowcount 0 も「行が動いた」以上の意味を
+持たない）。処理生存の判定は 4.2 のログ目視・安全の確保は 4.3 の再起動で行う。
+
+### 4.1 対象特定と attempts 判定
 ```sql
-SELECT id, external_event_id, caller_id, attempts, received_at, claimed_at
+SELECT id, external_event_id, caller_id, attempts, received_at, claimed_at,
+       attempts >= 5 AS exhausted   -- 5 = INBOUND_LINE_MAX_ATTEMPTS の実運用値（既定5）
 FROM inbound_event
 WHERE provider = 'line' AND state = 'processing'
   AND (claimed_at IS NULL OR claimed_at < now() - interval '3600 seconds')
 ORDER BY received_at;
 ```
-（閾値は env `INBOUND_LINE_STALE_PROCESSING_SECONDS` の実運用値に合わせる。0 件なら滞留なしで終了。）
+（閾値は env `INBOUND_LINE_STALE_PROCESSING_SECONDS` の実運用値に合わせる。0 件なら滞留なしで
+終了。）`exhausted = true` の行は failed へ戻しても再 claim guard（`attempts < max`）を通らない
+ため **(a) の対象外**——(b) で failed_exhausted へ直接打ち切る（RRV05136-M02）。
 
-### 4.2 UPDATE 文の完成形
-対象 `id` を確認のうえ、目的別にどちらか一方を実行する。
+### 4.2 実行前確認: 処理生存の目視（必須）
+reset 実行前に Railway ログで**当該 event_id の処理が生存していないかを目視確認**する:
+```
+railway logs [--since ...] --json   # id=<event_id> の durable-inbound counter 行・
+                                    # [WEBHOOK]/[ERROR] 行の直近活動を確認（ログ時刻は UTC・JST=+9h）
+```
+直近に当該 event_id のログ活動があれば処理が生きている可能性が高い——4.3 の再起動手順を用いる
+（そのまま reset しない）。
 
-**(a) 再 claim 可能へ戻す**（再配送がまだ来得る／検証で再処理させたい場合）:
+### 4.3 推奨手順: デプロイ再起動 → reset
+**最も安全な手順**は、Railway の**デプロイ再起動で全 BackgroundTask を消滅させてから reset を
+実行する**こと（再起動後は旧 task がプロセスごと存在しないため、生存 task との併走が構造的に
+起きない）。再起動のタイミングは deploy 運用と同様、問い合わせの少ない時間帯に弁護士が指示する。
+
+**再起動なしで reset する場合**は、「stale だがまだ生きている task」との**併走（二重返信）リスクを
+受容する操作**であることを了解のうえ実行する（受容は比較裁定＝「検知可能な2回返信 > 検知困難な
+0回沈黙」・fix4 work-log §3.3 の枠内）。
+
+### 4.4 UPDATE 文の完成形
+対象 `id` と 4.1 の `exhausted` 判定を確認のうえ、どちらか一方を実行する。
+
+**(a) 再 claim 可能へ戻す**（`exhausted = false` の行のみ・再配送がまだ来得る／検証で再処理させたい場合）:
 ```sql
 UPDATE inbound_event
 SET state = 'failed', last_error = 'manual_reset_stale_processing'
 WHERE provider = 'line' AND state = 'processing' AND id = <対象id>
+  AND attempts < 5   -- 5 = INBOUND_LINE_MAX_ATTEMPTS の実運用値（RRV05136-M02）
   AND (claimed_at IS NULL OR claimed_at < now() - interval '3600 seconds');
 ```
 
-**(b) 打ち切って収束させる**（再配送終了済みで再処理の見込みなし・顧客対応は聞き直しで実施）:
+**(b) 打ち切って収束させる**（`exhausted = true` の行、または再配送終了済みで再処理の見込みなし・
+顧客対応は聞き直しで実施）:
 ```sql
 UPDATE inbound_event
 SET state = 'failed_exhausted', processed_at = now(),
@@ -104,10 +134,11 @@ SET state = 'failed_exhausted', processed_at = now(),
 WHERE provider = 'line' AND state = 'processing' AND id = <対象id>
   AND (claimed_at IS NULL OR claimed_at < now() - interval '3600 seconds');
 ```
-（いずれも stale 条件を WHERE に残す＝**生きている処理を誤って reset しない**排他。rowcount 0 は
-「その行が動いた＝処理が生きていた」なので再度 4.1 から。）
+（stale 条件を WHERE に残すのは「SELECT 後に状態が動いた行を触らない」ための再確認であり、
+**生存 task の排除は保証しない**——冒頭注意のとおり、安全は 4.2 の目視＋4.3 の再起動で確保する。
+rowcount 0 のときは行が動いているので再度 4.1 から。）
 
-### 4.3 再処理確認
+### 4.5 再処理確認
 1. (a) の場合: 再配送/重複到着で `attempts` が増え `state` が `processing→done` へ遷移することを
    4.1 と同型の SELECT（`WHERE id = <対象id>`）で確認。再配送が来ない場合は自動再処理は起きない
    ——顧客へ聞き直し（§9.4）で回復し、行は (b) で収束させる。

@@ -32,8 +32,7 @@
 - **逸脱内容**: InboundEvent へ durable 記録するが **crash 後の未処理 event を自動 replay しない**。
 - **理由**: 安全な返信再開には ConversationSession/PendingCommand（§9.17.1・RV-06）が必要。無いまま replay すると**二重返信**。
 - **失うもの/代替**: 自動回復なし。未処理は「滞留」として収束率低下・dead-man で**検知**（HOTFIX-01 型沈黙障害の検知は達成）。回復は人手/RV-06。
-- **既知制約（H-NEW-01-R3・fix5 明文化）**: stale processing 回収（fix4）の駆動は **LINE 再配送のみ**。したがって **LINE 再配送が終了した後に stale 化した行は自動回収の契機を失う**——台帳上は人手 reset まで non-terminal のまま滞留し、顧客対応上は次のイベント（顧客の再発話等・別 dedup_key＝旧行は回収しない）まで沈黙する。検知は **§6 観測**（最古 non-terminal 滞留時間・収束率低下）、回収は**人手 reset**（runbook: work-log 2026-07-15_RV-05-13-fix5 §4）。K4 ON の LINE 再配送は指数バックオフで後期ほど疎になるため、stale 閾値 3600 秒（既定）を超える頃には再送が尽きていることがあり得る＝閾値は再配送ウィンドウ内の過剰併走を抑える下限であり、末尾再送による回収は保証しない。
-- **fencing 不要（H-NEW-01）**: **LINE Phase A は fencing/epoch を持たない**。処理は既存 BackgroundTasks が1回だけ実行し、競合 consumer が再claim しないため（sortation の epoch fencing は §B-02・LINE の inbound_event には epoch 列を足さない＝ALTER 0 維持）。
+- **既知制約（H-NEW-01-R3・fix5 明文化）**: stale processing 回収（fix4）の駆動は **LINE 再配送のみ**。したがって **LINE 再配送が終了した後に stale 化した行は自動回収の契機を失う**——台帳上は人手 reset まで non-terminal のまま滞留し、顧客対応上は次のイベント（顧客の再発話等・別 dedup_key＝旧行は回収しない）まで沈黙する。検知は **§6 観測**（最古 non-terminal 滞留時間・収束率低下）、回収は**人手 reset**（runbook: work-log 2026-07-15_RV-05-13-fix5 §4）。K4 ON の LINE 再配送は指数バックオフで後期ほど疎になるため、stale 閾値 3600 秒（既定）を超える頃には再送が尽きていることがあり得る＝閾値は再配送ウィンドウ内の過剰併走を抑える下限であり、末尾再送による回収は保証しない。**LINE Phase A は epoch fencing を持たない**（inbound_event に epoch 列を足さない＝ALTER 0 維持・sortation の epoch fencing は §B-02）——排他 claim UPDATE が保証するのは**併走 claim 間の排他のみ**で claim 済み旧 task の失効 guard は無く、**stale 再 claim と生存中の旧 task の併走はあり得る**。まれな併走（二重返信）は比較裁定（work-log fix4 §3.3）どおり**受容・検知可能**（fix6: 旧「fencing 不要＝BackgroundTasks が1回だけ実行し競合 consumer が再claim しない」記述は fix4 の stale 再 claim 導入と矛盾するため削除し本行へ一本化）。
 - **解消条件**: RV-06 完了で逸脱解消 → 顧客Bot も durable replay へ（別票・K4 前提）。
 
 ## §1 統合方針（H-05: 同居＋fencing は sortation 専用）
@@ -47,7 +46,7 @@
 ## §2 schema
 
 ### 2.1 InboundEvent（同居・**ALTER なし**・fencing なし）
-`provider="line"` / `external_event_id=webhookEventId` / **`caller_id=LINE userId`**（H-02）/ `signature_result` / `payload_hash` / `state`（§5.1）/ `attempts` / `processed_at` / `last_error`。**epoch/fence 列は足さない**（Phase A は fencing 不要・§H-01）。
+`provider="line"` / `external_event_id=webhookEventId` / **`caller_id=LINE userId`**（H-02）/ `signature_result` / `payload_hash` / `state`（§5.1）/ `attempts` / `processed_at` / `last_error`。**epoch/fence 列は足さない**（Phase A は epoch fencing を持たない・併走受容は §H-01）。
 
 ### 2.2 IngestionReceipt（新表・**epoch fencing**・H-NEW-01）
 ```
@@ -79,7 +78,7 @@ processing_attempt(
 ```
 - **監査専用・判定には使わない（H-D4-02）**: fencing/状態判定は **receipt.epoch / receipt.last_outcome のみ**で行う。processing_attempt は「いつ どの epoch で どの phase を試みたか」の履歴のみ。
 - **ON DELETE CASCADE**: receipt を（retention/監査で）削除する場合、attempt も追随（孤児行を残さない）。
-- **LINE（inbound_event）は attempt を作らない**（fencing 不要・§H-01）。将来 provider 追加は別 attempt 表 or 別票で扱う（polymorphic に戻さない）。
+- **LINE（inbound_event）は attempt を作らない**（epoch fencing を持たない・§H-01）。将来 provider 追加は別 attempt 表 or 別票で扱う（polymorphic に戻さない）。
 
 ### 2.4 冪等キー contract（H-04）
 - **NULL/空 禁止** → durable insert 拒否＝5xx。
