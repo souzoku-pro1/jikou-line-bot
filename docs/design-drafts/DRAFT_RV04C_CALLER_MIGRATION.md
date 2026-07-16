@@ -3,6 +3,9 @@
 - 発注: 司令塔 2026-07-15夜（Phase 1 最終）／起草: PC-A 2026-07-16（S1）
 - **rev D2（2026-07-16）**: R-RV-04C-D 所見 12 件を司令塔裁定どおり反映（H01〜H08・M01/M03/M04・
   I03・§9 裁定確定）。RCF-M13（kintone revision 原子 claim・Phase 2 候補）は司令塔台帳へ起票済み。
+- **rev D3（2026-07-16）**: R-RV-04C-D2 残所見 6 件を反映（H05残=LINE送信後 crash 行＋sending
+  marker・D2-H01=stale received 監視・H06残=工程4の3小工程化・D2-M01=NEXT 期限 env・
+  D2-M02/M03=§8 実測系追補）。
 - 正本の上位: `DRAFT_RV04_HMAC_MIGRATION.md`（v2・NM01 v1 FROZEN）。**本 DRAFT はサーバ側
   contract（canonical・検証順・§6.1/6.2 reason 表）を一切変更しない**（FROZEN 非抵触が受入条件）。
 - 前提（票で確定済み）: K1=kintone webhook 冪等キーは top-level `id`（公式仕様）／K2=kintone 側
@@ -234,13 +237,22 @@ rotation）を 5 点セットで成立**させる（RV-04 §3 の採用条件）
   INSERT inbound_event(state='received', attempts=1)   ← 挿入時 state = received
     ├─ UNIQUE(dedup_key) 衝突 → 重複配信 = skip 応答（200・処理登録なし・行は不変）
     └─ INSERT 成功 = claim 成立 → 同一 request 内で処理続行
-         処理成功（LINE 送信＋kintone 送信済み=yes 更新まで完了）
+         （②③の再判定 PASS・LINE 送信を行うと確定した時点）
+           → UPDATE state='sending'                      ← 送信着手 marker（H05残・D3）
+             ＝ LINE 送信「直前」に同一 DB 内で原子的に記録（done 遷移とは別の遷移）
+         LINE 送信 → App 29 送信済み=yes 更新（既存 handler の副作用順）
+         処理成功（全副作用完了）
            → UPDATE state='done', processed_at=now()     ← terminal 化は全副作用の後
          処理失敗（例外）
            → UPDATE state='failed', last_error=分類コード → 5xx は返さない（副作用途中の
              再配信は無いため応答は結果に影響しない・失敗は観測対象）
   DB 到達不能（INSERT 自体が不能）→ §4 H04 のとおり 5xx（fail-closed・行なし）
 ```
+
+- **sending marker（H05残・緩和策）**: `state='sending'` は**既存 state 列の新しい値**であり
+  列追加なし＝**ALTER 0 維持**（state は Text・provider 別語彙は §5.1〔RV-05〕の流儀）。
+  marker の目的は「LINE 送信に着手した事実」を副作用の**前**に永続化し、crash 後の人手判別を
+  可能にすること（送信自体の原子化ではない——それは RCF-M13 の領分）。
 
 - **claim 主体 = INSERT の UNIQUE 勝者**（LINE の「排他 claim UPDATE」に相当する原子性を、
   kintone では**初回 INSERT そのもの**が担う。再配送が存在しないため re-claim 経路は不要）。
@@ -249,8 +261,19 @@ rotation）を 5 点セットで成立**させる（RV-04 §3 の採用条件）
   | crash 点 | 行の状態 | 帰結 |
   |---|---|---|
   | INSERT 前 | 行なし | イベント喪失（kintone 非再送）。検知=業務側（承認したのに送信されない）＋日次健診。回復=人手（レコード再操作で新 `id`） |
-  | INSERT 後〜副作用前 | `received` 滞留 | 送信は起きていない。滞留として観測（下記 backlog 監視）→人手リカバリ。**再操作しても旧行は残る**（新 `id` で新行）＝旧行は人手 reset（failed へ）または滞留観測のまま終息 |
-  | 副作用後〜terminal 書込前 | `received` 滞留（実は送信済み） | 二重送信は起きない（重複配信が来ても dedup が skip・再操作時は②③の 送信済み=yes 再判定が止める）。滞留観測→人手が kintone 側の 送信済み=yes を確認して行を手動 terminal 化 |
+  | INSERT 後〜sending marker 前 | `received` 滞留 | 送信は**確実に**起きていない。滞留として観測（§4.2b）→人手リカバリ（安全に再操作できる）。**再操作しても旧行は残る**（新 `id` で新行）＝旧行は人手 reset（failed へ）または滞留観測のまま終息 |
+  | **sending marker 後〜LINE 送信完了前**（D3） | `sending` 滞留 | 送信は**未遂の可能性**。marker だけでは送信有無を確定できない＝下記 runbook の「送信済みの可能性あり」扱い（LINE 側の実受信確認まで再操作を保留） |
+  | **LINE 送信成功後〜App 29 送信済み=yes 更新前**（H05残・独立行） | `sending` 滞留（実は LINE 送信済み・kintone 側は 送信済み=no のまま） | **裁定=二重通知許容**。この状態でレコードを人手再操作すると②③の再判定（送信済み=no）を**正しく通過**して再送され得る＝顧客に同内容が 2 回届く。**比較裁定: 検知可能な 2 回 > 沈黙の 0 回**（RV-05 fix4 §3.3 と同思想——2 回は顧客・事務所に見えて謝れる・0 回は静かに約束を破る）。緩和は sending marker による下記 runbook 判別 |
+  | 全副作用後〜terminal 書込前 | `sending` 滞留（実は全て完了） | 二重送信は起きない（重複配信は dedup が skip・再操作時は②③の 送信済み=yes 再判定が止める）。滞留観測→人手が kintone 側 送信済み=yes を確認して行を手動 terminal 化 |
+
+- **人手再操作 runbook（H05残・S3 で runbook 節として固定）**:
+  1. 滞留行の `state` を確認——`received`=送信未着手（安全に再操作可）／`sending`=**「送信済みの
+     可能性あり」**。
+  2. `sending` の場合: App 29 の 送信済み フィールド・LINE の実受信（弁護士 or 管理画面で顧客
+     トーク確認）・Railway ログ（[LINE] reply/push OK 行）を突き合わせて送信有無を判別する。
+  3. **最終判断は人**——判別がつかない場合に再操作するか（二重通知リスクを取るか）
+     放置するか（未達リスクを取るか）は、内容の性質（承認済み回答の重要度）で大野が判断する。
+     機械は marker の提示まで（自動再送はしない）。
 - **既存 Stripe/LINE の reclaim・backlog 監視からの分離条件**:
   1. **reclaim 非適用**: LINE の stale processing 再 claim（RV-05-13 fix4）は `dedup_key`
      prefix=`line:` の claim 経路内でのみ発動・Stripe の stale 再 claim も Stripe 経路内。
@@ -265,11 +288,31 @@ rotation）を 5 点セットで成立**させる（RV-04 §3 の採用条件）
     専用・DRAFT_RV05 §H-01）。kintone レーンも epoch を持たない＝**不変条件維持**
     （併走の可能性は「再配送が存在しない」ため LINE より狭く、②③が受容域を担保）。
   - **state 正本**: state の正本は inbound_event 行（LINE/Stripe と同型）。kintone は
-    `received/done/failed` の 3 値のみ使用（`processing`・`failed_exhausted` は使わない＝
-    同期処理で claim=INSERT のため中間 state が不要・attempts は 1 固定で加算経路なし）。
+    `received/sending/done/failed` の **4 値**のみ使用（D3 で `sending` 追加。
+    `processing`・`failed_exhausted` は使わない＝同期処理で claim=INSERT のため LINE 型の
+    中間 state が不要・attempts は 1 固定で加算経路なし。`sending` は送信着手 marker であり
+    再 claim 対象にしない——kintone に再配送は存在しない）。
   - **migration 要否（確定）**: **不要（ALTER 0）**。使用列は provider／external_event_id／
     caller_id（=app id）／dedup_key／payload_hash／event_type（=body type）／state／
-    received_at／processed_at／last_error／attempts——すべて既存列。
+    received_at／processed_at／last_error／attempts——すべて既存列（`sending` は state 列の
+    値追加のみ）。
+
+### 4.2b kintone provider の滞留監視（D2-H01・既存 backlog 監視への統合）
+
+- **対象**: provider="kintone" の `received`・`sending` 滞留（=crash 表の中間 3 行の検知装置）。
+- **年齢閾値**: `KINTONE_STALE_EVENT_HOURS`（env・**既定 1 時間**）。根拠: kintone レーンは
+  同期処理（秒オーダー）であり、1 時間残留は確実に crash/障害。Stripe の 24h（再送待ち前提）
+  とは意味が違うため**閾値を分離**する。
+- **件数・表示**: 件数＋PK 上位 10 件のみ（event id・record 内容は出さない＝D17 流儀踏襲）。
+- **統合方法**: `check_journal_backlog`（daily_healthcheck 監視項目E）の集計へ **provider
+  次元を追加**し、kintone 分は**専用文言**（`kintone滞留: received/sending が1時間超 N件
+  (PK=[…]) — runbook: <§4.2 の人手再操作 runbook>`）で別警報にする。既存 Stripe/LINE の
+  閾値（24h）・文言・runbook 参照は**不変**。ゲートは既存 `STRIPE_EVENT_JOURNAL_ENABLED` に
+  依存させず `KINTONE_EVENT_DEDUP_ENABLED`（§4-①）で判定（flag OFF なら kintone 行が
+  存在しないため検査もスキップ）。
+- **実測テスト（S3）**: received/sending の閾値超え fixture で専用警報文言が出ること・
+  閾値内は出ないこと・Stripe/LINE の既存警報に影響しないこと（§8 D2-M03 の provider 不変
+  assert と対）。
 
 ## §5 移行順序と各段の rollback【票論点5】
 
@@ -311,7 +354,25 @@ rollback は複数箇所の状態が絡むため、§5.1 の順序付き複合�
 | 5-1 期限付き dual-accept | server が**新旧 2 token を期限付きで併存受理**する状態にする（S3 実装: `KINTONE_WEBHOOK_TOKEN`＋`KINTONE_WEBHOOK_TOKEN_NEXT` の 2 env 受理・期限は運用で管理）→ [人] `_NEXT` に新 token 投入 | 旧 token で 200 継続（無停止）・起動ログ正常 | `_NEXT` を外す（旧のみ受理へ即復帰） |
 | 5-2 kintone URL 更新 | [人] kintone App 29 Webhook 設定の URL を新 token 付きへ更新 | — | URL を旧 token 付きへ戻す（5-1 併存中は無停止で戻せる） |
 | 5-3 新 token 実着確認 | [人] App 29 でテスト遷移を 1 回発火 | PC-A: ログで**新 token での認証成功**を実測（旧 token 到達が 0 になったことも併せて確認） | （確認のみ・戻す対象なし） |
-| 5-4 旧 token revoke | [人] `KINTONE_WEBHOOK_TOKEN` を新 token 値へ差し替え・`_NEXT` を外す（＝旧値はどこにも無い） | 旧 token で 404・新 token で 200 の実測 | **不可逆側**: 旧値の再投入はしない（露出済みのため）。問題時は 5-1 の形（新値＋さらに次の新値）で前へ回す |
+| 5-4 旧 token revoke | **H06残（D3）: 下記 3 小工程に分解**（Railway の env 変更は**都度再デプロイ**を伴う前提で、どの再デプロイ時点でも新 token が受理される**原子性非依存の順序**にする） | 各小工程に記載 | 各小工程に記載 |
+
+**5-4 の 3 小工程（D3）**:
+
+| 小工程 | 操作（[人]） | この時点の受理状態 | 確認 | rollback |
+|---|---|---|---|---|
+| 5-4a primary 差替え | `KINTONE_WEBHOOK_TOKEN` を**新 token 値**へ差替え（`_NEXT`=新のまま・再デプロイ発生） | primary=新・NEXT=新（同値 2 本＝再デプロイ跨ぎでも新 token は必ず受理・**旧 token はこの再デプロイ完了時点で死ぬ**） | 起動正常・webhook 200 継続 | primary を旧値へ戻す…は**不可**（露出済み）。不調なら 5-1 の形で更に次の新値へ前進 |
+| 5-4b 新 token 成功ログ実測 | App 29 でテスト遷移 1 回発火 | 同上 | PC-A: **新 primary での認証成功**をログ実測（5-3 と別に、primary 差替え後の実測として独立に取る） | （確認のみ） |
+| 5-4c NEXT 削除 | `KINTONE_WEBHOOK_TOKEN_NEXT`（＋`_NEXT_EXPIRES`）を削除（再デプロイ発生） | primary=新のみ（定常形） | 起動正常・webhook 200 継続・NEXT 残置検査（下記 D2-M01）が消えること | `_NEXT` に新値を再投入（5-4a 直後の形へ戻る・無害） |
+
+- **NEXT の期限管理（D2-M01）**: `KINTONE_WEBHOOK_TOKEN_NEXT` を置く際は
+  **`KINTONE_WEBHOOK_TOKEN_NEXT_EXPIRES`（日付 env・例 `2026-07-31`）を併設**する。
+  - **期限超過時**: 起動ログに**固定文言の警告**（値・token は出さない）＋
+    `daily_healthcheck` に **NEXT 残置検査を 1 項目追加**——`_NEXT` が設定済みかつ
+    `_NEXT_EXPIRES` 超過（または `_EXPIRES` 未設定）なら**通知本文に notice として 1 行**
+    載せる（**警報ではない**＝異常検知扱いにしない。dual-accept 併存の消し忘れを
+    可視化するだけで可用性影響はないため）。
+  - **期限の owner = 大野**（runbook に明記・S3 で runbook 節として固定）: 期限の設定・延長・
+    5-4c での削除はすべて大野の操作。PC-A は notice の検知報告まで。
 
 （ingest 側の旧 `*_INGEST_TOKEN` 削除・GAS 旧 token 定数削除は段 5 と同時でよいが、
 **§5.1 rollback の手順 2 が参照するため、削除は当該 lane の段 4 安定確認後**とする。）
@@ -389,6 +450,20 @@ rollback は複数箇所の状態が絡むため、§5.1 の順序付き複合�
   - H07 strict 検証: 異常形 5 種で「起動成功してしまう」を旧コードで実測→実装後 起動停止。
   - H05 state/監視分離: kintone `failed` 行が既存 backlog 警報（Stripe 文言）に混入することを
     旧コードで実測→実装後 provider 別警報。
+  - **crash 境界（D2-M02・marker 含む）**: LINE 送信直前 crash（marker のみ）／LINE 送信後・
+    App 29 更新前 crash（marker＋送信済み）の各 fixture で、旧コード=「行が `received` の
+    まま区別不能」を実測→実装後 `sending` marker により判別可能（§4.2 crash 表の全行を
+    テストで固定）。
+  - **stale received/sending（D2-M02・§4.2b）**: 閾値超え fixture で旧コード=「警報なし
+    （検知空白）or Stripe 文言へ混入」を実測→実装後 kintone 専用警報。
+  - **rotation 4 状態 table test（D2-M02）**: {old-only／dual（primary=旧+NEXT=新）／
+    new-primary+NEXT（5-4a 後）／NEXT 削除後} の 4 状態 × {旧 token・新 token} の受理/拒否を
+    table test で固定（旧コード=NEXT 概念なしで dual 状態が FAIL する形）。
+- **provider 不変 assert（D2-M03）**: Stripe/LINE/kintone の**混在 fixture**（3 provider の
+  滞留行を同一 DB に共存させる）で、監視集計の **provider 別件数・provider 別最古時刻・
+  既存閾値（Stripe/LINE=24h が kintone=1h に引きずられないこと）・警報文面（Stripe 文言に
+  kintone が混ざらない/逆も）**を個別に assert するテストを S3 受入に含める（§4.2b の
+  分離条件の機械担保・既存 Stripe/LINE 監視の回帰防止）。
 
 ## §9 OPEN → 裁定確定（R-RV-04C-D・D2 反映済み）
 
