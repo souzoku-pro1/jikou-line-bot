@@ -655,7 +655,8 @@ async def kintone_approval_webhook(request: Request):
     if _dedup:
         from hub.kintone_lane import (claim_event, extract_event_id, observe_xff,
                                       mark_noop_done, mark_sending, mark_done,
-                                      mark_failed_preflight, observe_pre_claim_reject)
+                                      mark_failed_preflight, observe_pre_claim_reject,
+                                      is_record_not_found)
         observe_xff(request.headers.get("x-forwarded-for", ""))  # §4.1 observe-only
         event_id = extract_event_id(body)
         if not event_id:
@@ -697,15 +698,17 @@ async def kintone_approval_webhook(request: Request):
         return {"ok": True, "skip": "not_triggered"}
 
     # 最新レコードを取り直す（先生の修正を反映するため・hub 経由）
-    # H02: 404 確定のみ record_not_found（no-op done）。その他 KintoneError（401/timeout/
+    # H02残: record 不存在の確定は **HTTP 404 かつ既知 record-not-found code（GAIA_RE01）** の
+    # ときのみ no-op done。404×未知 code・code 欠落・非 JSON、および 404 以外（401/timeout/
     # 接続/5xx）は transient として mark_failed_preflight＋LINE write 0（done 化しない）。
     try:
         record = await hub_kintone.get_record(_APP_APPROVAL, record_id)
     except hub_kintone.KintoneError as e:
-        if _ev and getattr(e, "status", 0) != 404:
-            await mark_failed_preflight(_ev, f"get_record_error_{getattr(e, 'status', 0)}")
+        _st, _cd = getattr(e, "status", 0), getattr(e, "code", "")
+        if _ev and not is_record_not_found(_st, _cd):
+            await mark_failed_preflight(_ev, f"get_record_error_{_st}_{_cd or 'nocode'}")
             return {"ok": True, "skip": "get_record_error"}   # LINE write 0・failed 記録
-        record = None   # 404 確定 or flag OFF → 従来どおり record_not_found
+        record = None   # record 不存在確定（GAIA_RE01）or flag OFF → record_not_found
     if not record:
         if _ev:
             await mark_noop_done(_ev, "skip_record_not_found")

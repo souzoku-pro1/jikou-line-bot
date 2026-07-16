@@ -37,6 +37,17 @@ NOOP_REASONS = frozenset({
 
 _PROVIDER = "kintone"
 
+# H02残: kintone の「record 不存在」を示す既知 vendor code（no-op done を許すのはこれのみ）。
+# 404 でも app/endpoint/設定起因の 404（未知 code・code 欠落・非 JSON＝code 空）は含めない。
+# 出典: kintone REST API—GAIA_RE01 = "The specified record is not found."（HTTP 404）。
+RECORD_NOT_FOUND_CODES = frozenset({"GAIA_RE01"})
+
+
+def is_record_not_found(status: int, code: str) -> bool:
+    """H02残: record 不存在の確定条件＝HTTP 404 **かつ** 既知 record-not-found code。
+    404×未知 code・code 欠落（非 JSON 含む）は False（＝呼び出し側は failed_preflight）。"""
+    return status == 404 and (code or "") in RECORD_NOT_FOUND_CODES
+
 
 class KintoneLaneStateError(RuntimeError):
     """M02: terminal/marker UPDATE の rowcount!=1（行消失・想定外 state）。fail-closed。"""
