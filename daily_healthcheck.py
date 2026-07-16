@@ -47,6 +47,15 @@ logger = logging.getLogger("daily_healthcheck")
 _JST = timezone(timedelta(hours=9))
 
 
+def _iso(dt) -> str:
+    """最古時刻の表示（UTC・分精度・tz 無しは UTC 補完）。件数/時刻のみで PII は含まない。"""
+    if dt is None:
+        return "?"
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%MZ")
+
+
 # ══════════════════════════════════════════════════════════════
 # 監視項目A: Anthropic Models API
 # ══════════════════════════════════════════════════════════════
@@ -234,20 +243,41 @@ async def check_journal_backlog() -> list[str]:
                         f"(PK={sorted(failed)[:10]}) — runbook: docs/runbooks/"
                         "stripe-journal-recovery.md")
             if kintone_on:
-                # RV-04c §4.2b: kintone の received/sending 滞留（既定1h・§4.2 人手 runbook）
+                # RV-04c §4.2b/M04/M05: kintone の滞留（received/sending）と失敗（failed）を
+                # **別文言**で検知し、それぞれ provider 別**最古時刻**を併記する。
                 from hub.kintone_lane import stale_hours
+                _RB = "docs/runbooks/2026-07_kintone-lane-recovery.md"
                 cutoff_k = now - timedelta(hours=stale_hours())
-                k_stuck = (await session.execute(
-                    sa.select(InboundEvent.id).where(
+                # 滞留（未処理）: received/sending が閾値超
+                stuck_rows = (await session.execute(
+                    sa.select(InboundEvent.id, InboundEvent.received_at).where(
                         InboundEvent.provider == "kintone",
                         InboundEvent.state.in_(("received", "sending")),
-                        InboundEvent.received_at < cutoff_k))).scalars().all()
-                if k_stuck:
+                        InboundEvent.received_at < cutoff_k))).all()
+                if stuck_rows:
+                    ids = sorted(r[0] for r in stuck_rows)
+                    oldest = min(r[1] for r in stuck_rows)
                     problems.append(
-                        f"kintone滞留: received/sending が{stale_hours()}時間超 "
-                        f"{len(k_stuck)}件 (PK={sorted(k_stuck)[:10]}) — runbook: "
-                        "docs/work-logs/2026-07-16_RV-04c-S2_gas-signing.md の"
-                        "§4.2 人手再操作手順")
+                        f"kintone滞留(未処理): received/sending が{stale_hours()}時間超 "
+                        f"{len(stuck_rows)}件 最古={_iso(oldest)} "
+                        f"(PK={ids[:10]}) — runbook: {_RB}")
+                # 失敗: failed（transient 失敗＝mark_failed_preflight 等・再送なし＝人手）
+                failed_rows = (await session.execute(
+                    sa.select(InboundEvent.id, InboundEvent.received_at,
+                              InboundEvent.last_error).where(
+                        InboundEvent.provider == "kintone",
+                        InboundEvent.state == "failed",
+                        InboundEvent.received_at < cutoff_k))).all()
+                if failed_rows:
+                    ids = sorted(r[0] for r in failed_rows)
+                    oldest = min(r[1] for r in failed_rows)
+                    # last_error は境界化された分類コード（get_record_error_<status>/skip_*）＝
+                    # 自由文字列でないため distinct をそのまま表示（PII なし）。
+                    classes = sorted({r[2] or "unknown" for r in failed_rows})
+                    problems.append(
+                        f"kintone失敗: failed が{stale_hours()}時間超 {len(failed_rows)}件 "
+                        f"最古={_iso(oldest)} 分類={classes[:5]} "
+                        f"(PK={ids[:10]}) — runbook: {_RB}")
     except (sa.exc.ProgrammingError, sa.exc.OperationalError) as e:
         # テーブル不在（migration未適用）は静かにスキップ。それ以外のDB異常は
         # 実行失敗として上位に伝える（分類のみ・本文を握りつぶさない）

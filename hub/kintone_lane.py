@@ -38,6 +38,10 @@ NOOP_REASONS = frozenset({
 _PROVIDER = "kintone"
 
 
+class KintoneLaneStateError(RuntimeError):
+    """M02: terminal/marker UPDATE の rowcount!=1（行消失・想定外 state）。fail-closed。"""
+
+
 def dedup_enabled() -> bool:
     return os.environ.get(_FLAG, "").strip().lower() in _FLAG_TRUE
 
@@ -52,15 +56,29 @@ def stale_hours() -> int:
 
 
 def extract_event_id(body) -> str | None:
-    """kintone webhook body の top-level `id`（通知ごとに一意・K1 確定）。"""
+    """kintone webhook body の top-level `id`（通知ごとに一意・K1 確定）。
+    H01: **scalar（str/int）かつ非空**のみ受理。欠落・空・型不正（dict/list/bool 等）は
+    None（呼び出し側は claim せず 400 系で拒否＝LINE write 0）。"""
     if not isinstance(body, dict):
         return None
     v = body.get("id")
-    return str(v) if v else None
+    if isinstance(v, bool) or v is None:
+        return None
+    if isinstance(v, int):
+        return str(v)
+    if isinstance(v, str):
+        return v if v.strip() else None
+    return None   # dict/list/float 等の型不正
 
 
 def dedup_key(event_id: str) -> str:
     return "kintone:" + build_idempotency_key("kintone", event_id)
+
+
+def observe_pre_claim_reject() -> None:
+    """H01: id 欠落/空/型不正で claim 前に拒否した件を固定 reason で観測する。
+    拒否イベントは行が残らず滞留監視の対象外のため、ここで別計数する（固定文言・emit 不要）。"""
+    logger.warning("kintone webhook rejected pre-claim: invalid_or_missing_id")
 
 
 async def claim_event(*, event_id: str, caller_id: str, event_type: str | None,
@@ -79,7 +97,14 @@ async def claim_event(*, event_id: str, caller_id: str, event_type: str | None,
                 state="received", received_at=sa.func.now(), attempts=1))
         return "new"
     except IntegrityError:
-        return "duplicate"
+        # M01: IntegrityError を無条件に duplicate としない。同一 dedup_key 行の実在を再照合し、
+        # 存在＝真の重複配信（duplicate）・不在＝別制約違反等の異常として再送出（fail-closed）。
+        async with session_scope() as s:
+            exists = (await s.execute(sa.select(InboundEvent.id).where(
+                InboundEvent.dedup_key == dk))).first()
+        if exists:
+            return "duplicate"
+        raise
 
 
 async def _event_pk(event_id: str) -> int | None:
@@ -94,11 +119,13 @@ async def mark_noop_done(event_id: str, reason: str) -> None:
     if reason not in NOOP_REASONS:
         raise ValueError(f"noop reason not in enum: {reason}")
     async with session_scope() as s:
-        await s.execute(sa.update(InboundEvent)
-                        .where(InboundEvent.dedup_key == dedup_key(event_id),
-                               InboundEvent.state == "received")
-                        .values(state="done", processed_at=sa.func.now(),
-                                last_error=reason))
+        r = await s.execute(sa.update(InboundEvent)
+                            .where(InboundEvent.dedup_key == dedup_key(event_id),
+                                   InboundEvent.state == "received")
+                            .values(state="done", processed_at=sa.func.now(),
+                                    last_error=reason))
+        if r.rowcount != 1:   # M02: 行消失・想定外 state は fail-closed
+            raise KintoneLaneStateError("mark_noop_done rowcount!=1")
 
 
 async def mark_sending(event_id: str) -> bool:
@@ -115,22 +142,27 @@ async def mark_sending(event_id: str) -> bool:
 async def mark_done(event_id: str) -> None:
     """全副作用完了後の terminal（sending→done・last_error=NULL＝送信完了の印）。"""
     async with session_scope() as s:
-        await s.execute(sa.update(InboundEvent)
-                        .where(InboundEvent.dedup_key == dedup_key(event_id),
-                               InboundEvent.state == "sending")
-                        .values(state="done", processed_at=sa.func.now(),
-                                last_error=None))
+        r = await s.execute(sa.update(InboundEvent)
+                            .where(InboundEvent.dedup_key == dedup_key(event_id),
+                                   InboundEvent.state == "sending")
+                            .values(state="done", processed_at=sa.func.now(),
+                                    last_error=None))
+        if r.rowcount != 1:   # M02
+            raise KintoneLaneStateError("mark_done rowcount!=1")
 
 
 async def mark_failed_preflight(event_id: str, error_class: str) -> None:
     """§4.2 phase 表: marker **前**の確定失敗のみ failed（未送信確定）。
-    marker 後は呼ばない（sending 維持・failed 上書き禁止）。"""
+    marker 後は呼ばない（sending 維持・failed 上書き禁止）。error_class は分類コード
+    （H02 の get_record_error 等・M05 の failed 分類監視で参照）。"""
     async with session_scope() as s:
-        await s.execute(sa.update(InboundEvent)
-                        .where(InboundEvent.dedup_key == dedup_key(event_id),
-                               InboundEvent.state == "received")
-                        .values(state="failed", processed_at=sa.func.now(),
-                                last_error=(error_class or "unknown")[:100]))
+        r = await s.execute(sa.update(InboundEvent)
+                            .where(InboundEvent.dedup_key == dedup_key(event_id),
+                                   InboundEvent.state == "received")
+                            .values(state="failed", processed_at=sa.func.now(),
+                                    last_error=(error_class or "unknown")[:100]))
+        if r.rowcount != 1:   # M02
+            raise KintoneLaneStateError("mark_failed_preflight rowcount!=1")
 
 
 # ── §4.1 XFF 観測モード（observe-only・reject しない） ───────────────────────

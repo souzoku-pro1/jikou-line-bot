@@ -247,7 +247,11 @@ _LEGACY_ERROR_FIXED_MSG = "legacy disabled paths configuration invalid"
 
 def validate_legacy_disabled_paths_startup() -> frozenset:
     """RV-04c H07: 起動時 strict 検証。不正なら固定文言で起動停止（P1-114 方式合流）。
-    戻り値=検証済み停止 path 集合（起動ログ用）。"""
+    戻り値=検証済み停止 path 集合（起動ログ用）。
+    H03: dual-accept OFF のときは **検証しない**（停止 list は dual-accept ON 時のみ意味を
+    持つため・OFF は env が inert＝現行 byte 不変）。"""
+    if not dual_accept_enabled():
+        return frozenset()
     raw = os.environ.get(_LEGACY_DISABLED_ENV, "")
     try:
         return _parse_legacy_disabled_strict(raw)
@@ -256,8 +260,10 @@ def validate_legacy_disabled_paths_startup() -> frozenset:
 
 
 def legacy_disabled_paths() -> frozenset:
-    """実行時アクセサ。起動時 strict 検証が通っている前提。万一の parse 失敗は空集合
-    （起動時に fail-fast 済みのため通常到達しない・500 storm を避ける保守側）。"""
+    """実行時アクセサ。H03: dual-accept OFF は空集合（旧経路に一切干渉しない）。
+    ON 時は起動 strict 検証が通っている前提（parse 失敗は空集合＝500 storm を避ける保守側）。"""
+    if not dual_accept_enabled():
+        return frozenset()
     try:
         return _parse_legacy_disabled_strict(os.environ.get(_LEGACY_DISABLED_ENV, ""))
     except ServiceAuthConfigError:

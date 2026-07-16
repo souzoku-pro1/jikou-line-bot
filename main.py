@@ -650,27 +650,30 @@ async def kintone_approval_webhook(request: Request):
         except Exception:
             raise HTTPException(status_code=400, detail="invalid json")
 
-    # RV-04c 冪等 claim（flag ON・§4.2）。_ev は claim 済み event_id（flag OFF/未取得は None）。
+    # RV-04c 冪等 claim（flag ON・§4.2）。_ev は claim 済み event_id（flag OFF は None）。
     _ev = None
     if _dedup:
         from hub.kintone_lane import (claim_event, extract_event_id, observe_xff,
-                                      mark_noop_done, mark_sending, mark_done)
+                                      mark_noop_done, mark_sending, mark_done,
+                                      mark_failed_preflight, observe_pre_claim_reject)
         observe_xff(request.headers.get("x-forwarded-for", ""))  # §4.1 observe-only
         event_id = extract_event_id(body)
-        if event_id:
-            try:
-                outcome = await claim_event(
-                    event_id=event_id,
-                    caller_id=str((body.get("app") or {}).get("id") or "kintone"),
-                    event_type=body.get("type"), payload=raw)
-            except Exception:
-                # H04 fail-closed: dedup 不能（DB 障害等）は処理せず 5xx（喪失は §4.2b 観測）
-                raise HTTPException(status_code=503, detail="event store unavailable")
-            if outcome == "duplicate":
-                return {"ok": True, "skip": "duplicate_delivery"}
-            _ev = event_id
-        else:
-            logger.warning("[KINTONE] webhook に top-level id が無い（dedup せず処理）")
+        if not event_id:
+            # H01: id 欠落/空/型不正は claim 前に拒否（LINE write 0・固定 reason の 400）。
+            # 行を作らないため滞留監視ではなく専用計数で観測する。
+            observe_pre_claim_reject()
+            raise HTTPException(status_code=400, detail="invalid webhook id")
+        try:
+            outcome = await claim_event(
+                event_id=event_id,
+                caller_id=str((body.get("app") or {}).get("id") or "kintone"),
+                event_type=body.get("type"), payload=raw)
+        except Exception:
+            # H04 fail-closed: dedup 不能（DB 障害等）は処理せず 5xx（喪失は §4.2b 観測）
+            raise HTTPException(status_code=503, detail="event store unavailable")
+        if outcome == "duplicate":
+            return {"ok": True, "skip": "duplicate_delivery"}
+        _ev = event_id
 
     # レコード ID を取得（hub/webhook_auth・従来と同一ロジック）
     record_id = extract_record_id(body)
@@ -694,10 +697,15 @@ async def kintone_approval_webhook(request: Request):
         return {"ok": True, "skip": "not_triggered"}
 
     # 最新レコードを取り直す（先生の修正を反映するため・hub 経由）
+    # H02: 404 確定のみ record_not_found（no-op done）。その他 KintoneError（401/timeout/
+    # 接続/5xx）は transient として mark_failed_preflight＋LINE write 0（done 化しない）。
     try:
         record = await hub_kintone.get_record(_APP_APPROVAL, record_id)
-    except hub_kintone.KintoneError:
-        record = None
+    except hub_kintone.KintoneError as e:
+        if _ev and getattr(e, "status", 0) != 404:
+            await mark_failed_preflight(_ev, f"get_record_error_{getattr(e, 'status', 0)}")
+            return {"ok": True, "skip": "get_record_error"}   # LINE write 0・failed 記録
+        record = None   # 404 確定 or flag OFF → 従来どおり record_not_found
     if not record:
         if _ev:
             await mark_noop_done(_ev, "skip_record_not_found")
