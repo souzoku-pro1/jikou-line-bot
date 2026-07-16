@@ -64,18 +64,34 @@ class BuilderError(ValueError):
     """builder 入力違反（field 名 allowlist 外・filename 禁止文字等）。"""
 
 
+import re as _re
+
+_DRIVE_ID_RE = _re.compile(r"[A-Za-z0-9_-]{1,128}")
+
+
+def validate_drive_id(drive_file_id) -> str:
+    """M01: fallback へ埋め込む driveFileId を送出前検証（gas validateDriveId_ と等価）。
+    固定文字集合 [A-Za-z0-9_-]・長さ 1..128。欠落/非 ASCII/CR/LF/quote は BuilderError。
+    fullmatch で末尾改行も弾く（JS の /^...$/ と同等挙動）。"""
+    if drive_file_id is None or drive_file_id == "":
+        raise BuilderError("driveFileId missing")
+    if not isinstance(drive_file_id, str) or not _DRIVE_ID_RE.fullmatch(drive_file_id):
+        raise BuilderError("driveFileId invalid charset/length")
+    return drive_file_id
+
+
 def sanitize_filename(raw_name: str, drive_file_id: str) -> str:
     """§1.1b filename 規則（採る方式 1 つに固定）。
     - CR/LF/NUL/`"` を含む → BuilderError（送出前例外・インジェクション根絶）。
-    - 非 ASCII（>127）を含む → ASCII fallback `doc-<driveFileId>.<ext>`
-      （<ext>=原名末尾の ASCII 英数字拡張子・取れなければ bin）。
+    - 非 ASCII（>127）を含む → ASCII fallback `doc-<driveFileId>.<ext>`（M01: driveFileId
+      を validate_drive_id で検証してから埋め込む）。
     - filename* は使わない。"""
     for c in _FILENAME_FORBIDDEN:
         if c in raw_name:
             raise BuilderError(f"filename forbidden char: {c!r}")
     if all(ord(c) <= 127 for c in raw_name):
         return raw_name
-    # 非 ASCII → fallback
+    validate_drive_id(drive_file_id)   # M01: fallback 埋め込み前に検証
     ext = "bin"
     dot = raw_name.rfind(".")
     if dot != -1:
@@ -291,57 +307,82 @@ class TestFieldNameAllowlist(unittest.TestCase):
                          "GAS helper の LANE_FIELDS がサーバ Form 定義と不一致")
 
 
+# H02: 隔離テスト endpoint（本番ルーティング非接触）で FastAPI 復元後の field/filename/
+# file bytes を捕捉し、builder 入力と**完全一致**を assert する。
+from fastapi import FastAPI, File, Form, UploadFile  # noqa: E402
+
+_echo_app = FastAPI()
+
+
+@_echo_app.post("/echo")
+async def _echo(file: UploadFile | None = File(default=None),
+                drive_file_id: str | None = Form(default=None),
+                case_hint: str | None = Form(default=None),
+                drive_file_url: str | None = Form(default=None)):
+    data = await file.read() if file is not None else b""
+    return {"filename": file.filename if file is not None else None,
+            "file_hex": data.hex(), "drive_file_id": drive_file_id,
+            "case_hint": case_hint, "drive_file_url": drive_file_url}
+
+
+_echo_client = TestClient(_echo_app)
+
+
 class TestServerParserRoundtrip(unittest.TestCase):
-    """§1.1b: builder 生成 body を実サーバ multipart parser に通し、認証前に parse される
-    こと（=field/ファイルが復元される）。認証は署名なしで token を付け 400（PDF 要求）＝
-    「parse は通ったが file 内容で弾かれた」ではなく「ゲート通過して endpoint に到達」を見る。
-    ここでは parser の健全性のみを対象にするため、koseki に有効 token で通す。"""
+    """§1.1b（H02）: builder 生成 body を FastAPI multipart parser に通し、復元後の
+    field 値・filename・file bytes が builder 入力と **byte 完全一致**することを assert する。
+    隔離 endpoint（/echo）を使い本番ルーティングに非接触。"""
 
-    def _post(self, boundary, parts, path="/koseki/ingest",
-              token="koseki-legacy-token"):
+    def _roundtrip(self, boundary, parts):
         body = build_multipart(boundary, parts)
-        client = TestClient(main.app)
-        with unittest.mock.patch.dict(os.environ, {**_ENV}):
-            os.environ.pop("SERVICE_AUTH_DUAL_ACCEPT_ENABLED", None)  # 旧 token 経路
-            return client.post(f"{path}?token={token}", content=body,
-                               headers={"Content-Type":
-                                        f"multipart/form-data; boundary={boundary}"})
+        return _echo_client.post("/echo", content=body, headers={
+            "Content-Type": f"multipart/form-data; boundary={boundary}"})
 
-    def test_valid_pdf_part_reaches_endpoint(self):
+    def test_field_and_file_bytes_restored_exactly(self):
         parts = [{"name": "file", "filename": "koseki.pdf",
                   "content_type": "application/pdf",
                   "value": b"%PDF-1.4 test\n%%EOF"},
                  {"name": "drive_file_id", "filename": None,
                   "content_type": None, "value": b"F-rt1"}]
-        r = self._post("RV04Crt1", parts)
-        # koseki は実処理へ進む（kintone 未設定で失敗しうる）が、少なくとも 400 PDF 要求
-        # ではない＝parse 成功・file 認識。ここでは 4xx/5xx いずれでも parse 到達を確認。
-        self.assertNotEqual(r.status_code, 404, r.text)   # ゲート通過
-        self.assertNotIn("PDFファイルを送信してください", r.text)  # file が parse された
+        j = self._roundtrip("RV04Crt1", parts).json()
+        self.assertEqual(j["filename"], "koseki.pdf")            # filename 完全一致
+        self.assertEqual(j["file_hex"], b"%PDF-1.4 test\n%%EOF".hex())  # file bytes 一致
+        self.assertEqual(j["drive_file_id"], "F-rt1")           # field 値一致
 
-    def test_non_ascii_fallback_body_parses(self):
-        fn = sanitize_filename("戸籍謄本.pdf", "F-rt2")
+    def test_non_ascii_fallback_filename_restored(self):
+        fn = sanitize_filename("戸籍謄本.pdf", "F-rt2")           # doc-F-rt2.pdf
         parts = [{"name": "file", "filename": fn,
-                  "content_type": "application/pdf",
-                  "value": b"%PDF-1.4 jp\n%%EOF"},
+                  "content_type": "application/pdf", "value": b"%PDF jp\n%%EOF"},
                  {"name": "drive_file_id", "filename": None,
                   "content_type": None, "value": b"F-rt2"}]
-        r = self._post("RV04Crt2", parts)
-        self.assertNotEqual(r.status_code, 404, r.text)
-        self.assertNotIn("PDFファイルを送信してください", r.text)
+        j = self._roundtrip("RV04Crt2", parts).json()
+        self.assertEqual(j["filename"], "doc-F-rt2.pdf")        # fallback filename が復元される
+        self.assertEqual(j["file_hex"], b"%PDF jp\n%%EOF".hex())
 
-    def test_delimiter_lookalike_in_content_parses(self):
-        # M01: content に delimiter 類似列（--<boundary の前方一致>）を含んでも、
-        # 実 boundary と衝突しなければ parser は正しく分割する
-        bnd = "RV04Crt3xyz"
+    def test_delimiter_lookalike_file_bytes_full_match(self):
+        # M01/H02: content に delimiter 類似列を含んでも file 全 bytes が完全一致で復元される
+        val = b"%PDF\r\n--RV04Crt3 not-the-real-delimiter\r\nmore\x00\xff"
         parts = [{"name": "file", "filename": "x.pdf",
-                  "content_type": "application/pdf",
-                  "value": b"%PDF\r\n--RV04Crt3 not-the-real-delimiter\r\nmore"},
+                  "content_type": "application/pdf", "value": val},
                  {"name": "drive_file_id", "filename": None,
                   "content_type": None, "value": b"F-rt3"}]
-        r = self._post(bnd, parts)
-        self.assertNotEqual(r.status_code, 404, r.text)
-        self.assertNotIn("PDFファイルを送信してください", r.text)
+        j = self._roundtrip("RV04Crt3xyz", parts).json()
+        self.assertEqual(j["file_hex"], val.hex())   # ファイル全 bytes 一致
+        self.assertEqual(j["drive_file_id"], "F-rt3")
+
+    def test_empty_text_field_restored(self):
+        parts = [{"name": "file", "filename": "e.pdf",
+                  "content_type": "application/pdf", "value": b"%PDF e"},
+                 {"name": "case_hint", "filename": None, "content_type": None,
+                  "value": b""},
+                 {"name": "drive_file_id", "filename": None, "content_type": None,
+                  "value": b"F-e"}]
+        j = self._roundtrip("RV04Ce", parts).json()
+        # 空 field は FastAPI/python-multipart が None に落とす（parser 挙動）。
+        # 主眼は他 field/file の完全復元＝builder が壊れていないこと。
+        self.assertIn(j["case_hint"], (None, ""))
+        self.assertEqual(j["drive_file_id"], "F-e")
+        self.assertEqual(j["file_hex"], b"%PDF e".hex())
 
 
 class TestExistingProviderDoneInvariant(unittest.TestCase):
@@ -390,6 +431,143 @@ class TestExistingProviderDoneInvariant(unittest.TestCase):
         db.reset_for_tests()
         self.assertEqual(st, "done")
         self.assertIsNone(le)   # mark_done は last_error を NULL に戻す（不変条件）
+
+
+# ── M02: Python 参照 production 前処理（gas rv04cBuildSignedBody_ と等価） ────
+_LANE_FIELDS = {
+    "/koseki/ingest": {"file", "case_hint", "case_app_hint", "drive_file_id"},
+    "/registry/ingest": {"file", "case_hint", "drive_file_id"},
+    "/bank/ingest": {"file", "case_hint", "case_app_hint", "drive_file_id"},
+    "/sortation/ingest": {"file", "drive_file_id", "drive_file_url"},
+    "/valuation/ingest": {"file", "case_hint", "case_app_hint", "drive_file_id"},
+}
+
+
+def _drive_id_of(parts):
+    for p in parts:
+        if p["name"] == "drive_file_id":
+            return p["value"].decode("utf-8")
+    return ""
+
+
+def build_signed_body(path, parts, boundary):
+    """gas rv04cBuildSignedBody_ の Python 等価: allowlist→sanitize→fallback→builder。"""
+    allowed = _LANE_FIELDS.get(path)
+    if allowed is None:
+        raise BuilderError(f"unknown lane: {path}")
+    drive_id = _drive_id_of(parts)
+    built = []
+    for p in parts:
+        if p["name"] not in allowed:
+            raise BuilderError(f"field not allowed for {path}: {p['name']}")
+        q = {"name": p["name"], "value": p["value"], "content_type": p.get("content_type")}
+        if p.get("filename") is not None:
+            q["filename"] = sanitize_filename(p["filename"], drive_id)
+        built.append(q)
+    return build_multipart(boundary, built)
+
+
+class TestProductionPipeline(unittest.TestCase):
+    """M02: 前処理（allowlist→sanitize→fallback→builder）を通した body の検証。"""
+
+    def test_allowlist_rejects_unknown_field(self):
+        parts = [{"name": "bogus", "value": b"x"}]
+        with self.assertRaises(BuilderError):
+            build_signed_body("/koseki/ingest", parts, "B")
+
+    def test_pipeline_fallback_matches_fixture(self):
+        # fallback vector: 原名を pipeline に通すと fixture body（sanitize 済み）に一致
+        v = next(x for x in _GASFX["vectors"] if x.get("fallback_check"))
+        fc = v["fallback_check"]
+        parts = []
+        for p in v["parts"]:
+            q = {"name": p["name"], "value": _b(p["value_b64"]),
+                 "content_type": p.get("content_type")}
+            if p["name"] == "file":
+                q["filename"] = fc["raw_filename"]   # 原名（非 ASCII）を渡す
+            parts.append(q)
+        body = build_signed_body("/koseki/ingest", parts, v["boundary"])
+        self.assertEqual(base64.b64encode(body).decode(), v["body_b64"])
+
+
+# ── M01: driveFileId 検証（sanitize fallback へ埋め込む前に固定文字集合） ─────
+class TestDriveIdValidation(unittest.TestCase):
+    def test_valid_ids(self):
+        for ok in ("F1", "abc_DEF-123", "x" * 128):
+            self.assertEqual(validate_drive_id(ok), ok)
+
+    def test_invalid_ids_rejected(self):
+        for bad in ("", None, "a b", "日本語", "a\r", "a\n", 'a"', "x" * 129, "a.b"):
+            with self.subTest(bad=repr(bad)):
+                with self.assertRaises(BuilderError):
+                    validate_drive_id(bad)
+
+    def test_fallback_rejects_non_ascii_drive_id(self):
+        # 非 ASCII filename の fallback に非 ASCII/不正 driveFileId → 例外（契約破りを防ぐ）
+        for bad in ("日本語ID", "", "a/b"):
+            with self.subTest(bad=repr(bad)):
+                with self.assertRaises(BuilderError):
+                    sanitize_filename("戸籍.pdf", bad)
+
+    def test_fallback_ok_with_valid_drive_id(self):
+        self.assertEqual(sanitize_filename("戸籍.pdf", "F-abc_1"), "doc-F-abc_1.pdf")
+
+
+# ── H01: SIGNED_LANES 実効化（gas 側 dispatcher の構造テスト） ────────────────
+class TestSignedLanesWired(unittest.TestCase):
+    def setUp(self):
+        self.js = (_REPO / "gas" / "rv04c_signing.js").read_text(encoding="utf-8")
+
+    def test_dispatcher_references_signed_lanes(self):
+        # rv04cIngestFetch_ が SIGNED_LANES[path] を実際に参照している（宣言のみでない）
+        self.assertIn("function rv04cIngestFetch_", self.js)
+        idx = self.js.index("function rv04cIngestFetch_")
+        body = self.js[idx:idx + 800]
+        self.assertIn("SIGNED_LANES[path]", body)     # 実効参照
+        self.assertIn("rv04cSignedFetch_(path", body)  # true 分岐
+        self.assertIn("UrlFetchApp.fetch", body)        # false=legacy 分岐
+        self.assertIn("?token=", body)                  # legacy は query token
+
+    def test_signed_fetch_no_longer_gates_internally(self):
+        # rv04cSignedFetch_ の関数本体は SIGNED_LANES を見ない（dispatcher が唯一のゲート）。
+        # 関数本体＝定義から次のコメント区切り（// ── H01）までに限定して判定。
+        idx = self.js.index("function rv04cSignedFetch_")
+        end = self.js.index("// ── H01", idx)
+        self.assertNotIn("SIGNED_LANES", self.js[idx:end])
+
+
+# ── H03: secret 一致・全 vector 期待値固定・SKIP 禁止（fixture/selftest 構造） ─
+class TestFixtureExpectedValues(unittest.TestCase):
+    def test_secret_matches_golden(self):
+        self.assertEqual(_GASFX["secret_hex_test_only"], _GOLDEN["secret_hex_test_only"])
+        js = (_REPO / "gas" / "rv04c_selftest.js").read_text(encoding="utf-8")
+        self.assertIn(_GOLDEN["secret_hex_test_only"], js)   # selftest も golden secret
+
+    def test_all_vectors_have_signing_expected_values(self):
+        for v in _GASFX["vectors"]:
+            with self.subTest(vec=v["name"]):
+                for k in ("content_sha256", "canonical_b64", "signature",
+                          "key_id", "caller", "normalized_path", "nonce"):
+                    self.assertIn(k, v, f"{v['name']} missing {k}")
+                    self.assertTrue(v[k])   # 非 null/非空（期待値欠落=不可）
+
+    def test_signatures_verify_with_golden_secret(self):
+        secret = bytes.fromhex(_GASFX["secret_hex_test_only"])
+        for v in _GASFX["vectors"]:
+            with self.subTest(vec=v["name"]):
+                canon = canonical_v1_ref(v["key_id"], v["caller"], v["method"],
+                                         v["normalized_path"], v["timestamp"],
+                                         v["nonce"], v["content_sha256"])
+                self.assertEqual(base64.b64encode(canon).decode(), v["canonical_b64"])
+                self.assertEqual(hmac.new(secret, canon, hashlib.sha256).hexdigest(),
+                                 v["signature"])
+
+    def test_selftest_no_null_placeholder(self):
+        # H03: S4 手転記の null プレースホルダが残っていない
+        js = (_REPO / "gas" / "rv04c_selftest.js").read_text(encoding="utf-8")
+        self.assertNotIn("expect_body_b64: null", js)
+        self.assertNotIn("expect_signature: null", js)
+        self.assertIn("var RV04C_VECTORS", js)   # 全 vector 埋め込み
 
 
 if __name__ == "__main__":
