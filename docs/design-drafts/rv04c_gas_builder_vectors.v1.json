@@ -1,0 +1,147 @@
+{
+  "contract": "RV-04c GAS builder vectors v1（NM01 v1 準拠・builder byte 検証用）",
+  "note": "secret はテスト専用（golden と同値）。既存 rv04_hmac_golden_vectors.v1.json は不変。本 fixture は parts→builder→body の byte 一致（H03 第0段）・delimiter類似列内包（M01）・ASCII fallback（§1.1b）・空 field を固定する。",
+  "secret_hex_test_only": "1dfa2f9f6becae8c8eaed48f15d1c79da850996e92c0ae55a871bf066e5f2ce5",
+  "vectors": [
+    {
+      "name": "ascii_filename_multipart",
+      "boundary": "BND-ASCII",
+      "parts": [
+        {
+          "name": "file",
+          "filename": "koseki.pdf",
+          "content_type": "application/pdf",
+          "value_b64": "JVBERi0xLjQgYXNjaWkgYm9keQolJUVPRg=="
+        }
+      ],
+      "body_b64": "LS1CTkQtQVNDSUkNCkNvbnRlbnQtRGlzcG9zaXRpb246IGZvcm0tZGF0YTsgbmFtZT0iZmlsZSI7IGZpbGVuYW1lPSJrb3Nla2kucGRmIg0KQ29udGVudC1UeXBlOiBhcHBsaWNhdGlvbi9wZGYNCg0KJVBERi0xLjQgYXNjaWkgYm9keQolJUVPRg0KLS1CTkQtQVNDSUktLQ0K",
+      "content_sha256": "68ba13471fc5adf43c10cfb753ddca9f8e16d9c1410ebd75e22f5ca75b3c5dd9"
+    },
+    {
+      "name": "japanese_filename_multipart",
+      "boundary": "BND-JP",
+      "parts": [
+        {
+          "name": "file",
+          "filename": "戸籍謄本.pdf",
+          "content_type": "application/pdf",
+          "value_b64": "JVBERi0xLjQg5oi457GNIGJvZHkKJSVFT0Y="
+        }
+      ],
+      "body_b64": "LS1CTkQtSlANCkNvbnRlbnQtRGlzcG9zaXRpb246IGZvcm0tZGF0YTsgbmFtZT0iZmlsZSI7IGZpbGVuYW1lPSLmiLjnsY3orITmnKwucGRmIg0KQ29udGVudC1UeXBlOiBhcHBsaWNhdGlvbi9wZGYNCg0KJVBERi0xLjQg5oi457GNIGJvZHkKJSVFT0YNCi0tQk5ELUpQLS0NCg==",
+      "content_sha256": "0585ce11133e1c62a4308780b58e7207d628bd78c58fa46708e8d11861f379db"
+    },
+    {
+      "name": "empty_body",
+      "builder_na": true,
+      "body_b64": "",
+      "content_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "note": "空 body（builder 非対象・content_sha256=空の hash）"
+    },
+    {
+      "name": "long_boundary",
+      "boundary": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "parts": [
+        {
+          "name": "file",
+          "filename": "x.pdf",
+          "content_type": "application/pdf",
+          "value_b64": "YmluYXJ5AAH/IGRhdGE="
+        }
+      ],
+      "body_b64": "LS1BQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUENCkNvbnRlbnQtRGlzcG9zaXRpb246IGZvcm0tZGF0YTsgbmFtZT0iZmlsZSI7IGZpbGVuYW1lPSJ4LnBkZiINCkNvbnRlbnQtVHlwZTogYXBwbGljYXRpb24vcGRmDQoNCmJpbmFyeQAB/yBkYXRhDQotLUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQS0tDQo=",
+      "content_sha256": "42f2135195a13a1c1a71148d740ac7fa6754ff7e237e848bf6327ca7e290571d"
+    },
+    {
+      "name": "multi_field",
+      "boundary": "BND-MULTI",
+      "parts": [
+        {
+          "name": "meta",
+          "filename": null,
+          "content_type": "application/json",
+          "value_b64": "eyJraW5kIjoia29zZWtpIn0="
+        },
+        {
+          "name": "file",
+          "filename": "謄本.pdf",
+          "content_type": "application/pdf",
+          "value_b64": "JVBERiBtdWx0aSBib2R5CiUlRU9G"
+        }
+      ],
+      "body_b64": "LS1CTkQtTVVMVEkNCkNvbnRlbnQtRGlzcG9zaXRpb246IGZvcm0tZGF0YTsgbmFtZT0ibWV0YSINCkNvbnRlbnQtVHlwZTogYXBwbGljYXRpb24vanNvbg0KDQp7ImtpbmQiOiJrb3Nla2kifQ0KLS1CTkQtTVVMVEkNCkNvbnRlbnQtRGlzcG9zaXRpb246IGZvcm0tZGF0YTsgbmFtZT0iZmlsZSI7IGZpbGVuYW1lPSLorITmnKwucGRmIg0KQ29udGVudC1UeXBlOiBhcHBsaWNhdGlvbi9wZGYNCg0KJVBERiBtdWx0aSBib2R5CiUlRU9GDQotLUJORC1NVUxUSS0tDQo=",
+      "content_sha256": "db7fbb9a0344396f88c3064c069f68d143d277e61814d3f81741365fb6a57da1"
+    },
+    {
+      "name": "delimiter_lookalike_in_content",
+      "boundary": "RV04C0011deadbeefcafe",
+      "parts": [
+        {
+          "name": "file",
+          "filename": "x.pdf",
+          "content_type": "application/pdf",
+          "value_b64": "JVBERg0KLS1SVjA0QzAwMTEgbm90LXRoZS1kZWxpbWl0ZXINCnRhaWw="
+        },
+        {
+          "name": "drive_file_id",
+          "filename": null,
+          "content_type": null,
+          "value_b64": "Ri1kZWw="
+        }
+      ],
+      "body_b64": "LS1SVjA0QzAwMTFkZWFkYmVlZmNhZmUNCkNvbnRlbnQtRGlzcG9zaXRpb246IGZvcm0tZGF0YTsgbmFtZT0iZmlsZSI7IGZpbGVuYW1lPSJ4LnBkZiINCkNvbnRlbnQtVHlwZTogYXBwbGljYXRpb24vcGRmDQoNCiVQREYNCi0tUlYwNEMwMDExIG5vdC10aGUtZGVsaW1pdGVyDQp0YWlsDQotLVJWMDRDMDAxMWRlYWRiZWVmY2FmZQ0KQ29udGVudC1EaXNwb3NpdGlvbjogZm9ybS1kYXRhOyBuYW1lPSJkcml2ZV9maWxlX2lkIg0KDQpGLWRlbA0KLS1SVjA0QzAwMTFkZWFkYmVlZmNhZmUtLQ0K",
+      "content_sha256": "f49d80990b167197f87307073ea7f7b6cd965a83d7e1ed5ed7a370225678630a"
+    },
+    {
+      "name": "ascii_fallback_filename",
+      "boundary": "RV04C0022",
+      "parts": [
+        {
+          "name": "file",
+          "filename": "doc-F-fb.pdf",
+          "content_type": "application/pdf",
+          "value_b64": "JVBERi0xLjQgZmIKJSVFT0Y="
+        },
+        {
+          "name": "drive_file_id",
+          "filename": null,
+          "content_type": null,
+          "value_b64": "Ri1mYg=="
+        }
+      ],
+      "body_b64": "LS1SVjA0QzAwMjINCkNvbnRlbnQtRGlzcG9zaXRpb246IGZvcm0tZGF0YTsgbmFtZT0iZmlsZSI7IGZpbGVuYW1lPSJkb2MtRi1mYi5wZGYiDQpDb250ZW50LVR5cGU6IGFwcGxpY2F0aW9uL3BkZg0KDQolUERGLTEuNCBmYgolJUVPRg0KLS1SVjA0QzAwMjINCkNvbnRlbnQtRGlzcG9zaXRpb246IGZvcm0tZGF0YTsgbmFtZT0iZHJpdmVfZmlsZV9pZCINCg0KRi1mYg0KLS1SVjA0QzAwMjItLQ0K",
+      "content_sha256": "720d423d5015cc880a2c3a68606929a8b4ec5f111dbbb7ba12961b53a49b95c8",
+      "fallback_check": {
+        "raw_filename": "住民票の写し.pdf",
+        "drive_file_id": "F-fb",
+        "expected_filename": "doc-F-fb.pdf"
+      }
+    },
+    {
+      "name": "empty_text_field",
+      "boundary": "RV04C0033",
+      "parts": [
+        {
+          "name": "file",
+          "filename": "e.pdf",
+          "content_type": "application/pdf",
+          "value_b64": "JVBERi0xLjQgZQolJUVPRg=="
+        },
+        {
+          "name": "case_hint",
+          "filename": null,
+          "content_type": null,
+          "value_b64": ""
+        },
+        {
+          "name": "drive_file_id",
+          "filename": null,
+          "content_type": null,
+          "value_b64": "Ri1l"
+        }
+      ],
+      "body_b64": "LS1SVjA0QzAwMzMNCkNvbnRlbnQtRGlzcG9zaXRpb246IGZvcm0tZGF0YTsgbmFtZT0iZmlsZSI7IGZpbGVuYW1lPSJlLnBkZiINCkNvbnRlbnQtVHlwZTogYXBwbGljYXRpb24vcGRmDQoNCiVQREYtMS40IGUKJSVFT0YNCi0tUlYwNEMwMDMzDQpDb250ZW50LURpc3Bvc2l0aW9uOiBmb3JtLWRhdGE7IG5hbWU9ImNhc2VfaGludCINCg0KDQotLVJWMDRDMDAzMw0KQ29udGVudC1EaXNwb3NpdGlvbjogZm9ybS1kYXRhOyBuYW1lPSJkcml2ZV9maWxlX2lkIg0KDQpGLWUNCi0tUlYwNEMwMDMzLS0NCg==",
+      "content_sha256": "15cba38affef80e4900d0e22f95404dc091b58c56cbd48329630eece8a78e2b8"
+    }
+  ]
+}
