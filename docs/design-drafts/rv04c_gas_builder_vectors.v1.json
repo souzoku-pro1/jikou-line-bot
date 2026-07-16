@@ -23,7 +23,8 @@
       "timestamp": 1700000000,
       "nonce": "0000000000000000000000000000aa01",
       "canonical_b64": "Mjp2MQoxMDpraWQtZ29sZGVuCjEwOmdhcy1rb3Nla2kKNDpQT1NUCjE0Oi9rb3Nla2kvaW5nZXN0CjEwOjE3MDAwMDAwMDAKMzI6MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMGFhMDEKNjQ6NjhiYTEzNDcxZmM1YWRmNDNjMTBjZmI3NTNkZGNhOWY4ZTE2ZDljMTQxMGViZDc1ZTIyZjVjYTc1YjNjNWRkOQo=",
-      "signature": "9872efac46b4824383a9cbf83fecb15547af9687b495363a9463c46af1e97a36"
+      "signature": "9872efac46b4824383a9cbf83fecb15547af9687b495363a9463c46af1e97a36",
+      "pipeline": "match"
     },
     {
       "name": "japanese_filename_multipart",
@@ -45,7 +46,8 @@
       "timestamp": 1700000000,
       "nonce": "0000000000000000000000000000aa02",
       "canonical_b64": "Mjp2MQoxMDpraWQtZ29sZGVuCjEwOmdhcy1rb3Nla2kKNDpQT1NUCjE0Oi9rb3Nla2kvaW5nZXN0CjEwOjE3MDAwMDAwMDAKMzI6MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMGFhMDIKNjQ6MDU4NWNlMTExMzNlMWM2MmE0MzA4NzgwYjU4ZTcyMDdkNjI4YmQ3OGM1OGZhNDY3MDhlOGQxMTg2MWYzNzlkYgo=",
-      "signature": "faee21361acc5ad1c94e24be6159b0c94693dd7550b07608352dd74bfce4ea9b"
+      "signature": "faee21361acc5ad1c94e24be6159b0c94693dd7550b07608352dd74bfce4ea9b",
+      "pipeline": "reject"
     },
     {
       "name": "empty_body",
@@ -60,7 +62,8 @@
       "nonce": "0000000000000000000000000000aa03",
       "canonical_b64": "Mjp2MQoxMDpraWQtZ29sZGVuCjEwOmdhcy1rb3Nla2kKNDpQT1NUCjE0Oi9rb3Nla2kvaW5nZXN0CjEwOjE3MDAwMDAwMDAKMzI6MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMGFhMDMKNjQ6ZTNiMGM0NDI5OGZjMWMxNDlhZmJmNGM4OTk2ZmI5MjQyN2FlNDFlNDY0OWI5MzRjYTQ5NTk5MWI3ODUyYjg1NQo=",
       "signature": "ad167bdceb3a9c61a19e65b333137850bbeb657d73725d10c2ef35ac5465e531",
-      "note": "空 body（builder 非対象・enum 明示。hash/canonical/signature は検証する）"
+      "note": "空 body（builder 非対象・enum 明示。hash/canonical/signature は検証する）",
+      "pipeline": "skip"
     },
     {
       "name": "long_boundary",
@@ -82,7 +85,8 @@
       "timestamp": 1700000000,
       "nonce": "0000000000000000000000000000aa04",
       "canonical_b64": "Mjp2MQoxMDpraWQtZ29sZGVuCjEwOmdhcy1rb3Nla2kKNDpQT1NUCjE0Oi9rb3Nla2kvaW5nZXN0CjEwOjE3MDAwMDAwMDAKMzI6MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMGFhMDQKNjQ6NDJmMjEzNTE5NWExM2ExYzFhNzExNDhkNzQwYWM3ZmE2NzU0ZmY3ZTIzN2U4NDhiZjYzMjdjYTdlMjkwNTcxZAo=",
-      "signature": "fff9132dc51e1fc1c506834df17f2757f27d8b437eced728ee2f5a71f1dd1a71"
+      "signature": "fff9132dc51e1fc1c506834df17f2757f27d8b437eced728ee2f5a71f1dd1a71",
+      "pipeline": "match"
     },
     {
       "name": "multi_field",
@@ -110,7 +114,8 @@
       "timestamp": 1700000000,
       "nonce": "0000000000000000000000000000aa05",
       "canonical_b64": "Mjp2MQoxMDpraWQtZ29sZGVuCjEwOmdhcy1rb3Nla2kKNDpQT1NUCjE0Oi9rb3Nla2kvaW5nZXN0CjEwOjE3MDAwMDAwMDAKMzI6MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMGFhMDUKNjQ6ZGI3ZmJiOWEwMzQ0Mzk2Zjg4YzMwNjRjMDY5ZjY4ZDE0M2QyNzdlNjE4MTRkM2Y4MTc0MTM2NWZiNmE1N2RhMQo=",
-      "signature": "d0a4d626716c7cc6ce44d97de2aafde2a91e27c857bdfd22c27ae3d328129de9"
+      "signature": "d0a4d626716c7cc6ce44d97de2aafde2a91e27c857bdfd22c27ae3d328129de9",
+      "pipeline": "reject"
     },
     {
       "name": "delimiter_lookalike_in_content",
@@ -138,7 +143,8 @@
       "nonce": "0000000000000000000000000000dea1",
       "content_sha256": "f49d80990b167197f87307073ea7f7b6cd965a83d7e1ed5ed7a370225678630a",
       "canonical_b64": "Mjp2MQoxMDpraWQtZ29sZGVuCjEwOmdhcy1rb3Nla2kKNDpQT1NUCjE0Oi9rb3Nla2kvaW5nZXN0CjEwOjE3MDAwMDAwMDAKMzI6MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMGRlYTEKNjQ6ZjQ5ZDgwOTkwYjE2NzE5N2Y4NzMwNzA3M2VhN2Y3YjZjZDk2NWE4M2Q3ZTFlZDVlZDdhMzcwMjI1Njc4NjMwYQo=",
-      "signature": "b03545d6d726c43f6ed891ff3f94003d9c8c10c7ef4275ca190c11f2d775a5c3"
+      "signature": "b03545d6d726c43f6ed891ff3f94003d9c8c10c7ef4275ca190c11f2d775a5c3",
+      "pipeline": "match"
     },
     {
       "name": "ascii_fallback_filename",
@@ -171,7 +177,8 @@
         "raw_filename": "住民票の写し.pdf",
         "drive_file_id": "F-fb",
         "expected_filename": "doc-F-fb.pdf"
-      }
+      },
+      "pipeline": "match"
     },
     {
       "name": "empty_text_field",
@@ -205,7 +212,8 @@
       "nonce": "0000000000000000000000000000e001",
       "content_sha256": "15cba38affef80e4900d0e22f95404dc091b58c56cbd48329630eece8a78e2b8",
       "canonical_b64": "Mjp2MQoxMDpraWQtZ29sZGVuCjEwOmdhcy1rb3Nla2kKNDpQT1NUCjE0Oi9rb3Nla2kvaW5nZXN0CjEwOjE3MDAwMDAwMDAKMzI6MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMGUwMDEKNjQ6MTVjYmEzOGFmZmVmODBlNDkwMGQwZTIyZjk1NDA0ZGMwOTFiNThjNTZjYmQ0ODMyOTYzMGVlY2U4YTc4ZTJiOAo=",
-      "signature": "0073773c30304f6fd06f758629170d6a0236bac7c9e928198df172b6273461a1"
+      "signature": "0073773c30304f6fd06f758629170d6a0236bac7c9e928198df172b6273461a1",
+      "pipeline": "match"
     }
   ]
 }

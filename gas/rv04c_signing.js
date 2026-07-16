@@ -76,7 +76,11 @@ function appendBytes_(dst, src) {
 // ── M01: driveFileId の送出前検証（fallback へ埋め込む前に固定文字集合＋長さ範囲） ──
 // 実 Drive ID 形式（英数字・_・-）に整合。非 ASCII/CR/LF/quote/欠落は例外。
 function validateDriveId_(driveFileId) {
-  if (driveFileId === undefined || driveFileId === null || driveFileId === '') {
+  // M01残: 型検証を先に（RegExp の暗黙文字列化を排除。数値/null/undefined/配列を拒否）。
+  if (typeof driveFileId !== 'string') {
+    throw new Error('driveFileId not a string');
+  }
+  if (driveFileId === '') {
     throw new Error('driveFileId missing');
   }
   if (!/^[A-Za-z0-9_-]{1,128}$/.test(driveFileId)) {

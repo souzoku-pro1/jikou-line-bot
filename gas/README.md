@@ -1,9 +1,13 @@
 # gas/ — RV-04c GAS 署名ヘルパ（repo 正本 → S4 で GAS へ反映）
 
-- `rv04c_signing.js` — NM01 v1 HMAC 署名ヘルパ（builder・filename sanitize・canonical・
-  HMAC・`rv04cSignedFetch_`・`SIGNED_LANES`）。DRAFT_RV04C_CALLER_MIGRATION.md §1〜§3 準拠。
-- `rv04c_selftest.js` — golden self-test（`rv04c_goldenSelfTest`）＋大サイズ builder テスト
-  （`rv04c_builderLargeTest`）。GAS 実機で実行し Logger 出力を採取する。
+- `rv04c_signing.js` — NM01 v1 HMAC 署名ヘルパ（builder・filename sanitize・canonical・HMAC・
+  **watcher 共通入口 `rv04cIngestFetch_`**（SIGNED_LANES を実効化する唯一のゲート）・
+  `SIGNED_LANES`）。DRAFT_RV04C_CALLER_MIGRATION.md §1〜§3 準拠。
+  ※ `rv04cSignedFetch_` は `rv04cIngestFetch_` の内部実装（true lane 時のみ）。**watcher から
+  直接呼ばない**（直接呼ぶと SIGNED_LANES ゲートを迂回し rollback が効かなくなる・H01残）。
+- `rv04c_selftest.js` — golden self-test（`rv04c_goldenSelfTest`）＋production 前処理 self-test
+  （`rv04c_productionPipelineSelfTest`）＋大サイズ builder テスト（`rv04c_builderLargeTest`）。
+  GAS 実機で実行し Logger 出力を採取する。
 
 ## 正本の扱い（重要）
 
@@ -24,8 +28,14 @@
    全 vector PASS（第0段 body byte 一致を含む）の Logger 出力をスクショ→PC-A が .md へ保存。
 4. `rv04c_builderLargeTest` を実行し、出力 sha256 を Python 側（`test_rv04c_gas_builder.py`
    `TestBuilderStage0::test_large_pdf_chunk_boundary_algorithm` と同一入力）と突合。
-5. watcher の各 `UrlFetchApp.fetch('/…/ingest?token=…')` を `rv04cSignedFetch_('/…/ingest', parts)`
-   へ置換し、`SIGNED_LANES.<lane>=true` で lane 単位に署名経路へ切替（rollback は定数 1 箇所）。
+5. watcher の各 `UrlFetchApp.fetch('/…/ingest?token=…')` を
+   **`rv04cIngestFetch_('/…/ingest', {parts, legacyPayload, legacyToken})`** へ置換する
+   （**唯一のゲート**。`rv04cSignedFetch_` を直接置換しないこと＝H01残）。`SIGNED_LANES.<lane>`
+   が `false`/未設定なら `rv04cIngestFetch_` が既存 legacy fetch（`?token=…`・現行送信と byte
+   同一）を選び、`true` なら署名経路へ切替（rollback は `SIGNED_LANES` 定数 1 箇所）。
+   - `legacyPayload` = 現行 watcher と同一の `{file: blob, drive_file_id: …[, drive_file_url: …]}`
+     （自動 multipart）。`legacyToken` = 現行の `*_INGEST_TOKEN`。`parts` = 署名経路用の
+     手組み parts（`{name, value(bytes), filename?, contentType?}` 配列）。
 
 ## PC-A 側（repo）の検証
 
