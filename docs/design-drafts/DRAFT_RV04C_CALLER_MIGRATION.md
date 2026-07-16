@@ -6,6 +6,9 @@
 - **rev D3（2026-07-16）**: R-RV-04C-D2 残所見 6 件を反映（H05残=LINE送信後 crash 行＋sending
   marker・D2-H01=stale received 監視・H06残=工程4の3小工程化・D2-M01=NEXT 期限 env・
   D2-M02/M03=§8 実測系追補）。
+- **rev D4（2026-07-17）**: R-RV-04C-D3 所見 4 件を反映（H05残=phase 別失敗遷移表〔迷えば
+  sending・failed 上書き禁止〕・D3-H01=marker rowcount=1 を送信前提条件に契約化・
+  D2-M02残=実測 2 系統・D3-M01=検知遅延 ≈25h の明記）。
 - 正本の上位: `DRAFT_RV04_HMAC_MIGRATION.md`（v2・NM01 v1 FROZEN）。**本 DRAFT はサーバ側
   contract（canonical・検証順・§6.1/6.2 reason 表）を一切変更しない**（FROZEN 非抵触が受入条件）。
 - 前提（票で確定済み）: K1=kintone webhook 冪等キーは top-level `id`（公式仕様）／K2=kintone 側
@@ -238,16 +241,33 @@ rotation）を 5 点セットで成立**させる（RV-04 §3 の採用条件）
     ├─ UNIQUE(dedup_key) 衝突 → 重複配信 = skip 応答（200・処理登録なし・行は不変）
     └─ INSERT 成功 = claim 成立 → 同一 request 内で処理続行
          （②③の再判定 PASS・LINE 送信を行うと確定した時点）
-           → UPDATE state='sending'                      ← 送信着手 marker（H05残・D3）
+           → UPDATE state='sending' WHERE state='received'   ← 送信着手 marker（H05残・D3）
              ＝ LINE 送信「直前」に同一 DB 内で原子的に記録（done 遷移とは別の遷移）
+             **marker 成功（rowcount=1）が LINE 送信の前提条件（D3-H01・下記契約）**
          LINE 送信 → App 29 送信済み=yes 更新（既存 handler の副作用順）
          処理成功（全副作用完了）
            → UPDATE state='done', processed_at=now()     ← terminal 化は全副作用の後
-         処理失敗（例外）
-           → UPDATE state='failed', last_error=分類コード → 5xx は返さない（副作用途中の
-             再配信は無いため応答は結果に影響しない・失敗は観測対象）
+         処理失敗 → **phase 別失敗遷移表（D4・下記）に従う**（marker 後は failed へ
+             上書きしない）。5xx は返さない（副作用途中の再配信は無いため応答は結果に
+             影響しない・失敗は観測対象）
   DB 到達不能（INSERT 自体が不能）→ §4 H04 のとおり 5xx（fail-closed・行なし）
 ```
+
+- **marker 契約（D3-H01）**: `state='sending'` への UPDATE の**成功（rowcount=1）を LINE 送信の
+  前提条件**とする。UPDATE の失敗・例外・rowcount≠1（行が想定 state でない＝並行操作等）の
+  いずれの場合も **LINE write 0 で終了**（fail-closed・行は現状のまま・滞留として §4.2b が
+  検知）。根拠: marker が書けないまま送信すると「送信したのに判別材料が無い」領域が生まれ、
+  sending marker の存在意義（crash 後の人手判別）が崩れる。送らなければ最悪でも
+  「検知可能な未送信滞留」に収まる。
+
+- **phase 別失敗遷移表（D4・H05残）**——**原則: 「送信済みでないと確実に言える場合のみ
+  `failed`。迷えば `sending`」**:
+
+  | 失敗 phase | 遷移 | 理由 |
+  |---|---|---|
+  | LINE 呼出し前に確定失敗（marker 前の検証エラー・②③再判定 NG の例外系 等） | `failed` **可**（last_error=分類コード） | LINE write が発生していないことが構造上確実（marker 前=未送信確定） |
+  | marker UPDATE 自体の失敗・例外・rowcount≠1 | **遷移なし**（行は `received` のまま・LINE write 0 で終了） | D3-H01 契約。滞留として検知 |
+  | **marker 成功〜LINE 呼出し以後の一切**（LINE API 例外・timeout・レスポンス不明・成功後の App 29 更新失敗 を含む） | **`sending` 維持**（**`failed` への上書き禁止**・last_error も書かない＝state を動かさない） | timeout/例外は「送信されなかった」を意味しない（サーバ側で送信完了済みの可能性が常にある）。**不明は不明のまま**人手 runbook（§4.2 の判別手順）へ渡す。failed に上書きすると「未送信確定」の意味を偽り、人手再操作の安全判定を壊す |
 
 - **sending marker（H05残・緩和策）**: `state='sending'` は**既存 state 列の新しい値**であり
   列追加なし＝**ALTER 0 維持**（state は Text・provider 別語彙は §5.1〔RV-05〕の流儀）。
@@ -267,8 +287,10 @@ rotation）を 5 点セットで成立**させる（RV-04 §3 の採用条件）
   | 全副作用後〜terminal 書込前 | `sending` 滞留（実は全て完了） | 二重送信は起きない（重複配信は dedup が skip・再操作時は②③の 送信済み=yes 再判定が止める）。滞留観測→人手が kintone 側 送信済み=yes を確認して行を手動 terminal 化 |
 
 - **人手再操作 runbook（H05残・S3 で runbook 節として固定）**:
-  1. 滞留行の `state` を確認——`received`=送信未着手（安全に再操作可）／`sending`=**「送信済みの
-     可能性あり」**。
+  1. 滞留行の `state` を確認——`received`=送信未着手（安全に再操作可。marker 失敗終了も
+     ここに含まれる）／`failed`=**未送信確定**の失敗（phase 別遷移表により marker 前の確定
+     失敗のみがこの値を取る＝安全に再操作可）／`sending`=**「送信済みの可能性あり」**
+     （原則どおり、迷った失敗はすべてここに集まる）。
   2. `sending` の場合: App 29 の 送信済み フィールド・LINE の実受信（弁護士 or 管理画面で顧客
      トーク確認）・Railway ログ（[LINE] reply/push OK 行）を突き合わせて送信有無を判別する。
   3. **最終判断は人**——判別がつかない場合に再操作するか（二重通知リスクを取るか）
@@ -303,6 +325,9 @@ rotation）を 5 点セットで成立**させる（RV-04 §3 の採用条件）
 - **年齢閾値**: `KINTONE_STALE_EVENT_HOURS`（env・**既定 1 時間**）。根拠: kintone レーンは
   同期処理（秒オーダー）であり、1 時間残留は確実に crash/障害。Stripe の 24h（再送待ち前提）
   とは意味が違うため**閾値を分離**する。
+  **注意（D3-M01・runbook にも明記）**: 1h は**抽出閾値**であって検知速度ではない。駆動は
+  **日次健診（7:00 JST）のため最悪検知遅延 ≈25h**（7:00 直後に発生した滞留は翌朝の健診まで
+  検知されない）。より速い検知が必要になったら健診とは別の tick を別票で裁定する。
 - **件数・表示**: 件数＋PK 上位 10 件のみ（event id・record 内容は出さない＝D17 流儀踏襲）。
 - **統合方法**: `check_journal_backlog`（daily_healthcheck 監視項目E）の集計へ **provider
   次元を追加**し、kintone 分は**専用文言**（`kintone滞留: received/sending が1時間超 N件
@@ -454,6 +479,13 @@ rollback は複数箇所の状態が絡むため、§5.1 の順序付き複合�
     App 29 更新前 crash（marker＋送信済み）の各 fixture で、旧コード=「行が `received` の
     まま区別不能」を実測→実装後 `sending` marker により判別可能（§4.2 crash 表の全行を
     テストで固定）。
+  - **marker 後例外の failed 非上書き（D2-M02残・D4）**: marker 成功後に LINE API 例外/
+    timeout を注入し、「素朴実装＝`failed` へ上書き」が起きる形を旧設計相当で実測→
+    実装後 **最終 state=`sending` のまま**を assert（**最終 state と LINE 送信回数の両方を
+    assert する**）。
+  - **marker 失敗時 LINE write 0（D2-M02残・D3-H01）**: marker UPDATE を失敗/例外/rowcount=0 に
+    細工し、旧設計相当=「送信が走ってしまう」を実測→実装後 **LINE 送信回数 0・行は
+    `received` のまま**を assert（同じく最終 state＋送信回数の両 assert）。
   - **stale received/sending（D2-M02・§4.2b）**: 閾値超え fixture で旧コード=「警報なし
     （検知空白）or Stripe 文言へ混入」を実測→実装後 kintone 専用警報。
   - **rotation 4 状態 table test（D2-M02）**: {old-only／dual（primary=旧+NEXT=新）／
