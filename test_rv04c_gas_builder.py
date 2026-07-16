@@ -468,26 +468,51 @@ def build_signed_body(path, parts, boundary):
 
 
 class TestProductionPipeline(unittest.TestCase):
-    """M02: 前処理（allowlist→sanitize→fallback→builder）を通した body の検証。"""
+    """M02/H03残: 前処理を通した body の検証。pipeline 分類（match/reject/skip）に沿って
+    **SKIP 変換なし**で判定する（reject は例外送出が PASS 条件・match は body 一致）。"""
 
     def test_allowlist_rejects_unknown_field(self):
         parts = [{"name": "bogus", "value": b"x"}]
         with self.assertRaises(BuilderError):
             build_signed_body("/koseki/ingest", parts, "B")
 
-    def test_pipeline_fallback_matches_fixture(self):
-        # fallback vector: 原名を pipeline に通すと fixture body（sanitize 済み）に一致
-        v = next(x for x in _GASFX["vectors"] if x.get("fallback_check"))
-        fc = v["fallback_check"]
-        parts = []
-        for p in v["parts"]:
-            q = {"name": p["name"], "value": _b(p["value_b64"]),
-                 "content_type": p.get("content_type")}
-            if p["name"] == "file":
-                q["filename"] = fc["raw_filename"]   # 原名（非 ASCII）を渡す
-            parts.append(q)
-        body = build_signed_body("/koseki/ingest", parts, v["boundary"])
-        self.assertEqual(base64.b64encode(body).decode(), v["body_b64"])
+    def test_pipeline_classification_no_skip(self):
+        # 全 vector を pipeline 分類どおり判定（skip=builder_na のみ・他は match/reject）
+        seen = {"match": 0, "reject": 0, "skip": 0}
+        for v in _GASFX["vectors"]:
+            cls = v.get("pipeline")
+            self.assertIn(cls, ("match", "reject", "skip"), v["name"])
+            seen[cls] += 1
+            if cls == "skip":
+                self.assertTrue(v.get("builder_na"), v["name"])   # skip は builder_na のみ
+                continue
+            parts = []
+            for p in v["parts"]:
+                q = {"name": p["name"], "value": _b(p["value_b64"]),
+                     "content_type": p.get("content_type")}
+                if p.get("filename") is not None:
+                    # fallback vector は原名を渡して sanitize を経由
+                    q["filename"] = (v["fallback_check"]["raw_filename"]
+                                     if v.get("fallback_check") and p["name"] == "file"
+                                     else p["filename"])
+                parts.append(q)
+            if cls == "reject":
+                with self.subTest(vec=v["name"], expect="reject"):
+                    with self.assertRaises(BuilderError):
+                        build_signed_body("/koseki/ingest", parts, v["boundary"])
+            else:  # match
+                with self.subTest(vec=v["name"], expect="match"):
+                    body = build_signed_body("/koseki/ingest", parts, v["boundary"])
+                    self.assertEqual(base64.b64encode(body).decode(), v["body_b64"])
+        self.assertGreaterEqual(seen["match"], 4)
+        self.assertGreaterEqual(seen["reject"], 2)   # japanese(missing driveId)・multi_field(meta)
+
+    def test_allowlist_regression_is_reject_not_skip(self):
+        # 修正前 FAIL 実測対象: allowlist 退行（未許可 field）は SKIP でなく reject（例外）
+        parts = [{"name": "meta", "value": b"x", "content_type": "application/json"},
+                 {"name": "file", "filename": "a.pdf", "value": b"%PDF"}]
+        with self.assertRaises(BuilderError):   # SKIP で通さない
+            build_signed_body("/koseki/ingest", parts, "B")
 
 
 # ── M01: driveFileId 検証（sanitize fallback へ埋め込む前に固定文字集合） ─────
@@ -501,6 +526,18 @@ class TestDriveIdValidation(unittest.TestCase):
             with self.subTest(bad=repr(bad)):
                 with self.assertRaises(BuilderError):
                     validate_drive_id(bad)
+
+    def test_m01_type_rejection(self):
+        # M01残: 型不正（数値・None・配列・dict・bool）を明示拒否（暗黙文字列化なし）
+        for bad in (123, None, [1, 2], {"a": 1}, True, 1.5, b"F1"):
+            with self.subTest(bad=repr(bad)):
+                with self.assertRaises(BuilderError):
+                    validate_drive_id(bad)
+
+    def test_m01_gas_has_typeof_guard(self):
+        # GAS 側 validateDriveId_ に typeof 文字列ガードがあること（RegExp 暗黙変換の排除）
+        js = (_REPO / "gas" / "rv04c_signing.js").read_text(encoding="utf-8")
+        self.assertIn("typeof driveFileId !== 'string'", js)
 
     def test_fallback_rejects_non_ascii_drive_id(self):
         # 非 ASCII filename の fallback に非 ASCII/不正 driveFileId → 例外（契約破りを防ぐ）
@@ -530,10 +567,36 @@ class TestSignedLanesWired(unittest.TestCase):
 
     def test_signed_fetch_no_longer_gates_internally(self):
         # rv04cSignedFetch_ の関数本体は SIGNED_LANES を見ない（dispatcher が唯一のゲート）。
-        # 関数本体＝定義から次のコメント区切り（// ── H01）までに限定して判定。
         idx = self.js.index("function rv04cSignedFetch_")
         end = self.js.index("// ── H01", idx)
         self.assertNotIn("SIGNED_LANES", self.js[idx:end])
+
+    def test_h01_no_bypass_signed_fetch_outside_dispatcher(self):
+        # H01残: rv04cSignedFetch_ の呼出は dispatcher（rv04cIngestFetch_）内の 1 箇所のみ。
+        # 出現＝定義 1（function ...）＋呼出 1（dispatcher 内）＝計 2。自己参照/定義以外の
+        # 直接呼出があれば迂回ゲートになる。
+        import re
+        # ASCII の `(` を伴う参照のみ（コメント内の全角括弧説明は除外）
+        occ = [m.start() for m in re.finditer(r"rv04cSignedFetch_\(", self.js)]
+        self.assertEqual(len(occ), 2, f"想定外の rv04cSignedFetch_ 呼出/定義数: {len(occ)}")
+        # 呼出（function 定義でない方）が dispatcher 関数の範囲内にあること
+        disp_start = self.js.index("function rv04cIngestFetch_")
+        disp_end = self.js.index("\n}", disp_start)
+        call = [o for o in occ
+                if not self.js[max(0, o - 9):o].endswith("function ")]
+        self.assertEqual(len(call), 1)
+        self.assertTrue(disp_start < call[0] < disp_end,
+                        "rv04cSignedFetch_ 呼出が dispatcher 外にある（ゲート迂回）")
+
+    def test_h01_legacy_branch_send_identity(self):
+        # H01残-3: false/未設定 lane の legacy 送信が現行 watcher 形（?token=・payload・
+        # muteHttpExceptions）と一致することを構造で固定。
+        disp = self.js[self.js.index("function rv04cIngestFetch_"):]
+        disp = disp[:disp.index("\n}")]
+        self.assertIn("?token=' + encodeURIComponent(opts.legacyToken)", disp)  # URL token 形
+        self.assertIn("payload: opts.legacyPayload", disp)                       # payload passthrough
+        self.assertIn("muteHttpExceptions: true", disp)                          # options 一致
+        self.assertIn("SIGNED_LANES[path] === true", disp)                       # true のみ署名
 
 
 # ── H03: secret 一致・全 vector 期待値固定・SKIP 禁止（fixture/selftest 構造） ─
@@ -568,6 +631,20 @@ class TestFixtureExpectedValues(unittest.TestCase):
         self.assertNotIn("expect_body_b64: null", js)
         self.assertNotIn("expect_signature: null", js)
         self.assertIn("var RV04C_VECTORS", js)   # 全 vector 埋め込み
+
+    def test_h03_pipeline_selftest_no_skip_conversion(self):
+        # H03残: production pipeline self-test の catch が builder_na 以外を SKIP に落とさない。
+        # pipeline は match/reject/skip の明示分類で判定し、reject=例外送出が PASS 条件。
+        js = (_REPO / "gas" / "rv04c_selftest.js").read_text(encoding="utf-8")
+        pipe = js[js.index("function rv04c_productionPipelineSelfTest"):]
+        pipe = pipe[:pipe.index("\n}\n")]
+        # builder_na 以外の無条件 SKIP（旧 catch→SKIP continue）が無いこと
+        self.assertNotIn("pipeline=SKIP(' + e.message", pipe)   # 例外を SKIP 化しない
+        self.assertIn("FAIL(unexpected throw", pipe)            # match で例外→FAIL
+        self.assertIn("FAIL(expected reject)", pipe)            # reject で無例外→FAIL
+        # 全 vector に pipeline 分類がある（fixture 側）
+        for v in _GASFX["vectors"]:
+            self.assertIn(v.get("pipeline"), ("match", "reject", "skip"), v["name"])
 
 
 if __name__ == "__main__":
