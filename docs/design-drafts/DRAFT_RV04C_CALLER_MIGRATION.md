@@ -9,6 +9,8 @@
 - **rev D4（2026-07-17）**: R-RV-04C-D3 所見 4 件を反映（H05残=phase 別失敗遷移表〔迷えば
   sending・failed 上書き禁止〕・D3-H01=marker rowcount=1 を送信前提条件に契約化・
   D2-M02残=実測 2 系統・D3-M01=検知遅延 ≈25h の明記）。
+- **rev D5（2026-07-17）**: R-RV-04C-D4 所見 1 件を反映（D4-M01=正常 no-op の done terminal 化
+  〔固定 enum 理由コード〕・terminal 3 値の意味一覧・偽警報系の修正前 FAIL 実測追加）。
 - 正本の上位: `DRAFT_RV04_HMAC_MIGRATION.md`（v2・NM01 v1 FROZEN）。**本 DRAFT はサーバ側
   contract（canonical・検証順・§6.1/6.2 reason 表）を一切変更しない**（FROZEN 非抵触が受入条件）。
 - 前提（票で確定済み）: K1=kintone webhook 冪等キーは top-level `id`（公式仕様）／K2=kintone 側
@@ -240,7 +242,10 @@ rotation）を 5 点セットで成立**させる（RV-04 §3 の採用条件）
   INSERT inbound_event(state='received', attempts=1)   ← 挿入時 state = received
     ├─ UNIQUE(dedup_key) 衝突 → 重複配信 = skip 応答（200・処理登録なし・行は不変）
     └─ INSERT 成功 = claim 成立 → 同一 request 内で処理続行
-         （②③の再判定 PASS・LINE 送信を行うと確定した時点）
+         ②③の再照合が**正常に不成立**（業務的 no-op・D4-M01）
+           → UPDATE state='done', processed_at=now(), 理由=固定分類コード
+             （LINE write 0・下記「正常 no-op の terminal 遷移」）
+         ②③の再判定 PASS・LINE 送信を行うと確定した時点
            → UPDATE state='sending' WHERE state='received'   ← 送信着手 marker（H05残・D3）
              ＝ LINE 送信「直前」に同一 DB 内で原子的に記録（done 遷移とは別の遷移）
              **marker 成功（rowcount=1）が LINE 送信の前提条件（D3-H01・下記契約）**
@@ -268,6 +273,26 @@ rotation）を 5 点セットで成立**させる（RV-04 §3 の採用条件）
   | LINE 呼出し前に確定失敗（marker 前の検証エラー・②③再判定 NG の例外系 等） | `failed` **可**（last_error=分類コード） | LINE write が発生していないことが構造上確実（marker 前=未送信確定） |
   | marker UPDATE 自体の失敗・例外・rowcount≠1 | **遷移なし**（行は `received` のまま・LINE write 0 で終了） | D3-H01 契約。滞留として検知 |
   | **marker 成功〜LINE 呼出し以後の一切**（LINE API 例外・timeout・レスポンス不明・成功後の App 29 更新失敗 を含む） | **`sending` 維持**（**`failed` への上書き禁止**・last_error も書かない＝state を動かさない） | timeout/例外は「送信されなかった」を意味しない（サーバ側で送信完了済みの可能性が常にある）。**不明は不明のまま**人手 runbook（§4.2 の判別手順）へ渡す。failed に上書きすると「未送信確定」の意味を偽り、人手再操作の安全判定を壊す |
+
+- **正常 no-op の terminal 遷移（D4-M01）**: INSERT 後の②③再照合が**正常に不成立**となる経路
+  （承認済みでない・既に 送信済み=yes・record 不在 等の**業務的 no-op**）は、例外系ではないので
+  `failed` にも滞留にもせず **`done` へ terminal 遷移**する（`processed_at=now()`・**LINE write
+  0**）。理由は**固定分類コード**を `last_error` 列へ記録する（enum 固定・**自由文字列禁止**・
+  例: `skip_not_approved`／`skip_already_sent`／`skip_record_not_found`／`skip_missing_fields`。
+  列名は error だが provider=kintone では「terminal 理由コード」として流用＝**ALTER 0 維持**。
+  S3 実装時に既存 handler の skip 分岐（`not_triggered`/`already_sent_or_not_approved` 等）と
+  1:1 対応の enum を確定する）。received のまま放置すると §4.2b の 1h 監視が**正常動作を
+  偽警報**として拾ってしまう——これを塞ぐのが本遷移の目的。
+
+- **terminal 3 値の意味一覧（D4-M01・整合の単一の正）**:
+
+  | state | 意味 | LINE write | 人手対応 |
+  |---|---|---|---|
+  | `failed` | **未送信確定**の失敗（marker 前の**例外系**のみ） | 0（確定） | 安全に再操作可 |
+  | `done` | **業務完了 または 正常 no-op**（`last_error` の理由コードで判別: NULL/空=送信完了・`skip_*`=no-op） | 完了時 1／no-op 時 0 | 不要 |
+  | `sending` | **不明**（送信済みの可能性あり・非 terminal） | 不明 | §4.2 runbook で判別→最終判断は人 |
+
+  （`received` は過渡状態: 未処理 claim 済み or marker 失敗終了。滞留すれば §4.2b が検知。）
 
 - **sending marker（H05残・緩和策）**: `state='sending'` は**既存 state 列の新しい値**であり
   列追加なし＝**ALTER 0 維持**（state は Text・provider 別語彙は §5.1〔RV-05〕の流儀）。
@@ -486,6 +511,10 @@ rollback は複数箇所の状態が絡むため、§5.1 の順序付き複合�
   - **marker 失敗時 LINE write 0（D2-M02残・D3-H01）**: marker UPDATE を失敗/例外/rowcount=0 に
     細工し、旧設計相当=「送信が走ってしまう」を実測→実装後 **LINE 送信回数 0・行は
     `received` のまま**を assert（同じく最終 state＋送信回数の両 assert）。
+  - **正常 no-op の terminal 化（D4-M01）**: no-op 各分類（not_approved／already_sent／
+    record_not_found／missing_fields）の fixture で、旧設計相当=「行が `received` のまま
+    残留→1h 後に §4.2b が**偽警報**」を実測→実装後 **最終 state=`done`・LINE 送信 0・
+    理由コード一致**（分類ごとに個別 assert・enum 外の自由文字列が書かれないことも assert）。
   - **stale received/sending（D2-M02・§4.2b）**: 閾値超え fixture で旧コード=「警報なし
     （検知空白）or Stripe 文言へ混入」を実測→実装後 kintone 専用警報。
   - **rotation 4 状態 table test（D2-M02）**: {old-only／dual（primary=旧+NEXT=新）／
