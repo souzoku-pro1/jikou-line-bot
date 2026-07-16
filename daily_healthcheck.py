@@ -187,9 +187,17 @@ async def check_journal_backlog() -> list[str]:
       - inbound_event テーブル不在（migration未適用）
     警報文面は件数とPKのみ（event ID・dedup_key を出さない・D17流儀）。
     """
-    if os.environ.get("STRIPE_EVENT_JOURNAL_ENABLED") != "1":
-        return []
     if not os.environ.get("DATABASE_URL"):
+        return []
+
+    # RV-04c D2-M03: provider 次元で分離集計する。既存 Stripe/LINE 監視（STRIPE_EVENT_JOURNAL_
+    # ENABLED ゲート・24h・Stripe runbook）は **provider != kintone に限定**して不変を保ち、
+    # kintone は §4.2b の専用検査（KINTONE_EVENT_DEDUP_ENABLED ゲート・既定1h・専用 runbook）
+    # として別警報にする。どちらの flag も OFF なら何も見ない（現行 byte 同一）。
+    stripe_on = os.environ.get("STRIPE_EVENT_JOURNAL_ENABLED") == "1"
+    kintone_on = os.environ.get("KINTONE_EVENT_DEDUP_ENABLED", "").strip().lower() \
+        in ("1", "true", "on", "yes")
+    if not (stripe_on or kintone_on):
         return []
 
     import sqlalchemy as sa
@@ -197,18 +205,49 @@ async def check_journal_backlog() -> list[str]:
     from hub.db import session_scope
     from hub.inbound_event import InboundEvent
 
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
+    now = datetime.now(timezone.utc)
+    cutoff24 = now - timedelta(hours=24)
+    problems: list[str] = []
     try:
         async with session_scope() as session:
-            stuck = (await session.execute(
-                sa.select(InboundEvent.id).where(
-                    InboundEvent.state == "processing",
-                    sa.or_(InboundEvent.claimed_at.is_(None),
-                           InboundEvent.claimed_at < cutoff)))).scalars().all()
-            failed = (await session.execute(
-                sa.select(InboundEvent.id).where(
-                    InboundEvent.state == "failed",
-                    InboundEvent.received_at < cutoff))).scalars().all()
+            if stripe_on:
+                # 既存 Stripe/LINE: processing（stale）/failed が24時間超（kintone を除外）
+                stuck = (await session.execute(
+                    sa.select(InboundEvent.id).where(
+                        InboundEvent.provider != "kintone",
+                        InboundEvent.state == "processing",
+                        sa.or_(InboundEvent.claimed_at.is_(None),
+                               InboundEvent.claimed_at < cutoff24)))).scalars().all()
+                failed = (await session.execute(
+                    sa.select(InboundEvent.id).where(
+                        InboundEvent.provider != "kintone",
+                        InboundEvent.state == "failed",
+                        InboundEvent.received_at < cutoff24))).scalars().all()
+                if stuck:
+                    problems.append(
+                        f"journal滞留: processing が24時間超 {len(stuck)}件 "
+                        f"(PK={sorted(stuck)[:10]}) — runbook: docs/runbooks/"
+                        "stripe-journal-recovery.md")
+                if failed:
+                    problems.append(
+                        f"journal滞留: failed が24時間超 {len(failed)}件 "
+                        f"(PK={sorted(failed)[:10]}) — runbook: docs/runbooks/"
+                        "stripe-journal-recovery.md")
+            if kintone_on:
+                # RV-04c §4.2b: kintone の received/sending 滞留（既定1h・§4.2 人手 runbook）
+                from hub.kintone_lane import stale_hours
+                cutoff_k = now - timedelta(hours=stale_hours())
+                k_stuck = (await session.execute(
+                    sa.select(InboundEvent.id).where(
+                        InboundEvent.provider == "kintone",
+                        InboundEvent.state.in_(("received", "sending")),
+                        InboundEvent.received_at < cutoff_k))).scalars().all()
+                if k_stuck:
+                    problems.append(
+                        f"kintone滞留: received/sending が{stale_hours()}時間超 "
+                        f"{len(k_stuck)}件 (PK={sorted(k_stuck)[:10]}) — runbook: "
+                        "docs/work-logs/2026-07-16_RV-04c-S2_gas-signing.md の"
+                        "§4.2 人手再操作手順")
     except (sa.exc.ProgrammingError, sa.exc.OperationalError) as e:
         # テーブル不在（migration未適用）は静かにスキップ。それ以外のDB異常は
         # 実行失敗として上位に伝える（分類のみ・本文を握りつぶさない）
@@ -217,17 +256,6 @@ async def check_journal_backlog() -> list[str]:
             return []
         raise
 
-    problems: list[str] = []
-    if stuck:
-        problems.append(
-            f"journal滞留: processing が24時間超 {len(stuck)}件 "
-            f"(PK={sorted(stuck)[:10]}) — runbook: docs/runbooks/"
-            "stripe-journal-recovery.md")
-    if failed:
-        problems.append(
-            f"journal滞留: failed が24時間超 {len(failed)}件 "
-            f"(PK={sorted(failed)[:10]}) — runbook: docs/runbooks/"
-            "stripe-journal-recovery.md")
     if not problems:
         logger.info("journal backlog OK")
     return problems
@@ -307,6 +335,26 @@ async def _send_heartbeat_probe(silent_hours: int) -> bool:
 # 実行本体
 # ══════════════════════════════════════════════════════════════
 
+def check_next_token_residual() -> str | None:
+    """RV-04c D2-M01: KINTONE_WEBHOOK_TOKEN_NEXT の残置検査（notice・警報ではない）。
+    NEXT が設定済みかつ _NEXT_EXPIRES 超過（または未設定/不正）なら notice 文字列を返す。
+    rotation 5-4c の削除漏れの可視化のみ（可用性影響なし・owner=大野）。"""
+    if not os.environ.get("KINTONE_WEBHOOK_TOKEN_NEXT"):
+        return None
+    exp = os.environ.get("KINTONE_WEBHOOK_TOKEN_NEXT_EXPIRES", "").strip()
+    overdue = True
+    if exp:
+        try:
+            d = datetime.strptime(exp, "%Y-%m-%d").date()
+            overdue = datetime.now(_JST).date() > d
+        except ValueError:
+            overdue = True   # 不正な日付は残置扱い
+    if overdue:
+        return ("【notice】KINTONE_WEBHOOK_TOKEN_NEXT が残置しています"
+                "（rotation 5-4c の削除漏れ？ owner=大野・可用性影響なし）")
+    return None
+
+
 async def run_healthcheck() -> list[str]:
     """全監視項目を実行し、問題リストを返す。異常時のみ LINE 通知。"""
     now = datetime.now(_JST).strftime("%Y-%m-%d %H:%M:%S JST")
@@ -339,9 +387,14 @@ async def run_healthcheck() -> list[str]:
     except Exception as e:
         problems.append(f"業務通知dead-man監視の実行自体が失敗: {type(e).__name__}")
 
+    # RV-04c D2-M01: NEXT 残置 notice（警報ではない・problems に混ぜない）。
+    notice = check_next_token_residual()
+
     if problems:
         logger.error("healthcheck NG (%d problems): %s", len(problems), problems)
         body = "\n".join(f"・{p}" for p in problems)
+        if notice:
+            body += f"\n（{notice}）"   # 通知本文に 1 行添える（異常件数には数えない）
         sent_ok = await notify_admin_line(
             "【日次死活監視: 異常検知】\n"
             f"時刻: {now}\n"
@@ -359,6 +412,9 @@ async def run_healthcheck() -> list[str]:
     else:
         # PR-4c: 従来の print による二重出力を廃止。OK ログは上の logger.info に一本化
         # （INFO 配線済み〔P1-107a〕で本番 Railway に出力される）。
+        if notice:
+            # notice は固定文言（check_next_token_residual）。sink には定数のみ渡す（送信はしない）。
+            logger.info("healthcheck notice: KINTONE_WEBHOOK_TOKEN_NEXT residual")
         logger.info("healthcheck OK (%s) models=%s/%s", now, PRIMARY_MODEL, FALLBACK_MODEL)
 
     return problems

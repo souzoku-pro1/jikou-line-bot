@@ -47,6 +47,11 @@ _SKEW_ENV = "SIG_MAX_SKEW_SEC"
 # RV-04b dual-accept feature flag（既定 OFF＝完全に旧挙動。ON で署名経路併存）
 _DUAL_ACCEPT_ENV = "SERVICE_AUTH_DUAL_ACCEPT_ENABLED"
 _FLAG_TRUE = frozenset({"1", "true", "on", "yes"})
+# RV-04c §6/H07: 旧 query token を段階停止する path list（既定 未設定＝どこも停止しない）。
+_LEGACY_DISABLED_ENV = "SERVICE_AUTH_LEGACY_DISABLED_PATHS"
+_KNOWN_INGEST_PATHS = frozenset({
+    "/koseki/ingest", "/registry/ingest", "/bank/ingest",
+    "/sortation/ingest", "/valuation/ingest"})
 
 # §2.2: 署名経路で必須の 7 ヘッダ。欠落は第1段で missing_header（bad_sig 任せにしない）。
 _REQUIRED_HEADERS = ("X-Sig-Version", "X-Sig-Key-Id", "X-Sig-Caller",
@@ -211,6 +216,52 @@ def validate_registry_startup() -> int:
         return len(load_registry_strict())
     except ServiceAuthConfigError:
         raise ServiceAuthConfigError(_CONFIG_ERROR_FIXED_MSG) from None
+
+
+def _parse_legacy_disabled_strict(raw: str) -> frozenset:
+    """RV-04c H07: SERVICE_AUTH_LEGACY_DISABLED_PATHS を厳格集合検証。
+    未設定/空は空集合。以下は ServiceAuthConfigError（固定文言で起動停止）:
+    未知値・重複・末尾 slash・空要素・全角（非 ASCII）。実 routing raw path と同一
+    （無正規化・完全一致）で照合するため、設定側で正しい形のみ受け付ける。"""
+    if not raw.strip():
+        return frozenset()
+    items = raw.split(",")
+    seen = set()
+    for it in items:
+        if it == "" or it != it.strip():
+            raise ServiceAuthConfigError(_LEGACY_ERROR_FIXED_MSG)   # 空要素/前後空白
+        if any(ord(c) > 127 for c in it):
+            raise ServiceAuthConfigError(_LEGACY_ERROR_FIXED_MSG)   # 全角等
+        if len(it) > 1 and it.endswith("/"):
+            raise ServiceAuthConfigError(_LEGACY_ERROR_FIXED_MSG)   # 末尾 slash
+        if it not in _KNOWN_INGEST_PATHS:
+            raise ServiceAuthConfigError(_LEGACY_ERROR_FIXED_MSG)   # 未知値
+        if it in seen:
+            raise ServiceAuthConfigError(_LEGACY_ERROR_FIXED_MSG)   # 重複
+        seen.add(it)
+    return frozenset(seen)
+
+
+_LEGACY_ERROR_FIXED_MSG = "legacy disabled paths configuration invalid"
+
+
+def validate_legacy_disabled_paths_startup() -> frozenset:
+    """RV-04c H07: 起動時 strict 検証。不正なら固定文言で起動停止（P1-114 方式合流）。
+    戻り値=検証済み停止 path 集合（起動ログ用）。"""
+    raw = os.environ.get(_LEGACY_DISABLED_ENV, "")
+    try:
+        return _parse_legacy_disabled_strict(raw)
+    except ServiceAuthConfigError:
+        raise ServiceAuthConfigError(_LEGACY_ERROR_FIXED_MSG) from None
+
+
+def legacy_disabled_paths() -> frozenset:
+    """実行時アクセサ。起動時 strict 検証が通っている前提。万一の parse 失敗は空集合
+    （起動時に fail-fast 済みのため通常到達しない・500 storm を避ける保守側）。"""
+    try:
+        return _parse_legacy_disabled_strict(os.environ.get(_LEGACY_DISABLED_ENV, ""))
+    except ServiceAuthConfigError:
+        return frozenset()
 
 
 def _max_skew() -> int:
@@ -479,7 +530,15 @@ async def authorize_ingest(request: Request, *, token: str, token_env: str) -> N
                                 if reason == "registry_config_error"
                                 else "signature verification rejected")
         return
-    # 署名ヘッダ皆無 → 旧 query token（Phase A）
+    # 署名ヘッダ皆無 → 旧 query token（Phase A）。
+    # RV-04c §6: 当該 path が停止 list（dual-accept ON 時のみ参照）にあれば token を検証せず
+    # 404（存在しないフリの既存流儀）。停止 lane への旧 token 試行は下で計数（retirement §7）。
+    disabled = legacy_disabled_paths()
+    if disabled:
+        eff = effective_signed_path(request.scope)
+        if eff in disabled:
+            _log_ingest_decision(headers, "legacy_blocked")
+            raise HTTPException(status_code=404, detail="Not Found")
     if not verify_token(token, token_env):
         raise HTTPException(status_code=404, detail="Not Found")
 
