@@ -73,6 +73,18 @@ function appendBytes_(dst, src) {
   return dst;
 }
 
+// ── M01: driveFileId の送出前検証（fallback へ埋め込む前に固定文字集合＋長さ範囲） ──
+// 実 Drive ID 形式（英数字・_・-）に整合。非 ASCII/CR/LF/quote/欠落は例外。
+function validateDriveId_(driveFileId) {
+  if (driveFileId === undefined || driveFileId === null || driveFileId === '') {
+    throw new Error('driveFileId missing');
+  }
+  if (!/^[A-Za-z0-9_-]{1,128}$/.test(driveFileId)) {
+    throw new Error('driveFileId invalid charset/length');
+  }
+  return driveFileId;
+}
+
 // ── §1.1b: filename 規則（CR/LF/NUL/" 拒否＋非 ASCII は ASCII fallback） ──
 function sanitizeFilename_(rawName, driveFileId) {
   for (var i = 0; i < rawName.length; i++) {
@@ -86,6 +98,8 @@ function sanitizeFilename_(rawName, driveFileId) {
     if (rawName.charCodeAt(k) > 127) { ascii = false; break; }
   }
   if (ascii) return rawName;
+  // 非 ASCII → fallback。埋め込む driveFileId 自体を M01 検証してから使う。
+  validateDriveId_(driveFileId);
   var ext = 'bin';
   var dot = rawName.lastIndexOf('.');
   if (dot !== -1) {
@@ -148,28 +162,39 @@ function hmacHex_(canonicalBytes, keyBytes) {
   return toHex_(Utilities.computeHmacSha256Signature(canonicalBytes, keyBytes));
 }
 
-// ── 公開: 署名付き fetch（watcher の UrlFetchApp.fetch 呼出しをこの 1 行に置換） ──
-// path 例 '/koseki/ingest'。parts は {name, value(bytes), filename?, contentType?} の配列。
-// filename は呼び出し側で原名を渡す（内部で sanitize する）。
-function rv04cSignedFetch_(path, parts) {
-  // field 名 allowlist enforce（§1.1b）
+// ── M02: production 前処理（allowlist→sanitize→fallback→builder）を純関数化 ──
+// fetch/Script Properties に依存しないため self-test（S4）と本番が同一経路を通る。
+// 戻り値: {boundary, body(byte[]), driveFileId}。parts の filename は内部で sanitize される。
+function rv04cBuildSignedBody_(path, parts, boundary) {
   var allowed = LANE_FIELDS[path];
   if (!allowed) throw new Error('unknown lane: ' + path);
+  var driveFileId = _driveIdOf_(parts);        // drive_file_id 部の値（M01 で検証）
+  var built = [];
   for (var i = 0; i < parts.length; i++) {
     if (allowed.indexOf(parts[i].name) === -1) {
       throw new Error('field not allowed for ' + path + ': ' + parts[i].name);
     }
-    if (parts[i].filename) {
-      parts[i].filename = sanitizeFilename_(parts[i].filename, _driveIdOf_(parts));
+    var p = { name: parts[i].name, value: parts[i].value,
+              contentType: parts[i].contentType };
+    if (parts[i].filename !== undefined && parts[i].filename !== null) {
+      p.filename = sanitizeFilename_(parts[i].filename, driveFileId);
     }
+    built.push(p);
   }
+  return { boundary: boundary, body: buildMultipart_(boundary, built),
+           driveFileId: driveFileId };
+}
+
+// ── 公開: 署名付き fetch（true lane のみ・rv04cIngestFetch_ から呼ぶ） ──
+function rv04cSignedFetch_(path, parts) {
   var props = PropertiesService.getScriptProperties();
   var keyId = props.getProperty('RV04C_KEY_ID');
   var secretHex = props.getProperty('RV04C_SECRET_HEX');
   if (!keyId || !secretHex) throw new Error('RV04C key not configured in Script Properties');
 
   var boundary = 'RV04C' + Utilities.getUuid().replace(/-/g, '');
-  var body = buildMultipart_(boundary, parts);
+  var built = rv04cBuildSignedBody_(path, parts, boundary);   // M02 前処理を共用
+  var body = built.body;
   var csha = sha256Hex_(body);
   var ts = Math.floor(Date.now() / 1000);
   var nonce = Utilities.getUuid().replace(/-/g, '');
@@ -193,9 +218,29 @@ function rv04cSignedFetch_(path, parts) {
   });
 }
 
+// ── H01: watcher 共通入口。SIGNED_LANES[path] を実効化して署名/旧 query を選択 ──
+// opts = { parts, legacyPayload, legacyToken }。
+//   SIGNED_LANES[path]===true  → rv04cSignedFetch_（署名経路）
+//   それ以外（false/未設定）    → 既存 legacy fetch（query token・現行送信と byte 同一）
+// これで README の「SIGNED_LANES を false に戻す rollback」が実際に成立する。
+function rv04cIngestFetch_(path, opts) {
+  if (SIGNED_LANES[path] === true) {
+    return rv04cSignedFetch_(path, opts.parts);
+  }
+  // legacy: 現行 watcher と同一の query token + 自動 multipart（挙動不変）
+  return UrlFetchApp.fetch(
+    RAILWAY_URL + path + '?token=' + encodeURIComponent(opts.legacyToken), {
+      method: 'post',
+      payload: opts.legacyPayload,
+      muteHttpExceptions: true
+    });
+}
+
 function _driveIdOf_(parts) {
   for (var i = 0; i < parts.length; i++) {
-    if (parts[i].name === 'drive_file_id') return Utilities.newBlob(parts[i].value).getDataAsString();
+    if (parts[i].name === 'drive_file_id') {
+      return Utilities.newBlob(parts[i].value).getDataAsString();
+    }
   }
-  return 'unknown';
+  return '';
 }
