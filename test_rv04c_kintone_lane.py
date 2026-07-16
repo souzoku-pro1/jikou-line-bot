@@ -352,15 +352,47 @@ class TestLegacyStrict(unittest.TestCase):
                 with self.assertRaises(svc.ServiceAuthConfigError):
                     svc._parse_legacy_disabled_strict(raw)
 
+    # S32-M01: 有効な registry を投入し legacy list のみを切替えて因果を特定する。
+    _VALID_REG = json.dumps({"kid-x": {
+        "secret": "cd" * 32, "caller": "gas-ingest", "allowed_methods": ["POST"],
+        "allowed_paths": ["/koseki/ingest"], "not_before": 0, "expires_at": 2 ** 31,
+        "status": "active"}})
+
     def test_startup_failfast_on_bad_value_when_dual_accept_on(self):
         # H03: dual-accept ON かつ異常値 → 起動 fail-fast
         with patch.dict(os.environ, {**_ENV, "HEALTHCHECK_DISABLED": "1",
                                      "RETURN_DEADLINE_DISABLED": "1",
                                      "SERVICE_AUTH_DUAL_ACCEPT_ENABLED": "1",
+                                     "SERVICE_HMAC_KEY_REGISTRY": self._VALID_REG,
                                      "SERVICE_AUTH_LEGACY_DISABLED_PATHS": "/bad/path"}):
             with self.assertRaises(Exception):
                 with TestClient(main.app):
                     pass
+
+    def test_s32m01_legacy_cause_isolated_from_registry(self):
+        # S32-M01: 有効 registry ＋ 異常 legacy → 起動停止は **legacy 固定文言**（P1-114 と区別）
+        from hub import service_auth as svc
+        with patch.dict(os.environ, {**_ENV, "HEALTHCHECK_DISABLED": "1",
+                                     "RETURN_DEADLINE_DISABLED": "1",
+                                     "SERVICE_AUTH_DUAL_ACCEPT_ENABLED": "1",
+                                     "SERVICE_HMAC_KEY_REGISTRY": self._VALID_REG,
+                                     "SERVICE_AUTH_LEGACY_DISABLED_PATHS": "/bad/path"}):
+            with self.assertRaises(svc.ServiceAuthConfigError) as ctx:
+                with TestClient(main.app):
+                    pass
+        self.assertEqual(str(ctx.exception),
+                         "legacy disabled paths configuration invalid")   # legacy 側
+        self.assertNotIn("registry", str(ctx.exception))                  # P1-114 でない
+
+    def test_s32m01_valid_registry_valid_legacy_starts(self):
+        # 対照: 有効 registry ＋ 正常 legacy → 起動成功（legacy が原因でないこと）
+        with patch.dict(os.environ, {**_ENV, "HEALTHCHECK_DISABLED": "1",
+                                     "RETURN_DEADLINE_DISABLED": "1",
+                                     "SERVICE_AUTH_DUAL_ACCEPT_ENABLED": "1",
+                                     "SERVICE_HMAC_KEY_REGISTRY": self._VALID_REG,
+                                     "SERVICE_AUTH_LEGACY_DISABLED_PATHS": "/koseki/ingest"}):
+            with TestClient(main.app):
+                pass
 
     def test_h03_dual_accept_off_bad_value_no_failfast(self):
         # H03: dual-accept OFF は停止 list を検証しない（異常値でも起動する＝現行不変）
@@ -509,11 +541,11 @@ class TestInvalidId(_DbMixin):
             self.assertIsNone(kl.extract_event_id(bad), repr(bad))
 
 
-# ── 12. H02: get_record 例外分類（404=no-op done / その他=failed_preflight） ──
+# ── 12. H02残: get_record 例外分類（404×既知code=done / それ以外=failed_preflight） ──
 class TestGetRecordClassification(_DbMixin):
-    def _run(self, exc):
-        import hub.kintone as hk
-        body = _kintone_body(event_id="gr-" + str(id(exc) % 1000))
+    def _run(self, exc, ev):
+        # S32-M02: event ID は決定的かつ一意（id() や乱数を使わない）
+        body = _kintone_body(event_id=ev)
         proc = AsyncMock(return_value=None)
         with patch.dict(os.environ, {_DEDUP: "1"}), \
              patch.object(main, "send_line_push", new=proc), \
@@ -521,37 +553,64 @@ class TestGetRecordClassification(_DbMixin):
                           new=AsyncMock(side_effect=exc)):
             nr = TestClient(main.app, raise_server_exceptions=False)
             r = nr.post("/webhook/kintone/approval?token=kintone-token", json=body)
-        return r, proc, body["id"]
+        return r, proc
 
-    def test_404_is_noop_done(self):
+    def test_404_known_code_is_noop_done(self):
         import hub.kintone as hk
-        r, proc, ev = self._run(hk.KintoneError(404, "GAIA_RE01", "not found"))
+        r, proc = self._run(hk.KintoneError(404, "GAIA_RE01", "not found"), "gr-404known")
         self.assertEqual(r.status_code, 200)
         self.assertEqual(r.json().get("skip"), "record_not_found")
         proc.assert_not_awaited()
-        st, le = self._state_of(ev)
+        st, le = self._state_of("gr-404known")
         self.assertEqual((st, le), ("done", "skip_record_not_found"))
 
-    def test_timeout_is_failed_preflight_not_done(self):
-        # 修正前 FAIL: 現行（全 KintoneError→record_not_found）は timeout も done 化する
+    def test_404_unknown_code_is_failed(self):
+        # H02残: 404 でも未知 code（app/endpoint/設定起因）は done 化しない → failed
+        # 修正前 FAIL: 現行は 404 なら code を問わず done 化する
         import hub.kintone as hk
-        r, proc, ev = self._run(hk.KintoneError(0, "transport_error", "timeout"))
-        self.assertEqual(r.status_code, 200)
+        r, proc = self._run(hk.KintoneError(404, "GAIA_XX99", "other"), "gr-404unknown")
         self.assertEqual(r.json().get("skip"), "get_record_error")
-        proc.assert_not_awaited()             # LINE write 0
-        st, le = self._state_of(ev)
-        self.assertEqual(st, "failed")        # done 化しない（transient）
+        proc.assert_not_awaited()
+        st, le = self._state_of("gr-404unknown")
+        self.assertEqual(st, "failed")
+        self.assertIn("404", le)
+        self.assertIn("GAIA_XX99", le)
+
+    def test_404_missing_code_is_failed(self):
+        # H02残: 404×code 欠落（非 JSON 含む・code="") → failed
+        import hub.kintone as hk
+        r, proc = self._run(hk.KintoneError(404, "", "no code"), "gr-404nocode")
+        self.assertEqual(r.json().get("skip"), "get_record_error")
+        st, le = self._state_of("gr-404nocode")
+        self.assertEqual(st, "failed")
+        self.assertIn("nocode", le)
+
+    def test_timeout_is_failed_preflight_not_done(self):
+        import hub.kintone as hk
+        r, proc = self._run(hk.KintoneError(0, "transport_error", "timeout"), "gr-timeout")
+        self.assertEqual(r.json().get("skip"), "get_record_error")
+        proc.assert_not_awaited()
+        st, le = self._state_of("gr-timeout")
+        self.assertEqual(st, "failed")
         self.assertTrue(le.startswith("get_record_error_0"), le)
 
     def test_5xx_and_401_are_failed(self):
         import hub.kintone as hk
+        # S32-M02: status ごとに決定的な event ID
         for status in (500, 401, 403):
             with self.subTest(status=status):
-                r, proc, ev = self._run(hk.KintoneError(status, "x", "e"))
+                ev = f"gr-status-{status}"
+                r, proc = self._run(hk.KintoneError(status, "GAIA_X", "e"), ev)
                 st, le = self._state_of(ev)
                 self.assertEqual(st, "failed", status)
                 self.assertIn(str(status), le)
                 proc.assert_not_awaited()
+
+    def test_is_record_not_found_predicate(self):
+        self.assertTrue(kl.is_record_not_found(404, "GAIA_RE01"))
+        self.assertFalse(kl.is_record_not_found(404, "GAIA_XX99"))
+        self.assertFalse(kl.is_record_not_found(404, ""))
+        self.assertFalse(kl.is_record_not_found(500, "GAIA_RE01"))
 
 
 # ── 13. M01: IntegrityError の実在再照合（存在=dup / 不在=再送出） ───────────
@@ -658,11 +717,45 @@ class TestMonitorOldestAndFailed(_DbMixin):
         db.reset_for_tests()
         self.assertTrue(any("kintone滞留(未処理)" in x for x in p), p)
 
-    def test_mixed_multi_provider_complete_assert(self):
-        # Stripe failed 26h / LINE processing 26h / kintone received 3h + failed 4h
-        asyncio.run(self._seed("s1", "stripe", "failed", 26))
-        asyncio.run(self._seed("k-r", "kintone", "received", 3))
-        asyncio.run(self._seed("k-f", "kintone", "failed", 4, "get_record_error_500"))
+    async def _seed_at(self, ev, provider, state, received_at, last_error=None,
+                       claimed_at=None):
+        vals = dict(provider=provider, external_event_id=ev, dedup_key=f"{provider}:{ev}",
+                    payload_hash="0" * 64, signature_result="token", state=state,
+                    last_error=last_error, received_at=received_at, attempts=1)
+        if claimed_at is not None:
+            vals["claimed_at"] = claimed_at
+        async with db.session_scope() as s:
+            await s.execute(sa.insert(InboundEvent.__table__).values(**vals))
+
+    def test_oldest_time_exact_value(self):
+        # M04残: 時刻固定 fixture（5h前・3h前・0.5h前）で最古値の **完全一致** assert
+        now = datetime.now(timezone.utc)
+        t5 = (now - timedelta(hours=5)).replace(microsecond=0)
+        t3 = (now - timedelta(hours=3)).replace(microsecond=0)
+        thalf = (now - timedelta(minutes=30)).replace(microsecond=0)
+        asyncio.run(self._seed_at("o5", "kintone", "received", t5))
+        asyncio.run(self._seed_at("o3", "kintone", "sending", t3))
+        asyncio.run(self._seed_at("oh", "kintone", "received", thalf))  # 0.5h<1h=対象外
+        db.reset_for_tests()
+        with patch.dict(os.environ, {_DEDUP: "1"}):
+            problems = asyncio.run(hc.check_journal_backlog())
+        db.reset_for_tests()
+        stuck = [p for p in problems if "kintone滞留(未処理)" in p]
+        self.assertEqual(len(stuck), 1, problems)
+        self.assertIn("2件", stuck[0])                       # 5h・3h の 2 件（0.5h は対象外）
+        self.assertIn(f"最古={hc._iso(t5)}", stuck[0])       # 最古=5h前の完全一致
+        self.assertNotIn(hc._iso(thalf), stuck[0])           # 対象外は含まれない
+
+    def test_mixed_all_providers_including_line_processing(self):
+        # M04残: Stripe failed / LINE processing / kintone received+failed を同一 fixture で
+        now = datetime.now(timezone.utc)
+        asyncio.run(self._seed_at("s1", "stripe", "failed", now - timedelta(hours=26)))
+        asyncio.run(self._seed_at("l1", "line", "processing", now - timedelta(hours=26),
+                                  claimed_at=now - timedelta(hours=26)))
+        kr = (now - timedelta(hours=3)).replace(microsecond=0)
+        asyncio.run(self._seed_at("k-r", "kintone", "received", kr))
+        asyncio.run(self._seed_at("k-f", "kintone", "failed", now - timedelta(hours=4),
+                                  "get_record_error_500"))
         db.reset_for_tests()
         with patch.dict(os.environ, {"STRIPE_EVENT_JOURNAL_ENABLED": "1", _DEDUP: "1"}):
             problems = asyncio.run(hc.check_journal_backlog())
@@ -670,10 +763,13 @@ class TestMonitorOldestAndFailed(_DbMixin):
         stripe_p = " ".join(p for p in problems if "stripe-journal-recovery" in p)
         stuck = " ".join(p for p in problems if "kintone滞留(未処理)" in p)
         failed = " ".join(p for p in problems if "kintone失敗" in p)
-        self.assertIn("failed が24時間超 1件", stripe_p)     # Stripe 側件数（kintone 混ざらず）
-        self.assertNotIn("kintone", stripe_p)                # 文面分離
-        self.assertIn("1件", stuck)                          # kintone received 1
-        self.assertIn("1件", failed)                         # kintone failed 1
+        # Stripe/LINE（provider!=kintone）: processing 1・failed 1・kintone 非混入
+        self.assertIn("processing が24時間超 1件", stripe_p)   # LINE processing
+        self.assertIn("failed が24時間超 1件", stripe_p)       # Stripe failed
+        self.assertNotIn("kintone", stripe_p)
+        # kintone: received 1・failed 1・最古時刻完全一致
+        self.assertIn("1件", stuck)
+        self.assertIn(f"最古={hc._iso(kr)}", stuck)
         self.assertIn("get_record_error_500", failed)
 
 
