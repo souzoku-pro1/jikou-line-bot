@@ -208,7 +208,10 @@ class TestBuilderStage0(unittest.TestCase):
 
     def test_large_pdf_chunk_boundary_algorithm(self):
         # 実運用上限相当（~数 MB）＋chunk 境界前後で chunked==plain・SHA 一致
-        big = bytes((i * 131 + 7) % 256 for i in range(3_000_000))  # 3MB 疑似 PDF bytes
+        # GAS selftest（gas/rv04c_selftest.js:96）の signed byte 式 ((i*131+7)%256)-128 と
+        # **同一バイト列**（signed→8bit で +128 mod 256）。変更時は両側同時に。合成値自体に
+        # 意味はなく、cross-machine で一致することのみが要件。
+        big = bytes(((i * 131 + 7) + 128) % 256 for i in range(3_000_000))  # 3MB 疑似 PDF bytes
         parts = [{"name": "file", "filename": "big.pdf",
                   "content_type": "application/pdf", "value": big},
                  {"name": "drive_file_id", "filename": None,
