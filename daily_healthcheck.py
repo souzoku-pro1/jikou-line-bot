@@ -47,6 +47,15 @@ logger = logging.getLogger("daily_healthcheck")
 _JST = timezone(timedelta(hours=9))
 
 
+def _iso(dt) -> str:
+    """最古時刻の表示（UTC・分精度・tz 無しは UTC 補完）。件数/時刻のみで PII は含まない。"""
+    if dt is None:
+        return "?"
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%MZ")
+
+
 # ══════════════════════════════════════════════════════════════
 # 監視項目A: Anthropic Models API
 # ══════════════════════════════════════════════════════════════
@@ -187,9 +196,17 @@ async def check_journal_backlog() -> list[str]:
       - inbound_event テーブル不在（migration未適用）
     警報文面は件数とPKのみ（event ID・dedup_key を出さない・D17流儀）。
     """
-    if os.environ.get("STRIPE_EVENT_JOURNAL_ENABLED") != "1":
-        return []
     if not os.environ.get("DATABASE_URL"):
+        return []
+
+    # RV-04c D2-M03: provider 次元で分離集計する。既存 Stripe/LINE 監視（STRIPE_EVENT_JOURNAL_
+    # ENABLED ゲート・24h・Stripe runbook）は **provider != kintone に限定**して不変を保ち、
+    # kintone は §4.2b の専用検査（KINTONE_EVENT_DEDUP_ENABLED ゲート・既定1h・専用 runbook）
+    # として別警報にする。どちらの flag も OFF なら何も見ない（現行 byte 同一）。
+    stripe_on = os.environ.get("STRIPE_EVENT_JOURNAL_ENABLED") == "1"
+    kintone_on = os.environ.get("KINTONE_EVENT_DEDUP_ENABLED", "").strip().lower() \
+        in ("1", "true", "on", "yes")
+    if not (stripe_on or kintone_on):
         return []
 
     import sqlalchemy as sa
@@ -197,18 +214,70 @@ async def check_journal_backlog() -> list[str]:
     from hub.db import session_scope
     from hub.inbound_event import InboundEvent
 
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
+    now = datetime.now(timezone.utc)
+    cutoff24 = now - timedelta(hours=24)
+    problems: list[str] = []
     try:
         async with session_scope() as session:
-            stuck = (await session.execute(
-                sa.select(InboundEvent.id).where(
-                    InboundEvent.state == "processing",
-                    sa.or_(InboundEvent.claimed_at.is_(None),
-                           InboundEvent.claimed_at < cutoff)))).scalars().all()
-            failed = (await session.execute(
-                sa.select(InboundEvent.id).where(
-                    InboundEvent.state == "failed",
-                    InboundEvent.received_at < cutoff))).scalars().all()
+            if stripe_on:
+                # 既存 Stripe/LINE: processing（stale）/failed が24時間超（kintone を除外）
+                stuck = (await session.execute(
+                    sa.select(InboundEvent.id).where(
+                        InboundEvent.provider != "kintone",
+                        InboundEvent.state == "processing",
+                        sa.or_(InboundEvent.claimed_at.is_(None),
+                               InboundEvent.claimed_at < cutoff24)))).scalars().all()
+                failed = (await session.execute(
+                    sa.select(InboundEvent.id).where(
+                        InboundEvent.provider != "kintone",
+                        InboundEvent.state == "failed",
+                        InboundEvent.received_at < cutoff24))).scalars().all()
+                if stuck:
+                    problems.append(
+                        f"journal滞留: processing が24時間超 {len(stuck)}件 "
+                        f"(PK={sorted(stuck)[:10]}) — runbook: docs/runbooks/"
+                        "stripe-journal-recovery.md")
+                if failed:
+                    problems.append(
+                        f"journal滞留: failed が24時間超 {len(failed)}件 "
+                        f"(PK={sorted(failed)[:10]}) — runbook: docs/runbooks/"
+                        "stripe-journal-recovery.md")
+            if kintone_on:
+                # RV-04c §4.2b/M04/M05: kintone の滞留（received/sending）と失敗（failed）を
+                # **別文言**で検知し、それぞれ provider 別**最古時刻**を併記する。
+                from hub.kintone_lane import stale_hours
+                _RB = "docs/runbooks/2026-07_kintone-lane-recovery.md"
+                cutoff_k = now - timedelta(hours=stale_hours())
+                # 滞留（未処理）: received/sending が閾値超
+                stuck_rows = (await session.execute(
+                    sa.select(InboundEvent.id, InboundEvent.received_at).where(
+                        InboundEvent.provider == "kintone",
+                        InboundEvent.state.in_(("received", "sending")),
+                        InboundEvent.received_at < cutoff_k))).all()
+                if stuck_rows:
+                    ids = sorted(r[0] for r in stuck_rows)
+                    oldest = min(r[1] for r in stuck_rows)
+                    problems.append(
+                        f"kintone滞留(未処理): received/sending が{stale_hours()}時間超 "
+                        f"{len(stuck_rows)}件 最古={_iso(oldest)} "
+                        f"(PK={ids[:10]}) — runbook: {_RB}")
+                # 失敗: failed（transient 失敗＝mark_failed_preflight 等・再送なし＝人手）
+                failed_rows = (await session.execute(
+                    sa.select(InboundEvent.id, InboundEvent.received_at,
+                              InboundEvent.last_error).where(
+                        InboundEvent.provider == "kintone",
+                        InboundEvent.state == "failed",
+                        InboundEvent.received_at < cutoff_k))).all()
+                if failed_rows:
+                    ids = sorted(r[0] for r in failed_rows)
+                    oldest = min(r[1] for r in failed_rows)
+                    # last_error は境界化された分類コード（get_record_error_<status>/skip_*）＝
+                    # 自由文字列でないため distinct をそのまま表示（PII なし）。
+                    classes = sorted({r[2] or "unknown" for r in failed_rows})
+                    problems.append(
+                        f"kintone失敗: failed が{stale_hours()}時間超 {len(failed_rows)}件 "
+                        f"最古={_iso(oldest)} 分類={classes[:5]} "
+                        f"(PK={ids[:10]}) — runbook: {_RB}")
     except (sa.exc.ProgrammingError, sa.exc.OperationalError) as e:
         # テーブル不在（migration未適用）は静かにスキップ。それ以外のDB異常は
         # 実行失敗として上位に伝える（分類のみ・本文を握りつぶさない）
@@ -217,17 +286,6 @@ async def check_journal_backlog() -> list[str]:
             return []
         raise
 
-    problems: list[str] = []
-    if stuck:
-        problems.append(
-            f"journal滞留: processing が24時間超 {len(stuck)}件 "
-            f"(PK={sorted(stuck)[:10]}) — runbook: docs/runbooks/"
-            "stripe-journal-recovery.md")
-    if failed:
-        problems.append(
-            f"journal滞留: failed が24時間超 {len(failed)}件 "
-            f"(PK={sorted(failed)[:10]}) — runbook: docs/runbooks/"
-            "stripe-journal-recovery.md")
     if not problems:
         logger.info("journal backlog OK")
     return problems
@@ -307,6 +365,26 @@ async def _send_heartbeat_probe(silent_hours: int) -> bool:
 # 実行本体
 # ══════════════════════════════════════════════════════════════
 
+def check_next_token_residual() -> str | None:
+    """RV-04c D2-M01: KINTONE_WEBHOOK_TOKEN_NEXT の残置検査（notice・警報ではない）。
+    NEXT が設定済みかつ _NEXT_EXPIRES 超過（または未設定/不正）なら notice 文字列を返す。
+    rotation 5-4c の削除漏れの可視化のみ（可用性影響なし・owner=大野）。"""
+    if not os.environ.get("KINTONE_WEBHOOK_TOKEN_NEXT"):
+        return None
+    exp = os.environ.get("KINTONE_WEBHOOK_TOKEN_NEXT_EXPIRES", "").strip()
+    overdue = True
+    if exp:
+        try:
+            d = datetime.strptime(exp, "%Y-%m-%d").date()
+            overdue = datetime.now(_JST).date() > d
+        except ValueError:
+            overdue = True   # 不正な日付は残置扱い
+    if overdue:
+        return ("【notice】KINTONE_WEBHOOK_TOKEN_NEXT が残置しています"
+                "（rotation 5-4c の削除漏れ？ owner=大野・可用性影響なし）")
+    return None
+
+
 async def run_healthcheck() -> list[str]:
     """全監視項目を実行し、問題リストを返す。異常時のみ LINE 通知。"""
     now = datetime.now(_JST).strftime("%Y-%m-%d %H:%M:%S JST")
@@ -339,9 +417,14 @@ async def run_healthcheck() -> list[str]:
     except Exception as e:
         problems.append(f"業務通知dead-man監視の実行自体が失敗: {type(e).__name__}")
 
+    # RV-04c D2-M01: NEXT 残置 notice（警報ではない・problems に混ぜない）。
+    notice = check_next_token_residual()
+
     if problems:
         logger.error("healthcheck NG (%d problems): %s", len(problems), problems)
         body = "\n".join(f"・{p}" for p in problems)
+        if notice:
+            body += f"\n（{notice}）"   # 通知本文に 1 行添える（異常件数には数えない）
         sent_ok = await notify_admin_line(
             "【日次死活監視: 異常検知】\n"
             f"時刻: {now}\n"
@@ -359,6 +442,9 @@ async def run_healthcheck() -> list[str]:
     else:
         # PR-4c: 従来の print による二重出力を廃止。OK ログは上の logger.info に一本化
         # （INFO 配線済み〔P1-107a〕で本番 Railway に出力される）。
+        if notice:
+            # notice は固定文言（check_next_token_residual）。sink には定数のみ渡す（送信はしない）。
+            logger.info("healthcheck notice: KINTONE_WEBHOOK_TOKEN_NEXT residual")
         logger.info("healthcheck OK (%s) models=%s/%s", now, PRIMARY_MODEL, FALLBACK_MODEL)
 
     return problems

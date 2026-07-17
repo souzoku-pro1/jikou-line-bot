@@ -75,8 +75,16 @@ async def _on_startup():
     # SERVICE_HMAC_KEY_REGISTRY が壊れ JSON/構造違反なら ServiceAuthConfigError を
     # そのまま送出して起動を失敗させる（署名リクエスト毎の沈黙 500 の排除）。
     # flag OFF は registry 非参照＝現行挙動不変。
-    from hub.service_auth import validate_registry_startup
+    from hub.service_auth import (validate_registry_startup,
+                                  validate_legacy_disabled_paths_startup)
     validate_registry_startup()
+    # RV-04c H07: 旧 query 停止 path list の起動時 strict 検証（異常形は固定文言で起動停止）。
+    validate_legacy_disabled_paths_startup()
+    # RV-04c D2-M01: KINTONE_WEBHOOK_TOKEN_NEXT の残置を起動ログに固定文言で警告（値は出さない）。
+    from daily_healthcheck import check_next_token_residual
+    if check_next_token_residual():
+        logger.warning("[RV04c] KINTONE_WEBHOOK_TOKEN_NEXT residual "
+                       "(rotation cleanup pending; owner=大野)")
     from hub.return_deadline import register_return_deadline_job
     register_return_deadline_job()
     start_healthcheck_scheduler()
@@ -600,6 +608,17 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
     return {"status": "ok"}
 
 
+def _verify_kintone_token(token: str) -> bool:
+    """RV-04c §5.2: rotation 期間の dual-accept。primary（KINTONE_WEBHOOK_TOKEN）または
+    NEXT（KINTONE_WEBHOOK_TOKEN_NEXT・投入時のみ）のどちらかに一致すれば受理。
+    NEXT 未設定なら従来どおり primary のみ（byte 同一）。"""
+    if verify_token(token, "KINTONE_WEBHOOK_TOKEN"):
+        return True
+    if os.environ.get("KINTONE_WEBHOOK_TOKEN_NEXT"):
+        return verify_token(token, "KINTONE_WEBHOOK_TOKEN_NEXT")
+    return False
+
+
 @app.post("/webhook/kintone/approval")
 async def kintone_approval_webhook(request: Request):
     """
@@ -607,19 +626,61 @@ async def kintone_approval_webhook(request: Request):
     ステータス=承認済 かつ 送信済み=no のレコードに対して
     最新の AI下書き を LINE push し、送信済み=yes に更新する（冪等）。
     URL: /webhook/kintone/approval?token=<KINTONE_WEBHOOK_TOKEN>
+
+    RV-04c: flag KINTONE_EVENT_DEDUP_ENABLED ON のとき、webhook top-level `id` で
+    inbound_event 冪等記録＋state 遷移（received/sending/done/failed・§4.2）。flag OFF は
+    hub.kintone_lane を import せず現行挙動と byte 同一（env 直読みゲート・M-06 流儀）。
     """
     token = request.query_params.get("token", "")
-    if not verify_token(token, "KINTONE_WEBHOOK_TOKEN"):
+    if not _verify_kintone_token(token):
         raise HTTPException(status_code=404, detail="not found")
 
-    try:
-        body = await request.json()
-    except Exception:
-        raise HTTPException(status_code=400, detail="invalid json")
+    # RV-04c: flag ON は生 body を hash 用に確保してから parse する（flag OFF は request.json()）。
+    _dedup = os.environ.get("KINTONE_EVENT_DEDUP_ENABLED", "").strip().lower() \
+        in ("1", "true", "on", "yes")
+    if _dedup:
+        raw = await request.body()
+        try:
+            body = json.loads(raw)
+        except Exception:
+            raise HTTPException(status_code=400, detail="invalid json")
+    else:
+        try:
+            body = await request.json()
+        except Exception:
+            raise HTTPException(status_code=400, detail="invalid json")
+
+    # RV-04c 冪等 claim（flag ON・§4.2）。_ev は claim 済み event_id（flag OFF は None）。
+    _ev = None
+    if _dedup:
+        from hub.kintone_lane import (claim_event, extract_event_id, observe_xff,
+                                      mark_noop_done, mark_sending, mark_done,
+                                      mark_failed_preflight, observe_pre_claim_reject,
+                                      is_record_not_found)
+        observe_xff(request.headers.get("x-forwarded-for", ""))  # §4.1 observe-only
+        event_id = extract_event_id(body)
+        if not event_id:
+            # H01: id 欠落/空/型不正は claim 前に拒否（LINE write 0・固定 reason の 400）。
+            # 行を作らないため滞留監視ではなく専用計数で観測する。
+            observe_pre_claim_reject()
+            raise HTTPException(status_code=400, detail="invalid webhook id")
+        try:
+            outcome = await claim_event(
+                event_id=event_id,
+                caller_id=str((body.get("app") or {}).get("id") or "kintone"),
+                event_type=body.get("type"), payload=raw)
+        except Exception:
+            # H04 fail-closed: dedup 不能（DB 障害等）は処理せず 5xx（喪失は §4.2b 観測）
+            raise HTTPException(status_code=503, detail="event store unavailable")
+        if outcome == "duplicate":
+            return {"ok": True, "skip": "duplicate_delivery"}
+        _ev = event_id
 
     # レコード ID を取得（hub/webhook_auth・従来と同一ロジック）
     record_id = extract_record_id(body)
     if not record_id:
+        if _ev:
+            await mark_noop_done(_ev, "skip_missing_fields")
         return {"ok": True, "skip": "no_record_id"}
 
     # Webhook ボディで高速チェック（不要な API 呼び出しを減らす）
@@ -627,23 +688,38 @@ async def kintone_approval_webhook(request: Request):
         webhook_status = body["record"]["ステータス2"]["value"]
         webhook_sent   = body["record"]["送信済み"]["value"]
     except (KeyError, TypeError):
+        if _ev:
+            await mark_noop_done(_ev, "skip_missing_fields")
         return {"ok": True, "skip": "missing_fields"}
 
     if webhook_status != "承認済" or webhook_sent != "no":
+        if _ev:
+            await mark_noop_done(_ev, "skip_not_approved")
         return {"ok": True, "skip": "not_triggered"}
 
     # 最新レコードを取り直す（先生の修正を反映するため・hub 経由）
+    # H02残: record 不存在の確定は **HTTP 404 かつ既知 record-not-found code（GAIA_RE01）** の
+    # ときのみ no-op done。404×未知 code・code 欠落・非 JSON、および 404 以外（401/timeout/
+    # 接続/5xx）は transient として mark_failed_preflight＋LINE write 0（done 化しない）。
     try:
         record = await hub_kintone.get_record(_APP_APPROVAL, record_id)
-    except hub_kintone.KintoneError:
-        record = None
+    except hub_kintone.KintoneError as e:
+        _st, _cd = getattr(e, "status", 0), getattr(e, "code", "")
+        if _ev and not is_record_not_found(_st, _cd):
+            await mark_failed_preflight(_ev, f"get_record_error_{_st}_{_cd or 'nocode'}")
+            return {"ok": True, "skip": "get_record_error"}   # LINE write 0・failed 記録
+        record = None   # record 不存在確定（GAIA_RE01）or flag OFF → record_not_found
     if not record:
+        if _ev:
+            await mark_noop_done(_ev, "skip_record_not_found")
         return {"ok": True, "skip": "record_not_found"}
 
     current_status = record.get("ステータス2", {}).get("value", "")
     current_sent   = record.get("送信済み",   {}).get("value", "")
 
     if current_status != "承認済" or current_sent != "no":
+        if _ev:
+            await mark_noop_done(_ev, "skip_already_sent")
         return {"ok": True, "skip": "already_sent_or_not_approved"}
 
     user_id  = record.get("line_user_id", {}).get("value", "")
@@ -651,12 +727,26 @@ async def kintone_approval_webhook(request: Request):
     category = record.get("カテゴリ",     {}).get("value", "")
 
     if not user_id or not ai_draft:
+        if _ev:
+            await mark_noop_done(_ev, "skip_missing_user_or_draft")
         return {"ok": True, "skip": "missing_user_or_draft"}
 
+    # RV-04c §4.2 D3-H01: 送信着手 marker（received→sending）成功が LINE 送信の前提条件。
+    if _ev:
+        if not await mark_sending(_ev):
+            # marker 失敗（並行操作等）→ LINE write 0（fail-closed・行は現状のまま滞留観測へ）
+            logger.warning("[KINTONE] sending marker 失敗のため送信中止 record_id=%s",
+                           emit(record_id, "record_id", "log", "operator"))
+            return {"ok": True, "skip": "marker_not_acquired"}
+
     # LINE push 送信 → 送信済みフラグ更新 → チャットログ保存
+    # RV-04c §4.2 phase 表: marker 後の失敗（例外・timeout）は sending 維持（failed 上書き禁止・
+    # 不明は不明のまま §4.2 runbook へ）。例外は握らず伝播させ、state は sending に留める。
     await send_line_push(user_id, ai_draft)
     await mark_approval_sent(record_id)
     await save_to_chatlog(user_id, "assistant", ai_draft, category, "yes")
+    if _ev:
+        await mark_done(_ev)   # 全副作用完了後の terminal（sending→done・last_error=NULL）
 
     return {"ok": True, "record_id": record_id}
 
