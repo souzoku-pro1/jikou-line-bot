@@ -1,6 +1,7 @@
 # Runbook: RV-04c S4/S5 実機移行チェックリスト（GAS 署名・rotation・retirement）
 
-- 設計正本: `DRAFT_RV04C_CALLER_MIGRATION.md` rev D5（docs/rv04c-draft・**逸脱禁止**）。
+- 設計正本: **`docs/design-drafts/DRAFT_RV04C_CALLER_MIGRATION.md` rev D5・
+  SHA `c32c45df42370618e43903f94a59715081d23552`**（branch docs/rv04c-draft・**逸脱禁止**）。
   本チェックリストは正本の §1〜§7 を実機手順へ落とすもの。判断は正本に従う。
 - 実装参照（main 反映済み）: work-log `2026-07-16_RV-04c-S2*` / `*-S3*`・`gas/README.md`・
   runbook `2026-07_kintone-lane-recovery.md`。
@@ -40,24 +41,33 @@
 - **投入先1: GAS Script Properties**（プロジェクトの設定 → スクリプト プロパティ）:
   - キー `RV04C_KEY_ID` = 値 `gas-ingest-2026-07a`
   - キー `RV04C_SECRET_HEX` = 「値」（上記 hex）
-- **投入先2: Railway env `SERVICE_HMAC_KEY_REGISTRY`**（JSON・値は表示しない）:
+- **投入先2: Railway env `SERVICE_HMAC_KEY_REGISTRY`**（JSON・値は表示しない）——
+  **既存 JSON を置換しない。既存 entry を全件保持したまま `gas-ingest-2026-07a` を追加する**
+  （S4C-H01）。追加する entry:
   ```json
-  {
-    "gas-ingest-2026-07a": {
-      "secret": "「値」（GAS と同一 hex）",
-      "caller": "gas-ingest",
-      "allowed_methods": ["POST"],
-      "allowed_paths": ["/koseki/ingest", "/registry/ingest", "/bank/ingest",
-                        "/sortation/ingest", "/valuation/ingest"],
-      "not_before": <投入時刻 unix 秒>,
-      "expires_at": <次回 rotation 予定 unix 秒>,
-      "status": "active"
-    }
+  "gas-ingest-2026-07a": {
+    "secret": "「値」（GAS と同一 hex）",
+    "caller": "gas-ingest",
+    "allowed_methods": ["POST"],
+    "allowed_paths": ["/koseki/ingest", "/registry/ingest", "/bank/ingest",
+                      "/sortation/ingest", "/valuation/ingest"],
+    "not_before": <投入時刻 unix 秒>,
+    "expires_at": <次回 rotation 予定 unix 秒>,
+    "status": "active"
   }
   ```
   - caller 1 本＋allowed_paths 5 入口（§3/§9-1 の条件付き採用）。GAS と Railway に**同一 hex**。
   - **placeholder 厳禁**（未投入で点火すると P1-114 の起動時 4象限 fail-fast に落ちる＝これは
     正常動作。§D-1 注記）。
+  - **投入前後の集合一致確認（S4C-H01・値は見ない）**:
+    - **投入前**: 現 registry の **key ID 一覧のみ**を控える（値・secret は見ない）。取得例
+      （Railway の env 値を [人] が手元で・**key 名のみ抽出**）:
+      `python -c "import json,sys; print(sorted(json.loads(sys.stdin.read()).keys()))"`
+      に現 JSON を渡す（出力は key ID の配列だけ・secret は出ない）。
+    - **投入後**: 同じ方法で key ID 一覧を再取得し、**「投入前の既存 key ID 全件 ＋
+      gas-ingest-2026-07a」の集合と一致**することを確認（既存 entry の消失・上書きがないこと）。
+    - **現状 registry が空/未設定の場合**: 新規 JSON（上記 entry を 1 件だけ持つオブジェクト）で
+      可。この場合の投入後 key ID 一覧は `["gas-ingest-2026-07a"]` の 1 件。
 
 ## C. GAS 共同編集者ゼロの実見（M03・[人]・S4 前チェック）
 
@@ -67,6 +77,13 @@
     点火前に是正し [司令塔] へ報告。
 - 併せて Script Properties 採用条件 5 点（単独所有・共同編集者ゼロ・定期監査・secret/log 禁止・
   権限変更時 rotation）の充足を確認。
+
+- **[PC-A] 点火前ゲート（S4C-M02・kintone レーン点火の前提）**: App 29 refetch の
+  **404 厳格分類**（HTTP 404 ＋ vendor code `GAIA_RE01` のみ no-op done／未知 code・code 欠落・
+  非 JSON は failed_preflight）の対応テストが **main で PASS** していること、および
+  **S3 work-log（`2026-07-16_RV-04c-S3-fix2_review-findings.md` H02残）に記載がある**ことを
+  確認する（`test_rv04c_kintone_lane.py::TestGetRecordClassification` の 404×既知/未知/欠落
+  対照）。**本番での vendor 異常の人工発生は不要**（テスト済みであることの確認のみ）。
 
 ## D. 点火順序（各工程に停止条件つき）
 
@@ -92,6 +109,8 @@
 ### D-4. 並行観測（cadence 基準）[司令塔]→[PC-A]
 - **[PC-A]** lane 別に「署名成功継続 かつ **legacy 成功（token 経路 200）が 0 に収束**」を観測。
 - 観測窓は **lane 別最大実行間隔 × 2 かつ 署名成功最低 N=3 回**（§7-3・一律日数は用いない）。
+- **[PC-A]** この **lane 別 legacy 成功 0 収束の集計値**を後段 retirement（D-7）で S5 work-log へ
+  保存する（S4C-M01・保存工程は D-7 に記載）。
 - **停止条件**: legacy 成功が 0 に収束しない lane は停止（D-5）へ進めない。
 
 ### D-5. legacy 段階停止 [人]→[PC-A]
@@ -120,14 +139,24 @@
 - ingest 旧 `*_INGEST_TOKEN` 削除・GAS 旧 token 定数削除は **当該 lane の D-5 安定確認後**
   （§5.1 rollback の手順 2 が参照するため）。
 
-### D-7. retirement evidence（3 点セット）[PC-A]→[司令塔]
-- **[PC-A]** 以下 3 点を .md に実出力で固定:
+### D-7. retirement evidence（3 点セット＋計数・S5 work-log 固定）
+- **[PC-A]** 以下 3 点を S5 work-log（.md）に実出力で固定:
   1. **署名成功の実送**: 各 lane で署名経路 200 の実ログ（観測窓内 N 回）。
-  2. **能動 404 試験**: 旧 query token での手動アクセスが 404（`legacy_blocked` reason が出る）。
-     値は表示しない。
+  2. **能動 404 試験**: **[人]** が旧 query token を用いて手動アクセスし 404 になることを
+     発生させる（S4C-H02）。**[PC-A] の役割は HTTP 結果と固定 reason ログ（`legacy_blocked`）
+     の読取検分のみ**（能動アクセス自体は行わない）。**旧 token 値は [人] の手元のみで扱い、
+     チャット/報告への転記は禁止**（値は表示しない）。
   3. **credential 削除**: `*_INGEST_TOKEN` env 削除済み・GAS 旧 token 定数削除済み・承認キュー
      旧 token が kintone URL から消えたこと（[人]実見）＋ 5-4 完了。
-- **[司令塔]** 3 点セット確認で retirement 完了裁定。
+- **計数の保存（S4C-M01・retirement 要件の一部）**:
+  - **[PC-A]** **D-4 の lane 別「legacy 成功 0 収束」の集計値**を **S5 work-log へ保存**する
+    （停止判断の裏づけ・lane 別に「署名成功継続／legacy 成功が 0 に収束」の実測窓を記録）。
+  - **[PC-A]** legacy 停止後、**観測窓内の `legacy_blocked` 専用 reason の試行件数を、署名
+    成功 reason（`ok`）と分離して計数**し、**S5 work-log へ保存**する（「試行はあるが遮断
+    されている」と「そもそも来ていない」を区別・成功 0 の裏づけ）。
+- **retirement 宣言の要件**: 上記 **証跡 3 点（署名成功実送／能動 404／credential 削除）＋
+  D-4 収束集計値＋停止後 legacy_blocked 計数** が揃うこと。
+- **[司令塔]** 全要件の確認で retirement 完了裁定。
 
 ---
 
