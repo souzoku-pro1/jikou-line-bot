@@ -1,9 +1,11 @@
 # 作業記録 2026-07-18: RV-04c S5 cutover クローズ（retirement evidence 固定）
 
-- TASK_ID: S5-RETIREMENT-EVIDENCE／実施: PC-A（READ_ONLY 検分＋docs）／記録日 2026-07-19
+- TASK_ID: S5-RETIREMENT-EVIDENCE（＋fix1）／実施: PC-A（READ_ONLY 検分＋docs）／記録日 2026-07-19
 - 正本: `DRAFT_RV04C_CALLER_MIGRATION.md` rev D5・SHA `c32c45df42370618e43903f94a59715081d23552`
 - 手順書: `docs/runbooks/2026-07_S4-S5_cutover-checklist.md`
 - 対象 lane: **sortation（lane1）のみ**本番署名移行完了。koseki/registry 等は Phase 2（§末）。
+- **ステータス: 条件付きクローズ（削除実見の追補待ち・S5C-H01）**。retirement 3 点のうち証跡③
+  （credential 失効）は D-5 の env/GAS 定数**削除が未充足**のため暫定。削除実見の追補で充足化する。
 
 ## 0. 実施済み事実（司令塔記録・2026-07-18）
 
@@ -38,23 +40,52 @@
 - **D-4 根拠（?token= 付き成功の最終時刻・以後 0）**: 7/18 の HTTP Logs で司令塔が
   「token 付き POST なし（収束）」を確認済み。現デプロイ窓でも ?token= 付き成功 0 件を
   ライブ確認（上記）＝**最終 legacy 成功以降 0 件を維持**。
+- **観測窓の限界（S5C-M01・明記）**: 司令塔一次記録から固定できる範囲は「**D-3 初回署名成功
+  = 2026-07-18 午後**、以後 **`[照会中]` 3 件**（署名成功 3 回以上）」まで。**lane 別最大実行間隔の
+  実測 cadence（観測窓＝間隔×2 の基礎値）・署名成功 3 件の正確な各時刻は、旧世代デプロイの
+  アプリ/HTTP ログが世代交代で失効したため独立再検証不能**（一次記録依存）。したがって D-4 の
+  収束判定は「司令塔一次記録（HTTP Logs 実見）＋現デプロイ窓のライブ 0 件」に依拠し、
+  ログからの厳密な cadence 再算出は不可である旨を retirement 判定に反映する（§2）。
 
 ## 2. retirement evidence（3 点・充足）
 
 | # | 証跡 | 状態 | 根拠 |
 |---|---|---|---|
-| ① 署名成功の実送 | sortation 署名経路 200×3 以上（`[照会中]` 3 件） | **充足** | D-3/D-4（司令塔記録・7/18 HTTP Logs） |
-| ② 能動404実測 | 旧 SORTATION token → 404 `{"detail":"Not Found"}` | **充足** | D-7（[人]実測・7/18） |
-| ③ credential 失効 | `SORTATION_INGEST_TOKEN` 前進失効（新値・未配布）／`KINTONE_WEBHOOK_TOKEN` rotation 4 工程完了・NEXT 削除済み | **充足** | D-6a/D-6b（司令塔記録） |
-| ＋計数 | D-4 収束集計（署名≥3・legacy 0）／D-5 停止後 legacy_blocked を ok と分離 | 7/18 分は司令塔記録・現窓ライブは 0/0 | §1 |
+| ① 署名成功の実送 | sortation 署名経路 200×3 以上（`[照会中]` 3 件） | **充足（一次記録依存・S5C-M01）** | D-3/D-4（司令塔記録・7/18 HTTP Logs。cadence/各時刻は旧世代ログ失効で再検証不能） |
+| ② 能動404実測 | 旧 SORTATION token → 404・**reason=legacy_blocked 対応ログ採取済み**（§D-7・00:29 JST 再試験） | **充足** | D-7（[人]実測＋PC-A ログ採取・現デプロイ世代内） |
+| ③ credential 失効 | `KINTONE_WEBHOOK_TOKEN` rotation 4 工程完了・NEXT 削除済み／`SORTATION_INGEST_TOKEN` **前進失効（新値・未配布）**。ただし **D-5 の env 削除＋GAS 旧定数削除は未充足（残置）** | **暫定（S5C-H01）** | D-6a/D-6b（司令塔記録）＋§4-i 残置 |
+| ＋計数 | D-4 収束集計（署名≥3・legacy 0）／D-5 停止後 legacy_blocked を ok と分離 | 7/18 分は一次記録・現窓ライブは §1／00:29 再試験は §D-7 で採取 | §1・§D-7 |
 
-→ **sortation lane の retirement 要件は充足**（3 点＋収束）。現デプロイのライブ再計数は世代交代で
-制約されるため、7/18 分は司令塔一次記録に依拠する旨を明記（本 work-log の証跡構成）。
+→ **retirement 判定 = 条件付きクローズ（S5C-H01）**。証跡①②は充足（②は 00:29 再試験で reason
+出所まで採取）。**証跡③は「rotation 完了＋前進失効」までで、D-5 が要求する
+`SORTATION_INGEST_TOKEN` env 削除・GAS `SORTATION_TOKEN` 定数削除が未実施のため暫定**。
+D-5 安定確認後の**削除実見の追補をもって充足化**する。またライブ再計数は世代交代で制約され、
+D-4 の cadence/各時刻は一次記録依存である（S5C-M01）。
+
+### 2b. D-7 能動404 の当日ログ採取（H02・現デプロイ世代内＝retrievable）
+
+**2026-07-19 00:29 JST 再試験**（[人] が旧 SORTATION token で POST・PC-A がログ採取）:
+```
+2026-07-18 15:28:58,760 INFO hub.service_auth service-auth ingest decision key_id=（record_id・非表示） caller=（record_id・非表示） reason=legacy_blocked
+INFO:     100.64.0.3:29454 - "POST /sortation/ingest?token=<masked> HTTP/1.1" 404 Not Found
+```
+- UTC `15:28:58` ＝ **JST 2026-07-19 00:28:58**（≈00:29 JST）。現デプロイ `e519b725`
+  （15:02:42 UTC 起動）の世代内でログ採取可能。
+- **`reason=legacy_blocked`（`hub.service_auth`）と HTTP 404 が対応**＝停止 lane への旧 token 試行が
+  token 検証前に 404（存在しないフリ）で遮断され、専用 reason で計数されていることを実出力で固定。
+- URL の `token=` 以降は**マスク**（旧 token 値が写るため。採取行では値は空表示だったが規律に従い
+  マスク表記とする）。
+- **区別（S5C 追補）**: 初回 **7/18 23:33 JST の試験**は「**HTTP 404 のみ・reason 出所未証明**」
+  （当時のログは前世代で失効・decision ログ未採取）。本 00:29 JST 再試験で **reason=legacy_blocked
+  まで採取**し、能動404 の証跡を確定した。
 
 ## 3. 経過インシデント（記録）
 
-1. **GAS アカウント取り違え**: 旧版プロジェクトへ RV04C_ プロパティ/コードを誤投入 → 正本
-   プロジェクトへ再投入。**旧版からの削除が残置**（§4-ii）。
+1. **GAS アカウント取り違え**（S5C-H03・**対処済み 7/19**）: 旧版プロジェクト（tototonature 側
+   6/02 版・誤投入先）へ RV04C_ プロパティ/コードを誤投入 → 正本プロジェクトへ再投入。
+   **7/19 に [人] が旧版から `RV04C_KEY_ID`/`RV04C_SECRET_HEX` を削除**し、**共有実見＝編集者・
+   閲覧者とも本人のみ（単独所有）を確認**。→ **secret 露出先は本人アカウント内に限定**と証明され、
+   **司令塔裁定により rotation 不要**（露出が第三者に及んでいないため）。§4-ii=完了。
 2. **registry JSON 破損による起動停止**: `SERVICE_HMAC_KEY_REGISTRY` 破損で起動停止＝
    **P1-114 の正常動作**（沈黙 500 でなく起動 fail-fast）。rollback で即復旧。
 3. **Script Properties 投入形式誤り**: key ID を「名前」欄へ投入 → キー名/値の 2 行形式へ是正。
@@ -65,8 +96,11 @@
 
 - (i) **`SORTATION_INGEST_TOKEN` env 削除**と **GAS `SORTATION_TOKEN` 定数削除**は D-5 安定確認後の
   後日（§5.1 rollback 手順 2 が旧 credential 残存を参照するため、安定まで残す設計どおり）。
-- (ii) **旧版 GAS プロジェクト 2 箇所の `RV04C_` プロパティ削除**（[人]・未実施なら実施）。
-- (iii) **RCF-M14 Vision billing 対処**（別裁定）。
+  **← retirement 証跡③の充足に必要な未実施項目（S5C-H01・条件付きクローズの追補対象）。
+  削除実見をもって証跡③を充足化し retirement を完全クローズする。**
+- (ii) **旧版 GAS プロジェクトの `RV04C_` プロパティ削除**: **完了（7/19・[人]）**。削除実施・
+  単独所有実見・rotation 不要裁定（§3-1）。
+- (iii) **RCF-M14 Vision billing 対処**（別裁定・`DRAFT_RCF-M14_vision-billing.md`）。
 - (iv) **koseki/registry 等の残 lane 切替は Phase 2**（本 S5 は sortation lane1 のみ）。切替材料は
   S4-5-PREP-LANE23 報告（写しベース・照合ファースト）に準備済み。
 
