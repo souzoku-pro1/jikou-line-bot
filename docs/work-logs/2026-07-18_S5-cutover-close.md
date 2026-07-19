@@ -47,7 +47,7 @@
   収束判定は「司令塔一次記録（HTTP Logs 実見）＋現デプロイ窓のライブ 0 件」に依拠し、
   ログからの厳密な cadence 再算出は不可である旨を retirement 判定に反映する（§2）。
 
-## 2. retirement evidence（3 点・充足）
+## 2. retirement evidence（3 点・①②充足・③暫定）
 
 | # | 証跡 | 状態 | 根拠 |
 |---|---|---|---|
@@ -127,6 +127,6 @@ INFO:     100.64.0.3:29454 - "POST /sortation/ingest?token=<masked> HTTP/1.1" 40
   Railway Variables 画面で確認（値露出を伴うため PC-A は実施しない）。
 
 ## 6. 枠消化の日次一行
-- 2026-07-18: RV-04c S5 cutover クローズ（sortation lane1 retirement evidence 3 点固定・
+- 2026-07-18: RV-04c S5 cutover クローズ（sortation lane1 retirement evidence 2点充足・1点暫定を固定・
   インシデント記録・残置事項・flag スナップショット）。ログ世代交代の制約を明記。
   開始/終了とも **モデル実測 = Fable 5**。
