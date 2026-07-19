@@ -47,7 +47,7 @@ S5 work-log）。
 |---|---|---|
 | HOTFIX-01（07-14） | `_process_line_event` の関数内 `redact.emit` re-import による UnboundLocalError 全停止（顧客影響ゼロ・棚卸し済み） | 1 行削除＋回帰 3 本／**P1-113 で AST スキャナが関数内 `emit` import を emit_shadow 検知**（tree.body 直下のみ信頼）／顧客 Bot 経路の handler smoke 必須化 |
 | RCF-M08 | dead-man 警報の約 2 日周期オシレーション（警報送信自体が heartbeat を更新する自己参照） | stale 時 synthetic probe 実送で死活実測・成功=生存/失敗のみ警報 |
-| 7/18-1 GAS アカウント取り違え | 旧版プロジェクトへ誤投入 | 正本へ再投入・旧版から削除（残置・S5 §4-ii） |
+| 7/18-1 GAS アカウント取り違え | 旧版プロジェクトへ誤投入 | 正本へ再投入・旧版から削除（完了7/19・単独所有実見済み・S5 §4(ii)） |
 | 7/18-2 registry JSON 破損で起動停止 | — | **P1-114 の正常動作**（沈黙 500 でなく起動 fail-fast）・rollback 即復旧 |
 | 7/18-3 Script Properties 形式誤り | key ID を名前欄へ投入 | キー名/値の 2 行形式へ是正 |
 | 7/18-4 Vision API billing 403 | 仕分け判定が全件「不明」フォールバック | **RCF-M14 起票**（billing 有効化[人]・API 監視拡張=Phase 2 候補） |
