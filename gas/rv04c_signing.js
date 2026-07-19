@@ -29,7 +29,7 @@ var LANE_FIELDS = {
 
 // ── lane 別署名切替（false=旧 query token 経路のまま・rollback は 1 箇所） ──
 var SIGNED_LANES = {
-  '/koseki/ingest': false,
+  '/koseki/ingest': true,   // P2-CHAIN-001: lane2 切替（parts は file/drive_file_id の 2 キーのみ）
   '/registry/ingest': false,
   '/bank/ingest': false,
   '/sortation/ingest': false,
