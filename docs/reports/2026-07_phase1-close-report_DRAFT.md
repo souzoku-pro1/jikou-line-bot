@@ -7,11 +7,13 @@
 ## 1. サマリ
 
 Phase 1 は「顧客 Bot 中核の可観測性・耐障害性の底上げ」と「GAS/kintone 連携の認証堅牢化」を主軸に、
-**redaction 契約の機械強制**・**Stripe/LINE durable 基盤（flag OFF 待機）**・**HMAC 署名移行（RV-04a/b/c）**・
+**redaction 契約の機械強制**・**durable 基盤（LINE durable〔Phase A〕のみ flag OFF 待機・Stripe journal は
+既存稼働）**・**HMAC 署名移行（RV-04a/b/c）**・
 **dead-man/probe 監視**・**dependency lock+SBOM** を達成。実機移行は **sortation lane の署名経路化＋
-legacy 停止＋token rotation** まで到達（retirement evidence 3 点固定・S5 work-log）。
+legacy 停止＋token rotation** まで到達（**retirement evidence 2 点充足・1 点暫定〔§7 (i) 追補待ち〕**・
+S5 work-log）。
 
-## 2. マージ PR 一覧（Phase 1・2026-07-11〜18・31 件）
+## 2. マージ PR 一覧（Phase 1・2026-07-11〜18・merge-commit ベース 32 件〔#101–141 の git 集計〕＋merge-commit を持たない PR 1 件〔#130〕＝総数 33 件）
 
 | 期間 | PR（番号: 概要） |
 |---|---|
@@ -58,13 +60,16 @@ legacy 停止＋token rotation** まで到達（retirement evidence 3 点固定�
 - **legacy 段階停止**（`SERVICE_AUTH_LEGACY_DISABLED_PATHS`・起動 strict 検証・停止 lane 404＋legacy_blocked 計数）。
 - **token rotation 2 系統**: ingest（SORTATION 前進失効）／kintone webhook（`KINTONE_WEBHOOK_TOKEN` 4 工程 rotation・NEXT 期限管理）。
 - **dead-man/probe 監視**（業務通知 heartbeat・stale probe・kintone 滞留/失敗の provider 分離）。
-- **durable 基盤**（inbound_event/ingestion_receipt・epoch fencing・LINE Phase A・**flag OFF で本番待機**）。
+- **durable 基盤**（inbound_event/ingestion_receipt・epoch fencing・**LINE durable〔Phase A〕のみ
+  flag OFF 待機・Stripe journal は既存稼働**）。
 - **redaction 台帳 61 件**（sink:print ゼロ・emit 契約 AST 強制）・**dependency lock+SBOM**（universal・CycloneDX 1.6）。
 
 ## 7. 残置・申し送り
 
-- (i) `SORTATION_INGEST_TOKEN` env 削除＋GAS `SORTATION_TOKEN` 定数削除（D-5 安定確認後）。
-- (ii) 旧版 GAS プロジェクト 2 箇所の `RV04C_` プロパティ削除（[人]）。
+- (i) `SORTATION_INGEST_TOKEN` env 削除＋GAS `SORTATION_TOKEN` 定数削除（D-5 安定確認後・
+  **7/22 追補予定・唯一の削除追補対象**）。
+- (ii) 旧版 GAS プロジェクトの `RV04C_` プロパティ削除 — **完了（7/19・単独所有実見済み・
+  #141 正本 work-log §4(ii) 参照）**。
 - (iii) **RCF-M14**（Vision billing・別裁定）。
 - (iv) **残 lane 切替（koseki/registry/bank/valuation）は Phase 2**（材料: S4-5-PREP-LANE23／本報告 §Phase2）。
 - (v) **`INBOUND_EVENT_DURABLE_ENABLED` 点火は別裁定**（LINE redelivery=K4 切替と同時・RV-06）。
@@ -82,4 +87,5 @@ legacy 停止＋token rotation** まで到達（retirement evidence 3 点固定�
 - **#141 マージ済み**（merge commit `10f57c0`・main FF 済み）。
 - **Phase 1 完了日 = 2026-07-19**。
 - **最終 PR 番号 = #141**。
-- **条件付き事項**: 削除追補（§7 (i)(ii) の token/プロパティ削除）は **7/22 予定**。
+- **条件付き事項**: 削除追補（**§7 (i) のみ**: `SORTATION_INGEST_TOKEN` env 削除＋GAS
+  `SORTATION_TOKEN` 定数削除）は **7/22 予定**（§7 (ii) は 7/19 完了済みのため対象外）。
