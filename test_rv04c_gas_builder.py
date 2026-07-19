@@ -284,11 +284,16 @@ class TestFilenameSanitize(unittest.TestCase):
 
 
 class TestFieldNameAllowlist(unittest.TestCase):
-    """§1.1b: lane 別 field 名 allowlist（helper 層の enforce・DRAFT の入口定義と一致）。"""
+    """§1.1b: lane 別 field 名 allowlist（helper 層の enforce・DRAFT の入口定義と整合）。
 
-    # DRAFT §0/実装（*_ingest.py の Form 定義）と 1:1
+    契約改定（P2K-H01 裁定）:
+    旧: GAS allowlist=サーバForm 1:1（dual-accept期のcharacterization）。
+    新: GAS allowlist⊆サーバForm。koseki は2キー送信契約（P2K-H01裁定・
+    サーバ側Form(default=None)は受入互換のため無変更）。"""
+
+    # DRAFT §0/実装（*_ingest.py の Form 定義）の部分集合（koseki のみ 2 キー契約）
     LANE_FIELDS = {
-        "/koseki/ingest": {"file", "case_hint", "case_app_hint", "drive_file_id"},
+        "/koseki/ingest": {"file", "drive_file_id"},
         "/registry/ingest": {"file", "case_hint", "drive_file_id"},
         "/bank/ingest": {"file", "case_hint", "case_app_hint", "drive_file_id"},
         "/sortation/ingest": {"file", "drive_file_id", "drive_file_url"},
@@ -438,7 +443,7 @@ class TestExistingProviderDoneInvariant(unittest.TestCase):
 
 # ── M02: Python 参照 production 前処理（gas rv04cBuildSignedBody_ と等価） ────
 _LANE_FIELDS = {
-    "/koseki/ingest": {"file", "case_hint", "case_app_hint", "drive_file_id"},
+    "/koseki/ingest": {"file", "drive_file_id"},   # P2K-H01: 2キー送信契約（GAS等価）
     "/registry/ingest": {"file", "case_hint", "drive_file_id"},
     "/bank/ingest": {"file", "case_hint", "case_app_hint", "drive_file_id"},
     "/sortation/ingest": {"file", "drive_file_id", "drive_file_url"},
@@ -499,13 +504,15 @@ class TestProductionPipeline(unittest.TestCase):
                                      if v.get("fallback_check") and p["name"] == "file"
                                      else p["filename"])
                 parts.append(q)
+            # P2K-H01: 実行 lane は case_hint を許容する /valuation/ingest（vector 意味・
+            # fixture 不変。koseki 2キー契約化で empty_text_field が koseki を通らないため）
             if cls == "reject":
                 with self.subTest(vec=v["name"], expect="reject"):
                     with self.assertRaises(BuilderError):
-                        build_signed_body("/koseki/ingest", parts, v["boundary"])
+                        build_signed_body("/valuation/ingest", parts, v["boundary"])
             else:  # match
                 with self.subTest(vec=v["name"], expect="match"):
-                    body = build_signed_body("/koseki/ingest", parts, v["boundary"])
+                    body = build_signed_body("/valuation/ingest", parts, v["boundary"])
                     self.assertEqual(base64.b64encode(body).decode(), v["body_b64"])
         self.assertGreaterEqual(seen["match"], 4)
         self.assertGreaterEqual(seen["reject"], 2)   # japanese(missing driveId)・multi_field(meta)

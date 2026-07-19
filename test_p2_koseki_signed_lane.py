@@ -27,7 +27,8 @@ from test_rv04b_dual_accept import (  # noqa: E402
     LEGACY_TOKENS, REG_JSON, SECRET, _DbMixin, _FLAG, _INGEST_ENV, _REGENV,
     _client, _nofile_multipart, _nonce, _sig_headers)
 from test_rv04c_gas_builder import (  # noqa: E402
-    build_multipart, build_multipart_chunked, canonical_v1_ref)
+    BuilderError, build_multipart, build_multipart_chunked, build_signed_body,
+    canonical_v1_ref)
 
 import koseki_ingest  # noqa: E402
 
@@ -200,6 +201,49 @@ class TestKosekiTwoKeyByteParity(_DbMixin):
         self.assertEqual(captured["drive_file_id"], "F-big")
         self.assertIsNone(captured["case_hint"])               # parts 固定（2キーのみ）
         self.assertIsNone(captured["case_app_hint"])
+
+
+# ── fix1(P2K-H01): 2キー契約のコード強制（builder fail-fast・構造固定・sortation 回帰） ──
+class TestKosekiTwoKeyContractEnforced(unittest.TestCase):
+    """koseki の 2 キー送信契約を builder 層で強制する（沈黙縮退禁止＝P1-114思想）。
+    ガードは既存の rv04cBuildSignedBody_ allowlist enforce（Python 等価:
+    build_signed_body）— allowlist 縮小により case_hint 系が明示 throw になる。"""
+
+    _FILE_PART = {"name": "file", "filename": "a.pdf",
+                  "content_type": "application/pdf", "value": b"%PDF"}
+    _DRIVE_PART = {"name": "drive_file_id", "value": b"F-1"}
+
+    def test_a_case_hint_part_rejected_by_builder(self):
+        parts = [self._FILE_PART, self._DRIVE_PART,
+                 {"name": "case_hint", "value": b"C-1"}]
+        with self.assertRaises(BuilderError) as cm:
+            build_signed_body("/koseki/ingest", parts, "B")
+        self.assertIn("case_hint", str(cm.exception))   # 黙って落とさず明示 throw
+
+    def test_b_case_app_hint_part_rejected_by_builder(self):
+        parts = [self._FILE_PART, self._DRIVE_PART,
+                 {"name": "case_app_hint", "value": b"27"}]
+        with self.assertRaises(BuilderError) as cm:
+            build_signed_body("/koseki/ingest", parts, "B")
+        self.assertIn("case_app_hint", str(cm.exception))
+
+    def test_c_koseki_allowlist_is_exactly_file_drive_file_id_ordered(self):
+        # GAS 側 LANE_FIELDS の koseki entry を順序含め完全一致で固定
+        js = (_REPO / "gas" / "rv04c_signing.js").read_text(encoding="utf-8")
+        block = re.search(r"var LANE_FIELDS = \{(.*?)\};", js, re.S)
+        self.assertIsNotNone(block)
+        m = re.search(r"'/koseki/ingest':\s*\[([^\]]*)\]", block.group(1))
+        self.assertIsNotNone(m, "koseki entry が見つからない")
+        self.assertEqual(re.findall(r"'([a-z_]+)'", m.group(1)),
+                         ["file", "drive_file_id"])
+
+    def test_d_sortation_three_key_parts_pass_guard_unchanged(self):
+        # 回帰: sortation の既存 3 キー parts に対しガードは no-op（正常に body 生成）
+        parts = [self._FILE_PART, self._DRIVE_PART,
+                 {"name": "drive_file_url", "value": b"https://drive/x"}]
+        body = build_signed_body("/sortation/ingest", parts, "B")
+        self.assertIsInstance(body, bytes)
+        self.assertIn(b'name="drive_file_url"', body)
 
 
 if __name__ == "__main__":
