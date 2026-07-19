@@ -18,9 +18,10 @@
  * Python 参照実装（test_rv04c_gas_builder.py）と byte 等価。golden self-test で固定。
  */
 
-// ── lane 別 field 名 allowlist（§1.1b・サーバ *_ingest.py の Form 定義と 1:1） ──
+// ── lane 別 field 名 allowlist（§1.1b・サーバ *_ingest.py の Form 定義の部分集合。
+//    koseki は 2 キー送信契約＝P2K-H01。サーバ側 Form(default=None) は受入互換で無変更） ──
 var LANE_FIELDS = {
-  '/koseki/ingest':     ['file', 'case_hint', 'case_app_hint', 'drive_file_id'],
+  '/koseki/ingest':     ['file', 'drive_file_id'],
   '/registry/ingest':   ['file', 'case_hint', 'drive_file_id'],
   '/bank/ingest':       ['file', 'case_hint', 'case_app_hint', 'drive_file_id'],
   '/sortation/ingest':  ['file', 'drive_file_id', 'drive_file_url'],
@@ -29,7 +30,7 @@ var LANE_FIELDS = {
 
 // ── lane 別署名切替（false=旧 query token 経路のまま・rollback は 1 箇所） ──
 var SIGNED_LANES = {
-  '/koseki/ingest': false,
+  '/koseki/ingest': true,   // P2-CHAIN-001: lane2 切替（parts は file/drive_file_id の 2 キーのみ）
   '/registry/ingest': false,
   '/bank/ingest': false,
   '/sortation/ingest': false,
