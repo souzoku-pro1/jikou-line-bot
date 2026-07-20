@@ -188,5 +188,85 @@ class TestManifestCheck(_Base):
         self.assertIn("manifest 不足", out)
 
 
+# ── fix2(P2DRIFT2-H01/H02/M01/M02) 追加テスト ────────────────────────────────
+class TestRepoSideSecretMasked(_Base):
+    """H01(fix2): repo 側のみ secret の行も --show-content で両側非表示。"""
+
+    def test_repo_only_secret_sentinel_not_exposed(self):
+        repo_secret = "cd" * 32
+        repo_js = _SIGNING_JS + f"var REPO_ONLY = '{repo_secret}';\n"
+        (self.repo / "gas" / "rv04c_signing.js").write_text(repo_js, encoding="utf-8")
+        # live 側は同じ行が secret でない値（drift だが live 行自体は無害）
+        snap_js = _SIGNING_JS + "var REPO_ONLY = 'x';\n"
+        (self.snap / "rv04c_signing.js").write_text(snap_js, encoding="utf-8")
+        code, out = self._run(show_content=True)
+        self.assertEqual(code, 1, out)
+        self.assertNotIn(repo_secret, out)             # repo 側 sentinel を出さない
+        self.assertIn("(secret 様のため非表示)", out)   # 両側マスク
+        self.assertNotIn("var REPO_ONLY = 'x';", out)  # live 側も出さない（両側非表示）
+
+
+class TestSecretFilenameErrorPath(_Base):
+    """H01/M01(fix2): secret 様ファイル名はエラー経路（UTF-8 失敗等）でも非露出。"""
+
+    def test_error_path_does_not_expose_secret_filename(self):
+        (self.snap / "rv04c_signing.js").write_text(_SIGNING_JS, encoding="utf-8")
+        bad_name = "AIzaSyD0123456789abcdefghijklmnopqrstu.js"
+        (self.snap / bad_name).write_bytes(b"\xff\xfe\x00broken")
+        code, out = self._run()
+        self.assertEqual(code, 2, out)                 # 壊れ入力は exit 2
+        self.assertIn("UTF-8 として読めません", out)
+        self.assertNotIn("AIzaSyD", out)               # 名前はエラー文にも出さない
+        self.assertIn("(secret 様のためファイル名非表示)", out)
+
+
+class TestLegacyManifest(_Base):
+    """M02(fix2): manifest 正本は gas/ + legacy/gas/。コード.js 欠落は false green にしない。"""
+
+    def test_legacy_code_js_missing_detected(self):
+        (self.repo / "legacy" / "gas").mkdir(parents=True)
+        (self.repo / "legacy" / "gas" / "コード.js").write_text("var L = 1;\n",
+                                                               encoding="utf-8")
+        (self.snap / "rv04c_signing.js").write_text(_SIGNING_JS, encoding="utf-8")
+        code, out = self._run()
+        self.assertEqual(code, 1, out)
+        self.assertIn("legacy/gas/コード.js が snapshot にありません", out)
+        self.assertIn("manifest 不足", out)
+
+
+class TestStructuredWriterGuards(_Base):
+    """H02(fix2): 構造化 writer は sentinel 混入を構造的に出力しない。"""
+
+    def test_emit_rejects_secret_like_field(self):
+        import io
+        from gas_drift_check import report
+        buf = io.StringIO()
+        with self.assertRaises(ValueError):
+            report(buf, "ok_line", name="AIzaSyD0123456789abcdefghijklmnopqrstu.js",
+                 repo_name="gas/x.js")
+        self.assertEqual(buf.getvalue(), "")           # 何も出力されない
+
+    def test_emit_rejects_unknown_field_and_template(self):
+        import io
+        from gas_drift_check import report
+        buf = io.StringIO()
+        with self.assertRaises(ValueError):
+            report(buf, "ok_line", name="a.js", repo_name="gas/a.js",
+                 free_text="任意文字列は受けない")
+        with self.assertRaises(KeyError):
+            report(buf, "no_such_template")
+        self.assertEqual(buf.getvalue(), "")
+
+    def test_content_line_masks_sentinel_even_if_flag_false(self):
+        import io
+        from gas_drift_check import report_content_line
+        sentinel = "ab" * 32
+        buf = io.StringIO()
+        # 呼び出し側が is_secret=False と誤判定しても内部判定でマスクされる
+        report_content_line(buf, 7, "live", f"var X = '{sentinel}';", False)
+        self.assertNotIn(sentinel, buf.getvalue())
+        self.assertIn("(secret 様のため非表示)", buf.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()
