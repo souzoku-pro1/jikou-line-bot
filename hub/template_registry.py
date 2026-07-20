@@ -31,11 +31,11 @@ from hub.derivation_models import DerivationBase, ImmutableRecordError
 _BigIntPK = sa.BigInteger().with_variant(sa.Integer(), "sqlite")
 _JSON = sa.JSON().with_variant(postgresql.JSONB(), "postgresql")
 
-# 登録後変更不可の内容列（trigger と ORM guard の単一ソース）
+# 登録後変更不可の内容列（trigger と ORM guard の単一ソース・fix1: generator_version 追加）
 _FROZEN_COLUMNS = (
     "template_key", "version", "artifact_type", "unit_type", "purpose",
     "file_ref", "content_hash", "content_bytes_ref", "placeholders",
-    "mapping_version", "clause_library_version", "created_by",
+    "mapping_version", "clause_library_version", "generator_version", "created_by",
 )
 
 
@@ -67,6 +67,8 @@ class TemplateVersion(DerivationBase):
     placeholders: Mapped[list] = mapped_column(_JSON, nullable=False)
     mapping_version: Mapped[str] = mapped_column(sa.Text, nullable=False)
     clause_library_version: Mapped[str] = mapped_column(sa.Text, nullable=False)
+    # fix1 M02: §5.2 bytes 再現要素（生成器のバージョンも contract の一部）
+    generator_version: Mapped[str] = mapped_column(sa.Text, nullable=False)
     created_by: Mapped[str] = mapped_column(sa.Text, nullable=False)
     approved_by: Mapped[str | None] = mapped_column(sa.Text)
     status: Mapped[str] = mapped_column(sa.Text, nullable=False, default="draft")
@@ -84,6 +86,12 @@ def _reject_frozen_update(mapper, connection, target):  # noqa: ARG001
         if hist.has_changes():
             raise ImmutableRecordError(
                 f"template_version.{col} は登録後変更不可（訂正は新版の追加で行う）")
+    # fix1 M01: approved_by/approved_at は draft→active 遷移時に一度だけ設定可
+    for col in ("approved_by", "approved_at"):
+        hist = insp.attrs[col].history
+        if hist.has_changes() and hist.deleted and hist.deleted[0] is not None:
+            raise ImmutableRecordError(
+                f"template_version.{col} は確定後の書換不可（承認の書換は新版で行う）")
 
 
 def _reject_delete(mapper, connection, target):  # noqa: ARG001
@@ -102,6 +110,18 @@ def template_trigger_ddl() -> dict[str, list[str]]:
         f"IFNULL(OLD.{c}, '') IS NOT IFNULL(NEW.{c}, '')" for c in _FROZEN_COLUMNS)
     pg_when = " OR ".join(
         f"OLD.{c} IS DISTINCT FROM NEW.{c}" for c in _FROZEN_COLUMNS)
+    # fix1 H01: status の遷移条件も trigger で制約（同値/draft→active/draft→retired/
+    # active→retired のみ許可）。fix1 M01: approved_* は一度設定されたら書換不可。
+    sqlite_flow = ("NOT ((OLD.status = NEW.status) OR "
+                   "(OLD.status = 'draft' AND NEW.status IN ('active', 'retired')) OR "
+                   "(OLD.status = 'active' AND NEW.status = 'retired'))")
+    pg_flow = ("NOT ((OLD.status = NEW.status) OR "
+               "(OLD.status = 'draft' AND NEW.status IN ('active', 'retired')) OR "
+               "(OLD.status = 'active' AND NEW.status = 'retired'))")
+    sqlite_appr = ("(OLD.approved_by IS NOT NULL AND OLD.approved_by IS NOT NEW.approved_by) "
+                   "OR (OLD.approved_at IS NOT NULL AND OLD.approved_at IS NOT NEW.approved_at)")
+    pg_appr = ("(OLD.approved_by IS NOT NULL AND OLD.approved_by IS DISTINCT FROM NEW.approved_by) "
+               "OR (OLD.approved_at IS NOT NULL AND OLD.approved_at IS DISTINCT FROM NEW.approved_at)")
     return {
         "sqlite": [
             "CREATE TRIGGER trg_template_version_frozen BEFORE UPDATE ON template_version "
@@ -109,11 +129,24 @@ def template_trigger_ddl() -> dict[str, list[str]]:
             "BEGIN SELECT RAISE(ABORT, 'template_version content is immutable'); END",
             "CREATE TRIGGER trg_template_version_no_delete BEFORE DELETE ON template_version "
             "BEGIN SELECT RAISE(ABORT, 'template_version is append-only'); END",
+            "CREATE TRIGGER trg_template_version_draft_only BEFORE INSERT ON template_version "
+            "FOR EACH ROW WHEN NEW.status != 'draft' "
+            "BEGIN SELECT RAISE(ABORT, 'template_version must be created as draft'); END",
+            "CREATE TRIGGER trg_template_version_status_flow BEFORE UPDATE ON template_version "
+            f"FOR EACH ROW WHEN {sqlite_flow} "
+            "BEGIN SELECT RAISE(ABORT, 'template_version invalid status transition'); END",
+            "CREATE TRIGGER trg_template_version_approved_once BEFORE UPDATE ON template_version "
+            f"FOR EACH ROW WHEN {sqlite_appr} "
+            "BEGIN SELECT RAISE(ABORT, 'template_version approved_* is write-once'); END",
         ],
         "postgresql": [
             "CREATE OR REPLACE FUNCTION template_version_frozen() RETURNS trigger AS $$ "
             f"BEGIN IF {pg_when} THEN "
             "RAISE EXCEPTION 'template_version content is immutable'; END IF; "
+            f"IF {pg_flow} THEN "
+            "RAISE EXCEPTION 'template_version invalid status transition'; END IF; "
+            f"IF {pg_appr} THEN "
+            "RAISE EXCEPTION 'template_version approved_* is write-once'; END IF; "
             "RETURN NEW; END; $$ LANGUAGE plpgsql",
             "CREATE TRIGGER trg_template_version_frozen BEFORE UPDATE ON template_version "
             "FOR EACH ROW EXECUTE FUNCTION template_version_frozen()",
@@ -122,6 +155,12 @@ def template_trigger_ddl() -> dict[str, list[str]]:
             "$$ LANGUAGE plpgsql",
             "CREATE TRIGGER trg_template_version_no_delete BEFORE DELETE ON template_version "
             "FOR EACH ROW EXECUTE FUNCTION template_version_no_delete()",
+            "CREATE OR REPLACE FUNCTION template_version_draft_only() RETURNS trigger AS $$ "
+            "BEGIN IF NEW.status != 'draft' THEN "
+            "RAISE EXCEPTION 'template_version must be created as draft'; END IF; "
+            "RETURN NEW; END; $$ LANGUAGE plpgsql",
+            "CREATE TRIGGER trg_template_version_draft_only BEFORE INSERT ON template_version "
+            "FOR EACH ROW EXECUTE FUNCTION template_version_draft_only()",
         ],
     }
 
@@ -135,9 +174,19 @@ for _dialect, _stmts in template_trigger_ddl().items():
 
 # ── CRUD 最小（作成・参照・版固定＝activate） ────────────────────────────────
 
+class ActivationConflictError(RuntimeError):
+    """activate の競合（対象が同時に他 tx で遷移済み・fix1 H02）。tx 全体 rollback。"""
+
+
 async def create_template_version(**fields) -> int:
-    """新版を draft で登録（内容列は登録時のみ与えられる）。戻り値=id。"""
-    fields.setdefault("status", "draft")
+    """新版を **常に draft** で登録（fix1 H01: status の指定は受け付けない。
+    active への遷移は activate() のみ＝承認者必須。DB 側でも BEFORE INSERT trigger が
+    draft 以外の直接作成を拒否する）。戻り値=id。"""
+    if "status" in fields:
+        raise ValueError(
+            "create_template_version は status を受け付けない（常に draft 作成・"
+            "active 化は activate() のみ）")
+    fields["status"] = "draft"
     async with session_scope() as s:
         r = await s.execute(sa.insert(TemplateVersion.__table__).values(**fields))
         return r.inserted_primary_key[0]
@@ -152,13 +201,25 @@ async def get_active(template_key: str):
                    TemplateVersion.__table__.c.status == "active"))).one_or_none()
 
 
+async def _get_version_row(s, version_id: int):
+    """activate の事前参照（テストから差し替え可能な seam）。"""
+    return (await s.execute(
+        sa.select(TemplateVersion.__table__)
+        .where(TemplateVersion.__table__.c.id == version_id))).one_or_none()
+
+
 async def activate(version_id: int, approved_by: str) -> None:
     """版固定: 同一 transaction で旧 active→retired ＋ 対象 draft→active（§5.3）。
-    対象が draft でない場合は ValueError（再 activate・retired 復活は不可）。"""
+
+    - 対象が draft でない場合は ValueError（再 activate・retired 復活は不可）。
+    - **fix1 H02（競合安全化）**: 最終 UPDATE（draft→active）の rowcount を検査し、
+      0 件（＝select 後に他 tx が遷移させた TOCTOU）なら ActivationConflictError を
+      送出して **transaction 全体を rollback**（旧 active の retire も巻き戻る＝
+      「active 0 件」状態を残さない）。事前 select は利便のための friendly check・
+      整合性の正は rowcount 検査と部分ユニーク制約。
+    """
     async with session_scope() as s:
-        target = (await s.execute(
-            sa.select(TemplateVersion.__table__)
-            .where(TemplateVersion.__table__.c.id == version_id))).one_or_none()
+        target = await _get_version_row(s, version_id)
         if target is None or target.status != "draft":
             raise ValueError("activate 対象は draft の版のみ")
         await s.execute(
@@ -166,9 +227,12 @@ async def activate(version_id: int, approved_by: str) -> None:
             .where(TemplateVersion.__table__.c.template_key == target.template_key,
                    TemplateVersion.__table__.c.status == "active")
             .values(status="retired", retired_at=sa.func.now()))
-        await s.execute(
+        final = await s.execute(
             sa.update(TemplateVersion.__table__)
             .where(TemplateVersion.__table__.c.id == version_id,
                    TemplateVersion.__table__.c.status == "draft")
             .values(status="active", activated_at=sa.func.now(),
                     approved_by=approved_by, approved_at=sa.func.now()))
+        if final.rowcount != 1:
+            raise ActivationConflictError(
+                "activate 競合: 対象が draft でなくなっている（tx 全体を rollback）")

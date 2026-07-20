@@ -37,6 +37,7 @@ def upgrade() -> None:
         sa.Column("placeholders", _JSON, nullable=False),
         sa.Column("mapping_version", sa.Text, nullable=False),
         sa.Column("clause_library_version", sa.Text, nullable=False),
+        sa.Column("generator_version", sa.Text, nullable=False),   # fix1 M02（§5.2）
         sa.Column("created_by", sa.Text, nullable=False),
         sa.Column("approved_by", sa.Text, nullable=True),
         sa.Column("status", sa.Text, nullable=False),
@@ -63,12 +64,14 @@ def upgrade() -> None:
 def downgrade() -> None:
     dialect = op.get_bind().dialect.name
     if dialect == "sqlite":
-        op.execute("DROP TRIGGER IF EXISTS trg_template_version_frozen")
-        op.execute("DROP TRIGGER IF EXISTS trg_template_version_no_delete")
+        for trg in ("frozen", "no_delete", "draft_only", "status_flow", "approved_once"):
+            op.execute(f"DROP TRIGGER IF EXISTS trg_template_version_{trg}")
     elif dialect == "postgresql":
-        op.execute("DROP TRIGGER IF EXISTS trg_template_version_frozen ON template_version")
-        op.execute("DROP TRIGGER IF EXISTS trg_template_version_no_delete ON template_version")
+        for trg in ("frozen", "no_delete", "draft_only"):
+            op.execute(f"DROP TRIGGER IF EXISTS trg_template_version_{trg} "
+                       "ON template_version")
         op.execute("DROP FUNCTION IF EXISTS template_version_frozen()")
         op.execute("DROP FUNCTION IF EXISTS template_version_no_delete()")
+        op.execute("DROP FUNCTION IF EXISTS template_version_draft_only()")
     op.drop_index("uq_template_version_single_active", table_name="template_version")
     op.drop_table("template_version")

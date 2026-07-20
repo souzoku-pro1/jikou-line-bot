@@ -36,7 +36,7 @@ def _fields(**over):
              file_ref="templates/zaisan.docx", content_hash="ch" * 8,
              content_bytes_ref="drive:bytes-1", placeholders=["氏名", "作成日"],
              mapping_version="map-1", clause_library_version="clause-1",
-             created_by="pc-a")
+             generator_version="gen-1", created_by="pc-a")
     f.update(over)
     return f
 
@@ -188,8 +188,14 @@ class TestConstraints(_DbMixin):
         db.reset_for_tests()
 
     def test_status_vocabulary_check(self):
+        # fix1 H01 で create_template_version は status を受けないため、
+        # CHECK 制約自体は直接 SQL（Core insert）で検査する
+        async def _ins():
+            async with db.session_scope() as s:
+                await s.execute(sa.insert(TemplateVersion.__table__)
+                                .values(**_fields(status="published")))
         with self.assertRaises(IntegrityError):
-            _run(create_template_version(**_fields(status="published")))
+            _run(_ins())
         db.reset_for_tests()
 
     def test_bytes_contract_columns_not_null(self):
@@ -215,6 +221,149 @@ class TestStructure(unittest.TestCase):
         self.assertEqual(mig.count("op.create_table"), 1)
         self.assertEqual(mig.count("op.drop_table"), 1)
         self.assertIn("uq_template_version_single_active", mig)
+
+
+# ── fix1(P3002-H01/H02/M01/M02) 追加テスト ───────────────────────────────────
+class TestDraftOnlyCreation(_DbMixin):
+    """H01: 作成は常に draft・active 直接作成は repo/DB の両層で拒否。"""
+
+    def test_repo_rejects_status_kwarg(self):
+        with self.assertRaises(ValueError):
+            _run(create_template_version(**_fields(status="active")))
+        db.reset_for_tests()
+
+    def test_direct_sql_active_insert_rejected_by_trigger(self):
+        async def _ins():
+            async with db.session_scope() as s:
+                await s.execute(sa.insert(TemplateVersion.__table__)
+                                .values(**_fields(status="active")))
+        with self.assertRaises((IntegrityError, OperationalError)):
+            _run(_ins())
+        db.reset_for_tests()
+
+    def test_status_flow_trigger_blocks_retired_to_active(self):
+        pk = self._create()
+        self._activate(pk)
+
+        async def _retire():
+            async with db.session_scope() as s:
+                await s.execute(sa.update(TemplateVersion.__table__)
+                                .where(TemplateVersion.__table__.c.id == pk)
+                                .values(status="retired", retired_at=sa.func.now()))
+        _run(_retire())
+        db.reset_for_tests()
+
+        async def _revive():
+            async with db.session_scope() as s:
+                await s.execute(sa.update(TemplateVersion.__table__)
+                                .where(TemplateVersion.__table__.c.id == pk)
+                                .values(status="active"))
+        with self.assertRaises((IntegrityError, OperationalError)):
+            _run(_revive())
+        db.reset_for_tests()
+
+
+class TestActivateConflictSafety(_DbMixin):
+    """H02: 並行 activate でも常に active ≤1 件・rowcount=0 は tx 全体 rollback。"""
+
+    def _count_active(self):
+        async def _q():
+            async with db.session_scope() as s:
+                return (await s.execute(
+                    sa.select(sa.func.count()).select_from(TemplateVersion.__table__)
+                    .where(TemplateVersion.__table__.c.status == "active"))).scalar_one()
+        n = _run(_q())
+        db.reset_for_tests()
+        return n
+
+    def test_sequential_activates_keep_single_active(self):
+        pks = [self._create(version=f"1.{i}.0") for i in range(3)]
+        for pk in pks:
+            self._activate(pk)
+            self.assertEqual(self._count_active(), 1)   # 常に 1 件
+
+    def test_double_activate_same_id_rejected(self):
+        pk = self._create()
+        self._activate(pk)
+        with self.assertRaises(ValueError):
+            _run(activate(pk, "attorney-2"))
+        db.reset_for_tests()
+        self.assertEqual(self._count_active(), 1)
+
+    def test_rowcount_zero_rolls_back_whole_tx(self):
+        # TOCTOU 再現: 事前参照 seam を差し替え「実際は active な行」を draft と誤認させる
+        import hub.template_registry as tr
+        pk1 = self._create(version="1.0.0")
+        self._activate(pk1)                       # 現 active = pk1
+
+        real = tr._get_version_row
+
+        async def _lying(s, version_id):
+            row = await real(s, version_id)
+            fake = dict(row._mapping)
+            fake["status"] = "draft"              # 誤認: 実際は active
+            import types
+            return types.SimpleNamespace(**fake)
+
+        with patch.object(tr, "_get_version_row", _lying):
+            with self.assertRaises(tr.ActivationConflictError):
+                _run(activate(pk1, "attorney-2"))
+        db.reset_for_tests()
+        # rollback により旧 active の retire が巻き戻り「active 0 件」にならない
+        self.assertEqual(self._count_active(), 1)
+        self.assertEqual(self._get_active().id, pk1)
+
+
+class TestApprovedWriteOnce(_DbMixin):
+    """M01: approved_by/approved_at は draft→active 遷移時に一度だけ設定可。"""
+
+    def test_core_update_of_approved_rejected(self):
+        pk = self._create()
+        self._activate(pk)
+
+        async def _upd():
+            async with db.session_scope() as s:
+                await s.execute(sa.update(TemplateVersion.__table__)
+                                .where(TemplateVersion.__table__.c.id == pk)
+                                .values(approved_by="someone-else"))
+        with self.assertRaises((IntegrityError, OperationalError)):
+            _run(_upd())
+        db.reset_for_tests()
+
+    def test_orm_update_of_approved_rejected(self):
+        from hub.derivation_models import ImmutableRecordError
+        pk = self._create()
+        self._activate(pk)
+
+        async def _upd():
+            async with db.session_scope() as s:
+                obj = (await s.execute(sa.select(TemplateVersion)
+                                       .where(TemplateVersion.id == pk))).scalar_one()
+                obj.approved_by = "someone-else"
+        with self.assertRaises(ImmutableRecordError):
+            _run(_upd())
+        db.reset_for_tests()
+
+
+class TestGeneratorVersion(_DbMixin):
+    """M02: generator_version は NOT NULL・frozen（bytes 再現要素・§5.2）。"""
+
+    def test_not_null(self):
+        with self.assertRaises(IntegrityError):
+            _run(create_template_version(**_fields(generator_version=None)))
+        db.reset_for_tests()
+
+    def test_frozen(self):
+        pk = self._create()
+
+        async def _upd():
+            async with db.session_scope() as s:
+                await s.execute(sa.update(TemplateVersion.__table__)
+                                .where(TemplateVersion.__table__.c.id == pk)
+                                .values(generator_version="gen-2"))
+        with self.assertRaises((IntegrityError, OperationalError)):
+            _run(_upd())
+        db.reset_for_tests()
 
 
 if __name__ == "__main__":
