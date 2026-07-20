@@ -53,12 +53,16 @@ sortation_ingest.py:136: (_durable_enabled)  同上
   - ＝旧記述「観測 3 系列で検知されるため可視化は損なわれない」は**実態と不一致**であり修正:
     観測 3 系列（A 受理/B 終端 held/C 運用）は**カウンタ/ログ集計**であって、`received`
     滞留行を能動警報する仕組みではない。
-- **点火の前提条件（いずれか必須・再定義)**:
-  - **(A) 推奨**: `received` を含む **LINE 滞留監視を durable flag 配下で実装**（別票。
-    check_journal_backlog への state 追加ではなく durable flag ゲートの専用検査として追加し、
-    Stripe 監視の既存挙動を変えない）→ 実装後に単独点火可。
-  - **(B)**: **K4 redelivery と同時点火**（当初計画へ回帰。再配送が received/stale の
-    回収駆動を提供する）。
+- **点火の前提条件（fix2・司令塔裁定・唯一の前提＝経路 (A)）**:
+  - **(A) 必須**: **received／processing の滞留監視の実装**（別票・§7 スコープ案）。
+    監視要件（裁定そのまま）: **durable flag 配下で動作**・**received と processing の
+    両 state を対象**・**閾値超過で LINE 警報**（既存 dead-man／notify 系の流儀）・
+    **`STRIPE_EVENT_JOURNAL_ENABLED` に依存しない**。実装・merge 後に点火可。
+  - **【fix2・P2DP2-H01】旧経路 (B)「K4 同時点火」は単独の点火条件から削除**（司令塔裁定）。
+    理由: **K4 は非 2xx への再配送**であり、**200 ACK 後の BackgroundTask crash による
+    processing 滞留を回収できない**（LINE は 200 を受け取っており再配送しない＝
+    redelivery が来ない滞留クラスが残る）。K4 は「**あれば received（非 2xx 起因分）の
+    一部を減らす補助**」に格下げし、**必須ゲートとしない**。
 - 分離点火時のその他の影響（前提条件とは独立に不変）:
   - 二重返信は terminal state（done/failed_exhausted）skip で遮断（まれな stale 併走は
     正本の比較裁定どおり受容・検知可能）。
@@ -90,20 +94,19 @@ sortation_ingest.py:136: (_durable_enabled)  同上
   - (a) **[人]確認**: 本番 DB で inbound_event / ingestion_receipt / （claimed_at 列）の
     存在確認（alembic 適用実態）。
   - (b) **[人]確認**: `STRIPE_EVENT_JOURNAL_ENABLED` の live ON 実態（§2 の整合）。
-  - (c) **§3 の (A) または (B) のいずれかの充足（fix1・必須）**。
-- **手順案（(A)/(B) の分岐構造・fix1）**:
-  - **経路 (A)（推奨）**: ①別票で LINE 滞留監視（received 含む・durable flag 配下）を実装・
+  - (c) **§3 経路 (A)＝滞留監視の実装・merge（fix2・唯一の必須ゲート）**。
+    K4 は補助（あれば望ましいが点火条件ではない・§3）。
+- **手順案（fix2・(A) 単独前提へ改訂）**:
+  - **前段**: ①別票（§7・P2-CHAIN-012 想定）で received/processing 滞留監視を実装・
     merge → ②以降は共通手順へ。
-  - **経路 (B)**: ①[人] K4（LINE 再配送設定）を確認・有効化 → ②redelivery 有効の状態で
-    共通手順へ（点火は redelivery 切替と同時）。
   - **共通手順**:
     1. [人] `INBOUND_EVENT_DURABLE_ENABLED` を ON → デプロイ緑。
     2. startup ログで `[RV05] startup reconcile` の出力を実見（[人]）。
     3. LINE テスト発話 1 件 → 応答正常＋inbound_event に provider="line" の行が
        terminal（done）へ到達（[人]実見）。
     4. sortation テスト 1 件 → 200＋receipt 行・従来どおり `[照会中]`/`[済]`（[人]実見）。
-    5. 観測 3 系列（A 受理/B 終端 held/C 運用）のカウンタ初期値を記録
-       （経路 (A) なら滞留監視の警報 0 も確認）。
+    5. 観測 3 系列（A 受理/B 終端 held/C 運用）のカウンタ初期値を記録＋
+       滞留監視の警報 0 を確認。
 - **リスク**: (i) sortation H-04 の 5xx 化（自然リトライで回収・点火直後は観測強化）
   (ii) DB 到達不能時は durable 経路が fail 側（握らない設計）＝DB 障害が可視化される反面
   5xx が増える (iii) received/stale の沈黙滞留（§3・前提条件 (A)/(B) はこの遮断のため）。
@@ -112,8 +115,40 @@ sortation_ingest.py:136: (_durable_enabled)  同上
     `check_journal_backlog` は **provider != kintone で LINE 行も読み**、残置行が
     processing/failed のままだと **24 時間後に Stripe runbook 文言の警報**が
     （`STRIPE_EVENT_JOURNAL_ENABLED=1` なら）発火する＝「読み手なし」ではない。
-  - rollback 手順に追加: **残置行の状態確認と閉鎖（[人]確認）** — OFF 直前に
-    non-terminal（received/processing）の LINE 行を列挙し、処理完了済みの実態と突合のうえ
-    `done`（正常終端）または `failed_exhausted`（打ち切り）へ**明示遷移**させてから
-    OFF にする（誤警報と将来の再点火時の混入を防ぐ。遷移は runbook
-    work-log 2026-07-15_RV-05-13-fix5 §4 の reset 手順に準拠）。
+  - rollback 手順に追加: **残置行の状態確認と閉鎖（[人]確認・fix2 で安全側へ定義）**:
+    - **received 行を根拠なく `done` へ更新することは禁止**（未処理イベントを処理済みに
+      偽装する誤閉鎖の危険。`done` は「処理が正常終端した」の記録であり、閉鎖の道具に
+      使わない）。
+    - **安全側の閉鎖手順**: (i) received 行の内容確認（[人]・payload から対象イベントを
+      特定）→ (ii) **実業務が別経路で処理済みと確認できた行のみ**手動で
+      `failed_exhausted` へ（理由をメモ列等に記録・列がなければ運用メモに event id を
+      記録）→ (iii) **確認不能な行は残置のまま監視対象として追跡**（無理に閉じない）。
+    - **注意（fix2）**: runbook work-log 2026-07-15_RV-05-13-fix5 §4.1 の SQL は
+      **`state='processing'` 専用**（claimed_at 判定を含む）で、**received には
+      そのまま使えない**。received 用の参照 SQL（**SELECT のみ**・UPDATE は [人] の
+      個別判断）:
+      ```sql
+      SELECT id, external_event_id, attempts, received_at
+      FROM inbound_event
+      WHERE provider = 'line' AND state = 'received'
+      ORDER BY received_at;
+      ```
+    - processing 残置の reset は従来どおり runbook §4 に準拠。
+
+## 7. 経路 (A) 監視実装の別票スコープ案（P2-CHAIN-012 想定・fix2）
+
+- **実装対象**: `hub/durable_inbound.py`（または専用 module）に滞留検査関数を新設。
+  - durable flag（`INBOUND_EVENT_DURABLE_ENABLED`）配下でのみ動作（OFF は完全 no-op・
+    M-06 流儀＝env 直読みで import 不発）。
+  - 対象: `provider='line'` の **received（閾値超）と processing（stale 閾値超）** の両方。
+    **`STRIPE_EVENT_JOURNAL_ENABLED` に依存しない**（check_journal_backlog とは独立の
+    専用検査・既存 Stripe 監視の挙動を変えない）。
+  - 閾値: received 用の専用 env（名前のみ・既定値つき）を新設し、processing は既存
+    `INBOUND_LINE_STALE_PROCESSING_SECONDS` と整合させる。
+- **警報結線**: daily_healthcheck の problems へ合流（既存 dead-man／notify 系の流儀・
+  LINE 警報・D17 流儀＝件数と PK のみ・payload/eventID 非搭載）。
+- **テスト**: flag OFF no-op／received 滞留検知／processing stale 検知／閾値境界／
+  Stripe flag 非依存（OFF でも検知）／警報文面の redaction（PK・件数のみ）。
+- **既存テストへの非波及方針**: 新設関数＋新規テストファイルのみ。
+  `check_journal_backlog`・既存 `run_healthcheck` 系テストは無変更
+  （結線行の追加が既存テストを壊す場合は P2HC-fix1 と同型で「結線は別票」に分離）。
