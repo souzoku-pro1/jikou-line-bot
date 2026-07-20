@@ -1354,3 +1354,10 @@ async def _process_stripe_event(event: dict) -> None:
         # 「黙って成功扱い」を廃止する安全側一方向の変更（flag OFF時にも適用）。
         # 例外→handlerが5xx→Stripe再送→journal ONならfailed行の再claimで回復
         resp.raise_for_status()
+
+
+# ── RCF-M14 監視拡張（/health/deps）。末尾で結線する:
+#    test_sink_ast_policy の allowlist が main.py の sink 行番号を pin しているため、
+#    途中への行追加は行ずれで allowlist を壊す（既存テスト無変更の制約）。
+from hub.health_deps import router as health_deps_router  # noqa: E402
+app.include_router(health_deps_router)

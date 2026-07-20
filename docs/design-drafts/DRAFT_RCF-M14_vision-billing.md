@@ -27,6 +27,15 @@
     を 1 回叩き 403/課金エラーを problems へ。(b) sortation の縮退率（doc_type=不明の比率）を
     観測し閾値超で警報。いずれも別票・Phase 2 裁定。
 
+## 3.1 監視拡張の実装（2026-07-20・P2-CHAIN-008）
+
+- §3 実装形 (a) を実装済み: **`/health/deps`**（`hub/health_deps.py`・既存 `/health` は無変更）。
+  Vision へ 1x1 ダミー annotate の軽量 probe（タイムアウト短め・既定 5 秒・
+  env `HEALTH_DEPS_TIMEOUT_SECONDS` で調整可）を行い、403/到達不能/タイムアウトを
+  **HTTP 200 のまま `status: degraded`** で返す（healthcheck 自体を落とさない・本教訓の反映）。
+  応答に secret・内部 URL・vendor 本文は含めない（H02 流儀）。
+  daily_healthcheck からの定期呼出し・警報結線は別票（Phase 2 裁定のまま）。
+
 ## 4. 位置づけ・未決
 
 - 本件は **billing 運用事象**であり、コード欠陥ではない（縮退は設計どおり安全側）。恒久策の主体は
