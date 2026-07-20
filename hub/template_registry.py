@@ -107,13 +107,16 @@ sa.event.listen(TemplateVersion, "before_delete", _reject_delete)
 def template_trigger_ddl() -> dict[str, list[str]]:
     """内容列 UPDATE 拒否＋DELETE 全面拒否＋承認ゲートの dialect 別 DDL。
 
-    fix2（P3002-2）:
-    - H01: draft→active には approved_by（非 NULL・非空）・approved_at・activated_at を必須化
-    - H02: status='draft' の間 approved_* は NULL のまま（非 NULL 化は active 遷移と同時のみ）・
-      空文字拒否・片側のみ設定拒否（INSERT 側も lifecycle 列 NULL を強制）
-    - M01: →retired 遷移に retired_at 必須。frozen 比較は `IS NOT`（NULL↔空文字も検出・
-      purpose の厳密化）
-    ※ 並行 activate の実測は SQLite（テスト）。PostgreSQL 実機の並行実測は未実施（既知）。
+    fix2（P3002-2）→ fix3（P3002-3）で lifecycle 完全表へ拡張:
+    - 状態不変条件（M01/M02・全 UPDATE に適用）:
+      draft   = approved_by/approved_at/activated_at/retired_at **全て NULL**
+      active  = approved_by（**TRIM 後も非空**・H01）＋approved_at＋activated_at **必須**
+                かつ retired_at **NULL**
+      retired = retired_at **必須**
+    - 遷移固有: draft→retired では approval 列 NULL 維持／retired での approval 初回設定拒否／
+      active のまま activated_at 書換拒否／approved_* write-once／片側のみ設定拒否
+    ※ 並行 activate の実測は SQLite（テスト）。**PostgreSQL 実機の並行実測は未実施 —
+      デプロイ前推奨回帰として追跡**（fix3 改定裁定 (c)・受容済み）。
     """
     sqlite_when = " OR ".join(
         f"OLD.{c} IS NOT NEW.{c}" for c in _FROZEN_COLUMNS)
@@ -123,36 +126,40 @@ def template_trigger_ddl() -> dict[str, list[str]]:
     flow = ("NOT ((OLD.status = NEW.status) OR "
             "(OLD.status = 'draft' AND NEW.status IN ('active', 'retired')) OR "
             "(OLD.status = 'active' AND NEW.status = 'retired'))")
-    # fix2 承認ゲート（UPDATE 用・両 dialect 共通の条件を dialect 構文で表現）
-    sqlite_gate = (
-        # H01: 承認なし active の拒否
-        "(OLD.status = 'draft' AND NEW.status = 'active' AND ("
-        "NEW.approved_by IS NULL OR NEW.approved_by = '' OR "
-        "NEW.approved_at IS NULL OR NEW.activated_at IS NULL)) OR "
-        # H02: draft のままの事前設定禁止
+    # fix2→fix3 承認ゲート（UPDATE 用・lifecycle 完全表＋遷移固有条件）
+    _common_gate = (
+        # 状態不変条件: draft（lifecycle 全 NULL）
         "(NEW.status = 'draft' AND (NEW.approved_by IS NOT NULL OR "
-        "NEW.approved_at IS NOT NULL)) OR "
-        # M01(fix1 継承): write-once
+        "NEW.approved_at IS NOT NULL OR NEW.activated_at IS NOT NULL OR "
+        "NEW.retired_at IS NOT NULL)) OR "
+        # 状態不変条件: active（承認3点必須・TRIM 後も非空・retired_at NULL）
+        "(NEW.status = 'active' AND (NEW.approved_by IS NULL OR "
+        "TRIM(NEW.approved_by) = '' OR NEW.approved_at IS NULL OR "
+        "NEW.activated_at IS NULL OR NEW.retired_at IS NOT NULL)) OR "
+        # 状態不変条件: retired（retired_at 必須）
+        "(NEW.status = 'retired' AND NEW.retired_at IS NULL) OR "
+        # 遷移固有: draft→retired は approval 列 NULL 維持
+        "(OLD.status = 'draft' AND NEW.status = 'retired' AND "
+        "(NEW.approved_by IS NOT NULL OR NEW.approved_at IS NOT NULL)) OR "
+        # 遷移固有: retired での approval 初回設定拒否
+        "(OLD.status = 'retired' AND OLD.approved_by IS NULL AND "
+        "NEW.approved_by IS NOT NULL) OR "
+        # 片側のみ設定拒否
+        "((NEW.approved_by IS NULL) <> (NEW.approved_at IS NULL))")
+    sqlite_gate = (
+        _common_gate + " OR "
+        # write-once（fix1 継承）
         "(OLD.approved_by IS NOT NULL AND OLD.approved_by IS NOT NEW.approved_by) OR "
         "(OLD.approved_at IS NOT NULL AND OLD.approved_at IS NOT NEW.approved_at) OR "
-        # H02: 空文字・片側のみ禁止
-        "(NEW.approved_by = '') OR "
-        "((NEW.approved_by IS NULL) <> (NEW.approved_at IS NULL)) OR "
-        # M01: retired 遷移に retired_at 必須
-        "(OLD.status IN ('draft', 'active') AND NEW.status = 'retired' "
-        "AND NEW.retired_at IS NULL)")
+        # 遷移固有: active のまま activated_at 書換拒否
+        "(OLD.status = 'active' AND NEW.status = 'active' AND "
+        "OLD.activated_at IS NOT NEW.activated_at)")
     pg_gate = (
-        "(OLD.status = 'draft' AND NEW.status = 'active' AND ("
-        "NEW.approved_by IS NULL OR NEW.approved_by = '' OR "
-        "NEW.approved_at IS NULL OR NEW.activated_at IS NULL)) OR "
-        "(NEW.status = 'draft' AND (NEW.approved_by IS NOT NULL OR "
-        "NEW.approved_at IS NOT NULL)) OR "
+        _common_gate + " OR "
         "(OLD.approved_by IS NOT NULL AND OLD.approved_by IS DISTINCT FROM NEW.approved_by) OR "
         "(OLD.approved_at IS NOT NULL AND OLD.approved_at IS DISTINCT FROM NEW.approved_at) OR "
-        "(NEW.approved_by = '') OR "
-        "((NEW.approved_by IS NULL) <> (NEW.approved_at IS NULL)) OR "
-        "(OLD.status IN ('draft', 'active') AND NEW.status = 'retired' "
-        "AND NEW.retired_at IS NULL)")
+        "(OLD.status = 'active' AND NEW.status = 'active' AND "
+        "OLD.activated_at IS DISTINCT FROM NEW.activated_at)")
     # fix2 H02: INSERT は draft かつ lifecycle 列すべて NULL
     insert_bad = ("NEW.status != 'draft' OR NEW.approved_by IS NOT NULL OR "
                   "NEW.approved_at IS NOT NULL OR NEW.activated_at IS NOT NULL OR "

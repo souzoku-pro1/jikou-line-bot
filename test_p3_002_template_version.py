@@ -486,5 +486,74 @@ class TestPurposeStrictFrozen(_DbMixin):
         db.reset_for_tests()
 
 
+# ── fix3(P3002-3-H01/M01/M02) 追加テスト ─────────────────────────────────────
+class TestLifecycleCompleteTable(_DbMixin):
+    """M01/M02: 状態×lifecycle の完全表を trigger で強制（Core 実測・SQLite）。
+    PostgreSQL 実機の並行実測は未実施 — デプロイ前推奨回帰として追跡（改定裁定 (c)）。"""
+
+    def _upd(self, pk, **vals):
+        async def _u():
+            async with db.session_scope() as s:
+                await s.execute(sa.update(TemplateVersion.__table__)
+                                .where(TemplateVersion.__table__.c.id == pk)
+                                .values(**vals))
+        return _u
+
+    def test_whitespace_only_approver_rejected_core(self):
+        # H01: TRIM 後空の承認者は draft→active でも拒否（Core 直 UPDATE 実測）
+        pk = self._create()
+        with self.assertRaises((IntegrityError, OperationalError)):
+            _run(self._upd(pk, status="active", approved_by="   ",
+                           approved_at=sa.func.now(),
+                           activated_at=sa.func.now())())
+        db.reset_for_tests()
+
+    def test_retired_approval_first_set_rejected(self):
+        # M02: draft→retired（approval NULL 維持）後、retired のまま approval 初回設定は拒否
+        pk = self._create()
+        _run(self._upd(pk, status="retired", retired_at=sa.func.now())())
+        db.reset_for_tests()
+        with self.assertRaises((IntegrityError, OperationalError)):
+            _run(self._upd(pk, approved_by="late-approver",
+                           approved_at=sa.func.now())())
+        db.reset_for_tests()
+
+    def test_draft_to_retired_with_approval_rejected(self):
+        # M02: draft→retired と同時の approval 設定も拒否（承認は active 遷移専用）
+        pk = self._create()
+        with self.assertRaises((IntegrityError, OperationalError)):
+            _run(self._upd(pk, status="retired", retired_at=sa.func.now(),
+                           approved_by="x", approved_at=sa.func.now())())
+        db.reset_for_tests()
+
+    def test_active_activated_at_rewrite_rejected(self):
+        # M02: active のまま activated_at の書換は拒否（同一秒の now() では書換に
+        # ならないため、確実に異なる固定時刻へ書き換えて実測する）
+        from datetime import datetime, timezone
+        pk = self._create()
+        self._activate(pk)
+        with self.assertRaises((IntegrityError, OperationalError)):
+            _run(self._upd(pk, activated_at=datetime(2020, 1, 1,
+                                                     tzinfo=timezone.utc))())
+        db.reset_for_tests()
+
+    def test_state_invariant_matrix(self):
+        # 完全表: draft は lifecycle 全 NULL／active は retired_at NULL
+        pk = self._create()
+        for label, vals in {
+            "draft_with_activated_at": dict(activated_at=sa.func.now()),
+            "draft_with_retired_at": dict(retired_at=sa.func.now()),
+        }.items():
+            with self.subTest(case=label):
+                with self.assertRaises((IntegrityError, OperationalError)):
+                    _run(self._upd(pk, **vals)())
+                db.reset_for_tests()
+        self._activate(pk)
+        with self.subTest(case="active_with_retired_at"):
+            with self.assertRaises((IntegrityError, OperationalError)):
+                _run(self._upd(pk, retired_at=sa.func.now())())
+            db.reset_for_tests()
+
+
 if __name__ == "__main__":
     unittest.main()
