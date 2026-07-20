@@ -60,10 +60,13 @@ async def valuation_ingest(_auth: None = Depends(ingest_guard("VALUATION_INGEST_
 $ grep -n "bank/ingest\|valuation/ingest\|registry/ingest" legacy/gas/コード.js
 192:        RAILWAY_URL + '/registry/ingest?token=' + encodeURIComponent(REGISTRY_TOKEN), {
 ```
-- `/bank/ingest`・`/valuation/ingest` の**送信箇所は存在しない**（ingest 系の legacy 送信は
-  registry の 1 箇所のみ）。なお 5 行目の `'通帳'` フォルダは既存 `/scan` 行き（別経路・不変）。
-- ＝ **bank/valuation は「新規開通」であり dual-accept 併存期間が不要**（第8セッション判断の
-  裏取り成立）。**対照: registry（lane4 扱い）は live 送信元があるため koseki 型の
+- `/bank/ingest`・`/valuation/ingest` の送信箇所は **repo 写し上では未検出**（ingest 系の
+  legacy 送信は registry の 1 箇所のみ）。なお 5 行目の `'通帳'` フォルダは既存 `/scan` 行き
+  （別経路・不変）。
+- **P2L3P-H01: repo grep は live 不在の証明ではない**（repo/live drift は INC-0720 で実証済み）。
+  ＝「新規開通・dual-accept 併存期間が不要」は**条件付き候補**であり、確定には
+  **G-L3-0（§6 冒頭・[人] live 実見ゲート）の 3 点充足が必要**。
+  **対照: registry（lane4 扱い）は repo 写しにも live 送信元があるため koseki 型の
   dual 併存→切替が必要**。混同注意。
 - 補足: sortation の自動回送（`sortation_ingest.py:226-245`）は `ingest_valuation_pdf` 等の
   **in-process 直接呼出**（HTTP でない・認証非経由）。`_FORWARD_LINES`（119 行）は
@@ -97,14 +100,25 @@ $ grep -n "bank/ingest\|valuation/ingest\|registry/ingest" legacy/gas/コード.
 （negative 6・legacy/新規開通系 2〜3・byte パリティ 2・契約構造 1）＝ **2 lane 合計 20〜24**。
 共通ヘルパ化（koseki 版の parametrize 化）で 15 前後まで圧縮可。別途**行列 pin テスト改定 1**。
 
-## 6. 開通手順草案（koseki 手順との差分形式・dual 不要）
+## 6. 開通手順草案（koseki 手順との差分形式・dual 不要は G-L3-0 充足が条件）
+
+### 実施前提ゲート G-L3-0（[人]・live 実見・fix1/P2L3P-H01 で新設）
+
+- (a) **live GAS プロジェクト全文**で `/bank/ingest`・`/valuation/ingest` の endpoint 検索
+  （エディタの検索機能）→ **ヒット 0 を実見**。
+- (b) **トリガー一覧**（時計アイコン）で bank/valuation 系の実行主体が**ないことを実見**。
+- (c) 可能な観測窓で **Railway HTTP Logs** の `/bank/ingest`・`/valuation/ingest` への
+  **legacy 到達 0 を実見**。
+- → **3 点充足で初めて「新規開通・dual 不要」が確定**。**未充足（いずれかで live caller の
+  痕跡あり）なら registry 型（dual 併存→切替）へ計画を切替える**（下表の「dual-accept 併存」
+  「D-5 相当」行は registry 型に読み替え）。
 
 | 工程 | koseki（lane2・実績） | bank/valuation（lane3・草案） |
 |---|---|---|
 | repo: SIGNED_LANES | true 化＋行列 pin テスト | **同じ**（2 lane 分・pin 改定込み） |
 | repo: 送信契約 | 2 キー縮小（P2K-H01） | **OPEN-2**: 4 キーのまま or 2 キー縮小（裁定） |
 | repo: テスト | negative 横展開 12 件 | **同じ型**を 2 lane へ（§5 見積り） |
-| dual-accept 併存 | 必要（live 送信元あり） | **不要**（送信元ゼロ・§3）。**開通と同時に `SERVICE_AUTH_LEGACY_DISABLED_PATHS` へ両 path 追記可**（legacy を最初から閉じる） |
+| dual-accept 併存 | 必要（live 送信元あり） | **不要（G-L3-0 充足が前提条件）**。充足時は**開通と同時に `SERVICE_AUTH_LEGACY_DISABLED_PATHS` へ両 path 追記可**（legacy を最初から閉じる）。未充足なら registry 型へ切替 |
 | GAS 反映 | 既存ブロック②を dispatcher 置換 | **watcher ブロック新設**（OPEN-1: 要否・フォルダ ID・トリガー・[済] 規約は[人]裁定）。**全置換禁止・期待行列読み合わせ**（INC-0720 §7 規律） |
 | D-3/D-4 相当 | 200 実測 2〜3 件・?token= 0 | **同じ**（新規開通のため legacy 0 は自明・署名 200 のみ確認） |
 | D-5 相当 | 事後に PATHS 追記 | **開通時に前倒し済み**（上記）→ 事後工程なし |
@@ -115,7 +129,10 @@ $ grep -n "bank/ingest\|valuation/ingest\|registry/ingest" legacy/gas/コード.
 - **リスク**: (i) 新設 watcher のフォルダ誤指定・アカウント取り違え（7/18-1 前例）
   (ii) registry（live 送信元あり・dual 必要）との手順混同 (iii) LANE_FIELDS を 2 キー化する場合の
   gas_builder ⊆ 契約・fixture vector 実行 lane（現在 valuation 使用）への波及
-  (iv) legacy 即時閉鎖により障害切り分け経路が 1 本になる（一時 dual を選ぶ選択肢はある）。
+  (iv) legacy 即時閉鎖により障害切り分け経路が 1 本になる（一時 dual を選ぶ選択肢はある）
+  (v) **P2L3P-H01: repo grep のみを根拠に dual 省略した場合、未知の live caller が存在すると
+  当該経路が即 404**（INC-0720 と同型の巻き戻り事故）。**G-L3-0 の 3 点実見で事前に遮断**し、
+  痕跡発見時は registry 型へ切替える。
 - **停止条件候補**: 期待行列の読み合わせ不一致／D-3 相当で 401・404 連続／
   repo・live drift の検出／fixture 変更が必要になった場合。
 
