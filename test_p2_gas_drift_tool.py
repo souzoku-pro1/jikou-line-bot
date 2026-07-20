@@ -99,5 +99,94 @@ class TestSecretGuard(_Base):
         self.assertIn("(secret 様のため非表示)", out)
 
 
+# ── fix1(P2DRIFT-H01/H02/M01) 追加テスト ─────────────────────────────────────
+class TestSecretPatternsExpanded(_Base):
+    """H01: 非 hex の secret 様 5 種も警告し、--show-content でも値を出さない。"""
+
+    _PAYLOADS = {
+        "base64": "var B = 'QWxhZGRpbjpvcGVuIHNlc2FtZUFsYWRkaW46b3BlbnNlc2FtZQ==';",
+        "jwt": "var J = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.payload';",
+        "gapi_key": "var G = 'AIzaSyD0123456789abcdefghijklmnopqrstu';",
+        "assign": "var KOSEKI_TOKEN = 'supersecretvalue99';",
+        "url_token": "var U = RAILWAY_URL + '/koseki/ingest?token=abcdef1234567890';",
+    }
+
+    def test_five_nonhex_patterns_warned_and_hidden(self):
+        for label, payload in self._PAYLOADS.items():
+            with self.subTest(pattern=label):
+                (self.snap / "rv04c_signing.js").write_text(
+                    _SIGNING_JS + payload + "\n", encoding="utf-8")
+                code, out = self._run(show_content=True)
+                self.assertEqual(code, 1, (label, out))   # 行追加は drift
+                self.assertIn("[warn]", out, label)
+                self.assertIn("secret 様", out, label)
+                self.assertNotIn(payload, out, label)      # 行本文は恒久非表示
+                self.assertIn("(secret 様のため非表示)", out, label)
+
+
+class TestRequiredFileGate(_Base):
+    """H02: rv04c_signing.js 欠落は SIGNED_LANES 比較不能として exit 2（false green 遮断）。"""
+
+    def test_missing_required_file_exit_2(self):
+        (self.snap / "other.js").write_text("var X = 1;\n", encoding="utf-8")
+        code, out = self._run()
+        self.assertEqual(code, 2, out)
+        self.assertIn("必須ファイル rv04c_signing.js が snapshot にありません", out)
+        self.assertIn("SIGNED_LANES 比較不能", out)
+
+
+class TestBrokenInputContract(_Base):
+    """M01: 壊れた入力・repo-root 不正は traceback でなく固定文言＋exit 2。"""
+
+    def test_non_utf8_snapshot_exit_2(self):
+        (self.snap / "rv04c_signing.js").write_bytes(b"\xff\xfe\x00\x81broken")
+        code, out = self._run()   # 例外が漏れず戻り値で返ることも同時に検証
+        self.assertEqual(code, 2, out)
+        self.assertIn("UTF-8 として読めません", out)
+
+    def test_invalid_repo_root_exit_2(self):
+        import io
+        from gas_drift_check import run_check
+        (self.snap / "rv04c_signing.js").write_text(_SIGNING_JS, encoding="utf-8")
+        buf = io.StringIO()
+        code = run_check(self.snap, self._dir / "no-such-repo", out=buf)
+        self.assertEqual(code, 2, buf.getvalue())
+        self.assertIn("repo-root 不正", buf.getvalue())
+
+
+class TestSecretFilenameHidden(_Base):
+    """H01: secret 様文字列を含むファイル名は出力しない。"""
+
+    def test_secret_like_filename_not_printed(self):
+        (self.snap / "rv04c_signing.js").write_text(_SIGNING_JS, encoding="utf-8")
+        bad_name = "AIzaSyD0123456789abcdefghijklmnopqrstu.js"
+        (self.snap / bad_name).write_text("var X = 1;\n", encoding="utf-8")
+        code, out = self._run()
+        self.assertEqual(code, 1, out)             # 余分ファイル＝drift
+        self.assertNotIn(bad_name, out)            # ファイル名を出さない
+        self.assertNotIn("AIzaSyD", out)
+        self.assertIn("ファイル名の snapshot を検出", out)
+
+
+class TestManifestCheck(_Base):
+    """fix1: manifest 照合 — 余分（repo に無い）・不足（snapshot に無い）の検出。"""
+
+    def test_snapshot_extra_file_detected(self):
+        (self.snap / "rv04c_signing.js").write_text(_SIGNING_JS, encoding="utf-8")
+        (self.snap / "unknown.js").write_text("var X = 1;\n", encoding="utf-8")
+        code, out = self._run()
+        self.assertEqual(code, 1, out)
+        self.assertIn("manifest 余分", out)
+
+    def test_repo_file_missing_from_snapshot_detected(self):
+        (self.repo / "gas" / "rv04c_selftest.js").write_text("var T = 1;\n",
+                                                             encoding="utf-8")
+        (self.snap / "rv04c_signing.js").write_text(_SIGNING_JS, encoding="utf-8")
+        code, out = self._run()
+        self.assertEqual(code, 1, out)
+        self.assertIn("gas/rv04c_selftest.js が snapshot にありません", out)
+        self.assertIn("manifest 不足", out)
+
+
 if __name__ == "__main__":
     unittest.main()
