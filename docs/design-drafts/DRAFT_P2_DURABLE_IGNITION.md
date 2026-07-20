@@ -39,14 +39,27 @@ sortation_ingest.py:136: (_durable_enabled)  同上
 
 - 正本 §9.2 の逐語:
   > **K4（[人]/大野・前提条件）**: LINE 再配送設定確認（顧客Bot 自動 replay 有効化票=RV-06 後のブロッキング前提・§H-03 L3 も K4 後）。**Phase A（観測）は不要**。
-- ＝ **「点火は redelivery 切替と同時」という制約は Phase A には無い**。K4 が前提となるのは
-  **RV-06（顧客 Bot 自動 replay・別票）と §H-03 L3（完全差分照合）**であり、本 flag の
-  Phase A 点火（記録＋観測のみ・自動 replay なし）は **K4 未確定でも分離点火が設計上許容**。
-- **分離点火した場合の影響分析**（正本 §既知制約 H-NEW-01-R3 ほか）:
-  - stale processing 回収の駆動は **LINE 再配送のみ** → K4 未確認（再配送設定不明）のままだと
-    **stale 行は人手 reset まで滞留し得る**（検知は §6 観測 3 系列・回収 runbook は
-    work-log 2026-07-15_RV-05-13-fix5 §4）。＝観測でカバーされる既知制約であり、
-    Phase A の目的（可視化）自体は損なわれない。
+- 正本の記述上、K4 が直接の前提となるのは **RV-06（顧客 Bot 自動 replay・別票）と
+  §H-03 L3（完全差分照合）**。ただし——
+- **【fix1・P2DP-H01】「K4 未確定でも分離点火可」の根拠は撤回する**。理由＝**現状の
+  滞留検知の限界**（Codex 指摘・実装事実）:
+  - `daily_healthcheck.check_journal_backlog` は **`STRIPE_EVENT_JOURNAL_ENABLED=1`
+    依存**（別 flag。OFF なら LINE 行も含め何も見ない）。
+  - 検知対象 state は **processing（24h 超 stale）と failed（24h 超）のみ**。
+    **`received` の滞留は検知対象外**。
+  - 具体例（Codex 指摘）: LINE webhook の **batch 途中 503**（複数 event 中の一部 insert 後に
+    5xx）で、成功分の行が `received` のまま残る。再配送が無ければ（K4 未確認）誰も claim せず、
+    **どの監視にも掛からず沈黙滞留**する。
+  - ＝旧記述「観測 3 系列で検知されるため可視化は損なわれない」は**実態と不一致**であり修正:
+    観測 3 系列（A 受理/B 終端 held/C 運用）は**カウンタ/ログ集計**であって、`received`
+    滞留行を能動警報する仕組みではない。
+- **点火の前提条件（いずれか必須・再定義)**:
+  - **(A) 推奨**: `received` を含む **LINE 滞留監視を durable flag 配下で実装**（別票。
+    check_journal_backlog への state 追加ではなく durable flag ゲートの専用検査として追加し、
+    Stripe 監視の既存挙動を変えない）→ 実装後に単独点火可。
+  - **(B)**: **K4 redelivery と同時点火**（当初計画へ回帰。再配送が received/stale の
+    回収駆動を提供する）。
+- 分離点火時のその他の影響（前提条件とは独立に不変）:
   - 二重返信は terminal state（done/failed_exhausted）skip で遮断（まれな stale 併走は
     正本の比較裁定どおり受容・検知可能）。
   - **挙動変化が出るのは sortation の H-04**（ask 保存/通知の失敗が縮退→5xx へ変わる）。
@@ -77,15 +90,30 @@ sortation_ingest.py:136: (_durable_enabled)  同上
   - (a) **[人]確認**: 本番 DB で inbound_event / ingestion_receipt / （claimed_at 列）の
     存在確認（alembic 適用実態）。
   - (b) **[人]確認**: `STRIPE_EVENT_JOURNAL_ENABLED` の live ON 実態（§2 の整合）。
-  - (c) K4 は Phase A に不要（§3）。ただし K4 の確認自体は RV-06 の前提として別途残る。
-- **手順案**（点火票の骨子）:
-  1. [人] `INBOUND_EVENT_DURABLE_ENABLED` を ON → デプロイ緑。
-  2. startup ログで `[RV05] startup reconcile` の出力を実見（[人]）。
-  3. LINE テスト発話 1 件 → 応答正常＋inbound_event に provider="line" の行（[人]実見）。
-  4. sortation テスト 1 件 → 200＋receipt 行・従来どおり `[照会中]`/`[済]`（[人]実見）。
-  5. 観測 3 系列（A 受理/B 終端 held/C 運用）のカウンタ初期値を記録。
+  - (c) **§3 の (A) または (B) のいずれかの充足（fix1・必須）**。
+- **手順案（(A)/(B) の分岐構造・fix1）**:
+  - **経路 (A)（推奨）**: ①別票で LINE 滞留監視（received 含む・durable flag 配下）を実装・
+    merge → ②以降は共通手順へ。
+  - **経路 (B)**: ①[人] K4（LINE 再配送設定）を確認・有効化 → ②redelivery 有効の状態で
+    共通手順へ（点火は redelivery 切替と同時）。
+  - **共通手順**:
+    1. [人] `INBOUND_EVENT_DURABLE_ENABLED` を ON → デプロイ緑。
+    2. startup ログで `[RV05] startup reconcile` の出力を実見（[人]）。
+    3. LINE テスト発話 1 件 → 応答正常＋inbound_event に provider="line" の行が
+       terminal（done）へ到達（[人]実見）。
+    4. sortation テスト 1 件 → 200＋receipt 行・従来どおり `[照会中]`/`[済]`（[人]実見）。
+    5. 観測 3 系列（A 受理/B 終端 held/C 運用）のカウンタ初期値を記録
+       （経路 (A) なら滞留監視の警報 0 も確認）。
 - **リスク**: (i) sortation H-04 の 5xx 化（自然リトライで回収・点火直後は観測強化）
   (ii) DB 到達不能時は durable 経路が fail 側（握らない設計）＝DB 障害が可視化される反面
-  5xx が増える (iii) stale 滞留（K4 未確認のうちは人手 reset 運用・§3）。
+  5xx が増える (iii) received/stale の沈黙滞留（§3・前提条件 (A)/(B) はこの遮断のため）。
 - **rollback**: env OFF（1 本）→ **即時に現行挙動と byte 同一**（M-06 で import すらしない）。
-  記録済み行は残置で無害（読み手なし）。
+  - **【fix1・P2DP-M01】「記録済み行は残置で無害（読み手なし）」は撤回**。実態:
+    `check_journal_backlog` は **provider != kintone で LINE 行も読み**、残置行が
+    processing/failed のままだと **24 時間後に Stripe runbook 文言の警報**が
+    （`STRIPE_EVENT_JOURNAL_ENABLED=1` なら）発火する＝「読み手なし」ではない。
+  - rollback 手順に追加: **残置行の状態確認と閉鎖（[人]確認）** — OFF 直前に
+    non-terminal（received/processing）の LINE 行を列挙し、処理完了済みの実態と突合のうえ
+    `done`（正常終端）または `failed_exhausted`（打ち切り）へ**明示遷移**させてから
+    OFF にする（誤警報と将来の再点火時の混入を防ぐ。遷移は runbook
+    work-log 2026-07-15_RV-05-13-fix5 §4 の reset 手順に準拠）。
