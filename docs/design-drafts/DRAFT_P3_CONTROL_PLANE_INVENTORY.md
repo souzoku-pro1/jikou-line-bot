@@ -71,22 +71,28 @@
 ① DerivationRun ＋ HeirConfirmationDecision（app-state DB・migration 要=新規2表）
    │  （NH01 分離・immutable 制約・裁定 2026-07-12 済みのため先行着手可能）
    ▼
-② App37 TemplateVersion／snapshot 凍結（migration 要否は設計次第・App37 は kintone 側）
-   │
+② TemplateVersion の DB 化【fix1・P3PREP-H01: 正本 DRAFT_APP36 §2（89-91 行）裁定どおり
+   │  **app-state DB の別 metadata**（DerivationRun/HCD と同じ専用モジュール群・
+   │  inbound_event.Base 相乗りせず・L03 準拠）。**migration 要**。
    ▼
-③ App36 projection 起票（R4-3b・App30 detail へ DerivationRun.id 格納・単票 API 必須）
-   │
+③ 封筒フロー結線【fix1・P3PREP-H02: 正本 §3.1-3.2 の方向へ整合】
+   │  **DerivationRun → App30 要確認封筒の起票（機械・detail=DerivationRun.id・単票 API）
+   │  → [人] の関所（承認・review_resolve）→ HCD 1 行追記＋App36 projection 更新**
+   │  （旧記述「承認前 App36 を入力に App30 起票」の逆向きは撤回）
    ▼
 ④ effect level の control plane 組込み（E 定義確定後・App29/30 拡張）
    ⑤ Outbox worker（§8.8 Phase 6 契約・K4/RV-06 と同一群で裁定）→ Phase 3 では DEFER 継続が既定
 ```
-- migration 要否: ①=**要**（2 表新規）・②=設計次第・③④=既存表/kintone 拡張中心・⑤=要（将来）。
+- migration 要否: ①=**要**（2 表新規）・②=**要**（TemplateVersion 表・fix1）・
+  ③④=既存表/kintone 拡張中心・⑤=要（将来）。
 
 ## 5. Phase 3 最初の実装票 3 本分のスコープ案（司令塔裁定用）
 
+（fix1: Codex 推奨の依存関係 P3-001 → P3-002 → P3-003 へ再構成・E0–E3 は正本確認後）
+
 | 票案 | スコープ | 前提 |
 |---|---|---|
-| P3-001: DerivationRun/HCD 実装 | モデル＋migration 2 表＋immutable 制約（UPDATE/DELETE 拒否）＋分離契約テスト | 裁定済み・着手可 |
-| P3-002: App37 template registry | TemplateVersion 管理＋生成時 snapshot 凍結＋provisional=True 生成拒否 | ①・App37 実体（kintone・[人]） |
-| P3-003: projection 起票結線 | App36→App30 起票（detail=DerivationRun.id・単票 API）＋状態機械整合テスト | ①②・App30 稼働資産 |
+| P3-001: DerivationRun/HCD 実装 | モデル＋migration 2 表（app-state DB・別 metadata）＋immutable 制約（UPDATE/DELETE 拒否）＋分離契約テスト | 裁定済み・着手可 |
+| P3-002: TemplateVersion の DB 化 | **DB model＋migration**（正本 §2 裁定・app-state DB 別 metadata）。**immutable 版管理・部分 unique・bytes 再現 contract を DB 制約で担保**＋生成時 snapshot 凍結・provisional=True 生成拒否 | P3-001（同 metadata 群） |
+| P3-003: 封筒フロー結線 | **DerivationRun→App30 要確認封筒起票（機械）→[人]関所（review_resolve）→HCD 追記＋App36 projection 更新**（正本 §3.1-3.2 の向き・冪等キー＝`heir_derivation:{case}:{input_hash}`）＋状態機械整合テスト | P3-001・P3-002・App30 稼働資産 |
 - E0–E3 組込み（④）は**定義正本の確認後に別途起票**（本 3 本と並行裁定可）。
