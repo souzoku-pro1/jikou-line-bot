@@ -121,9 +121,21 @@ sortation_ingest.py:136: (_durable_enabled)  同上
   - rollback 手順に追加: **残置行の状態確認と閉鎖（[人]確認・fix2 で安全側へ定義）**:
     - **received 行を根拠なく `done` へ更新することは禁止**。
       **【fix3・P2DP3-M01 裁定】`done` は「照合源による根拠がある場合のみ許可」**へ変更
-      （管理終端の新 state は作らない＝migration 回避・裁定）。**`failed_exhausted` は
-      再試行打切り（attempts 上限）の意味に限定**し、管理閉鎖の代用にしない
-      （fix2 の「failed_exhausted へ手動遷移」は意味論の不整合として撤回）。
+      （管理終端の新 state は作らない＝migration 回避・裁定）。
+    - **【fix4・P2DP4-M01 裁定】`failed_exhausted` の定義統一**:
+      **「再試行を行わないことが確定した打切り」**。
+      - **自動**: `attempts >= max`（実装済みの遷移・retry_exhausted 系）。
+      - **手動**: **再配送終了済みで再処理見込みなしと [人] が判断した打切り**
+        （runbook work-log 7/15 §4.4 (b) の既存手順と整合）。
+      - **区別（運用案）**: 手動遷移時は `last_error` を固定分類（例: `manual_closed`）へ
+        更新し、自動上限（retry_exhausted 系）と識別可能にする（分類のみ・本文非搭載の
+        D17 流儀維持。分類値の実装確定は監視票 P2-CHAIN-012 かその後続）。
+      - **runbook との整合（注記）**: fix3 の「attempts 上限に**限定**」という表現は、
+        runbook §4.4 (b) が既に認める**手動打切り**（exhausted=true でない行の
+        「再配送終了済み・再処理見込みなし」判断）と矛盾していたため、本定義へ差し替える。
+        runbook 自体は **merge 済み歴史記録のため変更しない**（司令塔裁定）。
+      - **不変の核（fix3 維持）**: 照合源で正常処理済みを証明できた行は `done`（根拠必須）。
+        **「処理済み」の行を `failed_exhausted` に入れることは引き続き禁止**。
     - **【fix3・P2DP3-H01】「payload から対象イベントを特定」は撤回**。実装事実:
       Phase A は **raw payload を保存しない** — `hub/inbound_event.py` の保存列は
       provider／external_event_id／caller_id／dedup_key／**payload_hash（SHA-256 のみ）**／
