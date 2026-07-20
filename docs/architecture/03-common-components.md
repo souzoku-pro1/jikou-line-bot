@@ -263,3 +263,34 @@ UNIT_CONFIG = {
 - `hub/` の各モジュールに対応する `test_hub_*.py` を置く。抽出リファクタのタスクは
   「移設前後で既存テストが無変更で PASS」を完了条件に含める（09 参照）
 - 状態機械は**遷移表を data として持ち**、全禁止遷移を総当たりで検査するテストを書く
+
+## 12. `hub/durable_inbound.py` — durable inbound の確定仕様（2026-07-21 昇格）
+
+> 転記元: `docs/design-drafts/DRAFT_P2_DURABLE_IGNITION.md`（fix1〜fix4・R-P2-DURABLE-PREP-5
+> PASS・PR #154）。DRAFT は経緯込みの正本として残し、ここには**確定部分のみ**を仕様として置く。
+
+### 12.1 点火ゲート（INBOUND_EVENT_DURABLE_ENABLED）
+
+- 点火の**唯一の前提**＝LINE 滞留監視（received／processing の両 state・durable flag 配下・
+  `STRIPE_EVENT_JOURNAL_ENABLED` 非依存・閾値超過で LINE 警報）の**検査関数と
+  daily_healthcheck 結線の両方が merge 済み**であること。分票時は両票完了まで点火不可。
+- K4（LINE 再配送設定確認）は**補助**であり点火条件ではない（K4 は非 2xx への再配送のため、
+  200 ACK 後の BackgroundTask crash による滞留を回収できない）。
+- rollback は env OFF 1 本で即時に現行挙動と byte 同一（M-06: flag OFF は import 不発）。
+
+### 12.2 状態語彙（inbound_event.state・LINE Phase A）
+
+- `done` = 処理が正常終端した記録。**照合源による根拠がある場合のみ**手動遷移可。
+- `failed_exhausted` = **再試行を行わないことが確定した打切り**。
+  自動（`attempts >= max`・retry_exhausted 系）と手動（再配送終了済みで再処理見込みなしの
+  [人] 判断・runbook 2026-07-15_RV-05-13-fix5 §4.4(b)）の両方を含む。
+  手動遷移時は `last_error` を固定分類（例: `manual_closed`）とし自動上限と識別する（運用）。
+- **「処理済み」の行を `failed_exhausted` に入れることは禁止**（done と混同しない）。
+- 管理終端のための新 state は**作らない**（migration 回避・裁定）。
+
+### 12.3 照合源（received 行の閉鎖判断）
+
+- Phase A は **raw payload を保存しない**（保存列は payload_hash 等のみ・PII/本文非搭載）。
+- 照合源は**実在するもののみ**: `external_event_id`（LINE webhookEventId）・既存の構造化ログ・
+  LINE 側の配信記録等。**照合源が無い行は「確認不能として残置」が唯一の扱い**
+  （根拠なき done 更新＝未処理の処理済み偽装は禁止）。

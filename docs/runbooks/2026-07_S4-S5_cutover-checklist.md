@@ -165,3 +165,16 @@
 - kintone レーン（`KINTONE_EVENT_DEDUP_ENABLED`・`KINTONE_XFF_OBSERVE_ENABLED`）は D と独立に
   点火可（別 env）。滞留/失敗の人手対応は `2026-07_kintone-lane-recovery.md`。
 - 本チェックリストの全 env は既定 OFF/未設定＝現行挙動不変。点火は [人]、タイミングは [司令塔]。
+
+## F. GAS 反映の恒久規律（INC-0720 起点・2026-07-21 昇格）
+
+> 転記元: `docs/work-logs/2026-07-20_P2-koseki-cutover.md` §7（再発防止規律）。
+> 以後の**全 lane・全 GAS 反映**に適用する運用規律（追記・本チェックリスト本文は不変）。
+
+- (i) GAS への repo 写し反映は**「全置換」を禁止**する。反映指示には必ず **SIGNED_LANES
+  全 5 lane の期待行列を明記**し、反映後に [人] が live の行列を**読み合わせる**。
+- (ii) live 直編集で切替済みの lane がある間は、**repo 側 SIGNED_LANES を live 実態に
+  同期させる PR を cutover work-log と同時に出す**（repo/live drift の恒久解消）。
+- (iii) 機械化: 読み合わせ・drift 検査は `tools/gas_drift_check.py`
+  （snapshot 手貼り運用・SIGNED_LANES 期待行列対比・exit 0/1/2）を用いてよい。
+  一致（exit 0）を確認できない状態からの live 反映は行わない。
