@@ -76,6 +76,11 @@ def upgrade() -> None:
         sa.UniqueConstraint("supersedes_decision_id",
                             name="uq_heir_decision_supersedes"),
     )
+    # fix3 H04: 同一 run の root decision は 1 行のみ（部分ユニーク）
+    op.create_index("uq_heir_decision_single_root", "heir_confirmation_decision",
+                    ["derivation_run_id"], unique=True,
+                    sqlite_where=sa.text("supersedes_decision_id IS NULL"),
+                    postgresql_where=sa.text("supersedes_decision_id IS NULL"))
     # immutable trigger（両 dialect・モジュール定義と単一ソース共用）
     from hub.derivation_models import immutable_trigger_ddl
     dialect = op.get_bind().dialect.name
@@ -95,4 +100,7 @@ def downgrade() -> None:
             op.execute(f"DROP FUNCTION IF EXISTS {table}_immutable()")
         if table == "derivation_run":
             op.drop_index("uq_derivation_run_single_root", table_name="derivation_run")
+        else:
+            op.drop_index("uq_heir_decision_single_root",
+                          table_name="heir_confirmation_decision")
         op.drop_table(table)

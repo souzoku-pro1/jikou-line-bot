@@ -268,8 +268,8 @@ class TestPayloadAllowlist(_DbMixin):
 
     def test_lawyer_flags_allowlist(self):
         from hub.derivation_models import PayloadPolicyError, create_derivation_run
-        self._create(lawyer_flags={"flags": ["renounce_review"]},
-                     input_hash="lf-ok")
+        self._create(lawyer_flags={"flags": ["F1", "simultaneous_death"]},
+                     input_hash="lf-ok")   # fix3: 実導出由来の enum（F1=放棄・同時死亡推定）
         with self.assertRaises(PayloadPolicyError):
             _run(create_derivation_run(**_run_row(
                 lawyer_flags={"memo": "自由記述は不可"}, input_hash="lf-ng")))
@@ -412,18 +412,9 @@ class TestFieldGrammar(_DbMixin):
                 db.reset_for_tests()
 
 
-class TestCoreBypassPin(_DbMixin):
-    """H02: Core INSERT は payload 検査を迂回できる（既知の限界の pin）。
-    将来 JSON 検査を DB trigger 化した場合は本テストの期待を「拒否」へ反転させること。"""
-
-    def test_core_insert_bypasses_payload_validation_known_limit(self):
-        async def _ins():
-            async with db.session_scope() as s:
-                await s.execute(sa.insert(DerivationRun.__table__).values(
-                    **_run_row(result_payload={"heirs": [
-                        {"person_id": "山田太郎"}]})))   # 正規経路なら拒否される値
-        _run(_ins())   # 現状: 成功してしまう（DB 層へ下ろせていない・docstring 参照）
-        db.reset_for_tests()
+# fix3 改定裁定: 旧 TestCoreBypassPin（迂回成功の pin）は「脆弱性目録になる」判定により
+# 削除。Core 迂回の防御は test_p3_core_ast_policy（AST 機械検査）＋正規 module 内ガードの
+# 二段へ置換（hub/derivation_models.py の fix3 節参照）。
 
 
 class TestSingleRootDbLevel(_DbMixin):
@@ -486,6 +477,23 @@ class TestHcdChainGuards(_DbMixin):
         run_id = self._insert_run()
         with self.assertRaises(ChainIntegrityError):
             self._decide(derivation_run_id=run_id, supersedes_decision_id=88888)
+
+    def test_second_root_decision_rejected(self):
+        # fix3 H04: 同一 run の root decision 一意性（repo 検査＋DB 部分ユニーク）
+        from hub.derivation_models import ChainIntegrityError
+        run_id = self._insert_run()
+        self._decide(derivation_run_id=run_id)
+        with self.assertRaises(ChainIntegrityError):     # repo 層
+            self._decide(derivation_run_id=run_id)
+
+        async def _core_second_root():                   # repo 迂回でも DB が遮断
+            async with db.session_scope() as s:
+                await s.execute(sa.insert(HeirConfirmationDecision.__table__).values(
+                    derivation_run_id=run_id, decision="held", decided_by="b",
+                    decided_at=datetime.now(timezone.utc)))
+        with self.assertRaises(IntegrityError):
+            _run(_core_second_root())
+        db.reset_for_tests()
 
 
 if __name__ == "__main__":

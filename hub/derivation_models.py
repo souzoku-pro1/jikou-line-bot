@@ -98,6 +98,11 @@ class HeirConfirmationDecision(DerivationBase):
             "supersedes_decision_id IS NULL OR supersedes_decision_id != id",
             name="ck_heir_decision_no_self_supersede"),
         sa.UniqueConstraint("supersedes_decision_id", name="uq_heir_decision_supersedes"),
+        # fix3 H04: 同一 run の root decision（supersedes 無し）は 1 行のみ
+        # （run 側 single-root と同型・decision 連鎖も単一 root からの一本鎖になる）
+        sa.Index("uq_heir_decision_single_root", "derivation_run_id", unique=True,
+                 sqlite_where=sa.text("supersedes_decision_id IS NULL"),
+                 postgresql_where=sa.text("supersedes_decision_id IS NULL")),
     )
 
     id: Mapped[int] = mapped_column(_BigIntPK, primary_key=True, autoincrement=True)
@@ -167,29 +172,104 @@ _RESULT_TOP_KEYS = frozenset({"heirs", "facts"})
 _RESULT_HEIR_KEYS = frozenset({"person_id", "share", "relation_key"})
 _LAWYER_FLAGS_KEYS = frozenset({"flags"})
 
-# ── fix2 H01: field 別 grammar/enum（自由文字列 field を残さない・司令塔裁定） ──
-# person_id: App34 kintone `$id`（実装 heir_derivation.py:122 `record_id=v("$id")`＝数字列）
+# ── fix2 H01→fix3 改訂: field 別 grammar/enum（自由文字列 field を残さない） ──
+# person_id（fix3 H01: 実導出の全形式を明示列挙・自由文字列化しない）:
+#   (a) App34 kintone `$id`（heir_derivation.py:122 `record_id=v("$id")`＝数字列）
+#   (b) 胎児合成 ID（heir_derivation.py:406-412 `record_id=f"胎児:{label}"`・
+#       label は Declarations.fetuses の表示ラベル＝役割語）
 _PERSON_ID_RE = re.compile(r"^[0-9]{1,10}$")
+_FETUS_ID_RE = re.compile(r"^胎児:[^\r\n\"]{1,20}$")
 # share: 分数の固定文法のみ（engine は Fraction。全部相続は "1/1"）
-_SHARE_RE = re.compile(r"^[0-9]{1,4}/[1-9][0-9]{0,3}$")
-# relation_key: ASCII enum。正本は zokugara を日本語で持つが payload は ASCII キーに限定。
-# 【最小集合】正本に ASCII enum の定義が無いため heir_derivation の zokugara 区分から
-# 最小で定義した。拡張手順: 正本 §3.5 への追記（司令塔裁定）と同時に本集合へ追加する。
+_SHARE_RE = re.compile(r"^[0-9]{1,6}/[1-9][0-9]{0,5}$")
+# relation_key: ASCII enum（zokugara 9 区分の写像・_ZOKUGARA_TO_RELATION が単一の正）
 _RELATION_KEYS = frozenset({
-    "spouse", "child", "lineal_ascendant", "sibling", "representative",
-    "successive"})
-# facts: 条文キー enum のみ。heir_derivation.py が用いる根拠条文（basis）17 種の
-# ASCII 写像（民法890条→minpo_890 等）。拡張手順は relation_key と同じ。
-_FACT_KEYS = frozenset({
-    "minpo_32_2", "minpo_886", "minpo_887_1", "minpo_887_2", "minpo_887_3",
-    "minpo_889_1_1", "minpo_889_1_2", "minpo_889_2", "minpo_890", "minpo_891",
-    "minpo_896", "minpo_900_1", "minpo_900_2", "minpo_900_3",
-    "minpo_900_4_proviso", "minpo_901", "minpo_939"})
-# lawyer_flags.flags: ASCII enum（engine ctx["flags"] の日本語文は保存しない）。
-# 【最小集合・拡張手順は上と同じ】
-_LAWYER_FLAG_KEYS = frozenset({
-    "adoption_kind_unknown", "alive_unknown", "blood_type_unknown",
-    "renounce_review", "provisional"})
+    "spouse", "child", "fetus", "lineal_ascendant", "sibling",
+    "representative", "successive"})
+# facts: 条文キー enum のみ。heir_derivation.py が用いる根拠条文 17 種の
+# ASCII 写像（_BASIS_TO_FACT が単一の正）。拡張は正本改定と同時。
+_BASIS_TO_FACT = {
+    "民法32条の2": "minpo_32_2", "民法886条": "minpo_886",
+    "民法887条1項": "minpo_887_1", "民法887条2項": "minpo_887_2",
+    "民法887条3項": "minpo_887_3", "民法889条1項1号": "minpo_889_1_1",
+    "民法889条1項2号": "minpo_889_1_2", "民法889条2項": "minpo_889_2",
+    "民法890条": "minpo_890", "民法891条": "minpo_891", "民法896条": "minpo_896",
+    "民法900条1号": "minpo_900_1", "民法900条2号": "minpo_900_2",
+    "民法900条3号": "minpo_900_3", "民法900条4号但書": "minpo_900_4_proviso",
+    "民法901条": "minpo_901", "民法939条": "minpo_939",
+}
+_FACT_KEYS = frozenset(_BASIS_TO_FACT.values())
+# lawyer_flags.flags（fix3 M01: 実導出の全 flag 種と全数一致・provisional へ潰さない）:
+#   英数コード F1〜F5/C5/D5/E4/E5（heir_derivation の flag リテラル全数）＋
+#   日本語 flag 3 種の ASCII 写像（_FLAG_TO_KEY が単一の正）
+_FLAG_TO_KEY = {
+    "同時死亡推定": "simultaneous_death",
+    "数次相続": "successive_inheritance",
+    "数次": "successive_hold",
+}
+_FLAG_CODE_RE = re.compile(r"^[A-Z][0-9]$")
+_LAWYER_FLAG_KEYS = frozenset(
+    {"F1", "F2", "F3", "F4", "F5", "F6", "C5", "D5", "E4", "E5"}
+    | set(_FLAG_TO_KEY.values()))
+# zokugara（App36 続柄区分・heir_derivation の生成 9 区分）→ relation_key
+_ZOKUGARA_TO_RELATION = {
+    "配偶者": "spouse", "子": "child", "胎児": "fetus",
+    "孫（代襲）": "representative", "甥姪（代襲）": "representative",
+    "再代襲（曾孫等）": "representative",
+    "直系尊属": "lineal_ascendant", "兄弟姉妹": "sibling",
+}
+
+
+def flag_key(flag) -> str:
+    """導出器の flag（日本語含む）→ ASCII enum への単一変換（fix3 M01）。"""
+    if flag in _FLAG_TO_KEY:
+        return _FLAG_TO_KEY[flag]
+    if isinstance(flag, str) and _FLAG_CODE_RE.fullmatch(flag):
+        return flag
+    raise PayloadPolicyError("未知の lawyer flag: 写像に無い（拡張は正本改定と同時）")
+
+
+def fact_key(basis: str) -> str:
+    """導出器の根拠条文（日本語）→ 条文キー enum への単一変換（fix3 M01）。"""
+    try:
+        return _BASIS_TO_FACT[basis]
+    except KeyError:
+        raise PayloadPolicyError("未知の根拠条文: 写像に無い（拡張は正本改定と同時）")
+
+
+def relation_key_of(zokugara) -> str:
+    """zokugara → relation_key の単一変換。数次承継（No.… の …）は前方一致。"""
+    if isinstance(zokugara, str) and zokugara.startswith("数次承継"):
+        return "successive"
+    try:
+        return _ZOKUGARA_TO_RELATION[zokugara]
+    except (KeyError, TypeError):
+        raise PayloadPolicyError("未知の zokugara: 写像に無い（拡張は正本改定と同時）")
+
+
+def build_run_payload(derivation) -> tuple[dict, dict | None]:
+    """Derivation（heir_derivation.derive_heirs の結果）→ §3.5 準拠 payload への
+    単一変換（fix3 接続点）。氏名・日本語文はここで**落ちる**（保存されるのは
+    person_id/share/relation_key/条文キー/flag コードのみ）。"""
+    heirs = []
+    facts: list[str] = []
+    for h in derivation.heirs:
+        entry = {"person_id": h.person_id,
+                 "relation_key": relation_key_of(h.zokugara)}
+        if h.share is not None:
+            entry["share"] = f"{h.share.numerator}/{h.share.denominator}"
+        heirs.append(entry)
+        for b in h.basis:
+            k = fact_key(b)
+            if k not in facts:
+                facts.append(k)
+    payload = {"heirs": heirs, "facts": facts}
+    flag_keys: list[str] = []
+    for f in derivation.flags:
+        k = flag_key(f.get("flag", "") if isinstance(f, dict) else f)
+        if k not in flag_keys:
+            flag_keys.append(k)
+    lawyer_flags = {"flags": flag_keys} if flag_keys else None
+    return payload, lawyer_flags
 
 
 def _check_enum(value, allowed: frozenset, where: str) -> None:
@@ -219,7 +299,12 @@ def validate_result_payload(payload) -> None:
         if extra:
             raise PayloadPolicyError(
                 f"result_payload.heirs[*]: 許可キー外 {sorted(extra)}（person_id 系のみ）")
-        _check_re(h.get("person_id"), _PERSON_ID_RE, "result_payload.heirs[*].person_id")
+        pid = h.get("person_id")
+        if not isinstance(pid, str) or not (_PERSON_ID_RE.fullmatch(pid)
+                                            or _FETUS_ID_RE.fullmatch(pid)):
+            raise PayloadPolicyError(
+                "result_payload.heirs[*].person_id: App34 $id（数字列）または"
+                "胎児合成 ID（胎児:ラベル）のみ（fix3 H01・形式明示列挙）")
         if "share" in h:
             _check_re(h["share"], _SHARE_RE, "result_payload.heirs[*].share")
         if "relation_key" in h:
@@ -307,22 +392,21 @@ async def create_derivation_run(**fields) -> int:
 
 
 # ══════════════════════════════════════════════════════════════
-# fix2 H02: 入口保証の層別整理と既知の限界（司令塔裁定: DB 層を正とする）
+# fix2 H02→fix3 改定裁定: 入口保証の層別整理（Core 迂回は AST 機械検査で防御）
 # ══════════════════════════════════════════════════════════════
-# 三段の担保:
+# 【fix3 改定裁定（司令塔）】旧「受容ライン (a)(b)」は撤回。Core 迂回の防御は
+# **AST 機械検査**を採用する:
 #   (1) DB 制約（正）  — CHECK（status/rank/自己参照）・UNIQUE（supersede 連鎖）・
-#       部分ユニーク（single root＝並行初回作成も遮断）・immutable trigger
+#       部分ユニーク（single root＝run/decision とも・並行初回作成も遮断）・immutable trigger
 #   (2) repository 検査 — create_derivation_run/create_heir_decision（grammar/enum・
-#       cross-case・head 検査）
-#   (3) 「Core INSERT は正規経路外」 — 本 module の関数以外からの INSERT は運用規律違反
-# 【既知の限界（Codex 次巡へ受容可否を問う）】:
-#   - JSON payload の grammar/enum 検査（result_payload/lawyer_flags の中身）は
-#     SQLite/PG の trigger では実用的に表現できず **DB 層へ下ろせていない**。
-#     SQLAlchemy にも Core INSERT を横取りする table レベル event は存在しない
-#     （before_insert は ORM mapper event・fix2 で適用可否を検証済み）。
-#     したがって **Core INSERT は payload 検査を迂回できる**（現状挙動を
-#     test_p3_001 の pin テストで固定・将来 trigger 化する場合はそのテストを反転させる）。
-#   - cross-case supersede も同様に repository 層のみ（FK は行存在のみ検証）。
+#       cross-case/cross-run・head/root 検査）
+#   (3) AST 機械検査 — test_p3_core_ast_policy が git 追跡 *.py 全域を走査し、
+#       対象 table（derivation_run/heir_confirmation_decision/template_version）への
+#       sa.insert/sa.update/sa.delete を正規 module・migration・当該テスト以外で機械禁止
+#       （旧「迂回成功の pin テスト」は脆弱性目録になるため削除・Codex 判定採用）。
+# JSON payload の trigger 化が SQLite/PG で実用不能である事実、および SQLAlchemy に
+# table レベル Core insert event が無い事実は fix2 の検証どおり（AST 検査がその代替）。
+# PG 並行実測はデプロイ前推奨回帰として追跡（受容・Codex 同意）。
 
 
 async def create_heir_decision(**fields) -> int:
@@ -357,5 +441,15 @@ async def create_heir_decision(**fields) -> int:
             if already is not None:
                 raise ChainIntegrityError(
                     f"decision {sup} は既に supersede 済み（最新 decision のみ置換可）")
+        else:
+            # fix3 H04: 同一 run の root decision は 1 行のみ（DB 部分ユニークと重畳）
+            root = (await s.execute(
+                sa.select(t.c.id)
+                .where(t.c.derivation_run_id == run_id,
+                       t.c.supersedes_decision_id.is_(None)).limit(1))).first()
+            if root is not None:
+                raise ChainIntegrityError(
+                    "同一 run に root decision が既に存在（訂正は supersedes_decision_id "
+                    "で最新 decision を指すこと）")
         r = await s.execute(sa.insert(t).values(**fields))
         return r.inserted_primary_key[0]
