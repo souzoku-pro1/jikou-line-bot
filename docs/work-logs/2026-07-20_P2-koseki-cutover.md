@@ -5,6 +5,7 @@
 - 対象 lane: **koseki（lane2・`/koseki/ingest`）**。sortation（lane1）は S5 で完了済み。
   registry/bank/valuation（lane3 以降）は未着手・SIGNED_LANES false のまま。
 - ステータス: **D-3 相当まで成立（7/20）**。D-4/D-5 相当は 7/22 の回で判断（§6）。
+  **INC-0720（SEV-3・lane1 一時 404・7/20 中に復旧済み）あり**（§INC-0720）。
 
 ## 1. 概要（Railway 側）
 
@@ -22,14 +23,18 @@
 - gas_builder 不変条件の**契約改定（司令塔裁定）**: 旧「GAS allowlist＝サーバ Form 1:1
   （dual-accept 期の characterization）」→ 新「**GAS allowlist ⊆ サーバ Form**。koseki は
   2 キー送信契約・サーバ側 `Form(default=None)` は受入互換のため無変更」。
-- テスト: 全 suite **1474 passed・skip 0**（triage 1 FAIL 既知のみ）。負系（署名欠落/期限外/
+- テスト: **`python -m pytest -q` 全実行で 1 failed（`test_triage_classification::
+  test_classification_accuracy`＝既知）＋ 1474 passed・skip 0**。負系（署名欠落/期限外/
   nonce 再使用/body 改変/unknown key ID）・legacy 併存維持・2 キー byte パリティ（#140 整合版）・
   2 キー契約強制（throw×2・順序含め完全一致・sortation no-op 回帰）を固定。
 
 ## 3. live GAS 反映（7/20・[人]）
 
-- `rv04c_signing` を **merged main 版（`82ac42a` の `gas/rv04c_signing.js`・
-  `SIGNED_LANES['/koseki/ingest']: true`）へ全置換**。
+- `rv04c_signing` を merged main 版（`82ac42a` の `gas/rv04c_signing.js`・
+  `SIGNED_LANES['/koseki/ingest']: true`）へ**全置換した。この全置換により repo 値
+  `sortation=false` が live の `true` を上書きし、lane1 が legacy 経路へ回帰
+  （サーバは legacy 停止済み＝`SERVICE_AUTH_LEGACY_DISABLED_PATHS=/sortation/ingest`）
+  → 404**（→ §INC-0720。7/20 中に復旧済み）。
 - 戸籍読解ブロック（ブロック②）を **`rv04cIngestFetch_` 置換**: parts は 2 キー
   （`file`=bytes＋filename＋contentType／`drive_file_id`=utf8Bytes_）・`legacyToken` は
   既存定数 `KOSEKI_TOKEN`・`legacyPayload` は現行送信と同一（dispatcher 契約
@@ -59,3 +64,33 @@
 - (ii) **D-5 相当**: `SERVICE_AUTH_LEGACY_DISABLED_PATHS` へ `/koseki/ingest` 追記
   （順序は checklist §5.1 準拠・server→credential→GAS の逆順禁止）。
 - (iii) sortation 残置(i)（`SORTATION_INGEST_TOKEN` 削除・7/22 予定）と**同回に合流**。
+
+## INC-0720（SEV-3）: 全置換による lane1 SIGNED_LANES 巻き戻し → 一時 404
+
+- **経緯**: 7/20 `rv04c_signing` 全置換（17 時台）→ Codex **R-P2-KOSEKI-LOG-1 が
+  P2KL-H01 として巻き戻し経路を机上検出**（repo/live 差分の推論）→ [人] が Railway 実見で
+  **POST `/sortation/ingest` 404 連続を確認**（7/20）→ live の
+  `SIGNED_LANES['/sortation/ingest']` を `true` へ **1 行修正** → トリガー跨ぎ後
+  **200 復帰を [人] 実見**。
+- **実害**: 仕分け遅延のみ。「200 以外リネームせず自然リトライ」設計により、対象ファイルは
+  未整理フォルダ残留 → 復旧後自動再送（**404 件数 ≠ ファイル件数**）。
+  顧客 LINE 経路・データへの影響なし。
+- **検出者**: Codex（机上・repo/live 差分の推論）。**司令塔検収の見落とし**（S4-5 の lane1
+  切替が live 直編集だった事実と「全置換」指示の矛盾）が原因。
+- **live 最終行列（7/20 復旧後・[人]実見の一次記録・P2KL-H01 の要求）**:
+
+  | lane | SIGNED_LANES |
+  |---|---|
+  | `/sortation/ingest` | **true** |
+  | `/koseki/ingest` | **true** |
+  | `/registry/ingest` | false |
+  | `/bank/ingest` | false |
+  | `/valuation/ingest` | false |
+
+## 7. 再発防止規律（INC-0720 起点）
+
+- (i) GAS への repo 写し反映は**「全置換」を禁止**する。反映指示には必ず **SIGNED_LANES
+  全 5 lane の期待行列を明記**し、反映後に [人] が live の行列を**読み合わせる**。
+- (ii) live 直編集で切替済みの lane がある間は、**repo 側 SIGNED_LANES を live 実態に
+  同期させる PR を cutover work-log と同時に出す**（repo/live drift の恒久解消）。
+
