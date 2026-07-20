@@ -45,10 +45,10 @@ class TestSignedLanesKosekiOn(unittest.TestCase):
         self.assertIsNotNone(block, "SIGNED_LANES 定義が見つからない")
         found = dict(re.findall(r"'(/[a-z/]+/ingest)':\s*(true|false)", block.group(1)))
         self.assertEqual(found, {
-            "/koseki/ingest": "true",      # lane2: 本票で切替
+            "/koseki/ingest": "true",      # lane2: P2-CHAIN-001 で切替
             "/registry/ingest": "false",   # lane3 以降は据え置き
             "/bank/ingest": "false",
-            "/sortation/ingest": "false",  # lane1 は live GAS 側で点火済み（repo 基準値は不変）
+            "/sortation/ingest": "true",   # lane1: INC-0720 §7(ii) live 実態同期（S4-5 点火済み）
             "/valuation/ingest": "false",
         })
 

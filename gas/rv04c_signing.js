@@ -33,7 +33,7 @@ var SIGNED_LANES = {
   '/koseki/ingest': true,   // P2-CHAIN-001: lane2 切替（parts は file/drive_file_id の 2 キーのみ）
   '/registry/ingest': false,
   '/bank/ingest': false,
-  '/sortation/ingest': false,
+  '/sortation/ingest': true,  // INC-0720 §7(ii): live 実態同期（lane1 は S4-5 で点火済み・drift 恒久解消）
   '/valuation/ingest': false
 };
 
