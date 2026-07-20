@@ -22,6 +22,7 @@ from hub.inbound_event import Base  # noqa: E402（ORM metadata の起点・P1-0
 from hub.notify_heartbeat import metadata as heartbeat_metadata  # noqa: E402（P1-102・M05）
 from hub.service_auth import metadata as service_auth_metadata  # noqa: E402（RV-04a・nonce store）
 from hub.ingestion_receipt import metadata as ingestion_receipt_metadata  # noqa: E402（RV-05-13）
+from hub.derivation_models import DerivationBase  # noqa: E402（P3-001・app-state 別 metadata）
 
 config = context.config
 
@@ -31,7 +32,7 @@ if config.config_file_name is not None:
 # autogenerate 用の統合 metadata（P1-007b 裁定=用途別の別 metadata を list で統合）。
 # 新しい app-state モデル群はそれぞれの metadata をこの list に加えること。
 target_metadata = [Base.metadata, heartbeat_metadata, service_auth_metadata,
-                   ingestion_receipt_metadata]
+                   ingestion_receipt_metadata, DerivationBase.metadata]
 
 
 def run_migrations_offline() -> None:
