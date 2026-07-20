@@ -64,7 +64,7 @@ def upgrade() -> None:
 def downgrade() -> None:
     dialect = op.get_bind().dialect.name
     if dialect == "sqlite":
-        for trg in ("frozen", "no_delete", "draft_only", "status_flow", "approved_once"):
+        for trg in ("frozen", "no_delete", "draft_only", "status_flow", "approve_gate"):
             op.execute(f"DROP TRIGGER IF EXISTS trg_template_version_{trg}")
     elif dialect == "postgresql":
         for trg in ("frozen", "no_delete", "draft_only"):

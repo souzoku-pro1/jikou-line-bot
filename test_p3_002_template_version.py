@@ -112,10 +112,13 @@ class TestCrudAndSingleActive(_DbMixin):
         self._activate(pk1)
 
         async def _force_second_active():
+            # fix2 approve_gate を満たす形で強行（部分ユニークが最後の砦であることの検証）
             async with db.session_scope() as s:
                 await s.execute(sa.update(TemplateVersion.__table__)
                                 .where(TemplateVersion.__table__.c.version == "1.1.0")
-                                .values(status="active"))
+                                .values(status="active", approved_by="attorney-x",
+                                        approved_at=sa.func.now(),
+                                        activated_at=sa.func.now()))
         with self.assertRaises(IntegrityError):        # 部分ユニークが DB レベルで遮断
             _run(_force_second_active())
         db.reset_for_tests()
@@ -361,6 +364,123 @@ class TestGeneratorVersion(_DbMixin):
                 await s.execute(sa.update(TemplateVersion.__table__)
                                 .where(TemplateVersion.__table__.c.id == pk)
                                 .values(generator_version="gen-2"))
+        with self.assertRaises((IntegrityError, OperationalError)):
+            _run(_upd())
+        db.reset_for_tests()
+
+
+# ── fix2(P3002-2-H01/H02/M01) 追加テスト ─────────────────────────────────────
+class TestApprovalGate(_DbMixin):
+    """H01/H02: 承認なし active の DB 層拒否・approved_* の厳密化。
+    並行 activate の実測は SQLite。PostgreSQL 実機の並行実測は未実施（既知・docstring 参照）。"""
+
+    def test_active_without_approval_rejected(self):
+        pk = self._create()
+
+        async def _upd(**vals):
+            async with db.session_scope() as s:
+                await s.execute(sa.update(TemplateVersion.__table__)
+                                .where(TemplateVersion.__table__.c.id == pk)
+                                .values(**vals))
+        # 承認情報なしの draft→active
+        with self.assertRaises((IntegrityError, OperationalError)):
+            _run(_upd(status="active", activated_at=sa.func.now()))
+        db.reset_for_tests()
+        # 空文字 approved_by
+        with self.assertRaises((IntegrityError, OperationalError)):
+            _run(_upd(status="active", approved_by="", approved_at=sa.func.now(),
+                      activated_at=sa.func.now()))
+        db.reset_for_tests()
+        # 片側のみ（approved_at 欠落）
+        with self.assertRaises((IntegrityError, OperationalError)):
+            _run(_upd(status="active", approved_by="attorney-1",
+                      activated_at=sa.func.now()))
+        db.reset_for_tests()
+
+    def test_preset_approved_in_draft_rejected(self):
+        pk = self._create()
+
+        async def _upd():
+            async with db.session_scope() as s:
+                await s.execute(sa.update(TemplateVersion.__table__)
+                                .where(TemplateVersion.__table__.c.id == pk)
+                                .values(approved_by="early-bird",
+                                        approved_at=sa.func.now()))   # status は draft のまま
+        with self.assertRaises((IntegrityError, OperationalError)):
+            _run(_upd())
+        db.reset_for_tests()
+
+    def test_repo_rejects_preset_and_empty_approver(self):
+        with self.assertRaises(ValueError):
+            _run(create_template_version(**_fields(approved_by="early")))
+        db.reset_for_tests()
+        pk = self._create()
+        with self.assertRaises(ValueError):
+            _run(activate(pk, "  "))          # 空白のみの承認者
+        db.reset_for_tests()
+
+    def test_insert_with_lifecycle_values_rejected_by_trigger(self):
+        async def _ins():
+            async with db.session_scope() as s:
+                await s.execute(sa.insert(TemplateVersion.__table__).values(
+                    **_fields(status="draft"), approved_by="x",
+                    approved_at=sa.func.now()))
+        with self.assertRaises((IntegrityError, OperationalError)):
+            _run(_ins())
+        db.reset_for_tests()
+
+
+class TestRetiredAtRequired(_DbMixin):
+    """M01: →retired 遷移に retired_at 必須。"""
+
+    def test_active_to_retired_without_retired_at_rejected(self):
+        pk = self._create()
+        self._activate(pk)
+
+        async def _retire_bare():
+            async with db.session_scope() as s:
+                await s.execute(sa.update(TemplateVersion.__table__)
+                                .where(TemplateVersion.__table__.c.id == pk)
+                                .values(status="retired"))
+        with self.assertRaises((IntegrityError, OperationalError)):
+            _run(_retire_bare())
+        db.reset_for_tests()
+
+    def test_draft_to_retired_without_retired_at_rejected(self):
+        pk = self._create()
+
+        async def _retire_bare():
+            async with db.session_scope() as s:
+                await s.execute(sa.update(TemplateVersion.__table__)
+                                .where(TemplateVersion.__table__.c.id == pk)
+                                .values(status="retired"))
+        with self.assertRaises((IntegrityError, OperationalError)):
+            _run(_retire_bare())
+        db.reset_for_tests()
+
+    def test_draft_to_retired_with_retired_at_ok(self):
+        pk = self._create()
+
+        async def _retire():
+            async with db.session_scope() as s:
+                await s.execute(sa.update(TemplateVersion.__table__)
+                                .where(TemplateVersion.__table__.c.id == pk)
+                                .values(status="retired", retired_at=sa.func.now()))
+        _run(_retire())
+        db.reset_for_tests()
+
+
+class TestPurposeStrictFrozen(_DbMixin):
+    """M01: purpose の NULL↔空文字も frozen 違反として検出（IS NOT 厳密比較）。"""
+
+    def test_purpose_null_to_empty_rejected(self):
+        pk = self._create(purpose=None)
+
+        async def _upd():
+            async with db.session_scope() as s:
+                await s.execute(sa.update(TemplateVersion.__table__)
+                                .where(TemplateVersion.__table__.c.id == pk)
+                                .values(purpose=""))
         with self.assertRaises((IntegrityError, OperationalError)):
             _run(_upd())
         db.reset_for_tests()

@@ -105,23 +105,58 @@ sa.event.listen(TemplateVersion, "before_delete", _reject_delete)
 # ── DB 層 trigger（create_all／migration 共用の単一ソース） ──────────────────
 
 def template_trigger_ddl() -> dict[str, list[str]]:
-    """内容列 UPDATE 拒否＋DELETE 全面拒否の dialect 別 DDL。"""
+    """内容列 UPDATE 拒否＋DELETE 全面拒否＋承認ゲートの dialect 別 DDL。
+
+    fix2（P3002-2）:
+    - H01: draft→active には approved_by（非 NULL・非空）・approved_at・activated_at を必須化
+    - H02: status='draft' の間 approved_* は NULL のまま（非 NULL 化は active 遷移と同時のみ）・
+      空文字拒否・片側のみ設定拒否（INSERT 側も lifecycle 列 NULL を強制）
+    - M01: →retired 遷移に retired_at 必須。frozen 比較は `IS NOT`（NULL↔空文字も検出・
+      purpose の厳密化）
+    ※ 並行 activate の実測は SQLite（テスト）。PostgreSQL 実機の並行実測は未実施（既知）。
+    """
     sqlite_when = " OR ".join(
-        f"IFNULL(OLD.{c}, '') IS NOT IFNULL(NEW.{c}, '')" for c in _FROZEN_COLUMNS)
+        f"OLD.{c} IS NOT NEW.{c}" for c in _FROZEN_COLUMNS)
     pg_when = " OR ".join(
         f"OLD.{c} IS DISTINCT FROM NEW.{c}" for c in _FROZEN_COLUMNS)
-    # fix1 H01: status の遷移条件も trigger で制約（同値/draft→active/draft→retired/
-    # active→retired のみ許可）。fix1 M01: approved_* は一度設定されたら書換不可。
-    sqlite_flow = ("NOT ((OLD.status = NEW.status) OR "
-                   "(OLD.status = 'draft' AND NEW.status IN ('active', 'retired')) OR "
-                   "(OLD.status = 'active' AND NEW.status = 'retired'))")
-    pg_flow = ("NOT ((OLD.status = NEW.status) OR "
-               "(OLD.status = 'draft' AND NEW.status IN ('active', 'retired')) OR "
-               "(OLD.status = 'active' AND NEW.status = 'retired'))")
-    sqlite_appr = ("(OLD.approved_by IS NOT NULL AND OLD.approved_by IS NOT NEW.approved_by) "
-                   "OR (OLD.approved_at IS NOT NULL AND OLD.approved_at IS NOT NEW.approved_at)")
-    pg_appr = ("(OLD.approved_by IS NOT NULL AND OLD.approved_by IS DISTINCT FROM NEW.approved_by) "
-               "OR (OLD.approved_at IS NOT NULL AND OLD.approved_at IS DISTINCT FROM NEW.approved_at)")
+    # fix1 H01: status の遷移条件（同値/draft→active/draft→retired/active→retired のみ）
+    flow = ("NOT ((OLD.status = NEW.status) OR "
+            "(OLD.status = 'draft' AND NEW.status IN ('active', 'retired')) OR "
+            "(OLD.status = 'active' AND NEW.status = 'retired'))")
+    # fix2 承認ゲート（UPDATE 用・両 dialect 共通の条件を dialect 構文で表現）
+    sqlite_gate = (
+        # H01: 承認なし active の拒否
+        "(OLD.status = 'draft' AND NEW.status = 'active' AND ("
+        "NEW.approved_by IS NULL OR NEW.approved_by = '' OR "
+        "NEW.approved_at IS NULL OR NEW.activated_at IS NULL)) OR "
+        # H02: draft のままの事前設定禁止
+        "(NEW.status = 'draft' AND (NEW.approved_by IS NOT NULL OR "
+        "NEW.approved_at IS NOT NULL)) OR "
+        # M01(fix1 継承): write-once
+        "(OLD.approved_by IS NOT NULL AND OLD.approved_by IS NOT NEW.approved_by) OR "
+        "(OLD.approved_at IS NOT NULL AND OLD.approved_at IS NOT NEW.approved_at) OR "
+        # H02: 空文字・片側のみ禁止
+        "(NEW.approved_by = '') OR "
+        "((NEW.approved_by IS NULL) <> (NEW.approved_at IS NULL)) OR "
+        # M01: retired 遷移に retired_at 必須
+        "(OLD.status IN ('draft', 'active') AND NEW.status = 'retired' "
+        "AND NEW.retired_at IS NULL)")
+    pg_gate = (
+        "(OLD.status = 'draft' AND NEW.status = 'active' AND ("
+        "NEW.approved_by IS NULL OR NEW.approved_by = '' OR "
+        "NEW.approved_at IS NULL OR NEW.activated_at IS NULL)) OR "
+        "(NEW.status = 'draft' AND (NEW.approved_by IS NOT NULL OR "
+        "NEW.approved_at IS NOT NULL)) OR "
+        "(OLD.approved_by IS NOT NULL AND OLD.approved_by IS DISTINCT FROM NEW.approved_by) OR "
+        "(OLD.approved_at IS NOT NULL AND OLD.approved_at IS DISTINCT FROM NEW.approved_at) OR "
+        "(NEW.approved_by = '') OR "
+        "((NEW.approved_by IS NULL) <> (NEW.approved_at IS NULL)) OR "
+        "(OLD.status IN ('draft', 'active') AND NEW.status = 'retired' "
+        "AND NEW.retired_at IS NULL)")
+    # fix2 H02: INSERT は draft かつ lifecycle 列すべて NULL
+    insert_bad = ("NEW.status != 'draft' OR NEW.approved_by IS NOT NULL OR "
+                  "NEW.approved_at IS NOT NULL OR NEW.activated_at IS NOT NULL OR "
+                  "NEW.retired_at IS NOT NULL")
     return {
         "sqlite": [
             "CREATE TRIGGER trg_template_version_frozen BEFORE UPDATE ON template_version "
@@ -130,23 +165,23 @@ def template_trigger_ddl() -> dict[str, list[str]]:
             "CREATE TRIGGER trg_template_version_no_delete BEFORE DELETE ON template_version "
             "BEGIN SELECT RAISE(ABORT, 'template_version is append-only'); END",
             "CREATE TRIGGER trg_template_version_draft_only BEFORE INSERT ON template_version "
-            "FOR EACH ROW WHEN NEW.status != 'draft' "
-            "BEGIN SELECT RAISE(ABORT, 'template_version must be created as draft'); END",
+            f"FOR EACH ROW WHEN {insert_bad} "
+            "BEGIN SELECT RAISE(ABORT, 'template_version must be created as plain draft'); END",
             "CREATE TRIGGER trg_template_version_status_flow BEFORE UPDATE ON template_version "
-            f"FOR EACH ROW WHEN {sqlite_flow} "
+            f"FOR EACH ROW WHEN {flow} "
             "BEGIN SELECT RAISE(ABORT, 'template_version invalid status transition'); END",
-            "CREATE TRIGGER trg_template_version_approved_once BEFORE UPDATE ON template_version "
-            f"FOR EACH ROW WHEN {sqlite_appr} "
-            "BEGIN SELECT RAISE(ABORT, 'template_version approved_* is write-once'); END",
+            "CREATE TRIGGER trg_template_version_approve_gate BEFORE UPDATE ON template_version "
+            f"FOR EACH ROW WHEN {sqlite_gate} "
+            "BEGIN SELECT RAISE(ABORT, 'template_version approval gate violation'); END",
         ],
         "postgresql": [
             "CREATE OR REPLACE FUNCTION template_version_frozen() RETURNS trigger AS $$ "
             f"BEGIN IF {pg_when} THEN "
             "RAISE EXCEPTION 'template_version content is immutable'; END IF; "
-            f"IF {pg_flow} THEN "
+            f"IF {flow} THEN "
             "RAISE EXCEPTION 'template_version invalid status transition'; END IF; "
-            f"IF {pg_appr} THEN "
-            "RAISE EXCEPTION 'template_version approved_* is write-once'; END IF; "
+            f"IF {pg_gate} THEN "
+            "RAISE EXCEPTION 'template_version approval gate violation'; END IF; "
             "RETURN NEW; END; $$ LANGUAGE plpgsql",
             "CREATE TRIGGER trg_template_version_frozen BEFORE UPDATE ON template_version "
             "FOR EACH ROW EXECUTE FUNCTION template_version_frozen()",
@@ -156,8 +191,8 @@ def template_trigger_ddl() -> dict[str, list[str]]:
             "CREATE TRIGGER trg_template_version_no_delete BEFORE DELETE ON template_version "
             "FOR EACH ROW EXECUTE FUNCTION template_version_no_delete()",
             "CREATE OR REPLACE FUNCTION template_version_draft_only() RETURNS trigger AS $$ "
-            "BEGIN IF NEW.status != 'draft' THEN "
-            "RAISE EXCEPTION 'template_version must be created as draft'; END IF; "
+            f"BEGIN IF {insert_bad} THEN "
+            "RAISE EXCEPTION 'template_version must be created as plain draft'; END IF; "
             "RETURN NEW; END; $$ LANGUAGE plpgsql",
             "CREATE TRIGGER trg_template_version_draft_only BEFORE INSERT ON template_version "
             "FOR EACH ROW EXECUTE FUNCTION template_version_draft_only()",
@@ -186,6 +221,11 @@ async def create_template_version(**fields) -> int:
         raise ValueError(
             "create_template_version は status を受け付けない（常に draft 作成・"
             "active 化は activate() のみ）")
+    # fix2 H02: lifecycle 列の事前設定も受け付けない（draft は全て NULL・DB trigger と重畳）
+    for banned in ("approved_by", "approved_at", "activated_at", "retired_at"):
+        if fields.get(banned) is not None:
+            raise ValueError(f"create_template_version は {banned} を受け付けない"
+                             "（承認系は activate() 遷移時のみ設定される）")
     fields["status"] = "draft"
     async with session_scope() as s:
         r = await s.execute(sa.insert(TemplateVersion.__table__).values(**fields))
@@ -217,7 +257,11 @@ async def activate(version_id: int, approved_by: str) -> None:
       送出して **transaction 全体を rollback**（旧 active の retire も巻き戻る＝
       「active 0 件」状態を残さない）。事前 select は利便のための friendly check・
       整合性の正は rowcount 検査と部分ユニーク制約。
+    - fix2 H01: approved_by は非空文字列必須（DB approve_gate trigger と重畳）。
+      並行 activate の実測は SQLite（テスト）。PostgreSQL 実機での並行実測は未実施（既知）。
     """
+    if not isinstance(approved_by, str) or not approved_by.strip():
+        raise ValueError("approved_by（承認者）は非空文字列が必須")
     async with session_scope() as s:
         target = await _get_version_row(s, version_id)
         if target is None or target.status != "draft":
