@@ -27,6 +27,22 @@
     を 1 回叩き 403/課金エラーを problems へ。(b) sortation の縮退率（doc_type=不明の比率）を
     観測し閾値超で警報。いずれも別票・Phase 2 裁定。
 
+## 3.1 監視拡張の実装（2026-07-20・P2-CHAIN-008／fix1 2026-07-21・P2HC-H01）
+
+- §3 実装形 (a) を実装済み: `hub/health_deps.py`（既存 `/health` は無変更）。
+  **fix1 で probe 実行と結果参照を分離**（公開 GET を課金 API の実行器にしない＝
+  denial-of-wallet 経路の遮断・Codex 提案構造）:
+  - **`probe_deps_once()`**: Vision へ 1x1 ダミー annotate の軽量 probe
+    （タイムアウト既定 5 秒・env `HEALTH_DEPS_TIMEOUT_SECONDS`）を実行し、
+    結果を module 内キャッシュへ保存（timestamp 付き）。呼出し主体は内部ジョブ。
+    **daily_healthcheck からの結線は別票**（既存テストへの波及回避のため fix1 では
+    関数の提供までに留めた）。
+  - **`GET /health/deps`**: キャッシュされた**直近結果の参照のみ**（外部呼出しゼロ・
+    反復 GET でも Vision 呼出は増えない）。未 probe 時は `status: unknown` を 200 で返す。
+  - 403/到達不能/タイムアウトは **HTTP 200 のまま `status: degraded`**
+    （healthcheck 自体を落とさない・本教訓の反映）。応答・キャッシュに secret・内部 URL・
+    vendor 本文・例外本文は含めない（H02 流儀・分類はクラス名/HTTP status のみ）。
+
 ## 4. 位置づけ・未決
 
 - 本件は **billing 運用事象**であり、コード欠陥ではない（縮退は設計どおり安全側）。恒久策の主体は
