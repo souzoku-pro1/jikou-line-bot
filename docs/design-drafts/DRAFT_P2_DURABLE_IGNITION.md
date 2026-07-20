@@ -94,11 +94,14 @@ sortation_ingest.py:136: (_durable_enabled)  同上
   - (a) **[人]確認**: 本番 DB で inbound_event / ingestion_receipt / （claimed_at 列）の
     存在確認（alembic 適用実態）。
   - (b) **[人]確認**: `STRIPE_EVENT_JOURNAL_ENABLED` の live ON 実態（§2 の整合）。
-  - (c) **§3 経路 (A)＝滞留監視の実装・merge（fix2・唯一の必須ゲート）**。
+  - (c) **【fix3・P2DP3-M02】点火ゲート＝「滞留検査関数」と「daily_healthcheck 結線」の
+    両方が merge 済み**（司令塔裁定）。結線を別票に分けた場合は**両票完了まで点火不可**
+    （検査関数だけでは警報が発火しない＝ゲート未充足）。
     K4 は補助（あれば望ましいが点火条件ではない・§3）。
 - **手順案（fix2・(A) 単独前提へ改訂）**:
-  - **前段**: ①別票（§7・P2-CHAIN-012 想定）で received/processing 滞留監視を実装・
-    merge → ②以降は共通手順へ。
+  - **前段**: ①別票（§7・P2-CHAIN-012 想定）で received/processing 滞留監視の
+    **検査関数＋daily_healthcheck 結線の両方**を実装・merge（分票時は両票完了まで
+    進まない・fix3）→ ②以降は共通手順へ。
   - **共通手順**:
     1. [人] `INBOUND_EVENT_DURABLE_ENABLED` を ON → デプロイ緑。
     2. startup ログで `[RV05] startup reconcile` の出力を実見（[人]）。
@@ -109,20 +112,32 @@ sortation_ingest.py:136: (_durable_enabled)  同上
        滞留監視の警報 0 を確認。
 - **リスク**: (i) sortation H-04 の 5xx 化（自然リトライで回収・点火直後は観測強化）
   (ii) DB 到達不能時は durable 経路が fail 側（握らない設計）＝DB 障害が可視化される反面
-  5xx が増える (iii) received/stale の沈黙滞留（§3・前提条件 (A)/(B) はこの遮断のため）。
+  5xx が増える (iii) received/stale の沈黙滞留（§3・前提条件 (A) はこの遮断のため）。
 - **rollback**: env OFF（1 本）→ **即時に現行挙動と byte 同一**（M-06 で import すらしない）。
   - **【fix1・P2DP-M01】「記録済み行は残置で無害（読み手なし）」は撤回**。実態:
     `check_journal_backlog` は **provider != kintone で LINE 行も読み**、残置行が
     processing/failed のままだと **24 時間後に Stripe runbook 文言の警報**が
     （`STRIPE_EVENT_JOURNAL_ENABLED=1` なら）発火する＝「読み手なし」ではない。
   - rollback 手順に追加: **残置行の状態確認と閉鎖（[人]確認・fix2 で安全側へ定義）**:
-    - **received 行を根拠なく `done` へ更新することは禁止**（未処理イベントを処理済みに
-      偽装する誤閉鎖の危険。`done` は「処理が正常終端した」の記録であり、閉鎖の道具に
-      使わない）。
-    - **安全側の閉鎖手順**: (i) received 行の内容確認（[人]・payload から対象イベントを
-      特定）→ (ii) **実業務が別経路で処理済みと確認できた行のみ**手動で
-      `failed_exhausted` へ（理由をメモ列等に記録・列がなければ運用メモに event id を
-      記録）→ (iii) **確認不能な行は残置のまま監視対象として追跡**（無理に閉じない）。
+    - **received 行を根拠なく `done` へ更新することは禁止**。
+      **【fix3・P2DP3-M01 裁定】`done` は「照合源による根拠がある場合のみ許可」**へ変更
+      （管理終端の新 state は作らない＝migration 回避・裁定）。**`failed_exhausted` は
+      再試行打切り（attempts 上限）の意味に限定**し、管理閉鎖の代用にしない
+      （fix2 の「failed_exhausted へ手動遷移」は意味論の不整合として撤回）。
+    - **【fix3・P2DP3-H01】「payload から対象イベントを特定」は撤回**。実装事実:
+      Phase A は **raw payload を保存しない** — `hub/inbound_event.py` の保存列は
+      provider／external_event_id／caller_id／dedup_key／**payload_hash（SHA-256 のみ）**／
+      event_type／signature_result／received_at／state／processed_at／attempts／
+      last_error（分類のみ・本文/PII/vendor 生値なし）／claimed_at で、payload 本文の列は
+      存在しない（`hub/durable_inbound.py` 冒頭「PII/本文/payload 非混入」・
+      work-log 2026-07-15_RV-05-13-fix5 の D17/RCF-M05 流儀とも整合）。
+    - **照合源は「実在するもののみ」（裁定）**: `external_event_id`（LINE
+      webhookEventId）・既存の構造化ログ・LINE 側の配信記録等。
+      **照合源が存在しない場合は「確認不能として残置」が唯一の扱い**。
+    - **安全側の閉鎖手順（fix3 改訂）**: (i) received 行の `external_event_id` 等を上記
+      照合源と突合（[人]）→ (ii) **照合源で正常処理済みを証明できた行のみ**手動で
+      `done` へ（[人]個別判断・理由を運用メモに event id とともに記録）→
+      (iii) **証明できない行は残置のまま監視対象として追跡**（無理に閉じない）。
     - **注意（fix2）**: runbook work-log 2026-07-15_RV-05-13-fix5 §4.1 の SQL は
       **`state='processing'` 専用**（claimed_at 判定を含む）で、**received には
       そのまま使えない**。received 用の参照 SQL（**SELECT のみ**・UPDATE は [人] の
@@ -152,3 +167,6 @@ sortation_ingest.py:136: (_durable_enabled)  同上
 - **既存テストへの非波及方針**: 新設関数＋新規テストファイルのみ。
   `check_journal_backlog`・既存 `run_healthcheck` 系テストは無変更
   （結線行の追加が既存テストを壊す場合は P2HC-fix1 と同型で「結線は別票」に分離）。
+- **【fix3・P2DP3-M02】結線を別票に分離した場合でも、点火ゲートは
+  「検査関数＋結線の両方 merge 済み」のまま**（§6 前提条件 (c) と同一。結線票の完了までは
+  警報が発火しないため、検査関数のみの merge では点火できない）。
