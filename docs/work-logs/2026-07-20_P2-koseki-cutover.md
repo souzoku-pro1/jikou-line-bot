@@ -65,6 +65,26 @@
   （順序は checklist §5.1 準拠・server→credential→GAS の逆順禁止）。
 - (iii) sortation 残置(i)（`SORTATION_INGEST_TOKEN` 削除・7/22 予定）と**同回に合流**。
 
+## 6.1 D-4/D-5 相当の完了（7/20 追記）
+
+- **D-4 相当充足（7/20・[人]実見の一次記録）**:
+  - 署名経路 POST `/koseki/ingest` **200 = 計 2 件**（初回 D-3 の 1 件＋追加 1 件）・
+    `[済]` リネーム実見・Railway HTTP Logs で **`?token=` 付き 0 件**。
+  - **充足基準の裁定**: sortation は初 lane のため 3 件としたが、koseki は**同一署名基盤
+    （本番実績あり）＋行列 pin 済み**（PR #145）のため **2 件で充足**（司令塔裁定）。
+- **D-5 相当完了（7/20・[人]）**:
+  - `SERVICE_AUTH_LEGACY_DISABLED_PATHS` を **`/sortation/ingest,/koseki/ingest`** へ更新・
+    デプロイ緑。
+  - **停止後健全性**: `/health` ok ＋ 実機 1 件追加投入 → `[済]` リネーム
+    （＝legacy 停止後も署名経路無傷・**計 3 件目の 200**）。
+- **残置の更新**（7/22 の回で実施）:
+  - (a) koseki **能動 404（D-7 相当）**: PowerShell 実測＋`legacy_blocked` 当日採取。
+  - (b) **sortation 残置(i)**（token/env・GAS 定数削除）: INC-0720 復旧から **2 日の安定観測を
+    経る司令塔裁定により 7/22 維持**。
+- **観測窓の限界（S5C-M01 型・明記）**: 本節の 200 件数・`?token=` 0 件・デプロイ緑・`/health` は
+  いずれも **[人] の画面実見による一次記録**であり、PC-A がライブログから独立再計数したもの
+  ではない。
+
 ## INC-0720（SEV-3）: 全置換による lane1 SIGNED_LANES 巻き戻し → 一時 404
 
 - **経緯**: 7/20 `rv04c_signing` 全置換（17 時台）→ Codex **R-P2-KOSEKI-LOG-1 が
