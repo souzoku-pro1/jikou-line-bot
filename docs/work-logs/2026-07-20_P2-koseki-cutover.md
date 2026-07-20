@@ -4,7 +4,8 @@
 - 手順書: `docs/runbooks/2026-07_S4-S5_cutover-checklist.md`（D-2〜D-3 相当を lane2 に適用）
 - 対象 lane: **koseki（lane2・`/koseki/ingest`）**。sortation（lane1）は S5 で完了済み。
   registry/bank/valuation（lane3 以降）は未着手・SIGNED_LANES false のまま。
-- ステータス: **D-3 相当まで成立（7/20）**。D-4/D-5 相当は 7/22 の回で判断（§6）。
+- ステータス: **D-3〜D-5 相当まで完了（7/20・§6.1）**。残置は koseki 能動 404（D-7 相当）と
+  sortation 残置(i)のみ・7/22 実施（§6.1）。
   **INC-0720（SEV-3・lane1 一時 404・7/20 中に復旧済み）あり**（§INC-0720）。
 
 ## 1. 概要（Railway 側）
@@ -61,8 +62,10 @@
 ## 6. 残置（7/22 の回で判断）
 
 - (i) **D-4 相当**: 署名成功 2〜3 件・legacy 0 の並行観測。
+  → **§6.1 で 7/20 前倒し充足（当初計画 7/22）**。
 - (ii) **D-5 相当**: `SERVICE_AUTH_LEGACY_DISABLED_PATHS` へ `/koseki/ingest` 追記
   （順序は checklist §5.1 準拠・server→credential→GAS の逆順禁止）。
+  → **§6.1 で 7/20 前倒し完了（同上）**。
 - (iii) sortation 残置(i)（`SORTATION_INGEST_TOKEN` 削除・7/22 予定）と**同回に合流**。
 
 ## 6.1 D-4/D-5 相当の完了（7/20 追記）
