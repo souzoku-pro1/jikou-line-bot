@@ -52,6 +52,11 @@ def upgrade() -> None:
                            name="ck_derivation_run_no_self_supersede"),
         sa.UniqueConstraint("supersedes_run_id", name="uq_derivation_run_supersedes"),
     )
+    # fix2 H03: 同一 case の root は 1 行のみ（部分ユニーク・head 一意性の DB 担保）
+    op.create_index("uq_derivation_run_single_root", "derivation_run",
+                    ["case_record_id"], unique=True,
+                    sqlite_where=sa.text("supersedes_run_id IS NULL"),
+                    postgresql_where=sa.text("supersedes_run_id IS NULL"))
     op.create_table(
         "heir_confirmation_decision",
         sa.Column("id", _BigIntPK, primary_key=True, autoincrement=True),
@@ -65,6 +70,9 @@ def upgrade() -> None:
                   sa.ForeignKey("heir_confirmation_decision.id"), nullable=True),
         sa.CheckConstraint("decision IN ('confirmed', 'held', 'rejected')",
                            name="ck_heir_decision_decision"),
+        sa.CheckConstraint(
+            "supersedes_decision_id IS NULL OR supersedes_decision_id != id",
+            name="ck_heir_decision_no_self_supersede"),   # fix2 H04
         sa.UniqueConstraint("supersedes_decision_id",
                             name="uq_heir_decision_supersedes"),
     )
@@ -85,4 +93,6 @@ def downgrade() -> None:
         elif dialect == "postgresql":
             op.execute(f"DROP TRIGGER IF EXISTS trg_{table}_no_mutation ON {table}")
             op.execute(f"DROP FUNCTION IF EXISTS {table}_immutable()")
+        if table == "derivation_run":
+            op.drop_index("uq_derivation_run_single_root", table_name="derivation_run")
         op.drop_table(table)

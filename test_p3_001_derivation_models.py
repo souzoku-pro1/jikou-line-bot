@@ -31,11 +31,12 @@ def _run(coro):
 
 
 def _run_row(**over):
-    row = dict(case_app_id="26", case_record_id="R-1", decedent_person_id="P-0",
+    # person_id は App34 kintone `$id`＝数字列（fix2 grammar・heir_derivation.py:122）
+    row = dict(case_app_id="26", case_record_id="R-1", decedent_person_id="10",
                at_date="2026-01-01", frozen_case_version="v1",
-               input_person_revisions={"P-1": 3}, input_person_ids=["P-0", "P-1"],
+               input_person_revisions={"11": 3}, input_person_ids=["10", "11"],
                input_hash="ih" * 8, status="derived", rank=1,
-               result_payload={"heirs": [{"person_id": "P-1", "share": "1/1"}]},
+               result_payload={"heirs": [{"person_id": "11", "share": "1/1"}]},
                result_hash="rh" * 8, provisional=False, engine_version="hd-1")
     row.update(over)
     return row
@@ -255,10 +256,10 @@ class TestPayloadAllowlist(_DbMixin):
     def test_pii_like_name_rejected(self):
         from hub.derivation_models import PayloadPolicyError
         for bad in (
-            {"heirs": [{"person_id": "P-1", "share": "1/2"}], "氏名": "山田太郎"},
-            {"heirs": [{"person_id": "P-1", "name": "山田太郎"}]},
+            {"heirs": [{"person_id": "11", "share": "1/2"}], "氏名": "山田太郎"},
+            {"heirs": [{"person_id": "11", "name": "山田太郎"}]},
             {"heirs": [{"person_id": "山田太郎"}]},
-            {"heirs": [{"person_id": "P-1"}], "facts": ["住所: 東京都..."]},
+            {"heirs": [{"person_id": "11"}], "facts": ["住所: 東京都..."]},
         ):
             with self.subTest(bad=str(bad)[:40]):
                 with self.assertRaises(PayloadPolicyError):
@@ -341,19 +342,150 @@ class TestRankCheck(_DbMixin):
     """M01: rank IN (0,1,2,3) の総当たり（DB CHECK 実測）。"""
 
     def test_rank_values(self):
+        # fix2 H03 の single-root 部分ユニークと干渉しないよう case を分ける
         for ok in (0, 1, 2, 3):
             with self.subTest(rank=ok):
-                self._insert_run(rank=ok, input_hash=f"r{ok}")
+                self._insert_run(rank=ok, input_hash=f"r{ok}",
+                                 case_record_id=f"R-rank-{ok}")
         for ng in (-1, 4, 9):
             with self.subTest(rank=ng):
                 async def _ins(ng=ng):
                     async with db.session_scope() as s:
                         await s.execute(sa.insert(DerivationRun.__table__)
                                         .values(**_run_row(rank=ng,
+                                                           case_record_id=f"R-ng{ng}",
                                                            input_hash=f"n{ng}")))
                 with self.assertRaises(IntegrityError):
                     _run(_ins())
                 db.reset_for_tests()
+
+
+# ── fix2(P3001-2-H01〜H04) 追加テスト ────────────────────────────────────────
+class TestFieldGrammar(_DbMixin):
+    """H01: field 別 grammar/enum（ASCII でも自由文字列は保存不可）。"""
+
+    def _create(self, **over):
+        from hub.derivation_models import create_derivation_run
+        pk = _run(create_derivation_run(**_run_row(**over)))
+        db.reset_for_tests()
+        return pk
+
+    def test_ascii_pii_rejected(self):
+        # ASCII の氏名（ローマ字）/メール/住所/電話も grammar で拒否される
+        from hub.derivation_models import PayloadPolicyError
+        cases = {
+            "romaji_name": {"heirs": [{"person_id": "Yamada Taro"}]},
+            "email": {"heirs": [{"person_id": "11"}],
+                      "facts": ["taro@example.com"]},
+            "address": {"heirs": [{"person_id": "1-2-3 Chiyoda Tokyo"}]},
+            "phone": {"heirs": [{"person_id": "090-1234-5678"}]},
+        }
+        for label, bad in cases.items():
+            with self.subTest(case=label):
+                with self.assertRaises(PayloadPolicyError):
+                    self._create(result_payload=bad)
+                db.reset_for_tests()
+
+    def test_share_and_relation_grammar(self):
+        from hub.derivation_models import PayloadPolicyError
+        self._create(result_payload={
+            "heirs": [{"person_id": "11", "share": "1/2",
+                       "relation_key": "spouse"}],
+            "facts": ["minpo_890", "minpo_900_1"]})
+        for bad_heir in ({"person_id": "11", "share": "0.5"},
+                         {"person_id": "11", "share": "half"},
+                         {"person_id": "11", "relation_key": "配偶者"},
+                         {"person_id": "11", "relation_key": "friend"}):
+            with self.subTest(bad=str(bad_heir)):
+                with self.assertRaises(PayloadPolicyError):
+                    self._create(result_payload={"heirs": [bad_heir]},
+                                 case_record_id="R-g2")
+                db.reset_for_tests()
+
+    def test_facts_type_and_enum_rejected(self):
+        from hub.derivation_models import PayloadPolicyError
+        for bad_facts in ([123], [{"key": "minpo_890"}], [None],
+                          ["民法890条"], ["minpo_999"], "minpo_890"):
+            with self.subTest(bad=str(bad_facts)[:30]):
+                with self.assertRaises(PayloadPolicyError):
+                    self._create(result_payload={"heirs": [], "facts": bad_facts})
+                db.reset_for_tests()
+
+
+class TestCoreBypassPin(_DbMixin):
+    """H02: Core INSERT は payload 検査を迂回できる（既知の限界の pin）。
+    将来 JSON 検査を DB trigger 化した場合は本テストの期待を「拒否」へ反転させること。"""
+
+    def test_core_insert_bypasses_payload_validation_known_limit(self):
+        async def _ins():
+            async with db.session_scope() as s:
+                await s.execute(sa.insert(DerivationRun.__table__).values(
+                    **_run_row(result_payload={"heirs": [
+                        {"person_id": "山田太郎"}]})))   # 正規経路なら拒否される値
+        _run(_ins())   # 現状: 成功してしまう（DB 層へ下ろせていない・docstring 参照）
+        db.reset_for_tests()
+
+
+class TestSingleRootDbLevel(_DbMixin):
+    """H03: 並行初回作成の DB 遮断（部分ユニーク: case の root は 1 行）。"""
+
+    def test_second_root_core_insert_rejected(self):
+        self._insert_run(input_hash="root1")
+        async def _ins():
+            async with db.session_scope() as s:
+                await s.execute(sa.insert(DerivationRun.__table__)
+                                .values(**_run_row(input_hash="root2")))
+        with self.assertRaises(IntegrityError):   # repo 層を迂回しても DB が遮断
+            _run(_ins())
+        db.reset_for_tests()
+
+
+class TestHcdChainGuards(_DbMixin):
+    """H04: HeirConfirmationDecision への連鎖 guard 横展開。"""
+
+    def _decide(self, **fields):
+        from hub.derivation_models import create_heir_decision
+        base = dict(decision="held", decided_by="attorney-1",
+                    decided_at=datetime.now(timezone.utc))
+        base.update(fields)
+        pk = _run(create_heir_decision(**base))
+        db.reset_for_tests()
+        return pk
+
+    def test_happy_append_and_supersede(self):
+        run_id = self._insert_run()
+        d1 = self._decide(derivation_run_id=run_id)
+        d2 = self._decide(derivation_run_id=run_id, decision="confirmed",
+                          supersedes_decision_id=d1)
+        self.assertGreater(d2, d1)
+
+    def test_self_reference_rejected_by_db_check(self):
+        run_id = self._insert_run()
+        async def _ins():
+            async with db.session_scope() as s:
+                await s.execute(sa.insert(HeirConfirmationDecision.__table__).values(
+                    id=555, derivation_run_id=run_id, decision="held",
+                    decided_by="a", decided_at=datetime.now(timezone.utc),
+                    supersedes_decision_id=555))
+        with self.assertRaises(IntegrityError):
+            _run(_ins())
+        db.reset_for_tests()
+
+    def test_cross_run_supersede_rejected(self):
+        from hub.derivation_models import ChainIntegrityError
+        run1 = self._insert_run(case_record_id="R-a")
+        run2 = self._insert_run(case_record_id="R-b", input_hash="ih-b")
+        d1 = self._decide(derivation_run_id=run1)
+        with self.assertRaises(ChainIntegrityError):
+            self._decide(derivation_run_id=run2, supersedes_decision_id=d1)
+
+    def test_nonexistent_refs_rejected(self):
+        from hub.derivation_models import ChainIntegrityError
+        with self.assertRaises(ChainIntegrityError):
+            self._decide(derivation_run_id=99999)
+        run_id = self._insert_run()
+        with self.assertRaises(ChainIntegrityError):
+            self._decide(derivation_run_id=run_id, supersedes_decision_id=88888)
 
 
 if __name__ == "__main__":

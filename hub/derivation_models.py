@@ -56,6 +56,12 @@ class DerivationRun(DerivationBase):
                            name="ck_derivation_run_no_self_supersede"),
         # 再導出連鎖の一意性: 1 つの旧 run を置き換えられる新 run は 1 つだけ
         sa.UniqueConstraint("supersedes_run_id", name="uq_derivation_run_supersedes"),
+        # fix2 H03: 同一 case の root（supersedes 無し）は 1 行のみ（部分ユニーク・
+        # 両 dialect）。supersedes UNIQUE と合わせて「連鎖は単一 root からの一本鎖」
+        # ＝head 一意性を DB レベルで担保（並行初回作成の競合も遮断）
+        sa.Index("uq_derivation_run_single_root", "case_record_id", unique=True,
+                 sqlite_where=sa.text("supersedes_run_id IS NULL"),
+                 postgresql_where=sa.text("supersedes_run_id IS NULL")),
     )
 
     id: Mapped[int] = mapped_column(_BigIntPK, primary_key=True, autoincrement=True)
@@ -87,6 +93,10 @@ class HeirConfirmationDecision(DerivationBase):
     __table_args__ = (
         sa.CheckConstraint("decision IN ('confirmed', 'held', 'rejected')",
                            name="ck_heir_decision_decision"),
+        # fix2 H04: 自己参照の DB レベル拒否（run 側と同型）
+        sa.CheckConstraint(
+            "supersedes_decision_id IS NULL OR supersedes_decision_id != id",
+            name="ck_heir_decision_no_self_supersede"),
         sa.UniqueConstraint("supersedes_decision_id", name="uq_heir_decision_supersedes"),
     )
 
@@ -156,19 +166,44 @@ for _table in ("derivation_run", "heir_confirmation_decision"):
 _RESULT_TOP_KEYS = frozenset({"heirs", "facts"})
 _RESULT_HEIR_KEYS = frozenset({"person_id", "share", "relation_key"})
 _LAWYER_FLAGS_KEYS = frozenset({"flags"})
-# PII 様検出（D17 流儀）: 値は person_id／share（分数）／条文キー等の ASCII コード体系のみを
-# 許容し、CJK（氏名・住所が必ず含む）や改行を含む文字列は PII 様として拒否する。
-_VALUE_RE = re.compile(r"^[\x20-\x7e]{1,200}$")
+
+# ── fix2 H01: field 別 grammar/enum（自由文字列 field を残さない・司令塔裁定） ──
+# person_id: App34 kintone `$id`（実装 heir_derivation.py:122 `record_id=v("$id")`＝数字列）
+_PERSON_ID_RE = re.compile(r"^[0-9]{1,10}$")
+# share: 分数の固定文法のみ（engine は Fraction。全部相続は "1/1"）
+_SHARE_RE = re.compile(r"^[0-9]{1,4}/[1-9][0-9]{0,3}$")
+# relation_key: ASCII enum。正本は zokugara を日本語で持つが payload は ASCII キーに限定。
+# 【最小集合】正本に ASCII enum の定義が無いため heir_derivation の zokugara 区分から
+# 最小で定義した。拡張手順: 正本 §3.5 への追記（司令塔裁定）と同時に本集合へ追加する。
+_RELATION_KEYS = frozenset({
+    "spouse", "child", "lineal_ascendant", "sibling", "representative",
+    "successive"})
+# facts: 条文キー enum のみ。heir_derivation.py が用いる根拠条文（basis）17 種の
+# ASCII 写像（民法890条→minpo_890 等）。拡張手順は relation_key と同じ。
+_FACT_KEYS = frozenset({
+    "minpo_32_2", "minpo_886", "minpo_887_1", "minpo_887_2", "minpo_887_3",
+    "minpo_889_1_1", "minpo_889_1_2", "minpo_889_2", "minpo_890", "minpo_891",
+    "minpo_896", "minpo_900_1", "minpo_900_2", "minpo_900_3",
+    "minpo_900_4_proviso", "minpo_901", "minpo_939"})
+# lawyer_flags.flags: ASCII enum（engine ctx["flags"] の日本語文は保存しない）。
+# 【最小集合・拡張手順は上と同じ】
+_LAWYER_FLAG_KEYS = frozenset({
+    "adoption_kind_unknown", "alive_unknown", "blood_type_unknown",
+    "renounce_review", "provisional"})
 
 
-def _check_str(value, where: str) -> None:
-    if not isinstance(value, str) or not _VALUE_RE.fullmatch(value):
-        raise PayloadPolicyError(
-            f"{where}: 非 ASCII/長大/改行含み文字列は保存不可（PII 様・§3.5 氏名非保持）")
+def _check_enum(value, allowed: frozenset, where: str) -> None:
+    if not isinstance(value, str) or value not in allowed:
+        raise PayloadPolicyError(f"{where}: enum 外の値は保存不可（§3.5・fix2 grammar）")
+
+
+def _check_re(value, rx: re.Pattern, where: str) -> None:
+    if not isinstance(value, str) or not rx.fullmatch(value):
+        raise PayloadPolicyError(f"{where}: 固定文法に合致しない値は保存不可（fix2 grammar）")
 
 
 def validate_result_payload(payload) -> None:
-    """§3.5 allowlist。違反は PayloadPolicyError（保存前・入口ガード）。"""
+    """§3.5 allowlist＋fix2 field 別 grammar。違反は PayloadPolicyError（保存前）。"""
     if not isinstance(payload, dict):
         raise PayloadPolicyError("result_payload は dict であること")
     extra = set(payload) - _RESULT_TOP_KEYS
@@ -184,10 +219,19 @@ def validate_result_payload(payload) -> None:
         if extra:
             raise PayloadPolicyError(
                 f"result_payload.heirs[*]: 許可キー外 {sorted(extra)}（person_id 系のみ）")
-        for k, v in h.items():
-            _check_str(v, f"result_payload.heirs[*].{k}")
-    for f in payload.get("facts", []):
-        _check_str(f, "result_payload.facts[*]")
+        _check_re(h.get("person_id"), _PERSON_ID_RE, "result_payload.heirs[*].person_id")
+        if "share" in h:
+            _check_re(h["share"], _SHARE_RE, "result_payload.heirs[*].share")
+        if "relation_key" in h:
+            _check_enum(h["relation_key"], _RELATION_KEYS,
+                        "result_payload.heirs[*].relation_key")
+    facts = payload.get("facts", [])
+    if not isinstance(facts, list):
+        raise PayloadPolicyError("result_payload.facts は list であること")
+    for f in facts:
+        if not isinstance(f, str):   # dict/数値等の型混入も拒否（fix2）
+            raise PayloadPolicyError("result_payload.facts[*] は条文キー文字列のみ")
+        _check_enum(f, _FACT_KEYS, "result_payload.facts[*]")
 
 
 def validate_lawyer_flags(flags) -> None:
@@ -202,7 +246,7 @@ def validate_lawyer_flags(flags) -> None:
     if not isinstance(values, list):
         raise PayloadPolicyError("lawyer_flags.flags は list であること")
     for v in values:
-        _check_str(v, "lawyer_flags.flags[*]")
+        _check_enum(v, _LAWYER_FLAG_KEYS, "lawyer_flags.flags[*]")
 
 
 def _validate_run_payloads_orm(mapper, connection, target):  # noqa: ARG001
@@ -258,5 +302,60 @@ async def create_derivation_run(**fields) -> int:
                 raise ChainIntegrityError(
                     "同一 case に run が既に存在（head 一意性・新 run は現 head を "
                     "supersedes_run_id で指すこと)")
+        r = await s.execute(sa.insert(t).values(**fields))
+        return r.inserted_primary_key[0]
+
+
+# ══════════════════════════════════════════════════════════════
+# fix2 H02: 入口保証の層別整理と既知の限界（司令塔裁定: DB 層を正とする）
+# ══════════════════════════════════════════════════════════════
+# 三段の担保:
+#   (1) DB 制約（正）  — CHECK（status/rank/自己参照）・UNIQUE（supersede 連鎖）・
+#       部分ユニーク（single root＝並行初回作成も遮断）・immutable trigger
+#   (2) repository 検査 — create_derivation_run/create_heir_decision（grammar/enum・
+#       cross-case・head 検査）
+#   (3) 「Core INSERT は正規経路外」 — 本 module の関数以外からの INSERT は運用規律違反
+# 【既知の限界（Codex 次巡へ受容可否を問う）】:
+#   - JSON payload の grammar/enum 検査（result_payload/lawyer_flags の中身）は
+#     SQLite/PG の trigger では実用的に表現できず **DB 層へ下ろせていない**。
+#     SQLAlchemy にも Core INSERT を横取りする table レベル event は存在しない
+#     （before_insert は ORM mapper event・fix2 で適用可否を検証済み）。
+#     したがって **Core INSERT は payload 検査を迂回できる**（現状挙動を
+#     test_p3_001 の pin テストで固定・将来 trigger 化する場合はそのテストを反転させる）。
+#   - cross-case supersede も同様に repository 層のみ（FK は行存在のみ検証）。
+
+
+async def create_heir_decision(**fields) -> int:
+    """HeirConfirmationDecision 追記の正規経路（fix2 H04・run 側 guard の横展開)。
+
+    - derivation_run_id: 実在検証
+    - supersedes_decision_id: 実在・**同一 run 内**（cross-run 参照拒否）・
+      未 supersede のみ（UNIQUE と重畳）。自己参照は DB CHECK でも拒否
+    """
+    from hub.db import session_scope
+
+    run_id = fields.get("derivation_run_id")
+    sup = fields.get("supersedes_decision_id")
+    t = HeirConfirmationDecision.__table__
+    async with session_scope() as s:
+        run = (await s.execute(
+            sa.select(DerivationRun.__table__.c.id)
+            .where(DerivationRun.__table__.c.id == run_id))).one_or_none()
+        if run is None:
+            raise ChainIntegrityError(f"derivation_run_id={run_id} は存在しない")
+        if sup is not None:
+            old = (await s.execute(
+                sa.select(t.c.id, t.c.derivation_run_id)
+                .where(t.c.id == sup))).one_or_none()
+            if old is None:
+                raise ChainIntegrityError(f"supersedes_decision_id={sup} は存在しない")
+            if old.derivation_run_id != run_id:
+                raise ChainIntegrityError(
+                    "cross-run の decision supersede は禁止（同一 run 内の連鎖のみ）")
+            already = (await s.execute(
+                sa.select(t.c.id).where(t.c.supersedes_decision_id == sup))).first()
+            if already is not None:
+                raise ChainIntegrityError(
+                    f"decision {sup} は既に supersede 済み（最新 decision のみ置換可）")
         r = await s.execute(sa.insert(t).values(**fields))
         return r.inserted_primary_key[0]
