@@ -239,5 +239,122 @@ class TestSeparationContract(unittest.TestCase):
         self.assertEqual(mig.count("op.drop_table"), 1)   # loop で両表を drop
 
 
+# ── fix1(P3001-H01/H02/M01) 追加テスト ───────────────────────────────────────
+class TestPayloadAllowlist(_DbMixin):
+    """H02: schema allowlist＋PII 様防御（immutable への誤保存を入口で遮断）。"""
+
+    def _create(self, **over):
+        from hub.derivation_models import create_derivation_run
+        pk = _run(create_derivation_run(**_run_row(**over)))
+        db.reset_for_tests()
+        return pk
+
+    def test_valid_payload_accepted(self):
+        self.assertIsInstance(self._create(), int)
+
+    def test_pii_like_name_rejected(self):
+        from hub.derivation_models import PayloadPolicyError
+        for bad in (
+            {"heirs": [{"person_id": "P-1", "share": "1/2"}], "氏名": "山田太郎"},
+            {"heirs": [{"person_id": "P-1", "name": "山田太郎"}]},
+            {"heirs": [{"person_id": "山田太郎"}]},
+            {"heirs": [{"person_id": "P-1"}], "facts": ["住所: 東京都..."]},
+        ):
+            with self.subTest(bad=str(bad)[:40]):
+                with self.assertRaises(PayloadPolicyError):
+                    self._create(result_payload=bad)
+                db.reset_for_tests()
+
+    def test_lawyer_flags_allowlist(self):
+        from hub.derivation_models import PayloadPolicyError, create_derivation_run
+        self._create(lawyer_flags={"flags": ["renounce_review"]},
+                     input_hash="lf-ok")
+        with self.assertRaises(PayloadPolicyError):
+            _run(create_derivation_run(**_run_row(
+                lawyer_flags={"memo": "自由記述は不可"}, input_hash="lf-ng")))
+        db.reset_for_tests()
+
+    def test_orm_insert_also_guarded(self):
+        from hub.derivation_models import PayloadPolicyError
+
+        async def _ins():
+            async with db.session_scope() as s:
+                s.add(DerivationRun(**_run_row(
+                    result_payload={"heirs": [{"person_id": "P-1",
+                                               "full_name": "許可キー外"}]})))
+                await s.flush()
+        with self.assertRaises(PayloadPolicyError):
+            _run(_ins())
+        db.reset_for_tests()
+
+
+class TestChainIntegrity(_DbMixin):
+    """H01: supersedes 連鎖の健全性（自己参照/2-node/cross-case/多重 head）。"""
+
+    def _create(self, **over):
+        from hub.derivation_models import create_derivation_run
+        pk = _run(create_derivation_run(**_run_row(**over)))
+        db.reset_for_tests()
+        return pk
+
+    def test_self_loop_rejected_by_db_check(self):
+        async def _ins():
+            async with db.session_scope() as s:
+                await s.execute(sa.insert(DerivationRun.__table__).values(
+                    id=777, supersedes_run_id=777, **_run_row()))
+        with self.assertRaises(IntegrityError):
+            _run(_ins())
+        db.reset_for_tests()
+
+    def test_two_node_cycle_impossible(self):
+        # A→B の後、A を再度 supersede（分岐＝循環の芽）は拒否。
+        # A.supersedes=B への書換は immutable のため物理的に不可（既存テストで実測済み）。
+        from hub.derivation_models import ChainIntegrityError
+        a = self._create(input_hash="a")
+        self._create(supersedes_run_id=a, input_hash="b")
+        with self.assertRaises(ChainIntegrityError):
+            self._create(supersedes_run_id=a, input_hash="c")
+        db.reset_for_tests()
+
+    def test_cross_case_supersede_rejected(self):
+        from hub.derivation_models import ChainIntegrityError
+        a = self._create(case_record_id="R-1", input_hash="x1")
+        with self.assertRaises(ChainIntegrityError):
+            self._create(case_record_id="R-2", supersedes_run_id=a, input_hash="x2")
+        db.reset_for_tests()
+
+    def test_second_head_without_supersede_rejected(self):
+        from hub.derivation_models import ChainIntegrityError
+        self._create(input_hash="h1")
+        with self.assertRaises(ChainIntegrityError):
+            self._create(input_hash="h2")   # supersedes 無しの 2 本目＝多重 head
+        db.reset_for_tests()
+
+    def test_nonexistent_supersede_rejected(self):
+        from hub.derivation_models import ChainIntegrityError
+        with self.assertRaises(ChainIntegrityError):
+            self._create(supersedes_run_id=99999, input_hash="nx")
+        db.reset_for_tests()
+
+
+class TestRankCheck(_DbMixin):
+    """M01: rank IN (0,1,2,3) の総当たり（DB CHECK 実測）。"""
+
+    def test_rank_values(self):
+        for ok in (0, 1, 2, 3):
+            with self.subTest(rank=ok):
+                self._insert_run(rank=ok, input_hash=f"r{ok}")
+        for ng in (-1, 4, 9):
+            with self.subTest(rank=ng):
+                async def _ins(ng=ng):
+                    async with db.session_scope() as s:
+                        await s.execute(sa.insert(DerivationRun.__table__)
+                                        .values(**_run_row(rank=ng,
+                                                           input_hash=f"n{ng}")))
+                with self.assertRaises(IntegrityError):
+                    _run(_ins())
+                db.reset_for_tests()
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -47,6 +47,9 @@ def upgrade() -> None:
                   server_default=sa.func.now()),
         sa.CheckConstraint("status IN ('derived', 'held', 'error')",
                            name="ck_derivation_run_status"),
+        sa.CheckConstraint("rank IN (0, 1, 2, 3)", name="ck_derivation_run_rank"),
+        sa.CheckConstraint("supersedes_run_id IS NULL OR supersedes_run_id != id",
+                           name="ck_derivation_run_no_self_supersede"),
         sa.UniqueConstraint("supersedes_run_id", name="uq_derivation_run_supersedes"),
     )
     op.create_table(
