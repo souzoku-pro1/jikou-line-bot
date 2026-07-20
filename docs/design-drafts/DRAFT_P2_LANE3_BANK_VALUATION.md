@@ -51,7 +51,8 @@ async def valuation_ingest(_auth: None = Depends(ingest_guard("VALUATION_INGEST_
   （定義参照箇所: bank_ingest.py 7,291 行・valuation_ingest.py 4,385 行。**値は非出力**）。
   `SERVICE_AUTH_LEGACY_DISABLED_PATHS` の現運用値は
   `/sortation/ingest,/koseki/ingest`（work-log 2026-07-20 §6.1）＝**bank/valuation は
-  非該当で legacy 受理可能な状態**。ただし §3 のとおり legacy 送信元の GAS 現物が無い。
+  非該当で legacy 受理可能な状態**。ただし §3 のとおり legacy 送信元は **repo 写し上では
+  未検出**（live は G-L3-0 未実施のため未確定）。
 
 ## 3. 「GAS 現物不在」の repo 側証跡（新規開通の裏取り）
 
@@ -71,7 +72,8 @@ $ grep -n "bank/ingest\|valuation/ingest\|registry/ingest" legacy/gas/コード.
 - 補足: sortation の自動回送（`sortation_ingest.py:226-245`）は `ingest_valuation_pdf` 等の
   **in-process 直接呼出**（HTTP でない・認証非経由）。`_FORWARD_LINES`（119 行）は
   戸籍/登記事項証明/評価証明・課税明細の 3 種で **bank は回送対象外**。
-  ＝ 現状、両 lane への **HTTP 呼出元はゼロ**。
+  ＝ **repo 上では両 lane への HTTP 呼出元は未検出**（live の呼出元有無は G-L3-0 の
+  実見で確定する）。
 
 ## 4. 呼出予定元（設計文書上の位置づけ・引用)
 
@@ -122,7 +124,7 @@ $ grep -n "bank/ingest\|valuation/ingest\|registry/ingest" legacy/gas/コード.
 | GAS 反映 | 既存ブロック②を dispatcher 置換 | **watcher ブロック新設**（OPEN-1: 要否・フォルダ ID・トリガー・[済] 規約は[人]裁定）。**全置換禁止・期待行列読み合わせ**（INC-0720 §7 規律） |
 | D-3/D-4 相当 | 200 実測 2〜3 件・?token= 0 | **同じ**（新規開通のため legacy 0 は自明・署名 200 のみ確認） |
 | D-5 相当 | 事後に PATHS 追記 | **開通時に前倒し済み**（上記）→ 事後工程なし |
-| D-7 相当 | 能動 404 実測 | **同じ**（旧 token が存在しないため「未定義 env=deny-all 404」の確認に読み替え） |
+| D-7 相当 | 能動 404 実測 | **同じ**（旧 token 未配布が前提の場合「未定義 env=deny-all 404」の確認に読み替え。live の `BANK/VALUATION_INGEST_TOKEN` env 定義有無は G-L3-0 と同時に[人]確認） |
 
 ## 7. リスクと停止条件の候補
 
