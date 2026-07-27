@@ -11,7 +11,10 @@ hub/template_registry.py）・alembic migration・当該テストファイル以
       添字アクセス（②）・変数経由は**代入グラフの推移閉包**（③ 二段以上の alias）で追跡
   (4) raw SQL 形: `sa.text()/text()`・**`conn.exec_driver_sql()`（⑥・メソッド名検出）**の
       文字列引数に INSERT/UPDATE/DELETE＋対象 table 名。文字列は **BinOp(+) の定数
-      畳み込み（④）＋文字列定数変数の代入追跡（⑤）**まで解決する
+      畳み込み（④）＋文字列定数変数の代入追跡（⑤）＋JoinedStr（f-string）の
+      リテラル部分連結（fix6 P30016-M01）**まで解決する。f-string の式部分
+      （`{...}`）は**不明として扱い、リテラル部分のみで判定**する（リテラル部分に
+      DML＋対象 table 名が揃えば検出・式部分にしか table 名が無い場合は検出しない）
   (5) 関数 alias（①）: `ins = sa.insert`／`from sqlalchemy import insert as X` の
       変数代入形（関数オブジェクトの代入追跡・推移閉包）
   (6) `getattr(sa, "insert")(...)`（⑦・第2引数が文字列リテラルの getattr を解決）
@@ -22,8 +25,9 @@ hub/template_registry.py）・alembic migration・当該テストファイル以
   - exec / eval による実行時コード生成
   - __import__ / importlib による動的 import
   - getattr(obj, 変数) — 属性名が文字列リテラルでない getattr
-  - 実行時文字列組立で**定数伝播が追えない**もの（関数戻り値・引数・f-string の
-    非定数部・外部入力に依存する SQL 文字列 等）
+  - 実行時文字列組立で**定数伝播が追えない**もの（関数戻り値・引数・外部入力に
+    依存する SQL 文字列 等）。※f-string は fix6 で**検出対象へ移動**——リテラル
+    部分を連結して検査し、式部分のみを不明として扱う（上記 (4)）
 
 背景（改定裁定）: JSON payload 検査は DB trigger 化が実用不能・SQLAlchemy に table
 レベル Core insert event も無いため、Core 迂回の防御は本 AST 検査＋正規 module 内
@@ -85,8 +89,10 @@ def _import_table(tree: ast.AST) -> tuple[set, dict, set]:
 
 
 def _fold_str(node: ast.AST, str_consts: dict) -> str | None:
-    """文字列定数の畳み込み（fix5 ④⑤）: Constant／JoinedStr 定数部／BinOp(+) 連結／
-    定数文字列変数の参照。畳めない部分を含む連結は None（＝受容一覧の動的経路）。"""
+    """文字列定数の畳み込み（fix5 ④⑤・fix6 M01）: Constant／BinOp(+) 連結／
+    定数文字列変数の参照／**JoinedStr（f-string）はリテラル部分のみ連結**
+    （式部分は不明として無視・リテラル部分だけで DML＋table 名判定に掛ける）。
+    BinOp で畳めない部分を含む連結は None（＝受容一覧の動的経路）。"""
     if isinstance(node, ast.Constant) and isinstance(node.value, str):
         return node.value
     if isinstance(node, ast.Name):
@@ -303,6 +309,14 @@ class TestScannerFixtures(unittest.TestCase):
             "getattr_literal": ("import sqlalchemy as sa\n"                  # ⑦
                                 "getattr(sa, 'insert')"
                                 "(DerivationRun.__table__)\n", "core_dml"),
+            # fix6 P30016-M01: f-string のリテラル部分連結（式部分は不明扱い）
+            "exec_driver_fstring": (
+                "conn.exec_driver_sql("
+                "f'DELETE FROM derivation_run WHERE id={x}')\n",
+                "raw_sql:exec_driver_sql"),
+            "text_fstring": ("import sqlalchemy as sa\n"
+                             "sa.text(f'UPDATE template_version "
+                             "SET status={s}')\n", "raw_sql:text"),
         }
         self.assertGreaterEqual(len(cases), 15)   # fix5: 8→15 種以上を維持
         for label, (src, kind) in cases.items():
@@ -369,6 +383,11 @@ class TestScannerFixtures(unittest.TestCase):
             "runtime_built_sql": (         # 受容: 定数伝播が追えない実行時組立
                 "from sqlalchemy import text\n"
                 "text('DELETE FROM ' + table_name())\n"),
+            "fstring_table_in_expr_only": (   # fix6: table 名が式部分のみ＝不明扱い
+                "conn.exec_driver_sql(f'DELETE FROM {table}')\n"),
+            "fstring_no_dml_literal": (       # fix6: リテラル部分に DML が無い
+                "import sqlalchemy as sa\n"
+                "sa.text(f'{op} FROM derivation_run')\n"),
         }
         for label, src in cases.items():
             with self.subTest(case=label):
