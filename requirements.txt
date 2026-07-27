@@ -8,6 +8,8 @@ requests
 stripe
 reportlab
 pymupdf
+# ── P5-001 条項ライブラリ（裁定 2026-07-27: repo 内 YAML 正式採用・直接依存化）──
+pyyaml
 # ── DB基盤（P1-004・O-01 PostgreSQL）。追加分のみ==固定（既存行の固定化は別タスク）──
 sqlalchemy==2.0.51
 alembic==1.18.5
