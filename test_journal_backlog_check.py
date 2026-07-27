@@ -30,7 +30,10 @@ os.environ.update({
 import sqlalchemy as sa  # noqa: E402
 
 import hub.db as db  # noqa: E402
-from daily_healthcheck import check_journal_backlog  # noqa: E402
+from daily_healthcheck import (  # noqa: E402
+    check_journal_backlog,
+    check_unknown_providers,
+)
 from hub.inbound_event import (  # noqa: E402
     Base,
     InboundEvent,
@@ -206,6 +209,57 @@ class TestLineRowsNotCountedByE(_SqliteDbMixin):
         db.reset_for_tests()
         self.assertEqual(len(problems), 1, problems)
         self.assertIn("processing", problems[0])
+
+
+# ── MAIN-CONS-fix2 M01（裁定済み）: 監視項目H＝未知 provider 検知 ────────────
+class TestUnknownProviderDetection(_SqliteDbMixin):
+    """既知集合 {stripe, line, kintone} 以外の provider 行を警報する。
+    本文は provider 名と件数のみ（redaction 規律維持）。"""
+
+    def _insert(self, provider: str, n: int = 1):
+        async def _ins():
+            async with db.session_scope() as s:
+                for i in range(n):
+                    await s.execute(sa.insert(InboundEvent).values(
+                        provider=provider, dedup_key=f"{provider}:h-{i}",
+                        payload_hash="x" * 8, signature_result="valid",
+                        state="received", received_at=_utcnow()))
+        _run(_ins())
+        db.reset_for_tests()
+
+    def test_unknown_provider_reported_with_name_and_count_only(self):
+        self._insert("ghost", 2)      # 未知 provider fixture
+        self._insert("line", 1)       # 既知（G系専任）は対象外
+        problems = _run(check_unknown_providers())
+        db.reset_for_tests()
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("ghost", problems[0])
+        self.assertIn("2件", problems[0])
+        self.assertNotIn("line", problems[0])       # 既知 provider を混ぜない
+        self.assertNotIn("h-", problems[0])         # dedup_key/ID を載せない
+
+    def test_known_providers_only_is_silent(self):
+        for p in ("stripe", "line", "kintone"):
+            self._insert(p, 1)
+        problems = _run(check_unknown_providers())
+        db.reset_for_tests()
+        self.assertEqual(problems, [])
+
+    def test_no_database_url_skips(self):
+        env = {k: v for k, v in os.environ.items() if k != "DATABASE_URL"}
+        with patch.dict(os.environ, env, clear=True):
+            self.assertEqual(_run(check_unknown_providers()), [])
+
+    def test_missing_table_skips_quietly(self):
+        tmp = tempfile.mkdtemp(prefix="unknown_provider_no_table_")
+        try:
+            with patch.dict(os.environ, {
+                    "DATABASE_URL": f"sqlite+aiosqlite:///{tmp}/empty.db"}):
+                db.reset_for_tests()
+                self.assertEqual(_run(check_unknown_providers()), [])
+        finally:
+            db.reset_for_tests()
+            shutil.rmtree(tmp, ignore_errors=True)
 
 
 if __name__ == "__main__":

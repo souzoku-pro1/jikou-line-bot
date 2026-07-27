@@ -21,6 +21,9 @@
      〔INBOUND_LINE_STALE_RECEIVED_SECONDS／INBOUND_LINE_STALE_PROCESSING_SECONDS・
      既定 3600 秒〕超過）を検知する（P2-CHAIN-012 で追加・durable 点火 flag ON 時
      のみ〔env 直読みゲート・M-06〕・実体は hub/durable_inbound.check_line_backlog）
+  H. inbound_event の未知 provider 検知（既知集合 {stripe, line, kintone} 以外の
+     行が存在したら警報・provider 名と件数のみ・MAIN-CONS-fix2 M01 で追加。
+     provider 別専任監視〔E/G/kintone〕のいずれにも載らない行の沈黙滞留を遮断）
 
 異常時のみ LINE Push で管理者に通知する。正常時はログのみ。
 
@@ -303,6 +306,43 @@ async def check_journal_backlog() -> list[str]:
 
 
 # ══════════════════════════════════════════════════════════════
+# 監視項目H: inbound_event の未知 provider 検知（MAIN-CONS-fix2 M01・裁定済み）
+# ══════════════════════════════════════════════════════════════
+
+_KNOWN_PROVIDERS = ("stripe", "line", "kintone")
+
+
+async def check_unknown_providers() -> list[str]:
+    """既知集合 {stripe, line, kintone} 以外の provider 行を検知する。
+
+    provider 別の専任監視（E=stripe／G=line／kintone 専用検査）はいずれも既知集合を
+    前提とするため、未知 provider の行は**どの監視にも載らない**（沈黙滞留の芽）。
+    存在したら警報する。**本文は provider 名と件数のみ**（redaction 規律維持・
+    event ID/dedup_key/payload は載せない）。
+    DATABASE_URL 未設定・テーブル不在は静かにスキップ（E と同じ lazy 原則）。
+    """
+    if not os.environ.get("DATABASE_URL"):
+        return []
+    import sqlalchemy as sa
+
+    from hub.db import session_scope
+    from hub.inbound_event import InboundEvent
+    try:
+        async with session_scope() as session:
+            rows = (await session.execute(
+                sa.select(InboundEvent.provider, sa.func.count())
+                .where(InboundEvent.provider.notin_(_KNOWN_PROVIDERS))
+                .group_by(InboundEvent.provider))).all()
+    except (sa.exc.ProgrammingError, sa.exc.OperationalError) as e:
+        if "inbound_event" in str(e).lower():
+            return []
+        raise
+    return [f"未知provider検知: {p} {n}件"
+            "（provider 別滞留監視のいずれにも載らないため要確認）"
+            for p, n in sorted(rows)]
+
+
+# ══════════════════════════════════════════════════════════════
 # 監視項目F: 業務通知チャネルの dead-man（P1-102・RV-10 §4.2 最小版・統合形）
 # ══════════════════════════════════════════════════════════════
 
@@ -423,6 +463,10 @@ async def run_healthcheck() -> list[str]:
     except Exception as e:
         # DB接続情報が例外本文に含まれ得るため分類のみ（RCF-M05流儀）
         problems.append(f"journal滞留監視の実行自体が失敗: {type(e).__name__}")
+    try:
+        problems += await check_unknown_providers()  # 監視項目H（MAIN-CONS-fix2 M01）
+    except Exception as e:
+        problems.append(f"未知provider監視の実行自体が失敗: {type(e).__name__}")
     try:
         problems += await check_business_notify_liveness()  # 監視項目F（P1-102）
     except Exception as e:

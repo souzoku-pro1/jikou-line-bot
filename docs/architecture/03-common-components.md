@@ -277,14 +277,22 @@ UNIT_CONFIG = {
 - K4（LINE 再配送設定確認）は**補助**であり点火条件ではない（K4 は非 2xx への再配送のため、
   200 ACK 後の BackgroundTask crash による滞留を回収できない）。
 - rollback は env OFF 1 本で即時に現行挙動と byte 同一（M-06: flag OFF は import 不発）。
-- **rollback の残余（RMC-M04・MAIN-CONS-fix1）**: flag OFF は**挙動の復元であって状態の
-  完全復元ではない**。(a) 点火中に書かれた**既存 LINE 行は inbound_event に残置**され、
-  OFF 後は監視対象外（監視項目G は flag 配下でしか動かず、E 系は provider='stripe'
-  限定〔RMC-M01〕のため**無監視**）→ rollback 時は残置行の**照合と手動閉鎖**
-  （done＝§12.3 の照合源による根拠必須／打切り＝failed_exhausted・manual_closed・
-  §12.2）を必ず行うこと。
-  (b) **received 行を「処理済みの証明」なしに done へ変更することは禁止**
-  （§12.2 の done 定義どおり。証明なき done 化は取りこぼしの黙殺になる）。
+- **rollback の残余（RMC-M04・MAIN-CONS-fix1→fix2 M03 で分岐を逐語化）**:
+  flag OFF は**挙動の復元であって状態の完全復元ではない**。点火中に書かれた
+  **既存 LINE 行は inbound_event に残置**され、OFF 後は監視対象外（監視項目G は
+  flag 配下でしか動かず、E 系は provider='stripe' 限定〔RMC-M01〕のため**無監視**）。
+  rollback 時の残置行の扱いは次の 4 分岐（逐語・fix2 M03）:
+  1. **全行の照合は必須**（例外なし。§12.3 の照合源で 1 行ずつ判定する）。
+  2. **処理済みを証明できた行のみ** `done` へ遷移させる（§12.3 の照合源による
+     根拠が必須。**received 行を証明なしに done へ変更することは禁止**＝
+     証明なき done 化は取りこぼしの黙殺になる）。
+  3. **再試行を行わないと[人]が判断した行**は `failed_exhausted` へ
+     （`last_error=manual_closed`・§12.2 の手動打切り）。
+  4. **判断不能の行**は**残置＋別管理**（一覧を work-log に固定し、照合源が
+     得られ次第 2/3 へ再判定する）。
+  ※読み違い注意: §12.3 の「照合源なし」は**『done 化の根拠が無い＝done にできない』**
+  ことを言うのであって、**照合そのものの免除ではない**（「照合源なし＝残置が唯一の
+  選択肢」とは読まない。残置は 4 の別管理付きでのみ許される）。
 
 ### 12.2 状態語彙（inbound_event.state・LINE Phase A）
 
