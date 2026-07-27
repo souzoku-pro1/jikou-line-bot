@@ -172,13 +172,18 @@ _RESULT_TOP_KEYS = frozenset({"heirs", "facts"})
 _RESULT_HEIR_KEYS = frozenset({"person_id", "share", "relation_key"})
 _LAWYER_FLAGS_KEYS = frozenset({"flags"})
 
-# ── fix2 H01→fix3 改訂: field 別 grammar/enum（自由文字列 field を残さない） ──
-# person_id（fix3 H01: 実導出の全形式を明示列挙・自由文字列化しない）:
+# ── fix2 H01→fix3 改訂→fix4 H02: field 別 grammar/enum（自由文字列 field を残さない）──
+# person_id:
 #   (a) App34 kintone `$id`（heir_derivation.py:122 `record_id=v("$id")`＝数字列）
-#   (b) 胎児合成 ID（heir_derivation.py:406-412 `record_id=f"胎児:{label}"`・
-#       label は Declarations.fetuses の表示ラベル＝役割語）
+#   (b) 胎児合成 ID `胎児:F{n}`（同一 run 内の出現順連番）
+# 【fix4 H02 司令塔裁定・収載】胎児 ID は「役割語の自由文字列」を保存しない。
+#   導出器（凍結）の出力 `胎児:{label}`（label＝Declarations.fetuses の自由入力
+#   表示ラベル＝役割語）は変えず、**保存層の変換（build_run_payload）で非PII
+#   合成識別子 胎児:F1・胎児:F2…（出現順連番）へ写像**して吸収する。
+#   元ラベルとの対応は保存しない（表示が必要なら run 内で再導出可能）。
+#   role語 enum 方式は採らない（fetuses が自由入力である以上 enum は実データで割れる）。
 _PERSON_ID_RE = re.compile(r"^[0-9]{1,10}$")
-_FETUS_ID_RE = re.compile(r"^胎児:[^\r\n\"]{1,20}$")
+_FETUS_ID_RE = re.compile(r"^胎児:F[0-9]+$")   # fix4 H02: 合成 ID のみ（自由文字列排除）
 # share: 分数の固定文法のみ（engine は Fraction。全部相続は "1/1"）
 _SHARE_RE = re.compile(r"^[0-9]{1,6}/[1-9][0-9]{0,5}$")
 # relation_key: ASCII enum（zokugara 9 区分の写像・_ZOKUGARA_TO_RELATION が単一の正）
@@ -249,11 +254,20 @@ def relation_key_of(zokugara) -> str:
 def build_run_payload(derivation) -> tuple[dict, dict | None]:
     """Derivation（heir_derivation.derive_heirs の結果）→ §3.5 準拠 payload への
     単一変換（fix3 接続点）。氏名・日本語文はここで**落ちる**（保存されるのは
-    person_id/share/relation_key/条文キー/flag コードのみ）。"""
+    person_id/share/relation_key/条文キー/flag コードのみ）。
+    fix4 H02（裁定）: 導出器出力の胎児 ID `胎児:{label}` は、ここで非PII 合成識別子
+    `胎児:F{n}`（同一 run 内の出現順連番）へ写像する。元ラベルは保存しない。"""
     heirs = []
     facts: list[str] = []
+    fetus_synth: dict[str, str] = {}   # 元ラベル→F{n}（run 内のみ・保存しない）
+
+    def _synth_pid(pid):
+        if not (isinstance(pid, str) and pid.startswith("胎児:")):
+            return pid
+        return fetus_synth.setdefault(pid, f"胎児:F{len(fetus_synth) + 1}")
+
     for h in derivation.heirs:
-        entry = {"person_id": h.person_id,
+        entry = {"person_id": _synth_pid(h.person_id),
                  "relation_key": relation_key_of(h.zokugara)}
         if h.share is not None:
             entry["share"] = f"{h.share.numerator}/{h.share.denominator}"
@@ -304,7 +318,8 @@ def validate_result_payload(payload) -> None:
                                             or _FETUS_ID_RE.fullmatch(pid)):
             raise PayloadPolicyError(
                 "result_payload.heirs[*].person_id: App34 $id（数字列）または"
-                "胎児合成 ID（胎児:ラベル）のみ（fix3 H01・形式明示列挙）")
+                "胎児合成 ID（胎児:F{n}・出現順連番）のみ（fix4 H02 裁定・"
+                "役割語の自由文字列は保存不可）")
         if "share" in h:
             _check_re(h["share"], _SHARE_RE, "result_payload.heirs[*].share")
         if "relation_key" in h:

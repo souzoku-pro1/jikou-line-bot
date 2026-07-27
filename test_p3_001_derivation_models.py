@@ -496,5 +496,41 @@ class TestHcdChainGuards(_DbMixin):
         db.reset_for_tests()
 
 
+# ── fix4(P30014-H02) 胎児合成 ID（司令塔裁定の収載検証） ────────────────────
+class TestFetusSyntheticId(unittest.TestCase):
+    """H02 裁定: 胎児 ID は役割語の自由文字列を保存せず、build_run_payload が
+    `胎児:F{n}`（run 内出現順連番）へ写像する。grammar は合成 ID のみ許可。"""
+
+    def test_build_run_payload_maps_labels_to_sequential_synthetic_ids(self):
+        import json
+
+        from heir_derivation import Declarations, HeirPerson, derive_heirs
+        from hub.derivation_models import build_run_payload, validate_result_payload
+        d = derive_heirs(
+            [HeirPerson(record_id="10", name="被", alive="死亡",
+                        death_date="2025-04-13", is_decedent=True),
+             HeirPerson(record_id="11", name="長男", alive="生存",
+                        father_id="10")],
+            Declarations(fetuses=["妻", "第2子"]))   # 役割語の自由入力ラベル 2 件
+        payload, _ = build_run_payload(d)
+        fetus_ids = [h["person_id"] for h in payload["heirs"]
+                     if h["person_id"].startswith("胎児:")]
+        self.assertEqual(fetus_ids, ["胎児:F1", "胎児:F2"], payload)   # 出現順連番
+        s = json.dumps(payload, ensure_ascii=False)
+        self.assertNotIn("胎児:妻", s)      # 元ラベルとの対応も保存しない（裁定）
+        self.assertNotIn("第2子", s)
+        validate_result_payload(payload)    # 変換後は grammar を通過する
+
+    def test_grammar_rejects_free_label_fetus_id(self):
+        from hub.derivation_models import PayloadPolicyError, validate_result_payload
+        for bad in ("胎児:妻", "胎児:", "胎児:F", "胎児:Fx", "胎児:F1a"):
+            with self.subTest(pid=bad):
+                with self.assertRaises(PayloadPolicyError):
+                    validate_result_payload(
+                        {"heirs": [{"person_id": bad}], "facts": []})
+        validate_result_payload(   # 合成 ID は許可
+            {"heirs": [{"person_id": "胎児:F1"}], "facts": []})
+
+
 if __name__ == "__main__":
     unittest.main()
