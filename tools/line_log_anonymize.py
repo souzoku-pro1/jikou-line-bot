@@ -358,7 +358,7 @@ def _write_json(path: str, obj) -> None:
         json.dump(obj, f, ensure_ascii=False, indent=1)
 
 
-def main(argv=None) -> int:
+def main(argv=None, out=sys.stdout) -> int:
     ap = argparse.ArgumentParser(
         description="LINE-LOG-1 匿名化変換（[人]ローカル実行・一方向工程）")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -382,7 +382,7 @@ def main(argv=None) -> int:
         result = convert(rows, load_app29_drafts(args.app29_csv))
         _write_json(args.out, {"threads": result["threads"]})   # allowlist のみ（H02）
         _write_json(args.summary_out, result["summary"])        # 運用メタは別ファイル
-        sys.stdout.write(
+        out.write(
             json.dumps(result["summary"], ensure_ascii=False) + "\n")
         return 0
 
@@ -394,7 +394,7 @@ def main(argv=None) -> int:
             fallback_ids = set(json.load(f))
     errors, final = reverify(doc, fallback_ids)
     if errors:
-        sys.stdout.write(json.dumps({"result": "FAIL", "errors": errors[:50]},
+        out.write(json.dumps({"result": "FAIL", "errors": errors[:50]},
                                     ensure_ascii=False) + "\n")
         return 1                                 # PASS 前は checklist 生成・引渡し不可
     _write_json(args.out, {"threads": final["threads"]})
@@ -404,7 +404,7 @@ def main(argv=None) -> int:
                                           "確認者", "確認日"])
         w.writeheader()
         w.writerows(final["checklist"])
-    sys.stdout.write(json.dumps({"result": "PASS", **final["summary"]},
+    out.write(json.dumps({"result": "PASS", **final["summary"]},
                                 ensure_ascii=False) + "\n")
     return 0
 
