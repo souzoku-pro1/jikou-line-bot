@@ -416,6 +416,16 @@ async def run_healthcheck() -> list[str]:
         problems += await check_business_notify_liveness()  # 監視項目F（P1-102）
     except Exception as e:
         problems.append(f"業務通知dead-man監視の実行自体が失敗: {type(e).__name__}")
+    # 監視項目G（P2-CHAIN-012）: LINE durable 滞留（received/processing）。
+    # M-06: flag OFF は hub.durable_inbound を import せず（env 直読み）現行 byte 同一。
+    if os.environ.get("INBOUND_EVENT_DURABLE_ENABLED", "").strip().lower() \
+            in ("1", "true", "on", "yes"):
+        try:
+            from hub.durable_inbound import check_line_backlog
+            problems += await check_line_backlog()
+        except Exception as e:
+            # DB接続情報が例外本文に含まれ得るため分類のみ（RCF-M05流儀）
+            problems.append(f"LINE滞留監視の実行自体が失敗: {type(e).__name__}")
 
     # RV-04c D2-M01: NEXT 残置 notice（警報ではない・problems に混ぜない）。
     notice = check_next_token_residual()

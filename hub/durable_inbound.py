@@ -207,3 +207,60 @@ async def mark_line_failed(webhook_event_id: str, error_class: str) -> None:
                         .where(InboundEvent.dedup_key == line_dedup_key(webhook_event_id))
                         .values(state="failed", last_error=(error_class or "unknown")[:100]))
     count("B", "failed", webhook_event_id)
+
+
+# ── P2-CHAIN-012: LINE 滞留監視（received/processing・点火ゲートの片翼） ──────
+# DRAFT_P2_DURABLE_IGNITION §3/§7: received（200 ACK 後 crash・batch 途中 503 等で
+# 誰にも claim されない滞留）と processing（stale）を能動警報する。
+# `STRIPE_EVENT_JOURNAL_ENABLED` に依存しない（check_journal_backlog とは独立の専用検査）。
+_LINE_STALE_RECV_ENV = "INBOUND_LINE_STALE_RECEIVED_SECONDS"
+_DEFAULT_LINE_STALE_RECEIVED_SECONDS = 3600
+
+
+def line_stale_received_seconds() -> int:
+    """received 滞留の警報閾値（env INBOUND_LINE_STALE_RECEIVED_SECONDS・既定3600秒）。"""
+    raw = os.environ.get(_LINE_STALE_RECV_ENV, "").strip()
+    try:
+        v = int(raw)
+    except ValueError:
+        return _DEFAULT_LINE_STALE_RECEIVED_SECONDS
+    return v if v > 0 else _DEFAULT_LINE_STALE_RECEIVED_SECONDS
+
+
+async def check_line_backlog() -> list[str]:
+    """LINE durable 台帳の滞留検査（daily_healthcheck から flag ON 時のみ呼ばれる）。
+
+    - 対象: provider='line' の received（閾値超）・processing（stale 閾値超）。
+    - flag OFF／DATABASE_URL 未設定は何もしない（現行 byte 同一・M-06 は呼出し側の
+      env 直読み import ゲートが担い、本関数自身も二重に flag を検査する）。
+    - 警報文面は件数と PK のみ（D17 流儀・event ID・payload・本文は載せない）。
+    """
+    if not durable_enabled():
+        return []
+    if not os.environ.get("DATABASE_URL"):
+        return []
+    problems: list[str] = []
+    recv_cut = _line_stale_cutoff(line_stale_received_seconds())
+    proc_cut = _line_stale_cutoff(line_stale_processing_seconds())
+    async with session_scope() as s:
+        recv = (await s.execute(
+            sa.select(InboundEvent.id).where(
+                InboundEvent.provider == "line",
+                InboundEvent.state == "received",
+                InboundEvent.received_at < recv_cut))).scalars().all()
+        proc = (await s.execute(
+            sa.select(InboundEvent.id).where(
+                InboundEvent.provider == "line",
+                InboundEvent.state == "processing",
+                sa.or_(InboundEvent.claimed_at.is_(None),
+                       InboundEvent.claimed_at < proc_cut)))).scalars().all()
+    if recv:
+        problems.append(
+            f"LINE received 滞留 {len(recv)}件（PK: {sorted(recv)[:10]}）: "
+            "claim されないまま閾値超過。再配送で回収されない滞留クラスのため "
+            "DRAFT_P2_DURABLE_IGNITION §6 の照合手順で個別確認")
+    if proc:
+        problems.append(
+            f"LINE processing stale {len(proc)}件（PK: {sorted(proc)[:10]}）: "
+            "runbook 2026-07-15_RV-05-13-fix5 §4 の reset 手順で回収")
+    return problems
