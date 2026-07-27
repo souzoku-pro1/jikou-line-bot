@@ -263,7 +263,8 @@ class TestProviderInvariant(_DbMixin):
             await s.execute(sa.insert(InboundEvent.__table__).values(**vals))
 
     def test_mixed_providers_separated(self):
-        # Stripe failed 26h（既存警報）/ LINE processing 26h（既存）/ kintone received 3h（新）
+        # Stripe failed 26h（E系）/ LINE processing 26h（RMC-M01: G系専任・E系非計上）/
+        # kintone received 3h（専用検査）
         asyncio.run(self._seed("s1", "stripe", "failed", 26))
         asyncio.run(self._seed("l1", "line", "processing", 26, claimed_age=26))
         asyncio.run(self._seed("k1", "kintone", "received", 3))
@@ -274,13 +275,13 @@ class TestProviderInvariant(_DbMixin):
         db.reset_for_tests()
         stripe_p = [p for p in problems if "stripe-journal-recovery" in p]
         kintone_p = [p for p in problems if "kintone滞留" in p]
-        # 既存 Stripe/LINE 警報は Stripe runbook 文言・件数に kintone を混ぜない
+        # E系警報は Stripe runbook 文言・件数に kintone を混ぜない
         self.assertTrue(stripe_p, problems)
         self.assertTrue(kintone_p, problems)
-        # Stripe/LINE 警報の PK に kintone 行が入っていない（provider 分離）
         joined = " ".join(stripe_p)
-        self.assertIn("processing", joined)
-        self.assertIn("failed", joined)
+        self.assertIn("failed", joined)                       # Stripe failed は計上
+        # RMC-M01: LINE processing 26h は E系に計上されない（G系=check_line_backlog 専任）
+        self.assertNotIn("processing が24時間超", " ".join(problems))
 
     def test_kintone_not_in_stripe_alert_when_only_stripe_flag(self):
         # kintone flag OFF なら kintone 行があっても既存監視は触れない（混入なし）
@@ -763,9 +764,10 @@ class TestMonitorOldestAndFailed(_DbMixin):
         stripe_p = " ".join(p for p in problems if "stripe-journal-recovery" in p)
         stuck = " ".join(p for p in problems if "kintone滞留(未処理)" in p)
         failed = " ".join(p for p in problems if "kintone失敗" in p)
-        # Stripe/LINE（provider!=kintone）: processing 1・failed 1・kintone 非混入
-        self.assertIn("processing が24時間超 1件", stripe_p)   # LINE processing
+        # RMC-M01: E系は provider='stripe' 限定 — Stripe failed 1 のみ。
+        # LINE processing は G系（check_line_backlog）専任で E系に出ない・kintone 非混入
         self.assertIn("failed が24時間超 1件", stripe_p)       # Stripe failed
+        self.assertNotIn("processing が24時間超", stripe_p)    # LINE は E系非計上
         self.assertNotIn("kintone", stripe_p)
         # kintone: received 1・failed 1・最古時刻完全一致
         self.assertIn("1件", stuck)

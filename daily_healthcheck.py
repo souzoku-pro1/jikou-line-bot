@@ -12,9 +12,18 @@
   D. App 32（同封物ブロックマスタ）の有効ブロックキーが App 30『同封物選択』の
      選択肢と同期しているか検証する（docs/architecture/02 §4.2・T2-1 で追加）
   E. inbound_event journal の滞留（processing/failed の24時間超残留）を検知する
-     （P1-005d で追加・journal 未開通/DB未設定時は静かにスキップ）
+     （P1-005d で追加・journal 未開通/DB未設定時は静かにスキップ。
+     **provider='stripe' 限定**〔RMC-M01 裁定〕＋kintone 専用検査〔RV-04c §4.2b〕。
+     LINE は G 専任）
   F. 業務通知チャネル（DISPATCHBOT）の dead-man。heartbeat の鮮度を検証し、
      長時間無音/未設定を検知する（P1-102 で追加・DB/heartbeat未適用時はスキップ）
+  G. LINE durable 台帳の滞留（provider='line'・received/processing の env 閾値
+     〔INBOUND_LINE_STALE_RECEIVED_SECONDS／INBOUND_LINE_STALE_PROCESSING_SECONDS・
+     既定 3600 秒〕超過）を検知する（P2-CHAIN-012 で追加・durable 点火 flag ON 時
+     のみ〔env 直読みゲート・M-06〕・実体は hub/durable_inbound.check_line_backlog）
+  H. inbound_event の未知 provider 検知（既知集合 {stripe, line, kintone} 以外の
+     行が存在したら警報・provider 名と件数のみ・MAIN-CONS-fix2 M01 で追加。
+     provider 別専任監視〔E/G/kintone〕のいずれにも載らない行の沈黙滞留を遮断）
 
 異常時のみ LINE Push で管理者に通知する。正常時はログのみ。
 
@@ -183,7 +192,8 @@ def check_templates() -> list[str]:
 async def check_journal_backlog() -> list[str]:
     """journal（inbound_event）の滞留を検知し、問題のリストを返す。
 
-    検知対象:
+    検知対象（RMC-M01: provider='stripe' 限定。LINE は監視項目G＝
+    hub/durable_inbound.check_line_backlog 専任・kintone は本関数内の専用検査）:
       - state=processing で claimed_at が24時間超過（NULL=列追加前の行も対象）
       - state=failed で received_at が24時間超過
     閾値24hの根拠: Stripeの自動再送（指数バックオフ・最大3日）が生きている間は
@@ -199,10 +209,13 @@ async def check_journal_backlog() -> list[str]:
     if not os.environ.get("DATABASE_URL"):
         return []
 
-    # RV-04c D2-M03: provider 次元で分離集計する。既存 Stripe/LINE 監視（STRIPE_EVENT_JOURNAL_
-    # ENABLED ゲート・24h・Stripe runbook）は **provider != kintone に限定**して不変を保ち、
-    # kintone は §4.2b の専用検査（KINTONE_EVENT_DEDUP_ENABLED ゲート・既定1h・専用 runbook）
-    # として別警報にする。どちらの flag も OFF なら何も見ない（現行 byte 同一）。
+    # RV-04c D2-M03 → RMC-M01（裁定）: provider 次元で分離集計する。
+    # E 系（STRIPE_EVENT_JOURNAL_ENABLED ゲート・24h・Stripe runbook）は
+    # **provider == 'stripe' に限定**（旧 != kintone を置換。LINE は G 系
+    # 〔hub/durable_inbound.check_line_backlog・env 閾値既定 1h〕の専任とし、
+    # 24h/1h の二重計上と閾値矛盾を解消）。kintone は §4.2b の専用検査
+    # （KINTONE_EVENT_DEDUP_ENABLED ゲート・既定1h・専用 runbook）として別警報。
+    # どちらの flag も OFF なら何も見ない。
     stripe_on = os.environ.get("STRIPE_EVENT_JOURNAL_ENABLED") == "1"
     kintone_on = os.environ.get("KINTONE_EVENT_DEDUP_ENABLED", "").strip().lower() \
         in ("1", "true", "on", "yes")
@@ -220,16 +233,17 @@ async def check_journal_backlog() -> list[str]:
     try:
         async with session_scope() as session:
             if stripe_on:
-                # 既存 Stripe/LINE: processing（stale）/failed が24時間超（kintone を除外）
+                # RMC-M01: Stripe のみ（processing（stale）/failed が24時間超）。
+                # LINE は G 系（check_line_backlog）専任・kintone は下の専用検査
                 stuck = (await session.execute(
                     sa.select(InboundEvent.id).where(
-                        InboundEvent.provider != "kintone",
+                        InboundEvent.provider == "stripe",
                         InboundEvent.state == "processing",
                         sa.or_(InboundEvent.claimed_at.is_(None),
                                InboundEvent.claimed_at < cutoff24)))).scalars().all()
                 failed = (await session.execute(
                     sa.select(InboundEvent.id).where(
-                        InboundEvent.provider != "kintone",
+                        InboundEvent.provider == "stripe",
                         InboundEvent.state == "failed",
                         InboundEvent.received_at < cutoff24))).scalars().all()
                 if stuck:
@@ -289,6 +303,43 @@ async def check_journal_backlog() -> list[str]:
     if not problems:
         logger.info("journal backlog OK")
     return problems
+
+
+# ══════════════════════════════════════════════════════════════
+# 監視項目H: inbound_event の未知 provider 検知（MAIN-CONS-fix2 M01・裁定済み）
+# ══════════════════════════════════════════════════════════════
+
+_KNOWN_PROVIDERS = ("stripe", "line", "kintone")
+
+
+async def check_unknown_providers() -> list[str]:
+    """既知集合 {stripe, line, kintone} 以外の provider 行を検知する。
+
+    provider 別の専任監視（E=stripe／G=line／kintone 専用検査）はいずれも既知集合を
+    前提とするため、未知 provider の行は**どの監視にも載らない**（沈黙滞留の芽）。
+    存在したら警報する。**本文は provider 名と件数のみ**（redaction 規律維持・
+    event ID/dedup_key/payload は載せない）。
+    DATABASE_URL 未設定・テーブル不在は静かにスキップ（E と同じ lazy 原則）。
+    """
+    if not os.environ.get("DATABASE_URL"):
+        return []
+    import sqlalchemy as sa
+
+    from hub.db import session_scope
+    from hub.inbound_event import InboundEvent
+    try:
+        async with session_scope() as session:
+            rows = (await session.execute(
+                sa.select(InboundEvent.provider, sa.func.count())
+                .where(InboundEvent.provider.notin_(_KNOWN_PROVIDERS))
+                .group_by(InboundEvent.provider))).all()
+    except (sa.exc.ProgrammingError, sa.exc.OperationalError) as e:
+        if "inbound_event" in str(e).lower():
+            return []
+        raise
+    return [f"未知provider検知: {p} {n}件"
+            "（provider 別滞留監視のいずれにも載らないため要確認）"
+            for p, n in sorted(rows)]
 
 
 # ══════════════════════════════════════════════════════════════
@@ -412,6 +463,10 @@ async def run_healthcheck() -> list[str]:
     except Exception as e:
         # DB接続情報が例外本文に含まれ得るため分類のみ（RCF-M05流儀）
         problems.append(f"journal滞留監視の実行自体が失敗: {type(e).__name__}")
+    try:
+        problems += await check_unknown_providers()  # 監視項目H（MAIN-CONS-fix2 M01）
+    except Exception as e:
+        problems.append(f"未知provider監視の実行自体が失敗: {type(e).__name__}")
     try:
         problems += await check_business_notify_liveness()  # 監視項目F（P1-102）
     except Exception as e:
