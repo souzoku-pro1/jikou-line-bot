@@ -31,6 +31,13 @@ _PII_RES = [
     re.compile(r"\d{3}-\d{4}"),                     # 郵便番号様
     re.compile(r"\d{7,}"),                          # 長数字列（口座様）
     re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+"),  # メール様
+    # fix1 M01: 金額一般（実額）。丸め帯「◯万円台」「数万円」は数字が円に直結
+    # しないため非該当（許可・allowlist の meta.amount_band と整合）
+    re.compile(r"[¥￥]\s?\d"),                      # 通貨記号+数字
+    re.compile(r"\d[\d,]{2,}円"),                   # 実額の円表記（44,000円 等）
+    # fix1 M01: 住所・口座 sentinel（代表形）
+    re.compile(r"\d+(丁目|番地|号室)"),
+    re.compile(r"口座番号|普通預金\s?\d+"),
 ]
 
 
@@ -98,12 +105,17 @@ class TestSyntheticThreads(unittest.TestCase):
                     [x for x in t["turns"] if x["role"] == "assistant"],
                     t["thread_id"])
 
-    def test_no_pii_like_patterns(self):
+    def test_no_pii_like_patterns_machine_layer(self):
+        """機械層の PII 検査（fix1 H02: 特例除外なしの全文検査）。
+
+        保証範囲の契約（fix1 M01・二層）: 本テストが保証するのは**パターンで
+        機械検出できる類型**（電話/郵便/長数字列/メール/実額金額/住所・口座
+        sentinel）のみ。氏名等のパターン化できない類型は**固定24本の目視
+        レビュー**（Codex レビュー＋[人]）が第二層として担う。"""
         for t in THREADS:
             for turn in t["turns"]:
                 for rx in _PII_RES:
-                    # 費用定型の「44,000円」は桁区切り付き・長数字列に該当しない
-                    self.assertIsNone(rx.search(turn["text"].replace("44,000", "")),
+                    self.assertIsNone(rx.search(turn["text"]),
                                       (t["thread_id"], rx.pattern))
 
 
@@ -137,21 +149,83 @@ class TestMetrics(unittest.TestCase):
         self.assertEqual(len(agg["per_thread"]), len(THREADS))
 
 
+_G0_BANNED = {"chat_responder", "main", "claude_gateway", "hub"}
+
+
+def _g0_scan_static_imports(src: str) -> list[str]:
+    """旧検査（fix1 前）: 静的 Import/ImportFrom のみを見る（メタテスト用に保存）。"""
+    import ast
+    out = []
+    for node in ast.walk(ast.parse(src)):
+        if isinstance(node, ast.Import):
+            out += [al.name for al in node.names
+                    if al.name.split(".")[0] in _G0_BANNED]
+        elif isinstance(node, ast.ImportFrom):
+            if (node.module or "").split(".")[0] in _G0_BANNED:
+                out.append(node.module or "")
+    return out
+
+
+def _g0_scan(src: str) -> list[str]:
+    """G0 検査（fix1 H01 強化版）。
+
+    検出対象: (1) 静的 Import/ImportFrom（禁止 module）
+    (2) __import__(...) 呼出し (3) importlib.import_module(...) 呼出し
+    （from importlib import import_module の別名含む） (4) exec(...) 呼出し。
+    (2)-(4) は引数によらず**呼出し自体を違反**とする（相1 ハーネスに動的
+    import/実行時コード実行の正当用途は無い）。
+
+    残余（静的解析の限界・規律とレビューに委任）: getattr(builtins, 変数)・
+    eval で組み立てた import 等の**完全動的経路**は検出できない。"""
+    import ast
+    out = list(_g0_scan_static_imports(src))
+    tree = ast.parse(src)
+    import_module_aliases = {"import_module"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module == "importlib":
+            for al in node.names:
+                if al.name == "import_module":
+                    import_module_aliases.add(al.asname or al.name)
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        f = node.func
+        if isinstance(f, ast.Name) and f.id in ({"__import__", "exec"}
+                                                | import_module_aliases):
+            out.append(f"dynamic:{f.id}")
+        elif (isinstance(f, ast.Attribute) and f.attr == "import_module"
+              and isinstance(f.value, ast.Name) and f.value.id == "importlib"):
+            out.append("dynamic:importlib.import_module")
+    return out
+
+
 class TestG0Separation(unittest.TestCase):
     def test_lineq_does_not_import_production_response_modules(self):
-        # G0 規律: 相1 ハーネスは本番応答経路（§2.1 の変更対象外）を import しない
-        import ast
-        banned = {"chat_responder", "main", "claude_gateway", "hub"}
+        # G0 規律: 相1 ハーネスは本番応答経路（§2.1 の変更対象外）へ静的にも
+        # 動的にも到達しない（検出対象と残余は _g0_scan docstring）
         for f in Path("lineq").glob("*.py"):
-            tree = ast.parse(f.read_text(encoding="utf-8"))
-            for node in ast.walk(tree):
-                if isinstance(node, ast.Import):
-                    for al in node.names:
-                        self.assertNotIn(al.name.split(".")[0], banned,
-                                         (f.name, al.name))
-                elif isinstance(node, ast.ImportFrom):
-                    mod = (node.module or "").split(".")[0]
-                    self.assertNotIn(mod, banned, (f.name, node.module))
+            self.assertEqual(_g0_scan(f.read_text(encoding="utf-8")), [], f.name)
+
+    def test_meta_dynamic_import_caught_by_new_scan_only(self):
+        """fix1 H01 メタテスト: 旧検査（静的 import のみ）では通過し、
+        新検査では FAIL する違反 fixture を固定（検査強化の実効性を pin）。"""
+        fixtures = {
+            "dunder_import": "x = __import__('chat_responder')\n",
+            "importlib_module": ("import importlib\n"
+                                 "m = importlib.import_module('chat_responder')\n"),
+            "importlib_from": ("from importlib import import_module as im\n"
+                               "m = im('main')\n"),
+            "exec_call": "exec('import chat_responder')\n",
+        }
+        for label, src in fixtures.items():
+            with self.subTest(case=label):
+                self.assertEqual(_g0_scan_static_imports(src), [], label)  # 旧: 通過
+                self.assertTrue(_g0_scan(src), label)                      # 新: 検出
+
+    def test_meta_static_import_still_caught(self):
+        src = "import chat_responder\n"
+        self.assertTrue(_g0_scan_static_imports(src))
+        self.assertTrue(_g0_scan(src))
 
 
 if __name__ == "__main__":
