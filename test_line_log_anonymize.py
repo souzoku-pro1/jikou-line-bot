@@ -196,8 +196,9 @@ class TestSummaryShape(unittest.TestCase):
 
 
 class TestOneWayPipeline(unittest.TestCase):
-    """fix1 H04/H02: convert=中間＋summary 別ファイル・checklist なし →
-    reverify=全件再検査・PASS 時のみ最終＋checklist。"""
+    """fix1 H04/H02→fix3 H01: convert=中間＋summary 別ファイル・checklist なし →
+    reverify=全件再検査・PASS 時のみ staging 生成→ディレクトリ一度の rename で
+    原子公開（final.json/summary.json/checklist.csv）。"""
 
     def _tmp(self):
         import tempfile
@@ -217,6 +218,12 @@ class TestOneWayPipeline(unittest.TestCase):
                         "role": "assistant", "message": "こんにちは。",
                         "category": "挨拶・雑談", "auto_sent": "yes"})
 
+    def _mid(self, d):
+        self._write_csv(f"{d}/a28.csv")
+        main(["convert", "--app28-csv", f"{d}/a28.csv",
+              "--out", f"{d}/mid.json", "--summary-out", f"{d}/s1.json"])
+        return f"{d}/mid.json"
+
     def test_convert_outputs_corpus_and_separate_summary_no_checklist(self):
         d = self._tmp()
         self._write_csv(f"{d}/a28.csv")
@@ -226,20 +233,18 @@ class TestOneWayPipeline(unittest.TestCase):
         corpus = json.loads(Path(f"{d}/mid.json").read_text(encoding="utf-8"))
         self.assertEqual(set(corpus), {"threads"})       # H02: allowlist のみ
         summary = json.loads(Path(f"{d}/sum.json").read_text(encoding="utf-8"))
-        self.assertIn("main_shortfall", summary)          # 運用メタは別ファイル
-        self.assertFalse(list(Path(d).glob("*checklist*")))   # H04: 中間では生成しない
+        self.assertIn("main_shortfall", summary)
+        self.assertFalse(list(Path(d).glob("*checklist*")))
 
-    def test_reverify_pass_emits_final_and_checklist(self):
+    def test_reverify_pass_publishes_three_artifacts_atomically(self):
+        # fix3 (iii): 正常系で公開後に3成果物が揃い staging は残らない
         d = self._tmp()
-        self._write_csv(f"{d}/a28.csv")
-        main(["convert", "--app28-csv", f"{d}/a28.csv",
-              "--out", f"{d}/mid.json", "--summary-out", f"{d}/s1.json"])
-        rc = main(["reverify", "--in", f"{d}/mid.json",
-                   "--out", f"{d}/final.json", "--summary-out", f"{d}/s2.json",
-                   "--checklist-out", f"{d}/check.csv"])
+        mid = self._mid(d)
+        rc = main(["reverify", "--in", mid, "--out-dir", f"{d}/out"])
         self.assertEqual(rc, 0)
-        self.assertTrue(Path(f"{d}/final.json").exists())
-        self.assertTrue(Path(f"{d}/check.csv").exists())
+        for name in ("final.json", "summary.json", "checklist.csv"):
+            self.assertTrue(Path(f"{d}/out/{name}").exists(), name)
+        self.assertFalse(Path(f"{d}/out.staging").exists())
 
     def test_reverify_fail_closed_on_tampered_intermediate(self):
         d = self._tmp()
@@ -266,13 +271,10 @@ class TestOneWayPipeline(unittest.TestCase):
                 p = f"{d}/{label}.json"
                 Path(p).write_text(json.dumps(doc, ensure_ascii=False),
                                    encoding="utf-8")
-                rc = main(["reverify", "--in", p,
-                           "--out", f"{d}/{label}_final.json",
-                           "--summary-out", f"{d}/{label}_s.json",
-                           "--checklist-out", f"{d}/{label}_c.csv"])
-                self.assertEqual(rc, 1)                          # 非0終了
-                self.assertFalse(Path(f"{d}/{label}_c.csv").exists())  # 生成不可
-                self.assertFalse(Path(f"{d}/{label}_final.json").exists())
+                rc = main(["reverify", "--in", p, "--out-dir", f"{d}/{label}_out"])
+                self.assertEqual(rc, 1)
+                self.assertFalse(Path(f"{d}/{label}_out").exists())
+                self.assertFalse(Path(f"{d}/{label}_out.staging").exists())
 
     def test_reverify_applies_fallback_ids(self):
         d = self._tmp()
@@ -285,11 +287,9 @@ class TestOneWayPipeline(unittest.TestCase):
                                          encoding="utf-8")
         Path(f"{d}/fb.json").write_text(json.dumps(["C001"]), encoding="utf-8")
         rc = main(["reverify", "--in", f"{d}/mid.json",
-                   "--fallback-ids", f"{d}/fb.json",
-                   "--out", f"{d}/final.json", "--summary-out", f"{d}/s.json",
-                   "--checklist-out", f"{d}/c.csv"])
+                   "--fallback-ids", f"{d}/fb.json", "--out-dir", f"{d}/out"])
         self.assertEqual(rc, 0)
-        s = json.loads(Path(f"{d}/s.json").read_text(encoding="utf-8"))
+        s = json.loads(Path(f"{d}/out/summary.json").read_text(encoding="utf-8"))
         self.assertEqual(s["rare_counts"]["rare:fallback"], 1)
         self.assertEqual(s["main_counts"]["main:demoted"], 0)    # 二重計上なし
 
@@ -315,69 +315,75 @@ class TestOneWayPipeline(unittest.TestCase):
                                    encoding="utf-8")
                 buf = io.StringIO()
                 rc = main(["reverify", "--in", p,
-                           "--out", f"{d}/{label}_f.json",
-                           "--summary-out", f"{d}/{label}_s.json",
-                           "--checklist-out", f"{d}/{label}_c.csv"], out=buf)
+                           "--out-dir", f"{d}/{label}_out"], out=buf)
                 self.assertEqual(rc, 1)
                 self.assertNotIn(bad, buf.getvalue())            # 値の非反射
-                self.assertIn("threads[0]", buf.getvalue())      # index+固定 reason
-                self.assertFalse(Path(f"{d}/{label}_c.csv").exists())
+                self.assertIn("threads[0]", buf.getvalue())
+                self.assertFalse(Path(f"{d}/{label}_out").exists())
         with self.subTest(case="non_string"):
             doc = {"threads": [{"thread_id": 12345, "layer": "main:auto",
                                 "turns": [{"role": "user", "text": "x"}]}]}
             p = f"{d}/nonstr.json"
             Path(p).write_text(json.dumps(doc), encoding="utf-8")
             buf = io.StringIO()
-            rc = main(["reverify", "--in", p, "--out", f"{d}/n_f.json",
-                       "--summary-out", f"{d}/n_s.json",
-                       "--checklist-out", f"{d}/n_c.csv"], out=buf)
+            rc = main(["reverify", "--in", p, "--out-dir", f"{d}/n_out"], out=buf)
             self.assertEqual(rc, 1)
             self.assertNotIn("12345", buf.getvalue())
-            self.assertFalse(Path(f"{d}/n_c.csv").exists())
+            self.assertFalse(Path(f"{d}/n_out").exists())
 
-    def test_reverify_refuses_existing_outputs(self):
-        """fix2 H03(i): 既存成果物あり→開始前拒否・旧成果物は不変（PASS 外観なし）。"""
-        import io
-        d = self._tmp()
-        self._write_csv(f"{d}/a28.csv")
-        main(["convert", "--app28-csv", f"{d}/a28.csv",
-              "--out", f"{d}/mid.json", "--summary-out", f"{d}/s1.json"])
-        # 1回目: 正常に最終成果物を生成
-        main(["reverify", "--in", f"{d}/mid.json", "--out", f"{d}/final.json",
-              "--summary-out", f"{d}/s2.json", "--checklist-out", f"{d}/c.csv"])
-        old_final = Path(f"{d}/final.json").read_text(encoding="utf-8")
-        # 2回目: 検証 FAIL する入力でも、既存成果物があるため開始前拒否
-        bad = {"threads": [{"thread_id": "C001", "layer": "main:auto",
-                            "turns": [{"role": "user", "text": "あ" * 401}]}]}
-        Path(f"{d}/bad.json").write_text(json.dumps(bad, ensure_ascii=False),
-                                         encoding="utf-8")
-        buf = io.StringIO()
-        rc = main(["reverify", "--in", f"{d}/bad.json", "--out", f"{d}/final.json",
-                   "--summary-out", f"{d}/s2.json",
-                   "--checklist-out", f"{d}/c.csv"], out=buf)
-        self.assertEqual(rc, 1)
-        self.assertIn("既存の成果物", buf.getvalue())
-        self.assertEqual(Path(f"{d}/final.json").read_text(encoding="utf-8"),
-                         old_final)                              # 旧成果物は不変
-
-    def test_reverify_checklist_write_failure_leaves_no_partials(self):
-        """fix2 H03(ii): checklist 書込み失敗時に部分成果物・一時ファイルを残さない。"""
+    def test_reverify_refuses_existing_outputs_and_staging(self):
+        """fix3 (ii): 公開先の既存・staging 残骸は開始前拒否（旧成果物は不変）。"""
         import io
         import os
         d = self._tmp()
-        self._write_csv(f"{d}/a28.csv")
-        main(["convert", "--app28-csv", f"{d}/a28.csv",
-              "--out", f"{d}/mid.json", "--summary-out", f"{d}/s1.json"])
-        os.makedirs(f"{d}/c.csv.tmp")            # checklist の一時書込み先を潰す
+        mid = self._mid(d)
+        main(["reverify", "--in", mid, "--out-dir", f"{d}/out"])   # 1回目=成功
+        old_final = Path(f"{d}/out/final.json").read_text(encoding="utf-8")
         buf = io.StringIO()
-        rc = main(["reverify", "--in", f"{d}/mid.json", "--out", f"{d}/final.json",
-                   "--summary-out", f"{d}/s2.json",
-                   "--checklist-out", f"{d}/c.csv"], out=buf)
+        rc = main(["reverify", "--in", mid, "--out-dir", f"{d}/out"], out=buf)
+        self.assertEqual(rc, 1)
+        self.assertIn("既存の成果物", buf.getvalue())
+        self.assertEqual(Path(f"{d}/out/final.json").read_text(encoding="utf-8"),
+                         old_final)                              # 旧成果物は不変
+        os.makedirs(f"{d}/out2.staging")                         # staging 残骸の拒否
+        buf2 = io.StringIO()
+        rc2 = main(["reverify", "--in", mid, "--out-dir", f"{d}/out2"], out=buf2)
+        self.assertEqual(rc2, 1)
+        self.assertIn("staging の残骸", buf2.getvalue())
+        self.assertFalse(Path(f"{d}/out2").exists())
+
+    def test_reverify_publish_failure_leaves_no_artifacts(self):
+        """fix3 (i): 公開（rename）段の失敗→非0終了・公開先に成果物ゼロ・
+        staging 除去・未処理例外なし。"""
+        import io
+        from unittest.mock import patch
+
+        import tools.line_log_anonymize as lla
+        d = self._tmp()
+        mid = self._mid(d)
+        buf = io.StringIO()
+        with patch.object(lla, "_publish", side_effect=OSError("occupied")):
+            rc = main(["reverify", "--in", mid, "--out-dir", f"{d}/out"], out=buf)
+        self.assertEqual(rc, 1)                                  # 未処理例外なし
+        self.assertIn("公開（rename）に失敗", buf.getvalue())
+        self.assertFalse(Path(f"{d}/out").exists())              # 公開先ゼロ
+        self.assertFalse(Path(f"{d}/out.staging").exists())      # staging 除去
+
+    def test_reverify_staging_write_failure_leaves_no_partials(self):
+        """fix2 H03(ii) 継承: staging 内書込み失敗→部分成果物ゼロ・staging 除去。"""
+        import io
+        from unittest.mock import patch
+
+        import tools.line_log_anonymize as lla
+        d = self._tmp()
+        mid = self._mid(d)
+        buf = io.StringIO()
+        with patch.object(lla, "_write_json", side_effect=OSError("disk")):
+            rc = main(["reverify", "--in", mid, "--out-dir", f"{d}/out"], out=buf)
         self.assertEqual(rc, 1)
         self.assertIn("書込みに失敗", buf.getvalue())
-        self.assertFalse(Path(f"{d}/final.json").exists())       # 部分成果物なし
-        self.assertFalse(Path(f"{d}/s2.json").exists())
-        self.assertFalse([x for x in Path(d).glob("*.tmp") if x.is_file()])  # 一時ファイルなし（fixture の dir は除く）
+        self.assertFalse(Path(f"{d}/out").exists())
+        self.assertFalse(Path(f"{d}/out.staging").exists())
 
 
 if __name__ == "__main__":

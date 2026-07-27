@@ -33,9 +33,16 @@ synthetic_needed）を再計算する（demoted との二重計上なし）。
 import argparse
 import csv
 import json
+import os
 import re
+import shutil
 import sys
 from datetime import datetime, timedelta
+
+
+def _publish(staging: str, out_dir: str) -> None:
+    """staging ディレクトリを公開先へ一度の rename で確定（fix3 H01・テスト seam）。"""
+    os.rename(staging, out_dir)
 
 THREAD_GAP_HOURS = 72          # スレッド境界（§4.1 固定）
 MAIN_CAP = 10                  # 主要3群 各10本（§4.1）
@@ -402,9 +409,10 @@ def main(argv=None, out=sys.stdout) -> int:
     v.add_argument("--in", dest="infile", required=True)
     v.add_argument("--fallback-ids", default=None,
                    help="fallback 補正 thread_id の JSON list（H03・[人]突合済み）")
-    v.add_argument("--out", required=True, help="検証済み最終 corpus JSON")
-    v.add_argument("--summary-out", required=True)
-    v.add_argument("--checklist-out", required=True)
+    v.add_argument("--out-dir", dest="out_dir", required=True,
+                   help="最終成果物の公開先ディレクトリ（fix3 H01: "
+                        "final.json/summary.json/checklist.csv を staging で生成し"
+                        "一度の rename で原子公開）")
     args = ap.parse_args(argv)
 
     if args.cmd == "convert":
@@ -416,18 +424,27 @@ def main(argv=None, out=sys.stdout) -> int:
             json.dumps(result["summary"], ensure_ascii=False) + "\n")
         return 0
 
-    # fix2 H03: 出力の原子化 — (1) 既存成果物があれば開始前に拒否（上書き・
-    # 「PASS 外観」の残置を構造的に遮断） (2) 3成果物は一時ファイルへ生成し、
-    # 全成功後に原子的 rename（os.replace）で確定 (3) 途中失敗時は一時ファイルを
-    # 除去し、部分成果物を残さない。
-    import os
-    targets = (args.out, args.summary_out, args.checklist_out)
-    existing = [p for p in targets if os.path.exists(p)]
-    if existing:
+    # fix2 H03→fix3 H01（裁定済み・staging ディレクトリ方式）:
+    # (1) 3成果物は同一 staging ディレクトリ内に全て生成し、全成功後に
+    #     **ディレクトリ一度の rename（_publish）で原子公開**（個別3回の
+    #     os.replace は廃止＝rename 途中失敗による部分成果物を構造的に排除）。
+    # (2) 開始前検査: 公開先の既存拒否・staging 残骸の拒否（衝突拒否）。
+    # (3) 公開段の失敗も捕捉（非0終了・公開先に部分成果物ゼロ・staging は除去、
+    #     除去不能なら残骸パスを明示レポート・未処理例外なし）。
+    out_dir = args.out_dir.rstrip("/\\")
+    staging = out_dir + ".staging"
+    if os.path.exists(out_dir):
         out.write(json.dumps(
             {"result": "FAIL",
-             "errors": ["出力先に既存の成果物があります（上書きしません）。"
+             "errors": ["公開先に既存の成果物ディレクトリがあります（上書きしません）。"
                         "移動/削除のうえ再実行してください"]},
+            ensure_ascii=False) + "\n")
+        return 1
+    if os.path.exists(staging):
+        out.write(json.dumps(
+            {"result": "FAIL",
+             "errors": [f"staging の残骸があります: {staging}"
+                        "（内容を確認のうえ除去して再実行してください）"]},
             ensure_ascii=False) + "\n")
         return 1
 
@@ -443,28 +460,38 @@ def main(argv=None, out=sys.stdout) -> int:
                              ensure_ascii=False) + "\n")
         return 1                                 # PASS 前は checklist 生成・引渡し不可
 
-    tmps = tuple(p + ".tmp" for p in targets)
+    def _cleanup_staging() -> str | None:
+        shutil.rmtree(staging, ignore_errors=True)
+        return staging if os.path.exists(staging) else None
     try:
-        _write_json(tmps[0], {"threads": final["threads"]})
-        _write_json(tmps[1], final["summary"])
-        with open(tmps[2], "w", encoding="utf-8-sig", newline="") as f:
+        os.makedirs(staging)
+        _write_json(os.path.join(staging, "final.json"),
+                    {"threads": final["threads"]})
+        _write_json(os.path.join(staging, "summary.json"), final["summary"])
+        with open(os.path.join(staging, "checklist.csv"), "w",
+                  encoding="utf-8-sig", newline="") as f:
             w = csv.DictWriter(f, fieldnames=["thread_id", "残存PII目視確認",
                                               "確認者", "確認日"])
             w.writeheader()
             w.writerows(final["checklist"])
     except OSError:
-        for t in tmps:                           # 部分成果物を残さない
-            try:
-                os.remove(t)
-            except OSError:
-                pass
-        out.write(json.dumps(
-            {"result": "FAIL",
-             "errors": ["出力書込みに失敗しました（部分成果物は残していません）"]},
-            ensure_ascii=False) + "\n")
+        residue = _cleanup_staging()
+        msgs = ["出力書込みに失敗しました（公開先に成果物は置いていません）"]
+        if residue:
+            msgs.append(f"staging 残骸が除去できませんでした: {residue}")
+        out.write(json.dumps({"result": "FAIL", "errors": msgs},
+                             ensure_ascii=False) + "\n")
         return 1
-    for t, p in zip(tmps, targets):              # 全成功後に原子的 rename で確定
-        os.replace(t, p)
+    try:
+        _publish(staging, out_dir)               # 一度の rename で原子公開（fix3）
+    except OSError:
+        residue = _cleanup_staging()
+        msgs = ["公開（rename）に失敗しました（公開先に部分成果物はありません）"]
+        if residue:
+            msgs.append(f"staging 残骸が除去できませんでした: {residue}")
+        out.write(json.dumps({"result": "FAIL", "errors": msgs},
+                             ensure_ascii=False) + "\n")
+        return 1
     out.write(json.dumps({"result": "PASS", **final["summary"]},
                          ensure_ascii=False) + "\n")
     return 0

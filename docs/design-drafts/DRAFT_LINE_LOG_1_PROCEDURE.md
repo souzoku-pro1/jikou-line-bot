@@ -43,18 +43,24 @@
    （合成で充足）。突合根拠を work-log に記録。
 7. **reverify（全件再検査・fix1 H04）**:
    `python tools/line_log_anonymize.py reverify --in mid.json --fallback-ids fb.json
-   --out final.json --summary-out summary2.json --checklist-out checklist.csv`
+   --out-dir out`
    — schema／400字／enum（role/category/delivery/layer）／残存パターン／
-   allowlist 外フィールドを**全件再検査**。**FAIL（非0終了）の間は checklist・
-   最終成果物は生成されない＝引渡し不可**。修正して PASS まで繰り返す。
-8. **標本充足の確認（fix1 M02/H03）**: summary2 を確認 —
+   allowlist 外フィールドを**全件再検査**。**FAIL（非0終了）の間は成果物は一切
+   生成されない＝引渡し不可**。修正して PASS まで繰り返す。
+   **公開は staging ディレクトリ一括 rename（fix3 H01）**: 3成果物
+   （out/final.json・out/summary.json・out/checklist.csv）は staging
+   （out.staging）内に全て生成後、一度の rename で原子公開される。公開先
+   ディレクトリの既存・staging 残骸は開始前拒否（上書きしない）。公開段の
+   失敗時も公開先に部分成果物は残らない（staging は除去・除去不能時は
+   残骸パスが明示される→[人]が確認のうえ除去）。
+8. **標本充足の確認（fix1 M02/H03）**: out/summary.json を確認 —
    - `main_shortfall` に**正の値がある場合は G2 停止**（不足の扱い＝抽出期間延長か
      不足受容かを司令塔裁定へ）。
    - `rare_counts`／`synthetic_needed` は数値で確認（不足層は lineq 合成スレッドで
      充足・実例数と合成数は別集計のまま記録）。
-9. **目視チェックリスト**: checklist.csv にスレッドごとの残存 PII 無し確認を
+9. **目視チェックリスト**: out/checklist.csv にスレッドごとの残存 PII 無し確認を
    記入・署名（G2 の前提）。
-10. **引渡し**: final.json＋summary2.json＋checklist.csv を司令塔管理領域へ
+10. **引渡し**: 公開ディレクトリ out/（final.json＋summary.json＋checklist.csv）を司令塔管理領域へ
     （司令塔指定経路のみ）。
 11. **raw 削除**: App28/29 CSV・mid.json 等の中間ファイルを削除し、削除日時を
     work-log に記録（期限=export から7日以内・未完でも削除して再 export）。
@@ -93,11 +99,11 @@
 
 ## 6. 出力仕様（allowlist・§4.1 の固定仕様表に完全準拠）
 
-- final.json（corpus 本体）: `{"threads": [{thread_id, layer, turns:[{role, text,
+- out/final.json（corpus 本体）: `{"threads": [{thread_id, layer, turns:[{role, text,
   (assistant のみ) category, delivery}]}]}` — **allowlist フィールドのみ**。
-- summary2.json（**別ファイル**・運用メタデータ〔fix1 H02(ii)〕）: 件数・層分布・
+- out/summary.json（**別ファイル**・運用メタデータ〔fix1 H02(ii)〕）: 件数・層分布・
   不足数・除外理由のみ（本文・ID 系を含めない）。
-- checklist.csv: reverify PASS 時のみ生成（H04）。
+- out/checklist.csv: reverify PASS 時のみ生成（H04・staging 経由の原子公開=fix3 H01）。
 - **meta.amount_band/date_band は初回実行では不使用**（fix2 M01 裁定・§2-5。
   丸め粒度の[人]裁定〔§7-3〕→reverify schema への正式実装後に解禁。現状の
   reverify 完全限定 schema は meta を拒否する=現状維持）。
