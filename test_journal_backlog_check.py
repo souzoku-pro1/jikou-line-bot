@@ -262,5 +262,42 @@ class TestUnknownProviderDetection(_SqliteDbMixin):
             shutil.rmtree(tmp, ignore_errors=True)
 
 
+# ── MC3-L01: 監視項目H の run_healthcheck 結線（統合テスト） ─────────────────
+class TestUnknownProviderWiring(unittest.IsolatedAsyncioTestCase):
+    """H の problems が run_healthcheck() の最終 problems へ**ちょうど1回だけ**合流する。"""
+
+    async def test_h_problems_merged_exactly_once(self):
+        from contextlib import ExitStack
+        from unittest.mock import AsyncMock, MagicMock
+
+        import daily_healthcheck as hc
+        from channels import soufu_annai
+        sentinel = ("未知provider検知: ghost 9件"
+                    "（provider 別滞留監視のいずれにも載らないため要確認）")
+        checks = [("check_models", True), ("check_kintone_schema", True),
+                  ("check_templates", False), ("check_journal_backlog", True),
+                  ("check_business_notify_liveness", True)]
+        with ExitStack() as es:
+            for name, is_async in checks:
+                es.enter_context(patch.object(
+                    hc, name,
+                    AsyncMock(return_value=[]) if is_async
+                    else MagicMock(return_value=[])))
+            es.enter_context(patch.object(soufu_annai, "check_block_sync",
+                                          new_callable=AsyncMock, return_value=[]))
+            es.enter_context(patch.object(hc, "check_unknown_providers",
+                                          AsyncMock(return_value=[sentinel])))
+            notify = es.enter_context(patch.object(hc, "notify_admin_line",
+                                                   AsyncMock(return_value=True)))
+            env = {k: v for k, v in os.environ.items()
+                   if k not in ("INBOUND_EVENT_DURABLE_ENABLED",
+                                "KINTONE_WEBHOOK_TOKEN_NEXT")}
+            with patch.dict(os.environ, env, clear=True):
+                problems = await hc.run_healthcheck()
+        self.assertEqual(problems.count(sentinel), 1, problems)   # ちょうど1回
+        self.assertEqual(len(problems), 1, problems)              # 他検査の混入なし
+        notify.assert_awaited()   # 異常1件として通知経路にも乗る
+
+
 if __name__ == "__main__":
     unittest.main()

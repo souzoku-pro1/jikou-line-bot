@@ -280,23 +280,59 @@ async def main():
                 {'t': t, 'c': col})
             if not r.first():
                 ng.append(f'UNIQUE 不足: {t}.{col}')
-        # FK: processing_attempt.receipt_id → ingestion_receipt.id（ON DELETE CASCADE）
+        # FK 完全照合（fix3 H01(b): 子列・参照先 table.列・delete rule の3点を機械照合）
         r = await c.execute(sa.text(
-            "SELECT rc.delete_rule FROM information_schema.referential_constraints rc "
+            "SELECT kcu.column_name, ccu.table_name, ccu.column_name, rc.delete_rule "
+            "FROM information_schema.referential_constraints rc "
             "JOIN information_schema.table_constraints tc "
             "  ON tc.constraint_name = rc.constraint_name "
             " AND tc.table_schema = rc.constraint_schema "
+            "JOIN information_schema.key_column_usage kcu "
+            "  ON kcu.constraint_name = rc.constraint_name "
+            " AND kcu.constraint_schema = rc.constraint_schema "
+            "JOIN information_schema.constraint_column_usage ccu "
+            "  ON ccu.constraint_name = rc.constraint_name "
+            " AND ccu.constraint_schema = rc.constraint_schema "
             "WHERE rc.constraint_schema = current_schema() "
             "  AND tc.table_name = 'processing_attempt' "
             "  AND tc.constraint_type = 'FOREIGN KEY'"))
-        if 'CASCADE' not in [row[0] for row in r]:
-            ng.append('FK 不足: processing_attempt.receipt_id ON DELETE CASCADE')
-        # index（pg_indexes・H02: schemaname = current_schema() で限定・一覧表示）
+        fks = {tuple(row) for row in r}
+        if ('receipt_id', 'ingestion_receipt', 'id', 'CASCADE') not in fks:
+            ng.append('FK 不一致: processing_attempt.receipt_id → ingestion_receipt.id '
+                      f'ON DELETE CASCADE を満たさない（実測: {sorted(fks)}）')
+        # index 完全照合（fix3 H01(a): 名前＋対象列を pg_indexes.indexdef と機械照合）
         r = await c.execute(sa.text(
-            "SELECT indexname FROM pg_indexes WHERE schemaname = current_schema() "
-            "AND tablename IN ('inbound_event','ingestion_receipt','processing_attempt') "
-            "ORDER BY 1"))
-        print('indexes:', [row[0] for row in r])
+            "SELECT tablename, indexname, indexdef FROM pg_indexes "
+            "WHERE schemaname = current_schema() "
+            "AND tablename IN ('inbound_event','ingestion_receipt','processing_attempt')"))
+        idx = {(row[0], row[1]): row[2] for row in r}
+        import re as _re
+        def _idx_cols(indexdef):
+            m = _re.search(r'\(([^)]*)\)', indexdef)
+            return [x.strip().strip('"') for x in m.group(1).split(',')] if m else []
+        EXPECT_INDEXES = [   # (table, index名, 対象列の順序列)
+            ('inbound_event', 'ix_inbound_event_provider_state', ['provider', 'state']),
+            ('inbound_event', 'ix_inbound_event_received_at', ['received_at']),
+            ('ingestion_receipt', 'ix_ingestion_receipt_last_outcome', ['last_outcome']),
+        ]
+        for t, name, cols in EXPECT_INDEXES:
+            d = idx.get((t, name))
+            if d is None:
+                ng.append(f'index 不足: {t}.{name}')
+            elif _idx_cols(d) != cols:
+                ng.append(f'index 列不一致: {t}.{name} 期待={cols} 実測={_idx_cols(d)}')
+        # UNIQUE 系 index（auto 生成名があり得るため列で照合・UNIQUE 指定を必須とする）
+        EXPECT_UNIQUE_INDEXES = [
+            ('inbound_event', ['dedup_key']),
+            ('ingestion_receipt', ['idempotency_key']),
+            ('processing_attempt', ['receipt_id', 'epoch']),
+        ]
+        for t, cols in EXPECT_UNIQUE_INDEXES:
+            hit = any(it == t and 'UNIQUE' in d.upper() and _idx_cols(d) == cols
+                      for (it, _n), d in idx.items())
+            if not hit:
+                ng.append(f'UNIQUE index 不足: {t} {cols}')
+        print('indexes:', sorted(n for (_t, n) in idx))
         # 追加確認: signature_nonce（存在のみ・HMAC nonce は点火とは独立の基盤）
         r = await c.execute(sa.text(
             "SELECT 1 FROM information_schema.tables "
@@ -340,15 +376,41 @@ PY
   原因確定まで OFF に戻す）。
 - 起動 traceback なし・`Application startup complete`・`/health` 200（WebFetch）。
 
-**(c) LINE スモーク（M02: baseline との差分確認）**: テスト発話 1 件 → 応答正常＋
-(a)-4 の baseline に対し **provider='line' の行が 1 件だけ増加**していること・
-その行が **attempts=1・claimed_at 非 NULL**・received→processing→**done の terminal
-到達**を実見（§6 手順 3。行が 2 件以上増えた/attempts>1 は二重記録の疑い＝調査）。
+**(c) LINE スモーク（M02: baseline との差分確認＋fix3 M01: 対象一意化）**:
+テスト発話 1 件 → 応答正常＋(a)-4 の baseline に対し **provider='line' の行が 1 件だけ
+増加**・その行が **attempts=1・claimed_at 非 NULL**・received→processing→**done の
+terminal 到達**を実見（§6 手順 3。行が 2 件以上増えた/attempts>1 は二重記録の疑い＝調査）。
+**対象行の一意化（read-only 事後 SELECT）**: テストイベントの `external_event_id`
+（LINE webhookEventId・増分行から特定）で限定して確認する:
 
-**(d) sortation スモーク（M02）**: signed lane 1 件 → 200＋receipt 行＋従来どおり
-`[照会中]`/`[済]` リネーム（§6 手順 4）。加えて **processing_attempt に当該
-receipt の遷移行が記録され、(receipt_id, epoch) が一意**（uq_processing_attempt_
-receipt_epoch 違反なし）であることを確認。
+```sql
+-- read-only（SELECT のみ）。:ev はテストイベントの webhookEventId
+SELECT id, state, attempts, (claimed_at IS NOT NULL) AS claimed,
+       received_at, processed_at
+FROM inbound_event
+WHERE provider = 'line' AND external_event_id = :ev;
+-- 期待: 1 行のみ・state='done'・attempts=1・claimed=true
+```
+
+**(d) sortation スモーク（M02＋fix3 M01: 対象一意化）**: signed lane 1 件 → 200＋
+receipt 行＋従来どおり `[照会中]`/`[済]` リネーム（§6 手順 4）。加えて
+**processing_attempt に当該 receipt の遷移行が記録され、(receipt_id, epoch) が一意**
+（uq_processing_attempt_receipt_epoch 違反なし）であることを、**テストファイルの
+source file ID で限定した read-only 事後 SELECT** で確認する:
+
+```sql
+-- read-only（SELECT のみ）。:fid はテスト投入した Drive file ID
+SELECT id, last_outcome, epoch FROM ingestion_receipt WHERE source_file_id = :fid;
+-- 期待: 1 行のみ・last_outcome が正常終端・epoch >= 1
+SELECT receipt_id, epoch, phase, outcome FROM processing_attempt
+WHERE receipt_id = (SELECT id FROM ingestion_receipt WHERE source_file_id = :fid)
+ORDER BY epoch;
+-- 期待: (receipt_id, epoch) の重複なし・遷移が記録されている
+```
+
+**記録（fix3 M01）**: (a)-4 の baseline 実出力と (c)(d) の事後 SELECT 実出力は
+**同一の work-log（点火当日の作業記録）へ並べて保存**する（差分の突合を後から
+再検証できる形にする。出力は件数・state・時刻のみで PII を含まない）。
 
 ### 8.2 P1（点火後 24h の観測）
 
