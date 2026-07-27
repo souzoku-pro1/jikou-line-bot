@@ -242,3 +242,11 @@ async def claim_execution(app: kintone.KintoneApp, record: dict) -> bool:
 - 実装上の確定事項（DRAFT が未固定だった点の解決）: 封筒の チャネル/方向 は既存語彙
   「スキャン受領/受領」を踏襲（person_merge 同型）。専用チャネル値の新設は kintone
   フィールド変更（[人]・BLOCKED）を要するため初版では行わない。
+- **fix1 追記（R-P3-003A-1 対応）**:
+  - **ユニット種別（H03）**: 凍結 §2.1 どおり**案件由来**＝案件アプリ ID→ユニットの
+    写像で解決（App21=時効援用／App26=相続一般）。**案件から解決不能な場合は
+    起票せず異常扱い**（EnvelopePolicyError・kintone write ゼロ）。
+  - **導出コマンド票への申し送り（M02・固定事項）**: `file_heir_envelope` の失敗時
+    契約＝**search/create/policy いずれの失敗も例外伝播（握り潰し禁止・新規起票を
+    成功扱いにしない）**。リトライ判断は導出コマンド側の責務（冪等キーにより再実行
+    安全・契約 pin テスト=TestFailureBehaviorContract）。
