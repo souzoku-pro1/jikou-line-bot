@@ -1,0 +1,11 @@
+{
+  "_comment": "名称・アイコンはこのファイル1点の差し替えで変更する（P4-001 裁定）",
+  "name": "案件管理（仮）",
+  "short_name": "案件管理",
+  "start_url": "/app",
+  "scope": "/app",
+  "display": "standalone",
+  "background_color": "#ffffff",
+  "theme_color": "#1a3c6e",
+  "icons": []
+}
