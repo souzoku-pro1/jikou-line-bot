@@ -26,6 +26,12 @@
   （AIza 始まり）／token・secret・key へのリテラル代入／URL query 内の token 値。
 - **表示判定は repo 行・live 行の両側**で行い、どちらか該当なら両方を非表示（fix2・H01）。
 - secret 様の**ファイル名**は名前自体を出力しない（エラー経路含む）。
+- **制御文字（CR/LF 等）を含む表示名**は writer が拒否し、呼び出し側でマスクする
+  （fix3・P2DRIFT3-M01: 出力行の偽装・ログ注入の遮断）。
+
+## repo 正本の一意性（fix3・P2DRIFT3-L01）
+gas/ と legacy/gas/ に**同名ファイルが両方存在**する場合、照合先が不定になり
+false green の温床となるため、drift ではなく**入力エラー（exit 2）**として中断する。
 
 ## sink 政策との関係（fix2・H02）
 出力は print 直書きではなく**構造化 writer**（`report`／`report_content_line`）に一本化する。
@@ -64,9 +70,21 @@ _LANE_ENTRY_RE = re.compile(r"'(/[a-z/]+/ingest)':\s*(true|false)")
 _MASK_NAME = "(secret 様のためファイル名非表示).js"
 _MASK_LINE = "(secret 様のため非表示)"
 
+# M01(fix3): 制御文字（C0 領域＋DEL）。表示名に混入すると出力行の偽装が可能になる
+_CTRL_RE = re.compile(r"[\x00-\x1f\x7f]")
+
 
 def _is_secret_like(text: str) -> bool:
     return any(rx.search(text) for rx in _SECRET_RES)
+
+
+def _has_ctrl(text: str) -> bool:
+    return bool(_CTRL_RE.search(text))
+
+
+def _mask_needed(name: str) -> bool:
+    """表示名をマスクすべきか（secret 様 or 制御文字混入・fix3 M01）。"""
+    return _is_secret_like(name) or _has_ctrl(name)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -84,6 +102,11 @@ _TEMPLATES = {
                         "（SIGNED_LANES 比較不能のため検査を中断します）",
     "warn_secret_filename": "[warn] secret 様の文字列を含むファイル名の snapshot を検出"
                             "（名前は表示しません）。改名のうえ再実行を推奨します。",
+    "warn_ctrl_filename": "[warn] 制御文字を含むファイル名の snapshot を検出"
+                          "（名前は表示しません）。改名のうえ再実行を推奨します。",
+    "duplicate_repo_name": "[error] {name}: gas/ と legacy/gas/ の両方に存在します"
+                           "（repo 正本の一意性エラー・どちらかへ集約してから"
+                           "再実行してください）",
     "not_utf8": "[error] {name}: UTF-8 として読めません（貼付内容を確認してください）",
     "file_unreadable": "[error] {name}: 読み取りに失敗しました",
     "warn_secret_lines": "[warn] {name}: secret 様パターンを検出（行 {lines}）。"
@@ -106,10 +129,12 @@ _BOOLS = ("true", "false", "-")
 
 
 def _ok_display_name(v) -> bool:
-    """表示名: str かつ secret 様でない（マスク済み定数は常に可）。"""
+    """表示名: str かつ secret 様でも制御文字混入でもない（マスク済み定数は常に可）。
+    制御文字（CR/LF 等）は出力行の偽装が可能なため writer 側で拒否（fix3・M01）。"""
     if v in (_MASK_NAME, _MASK_LINE):
         return True
-    return isinstance(v, str) and len(v) <= 200 and not _is_secret_like(v)
+    return (isinstance(v, str) and len(v) <= 200
+            and not _is_secret_like(v) and not _has_ctrl(v))
 
 
 _FIELD_OK = {
@@ -191,6 +216,18 @@ def run_check(snapshot_dir: Path, repo_root: Path, show_content: bool = False,
         report(out, "bad_repo_root")
         return 2
 
+    # L01(fix3): gas/ と legacy/gas/ の同名衝突は照合先が不定＝入力エラー（exit 2）
+    names_per_sub = []
+    for sub in _REPO_SUBDIRS:
+        d = repo_root / sub
+        names_per_sub.append({p.name for p in d.glob("*.js")} if d.is_dir() else set())
+    duplicates = sorted(set.intersection(*names_per_sub))
+    if duplicates:
+        for dup in duplicates:
+            report(out, "duplicate_repo_name",
+                   name=(dup if not _mask_needed(dup) else _MASK_NAME))
+        return 2
+
     try:
         snaps = sorted(p for p in Path(snapshot_dir).glob("*.js") if p.is_file())
     except OSError:
@@ -210,10 +247,14 @@ def run_check(snapshot_dir: Path, repo_root: Path, show_content: bool = False,
     for snap in snaps:
         seen_names.add(snap.name)
         # H01: ファイル名自体が secret 様なら名前を出力しない（エラー経路含む）
+        # M01(fix3): 制御文字混入のファイル名も同様にマスク（出力行の偽装遮断）
         name_secret = _is_secret_like(snap.name)
-        disp = _MASK_NAME if name_secret else snap.name
+        name_masked = name_secret or _has_ctrl(snap.name)
+        disp = _MASK_NAME if name_masked else snap.name
         if name_secret:
             report(out, "warn_secret_filename")
+        elif name_masked:
+            report(out, "warn_ctrl_filename")
 
         # M01: 読取不能・decode 失敗は固定文言＋exit 2（traceback にしない）
         try:
@@ -235,7 +276,7 @@ def run_check(snapshot_dir: Path, repo_root: Path, show_content: bool = False,
             drift = True
             continue
         rel = repo_file.relative_to(repo_root).as_posix()
-        repo_disp = _MASK_LINE if name_secret else rel
+        repo_disp = _MASK_LINE if name_masked else rel
 
         try:
             repo_text = repo_file.read_text(encoding="utf-8")
@@ -290,7 +331,7 @@ def run_check(snapshot_dir: Path, repo_root: Path, show_content: bool = False,
             if repo_js.name not in seen_names:
                 rel = f"{sub}/{repo_js.name}"
                 report(out, "manifest_missing",
-                     repo_name=(rel if not _is_secret_like(rel) else _MASK_LINE))
+                     repo_name=(rel if not _mask_needed(rel) else _MASK_LINE))
                 drift = True
 
     return 1 if drift else 0

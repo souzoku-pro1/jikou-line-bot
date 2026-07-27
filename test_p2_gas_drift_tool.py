@@ -268,5 +268,42 @@ class TestStructuredWriterGuards(_Base):
         self.assertIn("(secret 様のため非表示)", buf.getvalue())
 
 
+# ── fix3(P2DRIFT3-M01/L01) 追加テスト（P2-CHAIN-014 相乗り）───────────────────
+class TestCtrlCharDisplayNameRejected(_Base):
+    """M01(fix3): 制御文字（CR/LF 等）を含む表示名は report() が構造的に拒否する
+    （出力行の偽装・ログ注入の遮断・report() 経由の構造検証）。"""
+
+    def test_report_rejects_ctrl_char_names_and_emits_nothing(self):
+        import io
+        from gas_drift_check import report
+        buf = io.StringIO()
+        forged = "x.js\n[ok]    forged.js: repo と一致 (repo=gas/forged.js)"
+        with self.assertRaises(ValueError):
+            report(buf, "ok_line", name=forged, repo_name="gas/x.js")
+        with self.assertRaises(ValueError):      # repo_name 側も同様に拒否
+            report(buf, "ok_line", name="a.js", repo_name="gas/a\r.js")
+        self.assertEqual(buf.getvalue(), "")     # 何も出力されない
+        # マスク済み定数は常に許容（呼び出し側マスク経路が塞がらないこと）
+        report(buf, "ok_line", name="(secret 様のためファイル名非表示).js",
+               repo_name="(secret 様のため非表示)")
+        self.assertIn("[ok]", buf.getvalue())
+
+
+class TestDuplicateRepoNameInputError(_Base):
+    """L01(fix3): gas/ と legacy/gas/ の同名衝突は照合先が不定＝入力エラー exit 2。"""
+
+    def test_same_name_in_gas_and_legacy_gas_exit_2(self):
+        (self.repo / "legacy" / "gas").mkdir(parents=True)
+        (self.repo / "legacy" / "gas" / "rv04c_signing.js").write_text(
+            "var OLD = 1;\n", encoding="utf-8")
+        (self.snap / "rv04c_signing.js").write_text(_SIGNING_JS, encoding="utf-8")
+        code, out = self._run()
+        self.assertEqual(code, 2, out)           # drift(1) ではなく入力エラー(2)
+        self.assertIn("gas/ と legacy/gas/ の両方に存在します", out)
+        self.assertIn("rv04c_signing.js", out)
+        self.assertIn("一意性エラー", out)
+        self.assertNotIn("[drift]", out)         # 照合本体まで進まない
+
+
 if __name__ == "__main__":
     unittest.main()
