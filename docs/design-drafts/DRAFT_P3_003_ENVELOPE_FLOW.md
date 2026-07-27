@@ -223,3 +223,18 @@ async def claim_execution(app: kintone.KintoneApp, record: dict) -> bool:
   レビュー・実機確認の重心が異なる。
 - p3-002（TemplateVersion）は P3-003 の直接依存ではない（成果物生成=Phase 5 接続点）が、
   同一 metadata 群の migration 順序の都合上 **merge 順は p3-001 → p3-002 → P3-003a** を既定とする。
+
+## 6. 追記（2026-07-27・P3-003a 実装時の前提欠落と裁定）
+
+- **前提欠落の発見**: §2.1/§5 の「指示Bot導出完了への結線」は、**導出コマンド
+  （指示Bot語彙「相続人を導出して」→ App34 読取 → derive_heirs → run 保存）の実行
+  経路が repo に未実装**であり結線先が存在しない（`derive_heirs`／
+  `create_derivation_run` の runtime 呼出しはゼロ・正本 §3.7 item 5 の起動経路は
+  未着手）。導出コマンド自体の設計も本 DRAFT §2 に未収録だった。
+- **裁定（2026-07-27・[人]）**: P3-003a は**封筒側のみ実装** —
+  `hub/heir_envelope.py`（`file_heir_envelope(run)`＝結線点の公開関数・冪等キー・
+  単票 API・flag `HEIR_DERIVATION_ENABLED` 既定 OFF）＋テストまで。
+  **実呼出しの結線は導出コマンド票（新規・設計を含む・スコープは[人]裁定）へ分離**する。
+- 実装上の確定事項（DRAFT が未固定だった点の解決）: 封筒の チャネル/方向 は既存語彙
+  「スキャン受領/受領」を踏襲（person_merge 同型）。専用チャネル値の新設は kintone
+  フィールド変更（[人]・BLOCKED）を要するため初版では行わない。
