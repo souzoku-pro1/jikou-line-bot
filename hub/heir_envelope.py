@@ -100,8 +100,9 @@ def _validated_snapshot(run) -> dict:
     """run 由来値の型・grammar を起票境界で機械検証し、検証済み snapshot のみを
     以後の組立てに使う（fix1 H02: 値側 PII ガード／M01: 冪等キー構成要素の文法固定）。"""
     rid = getattr(run, "id", None)
-    if not isinstance(rid, int) or rid <= 0:
-        raise EnvelopePolicyError("run.id は正の整数であること")
+    # fix3 M01: bool は int の subclass のため isinstance では True/False が素通りする
+    if type(rid) is not int or rid <= 0:
+        raise EnvelopePolicyError("run.id は正の整数であること（bool は拒否）")
     case_app_id = getattr(run, "case_app_id", None)
     if not isinstance(case_app_id, str) or not _APP_ID_RE.fullmatch(case_app_id):
         raise EnvelopePolicyError("case_app_id は数字列であること")
@@ -111,16 +112,18 @@ def _validated_snapshot(run) -> dict:
         raise EnvelopePolicyError(
             "case_record_id は kintone $id（数字列）であること"
             "（`:`・引用符等の曖昧値は冪等キー構成要素として拒否・fix1 M01）")
+    hashes: dict[str, str] = {}
     for name in ("input_hash", "result_hash"):
         v = getattr(run, name, None)
         if not isinstance(v, str) or not _HASH_RE.fullmatch(v):
             raise EnvelopePolicyError(
                 f"{name} は正規化 SHA-256（小文字 hex 64 桁）であること（§2.1）")
+        hashes[name] = v   # fix3 L01: 検証済みローカル値を格納（run 属性を再読しない）
     flags = getattr(run, "lawyer_flags", None)
     validate_lawyer_flags(flags)   # 既存 allowlist（enum 外＝PII 様値を保存前拒否・H02）
     return {
         "id": rid, "case_app_id": case_app_id, "case_record_id": case_record_id,
-        "input_hash": run.input_hash, "result_hash": run.result_hash,
+        "input_hash": hashes["input_hash"], "result_hash": hashes["result_hash"],
         "provisional": bool(getattr(run, "provisional", False)),
         "lawyer_flags": flags,
     }

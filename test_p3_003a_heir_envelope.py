@@ -211,6 +211,12 @@ class TestBoundaryValidation(_MockIo):
         self._reject(_mk_run(case_app_id="app-26"))
         self._reject(_mk_run(id="31"))           # 型違い（str）も拒否
 
+    def test_bool_run_id_rejected(self):
+        # fix3 M01: bool は int の subclass — isinstance 判定では True(=1>0) が
+        # 素通りするため type() is int で拒否することを対照で固定
+        self._reject(_mk_run(id=True))
+        self._reject(_mk_run(id=False))
+
     def test_pii_sentinel_in_allowed_key_rejected_before_write(self):
         # H02: 許可キー lawyer_flags 内の PII 様値（enum 外）を保存前に拒否
         self._reject(_mk_run(lawyer_flags={"flags": ["山田太郎"]}),

@@ -234,7 +234,9 @@ async def claim_execution(app: kintone.KintoneApp, record: dict) -> bool:
 - **裁定（2026-07-27・[人]・条件4点）**: P3-003a は**封筒側のみ実装** —
   (a) `hub/heir_envelope.py` の `file_heir_envelope(run)`＝**結線点の公開関数**として
   契約を明文化（入力=DerivationRun 参照のみ・冪等キー生成規則・戻り値4状態・
-  失敗時挙動=kintone 例外は握らず送出/部分状態なし/冪等キーで再実行安全）。
+  失敗時挙動=**下記の統一契約（fix3 H01）に従う**）。
+  ※（fix3 H01 注記）本 (a) 初出時の文言「部分状態なし」は**撤回**する
+  （create の ACK 不明と両立しないため。撤回の経緯記録であり遡及書き換えではない）。
   テストは公開関数を直接呼ぶ形で完結（実行経路不在でも検証可能）。
   (b) **導出コマンド経路（語彙ハンドラ→App34読取→derive→run保存）は別票＝要設計**。
   (c) **導出コマンド設計票は司令塔が別途起票**する（**P3-003a の完了条件に含めない**）。
@@ -246,12 +248,13 @@ async def claim_execution(app: kintone.KintoneApp, record: dict) -> bool:
   - **ユニット種別（H03）**: 凍結 §2.1 どおり**案件由来**＝案件アプリ ID→ユニットの
     写像で解決（App21=時効援用／App26=相続一般）。**案件から解決不能な場合は
     起票せず異常扱い**（EnvelopePolicyError・kintone write ゼロ）。
-  - **導出コマンド票への申し送り（M02→fix2 H02 訂正・固定事項）**:
-    `file_heir_envelope` の失敗時契約＝**search/create/policy いずれの失敗も例外伝播
-    （握り潰し禁止・新規起票を成功扱いにしない）**。
-    **create の通信失敗は「結果不明（ACK 不明）」**——POST が kintone 側で成功し
-    応答のみ喪失した可能性があるため「封筒未作成」とは断定しない。
-    **再実行時は冪等キーの完全一致検索（H01）が reconcile を担い、成功済み封筒が
-    見つかれば already_filed として回収（二重起票しない）**。リトライ判断は
+  - **失敗時の統一契約（fix3 H01 で一本化・導出コマンド票への申し送り固定事項）**:
+    `file_heir_envelope` の失敗時契約は次の一本のみとする（(a) と本項の二重定義を
+    解消・本項が唯一の定義）——**いずれの失敗も例外伝播（握り潰し禁止・新規起票を
+    成功扱いにしない）**としたうえで、
+    **search 失敗＝write 0／policy 失敗＝I/O 0／create 通信失敗＝結果不明（ACK 不明・
+    POST が kintone 側で成功し応答のみ喪失があり得るため「封筒未作成」と断定しない）。
+    再実行時は冪等キーの完全一致検索（H01）で reconcile（成功済み封筒は
+    already_filed として回収・二重起票しない）**。リトライ判断は
     導出コマンド側の責務（契約 pin テスト=TestFailureBehaviorContract・
     ACK 喪失回収=test_ack_lost_create_reconciled_on_retry）。
