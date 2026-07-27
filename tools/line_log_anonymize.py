@@ -173,18 +173,40 @@ def classify_layer(turns: list[dict]) -> str:
     return "main:auto"
 
 
+# thread_id の固定 grammar（fix2 H02: 連番仮名 C+数字・最大8文字）
+_THREAD_ID_RE = re.compile(r"^C[0-9]{3,7}$")
+
+
 def apply_fallback_corrections(threads: list[dict],
                                fallback_ids: set[str]) -> list[str]:
-    """fix1 H03: [人]補正（障害記録突合済み thread_id）を優先順位 a>b>c で再適用。
+    """fix1 H03→fix2 H01: [人]補正の再適用（**補正対象を機械強制**）。
 
-    rare:silent / rare:immediate は上位層のため不変（二重計上なし）。
-    それ以外の補正対象は rare:fallback へ。戻り値=未知 thread_id（警告用）。"""
-    known = {t["thread_id"] for t in threads}
-    for t in threads:
-        if t["thread_id"] in fallback_ids and t["layer"] not in (
-                "rare:silent", "rare:immediate"):
-            t["layer"] = "rare:fallback"
-    return sorted(fallback_ids - known)
+    補正できるのは **layer=main:demoted かつスレッド内に delivery='demoted' の
+    assistant 発話が存在する**スレッドのみ（手順書 §4「障害時間帯内の
+    PENDING_REPLY 縮退のみ」の機械強制）。それ以外（未知 ID・main:auto／
+    main:approved／希少層等）への指定は**エラー**として返し、呼出し元
+    （reverify）が FAIL させる。戻り値=エラー文字列のリスト
+    （grammar 通過済み ID のみ本文へ echo する・fix2 H02 整合）。"""
+    errors: list[str] = []
+    by_id = {t["thread_id"]: t for t in threads}
+    for fid in sorted(fallback_ids):
+        if not isinstance(fid, str) or not _THREAD_ID_RE.fullmatch(fid):
+            errors.append("fallback 補正 ID が thread_id grammar 不一致"
+                          "（値は表示しません）")
+            continue
+        th = by_id.get(fid)
+        if th is None:
+            errors.append(f"fallback 補正の thread_id が corpus に無い: {fid}")
+            continue
+        has_demoted = any(t.get("delivery") == "demoted"
+                          for t in th["turns"] if t.get("role") == "assistant")
+        if th["layer"] != "main:demoted" or not has_demoted:
+            errors.append(f"fallback 補正対象外: {fid}"
+                          "（main:demoted かつ PENDING 縮退発話のあるスレッドのみ・"
+                          "手順書 §4）")
+            continue
+        th["layer"] = "rare:fallback"
+    return errors
 
 
 def compute_summary(threads: list[dict], excluded: dict,
@@ -284,7 +306,15 @@ def reverify(doc: dict, fallback_ids: set[str]) -> tuple[list[str], dict | None]
         errors.append(f"corpus 本体に allowlist 外の最上位キー: {sorted(set(doc) - {'threads'})}")
     seen_ids = set()
     for i, th in enumerate(threads):
-        tid = th.get("thread_id", f"(index {i})")
+        # fix2 H02: thread_id を最初に grammar 検証。不正時は index＋固定 reason のみ
+        # （値をエラー文・stdout・checklist へ一切反射しない）
+        raw_tid = th.get("thread_id") if isinstance(th, dict) else None
+        if not isinstance(raw_tid, str) or not _THREAD_ID_RE.fullmatch(raw_tid):
+            errors.append(f"threads[{i}]: thread_id が不正"
+                          "（型/形式/長さ・連番仮名 C+数字 最大8文字のみ。"
+                          "値は表示しません）")
+            continue
+        tid = raw_tid                            # 以降の echo は grammar 通過済みのみ
         if set(th) != _THREAD_KEYS:
             errors.append(f"{tid}: thread フィールドが allowlist 外/不足")
             continue
@@ -318,9 +348,9 @@ def reverify(doc: dict, fallback_ids: set[str]) -> tuple[list[str], dict | None]
                 errors.append(f"{where}: 残存パターン検出")
     if errors:
         return errors, None
-    unknown = apply_fallback_corrections(threads, fallback_ids)
-    if unknown:
-        return [f"fallback 補正の thread_id が corpus に無い: {unknown}"], None
+    fb_errors = apply_fallback_corrections(threads, fallback_ids)   # fix2 H01
+    if fb_errors:
+        return fb_errors, None
     summary = compute_summary(threads, {}, {"stage": "reverify(検証済み最終)"})
     checklist = [{"thread_id": th["thread_id"],
                   "残存PII目視確認": "", "確認者": "", "確認日": ""}
@@ -386,6 +416,21 @@ def main(argv=None, out=sys.stdout) -> int:
             json.dumps(result["summary"], ensure_ascii=False) + "\n")
         return 0
 
+    # fix2 H03: 出力の原子化 — (1) 既存成果物があれば開始前に拒否（上書き・
+    # 「PASS 外観」の残置を構造的に遮断） (2) 3成果物は一時ファイルへ生成し、
+    # 全成功後に原子的 rename（os.replace）で確定 (3) 途中失敗時は一時ファイルを
+    # 除去し、部分成果物を残さない。
+    import os
+    targets = (args.out, args.summary_out, args.checklist_out)
+    existing = [p for p in targets if os.path.exists(p)]
+    if existing:
+        out.write(json.dumps(
+            {"result": "FAIL",
+             "errors": ["出力先に既存の成果物があります（上書きしません）。"
+                        "移動/削除のうえ再実行してください"]},
+            ensure_ascii=False) + "\n")
+        return 1
+
     with open(args.infile, encoding="utf-8") as f:
         doc = json.load(f)
     fallback_ids: set[str] = set()
@@ -395,17 +440,33 @@ def main(argv=None, out=sys.stdout) -> int:
     errors, final = reverify(doc, fallback_ids)
     if errors:
         out.write(json.dumps({"result": "FAIL", "errors": errors[:50]},
-                                    ensure_ascii=False) + "\n")
+                             ensure_ascii=False) + "\n")
         return 1                                 # PASS 前は checklist 生成・引渡し不可
-    _write_json(args.out, {"threads": final["threads"]})
-    _write_json(args.summary_out, final["summary"])
-    with open(args.checklist_out, "w", encoding="utf-8-sig", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=["thread_id", "残存PII目視確認",
-                                          "確認者", "確認日"])
-        w.writeheader()
-        w.writerows(final["checklist"])
+
+    tmps = tuple(p + ".tmp" for p in targets)
+    try:
+        _write_json(tmps[0], {"threads": final["threads"]})
+        _write_json(tmps[1], final["summary"])
+        with open(tmps[2], "w", encoding="utf-8-sig", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=["thread_id", "残存PII目視確認",
+                                              "確認者", "確認日"])
+            w.writeheader()
+            w.writerows(final["checklist"])
+    except OSError:
+        for t in tmps:                           # 部分成果物を残さない
+            try:
+                os.remove(t)
+            except OSError:
+                pass
+        out.write(json.dumps(
+            {"result": "FAIL",
+             "errors": ["出力書込みに失敗しました（部分成果物は残していません）"]},
+            ensure_ascii=False) + "\n")
+        return 1
+    for t, p in zip(tmps, targets):              # 全成功後に原子的 rename で確定
+        os.replace(t, p)
     out.write(json.dumps({"result": "PASS", **final["summary"]},
-                                ensure_ascii=False) + "\n")
+                         ensure_ascii=False) + "\n")
     return 0
 
 

@@ -34,7 +34,9 @@
    - `residue_detected`／`role_out_of_enum`／`category_out_of_enum`＝raw 側の
      データ問題: 原因を確認し、解消できない場合は**除外のまま確定**。
 5. **[人]手修正（mid.json 上）**: 氏名・屋号・地名等（パターンで拾えない PII）の
-   要旨化/トークン化。必要に応じ meta.amount_band/date_band を付与（粒度[人]裁定）。
+   要旨化/トークン化。**meta.amount_band/date_band は初回実行では不使用**
+   （fix2 M01 裁定: 付与しない。丸め粒度の[人]裁定〔§7-3〕後に reverify の
+   schema へ正式実装してから使用可＝現状の reverify は meta を拒否する）。
 6. **fallback 補正 ID の確定（fix1 H03・構造化入力）**: 障害記録（work-log の INC・
    Railway 障害時間帯）と突合し、層(c) に該当する thread_id を JSON list
    （例: `["C012","C031"]`）として fb.json に作成。**判定不能は入れない**
@@ -70,7 +72,10 @@
 
 - delivery からは (c) と通常降格を**機械判別できない**（どちらも PENDING_REPLY）。
 - **固定規則**: [人]が障害記録と突合した thread_id 一覧を**構造化補正ファイル**
-  （fb.json）として reverify へ渡す。変換器は**優先順位 a>b>c を再適用**
+  （fb.json）として reverify へ渡す。**補正対象は「layer=main:demoted かつ
+  PENDING 縮退（delivery=demoted）発話のあるスレッド」のみ＝変換器が機械強制
+  （fix2 H01）**し、それ以外（main:auto/approved・希少層・未知 ID）への指定は
+  reverify が FAIL する。変換器は**優先順位 a>b>c を再適用**
   （rare:silent／rare:immediate は不変・それ以外を rare:fallback へ）し、
   summary（rare_counts／main_counts／main_shortfall／synthetic_needed）を
   **再計算**する（demoted との二重計上なし・対照テストで固定）。
@@ -93,6 +98,9 @@
 - summary2.json（**別ファイル**・運用メタデータ〔fix1 H02(ii)〕）: 件数・層分布・
   不足数・除外理由のみ（本文・ID 系を含めない）。
 - checklist.csv: reverify PASS 時のみ生成（H04）。
+- **meta.amount_band/date_band は初回実行では不使用**（fix2 M01 裁定・§2-5。
+  丸め粒度の[人]裁定〔§7-3〕→reverify schema への正式実装後に解禁。現状の
+  reverify 完全限定 schema は meta を拒否する=現状維持）。
 
 ## 7. 実行前レビュー必須の STOP 項目（**全確定まで G1 通過不可**）
 

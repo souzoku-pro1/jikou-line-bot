@@ -112,34 +112,53 @@ class TestDeliveryFullMatch(unittest.TestCase):
 
 
 class TestFallbackCorrections(unittest.TestCase):
-    """fix1 H03: 構造化補正入力→a>b>c 再適用→summary 再計算・二重計上なし。"""
+    """fix1 H03→fix2 H01: 補正対象の機械強制（main:demoted＋PENDING 縮退発話のみ）。"""
 
-    def _mk(self, tid, layer):
-        return {"thread_id": tid, "layer": layer,
-                "turns": [{"role": "user", "text": "x"}]}
+    def _mk(self, tid, layer, demoted_turn=False):
+        turns = [{"role": "user", "text": "x"}]
+        if demoted_turn:
+            turns.append({"role": "assistant", "text": "y",
+                          "category": "その他判断系", "delivery": "demoted"})
+        return {"thread_id": tid, "layer": layer, "turns": turns}
 
     def test_demoted_reassigned_and_counts_recomputed(self):
-        threads = [self._mk("C001", "main:demoted"),
-                   self._mk("C002", "main:demoted"),
+        threads = [self._mk("C001", "main:demoted", demoted_turn=True),
+                   self._mk("C002", "main:demoted", demoted_turn=True),
                    self._mk("C003", "rare:silent")]
-        unknown = apply_fallback_corrections(threads, {"C001"})
-        self.assertEqual(unknown, [])
+        errors = apply_fallback_corrections(threads, {"C001"})
+        self.assertEqual(errors, [])
         from tools.line_log_anonymize import compute_summary
         s = compute_summary(threads, {})
         self.assertEqual(s["rare_counts"]["rare:fallback"], 1)   # 実例数の数値出力
         self.assertEqual(s["main_counts"]["main:demoted"], 1)    # 二重計上なし
         self.assertEqual(s["synthetic_needed"]["rare:fallback"], 2)
 
-    def test_priority_silent_immediate_not_overridden(self):
-        threads = [self._mk("C001", "rare:silent"),
-                   self._mk("C002", "rare:immediate")]
-        apply_fallback_corrections(threads, {"C001", "C002"})
-        self.assertEqual(threads[0]["layer"], "rare:silent")     # a>c
-        self.assertEqual(threads[1]["layer"], "rare:immediate")  # b>c
+    def test_non_demoted_targets_rejected(self):
+        # fix2 H01: main:auto／main:approved／希少層への指定はエラー（FAIL 化）
+        threads = [self._mk("C001", "main:auto"),
+                   self._mk("C002", "main:approved"),
+                   self._mk("C003", "rare:silent"),
+                   self._mk("C004", "main:demoted")]   # demoted 発話なしも対象外
+        for fid in ("C001", "C002", "C003", "C004"):
+            with self.subTest(target=fid):
+                errors = apply_fallback_corrections(
+                    [dict(t, turns=list(t["turns"])) for t in threads], {fid})
+                self.assertEqual(len(errors), 1, errors)
+                self.assertIn("補正対象外", errors[0])
 
     def test_unknown_id_reported(self):
         threads = [self._mk("C001", "main:auto")]
-        self.assertEqual(apply_fallback_corrections(threads, {"C999"}), ["C999"])
+        errors = apply_fallback_corrections(threads, {"C999"})
+        self.assertEqual(len(errors), 1)
+        self.assertIn("corpus に無い", errors[0])
+
+    def test_malformed_correction_id_not_echoed(self):
+        # grammar 不一致の補正 ID は値を echo しない（固定 reason のみ）
+        threads = [self._mk("C001", "main:auto")]
+        errors = apply_fallback_corrections(threads, {"090-1234-5678"})
+        self.assertEqual(len(errors), 1)
+        self.assertNotIn("090", errors[0])
+        self.assertIn("grammar 不一致", errors[0])
 
 
 class TestRedactionAndFailClosed(unittest.TestCase):
@@ -259,7 +278,9 @@ class TestOneWayPipeline(unittest.TestCase):
         d = self._tmp()
         doc = {"threads": [
             {"thread_id": "C001", "layer": "main:demoted",
-             "turns": [{"role": "user", "text": "不安です"}]}]}
+             "turns": [{"role": "user", "text": "不安です"},
+                       {"role": "assistant", "text": "確認します。",
+                        "category": "その他判断系", "delivery": "demoted"}]}]}
         Path(f"{d}/mid.json").write_text(json.dumps(doc, ensure_ascii=False),
                                          encoding="utf-8")
         Path(f"{d}/fb.json").write_text(json.dumps(["C001"]), encoding="utf-8")
@@ -275,6 +296,88 @@ class TestOneWayPipeline(unittest.TestCase):
     def test_reverify_unknown_fallback_id_fails(self):
         _errors, final = reverify({"threads": []}, {"C999"})
         self.assertIsNone(final)
+
+    def test_reverify_thread_id_tampering_not_reflected(self):
+        """fix2 H02: thread_id 改竄4種は index+固定 reason のみ・値を出力へ非反射。"""
+        import io
+        d = self._tmp()
+        cases = {
+            "pii_id": "090-1234-5678",
+            "too_long": "C123456789",
+            "bad_form": "X001",
+        }
+        for label, bad in cases.items():
+            with self.subTest(case=label):
+                doc = {"threads": [{"thread_id": bad, "layer": "main:auto",
+                                    "turns": [{"role": "user", "text": "x"}]}]}
+                p = f"{d}/{label}.json"
+                Path(p).write_text(json.dumps(doc, ensure_ascii=False),
+                                   encoding="utf-8")
+                buf = io.StringIO()
+                rc = main(["reverify", "--in", p,
+                           "--out", f"{d}/{label}_f.json",
+                           "--summary-out", f"{d}/{label}_s.json",
+                           "--checklist-out", f"{d}/{label}_c.csv"], out=buf)
+                self.assertEqual(rc, 1)
+                self.assertNotIn(bad, buf.getvalue())            # 値の非反射
+                self.assertIn("threads[0]", buf.getvalue())      # index+固定 reason
+                self.assertFalse(Path(f"{d}/{label}_c.csv").exists())
+        with self.subTest(case="non_string"):
+            doc = {"threads": [{"thread_id": 12345, "layer": "main:auto",
+                                "turns": [{"role": "user", "text": "x"}]}]}
+            p = f"{d}/nonstr.json"
+            Path(p).write_text(json.dumps(doc), encoding="utf-8")
+            buf = io.StringIO()
+            rc = main(["reverify", "--in", p, "--out", f"{d}/n_f.json",
+                       "--summary-out", f"{d}/n_s.json",
+                       "--checklist-out", f"{d}/n_c.csv"], out=buf)
+            self.assertEqual(rc, 1)
+            self.assertNotIn("12345", buf.getvalue())
+            self.assertFalse(Path(f"{d}/n_c.csv").exists())
+
+    def test_reverify_refuses_existing_outputs(self):
+        """fix2 H03(i): 既存成果物あり→開始前拒否・旧成果物は不変（PASS 外観なし）。"""
+        import io
+        d = self._tmp()
+        self._write_csv(f"{d}/a28.csv")
+        main(["convert", "--app28-csv", f"{d}/a28.csv",
+              "--out", f"{d}/mid.json", "--summary-out", f"{d}/s1.json"])
+        # 1回目: 正常に最終成果物を生成
+        main(["reverify", "--in", f"{d}/mid.json", "--out", f"{d}/final.json",
+              "--summary-out", f"{d}/s2.json", "--checklist-out", f"{d}/c.csv"])
+        old_final = Path(f"{d}/final.json").read_text(encoding="utf-8")
+        # 2回目: 検証 FAIL する入力でも、既存成果物があるため開始前拒否
+        bad = {"threads": [{"thread_id": "C001", "layer": "main:auto",
+                            "turns": [{"role": "user", "text": "あ" * 401}]}]}
+        Path(f"{d}/bad.json").write_text(json.dumps(bad, ensure_ascii=False),
+                                         encoding="utf-8")
+        buf = io.StringIO()
+        rc = main(["reverify", "--in", f"{d}/bad.json", "--out", f"{d}/final.json",
+                   "--summary-out", f"{d}/s2.json",
+                   "--checklist-out", f"{d}/c.csv"], out=buf)
+        self.assertEqual(rc, 1)
+        self.assertIn("既存の成果物", buf.getvalue())
+        self.assertEqual(Path(f"{d}/final.json").read_text(encoding="utf-8"),
+                         old_final)                              # 旧成果物は不変
+
+    def test_reverify_checklist_write_failure_leaves_no_partials(self):
+        """fix2 H03(ii): checklist 書込み失敗時に部分成果物・一時ファイルを残さない。"""
+        import io
+        import os
+        d = self._tmp()
+        self._write_csv(f"{d}/a28.csv")
+        main(["convert", "--app28-csv", f"{d}/a28.csv",
+              "--out", f"{d}/mid.json", "--summary-out", f"{d}/s1.json"])
+        os.makedirs(f"{d}/c.csv.tmp")            # checklist の一時書込み先を潰す
+        buf = io.StringIO()
+        rc = main(["reverify", "--in", f"{d}/mid.json", "--out", f"{d}/final.json",
+                   "--summary-out", f"{d}/s2.json",
+                   "--checklist-out", f"{d}/c.csv"], out=buf)
+        self.assertEqual(rc, 1)
+        self.assertIn("書込みに失敗", buf.getvalue())
+        self.assertFalse(Path(f"{d}/final.json").exists())       # 部分成果物なし
+        self.assertFalse(Path(f"{d}/s2.json").exists())
+        self.assertFalse([x for x in Path(d).glob("*.tmp") if x.is_file()])  # 一時ファイルなし（fixture の dir は除く）
 
 
 if __name__ == "__main__":
