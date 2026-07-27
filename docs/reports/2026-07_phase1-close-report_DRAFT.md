@@ -10,8 +10,8 @@ Phase 1 は「顧客 Bot 中核の可観測性・耐障害性の底上げ」と�
 **redaction 契約の機械強制**・**durable 基盤（LINE durable〔Phase A〕のみ flag OFF 待機・Stripe journal は
 既存稼働）**・**HMAC 署名移行（RV-04a/b/c）**・
 **dead-man/probe 監視**・**dependency lock+SBOM** を達成。実機移行は **sortation lane の署名経路化＋
-legacy 停止＋token rotation** まで到達（**retirement evidence 2 点充足・1 点暫定〔§7 (i) 追補待ち〕**・
-S5 work-log）。
+legacy 停止＋token rotation** まで到達（**retirement evidence 3 点全充足＝2026-07-27 完全クローズ**
+〔履歴: 7/19 時点は 2 点充足・1 点暫定＝§7(i) 追補待ちだった〕・S5 work-log §2）。
 
 ## 2. マージ PR 一覧（Phase 1・2026-07-11〜18・merge-commit ベース 32 件〔#101–141 の git 集計〕＋merge-commit を持たない PR 1 件〔#130〕＝総数 33 件）
 
@@ -88,7 +88,14 @@ S5 work-log）。
 ## 10. 最終事実（2026-07-19 追記）
 
 - **#141 マージ済み**（merge commit `10f57c0`・main FF 済み）。
-- **Phase 1 完了日 = 2026-07-19**。
+- **Phase 1 条件付き完了日 = 2026-07-19**（当時の残置=§7(i) のみ）。
 - **最終 PR 番号 = #141**。
-- **条件付き事項**: 削除追補（**§7 (i) のみ**: `SORTATION_INGEST_TOKEN` env 削除＋GAS
-  `SORTATION_TOKEN` 定数削除）は **7/22 予定**（§7 (ii) は 7/19 完了済みのため対象外）。
+- 履歴（7/19 時点の条件付き事項）: 削除追補（**§7 (i) のみ**: `SORTATION_INGEST_TOKEN`
+  env 削除＋GAS `SORTATION_TOKEN` 定数削除）は当初 7/22 予定だった
+  （§7 (ii) は 7/19 完了済みのため対象外）。
+
+## 11. 完全クローズ（2026-07-27 追記）
+
+- **§7(i) の残置解消**（削除実見・[人]・正本: S5 work-log §4(i) の 2026-07-27 追補）
+  により**残置ゼロ**。
+- **Phase 1 完全クローズ日 = 2026-07-27**（条件付き完了 7/19 と区別して記録）。
