@@ -66,8 +66,11 @@ S5 work-log）。
 
 ## 7. 残置・申し送り
 
-- (i) `SORTATION_INGEST_TOKEN` env 削除＋GAS `SORTATION_TOKEN` 定数削除（D-5 安定確認後・
-  **7/22 追補予定・唯一の削除追補対象**）。
+- (i) `SORTATION_INGEST_TOKEN` env 削除＋GAS `SORTATION_TOKEN` 定数削除 —
+  **完了（2026-07-27・[人]実見・時刻記録なし）**: env は Railway Variables 一覧に
+  不存在・GAS は全文検索ヒット 0・削除後の sortation signed lane 正常継続を
+  Railway HTTP Logs で観測（正本: S5 close work-log §4(i) の 2026-07-27 追補）。
+  **これをもって Phase 1 完全クローズ**。
 - (ii) 旧版 GAS プロジェクトの `RV04C_` プロパティ削除 — **完了（7/19・単独所有実見済み・
   #141 正本 work-log §4(ii) 参照）**。
 - (iii) **RCF-M14**（Vision billing・別裁定）。

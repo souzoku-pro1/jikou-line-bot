@@ -98,6 +98,13 @@ INFO:     100.64.0.3:29454 - "POST /sortation/ingest?token=<masked> HTTP/1.1" 40
   後日（§5.1 rollback 手順 2 が旧 credential 残存を参照するため、安定まで残す設計どおり）。
   **← retirement 証跡③の充足に必要な未実施項目（S5C-H01・条件付きクローズの追補対象）。
   削除実見をもって証跡③を充足化し retirement を完全クローズする。**
+  - **【追補 2026-07-27】完了（[人]実見・時刻記録なし）**:
+    (1) Railway env `SORTATION_INGEST_TOKEN` **削除済み**（Variables 一覧に不存在を実見）
+    (2) live GAS `SORTATION_TOKEN` 定数 **削除済み**（全文検索ヒット 0 を実見)
+    (3) 削除後の **sortation signed lane の正常継続を Railway HTTP Logs で観測**。
+    **証跡③充足＝sortation legacy credential の retirement 完全クローズ
+    （S5C-H01 の条件解消）。これをもって Phase 1 完全クローズ**
+    （phase1-close-report §7(i) 同時追補）。
 - (ii) **旧版 GAS プロジェクトの `RV04C_` プロパティ削除**: **完了（7/19・[人]）**。削除実施・
   単独所有実見・rotation 不要裁定（§3-1）。
 - (iii) **RCF-M14 Vision billing 対処**（別裁定・`DRAFT_RCF-M14_vision-billing.md`）。
