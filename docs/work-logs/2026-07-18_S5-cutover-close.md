@@ -4,8 +4,12 @@
 - 正本: `DRAFT_RV04C_CALLER_MIGRATION.md` rev D5・SHA `c32c45df42370618e43903f94a59715081d23552`
 - 手順書: `docs/runbooks/2026-07_S4-S5_cutover-checklist.md`
 - 対象 lane: **sortation（lane1）のみ**本番署名移行完了。koseki/registry 等は Phase 2（§末）。
-- **ステータス: 条件付きクローズ（削除実見の追補待ち・S5C-H01）**。retirement 3 点のうち証跡③
-  （credential 失効）は D-5 の env/GAS 定数**削除が未充足**のため暫定。削除実見の追補で充足化する。
+- **ステータス（現況・2026-07-27 更新）: 完全クローズ（retirement 3 点全充足）**。
+  §4(i) の削除実見追補（2026-07-27・[人]）により証跡③が充足し **S5C-H01 は解消**。
+  - 履歴（7/19 記録時点）: 「条件付きクローズ（削除実見の追補待ち・S5C-H01）」——
+    retirement 3 点のうち証跡③（credential 失効）は D-5 の env/GAS 定数削除が未充足の
+    ため暫定だった。以下の本文中の 7/18-19 時点の記述は**履歴として保持**する
+    （現況は本行と §2 の現況表示・§4(i) 追補が正）。
 
 ## 0. 実施済み事実（司令塔記録・2026-07-18）
 
@@ -47,20 +51,23 @@
   収束判定は「司令塔一次記録（HTTP Logs 実見）＋現デプロイ窓のライブ 0 件」に依拠し、
   ログからの厳密な cadence 再算出は不可である旨を retirement 判定に反映する（§2）。
 
-## 2. retirement evidence（3 点・①②充足・③暫定）
+## 2. retirement evidence（3 点・**全充足＝完全クローズ 2026-07-27**。①②=7/19 充足・③=7/27 追補で充足）
 
 | # | 証跡 | 状態 | 根拠 |
 |---|---|---|---|
 | ① 署名成功の実送 | sortation 署名経路 200×3 以上（`[照会中]` 3 件） | **充足（一次記録依存・S5C-M01）** | D-3/D-4（司令塔記録・7/18 HTTP Logs。cadence/各時刻は旧世代ログ失効で再検証不能） |
 | ② 能動404実測 | 旧 SORTATION token → 404・**reason=legacy_blocked 対応ログ採取済み**（§D-7・00:29 JST 再試験） | **充足** | D-7（[人]実測＋PC-A ログ採取・現デプロイ世代内） |
-| ③ credential 失効 | `KINTONE_WEBHOOK_TOKEN` rotation 4 工程完了・NEXT 削除済み／`SORTATION_INGEST_TOKEN` **前進失効（新値・未配布）**。ただし **D-5 の env 削除＋GAS 旧定数削除は未充足（残置）** | **暫定（S5C-H01）** | D-6a/D-6b（司令塔記録）＋§4-i 残置 |
+| ③ credential 失効 | `KINTONE_WEBHOOK_TOKEN` rotation 4 工程完了・NEXT 削除済み／`SORTATION_INGEST_TOKEN` **前進失効（新値・未配布）**。D-5 の env 削除＋GAS 旧定数削除は **7/19 時点で未充足（残置・履歴）→ 2026-07-27 の削除実見で充足** | **充足（2026-07-27 追補）** | D-6a/D-6b（司令塔記録）＋**§4-i 追補（削除実見 3 点・[人]）** |
 | ＋計数 | D-4 収束集計（署名≥3・legacy 0）／D-5 停止後 legacy_blocked を ok と分離 | 7/18 分は一次記録・現窓ライブは §1／00:29 再試験は §D-7 で採取 | §1・§D-7 |
 
-→ **retirement 判定 = 条件付きクローズ（S5C-H01）**。証跡①②は充足（②は 00:29 再試験で reason
-出所まで採取）。**証跡③は「rotation 完了＋前進失効」までで、D-5 が要求する
-`SORTATION_INGEST_TOKEN` env 削除・GAS `SORTATION_TOKEN` 定数削除が未実施のため暫定**。
-D-5 安定確認後の**削除実見の追補をもって充足化**する。またライブ再計数は世代交代で制約され、
-D-4 の cadence/各時刻は一次記録依存である（S5C-M01）。
+→ **retirement 判定（現況・2026-07-27）= 完全クローズ（3 点全充足）**。§4(i) の削除実見
+（env 不存在・GAS 全文検索 0・signed lane 正常継続の観測）により証跡③が充足し
+**S5C-H01 は解消**。ライブ再計数の世代交代制約（D-4 の cadence/各時刻は一次記録依存・
+S5C-M01）は記録上の限界としてそのまま残る。
+- 履歴（7/19 判定時点）: 条件付きクローズ（S5C-H01）——証跡①②は充足（②は 00:29
+  再試験で reason 出所まで採取）。証跡③は「rotation 完了＋前進失効」までで、D-5 が
+  要求する `SORTATION_INGEST_TOKEN` env 削除・GAS `SORTATION_TOKEN` 定数削除が
+  未実施のため暫定であり、削除実見の追補をもって充足化する扱いだった。
 
 ### 2b. D-7 能動404 の当日ログ採取（H02・現デプロイ世代内＝retrievable）
 
@@ -96,8 +103,16 @@ INFO:     100.64.0.3:29454 - "POST /sortation/ingest?token=<masked> HTTP/1.1" 40
 
 - (i) **`SORTATION_INGEST_TOKEN` env 削除**と **GAS `SORTATION_TOKEN` 定数削除**は D-5 安定確認後の
   後日（§5.1 rollback 手順 2 が旧 credential 残存を参照するため、安定まで残す設計どおり）。
-  **← retirement 証跡③の充足に必要な未実施項目（S5C-H01・条件付きクローズの追補対象）。
-  削除実見をもって証跡③を充足化し retirement を完全クローズする。**
+  **←（履歴・7/19 時点の注記）retirement 証跡③の充足に必要な未実施項目
+  （S5C-H01・条件付きクローズの追補対象）。削除実見をもって証跡③を充足化し
+  retirement を完全クローズする——とされていた（下の追補で実施済み）。**
+  - **【追補 2026-07-27】完了（[人]実見・時刻記録なし）**:
+    (1) Railway env `SORTATION_INGEST_TOKEN` **削除済み**（Variables 一覧に不存在を実見）
+    (2) live GAS `SORTATION_TOKEN` 定数 **削除済み**（全文検索ヒット 0 を実見)
+    (3) 削除後の **sortation signed lane の正常継続を Railway HTTP Logs で観測**。
+    **証跡③充足＝sortation legacy credential の retirement 完全クローズ
+    （S5C-H01 の条件解消）。これをもって Phase 1 完全クローズ**
+    （phase1-close-report §7(i) 同時追補）。
 - (ii) **旧版 GAS プロジェクトの `RV04C_` プロパティ削除**: **完了（7/19・[人]）**。削除実施・
   単独所有実見・rotation 不要裁定（§3-1）。
 - (iii) **RCF-M14 Vision billing 対処**（別裁定・`DRAFT_RCF-M14_vision-billing.md`）。
@@ -130,3 +145,5 @@ INFO:     100.64.0.3:29454 - "POST /sortation/ingest?token=<masked> HTTP/1.1" 40
 - 2026-07-18: RV-04c S5 cutover クローズ（sortation lane1 retirement evidence 2点充足・1点暫定を固定・
   インシデント記録・残置事項・flag スナップショット）。ログ世代交代の制約を明記。
   開始/終了とも **モデル実測 = Fable 5**。
+- 2026-07-27: 残置(i) の削除実見追補（§4-i・[人]）＝**証跡③充足・retirement/Phase 1
+  完全クローズ**（本書の現況表示を §冒頭・§2 で同期・SORT-CLOSE-fix1）。
