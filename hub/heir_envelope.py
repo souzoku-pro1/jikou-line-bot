@@ -85,11 +85,24 @@ def _build_detail(run) -> dict:
 async def file_heir_envelope(run) -> dict:
     """DerivationRun の要確認封筒を App30 へ起票する（導出完了直後の結線点・§2.1）。
 
-    run: DerivationRun（ORM 行または同属性のオブジェクト。参照する属性は
-         id / case_app_id / case_record_id / input_hash / result_hash /
-         status / provisional / lawyer_flags のみ＝result_payload は読まない）。
-    Returns: {"status": "filed"|"already_filed"|"disabled"|"not_target",
-              "record_id": str|None}
+    ## 結線点の契約（P3-003a 裁定条件 (a)・実行経路不在でも本関数単体で検証可能）
+
+    - **入力**: DerivationRun への参照（ORM 行または同属性のオブジェクト）。
+      参照する属性は id / case_app_id / case_record_id / input_hash / result_hash /
+      status / provisional / lawyer_flags のみ＝**result_payload は読まない**。
+      run の書換えは行わない（immutable 台帳と整合・読取専用）。
+    - **冪等キーの生成規則**: `idempotency_key()`＝
+      `heir_derivation:{case_record_id}:{input_hash}`（固定書式・detail に平文保持・
+      起票前の like 検索で二重封筒を遮断。同一入力の再導出は既存封筒を再利用）。
+    - **戻り値**: {"status": "filed"（新規起票・record_id=新 App30 レコード番号）|
+      "already_filed"（既存封筒あり・record_id=既存番号）|
+      "disabled"（flag OFF・record_id=None）|
+      "not_target"（status が derived/held 以外・record_id=None）}。
+    - **失敗時挙動**: kintone I/O の失敗（KintoneError 等）は**握らず送出**する。
+      検索失敗時は未起票のまま・create 失敗時も部分状態を残さない（App30 への
+      書込みは単票 create の 1 回のみ）。例外時の再実行は冪等キーにより安全
+      （成功済みなら already_filed になる）。リトライ判断は呼出し元
+      （導出コマンド票・別票）の責務。
     """
     if not heir_derivation_enabled():
         return {"status": "disabled", "record_id": None}

@@ -124,6 +124,31 @@ class TestFiling(unittest.TestCase):
         self.assertNotIn("宛先名", fields)
 
 
+class TestFailureBehaviorContract(unittest.TestCase):
+    """契約 (a) の失敗時挙動: kintone I/O の失敗は握らず送出（部分状態なし・
+    再実行は冪等キーで安全＝リトライ判断は呼出し元の責務）。"""
+
+    def test_kintone_errors_propagate_unhandled(self):
+        from hub.kintone import KintoneError
+        # create 失敗 → 送出（検索は通過済み・App30 書込みは単票1回のみ＝部分状態なし）
+        search = AsyncMock(return_value=[])
+        create = AsyncMock(side_effect=KintoneError(500, "x", "boom"))
+        with patch.dict(os.environ, _ON), \
+             patch.object(he.kintone, "search_records", new=search), \
+             patch.object(he.kintone, "create_record", new=create):
+            with self.assertRaises(KintoneError):
+                _run(he.file_heir_envelope(_mk_run()))
+        # 検索失敗 → 送出（未起票のまま・create には到達しない）
+        search2 = AsyncMock(side_effect=KintoneError(503, "y", "down"))
+        create2 = AsyncMock()
+        with patch.dict(os.environ, _ON), \
+             patch.object(he.kintone, "search_records", new=search2), \
+             patch.object(he.kintone, "create_record", new=create2):
+            with self.assertRaises(KintoneError):
+                _run(he.file_heir_envelope(_mk_run()))
+        create2.assert_not_awaited()
+
+
 class TestDetailClosedSet(unittest.TestCase):
     def test_detail_builder_pins_closed_set(self):
         d = he._build_detail(_mk_run())
