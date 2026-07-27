@@ -1,8 +1,8 @@
-# DRAFT: P3-003-CMD 導出コマンド経路 — 設計（実装禁止・凍結先行・fix2）
+# DRAFT: P3-003-CMD 導出コマンド経路 — 設計（実装禁止・凍結先行・fix3）
 
 - TASK_ID: P3-003-CMD 設計票（設計のみ・コード/テスト実装禁止）／記録日 2026-07-27
-  （fix1: D1 反映／fix2: R-P3-003-CMD-D2 反映＋[人]再裁定反映）
-- 調査 BASE: origin/main（p3-003a 着地済み）。**R-P3-003-CMD-D3 で凍結再判定**。
+  （fix1: D1 反映／fix2: D2 反映＋[人]再裁定反映／fix3: R-P3-003-CMD-D3 反映）
+- 調査 BASE: origin/main（p3-003a 着地済み）。**R-P3-003-CMD-D4 で凍結再判定**。
 - 正本参照（矛盾を作らない・編集しない）: DRAFT_P3_003_ENVELOPE_FLOW **§6 統一契約が正**
   （search 失敗=write 0／policy 失敗=I/O 0／create 通信失敗=結果不明・再実行時に
   完全一致検索で reconcile）・**§2.2 の TOCTOU 受容**・DRAFT_APP36 §2/§3.7・
@@ -83,6 +83,36 @@ dispatch_bot/heir_derive_task.py（新規・隔離 module＝person_merge_task �
 - **PII 統制**: canonical bytes は**氏名・身分事項を含む**ため、**保存・ログ出力を
   一切しない**（保持するのは hash 値のみ・§5）。
 
+#### 1.1a canonical 層の責務分離（fix3 M02・field 別の固定表）
+
+**原則**: canonical 層の責務は「**型固定＋文字面の健全性**（型検査・数字列 grammar・
+NFC・C0/C1 拒否）」のみ。**意味検証（enum の値域・日付の実在性・人物の存在）は
+canonical 層では行わない**——それは persons_from_records（変換層）と凍結エンジンの
+既存責務であり、canonical 層に複製すると二重の正を作るため。
+
+| field | 許容型 | 空文字 | 数字列 grammar | enum/date 等の意味検証の担当層 |
+|---|---|---|---|---|
+| record_id | str | 不可 | `^[0-9]+$` 必須（canonical 層で検査） | 存在検証=App34 読取（§1 手順3） |
+| name | str | 可（"" 保持） | なし | なし（原文のまま・エンジンも解釈しない） |
+| alive | str | 不可 | なし | **値域（生存/死亡/不明）=エンジン**。canonical=型のみ |
+| death_date | str | 可 | なし | **YYYY-MM-DD 形式・実在性=変換層/エンジン**。canonical=型のみ |
+| death_wareki | str | 可 | なし | なし（参考原文） |
+| is_decedent / born_before_parents_adoption | bool のみ（type is bool） | — | — | canonical=型のみ（真偽の妥当性=エンジン） |
+| father_id / mother_id / adoptive_father_id / adoptive_mother_id | str | 可（親不明=""） | **非空なら** `^[0-9]+$`（canonical 層で検査） | 参照整合=エンジン |
+| events[].kind | str | 不可 | なし | **種別語彙=エンジン**（参考提示用）。canonical=型のみ |
+| events[].date / events[].partner | str | 可 | なし | なし（和暦原文・氏名原文のまま） |
+| revision | str | 不可 | `^[0-9]+$` 必須 | なし（kintone が正） |
+| declarations の人物 ID（renounced/disqualified/adoption_kinds の key） | str | 不可 | `^[0-9]+$` 必須 | 参照整合=エンジン |
+| declarations.fetuses の要素 / adoption_kinds の value | str | 不可 | なし | 値域（普通養子/特別養子）=エンジン |
+| case_app_id / case_record_id / at_date | str | 不可 | ID は `^[0-9]+$`・at_date は `^\d{4}-\d{2}-\d{2}$`（文字面のみ） | 日付の実在性=変換層 |
+
+- 表の違反（型不正・grammar 不正・C0/C1・必須空）は**canonical 化中止**
+  （policy error・§5A の payload_policy 枠・値は非反射で位置情報のみ）。
+- **field 集合の機械検査（fix3 M02）**: `dataclasses.fields(HeirPerson)`／
+  `fields(LifeEvent)` の名前集合と canonical schema の field 集合の**完全一致**を
+  実装票テストで assert する（§7-20。エンジンに field が追加されたのに canonical
+  仕様（schema 版数 v）が未更新のまま、という乖離を構造的に FAIL させる）。
+
 ## 2. 起動条件
 
 - **語彙**: 主形「相続人を導出して」。registry の説明には「相続人」「導出」の
@@ -112,6 +142,7 @@ dispatch_bot/heir_derive_task.py（新規・隔離 module＝person_merge_task �
   | 被相続人 0名/複数名 | 同上（エンジン error＝保存対象外） | 同上（件数のみ） |
   | payload/validate 失敗 | run 未保存・write 0 | 「保存規格に不適合のため中止（分類名）」＋業務チャネル警報 |
   | run 保存失敗（競合含む） | DB tx 内（部分状態なし） | 「保存に失敗/競合（分類名）。再指示で再試行」 |
+  | 封筒 policy 失敗（EnvelopePolicyError） | run 保存済み・封筒 I/O 0 | 「run #N は保存済み・封筒の前提検証で中止」 |
   | 封筒 search 失敗（EnvelopeSearchError） | run 保存済み・封筒 write 0 | 「run #N は保存済み・封筒起票のみ失敗。再指示で封筒のみ再試行」 |
   | 封筒 create 通信失敗（EnvelopeCreateUnknownError） | run 保存済み・**封筒は結果不明** | 「run #N は保存済み・封筒は結果不明。再指示すると完全一致検索で回収」 |
 - **error run の監査**: DB レベルの error 監査（導出失敗履歴の永続化）が必要に
@@ -129,21 +160,30 @@ dispatch_bot/heir_derive_task.py（新規・隔離 module＝person_merge_task �
   （保存時の安全側格下げ・エンジン無改変・導出事実の rank/result_payload は保持）。
   (B) は §9-3 後の別票。
 
-### 3B. P3-003a 公開契約の改定（fix2 H03・[人]承認済み）
+### 3B. P3-003a 公開契約の改定（fix2 H03・[人]承認済み→fix3 M01 精密化）
 
-- `file_heir_envelope` の失敗は**段階別の固定例外**へ改定する:
-  - **EnvelopeSearchError**（search 段の I/O 失敗・write 0）
-  - **EnvelopeCreateUnknownError**（create 通信失敗＝ACK 不明・結果不明）
-  - EnvelopePolicyError（既存・policy 段＝kintone I/O 前）
-  いずれも **vendor 例外本文を保持しない**（分類のみ・固定 `stage` 属性
-  〔"search"／"create"〕を持つ）。§6 統一契約の意味論（write 0／I/O 0／結果不明）は
-  不変＝**例外の型でどの段の失敗かを機械判定可能にする**改定。
-- これにより §5A の例外分類と §6 の `ack_unknown` 計数が**推測なしで実装可能**
-  （「KintoneError がどの段から来たか」を呼出し側が推測する構造を排除）。
+- `file_heir_envelope` の失敗は**段階別の固定例外3種で閉じる**
+  （`stage` 属性の値域も **{"policy", "search", "create"} で閉じる**・fix3 M01）:
+  - EnvelopePolicyError（stage="policy"・kintone I/O 前＝I/O 0）
+  - **EnvelopeSearchError**（stage="search"・search 段の I/O 失敗・write 0）
+  - **EnvelopeCreateUnknownError**（stage="create"・create 通信失敗＝ACK 不明・
+    結果不明）
+  §6 統一契約の意味論（I/O 0／write 0／結果不明）は不変＝**例外の型と stage で
+  どの段の失敗かを機械判定可能にする**改定。
+- **vendor 例外非保持の具体契約（fix3 M01）**:
+  - wrapper 例外の `args` は**固定値のみ**（分類名・stage。vendor 例外の
+    message/str を含めない）。
+  - vendor 例外を**属性へ保存しない**（`self.original = e` 型の保持を禁止）。
+  - 変換は **`raise ... from None` で例外 chain を遮断**——`__cause__`／
+    `__context__` 経由で traceback に vendor 本文（URL・レコード値等）が残存する
+    経路を防ぐ。
 - **実装票への要求事項**: 本改定は P3-003a の契約変更のため、実装票で
-  **契約 pin テスト（TestFailureBehaviorContract）の同時更新**を必須とする
-  （search 失敗=EnvelopeSearchError・create 失敗=EnvelopeCreateUnknownError・
-  ACK 喪失回収テストの例外型 assert 追加）。
+  **契約 pin テスト（TestFailureBehaviorContract）の同時更新**を必須とする——
+  search 失敗=EnvelopeSearchError・create 失敗=EnvelopeCreateUnknownError・
+  ACK 喪失回収テストの例外型 assert に加え、**sentinel 入り vendor 例外を発生させ、
+  wrapper の `str()`／`repr()`／`__cause__`／`__context__`（連鎖の全段）に sentinel が
+  残存しないことの検査**（§7-18）と **stage 値域 {"policy","search","create"} の
+  閉集合 pin** を必須とする。
 
 ## 4. 冪等・二重起動（同一案件への連続コマンド）
 
@@ -197,23 +237,26 @@ dispatch_bot/heir_derive_task.py（新規・隔離 module＝person_merge_task �
 | 指示Bot 応答 | 件数・run id・封筒 No のみ | 本設計で固定 |
 | ログ | emit 契約の ID/件数のみ・例外は type 名分類のみ | §5A/§6・実装票で sink 検査 |
 
-### 5A. 例外分類表（fix1 M02→fix2 H03/H04 更新）
+### 5A. 例外分類表（fix1 M02→fix2 H03/H04→fix3 H01 で run/封筒の軸を分離）
 
-| 例外 | heir_derive_task の扱い | [人]応答（固定文言＋分類名のみ） |
-|---|---|---|
-| ChainIntegrityError | 捕捉→固定応答 | 「保存の前提が変化。再指示してください」 |
-| IntegrityError（並行競合） | 捕捉→run_conflict 応答 | 「並行実行と競合。再指示で回収できます」 |
-| PayloadPolicyError | 捕捉→固定応答＋**業務チャネル警報**（規格逸脱＝バグ疑い） | 「保存規格に不適合のため中止」 |
-| EnvelopePolicyError（policy 段） | 捕捉→固定応答 | 「封筒の前提検証で中止」 |
-| **EnvelopeSearchError**（§3B） | 捕捉→固定応答 | 「封筒起票のみ失敗。再指示で再試行」 |
-| **EnvelopeCreateUnknownError**（§3B） | 捕捉→ack_unknown 応答 | 「封筒は結果不明。再指示で回収」 |
-| KintoneError（App34 読取） | 捕捉→固定応答 | 「読取に失敗。再指示で再試行」 |
-| ImmutableRecordError | 捕捉→固定応答＋業務警報（到達＝バグ） | 「内部整合性エラー」 |
-| 想定外の Exception | **伝播**（握り潰し禁止・dispatch_bot 上位の既存エラー処理へ） | 上位既定 |
+| 例外 | heir_derive_task の扱い | ログ enum（§6 の 2軸） | [人]応答（固定文言＋分類名のみ） |
+|---|---|---|---|
+| ChainIntegrityError | 捕捉→固定応答 | run=failed:chain_integrity ／ envelope=skipped | 「保存の前提が変化。再指示してください」 |
+| IntegrityError（並行競合） | 捕捉→run_conflict 応答 | run=run_conflict ／ envelope=skipped | 「並行実行と競合。再指示で回収できます」 |
+| PayloadPolicyError | 捕捉→固定応答＋**業務チャネル警報**（規格逸脱＝バグ疑い） | run=failed:payload_policy ／ envelope=skipped | 「保存規格に不適合のため中止」 |
+| EnvelopePolicyError（stage="policy"） | 捕捉→固定応答 | run=created|no_change ／ **envelope=failed:policy** | 「run #N は保存済み・封筒の前提検証で中止」 |
+| **EnvelopeSearchError**（stage="search"・§3B） | 捕捉→固定応答 | run=created|no_change ／ **envelope=failed:search** | 「run #N は保存済み・封筒起票のみ失敗。再指示で再試行」 |
+| **EnvelopeCreateUnknownError**（stage="create"・§3B） | 捕捉→ack_unknown 応答 | run=created|no_change ／ **envelope=ack_unknown** | 「run #N は保存済み・封筒は結果不明。再指示で回収」 |
+| KintoneError（App34 読取） | 捕捉→固定応答 | run=failed:kintone_read ／ envelope=skipped | 「読取に失敗。再指示で再試行」 |
+| ImmutableRecordError | 捕捉→固定応答＋業務警報（到達＝バグ） | run=failed:immutable ／ envelope=skipped | 「内部整合性エラー」 |
+| 想定外の Exception | **伝播**（握り潰し禁止・dispatch_bot 上位の既存エラー処理へ。finally でログ emit＋pending invalidate 後に再送出） | run=failed:unexpected ／ envelope=skipped | 上位既定 |
 
-- **failed:<分類> の閉集合（fix2 M04）**: {chain_integrity, run_conflict,
-  payload_policy, envelope_policy, envelope_search, envelope_create_unknown,
-  kintone_read, immutable, unexpected}——ログ・応答の分類名はこの集合のみ。
+- **run_result の failed:<分類> 閉集合（fix2 M04→fix3 H01 で整理）**:
+  **{chain_integrity, payload_policy, kintone_read, immutable, unexpected}**——
+  run 段の失敗のみ（run_conflict／not_saved_error は独立 enum 値）。
+  **封筒段の分類（policy／search／create）は run_result に混入させない**——
+  封筒段の失敗は run が保存済みの事後であり、envelope_result 側
+  （failed:policy／failed:search／ack_unknown）だけで表現する（§6 の対応表が正）。
 - **pending の invalidate（fix2 H04・[人]裁定済み）**: **CMD の execute_fn 内
   finally で実施**（成功／分類済み失敗／想定外例外のすべての終端で invalidate＝
   task 固有の実装）。**dispatch_bot handler 本体は無改変**・既存タスクの
@@ -221,7 +264,7 @@ dispatch_bot/heir_derive_task.py（新規・隔離 module＝person_merge_task �
 - **非露出の固定**: 例外本文・App34 の値（氏名 sentinel）は応答文・LINE 通知・
   ログのいずれにも出さない（type 名の分類のみ）。
 
-## 6. 観測（fix1 M03→fix2 M04: run と封筒の別 enum に分離）
+## 6. 観測（fix1 M03→fix2 M04: 2軸分離→fix3 H01: enum 完全化＋合法組合せ表）
 
 - **構造化ログ（固定 enum・emit 契約）**:
   `[HEIR-CMD] run=<run_result> envelope=<envelope_result> case=<id>
@@ -233,19 +276,31 @@ dispatch_bot/heir_derive_task.py（新規・隔離 module＝person_merge_task �
   | no_change | head と同一 input_hash＝run 非作成 |
   | not_saved_error | derive error＝非保存（§8 裁定6改定） |
   | run_conflict | 保存の並行競合 |
-  | failed:<分類> | その他失敗（§5A の閉集合） |
-- **envelope_result enum（閉集合）**:
+  | failed:<分類> | その他 run 段失敗（§5A の run 段閉集合5種のみ） |
+- **envelope_result enum（閉集合・fix3 H01 で失敗値を完全化）**:
   | enum | 意味 |
   |---|---|
   | filed | 新規封筒起票 |
   | already_filed | 既存封筒回収（reconcile 計数） |
-  | ack_unknown | EnvelopeCreateUnknownError（結果不明のまま終了） |
+  | **failed:policy** | EnvelopePolicyError（stage="policy"・I/O 0 で中止） |
+  | **failed:search** | EnvelopeSearchError（stage="search"・write 0 で失敗） |
+  | ack_unknown | EnvelopeCreateUnknownError（**「結果不明」として failed とは別扱い**——失敗確定ではなく reconcile 対象） |
   | disabled | flag OFF（実行途中 OFF の境界含む・§2） |
   | skipped | run 側が created/no_change 以外＝封筒段に未到達 |
+- **合法な (run_result, envelope_result) の対応表（fix3 H01・これが閉集合の正）**:
+  | run_result | 許容される envelope_result |
+  |---|---|
+  | created ／ no_change | filed ／ already_filed ／ disabled |
+  | created ／ no_change | failed:policy ／ failed:search ／ ack_unknown |
+  | not_saved_error ／ run_conflict ／ failed:<run 段分類5種> | **skipped のみ** |
+  - **ログ生成関数は定義外の組合せを拒否する**（emit 前に対応表と照合し、表外は
+    ValueError＝バグの即時顕在化。「封筒段に未到達なのに filed」等の矛盾ログを
+    構造的に排除する契約）。§5A の各例外→2軸値の写像はこの表の部分集合であることを
+    実装票の table test（§7-17）で機械検査。
 - 値は case/run/record ID と件数のみ。[人]の確認手段は fix1 と同じ（指示Bot 応答・
   App30 封筒・Railway ログ検索）。daily_healthcheck 追加は初版なし。
 
-## 7. テスト計画（実装票で書くテストの一覧・fix2 で M03/H03/H04 分を追加）
+## 7. テスト計画（実装票で書くテストの一覧・fix2 で M03/H03/H04・fix3 で 17〜20 を追加）
 
 1. registry/parser: 語彙分類（正例）＋誤爆 negative。
 2. flag ゲート: OFF=I/O ゼロ＋固定文言／ON=経路実行。
@@ -278,6 +333,23 @@ dispatch_bot/heir_derive_task.py（新規・隔離 module＝person_merge_task �
     null と空文字の区別。
 16. **flag 境界（fix2 M03）**: task 直接呼出しでも OFF=I/O ゼロ／実行途中 OFF
     （run 保存後）→ envelope disabled 応答・再指示で回収。
+17. **2軸 enum の table test（fix3 M03-i）**: §6 の合法組合せ表を定数としてテストに
+    収載し、実装のログ生成関数と**全対一致**を検査（分岐網羅ではなく「表との一致」
+    ——表にある組合せは全て受理・表にない組合せは全て拒否、の両方向）。§5A の
+    各例外→2軸値の写像が表の部分集合であることも同時に assert。
+18. **安全な例外ラップ（fix3 M03-ii・§3B）**: sentinel 入り vendor 例外を各段
+    （policy／search／create）で発生させ、wrapper 例外の `str()`／`repr()`／`args`／
+    `__cause__`／`__context__`（連鎖全段）に sentinel 非残存・stage 値域
+    {"policy","search","create"} の閉集合 pin・`from None` による chain 遮断
+    （`__suppress_context__` の確認）。
+19. **canonical bytes の非残存（fix3 M03-iii）**: 氏名 sentinel 入りの canonical
+    材料で実行し、DB 全行・ログ出力・全例外の str/repr・mock（kintone/エンジン）の
+    **呼出し引数記録**のいずれにも canonical bytes（sentinel）が現れないこと
+    （保持は hash 値のみ＝§1.1 PII 統制の機械 pin）。
+20. **field 集合の構造試験（fix3 M03-iv・§1.1a）**: `dataclasses.fields(HeirPerson)`
+    ／`fields(LifeEvent)` の名前集合と canonical schema の field 集合の完全一致を
+    assert——エンジンへ field を追加すると、canonical 仕様（schema 版数 v）を
+    更新しない限り**このテストが FAIL する**構造にする（hash 材料の黙った欠落防止）。
 
 ## 8. 裁定記録（[人]。改定履歴付き・遡及書き換えにしない）
 
