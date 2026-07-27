@@ -104,19 +104,70 @@ sa.event.listen(TemplateVersion, "before_delete", _reject_delete)
 
 # ── DB 層 trigger（create_all／migration 共用の単一ソース） ──────────────────
 
+# fix4 M01: DB 層の「空白類のみ」判定に用いる空白文字の列挙（SP/TAB/LF/VT/FF/CR/
+# NBSP/全角スペース）。SQLite は TRIM(X, Y)・PG は BTRIM で表現する。
+# **表現しきれない残余（既知）**: Unicode Zs の一部（U+2000–U+200A・U+202F・U+205F 等）
+# は DB 層の列挙に含まれない。**repository 層検査（activate() の str.strip()＝Python の
+# Unicode 空白全域）が正**であり、DB 層は Core 迂回に対する近似防御（fix4 M01 で拡張）。
+_WS_CODEPOINTS = (9, 10, 11, 12, 13, 160, 12288)
+
+
+def _gate_sql(neq: str, blank: str) -> str:
+    """lifecycle 完全表（fix3→fix4 H01: 遷移履歴込み）の承認ゲート式。
+    neq=dialect の不一致比較演算子・blank=空白類のみ approved_by の判定式。"""
+    return (
+        # 状態不変条件: draft（lifecycle 全 NULL）
+        "(NEW.status = 'draft' AND (NEW.approved_by IS NOT NULL OR "
+        "NEW.approved_at IS NOT NULL OR NEW.activated_at IS NOT NULL OR "
+        "NEW.retired_at IS NOT NULL)) OR "
+        # 状態不変条件: active（承認3点必須・空白類のみ承認者拒否・retired_at NULL）
+        "(NEW.status = 'active' AND (NEW.approved_by IS NULL OR "
+        f"{blank} OR NEW.approved_at IS NULL OR "
+        "NEW.activated_at IS NULL OR NEW.retired_at IS NOT NULL)) OR "
+        # 状態不変条件: retired（retired_at 必須）
+        "(NEW.status = 'retired' AND NEW.retired_at IS NULL) OR "
+        # 遷移固有: draft→retired は approval 列・activated_at とも NULL 維持（fix4 H01）
+        "(OLD.status = 'draft' AND NEW.status = 'retired' AND "
+        "(NEW.approved_by IS NOT NULL OR NEW.approved_at IS NOT NULL OR "
+        "NEW.activated_at IS NOT NULL)) OR "
+        # 遷移固有: active→retired は activated_at を OLD 値から変更不可（fix4 H01）
+        "(OLD.status = 'active' AND NEW.status = 'retired' AND "
+        f"OLD.activated_at {neq} NEW.activated_at) OR "
+        # 遷移固有: retired→retired は activated_at・retired_at とも変更不可（fix4 H01）
+        "(OLD.status = 'retired' AND NEW.status = 'retired' AND "
+        f"(OLD.activated_at {neq} NEW.activated_at OR "
+        f"OLD.retired_at {neq} NEW.retired_at)) OR "
+        # 遷移固有: retired での approval 初回設定拒否
+        "(OLD.status = 'retired' AND OLD.approved_by IS NULL AND "
+        "NEW.approved_by IS NOT NULL) OR "
+        # 片側のみ設定拒否
+        "((NEW.approved_by IS NULL) <> (NEW.approved_at IS NULL)) OR "
+        # write-once（fix1 継承）
+        f"(OLD.approved_by IS NOT NULL AND OLD.approved_by {neq} NEW.approved_by) OR "
+        f"(OLD.approved_at IS NOT NULL AND OLD.approved_at {neq} NEW.approved_at) OR "
+        # 遷移固有: active のまま activated_at 書換拒否
+        "(OLD.status = 'active' AND NEW.status = 'active' AND "
+        f"OLD.activated_at {neq} NEW.activated_at)")
+
+
 def template_trigger_ddl() -> dict[str, list[str]]:
     """内容列 UPDATE 拒否＋DELETE 全面拒否＋承認ゲートの dialect 別 DDL。
 
-    fix2（P3002-2）→ fix3（P3002-3）で lifecycle 完全表へ拡張:
-    - 状態不変条件（M01/M02・全 UPDATE に適用）:
+    fix2（P3002-2）→ fix3（P3002-3）→ fix4（P30024）の lifecycle 完全表:
+    - 状態不変条件（全 UPDATE に適用）:
       draft   = approved_by/approved_at/activated_at/retired_at **全て NULL**
-      active  = approved_by（**TRIM 後も非空**・H01）＋approved_at＋activated_at **必須**
-                かつ retired_at **NULL**
+      active  = approved_by（**空白類のみは拒否**・fix4 M01: SP/TAB/LF/VT/FF/CR/NBSP/
+                全角スペースの列挙 TRIM・残余は repository 層が正）＋approved_at＋
+                activated_at **必須**かつ retired_at **NULL**
       retired = retired_at **必須**
-    - 遷移固有: draft→retired では approval 列 NULL 維持／retired での approval 初回設定拒否／
+    - 遷移固有（fix4 H01 で履歴込みに完全化）:
+      draft→retired   = approval 列・**activated_at** とも NULL 維持
+      active→retired  = activated_at は **OLD 値から変更不可**
+      retired→retired = **activated_at・retired_at とも変更不可**・approval 初回設定拒否
       active のまま activated_at 書換拒否／approved_* write-once／片側のみ設定拒否
     ※ 並行 activate の実測は SQLite（テスト）。**PostgreSQL 実機の並行実測は未実施 —
-      デプロイ前推奨回帰として追跡**（fix3 改定裁定 (c)・受容済み）。
+      デプロイ前推奨回帰として追跡**（fix3 改定裁定 (c)・受容済み・
+      TRACKING_PRE_DEPLOY_CHECKS #1）。
     """
     sqlite_when = " OR ".join(
         f"OLD.{c} IS NOT NEW.{c}" for c in _FROZEN_COLUMNS)
@@ -126,40 +177,13 @@ def template_trigger_ddl() -> dict[str, list[str]]:
     flow = ("NOT ((OLD.status = NEW.status) OR "
             "(OLD.status = 'draft' AND NEW.status IN ('active', 'retired')) OR "
             "(OLD.status = 'active' AND NEW.status = 'retired'))")
-    # fix2→fix3 承認ゲート（UPDATE 用・lifecycle 完全表＋遷移固有条件）
-    _common_gate = (
-        # 状態不変条件: draft（lifecycle 全 NULL）
-        "(NEW.status = 'draft' AND (NEW.approved_by IS NOT NULL OR "
-        "NEW.approved_at IS NOT NULL OR NEW.activated_at IS NOT NULL OR "
-        "NEW.retired_at IS NOT NULL)) OR "
-        # 状態不変条件: active（承認3点必須・TRIM 後も非空・retired_at NULL）
-        "(NEW.status = 'active' AND (NEW.approved_by IS NULL OR "
-        "TRIM(NEW.approved_by) = '' OR NEW.approved_at IS NULL OR "
-        "NEW.activated_at IS NULL OR NEW.retired_at IS NOT NULL)) OR "
-        # 状態不変条件: retired（retired_at 必須）
-        "(NEW.status = 'retired' AND NEW.retired_at IS NULL) OR "
-        # 遷移固有: draft→retired は approval 列 NULL 維持
-        "(OLD.status = 'draft' AND NEW.status = 'retired' AND "
-        "(NEW.approved_by IS NOT NULL OR NEW.approved_at IS NOT NULL)) OR "
-        # 遷移固有: retired での approval 初回設定拒否
-        "(OLD.status = 'retired' AND OLD.approved_by IS NULL AND "
-        "NEW.approved_by IS NOT NULL) OR "
-        # 片側のみ設定拒否
-        "((NEW.approved_by IS NULL) <> (NEW.approved_at IS NULL))")
-    sqlite_gate = (
-        _common_gate + " OR "
-        # write-once（fix1 継承）
-        "(OLD.approved_by IS NOT NULL AND OLD.approved_by IS NOT NEW.approved_by) OR "
-        "(OLD.approved_at IS NOT NULL AND OLD.approved_at IS NOT NEW.approved_at) OR "
-        # 遷移固有: active のまま activated_at 書換拒否
-        "(OLD.status = 'active' AND NEW.status = 'active' AND "
-        "OLD.activated_at IS NOT NEW.activated_at)")
-    pg_gate = (
-        _common_gate + " OR "
-        "(OLD.approved_by IS NOT NULL AND OLD.approved_by IS DISTINCT FROM NEW.approved_by) OR "
-        "(OLD.approved_at IS NOT NULL AND OLD.approved_at IS DISTINCT FROM NEW.approved_at) OR "
-        "(OLD.status = 'active' AND NEW.status = 'active' AND "
-        "OLD.activated_at IS DISTINCT FROM NEW.activated_at)")
+    # fix4 M01: 空白類のみ approved_by の dialect 別判定式（列挙は _WS_CODEPOINTS）
+    _ws_sqlite = "CHAR(" + ",".join(str(c) for c in _WS_CODEPOINTS) + ")"
+    _ws_pg = " || ".join(f"CHR({c})" for c in _WS_CODEPOINTS)
+    blank_sqlite = f"TRIM(NEW.approved_by, ' ' || {_ws_sqlite}) = ''"
+    blank_pg = f"BTRIM(NEW.approved_by, ' ' || {_ws_pg}) = ''"
+    sqlite_gate = _gate_sql("IS NOT", blank_sqlite)
+    pg_gate = _gate_sql("IS DISTINCT FROM", blank_pg)
     # fix2 H02: INSERT は draft かつ lifecycle 列すべて NULL
     insert_bad = ("NEW.status != 'draft' OR NEW.approved_by IS NOT NULL OR "
                   "NEW.approved_at IS NOT NULL OR NEW.activated_at IS NOT NULL OR "
@@ -264,8 +288,11 @@ async def activate(version_id: int, approved_by: str) -> None:
       送出して **transaction 全体を rollback**（旧 active の retire も巻き戻る＝
       「active 0 件」状態を残さない）。事前 select は利便のための friendly check・
       整合性の正は rowcount 検査と部分ユニーク制約。
-    - fix2 H01: approved_by は非空文字列必須（DB approve_gate trigger と重畳）。
-      並行 activate の実測は SQLite（テスト）。PostgreSQL 実機での並行実測は未実施（既知）。
+    - fix2 H01→fix4 M01: approved_by は非空文字列必須（str.strip()＝Python の Unicode
+      空白全域で判定。**本検査が空白判定の正**・DB approve_gate trigger の列挙 TRIM は
+      Core 迂回への近似防御として重畳）。
+      並行 activate の実測は SQLite（テスト）。PostgreSQL 実機での並行実測は未実施
+      （既知・TRACKING_PRE_DEPLOY_CHECKS #1 で追跡）。
     """
     if not isinstance(approved_by, str) or not approved_by.strip():
         raise ValueError("approved_by（承認者）は非空文字列が必須")

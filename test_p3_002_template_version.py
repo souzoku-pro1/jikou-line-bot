@@ -486,10 +486,94 @@ class TestPurposeStrictFrozen(_DbMixin):
         db.reset_for_tests()
 
 
-# ── fix3(P3002-3-H01/M01/M02) 追加テスト ─────────────────────────────────────
-class TestLifecycleCompleteTable(_DbMixin):
-    """M01/M02: 状態×lifecycle の完全表を trigger で強制（Core 実測・SQLite）。
-    PostgreSQL 実機の並行実測は未実施 — デプロイ前推奨回帰として追跡（改定裁定 (c)）。"""
+# ── fix3(P3002-3)→fix4(P30024-H01) lifecycle 完全表（table-driven 置換） ──────
+from datetime import datetime, timezone  # noqa: E402  （行列の固定時刻用）
+
+# 「OLD 値から変更」を確実に起こす固定時刻（activate の now() と必ず別値）
+_T1 = datetime(2020, 1, 1, tzinfo=timezone.utc)
+_T2 = datetime(2021, 6, 15, 12, 34, 56, tzinfo=timezone.utc)
+
+
+class TestLifecycleTransitionMatrix(_DbMixin):
+    """fix4 H01: 3状態（draft/active/retired）×4 lifecycle 列（approved_by/
+    approved_at/activated_at/retired_at）×遷移（同値遷移・draft→active・
+    draft→retired・active→retired）の全行列を table-driven で実測（Core・SQLite）。
+    PostgreSQL 実機の並行実測は未実施 — TRACKING_PRE_DEPLOY_CHECKS #1 で追跡。"""
+
+    # 行列: (label, 初期状態, UPDATE values, 期待=ok/deny)
+    # 初期状態: draft ＝作成直後／active ＝activate 済み／
+    #           retired_d ＝draft→retired 済み（approval 未設定）／
+    #           retired_a ＝active→retired 済み（approval 設定済み）
+    _MATRIX = [
+        # ── draft→draft（同値遷移）: lifecycle 4 列は全て NULL 維持 ──
+        ("draft_set_approved_by",   "draft", dict(approved_by="x"), "deny"),
+        ("draft_set_approved_at",   "draft", dict(approved_at=_T1), "deny"),
+        ("draft_set_activated_at",  "draft", dict(activated_at=_T1), "deny"),
+        ("draft_set_retired_at",    "draft", dict(retired_at=_T1), "deny"),
+        # ── draft→active: 承認3点必須・retired_at NULL ──
+        ("d2a_full_trio",           "draft", dict(status="active", approved_by="a",
+                                                  approved_at=_T1,
+                                                  activated_at=_T1), "ok"),
+        ("d2a_missing_approved_by", "draft", dict(status="active", approved_at=_T1,
+                                                  activated_at=_T1), "deny"),
+        ("d2a_missing_approved_at", "draft", dict(status="active", approved_by="a",
+                                                  activated_at=_T1), "deny"),
+        ("d2a_missing_activated_at", "draft", dict(status="active", approved_by="a",
+                                                   approved_at=_T1), "deny"),
+        ("d2a_with_retired_at",     "draft", dict(status="active", approved_by="a",
+                                                  approved_at=_T1, activated_at=_T1,
+                                                  retired_at=_T1), "deny"),
+        # ── draft→retired: retired_at 必須・approval/activated_at は NULL 維持 ──
+        ("d2r_bare",                "draft", dict(status="retired",
+                                                  retired_at=_T1), "ok"),
+        ("d2r_no_retired_at",       "draft", dict(status="retired"), "deny"),
+        ("d2r_with_approval",       "draft", dict(status="retired", retired_at=_T1,
+                                                  approved_by="x",
+                                                  approved_at=_T1), "deny"),
+        ("d2r_with_activated_at",   "draft", dict(status="retired", retired_at=_T1,
+                                                  activated_at=_T1), "deny"),   # fix4
+        # ── active→active（同値遷移）: 全 lifecycle 列とも書換不可 ──
+        ("active_change_approved_by",  "active", dict(approved_by="other"), "deny"),
+        ("active_change_approved_at",  "active", dict(approved_at=_T2), "deny"),
+        ("active_change_activated_at", "active", dict(activated_at=_T2), "deny"),
+        ("active_set_retired_at",      "active", dict(retired_at=_T2), "deny"),
+        # ── active→retired: retired_at 必須・activated_at は OLD 値固定・
+        #    approved_* write-once ──
+        ("a2r_bare",                "active", dict(status="retired",
+                                                   retired_at=_T2), "ok"),
+        ("a2r_no_retired_at",       "active", dict(status="retired"), "deny"),
+        ("a2r_change_activated_at", "active", dict(status="retired", retired_at=_T2,
+                                                   activated_at=_T2), "deny"),  # fix4
+        ("a2r_change_approved_by",  "active", dict(status="retired", retired_at=_T2,
+                                                   approved_by="other"), "deny"),
+        # ── retired→retired（同値遷移・approval 設定済み側）: 全列変更不可 ──
+        ("r2r_change_activated_at", "retired_a", dict(activated_at=_T2), "deny"),  # fix4
+        ("r2r_change_retired_at",   "retired_a", dict(retired_at=_T2), "deny"),    # fix4
+        ("r2r_change_approved_by",  "retired_a", dict(approved_by="other"), "deny"),
+        # ── retired→retired（approval 未設定側）: 初回設定・後付けも不可 ──
+        ("r2r_first_set_approval",  "retired_d", dict(approved_by="late",
+                                                      approved_at=_T2), "deny"),
+        ("r2r_set_activated_at",    "retired_d", dict(activated_at=_T2), "deny"),  # fix4
+    ]
+
+    def _make(self, state: str, i: int) -> int:
+        """行ごとに独立の template（key を分離・partial unique 非干渉）を初期状態へ。"""
+        pk = self._create(template_key=f"mx-{i}", version="1.0.0")
+        if state == "draft":
+            return pk
+        if state == "active":
+            self._activate(pk)
+            return pk
+        if state == "retired_d":                    # draft→retired（approval 未設定）
+            _run(self._upd(pk, status="retired", retired_at=sa.func.now())())
+            db.reset_for_tests()
+            return pk
+        if state == "retired_a":                    # active→retired（approval 設定済み）
+            self._activate(pk)
+            _run(self._upd(pk, status="retired", retired_at=sa.func.now())())
+            db.reset_for_tests()
+            return pk
+        raise AssertionError(state)
 
     def _upd(self, pk, **vals):
         async def _u():
@@ -499,60 +583,62 @@ class TestLifecycleCompleteTable(_DbMixin):
                                 .values(**vals))
         return _u
 
-    def test_whitespace_only_approver_rejected_core(self):
-        # H01: TRIM 後空の承認者は draft→active でも拒否（Core 直 UPDATE 実測）
-        pk = self._create()
-        with self.assertRaises((IntegrityError, OperationalError)):
-            _run(self._upd(pk, status="active", approved_by="   ",
-                           approved_at=sa.func.now(),
-                           activated_at=sa.func.now())())
-        db.reset_for_tests()
-
-    def test_retired_approval_first_set_rejected(self):
-        # M02: draft→retired（approval NULL 維持）後、retired のまま approval 初回設定は拒否
-        pk = self._create()
-        _run(self._upd(pk, status="retired", retired_at=sa.func.now())())
-        db.reset_for_tests()
-        with self.assertRaises((IntegrityError, OperationalError)):
-            _run(self._upd(pk, approved_by="late-approver",
-                           approved_at=sa.func.now())())
-        db.reset_for_tests()
-
-    def test_draft_to_retired_with_approval_rejected(self):
-        # M02: draft→retired と同時の approval 設定も拒否（承認は active 遷移専用）
-        pk = self._create()
-        with self.assertRaises((IntegrityError, OperationalError)):
-            _run(self._upd(pk, status="retired", retired_at=sa.func.now(),
-                           approved_by="x", approved_at=sa.func.now())())
-        db.reset_for_tests()
-
-    def test_active_activated_at_rewrite_rejected(self):
-        # M02: active のまま activated_at の書換は拒否（同一秒の now() では書換に
-        # ならないため、確実に異なる固定時刻へ書き換えて実測する）
-        from datetime import datetime, timezone
-        pk = self._create()
-        self._activate(pk)
-        with self.assertRaises((IntegrityError, OperationalError)):
-            _run(self._upd(pk, activated_at=datetime(2020, 1, 1,
-                                                     tzinfo=timezone.utc))())
-        db.reset_for_tests()
-
-    def test_state_invariant_matrix(self):
-        # 完全表: draft は lifecycle 全 NULL／active は retired_at NULL
-        pk = self._create()
-        for label, vals in {
-            "draft_with_activated_at": dict(activated_at=sa.func.now()),
-            "draft_with_retired_at": dict(retired_at=sa.func.now()),
-        }.items():
+    def test_full_matrix(self):
+        for i, (label, state, vals, expect) in enumerate(self._MATRIX):
             with self.subTest(case=label):
-                with self.assertRaises((IntegrityError, OperationalError)):
+                pk = self._make(state, i)
+                if expect == "ok":
                     _run(self._upd(pk, **vals)())
+                else:
+                    with self.assertRaises((IntegrityError, OperationalError)):
+                        _run(self._upd(pk, **vals)())
                 db.reset_for_tests()
-        self._activate(pk)
-        with self.subTest(case="active_with_retired_at"):
-            with self.assertRaises((IntegrityError, OperationalError)):
-                _run(self._upd(pk, retired_at=sa.func.now())())
-            db.reset_for_tests()
+
+
+# ── fix4(P30024-M01) 空白類 approved_by の DB/repository 両層拒否 ─────────────
+class TestWhitespaceApproverRejected(_DbMixin):
+    """M01: TRIM のみでなくタブ・改行・NBSP・全角スペース等の空白類のみの
+    approved_by を拒否。DB 層は列挙 TRIM（SP/TAB/LF/VT/FF/CR/NBSP/全角）・
+    **repository 層（str.strip()＝Unicode 空白全域）が正**（残余は module docstring）。"""
+
+    _BLANKS = {
+        "spaces": "   ",
+        "tab": "\t",
+        "newline": "\n",
+        "crlf": "\r\n",
+        "vertical_tab_formfeed": "\x0b\x0c",
+        "nbsp": "\xa0",
+        "zenkaku_space": "　",
+        "mixed": " \t\r\n\xa0　 ",
+    }
+
+    def _upd(self, pk, **vals):
+        async def _u():
+            async with db.session_scope() as s:
+                await s.execute(sa.update(TemplateVersion.__table__)
+                                .where(TemplateVersion.__table__.c.id == pk)
+                                .values(**vals))
+        return _u
+
+    def test_db_layer_rejects_whitespace_only_approver(self):
+        for i, (label, blank) in enumerate(self._BLANKS.items()):
+            with self.subTest(case=label):
+                pk = self._create(template_key=f"ws-{i}", version="1.0.0")
+                with self.assertRaises((IntegrityError, OperationalError)):
+                    _run(self._upd(pk, status="active", approved_by=blank,
+                                   approved_at=sa.func.now(),
+                                   activated_at=sa.func.now())())
+                db.reset_for_tests()
+
+    def test_repository_layer_rejects_whitespace_only_approver(self):
+        pk = self._create()
+        for label, blank in self._BLANKS.items():
+            with self.subTest(case=label):
+                with self.assertRaises(ValueError):
+                    _run(activate(pk, blank))
+                db.reset_for_tests()
+        self._activate(pk, approved_by="attorney-1")   # 正常系は通る（対照）
+        self.assertIsNotNone(self._get_active())
 
 
 if __name__ == "__main__":
