@@ -246,7 +246,12 @@ async def claim_execution(app: kintone.KintoneApp, record: dict) -> bool:
   - **ユニット種別（H03）**: 凍結 §2.1 どおり**案件由来**＝案件アプリ ID→ユニットの
     写像で解決（App21=時効援用／App26=相続一般）。**案件から解決不能な場合は
     起票せず異常扱い**（EnvelopePolicyError・kintone write ゼロ）。
-  - **導出コマンド票への申し送り（M02・固定事項）**: `file_heir_envelope` の失敗時
-    契約＝**search/create/policy いずれの失敗も例外伝播（握り潰し禁止・新規起票を
-    成功扱いにしない）**。リトライ判断は導出コマンド側の責務（冪等キーにより再実行
-    安全・契約 pin テスト=TestFailureBehaviorContract）。
+  - **導出コマンド票への申し送り（M02→fix2 H02 訂正・固定事項）**:
+    `file_heir_envelope` の失敗時契約＝**search/create/policy いずれの失敗も例外伝播
+    （握り潰し禁止・新規起票を成功扱いにしない）**。
+    **create の通信失敗は「結果不明（ACK 不明）」**——POST が kintone 側で成功し
+    応答のみ喪失した可能性があるため「封筒未作成」とは断定しない。
+    **再実行時は冪等キーの完全一致検索（H01）が reconcile を担い、成功済み封筒が
+    見つかれば already_filed として回収（二重起票しない）**。リトライ判断は
+    導出コマンド側の責務（契約 pin テスト=TestFailureBehaviorContract・
+    ACK 喪失回収=test_ack_lost_create_reconciled_on_retry）。

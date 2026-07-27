@@ -245,6 +245,28 @@ class TestFailureBehaviorContract(_MockIo):
                 _run(he.file_heir_envelope(_mk_run()))
         create2.assert_not_awaited()
 
+    def test_ack_lost_create_reconciled_on_retry(self):
+        """fix2 H02: create の通信失敗=結果不明（ACK 喪失）。kintone 側では封筒が
+        作成済みだった場合、再実行は H01 の完全一致照合で回収し二重起票しない。"""
+        from hub.kintone import KintoneError
+        # 1回目: create が通信例外（実際には kintone 側で封筒 No.88 が作成済み）
+        search1 = AsyncMock(return_value=[])
+        create1 = AsyncMock(side_effect=KintoneError(0, "", "timeout"))
+        with patch.dict(os.environ, _ON), \
+             patch.object(he.kintone, "search_records", new=search1), \
+             patch.object(he.kintone, "create_record", new=create1):
+            with self.assertRaises(KintoneError):
+                _run(he.file_heir_envelope(_mk_run()))
+        # 2回目（再実行）: 検索が「1回目で実は作成されていた封筒」を返す
+        search2 = AsyncMock(return_value=[_envelope_record("88")])
+        create2 = AsyncMock()
+        with patch.dict(os.environ, _ON), \
+             patch.object(he.kintone, "search_records", new=search2), \
+             patch.object(he.kintone, "create_record", new=create2):
+            r = _run(he.file_heir_envelope(_mk_run()))
+        self.assertEqual(r, {"status": "already_filed", "record_id": "88"})
+        create2.assert_not_awaited()             # 二重起票しない（完全一致照合で回収）
+
 
 class TestDetailClosedSet(unittest.TestCase):
     def test_detail_builder_pins_closed_set(self):

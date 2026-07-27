@@ -185,13 +185,17 @@ async def file_heir_envelope(run) -> dict:
       "already_filed"（既存封筒あり・record_id=既存番号）|
       "disabled"（flag OFF・record_id=None）|
       "not_target"（status が derived/held 以外・record_id=None）}。
-    - **失敗時挙動（fix1 M02・握り潰し禁止）**: **検索（search）・起票（create）・
-      検証（policy）のいずれの失敗も例外で伝播**する。握り潰して正常戻り値を返す
-      ことは禁止＝**新規起票を成功扱い（"filed"）にするのは create 成功時のみ**。
+    - **失敗時挙動（fix1 M02→fix2 H02 訂正・握り潰し禁止）**: **検索（search）・
+      起票（create）・検証（policy）のいずれの失敗も例外で伝播**する。握り潰して
+      正常戻り値を返すことは禁止＝**新規起票を成功扱い（"filed"）にするのは
+      create の成功応答を受領した時のみ**。
       policy 失敗（EnvelopePolicyError/PayloadPolicyError）は kintone I/O 前に送出
-      （write ゼロ）。search 失敗時は create 未到達・create 失敗時も App30 への
-      write は当該単票 create の 1 回以外に発生しない（部分状態なし）。
-      例外時の再実行は冪等キーにより安全（成功済みなら already_filed）。
+      （write ゼロ）。search 失敗時は create 未到達（write 発行ゼロ）。
+      **create の通信失敗は「結果不明（ACK 不明）」**——POST が kintone 側で成功し
+      応答のみ喪失した可能性があり、**「封筒未作成」とは断定できない**（本関数が
+      発行する write は当該単票 create の 1 回のみだが、その結果の確定はしない）。
+      **再実行時は冪等キーの完全一致検索（H01）が reconcile を担い、成功済み封筒が
+      見つかれば already_filed として回収**する（二重起票しない）。
       **リトライ判断は呼出し元（導出コマンド票・別票）の責務**——この契約は
       導出コマンド票への申し送り事項として DRAFT §6 に固定
       （契約 pin テスト: test_p3_003a_heir_envelope.TestFailureBehaviorContract）。
