@@ -532,5 +532,53 @@ class TestFetusSyntheticId(unittest.TestCase):
             {"heirs": [{"person_id": "胎児:F1"}], "facts": []})
 
 
+# ── fix5(P30015-M01) 胎児連番契約（validate 時の契約強制） ──────────────────
+class TestFetusSequenceContract(unittest.TestCase):
+    """M01 裁定: run 内の胎児 ID 集合は {F1..Fn}（F1 起点・正整数・連続・重複なし）。
+    F0・先頭ゼロ・欠番・重複を拒否。採番は出現ごと（同一ラベルでも別番号）。"""
+
+    def test_f0_and_leading_zero_rejected(self):
+        from hub.derivation_models import PayloadPolicyError, validate_result_payload
+        for bad in ("胎児:F0", "胎児:F01", "胎児:F00", "胎児:F010"):
+            with self.subTest(pid=bad):
+                with self.assertRaises(PayloadPolicyError):
+                    validate_result_payload(
+                        {"heirs": [{"person_id": bad}], "facts": []})
+
+    def test_duplicate_gap_and_nonstart_rejected(self):
+        from hub.derivation_models import PayloadPolicyError, validate_result_payload
+        cases = {
+            "duplicate": ["胎児:F1", "胎児:F1"],          # 重複
+            "gap": ["胎児:F1", "胎児:F3"],                # 欠番（F2 なし）
+            "non_f1_start": ["胎児:F2"],                  # F1 起点でない
+            "non_f1_start_pair": ["胎児:F2", "胎児:F3"],  # 連続だが F1 起点でない
+        }
+        for label, pids in cases.items():
+            with self.subTest(case=label):
+                with self.assertRaises(PayloadPolicyError):
+                    validate_result_payload(
+                        {"heirs": [{"person_id": p} for p in pids], "facts": []})
+        # 対照: {F1..Fn} 完全一致は通る（並び順は問わない）
+        validate_result_payload(
+            {"heirs": [{"person_id": "胎児:F2"}, {"person_id": "胎児:F1"}],
+             "facts": []})
+
+    def test_same_label_twice_gets_distinct_numbers(self):
+        # 裁定: 同一ラベル2回出現でも別番号（辞書写像の同一化を解消）。
+        # 導出器（凍結）を介さず build_run_payload の変換契約として直接検証する。
+        from fractions import Fraction
+        from types import SimpleNamespace
+
+        from hub.derivation_models import build_run_payload, validate_result_payload
+        heirs = [SimpleNamespace(person_id="胎児:妻", zokugara="胎児",
+                                 share=Fraction(1, 4), basis=["民法886条"]),
+                 SimpleNamespace(person_id="胎児:妻", zokugara="胎児",
+                                 share=Fraction(1, 4), basis=["民法886条"])]
+        payload, _ = build_run_payload(SimpleNamespace(heirs=heirs, flags=[]))
+        pids = [h["person_id"] for h in payload["heirs"]]
+        self.assertEqual(pids, ["胎児:F1", "胎児:F2"], payload)   # 同一化しない
+        validate_result_payload(payload)                          # 連番契約も通過
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -182,8 +182,13 @@ _LAWYER_FLAGS_KEYS = frozenset({"flags"})
 #   合成識別子 胎児:F1・胎児:F2…（出現順連番）へ写像**して吸収する。
 #   元ラベルとの対応は保存しない（表示が必要なら run 内で再導出可能）。
 #   role語 enum 方式は採らない（fetuses が自由入力である以上 enum は実データで割れる）。
+# 【fix5 M01 司令塔裁定・収載】胎児連番は validate 時に**契約強制**する:
+#   F1 起点・正整数・連続・重複なし（run 内の胎児 ID 集合が {F1..Fn} と完全一致）。
+#   F0・先頭ゼロ（F01 等）・欠番・重複はいずれも拒否。
+#   build_run_payload は**出現ごとに採番**する（同一ラベルが2回出現しても別番号。
+#   fix4 の辞書写像＝同一ラベル同一番号は、重複 ID の温床となるため解消）。
 _PERSON_ID_RE = re.compile(r"^[0-9]{1,10}$")
-_FETUS_ID_RE = re.compile(r"^胎児:F[0-9]+$")   # fix4 H02: 合成 ID のみ（自由文字列排除）
+_FETUS_ID_RE = re.compile(r"^胎児:F[1-9][0-9]*$")   # fix5: F0・先頭ゼロも構文で拒否
 # share: 分数の固定文法のみ（engine は Fraction。全部相続は "1/1"）
 _SHARE_RE = re.compile(r"^[0-9]{1,6}/[1-9][0-9]{0,5}$")
 # relation_key: ASCII enum（zokugara 9 区分の写像・_ZOKUGARA_TO_RELATION が単一の正）
@@ -256,15 +261,19 @@ def build_run_payload(derivation) -> tuple[dict, dict | None]:
     単一変換（fix3 接続点）。氏名・日本語文はここで**落ちる**（保存されるのは
     person_id/share/relation_key/条文キー/flag コードのみ）。
     fix4 H02（裁定）: 導出器出力の胎児 ID `胎児:{label}` は、ここで非PII 合成識別子
-    `胎児:F{n}`（同一 run 内の出現順連番）へ写像する。元ラベルは保存しない。"""
+    `胎児:F{n}`（同一 run 内の出現順連番）へ写像する。元ラベルは保存しない。
+    fix5 M01（裁定）: 採番は**出現ごと**（同一ラベルが2回出現しても別番号＝F1/F2。
+    辞書写像だと fetuses=["妻","妻"] が同一 ID に潰れ重複の温床になるため解消）。"""
     heirs = []
     facts: list[str] = []
-    fetus_synth: dict[str, str] = {}   # 元ラベル→F{n}（run 内のみ・保存しない）
+    fetus_count = 0                    # 出現順連番（run 内のみ・ラベル対応は保存しない）
 
     def _synth_pid(pid):
+        nonlocal fetus_count
         if not (isinstance(pid, str) and pid.startswith("胎児:")):
             return pid
-        return fetus_synth.setdefault(pid, f"胎児:F{len(fetus_synth) + 1}")
+        fetus_count += 1
+        return f"胎児:F{fetus_count}"
 
     for h in derivation.heirs:
         entry = {"person_id": _synth_pid(h.person_id),
@@ -325,6 +334,19 @@ def validate_result_payload(payload) -> None:
         if "relation_key" in h:
             _check_enum(h["relation_key"], _RELATION_KEYS,
                         "result_payload.heirs[*].relation_key")
+    # fix5 M01（裁定・契約強制）: run 内の胎児 ID 集合は {F1..Fn} と完全一致すること
+    # （F1 起点・正整数・連続・重複なし。F0/先頭ゼロは _FETUS_ID_RE が構文で拒否済み）
+    fetus_nums = [int(h["person_id"][len("胎児:F"):]) for h in heirs
+                  if isinstance(h, dict) and isinstance(h.get("person_id"), str)
+                  and h["person_id"].startswith("胎児:")]
+    if fetus_nums:
+        if len(set(fetus_nums)) != len(fetus_nums):
+            raise PayloadPolicyError(
+                "result_payload: 胎児合成 ID の重複（run 内で一意であること・fix5 M01）")
+        if set(fetus_nums) != set(range(1, len(fetus_nums) + 1)):
+            raise PayloadPolicyError(
+                "result_payload: 胎児合成 ID は F1 起点の連番であること"
+                "（欠番・非 F1 起点は保存不可・fix5 M01）")
     facts = payload.get("facts", [])
     if not isinstance(facts, list):
         raise PayloadPolicyError("result_payload.facts は list であること")
