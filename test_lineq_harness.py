@@ -31,10 +31,11 @@ _PII_RES = [
     re.compile(r"\d{3}-\d{4}"),                     # 郵便番号様
     re.compile(r"\d{7,}"),                          # 長数字列（口座様）
     re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+"),  # メール様
-    # fix1 M01: 金額一般（実額）。丸め帯「◯万円台」「数万円」は数字が円に直結
-    # しないため非該当（許可・allowlist の meta.amount_band と整合）
+    # fix1 M01→fix2 M01: 金額一般（実額）。許可される丸めは「数万円台」「数億円」等の
+    # **数字が単位に直結しない表現のみ**（数字+万/億+円 の実額は fix2 で検出対象）
     re.compile(r"[¥￥]\s?\d"),                      # 通貨記号+数字
     re.compile(r"\d[\d,]{2,}円"),                   # 実額の円表記（44,000円 等）
+    re.compile(r"\d[\d,]*\s?[万億]\s?円"),          # fix2: 単位付き実額（5万円/30万円/1億円）
     # fix1 M01: 住所・口座 sentinel（代表形）
     re.compile(r"\d+(丁目|番地|号室)"),
     re.compile(r"口座番号|普通預金\s?\d+"),
@@ -108,8 +109,9 @@ class TestSyntheticThreads(unittest.TestCase):
     def test_no_pii_like_patterns_machine_layer(self):
         """機械層の PII 検査（fix1 H02: 特例除外なしの全文検査）。
 
-        保証範囲の契約（fix1 M01・二層）: 本テストが保証するのは**パターンで
-        機械検出できる類型**（電話/郵便/長数字列/メール/実額金額/住所・口座
+        保証範囲の契約（fix1 M01→fix2 M01・二層）: 本テストが保証するのは
+        **パターンで機械検出できる類型**（電話/郵便/長数字列/メール/実額金額
+        〔桁区切り円・通貨記号・**単位付き実額=数字+万/億+円**〕/住所・口座
         sentinel）のみ。氏名等のパターン化できない類型は**固定24本の目視
         レビュー**（Codex レビュー＋[人]）が第二層として担う。"""
         for t in THREADS:
@@ -117,6 +119,18 @@ class TestSyntheticThreads(unittest.TestCase):
                 for rx in _PII_RES:
                     self.assertIsNone(rx.search(turn["text"]),
                                       (t["thread_id"], rx.pattern))
+
+    def test_pii_pattern_fixtures_unit_amounts(self):
+        """fix2 M01: 単位付き実額の positive／丸め帯（数字非直結）の negative。"""
+        def _hit(text):
+            return any(rx.search(text) for rx in _PII_RES)
+        for positive in ("5万円", "30万円", "1億円", "1,500万円", "10 万円"):
+            with self.subTest(positive=positive):
+                self.assertTrue(_hit(f"残債は{positive}です"), positive)
+        for negative in ("数万円台", "数億円", "数十万円規模とだけ伺いました",
+                        "何万円かかるか不安です"):
+            with self.subTest(negative=negative):
+                self.assertFalse(_hit(negative), negative)
 
 
 class TestMetrics(unittest.TestCase):
@@ -166,26 +180,38 @@ def _g0_scan_static_imports(src: str) -> list[str]:
     return out
 
 
-def _g0_scan(src: str) -> list[str]:
-    """G0 検査（fix1 H01 強化版）。
+def _g0_scan(src: str, *, track_importlib_aliases: bool = True) -> list[str]:
+    """G0 検査（fix1 H01 強化→fix2 H01: importlib の import alias 追跡）。
 
     検出対象: (1) 静的 Import/ImportFrom（禁止 module）
     (2) __import__(...) 呼出し (3) importlib.import_module(...) 呼出し
-    （from importlib import import_module の別名含む） (4) exec(...) 呼出し。
+    （`from importlib import import_module [as X]` の別名、および fix2:
+    `import importlib as il` の **module alias 経由 `il.import_module(...)`** を含む）
+    (4) exec(...) 呼出し。
     (2)-(4) は引数によらず**呼出し自体を違反**とする（相1 ハーネスに動的
     import/実行時コード実行の正当用途は無い）。
 
     残余（静的解析の限界・規律とレビューに委任）: getattr(builtins, 変数)・
-    eval で組み立てた import 等の**完全動的経路**は検出できない。"""
+    eval で組み立てた import・変数へ再代入した module オブジェクト経由等の
+    **完全動的経路**は検出できない。
+
+    track_importlib_aliases=False は fix1 時点の挙動（module alias 非追跡）を
+    再現するメタテスト専用スイッチ（本検査は常に既定 True で使う）。"""
     import ast
     out = list(_g0_scan_static_imports(src))
     tree = ast.parse(src)
     import_module_aliases = {"import_module"}
+    importlib_module_aliases = {"importlib"}
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom) and node.module == "importlib":
             for al in node.names:
                 if al.name == "import_module":
                     import_module_aliases.add(al.asname or al.name)
+        elif isinstance(node, ast.Import) and track_importlib_aliases:
+            for al in node.names:   # fix2 H01: import importlib as il 等の alias 収集
+                if al.name == "importlib" or al.name.startswith("importlib."):
+                    importlib_module_aliases.add(al.asname
+                                                 or al.name.split(".")[0])
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
@@ -194,9 +220,15 @@ def _g0_scan(src: str) -> list[str]:
                                                 | import_module_aliases):
             out.append(f"dynamic:{f.id}")
         elif (isinstance(f, ast.Attribute) and f.attr == "import_module"
-              and isinstance(f.value, ast.Name) and f.value.id == "importlib"):
-            out.append("dynamic:importlib.import_module")
+              and isinstance(f.value, ast.Name)
+              and f.value.id in importlib_module_aliases):
+            out.append(f"dynamic:{f.value.id}.import_module")
     return out
+
+
+def _g0_scan_fix1(src: str) -> list[str]:
+    """fix1 時点の検査（module alias 非追跡）。三段対照メタテスト専用。"""
+    return _g0_scan(src, track_importlib_aliases=False)
 
 
 class TestG0Separation(unittest.TestCase):
@@ -226,6 +258,20 @@ class TestG0Separation(unittest.TestCase):
         src = "import chat_responder\n"
         self.assertTrue(_g0_scan_static_imports(src))
         self.assertTrue(_g0_scan(src))
+
+    def test_meta_importlib_module_alias_three_stage_contrast(self):
+        """fix2 H01 メタテスト（三段対照）: `import importlib as il` 経由の
+        il.import_module(...) が「旧検査 PASS・fix1 検査 PASS・fix2 検査 FAIL」。"""
+        src = ("import importlib as il\n"
+               "m = il.import_module('chat_responder')\n")
+        self.assertEqual(_g0_scan_static_imports(src), [])   # 旧: 通過
+        self.assertEqual(_g0_scan_fix1(src), [])             # fix1: 通過（隙）
+        self.assertTrue(_g0_scan(src))                       # fix2: 検出
+        # 既存経路の非退行: literal importlib 経由は fix1/fix2 とも検出
+        src2 = ("import importlib\n"
+                "m = importlib.import_module('chat_responder')\n")
+        self.assertTrue(_g0_scan_fix1(src2))
+        self.assertTrue(_g0_scan(src2))
 
 
 if __name__ == "__main__":
