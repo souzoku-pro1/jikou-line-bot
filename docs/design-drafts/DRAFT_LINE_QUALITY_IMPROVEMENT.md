@@ -166,7 +166,10 @@ G0 の検査対象）。
 | turn.category | 既存 14 カテゴリ enum | 20 | 実値そのまま（enum 外は除外） |
 | meta.amount_band | 金額の丸め帯（例: 40万円台） | 16 | 丸め規則（粒度は[人]裁定） |
 | meta.date_band | 時期の丸め（例: 2015年頃） | 16 | 同上 |
+| layer | 固定 enum 6値のみ（main:auto／main:approved／main:demoted／rare:silent／rare:immediate／rare:fallback） | 14 | 変換器の層割当（機械: 希少 a>b→主要3群排他）＋fallback 補正（reverify 時の[人]構造化入力・優先順位 a>b>c を再適用）で確定 |
 
+  （改定 2026-07-27・LINE-LOG-PREP fix1 H02(i): 標本層ラベル `layer` を allowlist へ
+  正式追加。本改定は上表 1 行と本注記の追加のみ）
   上表に**無いフィールドは出力しない**（allowlist の追加は本 DRAFT 改定＝Codex
   レビュー経由のみ）。
 - **自由記述の残存検査**: 変換後コーパスに対し (a) パターン検査（電話/口座/郵便番号/
