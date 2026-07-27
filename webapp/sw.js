@@ -1,18 +1,7 @@
-// P4-001: SW キャッシュは shell のみ（DRAFT §4）。
-// データ応答（PII）は一切キャッシュしない — SHELL 以外は素通しの network fetch。
-const CACHE = "webapp-shell-v1";
-const SHELL = ["/app", "/app/app.js", "/app/manifest.json"];
-self.addEventListener("install", (e) => {
-  e.waitUntil(caches.open(CACHE).then((c) => c.addAll(SHELL)));
-});
-self.addEventListener("activate", (e) => {
-  e.waitUntil(caches.keys().then((keys) =>
-    Promise.all(keys.filter((k) => k !== CACHE).map((k) => caches.delete(k)))));
-});
-self.addEventListener("fetch", (e) => {
-  const url = new URL(e.request.url);
-  if (SHELL.includes(url.pathname)) {
-    e.respondWith(caches.match(e.request).then((r) => r || fetch(e.request)));
-  }
-  // SHELL 以外はハンドリングしない＝ブラウザ既定の network fetch（キャッシュゼロ）
-});
+// P4-001 fix1 H01（[人]裁定・SW キャッシュ全廃）: network-only。
+// 設計判断: 認証済み応答が Cache Storage に残ると cookie 失効・署名鍵差し替え後も
+// ブラウザ側で表示できてしまうため、SW によるキャッシュ経路を構造的に排除する
+// （オフライン非対応=認証境界優先）。fetch handler は登録しない＝全 request が
+// ブラウザ既定の network fetch。install/activate は SW 登録の維持のみ。
+self.addEventListener("install", () => { self.skipWaiting(); });
+self.addEventListener("activate", (e) => { e.waitUntil(self.clients.claim()); });
