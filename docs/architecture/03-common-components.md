@@ -277,6 +277,14 @@ UNIT_CONFIG = {
 - K4（LINE 再配送設定確認）は**補助**であり点火条件ではない（K4 は非 2xx への再配送のため、
   200 ACK 後の BackgroundTask crash による滞留を回収できない）。
 - rollback は env OFF 1 本で即時に現行挙動と byte 同一（M-06: flag OFF は import 不発）。
+- **rollback の残余（RMC-M04・MAIN-CONS-fix1）**: flag OFF は**挙動の復元であって状態の
+  完全復元ではない**。(a) 点火中に書かれた**既存 LINE 行は inbound_event に残置**され、
+  OFF 後は監視対象外（監視項目G は flag 配下でしか動かず、E 系は provider='stripe'
+  限定〔RMC-M01〕のため**無監視**）→ rollback 時は残置行の**照合と手動閉鎖**
+  （done＝§12.3 の照合源による根拠必須／打切り＝failed_exhausted・manual_closed・
+  §12.2）を必ず行うこと。
+  (b) **received 行を「処理済みの証明」なしに done へ変更することは禁止**
+  （§12.2 の done 定義どおり。証明なき done 化は取りこぼしの黙殺になる）。
 
 ### 12.2 状態語彙（inbound_event.state・LINE Phase A）
 

@@ -182,3 +182,80 @@ sortation_ingest.py:136: (_durable_enabled)  同上
 - **【fix3・P2DP3-M02】結線を別票に分離した場合でも、点火ゲートは
   「検査関数＋結線の両方 merge 済み」のまま**（§6 前提条件 (c) と同一。結線票の完了までは
   警報が発火しないため、検査関数のみの merge では点火できない）。
+
+## 8. 点火 runbook（MAIN-CONS-fix1・R-DEPLOY-READINESS-1 反映）
+
+R-DEPLOY-READINESS-1（対象 main `9e5708e`）の観測一覧を採録し、§6 手順案を
+実施形へ具体化する。**P0 は全項目必須**・P1/P2 は観測継続。
+
+### 8.0 更新注記（RMC-M01 との整合）
+
+§6 rollback の fix1 記述「check_journal_backlog は provider != kintone で LINE 行も
+読む」は **MAIN-CONS-fix1（RMC-M01 裁定）で解消**——E 系は provider='stripe' 限定と
+なり、**flag OFF 後の残置 LINE 行はどの監視にも載らない（無監視）**。したがって
+rollback 時の残置行の照合・手動閉鎖（§6・03-common §12.1 RMC-M04）は**必須手順**である
+（「24h 後に Stripe 文言で警報が出るから気づける」という消極的検知はもう無い）。
+
+### 8.1 P0（必須ゲート）
+
+**(a) 点火前（[人]・read-only 確認コマンド集）** — いずれも読取のみ・値は表示しない
+（DATABASE_PUBLIC_URL 経由・repo 直下で実行）:
+
+```bash
+# 1) migration 適用実態（alembic head 一致）
+cd /c/work/jikou-line-bot
+railway run python -c "import os; os.environ['DATABASE_URL']=os.environ['DATABASE_PUBLIC_URL']; import alembic.config; alembic.config.main(argv=['current'])"
+
+# 2) 3 テーブル・claimed_at 列・index の存在（information_schema 照会）
+railway run python - << 'PY'
+import os, asyncio, sqlalchemy as sa
+from sqlalchemy.ext.asyncio import create_async_engine
+url = os.environ['DATABASE_PUBLIC_URL'].replace('postgresql://', 'postgresql+psycopg://', 1)
+async def main():
+    eng = create_async_engine(url)
+    async with eng.connect() as c:
+        t = await c.execute(sa.text(
+            "SELECT table_name FROM information_schema.tables "
+            "WHERE table_name IN ('inbound_event','ingestion_receipt','signature_nonce')"))
+        print('tables:', sorted(r[0] for r in t))
+        col = await c.execute(sa.text(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_name='inbound_event' AND column_name='claimed_at'"))
+        print('inbound_event.claimed_at:', bool(col.first()))
+        ix = await c.execute(sa.text(
+            "SELECT indexname FROM pg_indexes WHERE tablename IN "
+            "('inbound_event','ingestion_receipt','signature_nonce') ORDER BY 1"))
+        print('indexes:', [r[0] for r in ix])
+    await eng.dispose()
+asyncio.run(main())
+PY
+
+# 3) STRIPE_EVENT_JOURNAL_ENABLED の確認（flag 値のみ・secret ではない）
+railway run python -c "import os; print('STRIPE_EVENT_JOURNAL_ENABLED =', os.environ.get('STRIPE_EVENT_JOURNAL_ENABLED'))"
+```
+
+**(b) deploy 直後（必須ゲート）**:
+- **`[RV05] startup reconcile` の成功ログを実見すること（必須）。
+  「skipped」が出た場合は点火中止**（flag が効いていない／DB 未到達のいずれか。
+  原因確定まで OFF に戻す）。
+- 起動 traceback なし・`Application startup complete`・`/health` 200（WebFetch）。
+
+**(c) LINE スモーク**: テスト発話 1 件 → 応答正常＋`inbound_event` に provider='line'
+行が生成され **received→processing→done の terminal 到達**を実見（§6 手順 3）。
+
+**(d) sortation スモーク**: signed lane 1 件 → 200＋receipt 行＋従来どおり
+`[照会中]`/`[済]` リネーム（§6 手順 4）。
+
+### 8.2 P1（点火後 24h の観測）
+
+- 監視項目G（LINE received/processing 滞留・既定 1h 閾値）の**警報 0**。
+- 日次死活監視の通知に新規異常なし・LINE 応答遅延の苦情/異常なし。
+- `[RV05]` 系ログにエラーなし・5xx 増加なし（sortation H-04 の 5xx 化は自然リトライで
+  回収されることを確認・§6 リスク (i)）。
+
+### 8.3 P2（1 週間の観測）
+
+- inbound_event の state 分布（received/processing 残置 0・done 率）を週次で確認。
+- `failed_exhausted` の新規発生 0（発生時は runbook 2026-07-15_RV-05-13-fix5 §4）。
+- 問題なければ観測強化を解除し、TRACKING_PRE_DEPLOY_CHECKS #3（G 系境界値の PG 実測）を
+  この観測ウィンドウ内で消化する。

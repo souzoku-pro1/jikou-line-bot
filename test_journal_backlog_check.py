@@ -165,5 +165,48 @@ class TestBacklogSkipConditions(unittest.TestCase):
             shutil.rmtree(tmp, ignore_errors=True)
 
 
+# ── RMC-M01（裁定）追加テスト: E系は provider='stripe' 限定 ──────────────────
+class TestLineRowsNotCountedByE(_SqliteDbMixin):
+    """LINE 行は G系（hub/durable_inbound.check_line_backlog）専任であり、
+    24h 超で滞留していても E系（check_journal_backlog）には計上されない。"""
+
+    def _insert_line_row(self, state: str):
+        async def _ins():
+            async with db.session_scope() as s:
+                await s.execute(sa.insert(InboundEvent).values(
+                    provider="line", dedup_key=f"line:rmc-m01-{state}",
+                    payload_hash="x" * 8, signature_result="valid",
+                    state=state,
+                    received_at=_utcnow() - timedelta(hours=30),
+                    claimed_at=_utcnow() - timedelta(hours=30)))
+        _run(_ins())
+        db.reset_for_tests()
+
+    def _set_stripe_only(self, **values):
+        async def _u():
+            async with db.session_scope() as session:
+                await session.execute(
+                    sa.update(InboundEvent)
+                    .where(InboundEvent.provider == "stripe").values(**values))
+        _run(_u())
+        db.reset_for_tests()
+
+    def test_line_rows_not_reported_by_journal_backlog(self):
+        # processing 30h 超・failed 30h 超の LINE 行を置いても E系は無反応
+        self._insert_line_row("processing")
+        self._insert_line_row("failed")
+        problems = _run(check_journal_backlog())
+        db.reset_for_tests()
+        self.assertEqual(problems, [], "LINE 行が E系に計上された（RMC-M01 違反）")
+        # 対照: 同条件の stripe 行は従来どおり計上される
+        _run(record_stripe_event(EVENT, PAYLOAD))
+        db.reset_for_tests()
+        self._set_stripe_only(claimed_at=_utcnow() - timedelta(hours=25))
+        problems = _run(check_journal_backlog())
+        db.reset_for_tests()
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("processing", problems[0])
+
+
 if __name__ == "__main__":
     unittest.main()
