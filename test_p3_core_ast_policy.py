@@ -318,7 +318,11 @@ class TestScannerFixtures(unittest.TestCase):
                              "sa.text(f'UPDATE template_version "
                              "SET status={s}')\n", "raw_sql:text"),
         }
-        self.assertGreaterEqual(len(cases), 15)   # fix5: 8→15 種以上を維持
+        # R-P3-001-7 M01: 件数保証を正確な期待へ固定（fix3:4 + fix4:4 + fix5:7 + fix6:2 = 18）
+        self.assertEqual(len(cases), 18, sorted(cases))
+        # fix6 追加2種（f-string リテラル部分連結）の存在を直接 assert
+        self.assertIn("exec_driver_fstring", cases)
+        self.assertIn("text_fstring", cases)
         for label, (src, kind) in cases.items():
             with self.subTest(case=label):
                 found = scan_source(src, "fx.py")
