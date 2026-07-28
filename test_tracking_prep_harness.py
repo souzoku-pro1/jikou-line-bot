@@ -240,6 +240,76 @@ def _launch_alias_violations(tree) -> list[str]:
     return violations
 
 
+# harness が正当に使う os の属性（この2つ以外の os 出現は全て違反・fix5 M01）
+_ALLOWED_OS_ATTRS = {"environ", "path"}
+
+
+def _launch_context_violations(tree) -> list[str]:
+    """fix5 M01: **許可文脈の閉集合方式**（禁止形の列挙からの反転・p4-002 fix4
+    と同方針）。
+
+    - `subprocess`（Name）の出現許可文脈は2つのみ:
+      (a) import 文そのもの（module 名は Name node を生成しないため走査上も
+      自然除外） (b) **_run_migrate 内の許可 Call**（argv 逐語 pin 済みの
+      `subprocess.run([sys.executable, "-m", "alembic", ...])` の func 起点）。
+      それ以外の**あらゆる出現**（代入 RHS・関数引数・IfExp/BoolOp・コンテナ・
+      unpack・return…）は違反——一段目の束縛自体が違反になるため、二段 alias・
+      条件式 alias は構造的に不能。
+    - `os`（Name）は launch 能力（os.system）の遮断のため、出現許可を
+      「`os.environ`／`os.path` を attr とする Attribute の基底」に限定
+      （他の属性・裸の os 出現は違反）。
+    - from-import された launch 関数名（run 等）は出現許可ゼロ
+      （`from subprocess import *` も違反）。
+
+    残余の限界（fix5 で限定）: **実行時文字列からの名前解決**（globals()/vars()
+    の辞書アクセス等・文字列は Name node でない）と **C 拡張内部の呼出し**のみ。
+    歴代検出器（fix3 walk+alias 追跡・fix4 R1/R2 代入遮断）は防御の重畳として残置。
+    """
+    violations = []
+    parents: dict = {}
+    for node in ast.walk(tree):
+        for child in ast.iter_child_nodes(node):
+            parents[child] = node
+
+    allowed_subprocess_names = set()     # 許可 (b): pin 済み Call の func 基底
+    for func in ast.walk(tree):
+        if isinstance(func, ast.FunctionDef) and func.name == "_run_migrate":
+            for node in ast.walk(func):
+                if (isinstance(node, ast.Call)
+                        and isinstance(node.func, ast.Attribute)
+                        and isinstance(node.func.value, ast.Name)
+                        and node.func.value.id == "subprocess"
+                        and node.func.attr == "run"
+                        and node.args and isinstance(node.args[0], ast.List)):
+                    allowed_subprocess_names.add(node.func.value)
+
+    from_funcs = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) \
+                and (node.module or "").split(".")[0] in _LAUNCH_MODULES:
+            for a in node.names:
+                if a.name == "*":
+                    violations.append("from <launch module> import * は違反")
+                elif a.name in _SUBPROC_FUNCS:
+                    from_funcs.add(a.asname or a.name)
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Name):
+            continue
+        if node.id == "subprocess" and node not in allowed_subprocess_names:
+            violations.append(f"subprocess の許可外文脈での出現（行 {node.lineno}）")
+        elif node.id == "os":
+            parent = parents.get(node)
+            ok = (isinstance(parent, ast.Attribute)
+                  and parent.value is node
+                  and parent.attr in _ALLOWED_OS_ATTRS)
+            if not ok:
+                violations.append(f"os の許可外文脈での出現（行 {node.lineno}）")
+        elif node.id in from_funcs:
+            violations.append(f"launch 関数名の出現: {node.id}（行 {node.lineno}）")
+    return violations
+
+
 def _find_process_launches_fix3(tree):
     """fix3 時点の検出（**対照用の凍結コピー・変更しない**）。
     Name target の alias 固定点追跡まで・非 Name target（Attribute/Subscript/
@@ -434,6 +504,49 @@ class TestMigrateLaunchShape(unittest.TestCase):
     def test_no_alias_smuggling_assignments(self):
         # fix4 M01: 非 Name target への launch 系持ち出しがハーネスに存在しない
         self.assertEqual(_launch_alias_violations(self._module_tree()), [])
+
+    def test_context_allowlist_zero_violations(self):
+        # fix5 M01: ハーネス本体は許可2文脈（import 文/pin 済み Call）のみで
+        # subprocess を使い、os は environ/path 基底のみ=新検査で違反ゼロ
+        self.assertEqual(_launch_context_violations(self._module_tree()), [])
+
+    def test_meta_fix5_bypass_fixtures_fix4_pass_new_fail(self):
+        """fix5 M01-3: Codex 実測4形（二段 alias・条件式）が「旧（fix4=fix3 検出
+        +代入遮断の合成）検査 PASS・新（許可文脈閉集合）検査 FAIL」の三段対照。"""
+        fixtures = {
+            "two_step_attribute": (
+                "import subprocess\n"
+                "class X:\n    pass\n"
+                "x = X()\n"
+                "sp = subprocess\n"
+                "x.go = sp.run\n"
+                "x.go(['c'])\n"),
+            "two_step_module_alias_container": (
+                "import subprocess\n"
+                "sp = subprocess\n"
+                "box = {}\n"
+                "box['m'] = sp\n"
+                "box['m'].run(['c'])\n"),
+            "two_step_unpack": (
+                "import subprocess\n"
+                "sp = subprocess\n"
+                "r, = (sp.run,)\n"
+                "r(['c'])\n"),
+            "conditional_alias": (
+                "import subprocess\n"
+                "runner = subprocess.run if True else None\n"
+                "runner(['c'])\n"),
+        }
+        for label, src in fixtures.items():
+            with self.subTest(fixture=label):
+                tree = ast.parse(src)
+                # fix4 検査 = fix3 検出器 + 代入遮断の合成が両方素通り
+                self.assertEqual(_find_process_launches_fix3(tree), [],
+                                 "fix3 検出は素通り（迂回実在の証明）")
+                self.assertEqual(_launch_alias_violations(tree), [],
+                                 "fix4 代入遮断も素通り（迂回実在の証明）")
+                self.assertNotEqual(_launch_context_violations(tree), [],
+                                    "新検査（許可文脈閉集合）は検出すること")
 
     def test_meta_fix4_bypass_fixtures_fix3_pass_new_fail(self):
         """fix4 M01-3: Codex 実測の3形が「旧（fix3 凍結コピー）検査 PASS・
