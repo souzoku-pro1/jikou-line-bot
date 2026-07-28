@@ -318,29 +318,83 @@ def _extra_guard_violations(tree) -> list[str]:
     return violations
 
 
-def _readonly_violations(tree) -> list[str]:
-    """fix3 H01 の現行検査 = fix2 検査（凍結コピーを部品として利用）＋
-    _extra_guard_violations の追加規則（代入先種類非依存の遮断）。
-
-    残余の限界（fix3 H01-4 で具体化）: operator.attrgetter（動的属性アクセス）・
-    asyncio.create_subprocess_exec/create_subprocess_shell（プロセス起動）は
-    「対象外」とせず **operator/asyncio を禁止 import 集合に追加して入口遮断**。
-    なお残る検出不能領域: globals()/locals()/vars() の辞書経由・文字列組立てで
-    実行時に構成される完全動的経路・C 拡張内部の呼出し。この残余は
-    sink AST policy・関所テスト・レビューで重畳防御する。
-    """
+def _readonly_violations_fix3(tree) -> list[str]:
+    """fix3 H01 時点の検査（**対照用の凍結コピー・変更しない**）。
+    禁止形の列挙方式の最終版=条件式（IfExp/BoolOp）・コンテナ（Dict 等）・
+    関数引数経由の静的迂回を検出できない版（fix4 メタテストの基準）。"""
     return _readonly_violations_fix2(tree) + _extra_guard_violations(tree)
 
 
-class TestReadOnlyMachineCheck(unittest.TestCase):
-    """read-only の AST 機械検査（fix1 M01→fix2 H01 で alias 完全追跡に関数化）。
+# fix4 H01-2: 禁止関数名（許可文脈ゼロ）。attrgetter も名前レベルで遮断
+_BANNED_NAMES = _BANNED_DYNAMIC | {"attrgetter"}
 
-    残余の限界（fix2 H01-4 で正確化）: globals()/locals()/vars() 辞書経由・
-    文字列組立てで実行時に構成される完全動的経路・C 拡張内部の呼出しは静的検査の
-    対象外。**subprocess 経由の HTTP（curl 等）は「対象外」とせず、
-    subprocess/os の import 自体を禁止 import 集合に含めて遮断**する（直接
-    HTTP client の import 検査と同列の入口遮断・実行形の検査ではない）。
-    残余は sink AST policy・関所テスト・レビューで重畳防御。
+
+def _context_allowlist_violations(tree) -> list[str]:
+    """fix4 H01: **許可文脈の閉集合方式**（禁止形の列挙からの反転）。
+
+    - kintone（poison 名）の出現許可文脈は2つのみ:
+      (a) import 文そのもの（`from hub import kintone`。import の module 名は
+      Name node を生成しないため走査上も自然に除外される）
+      (b) `kintone.<許可3 API>` を **Call の func とする Attribute 連鎖の起点**。
+      それ以外の**あらゆる出現**（関数引数・IfExp/BoolOp・Dict/List/Tuple/
+      Subscript 内・代入 RHS・return・比較…）は構文文脈を問わず違反。
+      名前の出現自体を縛るため alias の伝播追跡は不要（歴代検査は重畳として維持）。
+    - 禁止関数名（getattr/setattr/__import__/eval/exec/import_module/attrgetter）は
+      **許可文脈ゼロ**——Name としての出現・Attribute 連鎖末尾としての出現を
+      module 全域で違反化（本 module はこれらを一切使わない前提。正当な必要が
+      生じたらテスト改定=レビュー経由）。
+    """
+    violations = []
+    parents: dict = {}
+    for node in ast.walk(tree):
+        for child in ast.iter_child_nodes(node):
+            parents[child] = node
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name):
+            if node.id == "kintone":
+                parent = parents.get(node)
+                gp = parents.get(parent)
+                allowed = (isinstance(parent, ast.Attribute)
+                           and parent.attr in _ALLOWED_KINTONE_ATTRS
+                           and isinstance(gp, ast.Call) and gp.func is parent)
+                if not allowed:
+                    violations.append(
+                        f"kintone の許可外文脈での出現（行 {node.lineno}）")
+            if node.id in _BANNED_NAMES:
+                violations.append(f"禁止名の出現: {node.id}")
+        elif isinstance(node, ast.Attribute) and node.attr in _BANNED_NAMES:
+            violations.append(f"禁止名の Attribute 出現: {node.attr}")
+    return violations
+
+
+def _readonly_violations(tree) -> list[str]:
+    """fix4 H01 の現行検査 = **許可文脈の閉集合方式（一次）**＋歴代検査
+    （fix2 alias 追跡＋fix3 代入遮断=防御の重畳として残置）。
+
+    残余の限界（fix4 H01-4 で限定し書き直し）: 出現ベースの遮断により静的な
+    別名・持ち出し経路は構造的に閉じた。**本当に残るのは実行時文字列からの
+    名前解決（globals()/vars() の辞書アクセス等・文字列 "kintone" は Name node
+    でないため出現検査の対象外）と C 拡張内部の呼出しのみ**。この残余は
+    sink AST policy・関所テスト・レビューで重畳防御する。
+    """
+    return (_context_allowlist_violations(tree)
+            + _readonly_violations_fix2(tree)
+            + _extra_guard_violations(tree))
+
+
+class TestReadOnlyMachineCheck(unittest.TestCase):
+    """read-only の AST 機械検査。
+
+    fix4 H01 で**許可文脈の閉集合方式へ反転**（禁止形の列挙を追加し続ける方式を
+    終端）: kintone の出現は「import 文」「許可3 API の Call func 起点」のみ許可・
+    禁止関数名は許可文脈ゼロ。歴代検査（fix1/fix2/fix3 の凍結コピー）は
+    メタテストの基準および防御の重畳として並置維持。
+
+    残余の限界（fix4 で限定）: **実行時文字列からの名前解決**（globals()/vars()
+    の辞書アクセス等——文字列 "kintone" は Name node でないため出現検査の対象外）
+    と **C 拡張内部の呼出し**のみ。subprocess/os・operator/asyncio・HTTP client は
+    禁止 import 集合による入口遮断で対応済み。残余は sink AST policy・関所テスト・
+    レビューで重畳防御。
     """
 
     def setUp(self):
@@ -413,6 +467,34 @@ class TestReadOnlyMachineCheck(unittest.TestCase):
                                  "fix2 検査は素通り（迂回が実在した証明）")
                 self.assertNotEqual(_readonly_violations(tree), [],
                                     "新検査は検出すること")
+
+    def test_meta_fix4_bypass_fixtures_fix3_pass_new_fail(self):
+        """fix4 H01-3: Codex 実測4経路が「旧（fix3 凍結コピー）検査 PASS・
+        新（許可文脈閉集合）検査 FAIL」となる三段対照（歴代凍結コピーは並置維持）。"""
+        fixtures = {
+            "func_arg_sink": (
+                "from hub import kintone\n"
+                "def sink(m):\n    return m\n"
+                "sink(kintone)\n"),
+            "ifexp_alias": (
+                "from hub import kintone\n"
+                "k = kintone if True else None\n"),
+            "dict_container": (
+                "from hub import kintone\n"
+                "d = {'k': kintone}\n"
+                "fn = d['k'].update_record\n"),
+            "conditional_builtins_getattr": (
+                "import builtins\n"
+                "ga = builtins.getattr if True else None\n"
+                "x = ga(object, 'a')\n"),
+        }
+        for label, src in fixtures.items():
+            with self.subTest(fixture=label):
+                tree = ast.parse(src)
+                self.assertEqual(_readonly_violations_fix3(tree), [],
+                                 "fix3 検査は素通り（迂回が実在した証明）")
+                self.assertNotEqual(_readonly_violations(tree), [],
+                                    "新検査（許可文脈閉集合）は検出すること")
 
     def test_no_direct_http_or_process_launch_imports(self):
         imported = set()
