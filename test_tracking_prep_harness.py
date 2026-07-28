@@ -157,38 +157,114 @@ class TestMigrateOutputSanitizer(unittest.TestCase):
         self.assertIn("exit 3", buf2.getvalue())
 
 
-class TestMigrateLaunchShape(unittest.TestCase):
-    """fix2 M01-(ii): Alembic 起動形の AST 構造 pin（起動追加も検出）。"""
+# ── process 起動検出（fix3 M01 で走査範囲を完全化・関数化）──────────────────────
 
-    _SUBPROC_FUNCS = {"run", "Popen", "call", "check_call", "check_output",
-                      "system"}
+_SUBPROC_FUNCS = {"run", "Popen", "call", "check_call", "check_output", "system"}
+_LAUNCH_MODULES = {"subprocess", "os"}
+
+
+def _find_launches_legacy(tree):
+    """fix2 時点の検出（**対照用の凍結コピー・変更しない**）。
+    FunctionDef 配下限定＋module 名直書き（subprocess./os.）のみ検出する版。"""
+    launches = []
+    for func in ast.walk(tree):
+        if not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for node in ast.walk(func):
+            if not (isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and isinstance(node.func.value, ast.Name)):
+                continue
+            mod, attr = node.func.value.id, node.func.attr
+            if (mod == "subprocess" and attr in _SUBPROC_FUNCS) \
+                    or (mod == "os" and attr == "system"):
+                launches.append((func.name, node))
+    return launches
+
+
+def _find_process_launches(tree):
+    """fix3 M01 の新検出: module 全体を 1 度の walk で走査（module-level 含む）。
+
+    alias 追跡（p4-002 fix2 と同型）: subprocess/os の import alias
+    （import subprocess as sp）・from-import（from subprocess import run
+    [as r]）・代入 alias（x = subprocess／f = subprocess.run）を固定点まで
+    収集し、それら経由の起動呼出しも全て検出する。`from subprocess import *`
+    は追跡不能のため検出（違反）として返す。
+    Returns: list of (enclosing scope name or "<module>", ast.Call | ast.ImportFrom)
+    """
+    module_alias = set()
+    func_alias = set()
+    star_imports = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                if a.name.split(".")[0] in _LAUNCH_MODULES:
+                    module_alias.add(a.asname or a.name.split(".")[0])
+        elif isinstance(node, ast.ImportFrom):
+            if (node.module or "").split(".")[0] in _LAUNCH_MODULES:
+                for a in node.names:
+                    if a.name == "*":
+                        star_imports.append(node)
+                    elif a.name in _SUBPROC_FUNCS:
+                        func_alias.add(a.asname or a.name)
+    changed = True
+    while changed:                       # 代入 alias の固定点反復
+        changed = False
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.Assign, ast.AnnAssign, ast.NamedExpr)):
+                continue
+            value = getattr(node, "value", None)
+            targets = node.targets if isinstance(node, ast.Assign) \
+                else [node.target]
+            names = [n.id for t in targets for n in ast.walk(t)
+                     if isinstance(n, ast.Name)]
+            if isinstance(value, ast.Name):
+                if value.id in module_alias and not module_alias >= set(names):
+                    module_alias.update(names)
+                    changed = True
+                if value.id in func_alias and not func_alias >= set(names):
+                    func_alias.update(names)
+                    changed = True
+            if isinstance(value, ast.Attribute) \
+                    and isinstance(value.value, ast.Name) \
+                    and value.value.id in module_alias \
+                    and value.attr in _SUBPROC_FUNCS \
+                    and not func_alias >= set(names):
+                func_alias.update(names)
+                changed = True
+
+    launches = [("<module>", node) for node in star_imports]
+
+    def _visit(node, scope):
+        for child in ast.iter_child_nodes(node):
+            child_scope = child.name if isinstance(
+                child, (ast.FunctionDef, ast.AsyncFunctionDef)) else scope
+            if isinstance(child, ast.Call):
+                f = child.func
+                if isinstance(f, ast.Name) and f.id in func_alias:
+                    launches.append((scope, child))
+                elif isinstance(f, ast.Attribute) \
+                        and isinstance(f.value, ast.Name) \
+                        and f.value.id in module_alias \
+                        and f.attr in _SUBPROC_FUNCS:
+                    launches.append((scope, child))
+            _visit(child, child_scope)
+
+    _visit(tree, "<module>")
+    return launches
+
+
+class TestMigrateLaunchShape(unittest.TestCase):
+    """fix2 M01-(ii)→fix3 M01: Alembic 起動形の AST 構造 pin（走査範囲完全化）。
+
+    許可する起動は「_run_migrate 内の位置＋argv 構造」で一意特定した 1 件のみ。
+    それ以外に検出された process 起動（module-level・alias 経由含む）は全て違反。
+    """
 
     def _module_tree(self):
         return ast.parse(Path(harness.__file__).read_text(encoding="utf-8"))
 
-    def _find_launches(self, tree):
-        """subprocess.<func>()・os.system() の起動 Call を列挙（asyncio.run 等の
-        同名別 module 呼出しは対象外＝module 名まで見て判定）。"""
-        launches = []          # (enclosing function name, Call node)
-        for func in ast.walk(tree):
-            if not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                continue
-            for node in ast.walk(func):
-                if not (isinstance(node, ast.Call)
-                        and isinstance(node.func, ast.Attribute)
-                        and isinstance(node.func.value, ast.Name)):
-                    continue
-                mod, attr = node.func.value.id, node.func.attr
-                if (mod == "subprocess" and attr in self._SUBPROC_FUNCS) \
-                        or (mod == "os" and attr == "system"):
-                    launches.append((func.name, node))
-        return launches
-
-    def test_single_launch_in_run_migrate_with_pinned_shape(self):
-        launches = self._find_launches(self._module_tree())
-        self.assertEqual(len(launches), 1, "subprocess 起動は 1 箇所のみ")
-        fn_name, call = launches[0]
-        self.assertEqual(fn_name, "_run_migrate")
+    def _assert_pinned_shape(self, call):
         # argv 固定: [sys.executable, "-m", "alembic", "upgrade", "head"]
         argv = call.args[0]
         self.assertIsInstance(argv, ast.List)
@@ -204,6 +280,33 @@ class TestMigrateLaunchShape(unittest.TestCase):
         self.assertEqual(keywords["cwd"].id, "_REPO_ROOT")
         self.assertIsInstance(keywords["env"], ast.Name)
         self.assertEqual(keywords["env"].id, "child_env")
+
+    def test_single_launch_uniquely_identified_all_others_violate(self):
+        launches = _find_process_launches(self._module_tree())
+        allowed = [(scope, node) for scope, node in launches
+                   if scope == "_run_migrate" and isinstance(node, ast.Call)
+                   and node.args and isinstance(node.args[0], ast.List)]
+        self.assertEqual(len(allowed), 1, "許可起動（_run_migrate 内）は 1 件のみ")
+        self._assert_pinned_shape(allowed[0][1])
+        others = [x for x in launches if x not in allowed]
+        self.assertEqual(others, [], "許可外の process 起動は全て違反")
+
+    def test_meta_bypass_fixtures_old_pass_new_fail(self):
+        """fix3 M01-4: 迂回 fixture 3種が「旧検出 PASS・新検出 FAIL」の三段対照。"""
+        fixtures = {
+            "module_level_run": "import subprocess\nsubprocess.run(['x'])\n",
+            "import_alias": ("import subprocess as sp\n"
+                             "def f():\n    sp.run(['x'])\n"),
+            "from_import_run": ("from subprocess import run\n"
+                                "def f():\n    run(['x'])\n"),
+        }
+        for label, src in fixtures.items():
+            with self.subTest(fixture=label):
+                tree = ast.parse(src)
+                self.assertEqual(_find_launches_legacy(tree), [],
+                                 "旧検出は素通り（迂回が実在した証明）")
+                self.assertNotEqual(_find_process_launches(tree), [],
+                                    "新検出は検出すること")
 
     def test_d2_exclusion_is_full_path_only(self):
         # fix2 M01-(i): D2 検査の除外が完全 path 限定であること（同名別ファイル遮断）
