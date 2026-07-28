@@ -58,10 +58,10 @@ _ENV = {
 _PROTECTED = ("/app", "/app/app.js", "/app/manifest.json", "/app/sw.js")
 
 
-def _login(password):
+def _login(password, headers=None):
     with patch.dict(os.environ, _ENV):
         return _client.post("/app/login", data={"password": password},
-                            follow_redirects=False)
+                            headers=headers, follow_redirects=False)
 
 
 def _cookie_header(value):
@@ -173,11 +173,24 @@ class TestConfigValidation(unittest.TestCase):
         return {k: v for k, v in os.environ.items()
                 if k not in ("WEBAPP_PASSWORD_HASH", "WEBAPP_SESSION_SECRET")}
 
-    def test_unset_env_does_not_block_startup(self):
+    def test_both_unset_does_not_block_startup(self):
+        # fix2 H01 象限1: 両方未設定=機能無効として起動許容
         with patch.dict(os.environ, self._no_webapp_env(), clear=True):
-            validate_config()            # 例外なし=未設定は機能無効として許容
+            validate_config()
 
-    def test_valid_env_passes(self):
+    def test_only_one_env_set_fails_startup(self):
+        # fix2 H01 象限2/3: 片方のみ設定=設定ミスとして起動停止（×2 対照）
+        base = self._no_webapp_env()
+        for only in ("WEBAPP_PASSWORD_HASH", "WEBAPP_SESSION_SECRET"):
+            with self.subTest(only=only):
+                env = {**base, only: _ENV[only]}
+                with patch.dict(os.environ, env, clear=True):
+                    with self.assertRaises(WebAppConfigError) as ctx:
+                        validate_config()
+                    self.assertNotIn(_ENV[only], str(ctx.exception))  # 値の非反射
+
+    def test_both_set_and_valid_passes(self):
+        # fix2 H01 象限4: 両方設定=強度検証へ（適正値は通過）
         with patch.dict(os.environ, _ENV):
             validate_config()
 
@@ -283,6 +296,58 @@ class TestLoginDefenses(unittest.TestCase):
             self.assertRegex(key, r"^[0-9a-f]{64}$")     # sha256 のみ・生 IP 不在
             self.assertNotIn("testclient", key)
 
+    def test_xff_clients_have_separate_buckets(self):
+        # fix2 H02-i: proxy 配下の別 client は XFF 最終要素で bucket が分かれる
+        a = {"X-Forwarded-For": "10.0.0.1"}
+        b = {"X-Forwarded-For": "10.0.0.2"}
+        for _ in range(ATTEMPT_LIMIT):
+            _login("wrong", headers=a)
+        r_locked = _login(_PW, headers=a)                # client A はロック中
+        self.assertEqual(r_locked.headers["location"], "/app/login?e=1")
+        r_other = _login(_PW, headers=b)                 # client B は無影響
+        self.assertEqual(r_other.headers["location"], "/app")
+
+    def test_xff_last_element_is_authoritative(self):
+        # 自称 XFF を積んでも proxy 付加の最終要素で識別される（先頭偽装の無効化）
+        for i in range(ATTEMPT_LIMIT):
+            _login("wrong", headers={"X-Forwarded-For": f"fake-{i}, 10.0.0.9"})
+        r = _login(_PW, headers={"X-Forwarded-For": "another-fake, 10.0.0.9"})
+        self.assertEqual(r.headers["location"], "/app/login?e=1")  # 最終要素で集約
+
+    def test_xff_spoofed_value_hashed_not_reflected(self):
+        sentinel = "SPOOF-SENTINEL-XFF"
+        r = _login("wrong", headers={"X-Forwarded-For": f"{sentinel}, 10.0.0.3"})
+        self.assertEqual(r.headers["location"], "/app/login?e=1")  # 固定応答のみ
+        self.assertNotIn(sentinel, r.text)
+        for key in _attempts:                            # 内部状態も hash のみ
+            self.assertRegex(key, r"^[0-9a-f]{64}$")
+            self.assertNotIn(sentinel, key)
+
+    def test_bucket_overflow_preserves_lockout(self):
+        # fix2 H02-ii: 上限超過でも既存ロックアウトは解除されない（clear() 廃止）
+        now = time.time()
+        locked_key = "L" * 64
+        _attempts[locked_key] = (int(now), ATTEMPT_LIMIT)          # ロック中 bucket
+        expired_key = "E" * 64
+        _attempts[expired_key] = (
+            int(now - webapp_auth.ATTEMPT_WINDOW_SECONDS - 1), 3)  # 期限切れ
+        with patch.object(webapp_auth, "MAX_BUCKETS", 5):
+            for i in range(10):                          # 10,001個目相当の新規作成
+                webapp_auth._register_failure(f"k{i:062d}", now)
+            self.assertIn(locked_key, _attempts)         # ロックアウト保全
+            self.assertGreaterEqual(_attempts[locked_key][1], ATTEMPT_LIMIT)
+            self.assertNotIn(expired_key, _attempts)     # 期限切れは先に掃除
+            self.assertLessEqual(len(_attempts), 5 + 1)  # 直近登録+上限内へ退避
+
+    def test_all_locked_buckets_survive_overflow(self):
+        # 全 bucket ロック中なら退避しない（保全優先・自然掃除は窓満了で）
+        now = time.time()
+        with patch.object(webapp_auth, "MAX_BUCKETS", 3):
+            for i in range(5):
+                _attempts[f"x{i:063d}"] = (int(now), ATTEMPT_LIMIT)
+            webapp_auth._prune_buckets(now)
+            self.assertEqual(len(_attempts), 5)          # ロック中は1つも消えない
+
 
 class TestRouteGateEnforcement(unittest.TestCase):
     """fix1 M01: 公開例外リスト以外の全 route が認証関所を持つことの機械検査。"""
@@ -305,20 +370,27 @@ class TestRouteGateEnforcement(unittest.TestCase):
 
 
 class TestPathNormalization(unittest.TestCase):
-    """fix1 M02: path 正規化系・未知 /app/* の未認証拒否（内容非提供）。"""
+    """fix1 M02→fix2 M01: variant ごとに期待を個別固定（一括許容をやめる）。"""
 
-    _VARIANTS = ("/app/", "/app//x", "/app/unknown", "/app/%2e%2e/health",
-                 "/app/./x", "/app/index.html", "/app/login/../sw.js")
+    # variant → (status, location)。全7変種が catch-all（または client 正規化後の
+    # 実 route）の _gate に落ち、未認証は一律 303→/app/login となる。
+    _VARIANTS = {
+        "/app/": (303, "/app/login"),               # catch-all（_rest=""）
+        "/app//x": (303, "/app/login"),             # 連続 slash → catch-all
+        "/app/unknown": (303, "/app/login"),        # 未知 path → catch-all
+        "/app/%2e%2e/health": (303, "/app/login"),  # %2e%2e は raw 送信→decode 後 catch-all（/health へ抜けない）
+        "/app/./x": (303, "/app/login"),            # client 正規化で /app/x → catch-all
+        "/app/index.html": (303, "/app/login"),     # 直指定 → catch-all
+        "/app/login/../sw.js": (303, "/app/login"), # client 正規化で /app/sw.js → _gate
+    }
 
     def test_variants_unauthenticated_rejected(self):
         with patch.dict(os.environ, _ENV):
-            for path in self._VARIANTS:
+            for path, (status, location) in self._VARIANTS.items():
                 with self.subTest(path=path):
                     r = _client.get(path, follow_redirects=False)
-                    self.assertIn(r.status_code, (303, 307, 404))
-                    if r.status_code in (303, 307):
-                        self.assertIn(r.headers["location"],
-                                      ("/app/login", "/app"))
+                    self.assertEqual(r.status_code, status)
+                    self.assertEqual(r.headers["location"], location)
                     self.assertNotIn("ダッシュ", r.text)     # 内容非提供
 
     def test_uppercase_path_serves_nothing(self):
