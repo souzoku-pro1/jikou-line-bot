@@ -1,180 +1,232 @@
-# DRAFT: P3-003b 関所 side の前提設計（App36 projection・設計のみ・実装禁止）
+# DRAFT: P3-003b 関所 side の前提設計（App36 projection・設計のみ・実装禁止・fix1）
 
 - TASK_ID: P3-003B-D 設計票（設計のみ・コード/テスト実装禁止）／記録日 2026-07-28
+  （fix1: R-P3-003B-D1 反映＋[人]裁定4件確定）
 - 目的: 凍結 `DRAFT_P3_003_ENVELOPE_FLOW.md`（以下「正本」）§3.2/§3.3 の App36
-  projection を**実装可能にするための前提3点**を固定する——(1) App36 追加 field
+  projection を**実装可能にするための前提**を固定する——(1) App36 追加 field
   仕様 (2) 冪等キーの App36 上の実現方式と検索規則 (3) derive_heirs 出力→App36
-  「続柄」「法定相続分」の表記写像表。
+  「続柄」「法定相続分」の表記写像 (4) phase 3 書込み規則 (5) 既存行の移行設計。
 - 正本参照（**矛盾を作らない・編集しない**）: 正本 §3.2（3 phase）・§3.3（冪等キー=
   case_record_id＋person_id／H10 条件付き更新／human_state 保護／stale ガード）・
-  §6（欠落補記）・`DRAFT_APP36_DERIVATION_APP37_TEMPLATE_REGISTRY.md` §3。
+  §3.4（戸籍確認済 yes 遷移表・H11）・§6（欠落補記）・
+  `DRAFT_APP36_DERIVATION_APP37_TEMPLATE_REGISTRY.md` §3。
 - **スコープ外（明記）**: E0–E3 effect level・放棄写像（declarations.renounced →
   App36 状態「放棄済み」）は **v2.4 正本（repo 外）依存**であり本票では固定しない
   （正本 §2.4／§3.6 OPEN のとおり）。本票は「機械が確定後に App36 へ projection
-  する際の field・キー・表記」だけを対象とする。
+  する際の field・キー・表記・書込み規則・移行」だけを対象とする。
 - 実装現実の実査基盤（2026-07-28・read-only）: `hub/derivation_models.py`
   （`_ZOKUGARA_TO_RELATION`・`build_run_payload`・share の直列化）／
   `heir_derivation.py`（zokugara ラベル生成）／`config.EXPECTED_KINTONE_SCHEMA`
-  の App36 実 field。
+  の App36 実 field／正本 §3.2〜3.4。
 
-## 0. 前提の要約（実装現実・設計判断の土台）
+## 0. [人]裁定の確定記録（fix1・本文と1対1対応）
+
+| 裁定 ID | 論点 | 確定 | 反映先 |
+|---|---|---|---|
+| **裁定1** | relation_key の粒度（representative が3区分を collapse） | **(A) 条件付き**——result_payload に続柄区分コード（固定 ASCII enum）を追加。§3.5/P3-001 の改定を伴うため、その改定票の着地を P3-003b 実装の前提とする（§3.2・§6-3・M03） | §3.2／§6-3 |
+| **裁定2** | App36「続柄」dropdown 欠落 | **(A)**——[人] が dropdown に不足区分を追加。**「その他」への集約はしない**（粒度喪失を許容しない） | §3.2／§6-2 |
+| **裁定3** | 胎児行の扱い | **胎児が存在する案件は App36 projection 全体を要確認・停止**（除外案(A)は撤回）。民法886条（胎児は既に生まれたものとみなす）ゆえ確定前提が流動的で、部分反映は誤り。警報＋人対応・出生による実 person 化まで停止（§2A）。**凍結時に[人]の明示確認を要する** | §2A／§6-4 |
+| **裁定4** | 単独相続の法定相続分表記 | **`"1分の1"`**（機械的・写像規則を分岐させない） | §3.3 |
+
+## 1. 前提の要約（実装現実・設計判断の土台）
 
 - **result_payload は relation_key（ASCII enum）のみを保持**し、日本語の zokugara
   区分は `build_run_payload` で**落ちる**（正本 §4・PII 統制）。App36「続柄」
   （DROP_DOWN・日本語）へ写すには relation_key からの写像になる——が、relation_key
-  は zokugara より**粗い**（representative が3区分を collapse・§3 論点1）。
+  は zokugara より**粗い**（representative が3区分を collapse・裁定1）。
 - **person_id は App34 の `$id`（数字列）**。ただし**胎児は run 内合成 ID
   `胎児:F{n}`（出現順連番）**で、`build_run_payload` の採番は出現ごと＝
-  **run を跨いで安定しない**（同一胎児が再導出で別番号になり得る）。冪等キーの
-  片割れに person_id を使う設計に直接影響する（§2 論点）。
-- App36「続柄」「状態」は DROP_DOWN で**値域が固定**（下表）。導出 9 区分の一部は
-  dropdown に対応値が無い（§3 論点2）。
+  **run を跨いで安定しない**（同一胎児が再導出で別番号になり得る）→胎児案件は
+  停止（裁定3）。
+- App36「続柄」「状態」「戸籍確認済」は DROP_DOWN/RADIO で**値域が固定**（実査）。
 
-## 1. App36 追加 field 仕様（[人]が kintone に追加する際の仕様書）
+## 2. App36 追加 field 仕様（[人]が kintone に追加する際の仕様書）
 
 正本 §3.3 の H10（条件付き更新）と冪等キー（case_record_id＋person_id）を実装可能に
 するため、App36 に**新規2 field**が要る（正本 §6 の BLOCKED CU の具体化）。
 
-| field 名（案） | 型 | 値の grammar | 検索可否 | 用途・根拠 |
+| field 名（案） | 型 | 値の grammar（M02・保存層と逐語一致） | 検索可否 | 用途・根拠 |
 |---|---|---|---|---|
-| `current_derivation_run_id` | SINGLE_LINE_TEXT | 数字列（`^[0-9]+$`。DerivationRun.id=BigInt を文字列化） | **要・完全一致検索** | H10 条件付き更新の前提。各 App36 人物レコードが「どの run 由来か」を保持し、supersedes 連鎖の祖先判定に使う（正本 §3.3 H10） |
-| `導出元人物ID` | SINGLE_LINE_TEXT | 数字列（App34 `$id`）または合成 `胎児:F{n}`（§2 論点で扱い確定） | **要・完全一致検索** | 冪等キー（case_record_id＋person_id）の person_id 片。App36 に person_id を保持する field が現状無いため新設（正本 §3.3 冪等キー＝registry_ingest._upsert_zaisan 型の person 単位一意） |
+| `current_derivation_run_id` | SINGLE_LINE_TEXT | **`^[1-9][0-9]{0,18}$`**（DerivationRun.id=BigInt PK＝正の整数。前ゼロなし・最大19桁=int64 range） | **要・完全一致検索** | H10 条件付き更新の前提。各 App36 人物レコードが「どの run 由来か」を保持し supersedes 連鎖の祖先判定に使う（正本 §3.3 H10） |
+| `導出元人物ID` | SINGLE_LINE_TEXT | **`^[0-9]{1,10}$`**（App34 `$id`＝保存層 heir_derivation の person_id grammar と逐語一致）。**胎児 ID（`胎児:F…`）は本 field に入らない**——胎児案件は projection 停止（裁定3）のため | **要・完全一致検索** | 冪等キー（case_record_id＋person_id）の person_id 片。App36 に person_id 保持 field が現状無いため新設（正本 §3.3 冪等キー＝registry_ingest._upsert_zaisan 型の person 単位一意） |
 
-- **型の選択理由（SINGLE_LINE_TEXT・数値型でない）**: 既存 App30 の
-  `案件レコードID`・`案件アプリID`、App36 の `案件レコードID` が SINGLE_LINE_TEXT の
-  数字列で統一されている（実査）。kintone の NUMBER 型でも完全一致検索は可能だが、
-  ID を数値計算しない・既存踏襲・前ゼロ等の表現差を避ける観点から SINGLE_LINE_TEXT
-  を推奨。
-- **検索クエリでの利用**: 両 field とも kintone の `field = "値"` 完全一致で引く
-  （§2）。**インデックス相当の設定は kintone 側の運用**（[人]・実機作成時）。
-- **既存 field との非干渉**: 追加は上記2点のみ。既存の機械由来 field（続柄／
-  法定相続分／データ源）と human_state field（戸籍確認済／状態）には触れない
-  （正本 §3.3 human_state 保護）。
+- **grammar の出所（M02）**: `導出元人物ID` の `^[0-9]{1,10}$` は封筒側（P3-003a
+  `_CASE_RECORD_ID_RE`/person_id）および heir_derivation の App34 `$id` 表記と逐語
+  一致（保存層で数字列 1〜10 桁）。`case_record_id`（既存 field で表現）も同 grammar。
+  胎児合成 ID grammar（`^胎児:F[1-9][0-9]*$`）は**参考記載のみ**で、本 field の
+  許可 grammar には含めない（胎児案件は停止＝§2A・裁定3）。
+- **型の選択理由（SINGLE_LINE_TEXT・数値型でない）**: 既存 App30/App36 の ID 系
+  field が SINGLE_LINE_TEXT の数字列で統一（実査）。ID を数値計算しない・既存踏襲・
+  前ゼロ等の表現差回避のため SINGLE_LINE_TEXT を推奨。
+- **既存 field との非干渉**: 追加は上記2点のみ。機械由来 field（続柄/法定相続分/
+  データ源）と human_state field（戸籍確認済/状態）には触れない（正本 §3.3 保護）。
 
-## 2. 冪等キーの App36 上の実現方式と検索規則
+## 2A. 胎児案件の projection 停止（裁定3・[人]確定・凍結時に明示確認要）
 
-- **冪等キー**（正本 §3.3）= `case_record_id ＋ person_id`。App36 上の実現:
-  - `案件レコードID`（既存 field・SINGLE_LINE_TEXT）＝ case_record_id
-  - `導出元人物ID`（§1 新設）＝ person_id
-- **upsert 検索クエリ**（読取専用の探索・単票 API 不要の複数検索で可）:
-  ```
-  案件レコードID = "<case_record_id>" and 導出元人物ID = "<person_id>"
-  order by $id asc limit 2
-  ```
-  - **0 件** → 新規 insert（続柄/法定相続分/データ源/current_derivation_run_id を
-    機械由来として書く。human_state field は初期値のまま）。
-  - **1 件** → H10 条件付き更新（正本 §3.3）へ。`current_derivation_run_id` が
-    新 run の supersedes 連鎖の**祖先である場合のみ**機械由来 field を差分更新し、
-    成功時に `current_derivation_run_id` を新 run へ進める。
-  - **2 件以上** → 冪等キー重複＝異常。**書かず要確認**（業務チャネル警報・
-    件数と record_id のみ・氏名非出力）。
-- **検索の値の安全化**: case_record_id・person_id（数字列）は kintone query へ
-  埋める前に grammar（`^[0-9]+$`）を検証。胎児合成 ID を許容する場合は
-  `^胎児:F[0-9]+$` も許可 grammar に含める（§2 論点の裁定に従う）。
-- **TOCTOU の扱い**: 検索→更新の間隙は正本 §2.2 の受容（best-effort 冪等）と同じ。
-  完全な原子性は持たない（稀な二重 projection は human_state 保護と stale ガードで
-  実害を抑止）。**新規に原子性機構を作らない**（正本と整合）。
+- **規則**: 導出結果に **1 行でも zokugara=胎児（relation_key=fetus）が含まれる案件**
+  は、**App36 projection を全体停止して要確認**とする（confirmed decision があっても
+  App36 へは書かない・封筒はクローズせず要確認のまま or 明示保留）。
+- **理由（民法886条）**: 胎児は相続については既に生まれたものとみなされるが、
+  死産なら遡って相続人でなかったことになる（886条2項）。確定前提が出生まで流動的で、
+  **胎児を含む相続人構成を部分的に App36 へ確定反映するのは誤り**。加えて胎児の
+  person_id は run 跨ぎ非安定（§1）で冪等キーに載せられない。
+- **運用**: 業務チャネル警報（案件 record_id・胎児行の件数のみ・氏名非出力）＋
+  [人]対応。**出生による実 person 化（App34 に実 record 追加）後に通常 projection**
+  へ復帰（その経路は別票）。
+- **安定 ID 方式は将来票**: 胎児に案件内安定 ID を採番して部分反映する案は
+  build_run_payload の採番規約改定を伴い波及が大きいため、本票では採らない。
+- **凍結時の明示確認**: 本停止方針は業務影響（胎児案件は自動反映されない）が
+  大きいため、**凍結判定時に[人]の明示承認を要する**（裁定4件のうち唯一、
+  運用停止を伴うため）。
 
-### 2A. 未裁定論点（胎児 person_id の run 跨ぎ非安定・[人]裁定要）
-
-- **問題**: 胎児行の person_id は `胎児:F{n}`（run 内出現順・build_run_payload
-  fix5）で、**再導出で同一胎児が別番号になり得る**。冪等キー
-  case_record_id＋person_id が run を跨いで胎児を一意に追跡できない。
-- **選択肢**:
-  - **(A) 胎児行は App36 へ projection しない**（confirmed でも保留）。理由: 胎児は
-    出生擬制（886条）で確定前提が流動的・provisional=True（正本 §3A）とも整合。
-    実氏名 person も無い。**推奨**——正確性を損なわず、非安定 ID を冪等キーに
-    載せない。App36 反映は出生後の実 person 化を待つ別票。
-  - (B) 胎児行も projection し、person_id に合成 ID を格納。難点: run 跨ぎで重複行が
-    増殖・追跡不能（非推奨）。
-  - (C) 胎児に案件内安定 ID を別途採番する仕組みを新設。難点: build_run_payload の
-    採番規約（正本 §? fix5）改定を伴い波及大（本票スコープ外・別票）。
-- **推奨=(A)**。本票では「胎児行は App36 projection 対象外（confirmed 後も出生まで
-  保留）」を暫定前提とし、確定は [人]。
-
-## 3. derive_heirs 出力 → App36「続柄」「法定相続分」写像表
+## 3. derive_heirs 出力 → App36「続柄」「法定相続分」写像
 
 ### 3.1 続柄（DROP_DOWN・値域固定）
 
 - **App36「続柄」の実 dropdown 値域（実査）**: 配偶者／子／直系尊属／兄弟姉妹／
   甥姪（代襲）／受遺者（相続人外）／その他（7値）。
-- **derive_heirs の zokugara 区分 9 種**（`_ZOKUGARA_TO_RELATION` の8キー＋
-  `数次承継` 前方一致）と relation_key（result_payload に保存される ASCII enum）:
+- **zokugara 区分 9 種と写像**（裁定1-(A) の続柄区分コードを介した total 写像）:
 
-| # | zokugara 区分（原文） | relation_key（保存値） | App36 続柄への写像案 | 対応可否 |
+| # | zokugara 区分（原文） | relation_key（現保存値） | 続柄区分コード（裁定1・新設 enum 案） | App36 続柄（裁定2 で dropdown 拡張後） |
 |---|---|---|---|---|
-| 1 | 配偶者 | spouse | 配偶者 | ○ 完全一致 |
-| 2 | 子 | child | 子 | ○ |
-| 3 | 直系尊属 | lineal_ascendant | 直系尊属 | ○ |
-| 4 | 兄弟姉妹 | sibling | 兄弟姉妹 | ○ |
-| 5 | 甥姪（代襲） | representative | 甥姪（代襲） | △ representative 共有 |
-| 6 | 孫（代襲） | representative | **対応値なし** | ✗ dropdown 欠落＋粒度喪失 |
-| 7 | 再代襲（曾孫等） | representative | **対応値なし** | ✗ 同上 |
-| 8 | 胎児 | fetus | **対応値なし**（§2A で projection 外を推奨） | ✗ |
-| 9 | 数次承継（No.… の …） | successive | **対応値なし** | ✗ |
+| 1 | 配偶者 | spouse | `spouse` | 配偶者（既存） |
+| 2 | 子 | child | `child` | 子（既存） |
+| 3 | 直系尊属 | lineal_ascendant | `lineal_ascendant` | 直系尊属（既存） |
+| 4 | 兄弟姉妹 | sibling | `sibling` | 兄弟姉妹（既存） |
+| 5 | 甥姪（代襲） | representative | `nephew_niece_rep` | 甥姪（代襲）（既存） |
+| 6 | 孫（代襲） | representative | `grandchild_rep` | **孫（代襲）**（裁定2 で追加） |
+| 7 | 再代襲（曾孫等） | representative | `further_rep` | **再代襲（曾孫等）**（裁定2 で追加） |
+| 8 | 胎児 | fetus | `fetus` | **projection 停止**（裁定3・§2A・続柄は書かない） |
+| 9 | 数次承継（No.… の …） | successive | `successive` | **数次承継**（裁定2 で追加） |
 
-- **設計上の核心問題（2つ）**:
-  - **論点1（粒度喪失）**: result_payload は relation_key のみ保持し、
-    representative は 孫（代襲）／甥姪（代襲）／再代襲 を **collapse** する。
-    projection は relation_key からしか続柄を決められないため、
-    **relation_key=representative から「孫」か「甥姪」かを復元できない**。
-  - **論点2（dropdown 欠落）**: 孫（代襲）／再代襲／胎児／数次承継 に対応する
-    dropdown 値が App36 に無い。
+- **核心問題の再掲（裁定1 の背景）**: result_payload は relation_key のみ保持し、
+  representative が 孫（代襲）／甥姪（代襲）／再代襲 を **collapse** するため、
+  relation_key からは「孫」か「甥姪」かを復元できない。裁定1-(A) で**続柄区分コード
+  （zokugara 相当の固定 ASCII enum）を payload に追加**して total 写像を成立させる。
 
-### 3.2 未裁定論点（続柄写像・[人]裁定要）
+### 3.2 続柄写像の裁定（確定）
 
-- **論点1（relation_key の粒度）の選択肢**:
-  - **(A) result_payload に非PIIの続柄区分コードを追加**（zokugara 区分の ASCII
-    enum・氏名等を含まないため PII ではない）。projection は区分コード→続柄で
-    total 写像可能。**推奨**——正確性が要件・区分は法的カテゴリで非PII。
-    ただし **§3.5 payload schema／P3-001 の改定を伴う**（正本改定と同時＝別票の
-    前提。本設計票は「必要性の明文化」まで）。
-  - (B) relation_key のまま projection し、representative は一律「甥姪（代襲）」。
-    難点: 孫（代襲）を誤表示（不可）。
-  - (C) representative 行は続柄を書かず App36「状態=代襲」のみ立てる。難点:
-    続柄が空欄になり一覧性を損なう（次善）。
-- **論点2（dropdown 欠落）の選択肢**:
-  - **(A) [人] が App36「続柄」dropdown に不足値を追加**（孫（代襲）／
-    再代襲（曾孫等）／数次承継。胎児は §2A で projection 外を推奨のため任意）。
-    **推奨**——(論点1-A) と組み合わせると total な続柄写像が成立。
-  - (B) 欠落区分は「その他」へ寄せる。難点: 粒度喪失・法定相続分との突合が困難
-    （次善）。
-- **統合推奨**: 論点1-(A)＋論点2-(A) を採ると、**区分コード→拡張 dropdown の
-  total 写像**が実装できる（本票の写像表がその仕様原型）。両方とも kintone 実機
-  変更／schema 改定を伴うため **[人] ゲート**であり、実装票の前提になる。
+- **裁定1（粒度・確定=(A) 条件付き）**: result_payload に**続柄区分コード
+  （固定 ASCII enum）**を追加する。上表の9コードで閉じる（`spouse/child/
+  lineal_ascendant/sibling/nephew_niece_rep/grandchild_rep/further_rep/fetus/
+  successive`）。この改定は §3.5 payload schema／P3-001 の改定であり、その改定票の
+  着地が **P3-003b 実装の前提**（§6-3）。
+- **裁定2（dropdown・確定=(A)）**: [人] が App36「続柄」dropdown に **孫（代襲）／
+  再代襲（曾孫等）／数次承継**を追加。**「その他」への集約はしない**（粒度喪失を
+  許容しない）。胎児は projection 停止（裁定3）のため dropdown 追加不要。
+- 帰結: 裁定1＋裁定2 で **続柄区分コード→拡張 dropdown の total 写像**（上表）が
+  実装可能。両方 kintone 実機変更／schema 改定を伴い **[人] ゲート**。
 
 ### 3.3 法定相続分（SINGLE_LINE_TEXT）
 
 - **保存形**: result_payload の share は `"{numerator}/{denominator}"`（既約分数・
-  例 `"1/2"`・`"1/6"`。`build_run_payload` の直列化を実査）。
-- **App36「法定相続分」への表記写像規則（案）**:
-  - `"n/d"` → **`"d分のn"`**（日本語慣用・例 `"1/2"`→`"2分の1"`・`"1/6"`→
-    `"6分の1"`）。numerator=n・denominator=d。
-  - **単独相続（`"1/1"`）の表記**: 小裁定——(A)`"1分の1"`（機械的・写像規則が
-    単純）／(B)`"全部"`（法律実務の慣用）。**推奨=(A)**（写像規則を分岐させない・
-    表示整形は画面側の別責務）。
-  - **share=None**（held で相続分未確定の行）: 法定相続分は**空欄**（機械は書かない）。
-- **端数・約分**: share は Fraction 厳密演算の既約分数（heir_derivation §900 演算）で
-  既に約分済み。projection 側で再約分・四捨五入は**しない**（丸めは相続分の意味を
-  壊す）。分子分母をそのまま `"d分のn"` に流す。
+  例 `"1/2"`・`"1/6"`。`build_run_payload` の直列化を実査）。grammar は
+  `^[1-9][0-9]*/[1-9][0-9]*$`（正の既約分数・M02）。
+- **表記写像規則**: `"n/d"` → **`"d分のn"`**（例 `"1/2"`→`"2分の1"`・`"1/6"`→
+  `"6分の1"`）。numerator=n・denominator=d。
+- **単独相続（`"1/1"`）**: **`"1分の1"`（裁定4・確定）**——写像規則を分岐させない。
+- **share=None**（held で相続分未確定）: 法定相続分は**空欄**（機械は書かない）。
+- **端数・約分**: share は Fraction 厳密演算の既約分数で既に約分済み。projection 側で
+  再約分・四捨五入は**しない**（丸めは相続分の意味を壊す）。
 
-## 4. 実装票への申し送り（本票が確定した前提）
+## 4. phase 3 の App36 書込み規則（H01・正本 §3.2〜3.4 と逐語整合）
 
-- App36 追加 field（§1）・冪等キー検索規則（§2）・法定相続分表記規則（§3.3）は
-  **本設計で確定**（実装票はこの仕様で書ける）。
-- **続柄写像（§3.2）は [人] 裁定と kintone 実機変更が前提**——論点1-(A)（区分コード
-  追加＝§3.5/P3-001 改定）と論点2-(A)（dropdown 拡張）が解けるまで、P3-003b の
-  続柄 projection は**実装 BLOCKED**。暫定運用は論点1-(C)（続柄空欄＋状態=代襲）で
-  degrade 可能だが、正確性要件との兼ね合いで [人] 判断。
-- 胎児行（§2A）は projection 外（推奨）＝実装票では対象から除外。
+正本 §3.2 phase 3（decision=confirmed のときのみ App36 upsert）・§3.3（H10 条件付き
+更新・human_state 保護・stale ガード）・§3.4（戸籍確認済 yes 遷移＝弁護士のみ・
+逆遷移禁止）を、App36 の**列ごとの書込み可否**として明文化する。
+
+| App36 列 | 分類 | 新規 insert（0件一致） | 機械再導出 update（H10 祖先一致） | 根拠（正本） |
+|---|---|---|---|---|
+| 続柄／法定相続分／データ源 | 機械由来 | 書く（§3.1/§3.3・データ源="戸籍読解" 相当） | **差分更新**（値が変われば上書き） | §3.3 human_state 保護の対象外＝機械由来 |
+| current_derivation_run_id／導出元人物ID | 機械管理キー | 書く | current_derivation_run_id を新 run へ進める | §3.3 H10 |
+| **戸籍確認済** | human_state | **confirmed decision に限り `yes` を設定**（decided_by が `ATTORNEY_ALLOWLIST` 検証済みであること＝§3.2 phase 2・§3.4）。それ以外（held/rejected・機械再導出）は**触れない** | **絶対に下げない**（機械再導出は既存 `yes` を `no` へ戻さない）。§3.4 逆遷移禁止 | §3.2 phase 2／§3.4 |
+| 状態 | human_state | 初期値のまま（機械は書かない。放棄写像はスコープ外） | **手修正を上書きしない** | §3.3 human_state 保護 |
+| 氏名／住所／生年月日／本籍／連絡先 | 人手・非本票 | 機械は書かない（result_payload は person_id のみ＝氏名非保持） | 同左 | 正本 §4 PII 統制 |
+
+- **H01 の核心（2区別）**:
+  - **「confirmed による戸籍確認済 yes の設定」**は、decided_by が
+    ATTORNEY_ALLOWLIST 検証を通った confirmed decision の phase 3 でのみ起きる
+    （正本 §3.4 の「戸籍確認済 yes を書くのは decision 経由の弁護士のみ」と逐語一致）。
+  - **「機械再導出は既存 yes を絶対に下げない」**——H10 条件付き更新で機械由来列を
+    差分更新する際も、戸籍確認済 列は**読み書き対象に含めない**（human_state 保護・
+    §3.3）。よって機械再導出が `yes→no` を起こす経路が構造的に存在しない。
+- **stale ガード（正本 §3.3）との関係**: 確定時に対象 run が supersedes 連鎖の head
+  でなければ projection せず aborted（本表の update 自体に到達しない）。
+
+## 5. 冪等キーの App36 上の実現方式と検索規則（＋TOCTOU 正確化）
+
+- **冪等キー**（正本 §3.3）= `case_record_id ＋ person_id`。App36 上の実現:
+  `案件レコードID`（既存 field）＝ case_record_id／`導出元人物ID`（§2 新設）＝ person_id。
+- **upsert 検索クエリ**（読取専用の探索・複数検索で可）:
+  ```
+  案件レコードID = "<case_record_id>" and 導出元人物ID = "<person_id>"
+  order by $id asc limit 2
+  ```
+  値は kintone query へ埋める前に grammar（§2）で検証（数字列のみ・注入遮断）。
+- **1件一致時の状態閉集合（H02-iii・実装票で網羅すること）**:
+
+  | 状態 | 判定 | アクション |
+  |---|---|---|
+  | same run 再実行（current_derivation_run_id == 新 run.id） | 冪等ヒット | **no-op**（既に当該 run で projection 済み。二重書込みしない） |
+  | 祖先 run（current が新 run の supersedes 連鎖の祖先） | H10 更新可 | 機械由来列を差分**更新**＋current を新 run へ進める（§4 表） |
+  | current_derivation_run_id が空・不正（grammar 外） | 移行前/破損 | **要確認**（write 0・§H02 の backfill 前提と接続・警報） |
+  | 無関係 run（祖先でも子孫でもない・別系列） | 競合 | projection **せず要確認**（write 0・「別系列の run が既存」警報） |
+  | 祖先確認中に DB 不達（run 系列照会が失敗） | 判定不能 | **write 0・要確認**（結果不明を確定扱いにしない） |
+  | 子孫 run（current の方が新しい） | stale | §3.3 stale ガードで aborted（本表前に弾かれる） |
+
+- **2件以上一致** → 冪等キー重複＝異常。**書かず要確認**（件数と record_id のみ・
+  氏名非出力）。
+- **TOCTOU の残存リスク（M01・正確化）**: **同一 head run に対する並行 projection**で、
+  両者が「0件」を検索してから双方 insert すると **二重 insert が起こり得る**。
+  これは **stale ガードの対象外**（stale ガードは「より新しい run の存在」を見るもので、
+  同一 run の並行初回書込みは検知しない）。正本 §2.2 の best-effort 受容の範囲だが、
+  **実害の収束は重複検知＋人手**に委ねる:
+  - **重複検知（実装票の必須要件）**: projection 後（または daily 監査で）
+    `案件レコードID＋導出元人物ID` が2件以上ある App36 行を検出→**業務チャネル警報**
+    （件数・record_id のみ）。
+  - **人手収束手順（実装票の必須要件・手順書化）**: 警報を受けた [人] が重複行の
+    うち **current_derivation_run_id が最新（head）の1行を残し他を kintone 上で削除/
+    無効化**。機械は自動削除しない（immutable 台帳の削除操作を機械に持たせない規律）。
+  - 新規の原子性機構は作らない（正本と整合）。
+
+## 6. 既存 App36 行の移行設計（H02・点火ゲート）
+
+新設2 field（§2）は既存 App36 行では**空**になる。projection の H10 判定は
+current_derivation_run_id に依存するため、移行を点火ゲートとして固定する。
+
+1. **点火前データ調査（点火ゲート・[人]）**: App36 の**全既存行数**と、そのうち
+   `current_derivation_run_id` が空の行数を実機で調査する（read-only 集計・氏名非
+   出力・件数のみ）。**この調査結果の確認を projection 点火（`HEIR_DERIVATION_ENABLED`
+   相当の projection 有効化）の前提条件**とする。
+2. **方針の分岐**:
+   - **(a) App36 実質空**（既存行ゼロ or 導出対象案件に既存行なし）: backfill 不要。
+     projection は新規 insert から始まる。**まず (a) を前提確認**（実機調査で確定）。
+   - **(b) 既存行あり**: backfill 方針を [人] 裁定——手動で
+     current_derivation_run_id を埋める運用は導出 run の対応付けが必要で機械化困難な
+     ため、**当該案件は「初回 projection 時に既存行と突合せず新規扱い（要確認）」**
+     とし、重複は §5 の重複検知＋人手で収束させる（backfill を機械に持たせない）。
+3. **移行中の 1件一致（current 空）の扱い**: §5 の状態表のとおり **write 0・要確認**
+   （空の current は H10 の祖先判定ができない＝安全側）。backfill 完了案件のみ通常
+   update 経路へ乗る。
+
+## 7. 実装票への申し送り（本票が確定した前提）
+
+- **確定（実装票がこの仕様で書ける）**: App36 追加 field（§2・grammar M02）／
+  冪等キー検索規則・1件一致状態表（§5）／phase 3 書込み規則（§4）／法定相続分表記
+  （§3.3・裁定4）／胎児案件停止（§2A・裁定3）／既存行移行（§6）／重複検知＋人手収束
+  （§5・実装票の必須要件）。
+- **[人]ゲート（実装の前提・解けるまで BLOCKED）**: 裁定1（続柄区分コードの
+  §3.5/P3-001 改定票の着地）／裁定2（dropdown 拡張の kintone 実機変更）／§2A の胎児
+  停止の凍結時明示承認／§6 の点火前データ調査。これらが揃うまで続柄 projection は
+  実装 BLOCKED。
 - E0–E3・放棄写像はスコープ外（v2.4 正本確認後の別票）。
 
-## 5. 実機確認事項（[人]・実装前に要確定）
+## 8. 実機確認事項（[人]・§0 裁定と1対1・[人]回答欄つき）
 
-1. App36 への `current_derivation_run_id`／`導出元人物ID` の実機追加・field コード
-   確定・完全一致検索の可否（§1）。
-2. App36「続柄」dropdown への不足区分追加の可否・追加値の文言（§3.2 論点2）。
-3. result_payload への続柄区分コード追加（§3.5/P3-001 改定）の起票判断
-   （§3.2 論点1-(A)）。
-4. 胎児行を App36 projection 外とする暫定前提の承認（§2A）。
-5. 単独相続の法定相続分表記（`"1分の1"` か `"全部"`・§3.3）。
+| # | 確認事項 | 関連裁定/節 | [人]回答欄 |
+|---|---|---|---|
+| 1 | App36 への `current_derivation_run_id`／`導出元人物ID` 実機追加・field コード確定・完全一致検索可否 | §2 | 〔ここに大野回答〕 |
+| 2 | App36「続柄」dropdown へ 孫（代襲）／再代襲（曾孫等）／数次承継 を追加（その他集約なし） | 裁定2／§3.2 | 〔ここに大野回答〕 |
+| 3 | result_payload への続柄区分コード追加（§3.5/P3-001 改定）の起票 | 裁定1／§3.2／§6-3相当 | 〔ここに大野回答〕 |
+| 4 | 胎児案件の projection 全体停止・要確認方針の**明示承認**（運用停止を伴う） | 裁定3／§2A | 〔ここに大野回答〕 |
+| 5 | 既存 App36 行の点火前データ調査（件数・current 空件数）と backfill 方針(a)/(b) | §6 | 〔ここに大野回答〕 |
