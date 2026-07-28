@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>承認キュー参照 - 案件管理（仮）</title>
+<style>
+body{font-family:sans-serif;max-width:960px;margin:1.5rem auto;padding:0 1rem}
+.item{border:1px solid #ccc;border-radius:8px;padding:.8rem;margin:.6rem 0}
+.meta{color:#555;font-size:.9rem;margin-bottom:.4rem}
+pre{white-space:pre-wrap;background:#f7f7f7;padding:.5rem;border-radius:4px;margin:.3rem 0}
+label,button{font-size:1rem;margin-right:.6rem}
+a{color:#1a3c6e}
+.badge{display:inline-block;border:1px solid #888;border-radius:4px;padding:0 .4rem;font-size:.85rem;margin-left:.4rem}
+</style>
+</head>
+<body>
+<h1>承認キュー参照</h1>
+<p><a href="/app">← ダッシュボード</a></p>
+<!-- P4-004: 参照のみ——承認・送信の操作 UI はこの画面に存在しない（承認経路は
+     既存 webhook が単一の正）。裁定: AI 下書き本文（顧客往復含む）の表示可・
+     既定は送信済み=no のみ（全件切替あり） -->
+<div>
+  <label><input type="checkbox" id="all"> 全件表示（既定: 未送信のみ）</label>
+  <button id="prev">前へ</button><button id="next">次へ</button>
+  <span id="page"></span>
+</div>
+<div id="items"></div>
+<script>
+let offset = 0;
+const limit = 20;
+function v(rec, name) { return (rec[name] && rec[name].value) || ""; }
+async function load() {
+  const q = new URLSearchParams({limit: limit, offset: offset});
+  if (document.getElementById("all").checked) q.set("all", "1");
+  const resp = await fetch("/app/api/approvals?" + q, {redirect: "follow"});
+  if (resp.redirected || !resp.headers.get("content-type")?.includes("json")) {
+    location.href = "/app/login"; return;
+  }
+  const data = await resp.json();
+  const items = document.getElementById("items");
+  items.replaceChildren();
+  for (const rec of data.records) {
+    const div = document.createElement("div");
+    div.className = "item";
+    const meta = document.createElement("div");
+    meta.className = "meta";
+    meta.textContent = `#${v(rec, "$id")} ${v(rec, "顧客名")}` +
+      `｜${v(rec, "カテゴリ")}｜${v(rec, "ステータス2")}` +
+      `｜送信済み: ${v(rec, "送信済み")}｜${v(rec, "更新日時")}`;
+    div.appendChild(meta);
+    const msg = document.createElement("pre");
+    msg.textContent = "顧客: " + v(rec, "顧客メッセージ");
+    div.appendChild(msg);
+    const draft = document.createElement("pre");
+    draft.textContent = "AI下書き: " + v(rec, "AI下書き");
+    div.appendChild(draft);
+    if (v(rec, "判断理由")) {
+      const reason = document.createElement("div");
+      reason.className = "meta";
+      reason.textContent = "判断理由: " + v(rec, "判断理由");
+      div.appendChild(reason);
+    }
+    items.appendChild(div);
+  }
+  document.getElementById("page").textContent =
+    `offset ${offset}（${data.records.length}件表示）`;
+  document.getElementById("prev").disabled = offset === 0;
+  document.getElementById("next").disabled = data.records.length < limit;
+}
+document.getElementById("all").addEventListener("change", () => { offset = 0; load(); });
+document.getElementById("prev").addEventListener("click", () => { offset = Math.max(0, offset - limit); load(); });
+document.getElementById("next").addEventListener("click", () => { offset += limit; load(); });
+load();
+</script>
+</body>
+</html>
