@@ -1,21 +1,32 @@
-"""TRACKING-PREP fix1: tracking_pg_harness の接続遮断・引数検証の対照テスト。
+"""TRACKING-PREP fix1/fix2: tracking_pg_harness の接続遮断・出力遮断の対照テスト。
 
-固定する仕様（R-TRACKING-PREP-1 対応）:
-- H01: URL は検証済み要素からの再構築。query/fragment（host/hostaddr/service 等の
-  接続先上書きパラメータ）は全面拒否・拒否文言に URL 値非表示・非ローカル host 拒否
-- H02: migrate サブコマンド（唯一の alembic 適用経路）——不正 URL では rc 2 で
+固定する仕様（R-TRACKING-PREP-1/-2 対応）:
+- fix1 H01: URL は検証済み要素からの再構築。query/fragment（host/hostaddr/service
+  等の接続先上書きパラメータ）は全面拒否・拒否文言に URL 値非表示・非ローカル拒否
+- fix1 H02: migrate サブコマンド（唯一の alembic 適用経路）——不正 URL では rc 2 で
   alembic 未到達・DATABASE_URL 残置なし
-- M01: --rounds は正整数のみ（0/負数は固定文言+rc 2）
-- M02: check ごとの単調時計計時（#N elapsed=..s を出力）
+- fix2 H01: 子プロセス出力の構造化 sanitizer——既知 secret（URL 全体・password の
+  encoded/decoded/再 quote 全形）の完全一致置換＋DSN 様文字列の汎用置換
+  （password マスク済み URL でも username/host/dbname を残さない）
+- fix2 M01: Alembic 起動形の AST pin——_run_migrate 内の1回のみ・argv 固定・
+  shell 不使用・固定 cwd・検証済み子 env（同ファイル内への起動追加も検出）
+- fix1 M01: --rounds は正整数のみ（0/負数は固定文言+rc 2）
+- fix1 M02: check ごとの単調時計計時（#N elapsed=..s を出力）
 """
 
+import ast
 import io
 import os
 import unittest
-from unittest.mock import patch
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch  # subprocess.run は patch 経由でのみ触れる
 
+import tools.tracking_pg_harness as harness
 from tools.tracking_pg_harness import (
     HarnessConfigError,
+    _run_migrate,
+    _sanitize_output,
     _validated_local_url,
     main,
 )
@@ -101,6 +112,105 @@ class TestCliValidation(unittest.TestCase):
             self.assertEqual(rc, 2)
             self.assertNotIn("DATABASE_URL", os.environ)     # 残置なし
         self.assertNotIn("evil", buf.getvalue())
+
+
+class TestMigrateOutputSanitizer(unittest.TestCase):
+    """fix2 H01: 子プロセス出力の構造化 sanitizer の対照。"""
+
+    _URL_RAW = "postgresql://trkuser:p%40ssw0rd@127.0.0.1:5433/tracking_check"
+
+    def test_sanitize_unit_all_secret_forms(self):
+        url = _validated_local_url(self._URL_RAW)
+        dirty = "\n".join([
+            f"conn: {url}",                                    # 完全 URL
+            "enc: p%40ssw0rd",                                 # encoded password
+            "dec: p@ssw0rd",                                   # decoded password
+            "masked: postgresql://trkuser:***@127.0.0.1:5433/tracking_check",
+            "other: postgresql+psycopg://foo@localhost/x",     # 別 DSN 様文字列
+        ])
+        clean = _sanitize_output(dirty, url)
+        for sentinel in ("p%40ssw0rd", "p@ssw0rd", "trkuser",
+                         "tracking_check", "127.0.0.1:5433"):
+            self.assertNotIn(sentinel, clean)
+        self.assertIn("<DSN>", clean)                          # 汎用置換の証跡
+
+    def test_migrate_stdout_stderr_both_sanitized(self):
+        url = _validated_local_url(self._URL_RAW)
+        payload = (f"{url}\np%40ssw0rd p@ssw0rd\n"
+                   "postgresql://trkuser:***@127.0.0.1:5433/tracking_check")
+        fake = SimpleNamespace(returncode=0, stdout=payload, stderr=payload)
+        buf = io.StringIO()
+        with patch("subprocess.run", return_value=fake) as mock_run:
+            rc = _run_migrate(url, buf)
+        self.assertEqual(rc, 0)
+        mock_run.assert_called_once()
+        text = buf.getvalue()
+        for sentinel in ("p%40ssw0rd", "p@ssw0rd", "trkuser", "tracking_check"):
+            self.assertNotIn(sentinel, text)
+        # 失敗経路も同じ sanitizer を通る
+        fake_fail = SimpleNamespace(returncode=3, stdout="", stderr=payload)
+        buf2 = io.StringIO()
+        with patch("subprocess.run", return_value=fake_fail):
+            rc2 = _run_migrate(url, buf2)
+        self.assertEqual(rc2, 1)
+        self.assertNotIn("p@ssw0rd", buf2.getvalue())
+        self.assertIn("exit 3", buf2.getvalue())
+
+
+class TestMigrateLaunchShape(unittest.TestCase):
+    """fix2 M01-(ii): Alembic 起動形の AST 構造 pin（起動追加も検出）。"""
+
+    _SUBPROC_FUNCS = {"run", "Popen", "call", "check_call", "check_output",
+                      "system"}
+
+    def _module_tree(self):
+        return ast.parse(Path(harness.__file__).read_text(encoding="utf-8"))
+
+    def _find_launches(self, tree):
+        """subprocess.<func>()・os.system() の起動 Call を列挙（asyncio.run 等の
+        同名別 module 呼出しは対象外＝module 名まで見て判定）。"""
+        launches = []          # (enclosing function name, Call node)
+        for func in ast.walk(tree):
+            if not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for node in ast.walk(func):
+                if not (isinstance(node, ast.Call)
+                        and isinstance(node.func, ast.Attribute)
+                        and isinstance(node.func.value, ast.Name)):
+                    continue
+                mod, attr = node.func.value.id, node.func.attr
+                if (mod == "subprocess" and attr in self._SUBPROC_FUNCS) \
+                        or (mod == "os" and attr == "system"):
+                    launches.append((func.name, node))
+        return launches
+
+    def test_single_launch_in_run_migrate_with_pinned_shape(self):
+        launches = self._find_launches(self._module_tree())
+        self.assertEqual(len(launches), 1, "subprocess 起動は 1 箇所のみ")
+        fn_name, call = launches[0]
+        self.assertEqual(fn_name, "_run_migrate")
+        # argv 固定: [sys.executable, "-m", "alembic", "upgrade", "head"]
+        argv = call.args[0]
+        self.assertIsInstance(argv, ast.List)
+        first = argv.elts[0]
+        self.assertIsInstance(first, ast.Attribute)
+        self.assertEqual((first.value.id, first.attr), ("sys", "executable"))
+        self.assertEqual([e.value for e in argv.elts[1:]],
+                         ["-m", "alembic", "upgrade", "head"])
+        # keyword 形: shell 不使用・固定 cwd・検証済み子 env
+        keywords = {k.arg: k.value for k in call.keywords}
+        self.assertNotIn("shell", keywords)
+        self.assertIsInstance(keywords["cwd"], ast.Name)
+        self.assertEqual(keywords["cwd"].id, "_REPO_ROOT")
+        self.assertIsInstance(keywords["env"], ast.Name)
+        self.assertEqual(keywords["env"].id, "child_env")
+
+    def test_d2_exclusion_is_full_path_only(self):
+        # fix2 M01-(i): D2 検査の除外が完全 path 限定であること（同名別ファイル遮断）
+        import test_db_foundation_hardening as hard
+        cls = hard.TestNoDynamicAlembicInvocation
+        self.assertIn("tools/tracking_pg_harness.py", cls.EXCLUDED_PATHS)
+        self.assertNotIn("tracking_pg_harness.py", cls.EXCLUDED_FILES)
 
 
 class TestSelftestSmoke(unittest.TestCase):

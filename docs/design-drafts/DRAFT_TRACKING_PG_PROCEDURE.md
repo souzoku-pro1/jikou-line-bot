@@ -29,7 +29,8 @@
   **`TRACKING_PG_URL` の host を localhost/127.0.0.1/::1 に限定**しており、
   Railway/本番 URL を誤って与えても接続前に固定文言で拒否する（URL 値は非表示）。
 - 周囲の `DATABASE_URL` はハーネスが**無視して上書き**する（誤接続経路なし）。
-  alembic 適用時のみ一時的に `DATABASE_URL` を検証 DB へ向け、終了後に必ず外す。
+  **`DATABASE_URL` は migrate 子プロセス内だけで設定され、利用者は設定しない**
+  （fix2 M02: §3.2 のラッパー経由が唯一の適用経路・人が設定する手順は存在しない）。
 - データは全て合成（uuid ベース key・数字列 person_id）。片付けは **DB ごと削除**
   （行 delete はしない——immutable 台帳の削除操作を書かない規律とも整合）。
 

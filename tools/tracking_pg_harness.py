@@ -303,11 +303,30 @@ async def _amain(args, out) -> int:
     return 0 if ok else 1
 
 
-def _redacted(text: str, secrets: list[str]) -> str:
+# PostgreSQL DSN 様文字列（driver 修飾込み）。空白・引用符まで貪欲に拾い、
+# password が *** マスク済みの表現でも username/host/dbname を残さない。
+_DSN_RE = re.compile(r"postgres(?:ql)?(?:\+[A-Za-z0-9_]+)?://[^\s'\"]+")
+
+
+def _sanitize_output(text: str, url: str) -> str:
+    """migrate 子プロセス出力の構造化 sanitizer（fix2 H01）。
+
+    2 層構造: ①既知 secret の完全一致置換——URL 全体・password の
+    **encoded（URL 中の表記）/decoded（unquote 後）/再 quote 形の全形**を含める。
+    ②DSN 様文字列の汎用 regex 置換——SQLAlchemy が password をマスクした
+    `postgresql://user:***@host/db` 表現でも username/host/dbname が残るため、
+    DSN の形をした文字列は丸ごと固定文言 `<DSN>` へ置換する。
+    """
+    parts = urlsplit(url)
+    secrets = [url]
+    if parts.password:
+        secrets.append(parts.password)                       # encoded（URL 中表記）
+        secrets.append(unquote(parts.password))              # decoded
+        secrets.append(quote(unquote(parts.password), safe=""))   # 正規 quote 形
     for s in secrets:
         if s:
             text = text.replace(s, "***")
-    return text
+    return _DSN_RE.sub("<DSN>", text)
 
 
 def _run_migrate(url: str, out) -> int:
@@ -318,21 +337,21 @@ def _run_migrate(url: str, out) -> int:
     失敗時も env 残置が構造的に発生しない（「人が DATABASE_URL を直接設定して
     alembic を叩く」経路の廃止）。migration は明示コマンドのまま（D2 policy:
     アプリ module から alembic を import しない——本関数も import しない）。
-    子プロセス出力は URL・パスワードを伏字化してから表示する。
+    子プロセス出力は _sanitize_output（fix2 H01: 既知 secret 全形の完全一致置換＋
+    DSN 様文字列の汎用置換）を通してから表示する。
+    起動形は本関数内の 1 回のみ・argv 固定・shell 不使用・固定 cwd・検証済み
+    子 env（fix2 M01: test_tracking_prep_harness の AST 構造テストで pin）。
     """
     import subprocess
 
-    parts = urlsplit(url)
     child_env = {**os.environ, "DATABASE_URL": url}
     child_env.pop(_URL_ENV, None)        # 子には DATABASE_URL のみ渡す
     proc = subprocess.run(
         [sys.executable, "-m", "alembic", "upgrade", "head"],
         cwd=_REPO_ROOT, env=child_env, capture_output=True, text=True)
-    secrets = [url, parts.password or "",
-               quote(unquote(parts.password), safe="") if parts.password else ""]
     for stream in (proc.stdout, proc.stderr):
         if stream.strip():
-            out.write(_redacted(stream, secrets).rstrip() + "\n")
+            out.write(_sanitize_output(stream, url).rstrip() + "\n")
     if proc.returncode == 0:
         out.write("migrate: alembic upgrade head 完了（env 残置なし）\n")
         return 0
