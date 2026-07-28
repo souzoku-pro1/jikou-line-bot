@@ -1,8 +1,8 @@
-# Phase 1 完了報告（DRAFT・PC-A 整形／司令塔確定待ち）
+# Phase 1 完了報告（最終版）
 
-- 状態: **DRAFT**（PR 化は #141 マージ後・司令塔指示後）。費用欄は司令塔記入。
+- 状態: **最終版**（2026-07-28 確定・R-SORT-CLOSE-2 M01 反映）。費用欄は司令塔記入。
 - 期間: **2026-07-11（Phase 0 クローズ／Phase 1 着手）〜 2026-07-18（S5 cutover）**。
-- 基準 SHA（本 DRAFT 作成時 main）: `1d7c425`。
+- 基準 SHA（本報告 作成時 main）: `1d7c425`。
 
 ## 1. サマリ
 
@@ -94,8 +94,14 @@ legacy 停止＋token rotation** まで到達（**retirement evidence 3 点全�
   env 削除＋GAS `SORTATION_TOKEN` 定数削除）は当初 7/22 予定だった
   （§7 (ii) は 7/19 完了済みのため対象外）。
 
-## 11. 完全クローズ（2026-07-27 追記）
+## 11. 完全クローズ（2026-07-27 追記／2026-07-28 限定明確化）
 
 - **§7(i) の残置解消**（削除実見・[人]・正本: S5 work-log §4(i) の 2026-07-27 追補）
-  により**残置ゼロ**。
+  により、**Phase 1 完全クローズの条件であった §7(i)（`SORTATION_INGEST_TOKEN` env
+  ＋GAS `SORTATION_TOKEN` 定数の削除）の残置はゼロ**。
+- **「残置ゼロ」の範囲（R-SORT-CLOSE-2 M01・限定）**: 上記は **§7(i) に限った完了**で
+  あり、**その他の申し送りは Phase 2／DEFER として継続する**——§7(iii) RCF-M14
+  （Vision billing）／§7(iv) 残 lane 切替（Phase 2）／§7(v)
+  `INBOUND_EVENT_DURABLE_ENABLED` 点火（別裁定）／§7(vi) RCF-M11/M13（DEFER）。
+  これらは Phase 1 完全クローズの阻害要因ではない（Phase 1 スコープ外の継続項目）。
 - **Phase 1 完全クローズ日 = 2026-07-27**（条件付き完了 7/19 と区別して記録）。

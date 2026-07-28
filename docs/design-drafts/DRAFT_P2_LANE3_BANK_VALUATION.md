@@ -82,7 +82,7 @@ $ grep -n "bank/ingest\|valuation/ingest\|registry/ingest" legacy/gas/コード.
   > GAS watcher系（1 スクリプト「相続書類自動化」）… 対象 fetch は ingest 系（/koseki・/sortation。**/registry・/bank・/valuation は結線済み入口として同じヘルパで開通**）
 - `docs/runbooks/2026-07_S4-S5_cutover-checklist.md` 100-101 行:
   > `SIGNED_LANES.<lane>=true` を **1 lane ずつ**（順序: sortation → koseki → **registry/bank/valuation**）
-- `docs/reports/2026-07_phase1-close-report_DRAFT.md` 74 行:
+- `docs/reports/2026-07_phase1-close-report.md` §7(iv):
   > (iv) **残 lane 切替（koseki/registry/bank/valuation）は Phase 2**（材料: S4-5-PREP-LANE23）
 - ＝ 設計上は**同一 GAS スクリプトの新設 watcher ブロック**が呼出元になる想定だが、
   対象フォルダ ID・トリガー設計は文書化されていない（§6 OPEN-1・[人]裁定）。
