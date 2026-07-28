@@ -12,8 +12,8 @@ body{font-family:sans-serif;max-width:720px;margin:2rem auto;padding:0 1rem}
 </head>
 <body>
 <h1>案件管理（仮）ダッシュボード</h1>
-<!-- P4-001: 空ダッシュボード（shell のみ）。データ画面は P4-002 以降の票 -->
-<div class="card">案件一覧（P4-002 で実装）</div>
+<!-- P4-001 shell → P4-002 で案件画面を結線（read-only） -->
+<div class="card"><a href="/app/cases">案件一覧</a></div>
 <div class="card">書類到着状況（P4-003・scan 到着ゲート後）</div>
 <div class="card">承認キュー参照（P4-004 で実装）</div>
 <script src="/app/app.js"></script>
