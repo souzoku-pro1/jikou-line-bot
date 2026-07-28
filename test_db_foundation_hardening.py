@@ -114,11 +114,16 @@ class TestNoDynamicAlembicInvocation(unittest.TestCase):
       - alembic/ 配下（alembic 自身）
       - test_db_foundation.py（offline 煙テストが subprocess で alembic CLI を起動
         するのは「明示コマンドのみ」原則のテストであり違反ではない）
+      - tools/tracking_pg_harness.py（TRACKING-PREP fix1 H02: 検証済みローカル
+        URL を子プロセス env にのみ渡して `python -m alembic upgrade head` を
+        起動する migrate ラッパー。人が明示的に打つコマンドの一体化であり
+        app runtime からの自動 migration ではない＝D2 の趣旨と整合。
+        接続先はローカル限定を機械強制・test_tracking_prep_harness.py で検査）
       - 本テストファイル（検出対象の名前を文字列として含むため）
     """
 
     EXCLUDED_PREFIXES = ("alembic/",)
-    EXCLUDED_FILES = {"test_db_foundation.py", SELF}
+    EXCLUDED_FILES = {"test_db_foundation.py", "tracking_pg_harness.py", SELF}
 
     def test_no_dynamic_alembic_launch(self):
         violations = []

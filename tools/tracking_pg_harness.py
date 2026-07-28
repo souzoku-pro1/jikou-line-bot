@@ -20,6 +20,13 @@
 - 接続先は env **TRACKING_PG_URL** のみ（DATABASE_URL の周囲値は**無視して上書き**）。
 - host が localhost/127.0.0.1/::1 以外は固定文言で拒否（Railway・本番 URL を
   誤って与えても接続しない）。URL 値はエラー文言・出力へ一切出さない。
+- fix1 H01: URL は**検証済み要素からの再構築**方式——query/fragment は全面拒否
+  （host/hostaddr/service/options 等の接続先上書きパラメータの迂回を遮断）し、
+  元 URL 文字列は接続に使わない。
+- fix1 H02: alembic 適用も本ハーネスの `migrate` サブコマンド経由が唯一の経路
+  （検証済み URL を**子プロセスの env にのみ** DATABASE_URL として渡す＝
+  親環境は不変・失敗時も env 残置が構造的にゼロ。alembic は import しない=
+  D2 policy 整合の明示コマンド実行）。
 - データは全て合成（uuid ベースの key・数字列 person_id）。削除は行わない——
   検証 DB ごと捨てるのが正（手順書の後片付け参照）。
 
@@ -32,10 +39,12 @@ selftest: `--sqlite-selftest` は一時 SQLite でハーネス自身の論理を
 import argparse
 import asyncio
 import os
+import re
 import sys
 import tempfile
+import time
 import uuid
-from urllib.parse import urlsplit
+from urllib.parse import quote, unquote, urlsplit
 
 # `python tools/tracking_pg_harness.py` 直接実行でも hub/ を import 可能にする
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -51,7 +60,19 @@ class HarnessConfigError(ValueError):
     """接続設定の拒否（固定文言のみ・URL 値は含めない）。"""
 
 
+_DBNAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,63}$")
+
+
 def _validated_local_url(url: str) -> str:
+    """検証済み要素からの**再構築**方式（fix1 H01）。
+
+    authority（user/password/hostname/port）と dbname のみを解析・検証し、
+    **query/fragment は全面拒否**——libpq/psycopg は接続文字列の query で
+    host/hostaddr/port/service/options 等の**接続先上書き**が可能なため、
+    閉集合の許可も置かず原則どおり拒否する。検証後は元 URL を返さず、
+    検証済み要素だけから新しい接続 URL を組み立てて返す（未知の構成要素が
+    素通りする経路を構造的に遮断）。エラー文言に URL 値は含めない。
+    """
     if not url:
         raise HarnessConfigError(
             f"{_URL_ENV} が未設定です（検証用ローカル PG の URL を設定）")
@@ -59,11 +80,35 @@ def _validated_local_url(url: str) -> str:
     if parts.scheme not in ("postgresql", "postgresql+psycopg", "postgres"):
         raise HarnessConfigError(
             f"{_URL_ENV}: scheme は postgresql 系のみ許可（値は表示しない）")
-    if parts.hostname not in _ALLOWED_HOSTS:
+    if parts.query or parts.fragment:
+        raise HarnessConfigError(
+            f"{_URL_ENV}: query/fragment は不可（host/hostaddr/service 等の"
+            "接続先上書きパラメータを遮断するため全面拒否・値は表示しない）")
+    try:
+        hostname = parts.hostname
+        port = parts.port                # 非数値 port はここで ValueError
+    except ValueError:
+        raise HarnessConfigError(f"{_URL_ENV}: port が不正です（値は表示しない）")
+    if hostname not in _ALLOWED_HOSTS:
         raise HarnessConfigError(
             f"{_URL_ENV}: host はローカル（localhost/127.0.0.1/::1）のみ許可"
             "（本番・Railway への接続は本ハーネスでは構造的に不可・値は表示しない）")
-    return url
+    dbname = parts.path.lstrip("/")
+    if not _DBNAME_RE.fullmatch(dbname):
+        raise HarnessConfigError(
+            f"{_URL_ENV}: DB 名は英数・-・_（63 文字以内）のみ許可（値は表示しない）")
+    # ── 検証済み要素のみで再構築（元 URL は以後使わない）──
+    auth = ""
+    if parts.username is not None:
+        # urlsplit の username/password は未デコード → 一旦 unquote してから
+        # 再 quote（二重エンコードせず正規形で再構築）
+        auth = quote(unquote(parts.username), safe="")
+        if parts.password is not None:
+            auth += ":" + quote(unquote(parts.password), safe="")
+        auth += "@"
+    host = f"[{hostname}]" if ":" in hostname else hostname   # IPv6 (::1)
+    portpart = f":{port}" if port is not None else ""
+    return f"postgresql://{auth}{host}{portpart}/{dbname}"
 
 
 def _tv_fields(template_key: str, version: str) -> dict:
@@ -241,19 +286,66 @@ async def _amain(args, out) -> int:
         async with eng.begin() as c:
             await c.run_sync(DerivationBase.metadata.create_all)
 
+    # fix1 M02: 各 check を単調時計で個別計時。計測範囲=check 関数の全区間
+    # （合成データ作成＋並行競走＋invariant 検証 select を含む・work-log 様式と同一）
     ok = True
     if args.check in ("1", "all"):
+        t0 = time.monotonic()
         ok = await _check1(args.rounds, out) and ok
+        out.write(f"#1 elapsed={time.monotonic() - t0:.1f}s\n")
     if args.check in ("2", "all"):
+        t0 = time.monotonic()
         ok = await _check2(args.rounds, out) and ok
+        out.write(f"#2 elapsed={time.monotonic() - t0:.1f}s\n")
     await db.adispose_all()
     out.write(f"result: {'PASS' if ok else 'FAIL'}"
               f"{' (SELFTEST: #1/#2 の実測ではない)' if args.sqlite_selftest else ''}\n")
     return 0 if ok else 1
 
 
+def _redacted(text: str, secrets: list[str]) -> str:
+    for s in secrets:
+        if s:
+            text = text.replace(s, "***")
+    return text
+
+
+def _run_migrate(url: str, out) -> int:
+    """alembic upgrade head のラッパー（fix1 H02・唯一の適用経路）。
+
+    検証・再構築済み URL を **子プロセスの env にのみ** DATABASE_URL として渡して
+    `python -m alembic upgrade head` を実行する——親プロセスの環境は一切変更せず、
+    失敗時も env 残置が構造的に発生しない（「人が DATABASE_URL を直接設定して
+    alembic を叩く」経路の廃止）。migration は明示コマンドのまま（D2 policy:
+    アプリ module から alembic を import しない——本関数も import しない）。
+    子プロセス出力は URL・パスワードを伏字化してから表示する。
+    """
+    import subprocess
+
+    parts = urlsplit(url)
+    child_env = {**os.environ, "DATABASE_URL": url}
+    child_env.pop(_URL_ENV, None)        # 子には DATABASE_URL のみ渡す
+    proc = subprocess.run(
+        [sys.executable, "-m", "alembic", "upgrade", "head"],
+        cwd=_REPO_ROOT, env=child_env, capture_output=True, text=True)
+    secrets = [url, parts.password or "",
+               quote(unquote(parts.password), safe="") if parts.password else ""]
+    for stream in (proc.stdout, proc.stderr):
+        if stream.strip():
+            out.write(_redacted(stream, secrets).rstrip() + "\n")
+    if proc.returncode == 0:
+        out.write("migrate: alembic upgrade head 完了（env 残置なし）\n")
+        return 0
+    out.write(f"migrate: 失敗（exit {proc.returncode}）\n")
+    return 1
+
+
 def main(argv=None, out=sys.stdout) -> int:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    p.add_argument("command", nargs="?", choices=("run", "migrate"),
+                   default="run",
+                   help="run=実測（既定）/ migrate=alembic upgrade head を"
+                        "検証済み URL で適用（fix1 H02・唯一の適用経路）")
     p.add_argument("--check", choices=("1", "2", "all"), default="all")
     p.add_argument("--rounds", type=int, default=_ROUNDS_DEFAULT)
     p.add_argument("--create-tables", action="store_true",
@@ -263,7 +355,19 @@ def main(argv=None, out=sys.stdout) -> int:
                    help="一時 SQLite でハーネス論理の自己検証（#1/#2 実測ではない）")
     args = p.parse_args(argv)
 
+    if args.rounds < 1:                  # fix1 M01: 正整数のみ（固定文言・rc 2）
+        out.write("config error: --rounds は 1 以上の整数を指定してください\n")
+        return 2
+
     from hub import db
+    if args.command == "migrate":        # fix1 H02: ラッパー経由が唯一の適用経路
+        try:
+            url = _validated_local_url(os.environ.get(_URL_ENV, ""))
+        except HarnessConfigError as e:
+            out.write(f"config error: {e}\n")
+            return 2
+        return _run_migrate(url, out)
+
     if args.sqlite_selftest:
         tmp = tempfile.mkdtemp(prefix="trk_selftest_")
         os.environ["DATABASE_URL"] = f"sqlite+aiosqlite:///{tmp}/t.db"

@@ -53,30 +53,39 @@ docker run --name trk-pg -e POSTGRES_PASSWORD=trk -e POSTGRES_DB=tracking_check 
 接続 URL（以降 `<URL>`）: `postgresql://postgres:trk@127.0.0.1:5433/tracking_check`
 （(A) はパスワード部なし）。**port 5433 を使い、既定 5432 と混同しない**。
 
-### 3.2 スキーマ適用（alembic が正）
+### 3.2 スキーマ適用（fix1 H02: **ハーネスの migrate ラッパーが唯一の適用経路**）
 
 ```powershell
-$env:DATABASE_URL = "<URL>"
-python -m alembic upgrade head          # immutable trigger 等も含む実 DDL
-Remove-Item Env:DATABASE_URL            # 適用後は必ず外す
+$env:TRACKING_PG_URL = "<URL>"
+python tools\tracking_pg_harness.py migrate   # alembic upgrade head（実 DDL 全部）
 ```
 
+- **「人が DATABASE_URL を直接設定して alembic を叩く」手順は廃止**（fix1 H02）——
+  ラッパーが検証・再構築済みのローカル URL を**子プロセスの env にのみ**
+  DATABASE_URL として渡して `python -m alembic upgrade head` を実行する。
+  親環境は一切変更されず、**失敗時も env 残置が構造的に発生しない**。
+  子プロセス出力は URL・パスワードを伏字化して表示（D2 policy どおり alembic は
+  import せず明示コマンド実行のまま）。
 - 代替: ハーネスの `--create-tables`（`metadata.create_all`）でも対象 table と
   部分 unique index は作られ **invariant 検証には十分**。ただし immutable trigger・
   approve_gate trigger 等の migration 固有 DDL は作られない——**実測の本旨
-  （#1/#2 は index/制約の方言差確認）には影響しないが、alembic 適用を正とする**。
+  （#1/#2 は index/制約の方言差確認）には影響しないが、migrate 適用を正とする**。
 
 ### 3.3 実測
 
 ```powershell
-$env:TRACKING_PG_URL = "<URL>"
+$env:TRACKING_PG_URL = "<URL>"     # 3.2 で設定済みならそのまま
 python tools\tracking_pg_harness.py --check all --rounds 20
 Remove-Item Env:TRACKING_PG_URL
 ```
 
-- `--check 1` / `--check 2` で個別実行可。`--rounds` は 20 を既定推奨
+- `--check 1` / `--check 2` で個別実行可。`--rounds` は 20 を既定推奨・**1 以上の
+  整数のみ**（0/負数は固定文言＋終了コード2・fix1 M01）
   （競合の再現回数を稼ぐ。1 round = #1 同一 draft 競走＋異 draft 競走・
   #2 root 競走＋supersede 競走）。
+- URL は**検証済み要素からの再構築**方式（fix1 H01）: query/fragment 付き URL
+  （`?host=`／`hostaddr=`／`service=` 等の接続先上書きパラメータ）は固定文言で
+  拒否される（URL 値は表示されない）。
 - 事前にハーネス自己検証を走らせる場合: `--sqlite-selftest`（一時 SQLite・
   **#1/#2 の実測ではない**。準備票時点で PASS 済み: #1 loser=
   ActivationConflictError×3・#2 loser=ChainIntegrityError/IntegrityError 混在）。
@@ -102,7 +111,8 @@ Remove-Item Env:TRACKING_PG_URL
   敗者は上記いずれかの例外・head 連鎖は一本鎖のまま
 
 ハーネスの終了コード: 0=全 invariant PASS／1=FAIL（round 別の違反行を出力）／
-2=接続設定拒否。出力は件数・例外クラス名のみ（RV10: PII/secret 非出力）。
+2=接続設定・--rounds 不正の拒否。出力は件数・例外クラス名・所要秒のみ
+（RV10: PII/secret 非出力）。
 
 ## 5. 結果の work-log 保存様式
 
@@ -113,11 +123,16 @@ Remove-Item Env:TRACKING_PG_URL
 # TRACKING #1/#2 PG 実機並行実測（<実施日>）
 - 環境: ローカル PG <版>（docker|native）・alembic head=<revision>
 - コマンド: tracking_pg_harness --check all --rounds <N>
-- #1: loser_classes=<dict> serialized_rounds=<n> invariants=<PASS|FAIL> 所要=<s>
-- #2: loser_classes=<dict> invariants=<PASS|FAIL> 所要=<s>
+- #1: loser_classes=<dict> serialized_rounds=<n> invariants=<PASS|FAIL> 所要=<#1 elapsed 出力値>s
+- #2: loser_classes=<dict> invariants=<PASS|FAIL> 所要=<#2 elapsed 出力値>s
 - 判定: #1/#2 とも合格条件（裁定8 (a)(b)(c)）充足 → TRACKING 表の状態を「実施済み
   （<日付>・work-log 参照）」へ更新（別 commit）
 ```
+
+- **所要の計測範囲（fix1 M02・ハーネス出力と一意対応）**: ハーネスが
+  `time.monotonic()` で check ごとに計時し `#1 elapsed=<秒>s`／`#2 elapsed=<秒>s`
+  を出力する。範囲=当該 check 関数の全区間（合成データ作成＋並行競走＋invariant
+  検証 select を含む）。work-log にはこの出力値を転記する（手計時しない）。
 
 TRACKING_PRE_DEPLOY_CHECKS.md の #1/#2「状態」列の更新は**実施日の票**で行う
 （本準備票では変更しない）。
