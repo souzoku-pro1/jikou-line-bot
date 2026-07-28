@@ -1,0 +1,54 @@
+# 条項ライブラリ v1 — 遺産分割協議書（doc_type=iso_kyogi）
+# ★合成条項のみ（裁定③ 2026-07-27: 書式現物の到着前は器の検証用。
+#   実条項の投入は現物到着後の別票・弁護士レビュー必須）
+version: v1
+doc_type: iso_kyogi
+# placeholders は素のキー名で宣言する（{{行:キー}} の「行:」は繰返し種別 marker で
+# あり宣言には含めない=fill_table_rows の {{行: 規約と整合）
+placeholders:
+  - 被相続人氏名
+  - 相続開始日和暦
+  - 本籍
+  - 氏名
+  - 財産目録
+  - 作成日和暦
+clauses:
+  - clause_id: iso_kyogi_intro_v1
+    title: 前文（合成・器検証用）
+    applies:
+      rank_in: [0, 1, 2, 3]
+      requires_human: false
+    body_template: |
+      被相続人{{被相続人氏名}}（{{相続開始日和暦}}死亡・本籍{{本籍}}）の遺産に
+      ついて、共同相続人の全員は、次のとおり遺産分割の協議を行った。
+    repeat: none
+    order: 10
+    since_version: v1
+    notes: 合成条項（現物到着後に差し替え）
+  - clause_id: iso_kyogi_acquisition_v1
+    title: 相続人別の取得財産条項（合成・器検証用）
+    applies:
+      relation_keys_any: [spouse, child]
+      rank_in: [1]
+      flags_none: [successive_inheritance]
+      requires_human: false
+    body_template: |
+      相続人{{氏名}}は、次の財産を取得する。
+      {{行:財産目録}}
+    repeat: per_heir
+    order: 20
+    since_version: v1
+    notes: 合成条項（現物到着後に差し替え）
+  - clause_id: iso_kyogi_signature_v1
+    title: 署名欄（合成・器検証用）
+    applies:
+      rank_in: [0, 1, 2, 3]
+      requires_human: true
+    body_template: |
+      本協議の成立を証するため、本書を作成し、各自署名押印する。
+      {{作成日和暦}}
+      相続人 {{氏名}} 印
+    repeat: per_heir
+    order: 90
+    since_version: v1
+    notes: 合成条項（requires_human の器検証用・現物到着後に差し替え）

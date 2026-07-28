@@ -81,7 +81,9 @@ python-dotenv==1.2.2
 python-multipart==0.0.32
     # via -r requirements.txt
 pyyaml==6.0.3
-    # via uvicorn
+    # via
+    #   -r requirements.txt
+    #   uvicorn
 reportlab==5.0.0
     # via -r requirements.txt
 requests==2.34.2
