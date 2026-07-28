@@ -192,9 +192,12 @@ _FETUS_ID_RE = re.compile(r"^胎児:F[1-9][0-9]*$")   # fix5: F0・先頭ゼロ�
 # share: 分数の固定文法のみ（engine は Fraction。全部相続は "1/1"）
 _SHARE_RE = re.compile(r"^[0-9]{1,6}/[1-9][0-9]{0,5}$")
 # relation_key: ASCII enum（zokugara 9 区分の写像・_ZOKUGARA_TO_RELATION が単一の正）
-_RELATION_KEYS = frozenset({
+# 公開 read-only 定数（RELATION_KEYS）。他 module（clause_library 等）はこの語彙を
+# 「保存語彙の単一の正」として import する。frozenset＝不変型（再代入・変更不可）。
+RELATION_KEYS = frozenset({
     "spouse", "child", "fetus", "lineal_ascendant", "sibling",
     "representative", "successive"})
+_RELATION_KEYS = RELATION_KEYS   # 後方互換 alias（旧 private 名・同一オブジェクト）
 # facts: 条文キー enum のみ。heir_derivation.py が用いる根拠条文 17 種の
 # ASCII 写像（_BASIS_TO_FACT が単一の正）。拡張は正本改定と同時。
 _BASIS_TO_FACT = {
@@ -217,9 +220,11 @@ _FLAG_TO_KEY = {
     "数次": "successive_hold",
 }
 _FLAG_CODE_RE = re.compile(r"^[A-Z][0-9]$")
-_LAWYER_FLAG_KEYS = frozenset(
+# 公開 read-only 定数（LAWYER_FLAG_KEYS）。frozenset＝不変型。
+LAWYER_FLAG_KEYS = frozenset(
     {"F1", "F2", "F3", "F4", "F5", "F6", "C5", "D5", "E4", "E5"}
     | set(_FLAG_TO_KEY.values()))
+_LAWYER_FLAG_KEYS = LAWYER_FLAG_KEYS   # 後方互換 alias（旧 private 名・同一オブジェクト）
 # zokugara（App36 続柄区分・heir_derivation の生成 9 区分）→ relation_key
 _ZOKUGARA_TO_RELATION = {
     "配偶者": "spouse", "子": "child", "胎児": "fetus",
@@ -332,7 +337,7 @@ def validate_result_payload(payload) -> None:
         if "share" in h:
             _check_re(h["share"], _SHARE_RE, "result_payload.heirs[*].share")
         if "relation_key" in h:
-            _check_enum(h["relation_key"], _RELATION_KEYS,
+            _check_enum(h["relation_key"], RELATION_KEYS,
                         "result_payload.heirs[*].relation_key")
     # fix5 M01（裁定・契約強制）: run 内の胎児 ID 集合は {F1..Fn} と完全一致すること
     # （F1 起点・正整数・連続・重複なし。F0/先頭ゼロは _FETUS_ID_RE が構文で拒否済み）
@@ -368,7 +373,7 @@ def validate_lawyer_flags(flags) -> None:
     if not isinstance(values, list):
         raise PayloadPolicyError("lawyer_flags.flags は list であること")
     for v in values:
-        _check_enum(v, _LAWYER_FLAG_KEYS, "lawyer_flags.flags[*]")
+        _check_enum(v, LAWYER_FLAG_KEYS, "lawyer_flags.flags[*]")
 
 
 def _validate_run_payloads_orm(mapper, connection, target):  # noqa: ARG001

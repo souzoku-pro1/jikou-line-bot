@@ -24,7 +24,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import hub.db as db
-from hub.derivation_models import (DerivationBase, _LAWYER_FLAG_KEYS,
+from hub.derivation_models import (DerivationBase, LAWYER_FLAG_KEYS,
                                    build_run_payload, create_derivation_run,
                                    flag_key, validate_lawyer_flags,
                                    validate_result_payload)
@@ -187,7 +187,7 @@ class TestFrozenCasesEndToEnd(unittest.TestCase):
         literals = _engine_flag_literals()
         self.assertGreaterEqual(len(literals), 10, literals)
         mapped = {flag_key(fl) for fl in literals}   # 未写像なら PayloadPolicyError
-        self.assertLessEqual(mapped, _LAWYER_FLAG_KEYS,
+        self.assertLessEqual(mapped, LAWYER_FLAG_KEYS,
                              "写像結果が enum 外（enum と変換関数がずれている）")
 
 

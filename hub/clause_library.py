@@ -12,8 +12,8 @@
 - clause_id grammar・ライブラリ内一意／(doc_type, order) の**全 library 一意**・
   doc_type の重複ファイル拒否・**ファイル名 stem = doc_type**（「1ファイル=1文書種別」
   の機械強制・fix1 H01）
-- 適用条件の enum 整合（relation_keys_any ⊆ _RELATION_KEYS／flags_none ⊆
-  _LAWYER_FLAG_KEYS＝**hub/derivation_models の保存語彙を単一の正として import**・
+- 適用条件の enum 整合（relation_keys_any ⊆ RELATION_KEYS／flags_none ⊆
+  LAWYER_FLAG_KEYS＝**hub/derivation_models の保存語彙を単一の正として import**・
   rank_in は各要素 `type(x) is int` かつ 0〜3〔bool 遮断〕・requires_human は bool。
   非 str 要素（dict/list 等 unhashable 含む）は固定分類で拒否＝未処理 TypeError を
   出さない・fix1 H02）
@@ -40,7 +40,7 @@ from pathlib import Path
 
 import yaml
 
-from hub.derivation_models import _LAWYER_FLAG_KEYS, _RELATION_KEYS
+from hub.derivation_models import LAWYER_FLAG_KEYS, RELATION_KEYS
 
 CLAUSES_ROOT = "clauses"
 
@@ -112,9 +112,9 @@ def _validate_applies(clause_id: str, applies) -> None:
         raise ClauseLibraryError(
             f"{clause_id}: applies は {sorted(_APPLIES_KEYS)} のみ許可")
     _validate_str_subset(clause_id, "relation_keys_any",
-                         applies.get("relation_keys_any", []), _RELATION_KEYS)
+                         applies.get("relation_keys_any", []), RELATION_KEYS)
     _validate_str_subset(clause_id, "flags_none",
-                         applies.get("flags_none", []), _LAWYER_FLAG_KEYS)
+                         applies.get("flags_none", []), LAWYER_FLAG_KEYS)
     ranks = applies.get("rank_in", [])
     if not isinstance(ranks, list) or not all(
             type(x) is int and x in _RANKS for x in ranks):

@@ -5,7 +5,7 @@
 - clause_id grammar（文書種別接頭辞+意味slug+_vN）・ライブラリ内一意
 - (doc_type, order) の全 library 一意・doc_type 重複ファイル拒否・
   ファイル名 stem=doc_type（fix1 H01）
-- 適用条件は hub/derivation_models の保存語彙（_RELATION_KEYS/_LAWYER_FLAG_KEYS）
+- 適用条件は hub/derivation_models の保存語彙（RELATION_KEYS/LAWYER_FLAG_KEYS）
   を単一の正として検証・rank は type is int かつ 0-3（bool 遮断）・
   unhashable 要素は固定分類で拒否・requires_human bool（fix1 H02）
 - placeholder parser: {{key}}/{{行:key}} の閉集合・対応検査・空キー拒否（fix1 H02）
