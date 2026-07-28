@@ -87,9 +87,12 @@ _ALLOWED_KINTONE_ATTRS = {"KintoneApp", "search_records", "get_record"}
 _BANNED_DYNAMIC = {"getattr", "setattr", "__import__", "eval", "exec",
                    "import_module"}
 # 直接 HTTP client に加え subprocess/os も遮断（curl 等の外部プロセス経由 HTTP を
-# 「対象外」にせず、プロセス起動の import 自体を禁止して塞ぐ・fix2 H01-4）
+# 「対象外」にせず、プロセス起動の import 自体を禁止して塞ぐ・fix2 H01-4）。
+# fix3 H01-4: operator（attrgetter=動的属性アクセス）・asyncio
+# （create_subprocess_exec 系=プロセス起動）も「対象外」とせず入口遮断へ追加
+# （本 module は async def のみで asyncio API を必要としない）。
 _FORBIDDEN_IMPORTS = {"httpx", "requests", "urllib", "aiohttp", "http",
-                      "importlib", "subprocess", "os"}
+                      "importlib", "subprocess", "os", "operator", "asyncio"}
 _WRITE_VERBS = {"post", "put", "delete", "patch", "request"}
 
 
@@ -158,23 +161,11 @@ def _readonly_violations_legacy(tree) -> list[str]:
     return violations
 
 
-def _readonly_violations(tree) -> list[str]:
-    """fix2 H01 の新検査: alias 完全追跡。
+def _readonly_violations_fix2(tree) -> list[str]:
+    """fix2 H01 時点の検査（**対照用の凍結コピー・変更しない**）。
 
-    - 禁止関数（getattr/setattr/__import__/eval/exec/import_module）は
-      **import alias（from builtins import getattr as ga 等）・代入 alias も追跡**
-      して呼出しを違反化。import 自体も違反。
-    - kintone module の poison を全代入形式（Assign・tuple/list unpack・
-      NamedExpr(:=)・AnnAssign・import alias）で伝播（固定点まで反復）。
-      poison 名の生成自体が違反・poison 名への属性参照は許可 3 API のみ。
-    - 直接 HTTP client（httpx/requests/urllib/aiohttp/http）に加え
-      subprocess/os の import も違反（curl 等の外部プロセス HTTP を対象外に
-      しない=起動手段の import ごと遮断）。post/put/delete/patch/request の
-      属性呼出しも違反。
-
-    残余の限界（正確化）: globals()/locals()/vars() の辞書経由・文字列組立てで
-    実行時に構成される完全動的経路・C 拡張内部の呼出しは静的検査では検出できない。
-    この残余は sink AST policy・関所テスト・レビューで重畳防御する。
+    fix3 メタテストの基準: Attribute/Subscript 代入先への持ち出し・
+    builtins.getattr 型の Attribute 連鎖 alias を検出できない版。
     """
     violations = []
     poison = {"kintone"}
@@ -252,6 +243,95 @@ def _readonly_violations(tree) -> list[str]:
     return violations
 
 
+def _extra_guard_violations(tree) -> list[str]:
+    """fix3 H01 の追加規則（fix2 検査への上乗せ・代入先種類非依存の遮断）。
+
+    - R1: RHS が poison/禁止関数の別名式（直接 Name・Attribute 連鎖）である代入は、
+      **代入先の種類にかかわらず違反**——Attribute（box.kt = kintone）・Subscript
+      （holder["kt"] = kintone）は追跡せず、その代入自体を禁止（安全側）。
+    - R2: RHS 内の Call の**引数**に poison/禁止関数の別名式が含まれる代入も違反
+      （呼出し戻り値経由の持ち出し禁止。kintone.KintoneApp("...") のように
+      引数が非 hazard の呼出しは対象外=本体 module の正当パターンを誤検出しない）。
+    - R3: **Attribute 連鎖の末尾が禁止関数名**（builtins.getattr 等）の式は
+      alias 生成（どの代入先でも）・呼出しとも違反。Name target への束縛は
+      固定点で追跡し、その別名の呼出しも違反化。
+    """
+    violations = []
+    poison = {"kintone"}
+    extra_banned: set[str] = set()
+
+    def _is_banned_expr(v) -> bool:
+        if isinstance(v, ast.Name) and (v.id in _BANNED_DYNAMIC
+                                        or v.id in extra_banned):
+            return True
+        return isinstance(v, ast.Attribute) and v.attr in _BANNED_DYNAMIC
+
+    def _contains_hazard(v) -> bool:
+        for sub in ast.walk(v):
+            if isinstance(sub, ast.Name) and sub.id in poison:
+                return True
+            if _is_banned_expr(sub):
+                return True
+        return False
+
+    def _assign_nodes():
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Assign, ast.AnnAssign, ast.NamedExpr,
+                                 ast.AugAssign)):
+                value = getattr(node, "value", None)
+                if value is None:
+                    continue
+                targets = node.targets if isinstance(node, ast.Assign) \
+                    else [node.target]
+                yield node, targets, value
+
+    changed = True                       # R3: banned 別名の固定点追跡
+    while changed:
+        changed = False
+        for _, targets, value in _assign_nodes():
+            if not _is_banned_expr(value):
+                continue
+            for t in targets:
+                if isinstance(t, ast.Name) and t.id not in extra_banned:
+                    extra_banned.add(t.id)
+                    changed = True
+
+    for _, targets, value in _assign_nodes():
+        if _is_banned_expr(value):       # R3: alias 生成（代入先の種類を問わない）
+            violations.append("禁止関数の alias 生成（Attribute 連鎖含む）")
+        non_trackable = [t for t in targets
+                         if not isinstance(t, (ast.Name, ast.Tuple, ast.List,
+                                               ast.Starred))]
+        if non_trackable and _contains_hazard(value):   # R1
+            violations.append("Attribute/Subscript 代入先への hazard 持ち出し")
+        for call in (s for s in ast.walk(value) if isinstance(s, ast.Call)):
+            if any(_contains_hazard(a) for a in
+                   list(call.args) + [k.value for k in call.keywords]):   # R2
+                violations.append("hazard を引数に渡す呼出し戻り値の代入")
+                break
+
+    for node in ast.walk(tree):          # R3: banned 別名の呼出し
+        if isinstance(node, ast.Call):
+            f = node.func
+            if isinstance(f, ast.Name) and f.id in extra_banned:
+                violations.append(f"banned 別名の呼出し: {f.id}")
+    return violations
+
+
+def _readonly_violations(tree) -> list[str]:
+    """fix3 H01 の現行検査 = fix2 検査（凍結コピーを部品として利用）＋
+    _extra_guard_violations の追加規則（代入先種類非依存の遮断）。
+
+    残余の限界（fix3 H01-4 で具体化）: operator.attrgetter（動的属性アクセス）・
+    asyncio.create_subprocess_exec/create_subprocess_shell（プロセス起動）は
+    「対象外」とせず **operator/asyncio を禁止 import 集合に追加して入口遮断**。
+    なお残る検出不能領域: globals()/locals()/vars() の辞書経由・文字列組立てで
+    実行時に構成される完全動的経路・C 拡張内部の呼出し。この残余は
+    sink AST policy・関所テスト・レビューで重畳防御する。
+    """
+    return _readonly_violations_fix2(tree) + _extra_guard_violations(tree)
+
+
 class TestReadOnlyMachineCheck(unittest.TestCase):
     """read-only の AST 機械検査（fix1 M01→fix2 H01 で alias 完全追跡に関数化）。
 
@@ -302,6 +382,35 @@ class TestReadOnlyMachineCheck(unittest.TestCase):
                 tree = ast.parse(src)
                 self.assertEqual(_readonly_violations_legacy(tree), [],
                                  "旧検査は素通り（迂回が実在した証明）")
+                self.assertNotEqual(_readonly_violations(tree), [],
+                                    "新検査は検出すること")
+
+    def test_meta_fix3_bypass_fixtures_fix2_pass_new_fail(self):
+        """fix3 H01-3: Attribute/Subscript 代入系の迂回 3種が
+        「旧（fix2 凍結コピー）検査 PASS・新検査 FAIL」となる三段対照。"""
+        fixtures = {
+            "compound_attr_box_and_builtins_getattr": (
+                "from hub import kintone\n"
+                "import builtins\n"
+                "class B:\n    pass\n"
+                "box = B()\n"
+                "box.kt = kintone\n"
+                "ga = builtins.getattr\n"
+                "fn = ga(box.kt, 'create_' + 'record')\n"),
+            "subscript_assignment": (
+                "from hub import kintone\n"
+                "holder = {}\n"
+                "holder['kt'] = kintone\n"),
+            "builtins_getattr_alias": (
+                "import builtins\n"
+                "ga = builtins.getattr\n"
+                "x = ga(object, 'attr')\n"),
+        }
+        for label, src in fixtures.items():
+            with self.subTest(fixture=label):
+                tree = ast.parse(src)
+                self.assertEqual(_readonly_violations_fix2(tree), [],
+                                 "fix2 検査は素通り（迂回が実在した証明）")
                 self.assertNotEqual(_readonly_violations(tree), [],
                                     "新検査は検出すること")
 
