@@ -377,25 +377,10 @@ def _readonly_violations_fix4(tree) -> list[str]:
             + _extra_guard_violations(tree))
 
 
-def _binding_violations(tree) -> list[str]:
-    """fix5 H01: 束縛元の検証（最終ピース）。
-
-    - 正規束縛=「module 直下の `from hub import kintone`（alias なし）・
-      ちょうど 1 回」のみ許可。
-    - "kintone" という識別子への**他の全束縛**を違反化。
-
-    列挙の完全性（根拠）: Python 3.12 の AST（ASDL）で新しい識別子を束縛できる
-    構文要素は次の閉集合であり、本関数はその全てを検査する——
-    ① `Name(ctx=Store|Del)`（代入 target 全形式・for/with as・comprehension
-    target・walrus はすべてこの形に脱糖される） ② `alias.asname`／`alias.name`
-    （import 系） ③ `arg.arg`（posonly/args/kwonly/vararg/kwarg・lambda 含む——
-    仮引数は arguments 配下の arg node に一元化されている） ④
-    `ExceptHandler.name` ⑤ `FunctionDef/AsyncFunctionDef/ClassDef.name` ⑥
-    match 系 capture（`MatchAs.name`／`MatchStar.name`／`MatchMapping.rest`）
-    ⑦ `Global/Nonlocal.names`（宣言=束縛スコープの変更）。
-    これら以外に識別子を導入する AST node は存在しない（ASDL の identifier
-    フィールドを持つ node の全数）。
-    """
+def _binding_violations_fix5(tree) -> list[str]:
+    """fix5 時点の束縛検証（**対照用の凍結コピー・変更しない**）。
+    star import・PEP 695 type parameter を束縛構文として扱わない版
+    （fix6 メタテストの基準）。"""
     violations = []
     canonical = 0
     for node in ast.walk(tree):
@@ -432,6 +417,82 @@ def _binding_violations(tree) -> list[str]:
                 and isinstance(node.ctx, (ast.Store, ast.Del)):
             violations.append("代入系 target への kintone 束縛")
     if canonical != 1:
+        violations.append("正規束縛がちょうど 1 回でない")
+    return violations
+
+
+def _readonly_violations_fix5(tree) -> list[str]:
+    """fix5 時点の現行検査（**対照用の凍結コピー**）= 束縛検証(fix5)＋fix4。
+    star import・type parameter 束縛を見逃す版（fix6 メタの基準）。"""
+    return _binding_violations_fix5(tree) + _readonly_violations_fix4(tree)
+
+
+def _binding_violations(tree) -> list[str]:
+    """fix5 H01→fix6 で star import 全面違反・PEP 695 type parameter を追加。
+
+    - 正規束縛=「module 直下の `from hub import kintone`（alias なし）・
+      ちょうど 1 回」のみ許可。
+    - "kintone" という識別子への**他の全束縛**を違反化。
+
+    列挙の完全性（根拠・fix6 で type parameter/star import を追加し最終確定）:
+    Python 3.12 の AST（ASDL）で新しい識別子を束縛できる構文要素は次の閉集合であり、
+    本関数はその全てを検査する——
+    ① `Name(ctx=Store|Del)`（代入 target 全形式・for/with as・comprehension
+    target・walrus はすべてこの形に脱糖される） ② `alias.asname`／`alias.name`
+    （import 系） ③ `arg.arg`（posonly/args/kwonly/vararg/kwarg・lambda 含む——
+    仮引数は arguments 配下の arg node に一元化されている） ④
+    `ExceptHandler.name` ⑤ `FunctionDef/AsyncFunctionDef/ClassDef.name` ⑥
+    match 系 capture（`MatchAs.name`／`MatchStar.name`／`MatchMapping.rest`）
+    ⑦ `Global/Nonlocal.names`（宣言=束縛スコープの変更）
+    ⑧ **PEP 695 type parameter**（`TypeVar`／`ParamSpec`／`TypeVarTuple` の name。
+    `def f[kintone]()`／`class C[kintone]`／`type X[kintone] = ...`）。
+    加えて ⑨ **star import**（`from <any> import *`）は束縛される名前が静的に
+    確定できず kintone を暗黙導入し得るため、module を問わず一律違反とする
+    （本 module に star import を使う正当理由はない）。
+    これら以外に識別子を導入する AST node は存在しない（ASDL の identifier
+    フィールドを持つ node の全数）。
+    """
+    violations = []
+    canonical = 0
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            for a in node.names:
+                if a.name == "*":            # ⑨ star import は一律違反（fix6 H01）
+                    violations.append(f"star import（from {node.module} import *）")
+                elif a.asname == "kintone":
+                    violations.append("import alias による kintone 束縛")
+                elif a.name == "kintone" and a.asname is None:
+                    if node.module == "hub" and node in tree.body:
+                        canonical += 1
+                    else:
+                        violations.append("正規以外の from-import kintone 束縛")
+        elif isinstance(node, ast.Import):
+            for a in node.names:
+                if a.asname == "kintone" or (a.asname is None
+                                             and a.name == "kintone"):
+                    violations.append("import による kintone 束縛")
+        elif isinstance(node, ast.arg) and node.arg == "kintone":
+            violations.append("仮引数 kintone（shadow 束縛）")
+        elif isinstance(node, ast.ExceptHandler) and node.name == "kintone":
+            violations.append("except as kintone（shadow 束縛）")
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
+                               ast.ClassDef)) and node.name == "kintone":
+            violations.append("def/class 名 kintone（shadow 束縛）")
+        elif isinstance(node, (ast.MatchAs, ast.MatchStar)) \
+                and getattr(node, "name", None) == "kintone":
+            violations.append("match capture kintone（shadow 束縛）")
+        elif isinstance(node, ast.MatchMapping) and node.rest == "kintone":
+            violations.append("match mapping rest kintone（shadow 束縛）")
+        elif isinstance(node, (ast.Global, ast.Nonlocal)) \
+                and "kintone" in node.names:
+            violations.append("global/nonlocal kintone 宣言")
+        elif isinstance(node, (ast.TypeVar, ast.ParamSpec, ast.TypeVarTuple)) \
+                and node.name == "kintone":     # ⑧ PEP 695 type parameter
+            violations.append("type parameter kintone（shadow 束縛）")
+        elif isinstance(node, ast.Name) and node.id == "kintone" \
+                and isinstance(node.ctx, (ast.Store, ast.Del)):
+            violations.append("代入系 target への kintone 束縛")
+    if canonical != 1:
         violations.append(
             f"正規束縛（module 直下 from hub import kintone）が {canonical} 回"
             "（ちょうど 1 回であること）")
@@ -439,13 +500,16 @@ def _binding_violations(tree) -> list[str]:
 
 
 def _readonly_violations(tree) -> list[str]:
-    """fix5 H01 の現行検査 = 許可文脈の閉集合＋**束縛元の検証**（正規束縛
-    ちょうど1回・他の全束縛構文を違反化）＋歴代検査（防御の重畳）。
+    """fix6 H01/M01 の現行検査 = 許可文脈の閉集合＋**束縛元の検証**（正規束縛
+    ちょうど1回・全束縛構文〔7分類＋type parameter 3種〕を違反化・star import
+    一律違反）＋歴代検査（防御の重畳）。
 
-    残余の限界（fix5 で再訂正）: 束縛検証の追加により同名 shadow 束縛も閉じた。
-    **本当に残るのは実行時文字列からの名前解決（globals()/vars() の辞書アクセス
-    等・文字列 "kintone" は Name/identifier node でない）と C 拡張内部の呼出し
-    のみ**。この残余は sink AST policy・関所テスト・レビューで重畳防御する。
+    残余の限界（fix6 で最終確定）: 束縛検証（7分類＋PEP 695 type parameter＋
+    star import 禁止）と許可文脈閉集合により、静的に kintone を導入・別名化・
+    持ち出しする経路は網羅的に閉じた。**本当に残るのは実行時文字列からの
+    名前解決（globals()/vars() の辞書アクセス等・文字列 "kintone" は
+    Name/identifier node でない）と C 拡張内部の呼出しのみ**。この残余は
+    sink AST policy・関所テスト・レビューで重畳防御する。
     """
     return _binding_violations(tree) + _readonly_violations_fix4(tree)
 
@@ -598,6 +662,49 @@ class TestReadOnlyMachineCheck(unittest.TestCase):
         # fix5 H01-1: 本体 module の正規束縛がちょうど 1 回・shadow 束縛ゼロ
         src = Path(cv.__file__).read_text(encoding="utf-8")
         self.assertEqual(_binding_violations(ast.parse(src)), [])
+
+    def test_meta_fix6_star_import_both_orders(self):
+        """fix6 H01: star import が module を問わず「fix5 検査 PASS・新検査 FAIL」。
+        正規 import との前後両順序で対照。"""
+        fixtures = {
+            "canonical_then_star": (
+                "from hub import kintone\n"
+                "from evil import *\n"
+                "kintone.get_record(1, '2')\n"),
+            "star_then_canonical": (
+                "from evil import *\n"
+                "from hub import kintone\n"
+                "kintone.get_record(1, '2')\n"),
+        }
+        for label, src in fixtures.items():
+            with self.subTest(fixture=label):
+                tree = ast.parse(src)
+                self.assertEqual(_readonly_violations_fix5(tree), [],
+                                 "fix5 検査は素通り（star を束縛構文と見ない）")
+                self.assertNotEqual(_readonly_violations(tree), [],
+                                    "新検査は star import を検出すること")
+
+    def test_meta_fix6_type_parameter_shadow(self):
+        """fix6 M01: PEP 695 type parameter による kintone 束縛（def f[kintone]/
+        class C[kintone]/type X[kintone]）が「fix5 PASS・新検査 FAIL」。"""
+        fixtures = {
+            "def_type_param": (
+                "from hub import kintone\n"
+                "def f[kintone](): pass\n"),
+            "class_type_param": (
+                "from hub import kintone\n"
+                "class C[kintone]: pass\n"),
+            "type_alias_param": (
+                "from hub import kintone\n"
+                "type X[kintone] = list\n"),
+        }
+        for label, src in fixtures.items():
+            with self.subTest(fixture=label):
+                tree = ast.parse(src)
+                self.assertEqual(_readonly_violations_fix5(tree), [],
+                                 "fix5 検査は素通り（type parameter を見ない）")
+                self.assertNotEqual(_readonly_violations(tree), [],
+                                    "新検査は type parameter 束縛を検出すること")
 
     def test_no_direct_http_or_process_launch_imports(self):
         imported = set()
