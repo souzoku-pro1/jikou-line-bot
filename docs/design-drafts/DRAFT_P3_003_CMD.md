@@ -1,8 +1,9 @@
-# DRAFT: P3-003-CMD 導出コマンド経路 — 設計（実装禁止・凍結先行・fix3）
+# DRAFT: P3-003-CMD 導出コマンド経路 — 設計（実装禁止・凍結先行・fix4）
 
 - TASK_ID: P3-003-CMD 設計票（設計のみ・コード/テスト実装禁止）／記録日 2026-07-27
-  （fix1: D1 反映／fix2: D2 反映＋[人]再裁定反映／fix3: R-P3-003-CMD-D3 反映）
-- 調査 BASE: origin/main（p3-003a 着地済み）。**R-P3-003-CMD-D4 で凍結再判定**。
+  （fix1: D1 反映／fix2: D2 反映＋[人]再裁定反映／fix3: D3 反映／
+  fix4: R-P3-003-CMD-D4 反映・記録日 2026-07-28）
+- 調査 BASE: origin/main（p3-003a 着地済み）。**R-P3-003-CMD-D5 で凍結再判定**。
 - 正本参照（矛盾を作らない・編集しない）: DRAFT_P3_003_ENVELOPE_FLOW **§6 統一契約が正**
   （search 失敗=write 0／policy 失敗=I/O 0／create 通信失敗=結果不明・再実行時に
   完全一致検索で reconcile）・**§2.2 の TOCTOU 受容**・DRAFT_APP36 §2/§3.7・
@@ -94,12 +95,12 @@ canonical 層では行わない**——それは persons_from_records（変換�
 |---|---|---|---|---|
 | record_id | str | 不可 | `^[0-9]+$` 必須（canonical 層で検査） | 存在検証=App34 読取（§1 手順3） |
 | name | str | 可（"" 保持） | なし | なし（原文のまま・エンジンも解釈しない） |
-| alive | str | 不可 | なし | **値域（生存/死亡/不明）=エンジン**。canonical=型のみ |
-| death_date | str | 可 | なし | **YYYY-MM-DD 形式・実在性=変換層/エンジン**。canonical=型のみ |
+| alive | str | 不可 | なし | **どの層も値域（生存/死亡/不明）を機械強制しない（現状の正確な記録・fix4 M01）**——エンジンは文字列比較で参照するのみで値域外は事実上「生存扱い等の既定分岐」に落ちる。canonical=型のみ |
+| death_date | str | 可 | なし | **どの層も形式（YYYY-MM-DD）・実在性を完全保証しない（fix4 M01）**——変換層は kintone DATE field の値をそのまま写すだけ（kintone 側の field 型が事実上の保証源）。canonical=型のみ |
 | death_wareki | str | 可 | なし | なし（参考原文） |
 | is_decedent / born_before_parents_adoption | bool のみ（type is bool） | — | — | canonical=型のみ（真偽の妥当性=エンジン） |
 | father_id / mother_id / adoptive_father_id / adoptive_mother_id | str | 可（親不明=""） | **非空なら** `^[0-9]+$`（canonical 層で検査） | 参照整合=エンジン |
-| events[].kind | str | 不可 | なし | **種別語彙=エンジン**（参考提示用）。canonical=型のみ |
+| events[].kind | str | 不可 | なし | **どの層も種別語彙を機械強制しない（fix4 M01）**——参考提示用の原文であり、エンジンは前後提示にのみ使う。canonical=型のみ |
 | events[].date / events[].partner | str | 可 | なし | なし（和暦原文・氏名原文のまま） |
 | revision | str | 不可 | `^[0-9]+$` 必須 | なし（kintone が正） |
 | declarations の人物 ID（renounced/disqualified/adoption_kinds の key） | str | 不可 | `^[0-9]+$` 必須 | 参照整合=エンジン |
@@ -108,6 +109,12 @@ canonical 層では行わない**——それは persons_from_records（変換�
 
 - 表の違反（型不正・grammar 不正・C0/C1・必須空）は**canonical 化中止**
   （policy error・§5A の payload_policy 枠・値は非反射で位置情報のみ）。
+- **実装済みの保証と将来保証の分離（fix4 M01・[人]裁定済み）**: 上表の
+  「担当層」列は**現に実装されている保証だけ**を記録する（「エンジンが検証する
+  はず」という期待を保証として書かない）。alive 値域・death_date 形式/実在性・
+  events[].kind 語彙は**現状どの層も完全保証しない**——hash 再現性の観点では
+  canonical の型固定＋文字面検査で足りており、意味検証を将来追加する場合は
+  **本設計の改定ではなく別票**（エンジンまたは変換層の改定として起票）とする。
 - **field 集合の機械検査（fix3 M02）**: `dataclasses.fields(HeirPerson)`／
   `fields(LifeEvent)` の名前集合と canonical schema の field 集合の**完全一致**を
   実装票テストで assert する（§7-20。エンジンに field が追加されたのに canonical
@@ -170,19 +177,33 @@ canonical 層では行わない**——それは persons_from_records（変換�
     結果不明）
   §6 統一契約の意味論（I/O 0／write 0／結果不明）は不変＝**例外の型と stage で
   どの段の失敗かを機械判定可能にする**改定。
-- **vendor 例外非保持の具体契約（fix3 M01）**:
+- **vendor 例外非保持の具体契約（fix3 M01→fix4 H02・[人]裁定済み）**:
   - wrapper 例外の `args` は**固定値のみ**（分類名・stage。vendor 例外の
     message/str を含めない）。
   - vendor 例外を**属性へ保存しない**（`self.original = e` 型の保持を禁止）。
-  - 変換は **`raise ... from None` で例外 chain を遮断**——`__cause__`／
-    `__context__` 経由で traceback に vendor 本文（URL・レコード値等）が残存する
-    経路を防ぐ。
+  - **ラップ構造の指定（fix4 H02）**: vendor 例外を捕捉した `except` ブロックでは
+    **分類（stage）だけを変数へ記録して例外を抜け、固定 wrapper は except ブロックの
+    **外**で raise する**——
+    ```python
+    stage_failed = None
+    try:
+        ...  # vendor I/O
+    except RequestException:
+        stage_failed = "search"
+    if stage_failed is not None:
+        raise EnvelopeSearchError(stage_failed)   # except の外 → __context__ is None
+    ```
+    これにより **`__context__ is None`・`__cause__ is None` が実際に成立**する。
+    （`raise ... from None` は `__suppress_context__` で表示を抑制するだけで
+    `__context__` に vendor 例外オブジェクトが残るため、「連鎖全段に sentinel
+    非残存」の検査と両立しない——fix3 の from None 指定は本構造へ置換・改定。）
 - **実装票への要求事項**: 本改定は P3-003a の契約変更のため、実装票で
   **契約 pin テスト（TestFailureBehaviorContract）の同時更新**を必須とする——
   search 失敗=EnvelopeSearchError・create 失敗=EnvelopeCreateUnknownError・
   ACK 喪失回収テストの例外型 assert に加え、**sentinel 入り vendor 例外を発生させ、
-  wrapper の `str()`／`repr()`／`__cause__`／`__context__`（連鎖の全段）に sentinel が
-  残存しないことの検査**（§7-18）と **stage 値域 {"policy","search","create"} の
+  wrapper の `str()`／`repr()`／`args` に sentinel 非残存・
+  `__context__ is None`・`__cause__ is None` の検査**（§7-18・fix4 H02 で
+  実装可能な形に同期）と **stage 値域 {"policy","search","create"} の
   閉集合 pin** を必須とする。
 
 ## 4. 冪等・二重起動（同一案件への連続コマンド）
@@ -249,7 +270,8 @@ canonical 層では行わない**——それは persons_from_records（変換�
 | **EnvelopeCreateUnknownError**（stage="create"・§3B） | 捕捉→ack_unknown 応答 | run=created|no_change ／ **envelope=ack_unknown** | 「run #N は保存済み・封筒は結果不明。再指示で回収」 |
 | KintoneError（App34 読取） | 捕捉→固定応答 | run=failed:kintone_read ／ envelope=skipped | 「読取に失敗。再指示で再試行」 |
 | ImmutableRecordError | 捕捉→固定応答＋業務警報（到達＝バグ） | run=failed:immutable ／ envelope=skipped | 「内部整合性エラー」 |
-| 想定外の Exception | **伝播**（握り潰し禁止・dispatch_bot 上位の既存エラー処理へ。finally でログ emit＋pending invalidate 後に再送出） | run=failed:unexpected ／ envelope=skipped | 上位既定 |
+| 想定外の Exception（**run 保存前**・fix4 H01） | **伝播**（握り潰し禁止・dispatch_bot 上位の既存エラー処理へ。finally でログ emit＋pending invalidate 後に再送出） | run=failed:unexpected ／ envelope=skipped | 上位既定 |
+| 想定外の Exception（**run 保存後**＝封筒呼出し中・応答/ログ生成中・fix4 H01） | 同上（伝播。run は保存済みのまま残る＝再指示で封筒 reconcile 可能） | run=created|no_change ／ **envelope=failed:unexpected** | 上位既定 |
 
 - **run_result の failed:<分類> 閉集合（fix2 M04→fix3 H01 で整理）**:
   **{chain_integrity, payload_policy, kintone_read, immutable, unexpected}**——
@@ -277,26 +299,34 @@ canonical 層では行わない**——それは persons_from_records（変換�
   | not_saved_error | derive error＝非保存（§8 裁定6改定） |
   | run_conflict | 保存の並行競合 |
   | failed:<分類> | その他 run 段失敗（§5A の run 段閉集合5種のみ） |
-- **envelope_result enum（閉集合・fix3 H01 で失敗値を完全化）**:
+- **envelope_result enum（閉集合・fix3 H01 で失敗値を完全化→fix4 H01 で
+  unexpected を段階分離）**:
   | enum | 意味 |
   |---|---|
   | filed | 新規封筒起票 |
   | already_filed | 既存封筒回収（reconcile 計数） |
   | **failed:policy** | EnvelopePolicyError（stage="policy"・I/O 0 で中止） |
   | **failed:search** | EnvelopeSearchError（stage="search"・write 0 で失敗） |
+  | **failed:unexpected** | run 保存後（封筒呼出し中・応答/ログ生成中）の想定外例外（fix4 H01・run は保存済みのまま＝再指示で reconcile） |
   | ack_unknown | EnvelopeCreateUnknownError（**「結果不明」として failed とは別扱い**——失敗確定ではなく reconcile 対象） |
   | disabled | flag OFF（実行途中 OFF の境界含む・§2） |
   | skipped | run 側が created/no_change 以外＝封筒段に未到達 |
-- **合法な (run_result, envelope_result) の対応表（fix3 H01・これが閉集合の正）**:
+- **合法な (run_result, envelope_result) の対応表（fix3 H01→fix4 H01 完全化・
+  これが閉集合の正。§5A の全例外行がこの表のいずれかに写像される＝「全例外に
+  合法組合せが存在する」）**:
   | run_result | 許容される envelope_result |
   |---|---|
   | created ／ no_change | filed ／ already_filed ／ disabled |
-  | created ／ no_change | failed:policy ／ failed:search ／ ack_unknown |
-  | not_saved_error ／ run_conflict ／ failed:<run 段分類5種> | **skipped のみ** |
+  | created ／ no_change | failed:policy ／ failed:search ／ **failed:unexpected** ／ ack_unknown |
+  | not_saved_error ／ run_conflict ／ failed:<run 段分類5種（unexpected は**run 保存前**のみ）> | **skipped のみ** |
   - **ログ生成関数は定義外の組合せを拒否する**（emit 前に対応表と照合し、表外は
     ValueError＝バグの即時顕在化。「封筒段に未到達なのに filed」等の矛盾ログを
     構造的に排除する契約）。§5A の各例外→2軸値の写像はこの表の部分集合であることを
     実装票の table test（§7-17）で機械検査。
+  - **unexpected の段階分離（fix4 H01）**: 発生段階で表現を分ける——run 保存前の
+    想定外=(failed:unexpected, skipped)／run 保存後の想定外=(created|no_change,
+    failed:unexpected)。「run=failed:unexpected かつ envelope=failed:*」の組合せは
+    定義外（run 段で死んだなら封筒段には到達していない）。
 - 値は case/run/record ID と件数のみ。[人]の確認手段は fix1 と同じ（指示Bot 応答・
   App30 封筒・Railway ログ検索）。daily_healthcheck 追加は初版なし。
 
@@ -333,19 +363,26 @@ canonical 層では行わない**——それは persons_from_records（変換�
     null と空文字の区別。
 16. **flag 境界（fix2 M03）**: task 直接呼出しでも OFF=I/O ゼロ／実行途中 OFF
     （run 保存後）→ envelope disabled 応答・再指示で回収。
-17. **2軸 enum の table test（fix3 M03-i）**: §6 の合法組合せ表を定数としてテストに
-    収載し、実装のログ生成関数と**全対一致**を検査（分岐網羅ではなく「表との一致」
-    ——表にある組合せは全て受理・表にない組合せは全て拒否、の両方向）。§5A の
-    各例外→2軸値の写像が表の部分集合であることも同時に assert。
-18. **安全な例外ラップ（fix3 M03-ii・§3B）**: sentinel 入り vendor 例外を各段
-    （policy／search／create）で発生させ、wrapper 例外の `str()`／`repr()`／`args`／
-    `__cause__`／`__context__`（連鎖全段）に sentinel 非残存・stage 値域
-    {"policy","search","create"} の閉集合 pin・`from None` による chain 遮断
-    （`__suppress_context__` の確認）。
-19. **canonical bytes の非残存（fix3 M03-iii）**: 氏名 sentinel 入りの canonical
-    材料で実行し、DB 全行・ログ出力・全例外の str/repr・mock（kintone/エンジン）の
-    **呼出し引数記録**のいずれにも canonical bytes（sentinel）が現れないこと
-    （保持は hash 値のみ＝§1.1 PII 統制の機械 pin）。
+17. **2軸 enum の table test（fix3 M03-i→fix4 H01 同期）**: §6 の合法組合せ表を
+    定数としてテストに収載し、実装のログ生成関数と**全対一致**を検査（分岐網羅では
+    なく「表との一致」——表にある組合せは全て受理・表にない組合せは全て拒否、の
+    両方向）。§5A の各例外→2軸値の写像が表の部分集合であること＝**§5A の全例外行に
+    合法組合せが存在する**ことも同時に assert（unexpected の run 保存前/後の
+    段階分離を含む・(failed:unexpected, failed:*) が拒否されることの負系込み）。
+18. **安全な例外ラップ（fix3 M03-ii→fix4 H02 で実装可能な形に同期・§3B）**:
+    sentinel 入り vendor 例外を各段（policy／search／create）で発生させ、
+    wrapper 例外の `str()`／`repr()`／`args` に sentinel 非残存・
+    **`__context__ is None`・`__cause__ is None`**（§3B のラップ構造＝except
+    ブロック外 raise が成立している証明）・stage 値域
+    {"policy","search","create"} の閉集合 pin。
+19. **canonical blob の非残存（fix3 M03-iii→fix4 M02 で対象を正確化）**:
+    非残存の対象は**直列化済み canonical blob**（§1.1 の json.dumps 出力文字列/
+    bytes）とし、検査範囲は**永続化（DB 全行）・ログ出力・応答文・全例外の
+    str/repr**。**エンジン入力 mock の呼出し引数に氏名等が正規入力として現れる
+    ことは許容**（それはエンジンの正当な入力であり漏れではない）。これと分離して、
+    **呼出し終了後に canonical blob の永続的コピーが残らないこと**（compute_input_hash
+    が blob を module 変数・キャッシュ・戻り値に保持せず hash 値のみ返すこと）を
+    別の検査として実施。
 20. **field 集合の構造試験（fix3 M03-iv・§1.1a）**: `dataclasses.fields(HeirPerson)`
     ／`fields(LifeEvent)` の名前集合と canonical schema の field 集合の完全一致を
     assert——エンジンへ field を追加すると、canonical 仕様（schema 版数 v）を
@@ -376,6 +413,15 @@ canonical 層では行わない**——それは persons_from_records（変換�
 8. **pending invalidate の実装位置**（2026-07-27・[人]裁定済み・fix2 H04）:
    CMD の execute_fn 内 finally（task 固有）。dispatch_bot handler 本体は無改変・
    既存タスクの二重 OK 動作不変（§5A）。
+9. **例外ラップの構造**（2026-07-28・[人]裁定済み・fix4 H02）: vendor 例外を
+   捕捉した except ブロックの**外**で固定 wrapper を raise する構造を指定
+   （`__context__ is None` を実際に満たす。fix3 の `from None` 指定は
+   `__suppress_context__` による表示抑制に留まり「連鎖全段に sentinel 非残存」と
+   両立しないため置換・改定＝§3B）。
+10. **§1.1a 責務分離表の正確化**（2026-07-28・[人]裁定済み・fix4 M01）:
+    alive 値域・death_date 形式/実在性・events[].kind 語彙は「canonical では
+    意味検証しない・既存層も完全保証しない」と現状を正確に記録。実装済み保証と
+    将来保証を分離し、意味検証の将来追加は本設計の改定ではなく別票とする。
 
 ## 9. 実機確認事項（[人]・凍結後も実装前に要確定）
 
