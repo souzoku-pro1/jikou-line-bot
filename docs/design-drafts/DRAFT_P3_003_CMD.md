@@ -86,21 +86,22 @@ dispatch_bot/heir_derive_task.py（新規・隔離 module＝person_merge_task �
 
 #### 1.1a canonical 層の責務分離（fix3 M02・field 別の固定表）
 
-**原則**: canonical 層の責務は「**型固定＋文字面の健全性**（型検査・数字列 grammar・
-NFC・C0/C1 拒否）」のみ。**意味検証（enum の値域・日付の実在性・人物の存在）は
-canonical 層では行わない**——それは persons_from_records（変換層）と凍結エンジンの
-既存責務であり、canonical 層に複製すると二重の正を作るため。
+**原則**（fix5 M01 で一意化）: canonical 層の責務は「**型固定＋文字面の健全性**
+（型検査・数字列 grammar・NFC・C0/C1 拒否）」のみ。**意味検証は canonical 層の
+責務外**——現状、変換層（persons_from_records）と凍結エンジンが値を**利用**するが、
+**完全な値域検証はどの層も行わない**（canonical 層に意味検証を複製して二重の正を
+作らない、という方針は不変）。
 
 | field | 許容型 | 空文字 | 数字列 grammar | enum/date 等の意味検証の担当層 |
 |---|---|---|---|---|
 | record_id | str | 不可 | `^[0-9]+$` 必須（canonical 層で検査） | 存在検証=App34 読取（§1 手順3） |
 | name | str | 可（"" 保持） | なし | なし（原文のまま・エンジンも解釈しない） |
-| alive | str | 不可 | なし | **どの層も値域（生存/死亡/不明）を機械強制しない（現状の正確な記録・fix4 M01）**——エンジンは文字列比較で参照するのみで値域外は事実上「生存扱い等の既定分岐」に落ちる。canonical=型のみ |
+| alive | str | 不可 | なし | **どの層も値域（生存/死亡/不明）を機械強制しない（fix4 M01→fix5 逐語訂正）**——エンジンの `_classify_death()` は「生存」→alive・「不明」→unknown、**それ以外の値（値域外を含む）**は死亡日なし=undated／死亡日あり=文字列比較で pre/post/same へ進む。canonical=型のみ |
 | death_date | str | 可 | なし | **どの層も形式（YYYY-MM-DD）・実在性を完全保証しない（fix4 M01）**——変換層は kintone DATE field の値をそのまま写すだけ（kintone 側の field 型が事実上の保証源）。canonical=型のみ |
 | death_wareki | str | 可 | なし | なし（参考原文） |
 | is_decedent / born_before_parents_adoption | bool のみ（type is bool） | — | — | canonical=型のみ（真偽の妥当性=エンジン） |
 | father_id / mother_id / adoptive_father_id / adoptive_mother_id | str | 可（親不明=""） | **非空なら** `^[0-9]+$`（canonical 層で検査） | 参照整合=エンジン |
-| events[].kind | str | 不可 | なし | **どの層も種別語彙を機械強制しない（fix4 M01）**——参考提示用の原文であり、エンジンは前後提示にのみ使う。canonical=型のみ |
+| events[].kind | str | 不可 | なし | **語彙の閉集合検証はどの層にもない（fix5 訂正・「参考提示用」は撤回）**——`kind=="婚姻"/"離婚"` は配偶者関係の成立・解消判定に使われ**導出結果へ直接影響**し、変換層は `kind=="死亡"` を death_wareki 抽出に使用する。canonical=型のみ |
 | events[].date / events[].partner | str | 可 | なし | なし（和暦原文・氏名原文のまま） |
 | revision | str | 不可 | `^[0-9]+$` 必須 | なし（kintone が正） |
 | declarations の人物 ID（renounced/disqualified/adoption_kinds の key） | str | 不可 | `^[0-9]+$` 必須 | 参照整合=エンジン |
