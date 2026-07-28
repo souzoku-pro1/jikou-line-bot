@@ -1,7 +1,8 @@
-# DRAFT: P3-003b 関所 side の前提設計（App36 projection・設計のみ・実装禁止・fix2）
+# DRAFT: P3-003b 関所 side の前提設計（App36 projection・設計のみ・実装禁止・fix3）
 
 - TASK_ID: P3-003B-D 設計票（設計のみ・コード/テスト実装禁止）／記録日 2026-07-28
-  （fix1: D1 反映＋[人]裁定4件確定／fix2: R-P3-003B-D2 反映・記録日 2026-07-29）
+  （fix1: D1 反映＋[人]裁定4件確定／fix2: D2 反映／fix3: R-P3-003B-D3 反映・
+  記録日 2026-07-29。fix3 で機械再導出＝App36 write 0 の一本経路へ確定）
 - 目的: 凍結 `DRAFT_P3_003_ENVELOPE_FLOW.md`（以下「正本」）§3.2/§3.3 の App36
   projection を**実装可能にするための前提**を固定する——(1) App36 追加 field
   仕様 (2) 冪等キーの App36 上の実現方式と検索規則 (3) derive_heirs 出力→App36
@@ -174,24 +175,31 @@ projection）。
 - `yes→no`（逆遷移）は confirmed handler も**起こさない**（§3.4 逆遷移禁止。
   confirmed は yes へ上げる方向のみ）。
 
-### 4B. 主体(B) = 機械再導出（confirm を伴わない projection）
+### 4B. 主体(B) = 機械再導出（confirm を伴わない projection）＝**App36 write 0**（fix3 H01・[人]裁定）
 
-| App36 列 | insert（0件一致） | update（H10 祖先一致） | 根拠（正本） |
+**確定（fix3 H01・[人]裁定）**: confirm を伴わない機械再導出は **App36 へ一切書かない**。
+
+| App36 列 | insert（0件一致） | update（既存行あり） | 根拠 |
 |---|---|---|---|
-| 続柄／法定相続分／データ源 | 書く | 差分更新 | §3.3 機械由来 |
-| current_derivation_run_id／導出元人物ID | 書く | current を新 run へ進める | §3.3 H10 |
-| **戸籍確認済** | 触れない（初期値のまま＝no） | **読み書き対象に含めない**——既存 `yes` を絶対に下げない | §3.4 逆遷移禁止・§3.3 保護 |
-| 状態 | 初期値のまま | 手修正を上書きしない | §3.3 保護 |
-| 氏名等 | 機械は書かない | 同左 | 正本 §4 PII |
+| 全列（続柄／法定相続分／データ源／current_derivation_run_id／導出元人物ID／戸籍確認済／状態／氏名等） | **書かない** | **書かない** | 下記 fix3 H01 |
 
-- **主体(B) の核心（fix2 H01・機械側に限定した制約）**: 機械再導出は戸籍確認済 列を
-  **読み書き対象に含めない**（H10 差分更新の対象列から除外）。したがって機械再導出が
-  `yes→no` を起こす経路が**構造的に存在しない**。この「読み書き対象に含めない」は
-  **主体(B) の記述であり、主体(A) の confirmed handler には掛からない**（(A) は
-  §4A のとおり yes を書く）。
-
-- **stale ガード（正本 §3.3・両主体共通）**: 確定/再導出時に対象 run が supersedes
-  連鎖の head でなければ projection せず aborted（両表の update 自体に到達しない）。
+- **一本経路への統一（fix3 H01）**: 従来 §4B が持っていた「insert・機械由来列の
+  update・current 前進」は**すべて廃止**する。機械再導出は App36 に対して
+  **insert しない・update しない・current を前進させない＝write 0**。
+  **App36 への反映は、新 run に対する confirmed decision の後に §4A（confirmed
+  handler）だけが行う**——これで正本 §3.2「App36 upsert は decision=confirmed の
+  ときのみ」と**逐語整合**する（機械が先行して App36 を触る経路が消える）。
+- **機械再導出の役割の明記（fix3 H01-iii）**: 機械再導出（confirm なし）の責務は
+  **run/HCD 側の生成まで**（DerivationRun の保存・supersedes 連鎖の前進・
+  HeirConfirmationDecision の追記経路の提供）。**App36 projection は含まない**。
+  App36 は「confirmed handler が新 run の confirmed 後に upsert する」side だけが
+  更新する。
+- **current_derivation_run_id の前進も §4A に一元化（fix3 H01-ii）**: current の
+  前進は confirmed handler の書込み（§4A の update 行）でのみ起きる。機械再導出は
+  current を触らない。
+- **stale ガード（正本 §3.3）**: confirmed handler の projection 時に対象 run が
+  supersedes 連鎖の head でなければ projection せず aborted（§4A の update に到達
+  しない）。機械再導出は元より App36 を触らないため stale 判定の対象外。
 
 ## 5. 冪等キーの App36 上の実現方式と検索規則（＋TOCTOU 正確化）
 
@@ -203,38 +211,43 @@ projection）。
   order by $id asc limit 2
   ```
   値は kintone query へ埋める前に grammar（§2）で検証（数字列のみ・注入遮断）。
-- **1件一致時の状態閉集合（H02-iii・実装票で網羅すること）**:
+- **主体は confirmed handler のみ（fix3 H01 連動）**: §4B の改定により、以下の
+  upsert 検索・1件一致処理を実行する主体は **confirmed handler（§4A）だけ**である
+  （機械再導出は App36 を触らない＝write 0）。したがって「機械が先に insert して
+  おき、後から confirmed handler が書く」という**先行 write 起因の衝突は発生しない**。
+- **1件一致時の状態閉集合（confirmed handler の処理・実装票で網羅すること）**:
 
-  | 状態 | 判定 | アクション |
+  | 状態 | 判定 | アクション（confirmed handler） |
   |---|---|---|
-  | same run 再実行（current_derivation_run_id == 新 run.id） | 冪等ヒット | **no-op**（既に当該 run で projection 済み。二重書込みしない） |
-  | 祖先 run（current が新 run の supersedes 連鎖の祖先） | H10 更新可 | 機械由来列を差分**更新**＋current を新 run へ進める（§4 表） |
-  | current_derivation_run_id が空・不正（grammar 外） | 移行前/破損 | **要確認**（write 0・§H02 の backfill 前提と接続・警報） |
+  | same run（current_derivation_run_id == 新 run.id） | 冪等ヒット | **§4A の update を適用**（戸籍確認済 no→yes 等）。機械が先行 write しないため「既に機械が書いた行への no-op」ではなく、**confirmed handler が初めて当該 run の内容を書く／再確定する**（fix3 連動）。二重書込みはしない |
+  | 祖先 run（current が新 run の supersedes 連鎖の祖先） | H10 更新可 | 機械由来列を差分**更新**＋**current を新 run へ進める（§4A に一元化・fix3 H01-ii）** |
+  | current_derivation_run_id が空・不正（grammar 外） | 移行前/破損 | **要確認**（write 0・§6 の backfill 前提と接続・警報） |
   | 無関係 run（祖先でも子孫でもない・別系列） | 競合 | projection **せず要確認**（write 0・「別系列の run が既存」警報） |
   | 祖先確認中に DB 不達（run 系列照会が失敗） | 判定不能 | **write 0・要確認**（結果不明を確定扱いにしない） |
   | 子孫 run（current の方が新しい） | stale | §3.3 stale ガードで aborted（本表前に弾かれる） |
 
 - **2件以上一致** → 冪等キー重複＝異常。**書かず要確認**（件数と record_id のみ・
   氏名非出力）。
-- **TOCTOU の残存リスク（M01・正確化）**: **同一 head run に対する並行 projection**で、
-  両者が「0件」を検索してから双方 insert すると **二重 insert が起こり得る**。
-  これは **stale ガードの対象外**（stale ガードは「より新しい run の存在」を見るもので、
-  同一 run の並行初回書込みは検知しない）。正本 §2.2 の best-effort 受容の範囲だが、
-  **実害の収束は重複検知＋人手**に委ねる:
+- **TOCTOU の残存リスク（M01・fix3 で経路縮小）**: 書込み主体が confirmed handler の
+  1本に統一された（機械再導出は write 0）ため、**重複が生じ得るのは同一 head run に
+  対する confirmed handler の並行実行**に限られる（両者が「0件」を検索してから双方
+  insert）。これは **stale ガードの対象外**（同一 run の並行初回書込みは検知しない）。
+  正本 §2.2 の best-effort 受容の範囲だが、**実害の収束は重複検知＋人手**に委ねる:
   - **重複検知（実装票の必須要件）**: projection 後（または daily 監査で）
     `案件レコードID＋導出元人物ID` が2件以上ある App36 行を検出→**業務チャネル警報**
     （件数・record_id のみ）。
-  - **人手収束手順（実装票の必須要件・手順書化・fix2 M01 の決定規則）**: 警報を
-    受けた [人] が重複行を次の一意規則で収束させる:
-    1. **残す1行の決定規則**: (i) `current_derivation_run_id` が最も新しい
-       （head に近い）行を残す。 (ii) **同一 head 並行重複では current が同値になる**
-       ため決定不能——その場合は **`$id`（App36 record ID）が最小の1行を残す**
-       （一意な tiebreak・どの環境でも同じ行が残る決定的規則）。
-    2. **削除前の保全確認**: 削除する行に **human_state（戸籍確認済=yes・状態の
-       手修正）や 氏名/住所/連絡先 等の手入力情報が「残す行には無く削除行だけに
-       ある」場合は削除しない**——先に残す行へ手で集約してから削除する（機械由来列
-       以外の情報を消さない）。
-    3. 機械は自動削除しない（immutable 台帳の削除操作を機械に持たせない規律）。
+  - **人手収束手順（実装票の必須要件・手順書化・fix2 M01→fix3 M01 で適用範囲を限定）**:
+    警報を受けた [人] が重複行を次で収束させる:
+    1. **削除を伴う収束は「同一 head と確認できた重複」に限る（fix3 M01）**——両行の
+       `current_derivation_run_id` が同値で、かつ同一 head run を指すと確認できた場合
+       のみ、**`$id`（App36 record ID）が最小の1行を残す**一意 tiebreak を適用する。
+    2. **削除・無効化ゼロで要確認（fix3 M01）**: current が**不正・空・別系列・
+       比較不能**（同一 head と確認できない）重複は、**機械も人手手順も一切削除・
+       無効化しない**——原因究明のため要確認のまま保持する（誤って正しい行を消さない）。
+    3. **削除前の保全確認（tiebreak 適用時のみ）**: 削除する行に human_state
+       （戸籍確認済=yes・状態の手修正）や 氏名/住所/連絡先 等の手入力情報が「残す行に
+       無く削除行だけにある」場合は削除しない——先に残す行へ手で集約してから削除。
+    4. 機械は自動削除しない（immutable 台帳の削除操作を機械に持たせない規律）。
        kintone 上の削除/無効化は [人] が実施。
   - 新規の原子性機構は作らない（正本と整合）。
 
@@ -259,9 +272,10 @@ current_derivation_run_id に依存するため、移行を点火ゲートとし
      → (ii) **[人] が既存行と導出 person の対応を確認し、新設2 field
      （`導出元人物ID`・`current_derivation_run_id`）を手で backfill** → (iii)
      backfill 完了後にのみ通常 update 経路（§5 の1件一致＝祖先判定）へ入れる。
-   - **この方式が保全を構造的に満たす理由**: 既存行を消さず・複製せず、機械は
-     backfill 済み行に対してのみ機械由来列を差分更新する（§4B）。human_state と
-     手入力列は §4 の書込み表で保護対象のまま＝**移行によって手入力情報が失われる
+   - **この方式が保全を構造的に満たす理由**: 既存行を消さず・複製せず、backfill 済み
+     行に対しては **confirmed handler（§4A）が新 run の confirmed 後にのみ**機械由来列を
+     差分更新する（機械再導出は App36 を触らない＝§4B write 0）。human_state と
+     手入力列は §4A の書込み表で保護対象のまま＝**移行によって手入力情報が失われる
      経路が存在しない**。
 3. **移行中の 1件一致（current 空）の扱い**: §5 の状態表のとおり **write 0・要確認**
    （空の current は H10 の祖先判定ができない＝安全側）。backfill 完了案件のみ通常
@@ -270,9 +284,10 @@ current_derivation_run_id に依存するため、移行を点火ゲートとし
 ## 7. 実装票への申し送り（本票が確定した前提）
 
 - **確定（実装票がこの仕様で書ける）**: App36 追加 field（§2・grammar M02）／
-  冪等キー検索規則・1件一致状態表（§5）／phase 3 書込み規則（§4）／法定相続分表記
-  （§3.3・裁定4）／胎児案件停止（§2A・裁定3）／既存行移行（§6）／重複検知＋人手収束
-  （§5・実装票の必須要件）。
+  冪等キー検索規則・1件一致状態表（§5）／**phase 3 書込み規則（§4・fix3: 機械再導出は
+  App36 write 0＝confirmed handler の一本経路）**／法定相続分表記（§3.3・裁定4）／
+  胎児案件停止（§2A・裁定3）／既存行移行（§6）／重複検知＋人手収束（§5・削除は
+  同一 head 確認済みに限定・fix3 M01）。
 - **[人]ゲート（実装の前提・解けるまで BLOCKED）**: 裁定1（続柄区分コードの
   §3.5/P3-001 改定票の着地）／裁定2（dropdown 拡張の kintone 実機変更）／§2A の胎児
   停止の凍結時明示承認／§6 の点火前データ調査。これらが揃うまで続柄 projection は
