@@ -182,6 +182,129 @@ def _find_launches_legacy(tree):
     return launches
 
 
+def _collect_launch_aliases(tree) -> tuple[set, set]:
+    """subprocess/os の module 名（import alias 込み）と launch 関数名
+    （from-import 込み）を収集（fix4 M01 の R 判定にも使う共通部品）。"""
+    module_names = set()
+    func_names = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                if a.name.split(".")[0] in _LAUNCH_MODULES:
+                    module_names.add(a.asname or a.name.split(".")[0])
+        elif isinstance(node, ast.ImportFrom):
+            if (node.module or "").split(".")[0] in _LAUNCH_MODULES:
+                for a in node.names:
+                    if a.name in _SUBPROC_FUNCS:
+                        func_names.add(a.asname or a.name)
+    return module_names, func_names
+
+
+def _launch_alias_violations(tree) -> list[str]:
+    """fix4 M01: 代入先種類非依存の遮断（p4-002 fix3 と同型・独立実装）。
+
+    - R1: subprocess/os の module・launch 関数を参照する RHS を **非 Name target**
+      （Attribute: x.go = subprocess.run／x.sp = subprocess・Subscript）へ代入する
+      文自体を違反化（追跡しない・安全側）。
+    - R2: **tuple/list unpack** の代入は、RHS に launch 系参照が含まれれば
+      対応追跡せず代入自体を違反化（安全側の選択肢を採用）。
+    Name target への束縛は fix3 検出器の固定点追跡が担当（本関数は非追跡形の遮断）。
+    """
+    module_names, func_names = _collect_launch_aliases(tree)
+
+    def _is_launch_ref(v) -> bool:
+        if isinstance(v, ast.Name) and v.id in module_names | func_names:
+            return True
+        return (isinstance(v, ast.Attribute)
+                and isinstance(v.value, ast.Name)
+                and v.value.id in module_names
+                and v.attr in _SUBPROC_FUNCS)
+
+    def _contains_launch_ref(v) -> bool:
+        return any(_is_launch_ref(s) for s in ast.walk(v))
+
+    violations = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Assign, ast.AnnAssign, ast.NamedExpr,
+                                 ast.AugAssign)):
+            continue
+        value = getattr(node, "value", None)
+        if value is None or not _contains_launch_ref(value):
+            continue
+        targets = node.targets if isinstance(node, ast.Assign) \
+            else [node.target]
+        for t in targets:
+            if not isinstance(t, ast.Name):      # Attribute/Subscript/unpack 全て
+                violations.append(
+                    f"launch 系参照の非 Name target 代入（{type(t).__name__}）")
+    return violations
+
+
+def _find_process_launches_fix3(tree):
+    """fix3 時点の検出（**対照用の凍結コピー・変更しない**）。
+    Name target の alias 固定点追跡まで・非 Name target（Attribute/Subscript/
+    unpack）への持ち出しは検出できない版。"""
+    module_alias = set()
+    func_alias = set()
+    star_imports = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                if a.name.split(".")[0] in _LAUNCH_MODULES:
+                    module_alias.add(a.asname or a.name.split(".")[0])
+        elif isinstance(node, ast.ImportFrom):
+            if (node.module or "").split(".")[0] in _LAUNCH_MODULES:
+                for a in node.names:
+                    if a.name == "*":
+                        star_imports.append(node)
+                    elif a.name in _SUBPROC_FUNCS:
+                        func_alias.add(a.asname or a.name)
+    changed = True
+    while changed:
+        changed = False
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.Assign, ast.AnnAssign, ast.NamedExpr)):
+                continue
+            value = getattr(node, "value", None)
+            targets = node.targets if isinstance(node, ast.Assign) \
+                else [node.target]
+            names = [n.id for t in targets for n in ast.walk(t)
+                     if isinstance(n, ast.Name)]
+            if isinstance(value, ast.Name):
+                if value.id in module_alias and not module_alias >= set(names):
+                    module_alias.update(names)
+                    changed = True
+                if value.id in func_alias and not func_alias >= set(names):
+                    func_alias.update(names)
+                    changed = True
+            if isinstance(value, ast.Attribute) \
+                    and isinstance(value.value, ast.Name) \
+                    and value.value.id in module_alias \
+                    and value.attr in _SUBPROC_FUNCS \
+                    and not func_alias >= set(names):
+                func_alias.update(names)
+                changed = True
+    launches = [("<module>", node) for node in star_imports]
+
+    def _visit(node, scope):
+        for child in ast.iter_child_nodes(node):
+            child_scope = child.name if isinstance(
+                child, (ast.FunctionDef, ast.AsyncFunctionDef)) else scope
+            if isinstance(child, ast.Call):
+                f = child.func
+                if isinstance(f, ast.Name) and f.id in func_alias:
+                    launches.append((scope, child))
+                elif isinstance(f, ast.Attribute) \
+                        and isinstance(f.value, ast.Name) \
+                        and f.value.id in module_alias \
+                        and f.attr in _SUBPROC_FUNCS:
+                    launches.append((scope, child))
+            _visit(child, child_scope)
+
+    _visit(tree, "<module>")
+    return launches
+
+
 def _find_process_launches(tree):
     """fix3 M01 の新検出: module 全体を 1 度の walk で走査（module-level 含む）。
 
@@ -307,6 +430,39 @@ class TestMigrateLaunchShape(unittest.TestCase):
                                  "旧検出は素通り（迂回が実在した証明）")
                 self.assertNotEqual(_find_process_launches(tree), [],
                                     "新検出は検出すること")
+
+    def test_no_alias_smuggling_assignments(self):
+        # fix4 M01: 非 Name target への launch 系持ち出しがハーネスに存在しない
+        self.assertEqual(_launch_alias_violations(self._module_tree()), [])
+
+    def test_meta_fix4_bypass_fixtures_fix3_pass_new_fail(self):
+        """fix4 M01-3: Codex 実測の3形が「旧（fix3 凍結コピー）検査 PASS・
+        新検査 FAIL」となる三段対照（凍結コピー方式の継続）。"""
+        fixtures = {
+            "attr_target_func": (
+                "import subprocess\n"
+                "class X:\n    pass\n"
+                "x = X()\n"
+                "x.go = subprocess.run\n"
+                "x.go(['cmd'])\n"),
+            "tuple_unpack_func": (
+                "import subprocess\n"
+                "r, = (subprocess.run,)\n"
+                "r(['cmd'])\n"),
+            "attr_target_module": (
+                "import subprocess\n"
+                "class X:\n    pass\n"
+                "x = X()\n"
+                "x.sp = subprocess\n"
+                "x.sp.run(['cmd'])\n"),
+        }
+        for label, src in fixtures.items():
+            with self.subTest(fixture=label):
+                tree = ast.parse(src)
+                self.assertEqual(_find_process_launches_fix3(tree), [],
+                                 "fix3 検出は素通り（迂回が実在した証明）")
+                self.assertNotEqual(_launch_alias_violations(tree), [],
+                                    "新検査は検出すること")
 
     def test_d2_exclusion_is_full_path_only(self):
         # fix2 M01-(i): D2 検査の除外が完全 path 限定であること（同名別ファイル遮断）
