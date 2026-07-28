@@ -81,18 +81,186 @@ class TestAuthBoundary(unittest.TestCase):
                         f"{method} {route.path} に認証関所（_gate）がない")
 
 
+# ── read-only AST 検査（fix2 H01 で関数化・alias 完全追跡）─────────────────────
+
+_ALLOWED_KINTONE_ATTRS = {"KintoneApp", "search_records", "get_record"}
+_BANNED_DYNAMIC = {"getattr", "setattr", "__import__", "eval", "exec",
+                   "import_module"}
+# 直接 HTTP client に加え subprocess/os も遮断（curl 等の外部プロセス経由 HTTP を
+# 「対象外」にせず、プロセス起動の import 自体を禁止して塞ぐ・fix2 H01-4）
+_FORBIDDEN_IMPORTS = {"httpx", "requests", "urllib", "aiohttp", "http",
+                      "importlib", "subprocess", "os"}
+_WRITE_VERBS = {"post", "put", "delete", "patch", "request"}
+
+
+def _names_in(target) -> list[str]:
+    return [n.id for n in ast.walk(target) if isinstance(n, ast.Name)]
+
+
+def _assign_pairs(target, value) -> list[tuple[str, ast.AST]]:
+    """代入 target と value の (名前, 対応式) 対。tuple/list unpack は要素対応・
+    形が合わない unpack は保守的に「全 target 名 × value 全体」。"""
+    if isinstance(target, ast.Name):
+        return [(target.id, value)]
+    if isinstance(target, ast.Starred):
+        return _assign_pairs(target.value, value)
+    if isinstance(target, (ast.Tuple, ast.List)):
+        if isinstance(value, (ast.Tuple, ast.List)) \
+                and len(value.elts) == len(target.elts):
+            out = []
+            for t, v in zip(target.elts, value.elts):
+                out += _assign_pairs(t, v)
+            return out
+        return [(name, value) for t in target.elts for name in _names_in(t)]
+    return []
+
+
+def _is_alias_of(value, names: set) -> bool:
+    """value が names の別名になる式か（Name そのもの／Name 起点の Attribute 連鎖。
+    Call の戻り値は別名ではない=KintoneApp(...) 等を誤検出しない）。"""
+    node = value
+    while isinstance(node, ast.Attribute):
+        node = node.value
+    return isinstance(node, ast.Name) and node.id in names
+
+
+def _contains_alias_of(value, names: set) -> bool:
+    return any(_is_alias_of(sub, names)
+               for sub in ast.walk(value) if isinstance(sub, (ast.Name,
+                                                              ast.Attribute)))
+
+
+def _readonly_violations_legacy(tree) -> list[str]:
+    """fix1 時点の検査（**対照用の凍結コピー・変更しない**）。
+    迂回 fixture が旧 PASS/新 FAIL となる三段対照（lineq G0 型）の基準。"""
+    violations = []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            mod = getattr(node, "module", "") or ""
+            for a in node.names:
+                if ("kintone" in (a.name or "") or "kintone" in mod) \
+                        and a.asname is not None:
+                    violations.append(f"import alias: {a.asname}")
+        if isinstance(node, (ast.Assign, ast.AnnAssign, ast.NamedExpr)):
+            value = node.value
+            if isinstance(value, ast.Name) and value.id == "kintone":
+                violations.append("module alias 代入")
+            if isinstance(value, ast.Attribute) \
+                    and isinstance(value.value, ast.Name) \
+                    and value.value.id == "kintone":
+                violations.append(f"属性 alias 代入: {value.attr}")
+        if isinstance(node, ast.Call):
+            f = node.func
+            name = f.id if isinstance(f, ast.Name) else (
+                f.attr if isinstance(f, ast.Attribute) else "")
+            if name in _BANNED_DYNAMIC:
+                violations.append(f"動的呼出し: {name}")
+    return violations
+
+
+def _readonly_violations(tree) -> list[str]:
+    """fix2 H01 の新検査: alias 完全追跡。
+
+    - 禁止関数（getattr/setattr/__import__/eval/exec/import_module）は
+      **import alias（from builtins import getattr as ga 等）・代入 alias も追跡**
+      して呼出しを違反化。import 自体も違反。
+    - kintone module の poison を全代入形式（Assign・tuple/list unpack・
+      NamedExpr(:=)・AnnAssign・import alias）で伝播（固定点まで反復）。
+      poison 名の生成自体が違反・poison 名への属性参照は許可 3 API のみ。
+    - 直接 HTTP client（httpx/requests/urllib/aiohttp/http）に加え
+      subprocess/os の import も違反（curl 等の外部プロセス HTTP を対象外に
+      しない=起動手段の import ごと遮断）。post/put/delete/patch/request の
+      属性呼出しも違反。
+
+    残余の限界（正確化）: globals()/locals()/vars() の辞書経由・文字列組立てで
+    実行時に構成される完全動的経路・C 拡張内部の呼出しは静的検査では検出できない。
+    この残余は sink AST policy・関所テスト・レビューで重畳防御する。
+    """
+    violations = []
+    poison = {"kintone"}
+    banned = set(_BANNED_DYNAMIC)
+
+    for node in ast.walk(tree):          # import 系（1 パスで確定）
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                top = a.name.split(".")[0]
+                if top in _FORBIDDEN_IMPORTS:
+                    violations.append(f"禁止 import: {a.name}")
+                if "kintone" in a.name:
+                    bound = a.asname or top
+                    poison.add(bound)
+                    if a.asname is not None:
+                        violations.append(f"kintone import alias: {a.asname}")
+        elif isinstance(node, ast.ImportFrom):
+            mod = node.module or ""
+            if mod.split(".")[0] in _FORBIDDEN_IMPORTS:
+                violations.append(f"禁止 module からの import: {mod}")
+            if mod.endswith("kintone"):
+                violations.append(f"kintone の属性直接 import: {mod}")
+            for a in node.names:
+                if a.name in _BANNED_DYNAMIC:
+                    violations.append(f"禁止関数 import: {a.name}")
+                    banned.add(a.asname or a.name)
+                if a.name == "kintone":
+                    poison.add(a.asname or a.name)
+                    if a.asname is not None:
+                        violations.append(f"kintone import alias: {a.asname}")
+
+    changed = True                       # 代入 alias の固定点反復
+    while changed:
+        changed = False
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign):
+                pairs = []
+                for tgt in node.targets:
+                    pairs += _assign_pairs(tgt, node.value)
+            elif isinstance(node, (ast.AnnAssign, ast.NamedExpr)):
+                if getattr(node, "value", None) is None:
+                    continue
+                pairs = _assign_pairs(node.target, node.value)
+            else:
+                continue
+            for name, value in pairs:
+                poisoned = (_is_alias_of(value, poison)
+                            or (not isinstance(value, (ast.Name, ast.Attribute))
+                                and _contains_alias_of(value, poison)
+                                and isinstance(value, (ast.Tuple, ast.List))))
+                if poisoned and name not in poison:
+                    poison.add(name)
+                    violations.append(f"kintone alias 代入: {name}")
+                    changed = True
+                if isinstance(value, ast.Name) and value.id in banned \
+                        and name not in banned:
+                    banned.add(name)
+                    violations.append(f"禁止関数 alias 代入: {name}")
+                    changed = True
+
+    for node in ast.walk(tree):          # 使用箇所（poison/banned 確定後）
+        if isinstance(node, ast.Call):
+            f = node.func
+            name = f.id if isinstance(f, ast.Name) else (
+                f.attr if isinstance(f, ast.Attribute) else "")
+            if name in banned:
+                violations.append(f"動的呼出し: {name}")
+            if isinstance(f, ast.Attribute) and f.attr in _WRITE_VERBS:
+                violations.append(f"HTTP 書込み動詞呼出し: {f.attr}")
+        if isinstance(node, ast.Attribute) \
+                and isinstance(node.value, ast.Name) \
+                and node.value.id in poison \
+                and node.attr not in _ALLOWED_KINTONE_ATTRS:
+            violations.append(f"poison 属性参照: {node.attr}")
+    return violations
+
+
 class TestReadOnlyMachineCheck(unittest.TestCase):
-    """read-only の AST 機械検査（fix1 M01 で迂回経路を強化）。
+    """read-only の AST 機械検査（fix1 M01→fix2 H01 で alias 完全追跡に関数化）。
 
-    検査範囲: (i) kintone 系 module/属性の alias binding 追跡（`x = kintone`／
-    `f = kintone.create_record`／import alias） (ii) getattr 等の動的属性アクセス
-    の全面違反化 (iii) importlib/__import__/eval/exec の違反化 (iv) httpx 等の
-    直接 HTTP client import と POST/PUT/DELETE/PATCH 系呼出しの違反化。
-
-    静的解析の限界（明記）: 文字列組立てから到達する完全動的経路
-    （例: globals() 辞書経由・C 拡張内部の呼出し）は本検査では検出できない。
-    その残余は sink AST policy・関所テスト・レビューで重畳的に防御する
-    （lineq G0 の動的 import 検査で確立した型の再利用）。
+    残余の限界（fix2 H01-4 で正確化）: globals()/locals()/vars() 辞書経由・
+    文字列組立てで実行時に構成される完全動的経路・C 拡張内部の呼出しは静的検査の
+    対象外。**subprocess 経由の HTTP（curl 等）は「対象外」とせず、
+    subprocess/os の import 自体を禁止 import 集合に含めて遮断**する（直接
+    HTTP client の import 検査と同列の入口遮断・実行形の検査ではない）。
+    残余は sink AST policy・関所テスト・レビューで重畳防御。
     """
 
     def setUp(self):
@@ -100,67 +268,51 @@ class TestReadOnlyMachineCheck(unittest.TestCase):
         self.tree = ast.parse(self.src)
 
     def test_only_read_apis_of_kintone_used(self):
-        allowed = {"KintoneApp", "search_records", "get_record"}
         used = {n.attr for n in ast.walk(self.tree)
                 if isinstance(n, ast.Attribute)
                 and isinstance(n.value, ast.Name) and n.value.id == "kintone"}
         self.assertTrue(used)
-        self.assertLessEqual(used, allowed, f"書込み系 API の使用: {used - allowed}")
+        self.assertLessEqual(used, _ALLOWED_KINTONE_ATTRS,
+                             f"書込み系 API の使用: {used - _ALLOWED_KINTONE_ATTRS}")
         for banned in ("create_record", "update_record", "delete_record",
                        "upload_file", "_write"):
             self.assertNotIn(banned, self.src)
 
-    def test_no_alias_binding_of_kintone(self):
-        # fix1 M01-(i): module/属性の別名 binding を全面違反化
-        # （検査が追跡できない参照名を作らせない）
-        violations = []
-        for node in ast.walk(self.tree):
-            if isinstance(node, (ast.Import, ast.ImportFrom)):
-                mod = getattr(node, "module", "") or ""
-                for a in node.names:
-                    if ("kintone" in (a.name or "") or "kintone" in mod) \
-                            and a.asname is not None:
-                        violations.append(f"import alias: {a.asname}")
-            if isinstance(node, (ast.Assign, ast.AnnAssign, ast.NamedExpr)):
-                value = node.value
-                if isinstance(value, ast.Name) and value.id == "kintone":
-                    violations.append("module alias 代入")
-                if isinstance(value, ast.Attribute) \
-                        and isinstance(value.value, ast.Name) \
-                        and value.value.id == "kintone":
-                    violations.append(f"属性 alias 代入: {value.attr}")
-        self.assertEqual(violations, [])
+    def test_module_passes_strengthened_checker(self):
+        self.assertEqual(_readonly_violations(self.tree), [])
 
-    def test_no_dynamic_access_or_import(self):
-        # fix1 M01-(ii)(iii): getattr/setattr/__import__/importlib/eval/exec
-        banned_calls = {"getattr", "setattr", "__import__", "eval", "exec",
-                        "import_module"}
-        found = []
-        for node in ast.walk(self.tree):
-            if isinstance(node, ast.Call):
-                f = node.func
-                name = f.id if isinstance(f, ast.Name) else (
-                    f.attr if isinstance(f, ast.Attribute) else "")
-                if name in banned_calls:
-                    found.append(name)
-        self.assertEqual(found, [])
-        self.assertNotIn("importlib", self.src)
+    def test_meta_bypass_fixtures_old_pass_new_fail(self):
+        """fix2 H01-3: Codex 提示の迂回 fixture 3種が「旧検査 PASS・新検査 FAIL」
+        となる三段対照（lineq G0 の型）。旧検査は凍結コピー=基準の固定。"""
+        fixtures = {
+            "builtins_alias_getattr_concat": (
+                "from builtins import getattr as ga\n"
+                "from hub import kintone\n"
+                "fn = ga(kintone, 'create_' + 'record')\n"),
+            "builtins_alias_dunder_import": (
+                "from builtins import __import__ as imp\n"
+                "k = imp('hub.kintone')\n"),
+            "tuple_unpack_alias": (
+                "from hub import kintone\n"
+                "kt, = (kintone,)\n"
+                "fn = kt.update_record\n"),
+        }
+        for label, src in fixtures.items():
+            with self.subTest(fixture=label):
+                tree = ast.parse(src)
+                self.assertEqual(_readonly_violations_legacy(tree), [],
+                                 "旧検査は素通り（迂回が実在した証明）")
+                self.assertNotEqual(_readonly_violations(tree), [],
+                                    "新検査は検出すること")
 
-    def test_no_direct_http_client_or_write_verbs(self):
-        # fix1 M01-(iv): 直接 HTTP client の import・書込み動詞呼出しの違反化
+    def test_no_direct_http_or_process_launch_imports(self):
         imported = set()
         for node in ast.walk(self.tree):
             if isinstance(node, ast.Import):
                 imported.update(a.name.split(".")[0] for a in node.names)
             elif isinstance(node, ast.ImportFrom):
                 imported.add((node.module or "").split(".")[0])
-        self.assertFalse(imported & {"httpx", "requests", "urllib", "aiohttp",
-                                     "http"}, imported)
-        write_verbs = {"post", "put", "delete", "patch", "request"}
-        found = [n.func.attr for n in ast.walk(self.tree)
-                 if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
-                 and n.func.attr in write_verbs]
-        self.assertEqual(found, [])
+        self.assertFalse(imported & _FORBIDDEN_IMPORTS, imported)
 
 
 class TestCasesApi(unittest.TestCase):
