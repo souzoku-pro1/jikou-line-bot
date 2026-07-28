@@ -1361,3 +1361,8 @@ async def _process_stripe_event(event: dict) -> None:
 #    途中への行追加は行ずれで allowlist を壊す（既存テスト無変更の制約）。
 from hub.health_deps import router as health_deps_router  # noqa: E402
 app.include_router(health_deps_router)
+
+# ── P4-001: PWA（仮名称・認証+shell）。末尾追記は sink allowlist の行番号 pin を
+#    壊さないための規約（health_deps と同型）。/app 配下は webapp_auth が認証を担う。
+from hub.webapp_auth import router as webapp_router  # noqa: E402
+app.include_router(webapp_router)

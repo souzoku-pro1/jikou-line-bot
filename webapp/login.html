@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ログイン - 案件管理（仮）</title>
+<style>
+body{font-family:sans-serif;max-width:420px;margin:15vh auto;padding:0 1rem}
+input,button{font-size:1rem;padding:.6rem;width:100%;box-sizing:border-box;margin-top:.5rem}
+button{background:#1a3c6e;color:#fff;border:0;border-radius:4px}
+</style>
+</head>
+<body>
+<h1>案件管理（仮）</h1>
+<!-- 失敗時も理由・入力値を表示しない（固定文言のみ） -->
+<form method="post" action="/app/login">
+  <input type="password" name="password" placeholder="パスワード" autocomplete="current-password" required>
+  <button type="submit">ログイン</button>
+</form>
+<script>if(location.search.includes('e=1')){document.body.insertAdjacentHTML('beforeend','<p>ログインできませんでした。</p>')}</script>
+</body>
+</html>
