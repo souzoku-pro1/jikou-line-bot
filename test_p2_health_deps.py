@@ -189,6 +189,50 @@ class TestNoSecretInResponse(_CacheReset):
             self.assertNotIn("googleapis.com", r.text)
 
 
+class TestMinimizedDisclosure(_CacheReset):
+    """HEALTH-MIN-1（R-P4-001-1 L01）: 公開情報の最小化の機械 pin。"""
+
+    _ENV_NAMES = ("GOOGLE_VISION_API_KEY", "HEALTH_DEPS_TIMEOUT_SECONDS")
+
+    def test_unconfigured_is_fixed_string_only(self):
+        # 前後比較: 旧 {"status","reason"(env 名入り)} → 新 {"status"} のみ
+        env = {k: v for k, v in os.environ.items() if k != "GOOGLE_VISION_API_KEY"}
+        with patch.dict(os.environ, env, clear=True):
+            _probe()
+        r = _client.get("/health/deps")
+        self.assertEqual(r.json()["deps"]["vision"], {"status": "unconfigured"})
+        for name in self._ENV_NAMES:
+            self.assertNotIn(name, r.text)
+        self.assertNotIn("env ", r.text)
+
+    def test_all_scenarios_schema_and_no_env_names(self):
+        scenarios = {
+            "ok": (_KEY_ENV, _fake_client(_FakeResp(200))),
+            "http_403": (_KEY_ENV, _fake_client(_FakeResp(403))),
+            "timeout": (_KEY_ENV, _fake_client(httpx.ReadTimeout("t"))),
+            "generic_error": (_KEY_ENV, _fake_client(RuntimeError("x"))),
+        }
+        for label, (env, fake) in scenarios.items():
+            with self.subTest(case=label):
+                hd._last_result = None
+                with patch.dict(os.environ, env), \
+                     patch.object(hd.httpx, "AsyncClient", fake):
+                    _probe()
+                r = _client.get("/health/deps")
+                body = r.json()
+                # 応答スキーマの閉集合（top-level / deps 名 / dep 値のキー）
+                self.assertEqual(set(body), {"status", "deps", "checked_at"})
+                self.assertEqual(set(body["deps"]), {"vision"})   # 抽象名のみ
+                for dep in body["deps"].values():
+                    self.assertLessEqual(set(dep),
+                                         {"status", "reason", "http_status"})
+                # 秘密・env 名・内部 URL の非含有
+                for name in self._ENV_NAMES:
+                    self.assertNotIn(name, r.text)
+                self.assertNotIn(_KEY_ENV["GOOGLE_VISION_API_KEY"], r.text)
+                self.assertNotIn("googleapis", r.text)
+
+
 class TestHealthRegression(unittest.TestCase):
     def test_health_unchanged(self):
         # 既存 /health は無変更（死活監視の互換維持・mock 不要で応答すること）。
