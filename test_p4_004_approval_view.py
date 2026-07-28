@@ -11,6 +11,7 @@
 
 import ast
 import os
+import re
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -588,6 +589,14 @@ class TestApprovalsApi(unittest.TestCase):
         self.assertEqual(mock.call_args.args[1],
                          "order by 更新日時 desc limit 50 offset 20")
 
+    def test_fields_exclude_line_user_id(self):
+        # fix1 M01: 生 external ID をブラウザへ送らない（fields から除外）
+        self.assertNotIn("line_user_id", av._FIELDS)
+        mock = AsyncMock(return_value=[])
+        self._get("/app/api/approvals", mock)
+        self.assertEqual(mock.call_args.kwargs.get("fields"), av._FIELDS)
+        self.assertNotIn("line_user_id", mock.call_args.kwargs.get("fields"))
+
     def test_invalid_inputs_fixed_400_no_call(self):
         for qs in ("all=0", "all=yes", "limit=51", "limit=0", "limit=abc",
                    "offset=-1", "offset=x"):
@@ -615,6 +624,106 @@ class TestPage(unittest.TestCase):
             r = _client.get("/app", headers=_auth_headers(),
                             follow_redirects=False)
             self.assertIn('href="/app/approvals"', r.text)
+
+
+class TestCacheControlNoStore(unittest.TestCase):
+    """fix1 H01: PWA 保護領域の共通契約 Cache-Control: no-store, private。
+    _gate 経由の全応答（成功/400/redirect/画面）＋ merge 済み P4-002 API へ遡及。"""
+
+    _EXPECTED = "no-store, private"
+
+    def _hdr(self, r):
+        return r.headers.get("cache-control", "")
+
+    def test_p4004_api_success_400_and_redirect(self):
+        # 成功
+        mock = AsyncMock(return_value=[])
+        with patch.dict(os.environ, _ENV), \
+             patch.object(hub_kintone, "search_records", mock):
+            ok = _client.get("/app/api/approvals", headers=_auth_headers(),
+                             follow_redirects=False)
+        self.assertEqual(self._hdr(ok), self._EXPECTED)
+        # 400（固定応答）
+        with patch.dict(os.environ, _ENV), \
+             patch.object(hub_kintone, "search_records", AsyncMock()):
+            bad = _client.get("/app/api/approvals?all=yes",
+                              headers=_auth_headers(), follow_redirects=False)
+        self.assertEqual(bad.status_code, 400)
+        self.assertEqual(self._hdr(bad), self._EXPECTED)
+        # 未認証 303 redirect
+        with patch.dict(os.environ, _ENV):
+            red = _client.get("/app/api/approvals", follow_redirects=False)
+        self.assertEqual(red.status_code, 303)
+        self.assertEqual(self._hdr(red), self._EXPECTED)
+        # 画面
+        with patch.dict(os.environ, _ENV):
+            page = _client.get("/app/approvals", headers=_auth_headers(),
+                               follow_redirects=False)
+        self.assertEqual(self._hdr(page), self._EXPECTED)
+
+    def test_p4002_case_api_retroactively_covered(self):
+        # merge 済み P4-002 案件 API（顧客 PII 含む）へ遡及適用される
+        import hub.webapp_case_views as cv
+        with patch.dict(os.environ, _ENV), \
+             patch.object(hub_kintone, "search_records", AsyncMock(return_value=[])):
+            r = _client.get("/app/api/cases", headers=_auth_headers(),
+                            follow_redirects=False)
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(self._hdr(r), self._EXPECTED)
+        self.assertTrue(cv.router.routes)          # 参照の健全性
+        with patch.dict(os.environ, _ENV), \
+             patch.object(hub_kintone, "get_record",
+                          AsyncMock(return_value={"顧客名": {"value": "x"}})), \
+             patch.object(hub_kintone, "search_records", AsyncMock(return_value=[])):
+            d = _client.get("/app/api/cases/1", headers=_auth_headers(),
+                            follow_redirects=False)
+        self.assertEqual(self._hdr(d), self._EXPECTED)
+
+    def test_login_public_responses_no_store(self):
+        with patch.dict(os.environ, _ENV):
+            page = _client.get("/app/login", follow_redirects=False)
+            self.assertEqual(self._hdr(page), self._EXPECTED)
+            fail = _client.post("/app/login", data={"password": "x"},
+                                follow_redirects=False)
+            self.assertEqual(fail.status_code, 303)
+            self.assertEqual(self._hdr(fail), self._EXPECTED)
+
+
+class TestReferenceOnlyUiClosedSet(unittest.TestCase):
+    """fix1 M02: 参照専用 UI の閉集合機械検査（approvals.html の HTML/JS 走査）。"""
+
+    def setUp(self):
+        import hub.webapp_approval_view as _av
+        self.src = (Path(_av.__file__).resolve().parent.parent
+                    / "webapp" / "approvals.html").read_text(encoding="utf-8")
+        self.lower = self.src.lower()
+
+    def test_buttons_are_prev_next_only(self):
+        ids = set(re.findall(r'<button[^>]*\bid="([^"]+)"', self.src))
+        self.assertEqual(ids, {"prev", "next"})
+        # id なし button（操作ボタンの混入）も不在
+        self.assertEqual(self.src.count("<button"), 2)
+
+    def test_inputs_are_all_checkbox_only(self):
+        inputs = re.findall(r"<input\b[^>]*>", self.src)
+        self.assertEqual(len(inputs), 1)
+        self.assertIn('id="all"', inputs[0])
+        self.assertIn('type="checkbox"', inputs[0])
+
+    def test_fetch_targets_are_read_api_get_only(self):
+        # fetch は参照 API のみ・書込み動詞や form はゼロ
+        fetches = re.findall(r"fetch\(([^)]*)\)", self.src)
+        self.assertTrue(fetches)
+        for f in fetches:
+            self.assertIn("/app/api/approvals", f)
+        # fetch options に method 指定がない＝既定 GET
+        self.assertNotIn("method:", self.lower.replace(" ", ""))
+        for verb in ('"post"', "'post'", '"put"', '"patch"', '"delete"',
+                     "<form", "action="):
+            self.assertNotIn(verb, self.lower)
+
+    def test_no_line_user_id_in_ui(self):
+        self.assertNotIn("line_user_id", self.src)
 
 
 if __name__ == "__main__":

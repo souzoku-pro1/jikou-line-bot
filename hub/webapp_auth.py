@@ -63,7 +63,8 @@ import time
 from pathlib import Path
 
 from fastapi import APIRouter, Form, Request
-from fastapi.responses import FileResponse, RedirectResponse, Response
+from fastapi.responses import (FileResponse, JSONResponse, RedirectResponse,
+                               Response)
 
 router = APIRouter()
 
@@ -262,24 +263,45 @@ def _authed(request: Request) -> bool:
     return verify_session(request.cookies.get(_COOKIE))
 
 
+# fix1 H01: PWA 保護領域の共通キャッシュ契約。顧客 PII を含み得る全応答を
+# ブラウザ/中間キャッシュに残さない（`private` は共有キャッシュ禁止・`no-store` は
+# 保存自体を禁止）。_gate 経由の全応答（成功・400・404・303 redirect）へ一律付与し、
+# merge 済み P4-002 の案件 API（顧客 PII 含む）にも遡及適用される。login（公開）にも
+# 付与する（secret は含まないが保存させないのが無難）。
+_CACHE_CONTROL = "no-store, private"
+
+
+def _no_store(resp: Response) -> Response:
+    resp.headers["Cache-Control"] = _CACHE_CONTROL
+    return resp
+
+
 def _login_redirect() -> RedirectResponse:
-    return RedirectResponse("/app/login", status_code=303)
+    return _no_store(RedirectResponse("/app/login", status_code=303))
 
 
 def _fail_redirect() -> RedirectResponse:
     """全失敗共通の固定応答（理由・入力値を一切区別しない/反射しない）。"""
-    return RedirectResponse("/app/login?e=1", status_code=303)
+    return _no_store(RedirectResponse("/app/login?e=1", status_code=303))
 
 
 def _gate(fn):
     """認証関所（fix1 M01・単一実装）。保護 route は本 decorator 経由でのみ
     登録する。機械検査テストが「PUBLIC_ROUTES 以外の全 route が本関所を持つ」
-    ことを assert する（将来 route 追加時の検査忘れ防波堤）。"""
+    ことを assert する（将来 route 追加時の検査忘れ防波堤）。
+
+    P4-004 fix1 H01: 保護 route の全応答に Cache-Control: no-store, private を
+    一元付与する（共通契約）。case_views/approval_view の API は dict を返すため、
+    dict/list は JSONResponse へ正規化してからヘッダを付ける（既存挙動＝FastAPI が
+    dict を JSON 化するのと等価・content は不変）。"""
     @functools.wraps(fn)
     async def wrapper(request: Request):
         if not _authed(request):
             return _login_redirect()
-        return await fn(request)
+        result = await fn(request)
+        if not isinstance(result, Response):     # dict/list → JSONResponse 正規化
+            result = JSONResponse(result)
+        return _no_store(result)
     wrapper.__webapp_gate__ = True
     return wrapper
 
@@ -294,7 +316,7 @@ def _file(name: str, media_type: str) -> Response:
 @router.get("/app/login")
 async def login_page():
     """ログイン画面（/app 配下で唯一の非認証 route＝PUBLIC_ROUTES）。"""
-    return _file("login.html", "text/html; charset=utf-8")
+    return _no_store(_file("login.html", "text/html; charset=utf-8"))
 
 
 @router.post("/app/login")
@@ -322,7 +344,7 @@ async def login(request: Request, password: str = Form(default="")):
     resp = RedirectResponse("/app", status_code=303)
     resp.set_cookie(_COOKIE, value, max_age=SESSION_TTL_SECONDS, path="/app",
                     httponly=True, samesite="strict", secure=True)
-    return resp
+    return _no_store(resp)
 
 
 @router.get("/app")

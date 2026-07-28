@@ -30,7 +30,8 @@ APP_APPROVAL = kintone.KintoneApp("App 29 (承認キュー)", "APP_APPROVAL",
 
 PAGE_LIMIT_MAX = 50
 PAGE_LIMIT_DEFAULT = 20
-_FIELDS = ["$id", "line_user_id", "顧客名", "顧客メッセージ", "AI下書き",
+# fix1 M01: line_user_id（生の external ID）は UI 未使用のためブラウザへ送らない。
+_FIELDS = ["$id", "顧客名", "顧客メッセージ", "AI下書き",
            "カテゴリ", "判断理由", "ステータス2", "送信済み", "更新日時"]
 _INT_RE = re.compile(r"^[0-9]{1,6}$")
 
