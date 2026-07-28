@@ -495,20 +495,10 @@ def _os_chain_violations(tree) -> list[str]:
     return violations
 
 
-def _proc_binding_violations(tree) -> list[str]:
-    """fix6 M02: subprocess/os の束縛元の検証（p4-002 fix5 と同型）。
-
-    正規束縛=「alias なし `import subprocess`／`import os` が各ちょうど 1 回」。
-    それ以外の "subprocess"/"os" への全束縛を違反化。
-
-    列挙の完全性（根拠）: Python 3.12 AST（ASDL）で識別子を束縛する node は
-    ①Name(ctx=Store|Del)（代入 target 全形式・for/with as・comprehension
-    target・walrus は本形へ脱糖） ②alias.asname/alias.name（import 系）
-    ③arg.arg（posonly/args/kwonly/vararg/kwarg・lambda 含む＝arguments 配下 arg）
-    ④ExceptHandler.name ⑤FunctionDef/AsyncFunctionDef/ClassDef.name
-    ⑥match capture（MatchAs/MatchStar.name・MatchMapping.rest）
-    ⑦Global/Nonlocal.names、の閉集合であり、本関数はその全てを検査する。
-    """
+def _proc_binding_violations_prev(tree) -> list[str]:
+    """fix6 M02 初版の束縛検証（**対照用の凍結コピー・変更しない**）。
+    全面 star import・PEP 695 type parameter を束縛構文として扱わない版
+    （p4-002 fix6 と同型の追補メタテストの基準）。"""
     targets = {"subprocess", "os"}
     canon = {"subprocess": 0, "os": 0}
     violations = []
@@ -540,6 +530,73 @@ def _proc_binding_violations(tree) -> list[str]:
             for n in node.names:
                 if n in targets:
                     violations.append(f"global/nonlocal {n} 宣言")
+        elif isinstance(node, ast.Name) and node.id in targets \
+                and isinstance(node.ctx, (ast.Store, ast.Del)):
+            violations.append(f"代入系 target への {node.id} 束縛")
+    for name in targets:
+        if canon[name] != 1:
+            violations.append(
+                f"正規束縛（alias なし import {name}）が {canon[name]} 回"
+                "（ちょうど 1 回であること）")
+    return violations
+
+
+def _proc_binding_violations(tree) -> list[str]:
+    """fix6 M02: subprocess/os の束縛元の検証（p4-002 fix5/fix6 と同型）。
+
+    正規束縛=「alias なし `import subprocess`／`import os` が各ちょうど 1 回」。
+    それ以外の "subprocess"/"os" への全束縛を違反化。
+
+    列挙の完全性（根拠・p4-002 fix6 に合わせて最終確定）: Python 3.12 AST（ASDL）
+    で識別子を束縛する node は ①Name(ctx=Store|Del)（代入 target 全形式・
+    for/with as・comprehension target・walrus は本形へ脱糖） ②alias.asname/
+    alias.name（import 系） ③arg.arg（posonly/args/kwonly/vararg/kwarg・lambda
+    含む＝arguments 配下 arg） ④ExceptHandler.name ⑤FunctionDef/
+    AsyncFunctionDef/ClassDef.name ⑥match capture（MatchAs/MatchStar.name・
+    MatchMapping.rest） ⑦Global/Nonlocal.names ⑧**PEP 695 type parameter**
+    （TypeVar/ParamSpec/TypeVarTuple の name）、の閉集合であり、本関数はその全てを
+    検査する。加えて ⑨ **star import**（`from <any> import *`）は束縛名が静的に
+    確定できず subprocess/os を暗黙導入し得るため module を問わず一律違反。
+
+    残余（p4-002 と共通で最終確定）: 実行時文字列からの名前解決（globals()/vars()
+    の辞書アクセス・文字列は identifier node でない）と C 拡張内部の呼出しのみ。
+    """
+    targets = {"subprocess", "os"}
+    canon = {"subprocess": 0, "os": 0}
+    violations = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                if a.asname in targets:
+                    violations.append(f"import alias による {a.asname} 束縛")
+                elif a.name in targets and a.asname is None:
+                    canon[a.name] += 1
+        elif isinstance(node, ast.ImportFrom):
+            for a in node.names:
+                if a.name == "*":            # ⑨ star import は module を問わず違反
+                    violations.append(f"star import（from {node.module} import *）")
+                elif a.asname in targets or a.name in targets:
+                    violations.append(
+                        f"from-import による {a.asname or a.name} 束縛")
+        elif isinstance(node, ast.arg) and node.arg in targets:
+            violations.append(f"仮引数 {node.arg}（shadow 束縛）")
+        elif isinstance(node, ast.ExceptHandler) and node.name in targets:
+            violations.append(f"except as {node.name}（shadow 束縛）")
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
+                               ast.ClassDef)) and node.name in targets:
+            violations.append(f"def/class 名 {node.name}（shadow 束縛）")
+        elif isinstance(node, (ast.MatchAs, ast.MatchStar)) \
+                and getattr(node, "name", None) in targets:
+            violations.append(f"match capture {node.name}（shadow 束縛）")
+        elif isinstance(node, ast.MatchMapping) and node.rest in targets:
+            violations.append(f"match mapping rest {node.rest}（shadow 束縛）")
+        elif isinstance(node, (ast.Global, ast.Nonlocal)):
+            for n in node.names:
+                if n in targets:
+                    violations.append(f"global/nonlocal {n} 宣言")
+        elif isinstance(node, (ast.TypeVar, ast.ParamSpec, ast.TypeVarTuple)) \
+                and node.name in targets:       # ⑧ PEP 695 type parameter
+            violations.append(f"type parameter {node.name}（shadow 束縛）")
         elif isinstance(node, ast.Name) and node.id in targets \
                 and isinstance(node.ctx, (ast.Store, ast.Del)):
             violations.append(f"代入系 target への {node.id} 束縛")
@@ -619,6 +676,28 @@ class TestMigrateLaunchShape(unittest.TestCase):
         tree = self._module_tree()
         self.assertEqual(_os_chain_violations(tree), [])
         self.assertEqual(_proc_binding_violations(tree), [])
+
+    def test_meta_star_import_and_type_param(self):
+        """p4-002 fix6 と同2点の追補: 全面 star import・PEP 695 type parameter が
+        「初版束縛検査 PASS・新検査 FAIL」の三段対照（凍結コピー継続）。"""
+        fixtures = {
+            "star_import_any_module": (
+                "import subprocess\nimport os\n"
+                "from evil import *\n"),
+            "type_param_subprocess": (
+                "import subprocess\nimport os\n"
+                "def f[subprocess](): pass\n"),
+            "type_param_os_class": (
+                "import subprocess\nimport os\n"
+                "class C[os]: pass\n"),
+        }
+        for label, src in fixtures.items():
+            with self.subTest(fixture=label):
+                tree = ast.parse(src)
+                self.assertEqual(_proc_binding_violations_prev(tree), [],
+                                 "初版束縛検査は素通り（迂回実在の証明）")
+                self.assertNotEqual(_proc_binding_violations(tree), [],
+                                    "新検査は star/type parameter を検出すること")
 
     def test_os_chain_meta_fix5_pass_new_fail(self):
         """fix6 M01-3: os.path.os.system(...) が「旧（fix5 基底許可）PASS・
