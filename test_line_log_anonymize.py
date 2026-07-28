@@ -332,19 +332,24 @@ class TestOneWayPipeline(unittest.TestCase):
             self.assertFalse(Path(f"{d}/n_out").exists())
 
     def test_reverify_refuses_existing_outputs_and_staging(self):
-        """fix3 (ii): 公開先の既存・staging 残骸は開始前拒否（旧成果物は不変）。"""
+        """fix3 (ii): 公開先の既存・staging 残骸は開始前拒否（旧成果物は不変）。
+        R-LINE-LOG-PREP-4 M01: 3成果物すべて read_bytes() の before/after 完全一致で
+        不変を pin（final.json だけでなく summary.json/checklist.csv も）。"""
         import io
         import os
+        _ARTIFACTS = ("final.json", "summary.json", "checklist.csv")
         d = self._tmp()
         mid = self._mid(d)
         main(["reverify", "--in", mid, "--out-dir", f"{d}/out"])   # 1回目=成功
-        old_final = Path(f"{d}/out/final.json").read_text(encoding="utf-8")
+        before = {name: Path(f"{d}/out/{name}").read_bytes()
+                  for name in _ARTIFACTS}
         buf = io.StringIO()
         rc = main(["reverify", "--in", mid, "--out-dir", f"{d}/out"], out=buf)
         self.assertEqual(rc, 1)
         self.assertIn("既存の成果物", buf.getvalue())
-        self.assertEqual(Path(f"{d}/out/final.json").read_text(encoding="utf-8"),
-                         old_final)                              # 旧成果物は不変
+        for name in _ARTIFACTS:                                  # 3成果物とも不変
+            self.assertEqual(Path(f"{d}/out/{name}").read_bytes(), before[name],
+                             f"{name} が再実行拒否時に変化した")
         os.makedirs(f"{d}/out2.staging")                         # staging 残骸の拒否
         buf2 = io.StringIO()
         rc2 = main(["reverify", "--in", mid, "--out-dir", f"{d}/out2"], out=buf2)
