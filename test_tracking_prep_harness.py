@@ -261,8 +261,11 @@ def _launch_context_violations(tree) -> list[str]:
     - from-import された launch 関数名（run 等）は出現許可ゼロ
       （`from subprocess import *` も違反）。
 
-    残余の限界（fix5 で限定）: **実行時文字列からの名前解決**（globals()/vars()
-    の辞書アクセス等・文字列は Name node でない）と **C 拡張内部の呼出し**のみ。
+    残余（fix6 で os 完全連鎖 pin・subprocess/os 束縛検証の追加後に再訂正）:
+    束縛元検証（_proc_binding_violations）と os 完全連鎖（_os_chain_violations）を
+    合わせた現行検査では、静的な別名・shadow 束縛・属性連鎖迂回は構造的に閉じた。
+    **本当に残るのは実行時文字列からの名前解決**（globals()/vars() の辞書アクセス
+    等・文字列は Name/identifier node でない）**と C 拡張内部の呼出しのみ**。
     歴代検出器（fix3 walk+alias 追跡・fix4 R1/R2 代入遮断）は防御の重畳として残置。
     """
     violations = []
@@ -447,6 +450,107 @@ def _find_process_launches(tree):
     return launches
 
 
+# fix6 M01: os の実使用の完全連鎖（source 実査で逐語 pin）。
+# os.path.dirname(...)/os.path.abspath(...) と os.environ の読取・添字のみ。
+_ALLOWED_OS_PATH_ATTRS = {"dirname", "abspath"}
+_ALLOWED_OS_ENVIRON_ATTRS = {"get"}       # os.environ.get のみ（bare/添字も許可）
+
+
+def _os_chain_violations(tree) -> list[str]:
+    """fix6 M01: os を「基底許可」ではなく**実使用の完全連鎖**で閉集合化。
+
+    許可（現行 source の逐語）:
+      - `os.path.dirname(...)` / `os.path.abspath(...)`
+      - `os.environ`（bare 読取＝dict unpack）/ `os.environ.get(...)` /
+        `os.environ[...]`（読取・添字代入）
+    os.path からさらに属性を辿る連鎖（os.path.os 等）・os.environ の許可外属性・
+    その他の os 連鎖（os.system 等）は全て違反。
+    """
+    parents: dict = {}
+    for node in ast.walk(tree):
+        for child in ast.iter_child_nodes(node):
+            parents[child] = node
+    violations = []
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Name) and node.id == "os"):
+            continue
+        parent = parents.get(node)
+        if not (isinstance(parent, ast.Attribute) and parent.value is node):
+            violations.append(f"os の裸出現（行 {node.lineno}）")
+            continue
+        gp = parents.get(parent)
+        if parent.attr == "path":
+            if not (isinstance(gp, ast.Attribute)
+                    and gp.attr in _ALLOWED_OS_PATH_ATTRS):
+                violations.append(
+                    f"os.path の許可外連鎖（行 {node.lineno}）")
+        elif parent.attr == "environ":
+            if isinstance(gp, ast.Attribute):
+                if gp.attr not in _ALLOWED_OS_ENVIRON_ATTRS:
+                    violations.append(
+                        f"os.environ の許可外属性: {gp.attr}（行 {node.lineno}）")
+            # Subscript（添字）・bare（Dict unpack 等）は許可
+        else:
+            violations.append(f"os の許可外連鎖: os.{parent.attr}")
+    return violations
+
+
+def _proc_binding_violations(tree) -> list[str]:
+    """fix6 M02: subprocess/os の束縛元の検証（p4-002 fix5 と同型）。
+
+    正規束縛=「alias なし `import subprocess`／`import os` が各ちょうど 1 回」。
+    それ以外の "subprocess"/"os" への全束縛を違反化。
+
+    列挙の完全性（根拠）: Python 3.12 AST（ASDL）で識別子を束縛する node は
+    ①Name(ctx=Store|Del)（代入 target 全形式・for/with as・comprehension
+    target・walrus は本形へ脱糖） ②alias.asname/alias.name（import 系）
+    ③arg.arg（posonly/args/kwonly/vararg/kwarg・lambda 含む＝arguments 配下 arg）
+    ④ExceptHandler.name ⑤FunctionDef/AsyncFunctionDef/ClassDef.name
+    ⑥match capture（MatchAs/MatchStar.name・MatchMapping.rest）
+    ⑦Global/Nonlocal.names、の閉集合であり、本関数はその全てを検査する。
+    """
+    targets = {"subprocess", "os"}
+    canon = {"subprocess": 0, "os": 0}
+    violations = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                if a.asname in targets:
+                    violations.append(f"import alias による {a.asname} 束縛")
+                elif a.name in targets and a.asname is None:
+                    canon[a.name] += 1
+        elif isinstance(node, ast.ImportFrom):
+            for a in node.names:
+                if a.asname in targets or a.name in targets:
+                    violations.append(
+                        f"from-import による {a.asname or a.name} 束縛")
+        elif isinstance(node, ast.arg) and node.arg in targets:
+            violations.append(f"仮引数 {node.arg}（shadow 束縛）")
+        elif isinstance(node, ast.ExceptHandler) and node.name in targets:
+            violations.append(f"except as {node.name}（shadow 束縛）")
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
+                               ast.ClassDef)) and node.name in targets:
+            violations.append(f"def/class 名 {node.name}（shadow 束縛）")
+        elif isinstance(node, (ast.MatchAs, ast.MatchStar)) \
+                and getattr(node, "name", None) in targets:
+            violations.append(f"match capture {node.name}（shadow 束縛）")
+        elif isinstance(node, ast.MatchMapping) and node.rest in targets:
+            violations.append(f"match mapping rest {node.rest}（shadow 束縛）")
+        elif isinstance(node, (ast.Global, ast.Nonlocal)):
+            for n in node.names:
+                if n in targets:
+                    violations.append(f"global/nonlocal {n} 宣言")
+        elif isinstance(node, ast.Name) and node.id in targets \
+                and isinstance(node.ctx, (ast.Store, ast.Del)):
+            violations.append(f"代入系 target への {node.id} 束縛")
+    for name in targets:
+        if canon[name] != 1:
+            violations.append(
+                f"正規束縛（alias なし import {name}）が {canon[name]} 回"
+                "（ちょうど 1 回であること）")
+    return violations
+
+
 class TestMigrateLaunchShape(unittest.TestCase):
     """fix2 M01-(ii)→fix3 M01: Alembic 起動形の AST 構造 pin（走査範囲完全化）。
 
@@ -509,6 +613,38 @@ class TestMigrateLaunchShape(unittest.TestCase):
         # fix5 M01: ハーネス本体は許可2文脈（import 文/pin 済み Call）のみで
         # subprocess を使い、os は environ/path 基底のみ=新検査で違反ゼロ
         self.assertEqual(_launch_context_violations(self._module_tree()), [])
+
+    def test_os_complete_chain_and_binding_zero_violations(self):
+        # fix6 M01/M02: os の完全連鎖 pin・subprocess/os の束縛検証で本体違反ゼロ
+        tree = self._module_tree()
+        self.assertEqual(_os_chain_violations(tree), [])
+        self.assertEqual(_proc_binding_violations(tree), [])
+
+    def test_os_chain_meta_fix5_pass_new_fail(self):
+        """fix6 M01-3: os.path.os.system(...) が「旧（fix5 基底許可）PASS・
+        新（完全連鎖）FAIL」の三段対照。"""
+        src = "import os\nos.path.os.system('x')\n"
+        tree = ast.parse(src)
+        self.assertEqual(_launch_context_violations(tree), [],
+                         "fix5 は素通り（os 基底 path が許可のため）")
+        self.assertNotEqual(_os_chain_violations(tree), [],
+                            "新検査（完全連鎖）は検出すること")
+
+    def test_proc_binding_meta_fix5_pass_new_fail(self):
+        """fix6 M02-3: Codex 実測2形の shadow 束縛（Name node を生成しない
+        束縛構文）が「fix5 PASS・新（束縛検証）FAIL」の三段対照。"""
+        fixtures = {
+            "import_alias_subprocess": "import evil_module as subprocess\n",
+            "parameter_shadow_subprocess": "def f(subprocess):\n    pass\n",
+        }
+        for label, src in fixtures.items():
+            with self.subTest(fixture=label):
+                tree = ast.parse(src)
+                # fix5 は束縛のみ（使用なし）を検出しない＝素通り
+                self.assertEqual(_launch_context_violations(tree), [],
+                                 "fix5 は素通り（束縛のみは Name Load を生じない）")
+                self.assertNotEqual(_proc_binding_violations(tree), [],
+                                    "新検査（束縛検証）は検出すること")
 
     def test_meta_fix5_bypass_fixtures_fix4_pass_new_fail(self):
         """fix5 M01-3: Codex 実測4形（二段 alias・条件式）が「旧（fix4=fix3 検出
