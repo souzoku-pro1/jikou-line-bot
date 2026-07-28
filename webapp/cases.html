@@ -42,8 +42,12 @@ async function load() {
   const sel = document.getElementById("status");
   if (sel.options.length === 1) {
     for (const o of data.status_options) {
-      sel.insertAdjacentHTML("beforeend",
-        `<option value="${o}">${o}</option>`);   // サーバ由来の閉集合のみ
+      // fix1 H01: createElement+textContent 構築（HTML 文字列補間の廃止・
+      // 値は常に DOM 文字列として扱われる。選択肢はサーバ由来の閉集合のみ）
+      const opt = document.createElement("option");
+      opt.value = o;
+      opt.textContent = o;
+      sel.appendChild(opt);
     }
     sel.value = st;
   }

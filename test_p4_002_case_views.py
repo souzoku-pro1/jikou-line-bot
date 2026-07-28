@@ -82,19 +82,85 @@ class TestAuthBoundary(unittest.TestCase):
 
 
 class TestReadOnlyMachineCheck(unittest.TestCase):
+    """read-only の AST 機械検査（fix1 M01 で迂回経路を強化）。
+
+    検査範囲: (i) kintone 系 module/属性の alias binding 追跡（`x = kintone`／
+    `f = kintone.create_record`／import alias） (ii) getattr 等の動的属性アクセス
+    の全面違反化 (iii) importlib/__import__/eval/exec の違反化 (iv) httpx 等の
+    直接 HTTP client import と POST/PUT/DELETE/PATCH 系呼出しの違反化。
+
+    静的解析の限界（明記）: 文字列組立てから到達する完全動的経路
+    （例: globals() 辞書経由・C 拡張内部の呼出し）は本検査では検出できない。
+    その残余は sink AST policy・関所テスト・レビューで重畳的に防御する
+    （lineq G0 の動的 import 検査で確立した型の再利用）。
+    """
+
+    def setUp(self):
+        self.src = Path(cv.__file__).read_text(encoding="utf-8")
+        self.tree = ast.parse(self.src)
+
     def test_only_read_apis_of_kintone_used(self):
-        # read-only の機械検査: kintone module への属性参照は読取系のみ
-        src = Path(cv.__file__).read_text(encoding="utf-8")
-        tree = ast.parse(src)
         allowed = {"KintoneApp", "search_records", "get_record"}
-        used = {n.attr for n in ast.walk(tree)
+        used = {n.attr for n in ast.walk(self.tree)
                 if isinstance(n, ast.Attribute)
                 and isinstance(n.value, ast.Name) and n.value.id == "kintone"}
         self.assertTrue(used)
         self.assertLessEqual(used, allowed, f"書込み系 API の使用: {used - allowed}")
         for banned in ("create_record", "update_record", "delete_record",
                        "upload_file", "_write"):
-            self.assertNotIn(banned, src)
+            self.assertNotIn(banned, self.src)
+
+    def test_no_alias_binding_of_kintone(self):
+        # fix1 M01-(i): module/属性の別名 binding を全面違反化
+        # （検査が追跡できない参照名を作らせない）
+        violations = []
+        for node in ast.walk(self.tree):
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                mod = getattr(node, "module", "") or ""
+                for a in node.names:
+                    if ("kintone" in (a.name or "") or "kintone" in mod) \
+                            and a.asname is not None:
+                        violations.append(f"import alias: {a.asname}")
+            if isinstance(node, (ast.Assign, ast.AnnAssign, ast.NamedExpr)):
+                value = node.value
+                if isinstance(value, ast.Name) and value.id == "kintone":
+                    violations.append("module alias 代入")
+                if isinstance(value, ast.Attribute) \
+                        and isinstance(value.value, ast.Name) \
+                        and value.value.id == "kintone":
+                    violations.append(f"属性 alias 代入: {value.attr}")
+        self.assertEqual(violations, [])
+
+    def test_no_dynamic_access_or_import(self):
+        # fix1 M01-(ii)(iii): getattr/setattr/__import__/importlib/eval/exec
+        banned_calls = {"getattr", "setattr", "__import__", "eval", "exec",
+                        "import_module"}
+        found = []
+        for node in ast.walk(self.tree):
+            if isinstance(node, ast.Call):
+                f = node.func
+                name = f.id if isinstance(f, ast.Name) else (
+                    f.attr if isinstance(f, ast.Attribute) else "")
+                if name in banned_calls:
+                    found.append(name)
+        self.assertEqual(found, [])
+        self.assertNotIn("importlib", self.src)
+
+    def test_no_direct_http_client_or_write_verbs(self):
+        # fix1 M01-(iv): 直接 HTTP client の import・書込み動詞呼出しの違反化
+        imported = set()
+        for node in ast.walk(self.tree):
+            if isinstance(node, ast.Import):
+                imported.update(a.name.split(".")[0] for a in node.names)
+            elif isinstance(node, ast.ImportFrom):
+                imported.add((node.module or "").split(".")[0])
+        self.assertFalse(imported & {"httpx", "requests", "urllib", "aiohttp",
+                                     "http"}, imported)
+        write_verbs = {"post", "put", "delete", "patch", "request"}
+        found = [n.func.attr for n in ast.walk(self.tree)
+                 if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                 and n.func.attr in write_verbs]
+        self.assertEqual(found, [])
 
 
 class TestCasesApi(unittest.TestCase):
@@ -182,6 +248,72 @@ class TestCaseDetailApi(unittest.TestCase):
                 self.assertEqual(r.content, b"")
                 get_mock.assert_not_called()
                 search_mock.assert_not_called()
+
+
+class TestBoundaryPins(unittest.TestCase):
+    """fix1 L01: 境界・fields 集合の完全一致 pin。"""
+
+    def test_chat_count_exactly_at_cap_sets_capped(self):
+        case = _rec(**{"顧客名": "山田太郎", "LINEユーザーID": _LUID})
+        chats = [_rec(**{"$id": str(i)}) for i in range(500)]     # ちょうど 500
+        get_mock = AsyncMock(return_value=case)
+        search_mock = AsyncMock(side_effect=[[], chats])
+        with patch.dict(os.environ, _ENV), \
+             patch.object(hub_kintone, "get_record", get_mock), \
+             patch.object(hub_kintone, "search_records", search_mock):
+            r = _client.get("/app/api/cases/12", headers=_auth_headers(),
+                            follow_redirects=False)
+        self.assertEqual(r.json()["chat_count"], 500)
+        self.assertTrue(r.json()["chat_count_capped"])
+
+    def test_fields_sets_pinned_exactly(self):
+        # App21 一覧 / App30 絞込の fields 集合の完全一致（黙った拡張の防波堤）
+        self.assertEqual(cv._LIST_FIELDS,
+                         ["$id", "status", "顧客名", "問い合わせ業者名", "更新日時"])
+        self.assertEqual(cv._SHIPPING_FIELDS,
+                         ["$id", "件名", "チャネル", "方向", "発送ステータス",
+                          "発送日時", "追跡番号", "送達結果", "更新日時"])
+        mock = AsyncMock(return_value=[])
+        with patch.dict(os.environ, _ENV), \
+             patch.object(hub_kintone, "search_records", mock):
+            _client.get("/app/api/cases", headers=_auth_headers(),
+                        follow_redirects=False)
+        self.assertEqual(mock.call_args.kwargs.get("fields"), cv._LIST_FIELDS)
+        get_mock = AsyncMock(return_value=_rec(**{"顧客名": "x"}))
+        ship_mock = AsyncMock(side_effect=[[]])
+        with patch.dict(os.environ, _ENV), \
+             patch.object(hub_kintone, "get_record", get_mock), \
+             patch.object(hub_kintone, "search_records", ship_mock):
+            _client.get("/app/api/cases/12", headers=_auth_headers(),
+                        follow_redirects=False)
+        self.assertEqual(ship_mock.call_args.kwargs.get("fields"),
+                         cv._SHIPPING_FIELDS)
+
+
+class TestWebappDomSafety(unittest.TestCase):
+    """fix1 H01: HTML 文字列補間 API の全画面不在（将来画面の防波堤）。"""
+
+    _FORBIDDEN = ("innerHTML", "insertAdjacentHTML", "document.write")
+
+    def test_no_html_string_apis_in_any_webapp_page(self):
+        pages = sorted((Path(cv.__file__).resolve().parent.parent / "webapp")
+                       .glob("*.html"))
+        self.assertGreaterEqual(len(pages), 4)           # 走査対象が空でないこと
+        for page in pages:
+            src = page.read_text(encoding="utf-8")
+            for banned in self._FORBIDDEN:
+                with self.subTest(page=page.name, banned=banned):
+                    self.assertNotIn(banned, src)
+
+    def test_cases_status_options_built_as_dom_strings(self):
+        # H01 pin: option は createElement+textContent/value 代入で構築され、
+        # HTML 特殊文字を含む選択肢値も DOM 文字列として扱われる（補間文字列なし）
+        src = (Path(cv.__file__).resolve().parent.parent
+               / "webapp" / "cases.html").read_text(encoding="utf-8")
+        self.assertIn('document.createElement("option")', src)
+        self.assertIn("opt.textContent = o", src)
+        self.assertIn("opt.value = o", src)
+        self.assertNotIn("<option", src.split("<script>")[1])   # JS 内に option HTML なし
 
 
 class TestPages(unittest.TestCase):
