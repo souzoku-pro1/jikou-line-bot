@@ -17,6 +17,6 @@ button{background:#1a3c6e;color:#fff;border:0;border-radius:4px}
   <input type="password" name="password" placeholder="パスワード" autocomplete="current-password" required>
   <button type="submit">ログイン</button>
 </form>
-<script>if(location.search.includes('e=1')){document.body.insertAdjacentHTML('beforeend','<p>ログインできませんでした。</p>')}</script>
+<script>if(location.search.includes('e=1')){const p=document.createElement('p');p.textContent='ログインできませんでした。';document.body.appendChild(p)}</script>
 </body>
 </html>

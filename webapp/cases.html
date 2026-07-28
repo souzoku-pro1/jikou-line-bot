@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>案件一覧 - 案件管理（仮）</title>
+<style>
+body{font-family:sans-serif;max-width:960px;margin:1.5rem auto;padding:0 1rem}
+table{border-collapse:collapse;width:100%}
+th,td{border:1px solid #ccc;padding:.4rem .6rem;font-size:.95rem;text-align:left}
+select,button{font-size:1rem;padding:.3rem .6rem;margin:0 .3rem .8rem 0}
+a{color:#1a3c6e}
+</style>
+</head>
+<body>
+<h1>案件一覧</h1>
+<p><a href="/app">← ダッシュボード</a></p>
+<!-- P4-002: read-only（表示のみ・操作なし）。status 選択肢はサーバ応答の
+     status_options（EXPECTED_KINTONE_SCHEMA 由来）から構成し、画面で発明しない -->
+<div>
+  <select id="status"><option value="">（すべて）</option></select>
+  <button id="prev">前へ</button><button id="next">次へ</button>
+  <span id="page"></span>
+</div>
+<table>
+  <thead><tr><th>ID</th><th>顧客名</th><th>status</th><th>問い合わせ業者名</th><th>更新日時</th></tr></thead>
+  <tbody id="rows"></tbody>
+</table>
+<script>
+let offset = 0;
+const limit = 20;
+function v(rec, name) { return (rec[name] && rec[name].value) || ""; }
+async function load() {
+  const st = document.getElementById("status").value;
+  const q = new URLSearchParams({limit: limit, offset: offset});
+  if (st) q.set("status", st);
+  const resp = await fetch("/app/api/cases?" + q, {redirect: "follow"});
+  if (resp.redirected || !resp.headers.get("content-type")?.includes("json")) {
+    location.href = "/app/login"; return;      // 未認証（session 失効）
+  }
+  const data = await resp.json();
+  const sel = document.getElementById("status");
+  if (sel.options.length === 1) {
+    for (const o of data.status_options) {
+      // fix1 H01: createElement+textContent 構築（HTML 文字列補間の廃止・
+      // 値は常に DOM 文字列として扱われる。選択肢はサーバ由来の閉集合のみ）
+      const opt = document.createElement("option");
+      opt.value = o;
+      opt.textContent = o;
+      sel.appendChild(opt);
+    }
+    sel.value = st;
+  }
+  const rows = document.getElementById("rows");
+  rows.replaceChildren();
+  for (const rec of data.records) {
+    const tr = document.createElement("tr");
+    const id = v(rec, "$id");
+    const link = document.createElement("a");
+    link.href = "/app/case?id=" + encodeURIComponent(id);
+    link.textContent = id;
+    const cells = [link, v(rec, "顧客名"), v(rec, "status"),
+                   v(rec, "問い合わせ業者名"), v(rec, "更新日時")];
+    for (const c of cells) {
+      const td = document.createElement("td");
+      if (c instanceof Node) { td.appendChild(c); } else { td.textContent = c; }
+      tr.appendChild(td);
+    }
+    rows.appendChild(tr);
+  }
+  document.getElementById("page").textContent =
+    `offset ${offset}（${data.records.length}件表示）`;
+  document.getElementById("prev").disabled = offset === 0;
+  document.getElementById("next").disabled = data.records.length < limit;
+}
+document.getElementById("status").addEventListener("change", () => { offset = 0; load(); });
+document.getElementById("prev").addEventListener("click", () => { offset = Math.max(0, offset - limit); load(); });
+document.getElementById("next").addEventListener("click", () => { offset += limit; load(); });
+load();
+</script>
+</body>
+</html>

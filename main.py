@@ -1362,7 +1362,11 @@ async def _process_stripe_event(event: dict) -> None:
 from hub.health_deps import router as health_deps_router  # noqa: E402
 app.include_router(health_deps_router)
 
-# ── P4-001: PWA（仮名称・認証+shell）。末尾追記は sink allowlist の行番号 pin を
-#    壊さないための規約（health_deps と同型）。/app 配下は webapp_auth が認証を担う。
+# ── P4-001/P4-002: PWA（仮名称・認証+shell+案件画面）。末尾追記は sink allowlist の
+#    行番号 pin を壊さないための規約（health_deps と同型・pin 最大行より後）。
+#    P4-002 の router は webapp_auth の catch-all（/app/{_rest:path}）より**先に**
+#    結線する必要がある（include 順=マッチ順）。認証はどちらも _gate（P4-001）が担う。
+from hub.webapp_case_views import router as case_views_router  # noqa: E402
+app.include_router(case_views_router)
 from hub.webapp_auth import router as webapp_router  # noqa: E402
 app.include_router(webapp_router)
