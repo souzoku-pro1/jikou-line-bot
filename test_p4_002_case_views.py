@@ -367,19 +367,87 @@ def _context_allowlist_violations(tree) -> list[str]:
     return violations
 
 
-def _readonly_violations(tree) -> list[str]:
-    """fix4 H01 の現行検査 = **許可文脈の閉集合方式（一次）**＋歴代検査
-    （fix2 alias 追跡＋fix3 代入遮断=防御の重畳として残置）。
-
-    残余の限界（fix4 H01-4 で限定し書き直し）: 出現ベースの遮断により静的な
-    別名・持ち出し経路は構造的に閉じた。**本当に残るのは実行時文字列からの
-    名前解決（globals()/vars() の辞書アクセス等・文字列 "kintone" は Name node
-    でないため出現検査の対象外）と C 拡張内部の呼出しのみ**。この残余は
-    sink AST policy・関所テスト・レビューで重畳防御する。
-    """
+def _readonly_violations_fix4(tree) -> list[str]:
+    """fix4 H01 時点の検査（**対照用の凍結コピー・変更しない**）。
+    出現文脈の閉集合まで=「kintone という名前への**束縛元**」は検証しないため、
+    同名 shadow 束縛（import alias・仮引数・except as・match capture 等の
+    Name node を生成しない束縛構文）を検出できない版（fix5 メタテストの基準）。"""
     return (_context_allowlist_violations(tree)
             + _readonly_violations_fix2(tree)
             + _extra_guard_violations(tree))
+
+
+def _binding_violations(tree) -> list[str]:
+    """fix5 H01: 束縛元の検証（最終ピース）。
+
+    - 正規束縛=「module 直下の `from hub import kintone`（alias なし）・
+      ちょうど 1 回」のみ許可。
+    - "kintone" という識別子への**他の全束縛**を違反化。
+
+    列挙の完全性（根拠）: Python 3.12 の AST（ASDL）で新しい識別子を束縛できる
+    構文要素は次の閉集合であり、本関数はその全てを検査する——
+    ① `Name(ctx=Store|Del)`（代入 target 全形式・for/with as・comprehension
+    target・walrus はすべてこの形に脱糖される） ② `alias.asname`／`alias.name`
+    （import 系） ③ `arg.arg`（posonly/args/kwonly/vararg/kwarg・lambda 含む——
+    仮引数は arguments 配下の arg node に一元化されている） ④
+    `ExceptHandler.name` ⑤ `FunctionDef/AsyncFunctionDef/ClassDef.name` ⑥
+    match 系 capture（`MatchAs.name`／`MatchStar.name`／`MatchMapping.rest`）
+    ⑦ `Global/Nonlocal.names`（宣言=束縛スコープの変更）。
+    これら以外に識別子を導入する AST node は存在しない（ASDL の identifier
+    フィールドを持つ node の全数）。
+    """
+    violations = []
+    canonical = 0
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            for a in node.names:
+                if a.asname == "kintone":
+                    violations.append("import alias による kintone 束縛")
+                elif a.name == "kintone" and a.asname is None:
+                    if node.module == "hub" and node in tree.body:
+                        canonical += 1
+                    else:
+                        violations.append("正規以外の from-import kintone 束縛")
+        elif isinstance(node, ast.Import):
+            for a in node.names:
+                if a.asname == "kintone" or (a.asname is None
+                                             and a.name == "kintone"):
+                    violations.append("import による kintone 束縛")
+        elif isinstance(node, ast.arg) and node.arg == "kintone":
+            violations.append("仮引数 kintone（shadow 束縛）")
+        elif isinstance(node, ast.ExceptHandler) and node.name == "kintone":
+            violations.append("except as kintone（shadow 束縛）")
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
+                               ast.ClassDef)) and node.name == "kintone":
+            violations.append("def/class 名 kintone（shadow 束縛）")
+        elif isinstance(node, (ast.MatchAs, ast.MatchStar)) \
+                and getattr(node, "name", None) == "kintone":
+            violations.append("match capture kintone（shadow 束縛）")
+        elif isinstance(node, ast.MatchMapping) and node.rest == "kintone":
+            violations.append("match mapping rest kintone（shadow 束縛）")
+        elif isinstance(node, (ast.Global, ast.Nonlocal)) \
+                and "kintone" in node.names:
+            violations.append("global/nonlocal kintone 宣言")
+        elif isinstance(node, ast.Name) and node.id == "kintone" \
+                and isinstance(node.ctx, (ast.Store, ast.Del)):
+            violations.append("代入系 target への kintone 束縛")
+    if canonical != 1:
+        violations.append(
+            f"正規束縛（module 直下 from hub import kintone）が {canonical} 回"
+            "（ちょうど 1 回であること）")
+    return violations
+
+
+def _readonly_violations(tree) -> list[str]:
+    """fix5 H01 の現行検査 = 許可文脈の閉集合＋**束縛元の検証**（正規束縛
+    ちょうど1回・他の全束縛構文を違反化）＋歴代検査（防御の重畳）。
+
+    残余の限界（fix5 で再訂正）: 束縛検証の追加により同名 shadow 束縛も閉じた。
+    **本当に残るのは実行時文字列からの名前解決（globals()/vars() の辞書アクセス
+    等・文字列 "kintone" は Name/identifier node でない）と C 拡張内部の呼出し
+    のみ**。この残余は sink AST policy・関所テスト・レビューで重畳防御する。
+    """
+    return _binding_violations(tree) + _readonly_violations_fix4(tree)
 
 
 class TestReadOnlyMachineCheck(unittest.TestCase):
@@ -495,6 +563,41 @@ class TestReadOnlyMachineCheck(unittest.TestCase):
                                  "fix3 検査は素通り（迂回が実在した証明）")
                 self.assertNotEqual(_readonly_violations(tree), [],
                                     "新検査（許可文脈閉集合）は検出すること")
+
+    def test_meta_fix5_shadow_binding_fixtures_fix4_pass_new_fail(self):
+        """fix5 H01-3: Codex 実測4形の同名 shadow 束縛（Name node を生成しない
+        束縛構文）が「fix4 検査 PASS・新（束縛検証）検査 FAIL」の三段対照。
+        各 fixture の使用箇所は許可文脈（許可 API の Call）なので、検出は
+        束縛元検証によることが分離して証明される。"""
+        fixtures = {
+            "import_alias_shadow": (
+                "import evil_module as kintone\n"
+                "kintone.get_record(1, '2')\n"),
+            "function_parameter_shadow": (
+                "def f(kintone):\n"
+                "    return kintone.get_record(1, '2')\n"),
+            "except_as_shadow": (
+                "try:\n    pass\n"
+                "except Exception as kintone:\n"
+                "    kintone.get_record(1, '2')\n"),
+            "match_capture_shadow": (
+                "def f(v):\n"
+                "    match v:\n"
+                "        case kintone:\n"
+                "            return kintone.get_record(1, '2')\n"),
+        }
+        for label, src in fixtures.items():
+            with self.subTest(fixture=label):
+                tree = ast.parse(src)
+                self.assertEqual(_readonly_violations_fix4(tree), [],
+                                 "fix4 検査は素通り（迂回が実在した証明）")
+                self.assertNotEqual(_readonly_violations(tree), [],
+                                    "新検査（束縛元検証）は検出すること")
+
+    def test_canonical_binding_exactly_once(self):
+        # fix5 H01-1: 本体 module の正規束縛がちょうど 1 回・shadow 束縛ゼロ
+        src = Path(cv.__file__).read_text(encoding="utf-8")
+        self.assertEqual(_binding_violations(ast.parse(src)), [])
 
     def test_no_direct_http_or_process_launch_imports(self):
         imported = set()
