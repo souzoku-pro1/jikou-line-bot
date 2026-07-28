@@ -11,6 +11,8 @@ fix1（P2HC-H01）: **probe 実行と結果参照を分離**する。
 RCF-M14 の教訓は維持: 依存障害・タイムアウトでも probe 結果は分類のみ・
 healthcheck 系は落とさない。露出禁止も維持: 応答・キャッシュに secret（API key）・
 内部 URL・vendor 応答本文・例外本文を含めない（分類はクラス名/HTTP status のみ）。
+HEALTH-MIN-1（R-P4-001-1 L01）: **env 名も応答へ出さない**——unconfigured は
+固定文字列 status のみ・deps 名は抽象名（vision 等）に限定。
 既存 `/health`（起動確認・import チェック）は無変更。
 """
 
@@ -51,7 +53,8 @@ async def _probe_vision() -> dict:
     例外本文・vendor 応答本文は結果に載せない。"""
     api_key = os.environ.get("GOOGLE_VISION_API_KEY", "")
     if not api_key:
-        return {"status": "unconfigured", "reason": "env GOOGLE_VISION_API_KEY unset"}
+        # HEALTH-MIN-1: 固定文字列のみ（env 名・内部識別子を応答へ出さない）
+        return {"status": "unconfigured"}
     payload = {"requests": [{"image": {"content": _PNG_1PX_B64},
                              "features": [{"type": "TEXT_DETECTION", "maxResults": 1}]}]}
     try:
