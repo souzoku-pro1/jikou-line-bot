@@ -192,15 +192,22 @@ async def execute(pending) -> tuple[str, str, str]:
         rid = state["run_id"]
         return message, str(rid) if rid is not None else "", ""
     finally:
-        # §5A: すべての終端（成功／分類済み失敗／想定外例外）でログ emit＋invalidate
+        # §5A: すべての終端（成功／分類済み失敗／想定外例外）でログ emit＋invalidate。
+        # fix1 H01: 二重 finally 構造——ログ処理（build/emit/logger）の**いかなる
+        # 例外**（表外組合せの ValueError・logger/emit 自体の想定外を含む）でも
+        # 内側 finally の invalidate へ必ず到達する。捕捉は Exception 幅・失敗時の
+        # logger.error は固定文言のみ（例外本文・値を載せない＝非露出維持）
         try:
-            logger.info("%s", build_heir_cmd_log(
-                state["run"], state["env"],
-                emit(case_record_id, "record_id", "log", "operator"),
-                state["run_id"], state["env_no"]))
-        except ValueError:
-            logger.error("[HEIR-CMD] illegal enum combination (bug)")
-        confirm.invalidate(user_id)   # 裁定8: execute_fn 内 finally・handler 無改変
+            try:
+                logger.info("%s", build_heir_cmd_log(
+                    state["run"], state["env"],
+                    emit(case_record_id, "record_id", "log", "operator"),
+                    state["run_id"], state["env_no"]))
+            except Exception:
+                logger.error(
+                    "[HEIR-CMD] log emission failed (fixed classification only)")
+        finally:
+            confirm.invalidate(user_id)   # 裁定8: 全終端で必ず実行・handler 無改変
 
 
 async def _pipeline(state: dict, case_app_id: str, case_record_id: str) -> str:

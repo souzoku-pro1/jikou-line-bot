@@ -603,6 +603,107 @@ class TestConfirmAndPending(_CmdBase):
         # 二重 OK 相当: pending が消えている＝再実行は「確認待ちなし」側に落ちる
 
 
+# ── fix1 H01: ログ処理が死んでも pending invalidate へ必ず到達（二重 finally）──
+class TestLogFailureStillInvalidates(_CmdBase):
+    """R-P3-003-CMD-IMPL-1 H01: finally 内のログ処理（logger.info／
+    build_heir_cmd_log／emit）がいかなる例外を送出しても、内側 finally の
+    confirm.invalidate に必ず到達することを pending 消滅の実測で pin。"""
+
+    def _arm_pending(self, user="U1"):
+        p = _pending(user)
+        confirm.create(user, p.parsed, p.case, "相続人を導出して")
+        self.assertTrue(confirm.has_active(user))
+        return p
+
+    def test_logger_info_runtime_error_still_invalidates(self):
+        p = self._arm_pending()
+        with patch.object(ht.logger, "info",
+                          side_effect=RuntimeError("logging backend down")):
+            msg, rid, _u = _run(ht.execute(p))
+        db.reset_for_tests()
+        self.assertIn("相続人導出を保存しました", msg)   # 本処理は完了している
+        self.assertFalse(confirm.has_active("U1"))       # invalidate 到達
+
+    def test_build_log_valueerror_still_invalidates(self):
+        # 表外組合せ相当（build_heir_cmd_log が ValueError）でも invalidate
+        p = self._arm_pending()
+        with patch.object(ht, "build_heir_cmd_log",
+                          side_effect=ValueError("illegal combination")), \
+             self.assertLogs("dispatch_bot.heir_derive_task",
+                             level="ERROR") as cap:
+            msg, rid, _u = _run(ht.execute(p))
+        db.reset_for_tests()
+        self.assertFalse(confirm.has_active("U1"))
+        # 失敗時の logger.error は固定文言のみ（例外本文・値は非露出）
+        out = "\n".join(cap.output)
+        self.assertIn("log emission failed (fixed classification only)", out)
+        self.assertNotIn("illegal combination", out)
+
+    def test_emit_unexpected_error_still_invalidates(self):
+        p = self._arm_pending()
+        with patch.object(ht, "emit",
+                          side_effect=RuntimeError("emit exploded")), \
+             self.assertLogs("dispatch_bot.heir_derive_task",
+                             level="ERROR") as cap:
+            msg, rid, _u = _run(ht.execute(p))
+        db.reset_for_tests()
+        self.assertFalse(confirm.has_active("U1"))
+        out = "\n".join(cap.output)
+        self.assertIn("log emission failed (fixed classification only)", out)
+        self.assertNotIn("emit exploded", out)
+
+
+# ── fix1 L01: §7-1 誤爆 negative の分類契約 pin ──────────────────────────────
+class TestVocabularyNegativeContract(unittest.TestCase):
+    """§7-1 誤爆 negative。parser の分類は LLM（parse_instruction・実 API）で、
+    既存 suite に分類実測の先例は無い（全 dispatch テストが parse_instruction を
+    mock）。実装可能な最も近い形として、分類を規定する**契約面**を機械 pin する:
+    (a) catalog の heir_derivation 行が「両語を含む明示指示のみ」を宣言
+    (b) parser system prompt が「該当なしは task_type=null」を指示
+    (c) 片語フレーズが正しく他タスク/null に分類された場合、handler が
+        heir_derivation へ横流ししない（keyword 迂回経路が存在しない）"""
+
+    NEGATIVE_PHRASES = ("相続人を確認して", "導出資料を表示して")
+
+    def test_catalog_declares_both_word_requirement(self):
+        with patch.dict(os.environ, {"HEIR_DERIVATION_ENABLED": "1"}):
+            catalog = registry.catalog_for_prompt()
+        line = next(ln for ln in catalog.splitlines()
+                    if "heir_derivation" in ln)
+        self.assertIn("「相続人」「導出」の両語を含む明示指示のみ", line)
+
+    def test_prompt_requires_null_when_no_match(self):
+        from dispatch_bot import parser
+        with patch.dict(os.environ, {"HEIR_DERIVATION_ENABLED": "1"}):
+            prompt = parser.build_system_prompt()
+        self.assertIn("該当するタスク種別がなければ task_type=null", prompt)
+
+    def test_handler_does_not_reroute_single_word_phrases(self):
+        # 片語フレーズが person_confirm / null に分類されたとき、heir execute が
+        # 呼ばれないこと（handler・registry に keyword 迂回が無いことの回帰 pin）
+        from dispatch_bot import handler, parser
+
+        async def _case(phrase, task_type):
+            handler.reset_sessions()
+            confirm.reset()
+            parse = {"intent": "task", "task_type": task_type,
+                     "customer_name": None, "task_params": {},
+                     "confidence": "low", "missing_fields": [],
+                     "clarification": "どの案件ですか"}
+            heir_exec = AsyncMock()
+            with patch.object(parser, "parse_instruction",
+                              new=AsyncMock(return_value=parse)), \
+                 patch.object(ht, "execute", new=heir_exec), \
+                 patch.dict(os.environ, {"HEIR_DERIVATION_ENABLED": "1"}):
+                await handler.handle_message("U9", phrase)
+            heir_exec.assert_not_awaited()
+
+        for phrase in self.NEGATIVE_PHRASES:
+            for task_type in (None, "person_confirm"):
+                with self.subTest(phrase=phrase, task_type=task_type):
+                    asyncio.run(_case(phrase, task_type))
+
+
 # ── §5A/§7-12: 想定外例外の段階分離（fix4 H01）───────────────────────────────
 class TestUnexpectedStageSeparation(_CmdBase):
     def test_before_save_unexpected(self):
