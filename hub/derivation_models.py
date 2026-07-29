@@ -169,7 +169,11 @@ for _table in ("derivation_run", "heir_confirmation_decision"):
 # 許可集合の拡張は正本 §3.5 の改定と同時にのみ行う。
 
 _RESULT_TOP_KEYS = frozenset({"heirs", "facts"})
-_RESULT_HEIR_KEYS = frozenset({"person_id", "share", "relation_key"})
+# P3-001 改定票（2026-07-30・P3-003B_DESIGN 裁定1）: heirs 行へ zokugara_code
+# （続柄区分コード・固定9値 ASCII enum）を追加。改定前 run の payload はこのキーを
+# 持たない＝版判別は payload_has_zokugara_codes（コード欠落=精密 projection 不可・
+# 要確認扱い。P3-003B §3.2「旧 run」）。
+_RESULT_HEIR_KEYS = frozenset({"person_id", "share", "relation_key", "zokugara_code"})
 _LAWYER_FLAGS_KEYS = frozenset({"flags"})
 
 # ── fix2 H01→fix3 改訂→fix4 H02: field 別 grammar/enum（自由文字列 field を残さない）──
@@ -232,6 +236,51 @@ _ZOKUGARA_TO_RELATION = {
     "再代襲（曾孫等）": "representative",
     "直系尊属": "lineal_ascendant", "兄弟姉妹": "sibling",
 }
+# ── P3-001 改定票（P3-003B_DESIGN 裁定1・§3.1/§3.2）: 続柄区分コード ──────────
+# relation_key は representative が 孫（代襲）/甥姪（代襲）/再代襲 を collapse する
+# ため App36 続柄への total 写像が成立しない。zokugara と 1:1 の固定9値 ASCII enum
+# を heirs 行へ併存保存する（値は P3-003B §3.1 表・§3.2 の凍結9値と逐語一致）。
+# 取扱い契約（§3.2 M03）: enum 閉集合（enum 外は PayloadPolicyError で保存拒否）・
+# 最小化（person_id と結合した続柄は必要範囲=続柄写像を超えて保持・流通させない。
+# PII とは断定しない）・非露出（値をログ・例外文言・業務通知へ出さない）。
+# 公開 read-only 定数（ZOKUGARA_CODES）: P3-003b 実装票の enum⇔dropdown 写像が
+# この語彙を単一の正として import する。frozenset＝不変型。拡張は正本改定と同時。
+ZOKUGARA_CODES = frozenset({
+    "spouse", "child", "lineal_ascendant", "sibling", "nephew_niece_rep",
+    "grandchild_rep", "further_rep", "fetus", "successive"})
+_ZOKUGARA_CODES = ZOKUGARA_CODES   # module 内参照用 alias（RELATION_KEYS と同型）
+# zokugara → 続柄区分コード（§3.1 表の total 写像・_ZOKUGARA_TO_RELATION と同型）
+_ZOKUGARA_TO_CODE = {
+    "配偶者": "spouse", "子": "child", "胎児": "fetus",
+    "孫（代襲）": "grandchild_rep", "甥姪（代襲）": "nephew_niece_rep",
+    "再代襲（曾孫等）": "further_rep",
+    "直系尊属": "lineal_ascendant", "兄弟姉妹": "sibling",
+}
+# 続柄区分コード → relation_key（§3.1 表の collapse 方向・両キー併存時の整合検査用）
+_CODE_TO_RELATION = {
+    "spouse": "spouse", "child": "child", "fetus": "fetus",
+    "lineal_ascendant": "lineal_ascendant", "sibling": "sibling",
+    "nephew_niece_rep": "representative", "grandchild_rep": "representative",
+    "further_rep": "representative", "successive": "successive",
+}
+# ── fix1（R-P3-001-REV-1 H01）: 数次承継ラベルの固定文法（前方一致は撤回） ──
+# 初版（f60df0d）は「数次承継」への前方一致（startswith）だったが、「数次承継XYZ」
+# 等の異常形まで successive へ黙って写像する穴（H01）のため撤回し、実生成形と厳密
+# 一致する固定文法へ置換。生成箇所は heir_derivation._apply_suji の 1 箇所のみ（逐語）:
+#   zokugara=f"数次承継（No.{person.record_id} {person.name} の"
+#            f"{sh.zokugara}）"
+# 骨格＝全角括弧・`No.`＋record_id（App34 $id と同帯 ^[0-9]{1,10}$）・空白区切りの
+# 氏名・` の`＋下位 zokugara・終端`）`。氏名・下位 zokugara は自由文字列（下位は
+# 入れ子の数次承継（…）を含む）のため非空 `.+` のみ要求し、骨格を厳密固定する。
+_SUCCESSIVE_LABEL_RE = re.compile(r"^数次承継（No\.[0-9]{1,10} .+ の.+）$")
+
+
+def _is_successive_label(zokugara) -> bool:
+    """数次承継ラベルの共通判定（fix1 H01・relation_key_of／zokugara_code_of が
+    共用する単一判定）。固定文法に合致しない形は False＝写像 miss として
+    PayloadPolicyError（fail-closed・固定文言・入力値は文言に載せない）。"""
+    return isinstance(zokugara, str) and \
+        _SUCCESSIVE_LABEL_RE.fullmatch(zokugara) is not None
 
 
 def flag_key(flag) -> str:
@@ -252,13 +301,40 @@ def fact_key(basis: str) -> str:
 
 
 def relation_key_of(zokugara) -> str:
-    """zokugara → relation_key の単一変換。数次承継（No.… の …）は前方一致。"""
-    if isinstance(zokugara, str) and zokugara.startswith("数次承継"):
+    """zokugara → relation_key の単一変換。数次承継は固定文法（_SUCCESSIVE_LABEL_RE）
+    と厳密一致のみ（初版の前方一致は fix1 H01 で撤回）。"""
+    if _is_successive_label(zokugara):
         return "successive"
     try:
         return _ZOKUGARA_TO_RELATION[zokugara]
     except (KeyError, TypeError):
         raise PayloadPolicyError("未知の zokugara: 写像に無い（拡張は正本改定と同時）")
+
+
+def zokugara_code_of(zokugara) -> str:
+    """zokugara → 続柄区分コードの単一変換（P3-001 改定票・relation_key_of と同型）。
+    数次承継は固定文法（_SUCCESSIVE_LABEL_RE）と厳密一致のみ（初版の前方一致は
+    fix1 H01 で撤回）。例外文言に zokugara の値は載せない（非露出）。"""
+    if _is_successive_label(zokugara):
+        return "successive"
+    try:
+        return _ZOKUGARA_TO_CODE[zokugara]
+    except (KeyError, TypeError):
+        raise PayloadPolicyError("未知の zokugara: 写像に無い（拡張は正本改定と同時）")
+
+
+def payload_has_zokugara_codes(payload) -> bool:
+    """版判別（P3-001 改定票・P3-003B §3.2「旧 run」）: 全 heirs 行が zokugara_code
+    を持てば True＝改定後 payload（精密 projection 可）。コード欠落行があれば False
+    ＝改定前 run 相当（精密 projection 不可・要確認扱い。粗い relation_key 写像に
+    頼らない）。heirs が空なら写像すべき行が無いため True。dict/list 構造でない
+    payload は False（安全側＝要確認）。読み取り専用・保存は行わない。"""
+    if not isinstance(payload, dict):
+        return False
+    heirs = payload.get("heirs")
+    if not isinstance(heirs, list):
+        return False
+    return all(isinstance(h, dict) and "zokugara_code" in h for h in heirs)
 
 
 def build_run_payload(derivation) -> tuple[dict, dict | None]:
@@ -282,7 +358,8 @@ def build_run_payload(derivation) -> tuple[dict, dict | None]:
 
     for h in derivation.heirs:
         entry = {"person_id": _synth_pid(h.person_id),
-                 "relation_key": relation_key_of(h.zokugara)}
+                 "relation_key": relation_key_of(h.zokugara),
+                 "zokugara_code": zokugara_code_of(h.zokugara)}
         if h.share is not None:
             entry["share"] = f"{h.share.numerator}/{h.share.denominator}"
         heirs.append(entry)
@@ -339,6 +416,16 @@ def validate_result_payload(payload) -> None:
         if "relation_key" in h:
             _check_enum(h["relation_key"], RELATION_KEYS,
                         "result_payload.heirs[*].relation_key")
+        if "zokugara_code" in h:
+            _check_enum(h["zokugara_code"], ZOKUGARA_CODES,
+                        "result_payload.heirs[*].zokugara_code")
+            # 両キー併存時は §3.1 表の collapse 整合を強制（矛盾 payload は
+            # immutable 台帳へ入れない。値は例外文言に載せない=非露出）
+            if "relation_key" in h and \
+                    _CODE_TO_RELATION[h["zokugara_code"]] != h["relation_key"]:
+                raise PayloadPolicyError(
+                    "result_payload.heirs[*]: zokugara_code と relation_key が"
+                    "写像表（P3-003B §3.1）で整合しない（保存不可）")
     # fix5 M01（裁定・契約強制）: run 内の胎児 ID 集合は {F1..Fn} と完全一致すること
     # （F1 起点・正整数・連続・重複なし。F0/先頭ゼロは _FETUS_ID_RE が構文で拒否済み）
     fetus_nums = [int(h["person_id"][len("胎児:F"):]) for h in heirs

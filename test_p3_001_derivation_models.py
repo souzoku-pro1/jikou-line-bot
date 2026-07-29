@@ -580,5 +580,290 @@ class TestFetusSequenceContract(unittest.TestCase):
         validate_result_payload(payload)                          # 連番契約も通過
 
 
+# ── P3-001 改定票（P3-003B_DESIGN 裁定1・2026-07-30）: 続柄区分コード ────────
+class TestZokugaraCodeEnum(unittest.TestCase):
+    """裁定1: heirs 行の zokugara_code は固定9値 ASCII enum の閉集合。
+    値は DRAFT_P3_003B_DESIGN §3.1 表/§3.2 の凍結9値と逐語一致（独自値名なし）。"""
+
+    # §3.2 の凍結9値（設計書と逐語一致・この定数がテスト側の対照凍結コピー）
+    FROZEN_9 = frozenset({
+        "spouse", "child", "lineal_ascendant", "sibling", "nephew_niece_rep",
+        "grandchild_rep", "further_rep", "fetus", "successive"})
+
+    def test_nine_codes_verbatim_closed_set(self):
+        from hub.derivation_models import ZOKUGARA_CODES
+        self.assertEqual(ZOKUGARA_CODES, self.FROZEN_9)
+        self.assertIsInstance(ZOKUGARA_CODES, frozenset)   # 公開定数は不変型
+
+    def test_mapping_total_over_engine_labels(self):
+        # §3.1 表: heir_derivation の生成 9 区分すべてにコードが定まる（total 写像）
+        from hub.derivation_models import (relation_key_of, zokugara_code_of)
+        expected = {
+            "配偶者": "spouse", "子": "child", "胎児": "fetus",
+            "孫（代襲）": "grandchild_rep", "甥姪（代襲）": "nephew_niece_rep",
+            "再代襲（曾孫等）": "further_rep",
+            "直系尊属": "lineal_ascendant", "兄弟姉妹": "sibling",
+            # 初版は前方一致で受理→fix1 H01 で固定文法へ撤回（本ラベルは骨格
+            # 合致のため引き続き受理される。厳密対照は TestSuccessiveLabelGrammarFix1）
+            "数次承継（No.5 花子 の 子）": "successive",
+        }
+        collapse = {"grandchild_rep": "representative",
+                    "nephew_niece_rep": "representative",
+                    "further_rep": "representative"}
+        for zoku, code in expected.items():
+            with self.subTest(zokugara=zoku):
+                self.assertEqual(zokugara_code_of(zoku), code)
+                # relation_key との整合（collapse 方向・§3.1 表と1対1）
+                self.assertEqual(collapse.get(code, code), relation_key_of(zoku))
+
+    def test_unknown_zokugara_rejected(self):
+        from hub.derivation_models import PayloadPolicyError, zokugara_code_of
+        for bad in ("親戚", "spouse", "", None, 1):   # 日本語ラベル以外は写像に無い
+            with self.subTest(zokugara=bad):
+                with self.assertRaises(PayloadPolicyError):
+                    zokugara_code_of(bad)
+
+    def test_enum_closed_set_in_validate(self):
+        from hub.derivation_models import (PayloadPolicyError,
+                                           validate_result_payload)
+        for code in sorted(self.FROZEN_9):   # 9値全数が受理される
+            with self.subTest(ok=code):
+                validate_result_payload(
+                    {"heirs": [{"person_id": "11", "zokugara_code": code}],
+                     "facts": []})
+        for bad in ("配偶者", "grandchild", "SPOUSE", "", 123, None,
+                    ["spouse"], "representative"):   # relation_key の語彙も enum 外
+            with self.subTest(bad=str(bad)[:20]):
+                with self.assertRaises(PayloadPolicyError):
+                    validate_result_payload(
+                        {"heirs": [{"person_id": "11", "zokugara_code": bad}],
+                         "facts": []})
+
+    def test_code_relation_key_consistency_enforced(self):
+        from hub.derivation_models import (PayloadPolicyError,
+                                           validate_result_payload)
+        validate_result_payload(   # §3.1 表どおりの併存は受理
+            {"heirs": [{"person_id": "11", "relation_key": "representative",
+                        "zokugara_code": "grandchild_rep"}], "facts": []})
+        for code, rel in (("grandchild_rep", "child"),
+                          ("spouse", "sibling"),
+                          ("successive", "representative")):
+            with self.subTest(code=code, rel=rel):
+                with self.assertRaises(PayloadPolicyError):
+                    validate_result_payload(
+                        {"heirs": [{"person_id": "11", "relation_key": rel,
+                                    "zokugara_code": code}], "facts": []})
+
+    def test_build_run_payload_carries_code_for_every_heir(self):
+        from fractions import Fraction
+        from types import SimpleNamespace
+
+        from hub.derivation_models import (build_run_payload,
+                                           payload_has_zokugara_codes,
+                                           validate_result_payload)
+        heirs = [SimpleNamespace(person_id="11", zokugara="配偶者",
+                                 share=Fraction(1, 2), basis=["民法890条"]),
+                 SimpleNamespace(person_id="12", zokugara="孫（代襲）",
+                                 share=Fraction(1, 4), basis=["民法887条2項"]),
+                 SimpleNamespace(person_id="13",
+                                 zokugara="数次承継（No.9 二郎 の 子）",
+                                 share=Fraction(1, 4), basis=["民法896条"])]
+        payload, _ = build_run_payload(SimpleNamespace(heirs=heirs, flags=[]))
+        self.assertEqual([h["zokugara_code"] for h in payload["heirs"]],
+                         ["spouse", "grandchild_rep", "successive"], payload)
+        validate_result_payload(payload)                    # 閉集合・整合を通過
+        self.assertTrue(payload_has_zokugara_codes(payload))   # 改定後 payload と判別
+
+
+class TestZokugaraCodeNonExposure(unittest.TestCase):
+    """§3.2 M03 非露出: person_id と結合した続柄区分の値は例外文言へ出さない
+    （既存 sink 検査と同型の sentinel 方式。PII 断定はしない=最小化対象として扱う）。"""
+
+    def _assert_sentinels_absent(self, exc, *sentinels):
+        surfaces = [str(exc), repr(exc), repr(exc.args)]
+        for s in surfaces:
+            for sent in sentinels:
+                self.assertNotIn(sent, s, surfaces)
+
+    def test_enum_violation_exposes_neither_code_nor_person_id(self):
+        from hub.derivation_models import (PayloadPolicyError,
+                                           validate_result_payload)
+        pid_sentinel = "7777777707"
+        code_sentinel = "SECRET_ZOKUGARA_SENTINEL_X"
+        with self.assertRaises(PayloadPolicyError) as ctx:
+            validate_result_payload(
+                {"heirs": [{"person_id": pid_sentinel,
+                            "zokugara_code": code_sentinel}], "facts": []})
+        self._assert_sentinels_absent(ctx.exception, pid_sentinel, code_sentinel)
+
+    def test_consistency_violation_exposes_no_values(self):
+        from hub.derivation_models import (PayloadPolicyError,
+                                           validate_result_payload)
+        pid_sentinel = "7777777708"
+        with self.assertRaises(PayloadPolicyError) as ctx:
+            validate_result_payload(
+                {"heirs": [{"person_id": pid_sentinel, "relation_key": "child",
+                            "zokugara_code": "grandchild_rep"}], "facts": []})
+        # 正当な enum 値どうしの矛盾でも、値と person_id を文言に載せない
+        self._assert_sentinels_absent(ctx.exception, pid_sentinel,
+                                      "grandchild_rep", "child")
+
+    def test_mapping_failure_exposes_no_zokugara_value(self):
+        from hub.derivation_models import PayloadPolicyError, zokugara_code_of
+        label_sentinel = "続柄SENTINEL孫X"
+        with self.assertRaises(PayloadPolicyError) as ctx:
+            zokugara_code_of(label_sentinel)
+        self._assert_sentinels_absent(ctx.exception, label_sentinel)
+
+
+class TestZokugaraCodeHashMaterial(_DbMixin):
+    """CMD 裁定5/§4B との整合: zokugara_code は result_payload 内＝result_hash
+    （canonical(result_payload)）の材料に入る。input_hash 材料列（input_*／
+    engine_version／frozen_case_version）は本改定で不変（列追加・DDL なし）。"""
+
+    def test_code_difference_changes_result_hash_material(self):
+        import hashlib
+        import json
+
+        from hub.derivation_models import validate_result_payload
+
+        def canon_sha(p):   # §1.1/§4B と同型の決定的直列化（テスト内対照実装）
+            return hashlib.sha256(json.dumps(
+                p, ensure_ascii=False, sort_keys=True,
+                separators=(",", ":")).encode("utf-8")).hexdigest()
+
+        base = {"heirs": [{"person_id": "11", "relation_key": "representative",
+                           "zokugara_code": "grandchild_rep"}], "facts": []}
+        other = {"heirs": [{"person_id": "11", "relation_key": "representative",
+                            "zokugara_code": "nephew_niece_rep"}], "facts": []}
+        validate_result_payload(base)
+        validate_result_payload(other)
+        self.assertNotEqual(canon_sha(base), canon_sha(other))   # 材料差＝別 hash
+        legacy = {"heirs": [{"person_id": "11",
+                             "relation_key": "representative"}], "facts": []}
+        validate_result_payload(legacy)
+        self.assertNotEqual(canon_sha(base), canon_sha(legacy))  # 旧形とも別 hash
+
+    def test_input_material_columns_unchanged(self):
+        # 本票は payload 内キー追加のみ。derivation_run の列集合（input_hash 材料
+        # 供給列を含む）に増減が無いことを pin（DDL/migration 無変更の構造証明）
+        self.assertEqual(set(DerivationRun.__table__.c.keys()), {
+            "id", "case_app_id", "case_record_id", "decedent_person_id",
+            "at_date", "frozen_case_version", "input_person_revisions",
+            "input_person_ids", "input_hash", "status", "rank",
+            "result_payload", "result_hash", "lawyer_flags", "provisional",
+            "supersedes_run_id", "engine_version", "created_at"})
+
+    def test_new_payload_persists_via_regular_path(self):
+        # 改定後 payload（コード入り）が正規経路（create_derivation_run）で保存到達
+        from hub.derivation_models import create_derivation_run
+        pk = _run(create_derivation_run(**_run_row(result_payload={
+            "heirs": [{"person_id": "11", "share": "1/2",
+                       "relation_key": "spouse", "zokugara_code": "spouse"}],
+            "facts": ["minpo_890"]})))
+        db.reset_for_tests()
+        self.assertIsInstance(pk, int)
+
+
+class TestZokugaraCodeVersionDiscrimination(_DbMixin):
+    """§3.2「旧 run」: 改定前 payload（コード欠落）は保存有効なまま共存し、
+    payload_has_zokugara_codes で False（精密 projection 不可＝要確認）と判別できる。
+    App36 既存レコード 0 件のため data migration は無い（判別のみで足りる）。"""
+
+    def test_discrimination_over_payload_forms(self):
+        from hub.derivation_models import payload_has_zokugara_codes
+        new = {"heirs": [{"person_id": "11", "zokugara_code": "spouse"},
+                         {"person_id": "12", "zokugara_code": "child"}],
+               "facts": []}
+        legacy = {"heirs": [{"person_id": "11", "relation_key": "spouse"}],
+                  "facts": []}
+        mixed = {"heirs": [{"person_id": "11", "zokugara_code": "spouse"},
+                           {"person_id": "12"}], "facts": []}
+        self.assertTrue(payload_has_zokugara_codes(new))
+        self.assertFalse(payload_has_zokugara_codes(legacy))    # 旧 run＝要確認側
+        self.assertFalse(payload_has_zokugara_codes(mixed))     # 1行でも欠落なら旧扱い
+        self.assertTrue(payload_has_zokugara_codes({"heirs": [], "facts": []}))
+        self.assertFalse(payload_has_zokugara_codes(None))      # 構造外は安全側
+        self.assertFalse(payload_has_zokugara_codes({"facts": []}))
+
+    def test_legacy_payload_still_persists(self):
+        # 旧形 payload の保存契約は不変（既存 run と同形の新規保存も拒否しない＝
+        # 期待値の緩和ではなく現行契約の pin。判別は projection 側の責務）
+        from hub.derivation_models import create_derivation_run
+        pk = _run(create_derivation_run(**_run_row()))   # _run_row はコード無し旧形
+        db.reset_for_tests()
+        self.assertIsInstance(pk, int)
+
+
+# ── fix1（R-P3-001-REV-1 H01）: 数次承継ラベルの固定文法対照テスト ───────────
+class TestSuccessiveLabelGrammarFix1(unittest.TestCase):
+    """H01: 数次承継の判定は実生成形と厳密一致する固定文法のみ（前方一致は撤回）。
+
+    実生成箇所は heir_derivation._apply_suji の 1 箇所（逐語）:
+        zokugara=f"数次承継（No.{person.record_id} {person.name} の"
+                 f"{sh.zokugara}）"
+    骨格＝全角括弧・No.＋数字列（^[0-9]{1,10}$）・空白・氏名・` の`＋下位区分・`）`。
+    異常形は relation_key_of／zokugara_code_of の双方で PayloadPolicyError
+    （fail-closed・固定文言・入力ラベルの全文/部分文字列を文言に載せない）。"""
+
+    OK_LABELS = (
+        "数次承継（No.5 花子 の子）",                     # 実生成形（空白なし直結）
+        "数次承継（No.9000001 山田 太郎 の配偶者）",      # 氏名に空白を含む
+        "数次承継（No.7 A の孫（代襲））",                # 下位区分が全角括弧を含む
+        "数次承継（No.3 X の数次承継（No.4 Y の子））",   # 入れ子（再帰生成形）
+        "数次承継（No.1234567890 花子 の兄弟姉妹）",      # No. 上限 10 桁
+    )
+    BAD_LABELS = (
+        "数次承継",                        # ラベルのみ（本体なし）
+        "数次承継XYZ",                     # 任意接尾（H01 の指摘形）
+        "数次承継(No.5 花子 の子)",        # 半角括弧（生成形は全角のみ）
+        "数次承継（No.）",                 # No. 直後に本体なし
+        "数次承継（No.abc 花子 の子）",    # No. が数字列でない
+        "数次承継（No.12345678901 花子 の子）",   # No. 11 桁（$id 帯超過）
+        "数次承継（No.5 花子 子）",        # 「 の」欠落
+        "数次承継（No.5 花子 の子",        # 閉じ括弧欠落
+        "数次承継（No.5 花子 の）",        # 下位区分が空
+        "数次承継（No.5 の子）",           # 氏名部欠落（生成形は氏名を挟む）
+        "数次承継（No. 5 花子 の子）",     # No. と数字の間に空白
+    )
+
+    def test_generated_skeleton_accepted_by_both(self):
+        from hub.derivation_models import relation_key_of, zokugara_code_of
+        for label in self.OK_LABELS:
+            with self.subTest(label=label):
+                self.assertEqual(relation_key_of(label), "successive")
+                self.assertEqual(zokugara_code_of(label), "successive")
+
+    def test_malformed_rejected_by_both_and_not_reflected(self):
+        from hub.derivation_models import (PayloadPolicyError, relation_key_of,
+                                           zokugara_code_of)
+        for label in self.BAD_LABELS:
+            for fn in (relation_key_of, zokugara_code_of):
+                with self.subTest(label=label, fn=fn.__name__):
+                    with self.assertRaises(PayloadPolicyError) as ctx:
+                        fn(label)
+                    # 非露出: 入力ラベルの全文が例外の str/repr/args へ非反射
+                    # （固定文言のみ。部分文字列の代表として「数次承継」も検査）
+                    for surface in (str(ctx.exception), repr(ctx.exception),
+                                    repr(ctx.exception.args)):
+                        self.assertNotIn(label, surface)
+                        self.assertNotIn("数次承継", surface)
+
+    def test_single_shared_predicate(self):
+        # 判定は 1 箇所の共通判定（_is_successive_label）に集約されている
+        # （relation_key_of / zokugara_code_of がそれぞれ独自判定を持たない構造の pin:
+        #   ソース上 startswith("数次承継") が残っていないことを機械検査）
+        import inspect
+
+        import hub.derivation_models as dm
+        src = inspect.getsource(dm)
+        self.assertNotIn('startswith("数次承継")', src)
+        self.assertNotIn("startswith('数次承継')", src)
+        # 共通判定の存在と、両関数からの参照
+        self.assertTrue(callable(dm._is_successive_label))
+        for fn in (dm.relation_key_of, dm.zokugara_code_of):
+            self.assertIn("_is_successive_label", inspect.getsource(fn))
+
+
 if __name__ == "__main__":
     unittest.main()

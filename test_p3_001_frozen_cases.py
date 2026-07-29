@@ -26,7 +26,8 @@ from unittest.mock import patch
 import hub.db as db
 from hub.derivation_models import (DerivationBase, LAWYER_FLAG_KEYS,
                                    build_run_payload, create_derivation_run,
-                                   flag_key, validate_lawyer_flags,
+                                   flag_key, payload_has_zokugara_codes,
+                                   validate_lawyer_flags,
                                    validate_result_payload)
 
 # 凍結 47 行の正解仕様クラス（09-heir-test-cases.md v0.1 の A13+B8+C5+D5+E6+F6+G4）。
@@ -156,6 +157,9 @@ class TestFrozenCasesEndToEnd(unittest.TestCase):
                 payload, flags = build_run_payload(deriv)   # 氏名・胎児ラベルはここで落ちる
                 validate_result_payload(payload)   # 記号ID残存＝予期しない出力→ここで FAIL
                 validate_lawyer_flags(flags)
+                # P3-001 改定票: 改定後 run は全 heirs 行が続柄区分コードを持つ
+                # （凍結47ケースの全 zokugara ラベルで total 写像が成立する証明）
+                self.assertTrue(payload_has_zokugara_codes(payload), (tid, payload))
                 for h in payload["heirs"]:
                     pid = h["person_id"]
                     if pid.startswith("胎児:"):

@@ -138,6 +138,21 @@ HeirConfirmationDecision に切り出す**。正本 §9.21 の human_state 等�
 - result_payload は **person_id のみ**（氏名・住所・生年月日を保持しない）。氏名等は App34/36
   参照で実行時解決。facts は導出根拠の最小限（条文キー等）に絞る。
 - schema allowlist で「許可キー以外は保存拒否」（PII 混入を構造で防ぐ・RV10 §1.2 と整合）。
+- **改定（2026-07-30・P3-001 改定票・DRAFT_P3_003B_DESIGN 裁定1/§3.2 M03）**: heirs 行へ
+  **続柄区分コード `zokugara_code`（固定9値 ASCII enum・P3-003B §3.1 表と逐語一致:
+  `spouse/child/lineal_ascendant/sibling/nephew_niece_rep/grandchild_rep/further_rep/
+  fetus/successive`）**を追加（representative の collapse を解消し App36 続柄への
+  total 写像を成立させる）。取扱い契約: (i) **enum 閉集合**——enum 外は
+  PayloadPolicyError で保存拒否（relation_key/facts と同型）。両キー併存時は
+  §3.1 表の collapse 整合（code→relation_key）も強制。 (ii) **最小化**——person_id と
+  結合した続柄は「個人に関する情報」として必要範囲（続柄写像）を超えて保持・流通
+  させない（PII とは断定しない）。 (iii) **非露出**——値をログ・例外文言・業務通知へ
+  出さない。 (iv) **hash**——zokugara_code は result_payload 内＝result_hash
+  （canonical(result_payload)・P3-003_CMD §4B）の材料に含まれる。input_hash／
+  engine_version／frozen_case_version の材料規則（CMD 裁定5）は**不変**。
+  (v) **版判別**——改定前 run の payload はコード欠落＝精密 projection 不可・要確認
+  扱い（判別は `payload_has_zokugara_codes`・App36 既存レコード 0 件のため data
+  migration なし）。
 
 ### 3.6 放棄（相続放棄）の写像（OPEN: 凍結表追補）
 - declarations.renounced の人物を App36 `状態:"放棄済み"` に写像する**方針は明記**するが、
