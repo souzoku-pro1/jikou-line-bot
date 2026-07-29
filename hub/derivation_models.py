@@ -263,6 +263,24 @@ _CODE_TO_RELATION = {
     "nephew_niece_rep": "representative", "grandchild_rep": "representative",
     "further_rep": "representative", "successive": "successive",
 }
+# ── fix1（R-P3-001-REV-1 H01）: 数次承継ラベルの固定文法（前方一致は撤回） ──
+# 初版（f60df0d）は「数次承継」への前方一致（startswith）だったが、「数次承継XYZ」
+# 等の異常形まで successive へ黙って写像する穴（H01）のため撤回し、実生成形と厳密
+# 一致する固定文法へ置換。生成箇所は heir_derivation._apply_suji の 1 箇所のみ（逐語）:
+#   zokugara=f"数次承継（No.{person.record_id} {person.name} の"
+#            f"{sh.zokugara}）"
+# 骨格＝全角括弧・`No.`＋record_id（App34 $id と同帯 ^[0-9]{1,10}$）・空白区切りの
+# 氏名・` の`＋下位 zokugara・終端`）`。氏名・下位 zokugara は自由文字列（下位は
+# 入れ子の数次承継（…）を含む）のため非空 `.+` のみ要求し、骨格を厳密固定する。
+_SUCCESSIVE_LABEL_RE = re.compile(r"^数次承継（No\.[0-9]{1,10} .+ の.+）$")
+
+
+def _is_successive_label(zokugara) -> bool:
+    """数次承継ラベルの共通判定（fix1 H01・relation_key_of／zokugara_code_of が
+    共用する単一判定）。固定文法に合致しない形は False＝写像 miss として
+    PayloadPolicyError（fail-closed・固定文言・入力値は文言に載せない）。"""
+    return isinstance(zokugara, str) and \
+        _SUCCESSIVE_LABEL_RE.fullmatch(zokugara) is not None
 
 
 def flag_key(flag) -> str:
@@ -283,8 +301,9 @@ def fact_key(basis: str) -> str:
 
 
 def relation_key_of(zokugara) -> str:
-    """zokugara → relation_key の単一変換。数次承継（No.… の …）は前方一致。"""
-    if isinstance(zokugara, str) and zokugara.startswith("数次承継"):
+    """zokugara → relation_key の単一変換。数次承継は固定文法（_SUCCESSIVE_LABEL_RE）
+    と厳密一致のみ（初版の前方一致は fix1 H01 で撤回）。"""
+    if _is_successive_label(zokugara):
         return "successive"
     try:
         return _ZOKUGARA_TO_RELATION[zokugara]
@@ -294,8 +313,9 @@ def relation_key_of(zokugara) -> str:
 
 def zokugara_code_of(zokugara) -> str:
     """zokugara → 続柄区分コードの単一変換（P3-001 改定票・relation_key_of と同型）。
-    数次承継（No.… の …）は前方一致。例外文言に zokugara の値は載せない（非露出）。"""
-    if isinstance(zokugara, str) and zokugara.startswith("数次承継"):
+    数次承継は固定文法（_SUCCESSIVE_LABEL_RE）と厳密一致のみ（初版の前方一致は
+    fix1 H01 で撤回）。例外文言に zokugara の値は載せない（非露出）。"""
+    if _is_successive_label(zokugara):
         return "successive"
     try:
         return _ZOKUGARA_TO_CODE[zokugara]

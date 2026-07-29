@@ -603,7 +603,9 @@ class TestZokugaraCodeEnum(unittest.TestCase):
             "孫（代襲）": "grandchild_rep", "甥姪（代襲）": "nephew_niece_rep",
             "再代襲（曾孫等）": "further_rep",
             "直系尊属": "lineal_ascendant", "兄弟姉妹": "sibling",
-            "数次承継（No.5 花子 の 子）": "successive",   # 前方一致
+            # 初版は前方一致で受理→fix1 H01 で固定文法へ撤回（本ラベルは骨格
+            # 合致のため引き続き受理される。厳密対照は TestSuccessiveLabelGrammarFix1）
+            "数次承継（No.5 花子 の 子）": "successive",
         }
         collapse = {"grandchild_rep": "representative",
                     "nephew_niece_rep": "representative",
@@ -791,6 +793,76 @@ class TestZokugaraCodeVersionDiscrimination(_DbMixin):
         pk = _run(create_derivation_run(**_run_row()))   # _run_row はコード無し旧形
         db.reset_for_tests()
         self.assertIsInstance(pk, int)
+
+
+# ── fix1（R-P3-001-REV-1 H01）: 数次承継ラベルの固定文法対照テスト ───────────
+class TestSuccessiveLabelGrammarFix1(unittest.TestCase):
+    """H01: 数次承継の判定は実生成形と厳密一致する固定文法のみ（前方一致は撤回）。
+
+    実生成箇所は heir_derivation._apply_suji の 1 箇所（逐語）:
+        zokugara=f"数次承継（No.{person.record_id} {person.name} の"
+                 f"{sh.zokugara}）"
+    骨格＝全角括弧・No.＋数字列（^[0-9]{1,10}$）・空白・氏名・` の`＋下位区分・`）`。
+    異常形は relation_key_of／zokugara_code_of の双方で PayloadPolicyError
+    （fail-closed・固定文言・入力ラベルの全文/部分文字列を文言に載せない）。"""
+
+    OK_LABELS = (
+        "数次承継（No.5 花子 の子）",                     # 実生成形（空白なし直結）
+        "数次承継（No.9000001 山田 太郎 の配偶者）",      # 氏名に空白を含む
+        "数次承継（No.7 A の孫（代襲））",                # 下位区分が全角括弧を含む
+        "数次承継（No.3 X の数次承継（No.4 Y の子））",   # 入れ子（再帰生成形）
+        "数次承継（No.1234567890 花子 の兄弟姉妹）",      # No. 上限 10 桁
+    )
+    BAD_LABELS = (
+        "数次承継",                        # ラベルのみ（本体なし）
+        "数次承継XYZ",                     # 任意接尾（H01 の指摘形）
+        "数次承継(No.5 花子 の子)",        # 半角括弧（生成形は全角のみ）
+        "数次承継（No.）",                 # No. 直後に本体なし
+        "数次承継（No.abc 花子 の子）",    # No. が数字列でない
+        "数次承継（No.12345678901 花子 の子）",   # No. 11 桁（$id 帯超過）
+        "数次承継（No.5 花子 子）",        # 「 の」欠落
+        "数次承継（No.5 花子 の子",        # 閉じ括弧欠落
+        "数次承継（No.5 花子 の）",        # 下位区分が空
+        "数次承継（No.5 の子）",           # 氏名部欠落（生成形は氏名を挟む）
+        "数次承継（No. 5 花子 の子）",     # No. と数字の間に空白
+    )
+
+    def test_generated_skeleton_accepted_by_both(self):
+        from hub.derivation_models import relation_key_of, zokugara_code_of
+        for label in self.OK_LABELS:
+            with self.subTest(label=label):
+                self.assertEqual(relation_key_of(label), "successive")
+                self.assertEqual(zokugara_code_of(label), "successive")
+
+    def test_malformed_rejected_by_both_and_not_reflected(self):
+        from hub.derivation_models import (PayloadPolicyError, relation_key_of,
+                                           zokugara_code_of)
+        for label in self.BAD_LABELS:
+            for fn in (relation_key_of, zokugara_code_of):
+                with self.subTest(label=label, fn=fn.__name__):
+                    with self.assertRaises(PayloadPolicyError) as ctx:
+                        fn(label)
+                    # 非露出: 入力ラベルの全文が例外の str/repr/args へ非反射
+                    # （固定文言のみ。部分文字列の代表として「数次承継」も検査）
+                    for surface in (str(ctx.exception), repr(ctx.exception),
+                                    repr(ctx.exception.args)):
+                        self.assertNotIn(label, surface)
+                        self.assertNotIn("数次承継", surface)
+
+    def test_single_shared_predicate(self):
+        # 判定は 1 箇所の共通判定（_is_successive_label）に集約されている
+        # （relation_key_of / zokugara_code_of がそれぞれ独自判定を持たない構造の pin:
+        #   ソース上 startswith("数次承継") が残っていないことを機械検査）
+        import inspect
+
+        import hub.derivation_models as dm
+        src = inspect.getsource(dm)
+        self.assertNotIn('startswith("数次承継")', src)
+        self.assertNotIn("startswith('数次承継')", src)
+        # 共通判定の存在と、両関数からの参照
+        self.assertTrue(callable(dm._is_successive_label))
+        for fn in (dm.relation_key_of, dm.zokugara_code_of):
+            self.assertIn("_is_successive_label", inspect.getsource(fn))
 
 
 if __name__ == "__main__":
