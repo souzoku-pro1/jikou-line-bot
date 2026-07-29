@@ -226,34 +226,38 @@ class TestBoundaryValidation(_MockIo):
 
 
 class TestFailureBehaviorContract(_MockIo):
-    """契約 pin（fix1 M02）: search/create/policy 失敗は例外伝播・握り潰し禁止・
-    新規起票を成功扱いにしない・例外時の追加 write ゼロ。"""
+    """契約 pin（fix1 M02 → P3-003-CMD §3B 改定〔[人]承認済み・裁定7/9〕で同時更新）:
+    失敗は段階別固定例外3種（policy/search/create）で閉じる・握り潰し禁止・
+    新規起票を成功扱いにしない・例外時の追加 write ゼロ・vendor 本文非保持・
+    except 外 raise（__context__ is None）。"""
 
-    def test_kintone_errors_propagate_unhandled(self):
+    def test_stage_exceptions_replace_raw_propagation(self):
         from hub.kintone import KintoneError
-        # create 失敗 → 送出。App30 への write は当該単票 create 1回のみ（追加 write ゼロ）
+        # create 失敗 → EnvelopeCreateUnknownError（結果不明）。
+        # App30 への write は当該単票 create 1回のみ（追加 write ゼロ）
         search = AsyncMock(return_value=[])
         create = AsyncMock(side_effect=KintoneError(500, "x", "boom"))
         with patch.dict(os.environ, _ON), \
              patch.object(he.kintone, "search_records", new=search), \
              patch.object(he.kintone, "create_record", new=create):
-            with self.assertRaises(KintoneError):
+            with self.assertRaises(he.EnvelopeCreateUnknownError):
                 _run(he.file_heir_envelope(_mk_run()))
         self.assertEqual(search.await_count, 1)
         self.assertEqual(create.await_count, 1)  # 成功扱いの戻り値は返さない=例外のみ
-        # 検索失敗 → 送出（未起票のまま・create 未到達）
+        # 検索失敗 → EnvelopeSearchError（未起票のまま・create 未到達=write 0）
         search2 = AsyncMock(side_effect=KintoneError(503, "y", "down"))
         create2 = AsyncMock()
         with patch.dict(os.environ, _ON), \
              patch.object(he.kintone, "search_records", new=search2), \
              patch.object(he.kintone, "create_record", new=create2):
-            with self.assertRaises(KintoneError):
+            with self.assertRaises(he.EnvelopeSearchError):
                 _run(he.file_heir_envelope(_mk_run()))
         create2.assert_not_awaited()
 
     def test_ack_lost_create_reconciled_on_retry(self):
-        """fix2 H02: create の通信失敗=結果不明（ACK 喪失）。kintone 側では封筒が
-        作成済みだった場合、再実行は H01 の完全一致照合で回収し二重起票しない。"""
+        """fix2 H02→§3B: create の通信失敗=結果不明（EnvelopeCreateUnknownError）。
+        kintone 側では封筒が作成済みだった場合、再実行は H01 の完全一致照合で
+        回収し二重起票しない。"""
         from hub.kintone import KintoneError
         # 1回目: create が通信例外（実際には kintone 側で封筒 No.88 が作成済み）
         search1 = AsyncMock(return_value=[])
@@ -261,7 +265,7 @@ class TestFailureBehaviorContract(_MockIo):
         with patch.dict(os.environ, _ON), \
              patch.object(he.kintone, "search_records", new=search1), \
              patch.object(he.kintone, "create_record", new=create1):
-            with self.assertRaises(KintoneError):
+            with self.assertRaises(he.EnvelopeCreateUnknownError):
                 _run(he.file_heir_envelope(_mk_run()))
         # 2回目（再実行）: 検索が「1回目で実は作成されていた封筒」を返す
         search2 = AsyncMock(return_value=[_envelope_record("88")])
@@ -272,6 +276,42 @@ class TestFailureBehaviorContract(_MockIo):
             r = _run(he.file_heir_envelope(_mk_run()))
         self.assertEqual(r, {"status": "already_filed", "record_id": "88"})
         create2.assert_not_awaited()             # 二重起票しない（完全一致照合で回収）
+
+    def test_stage_closed_set_and_wrapper_hygiene(self):
+        """§3B/§7-18: stage 値域 {policy, search, create} の閉集合 pin＋
+        sentinel 入り vendor 例外が wrapper の str/repr/args へ非残存・
+        __context__ is None・__cause__ is None（except 外 raise の実証）。"""
+        self.assertEqual(
+            {he.EnvelopePolicyError.stage, he.EnvelopeSearchError.stage,
+             he.EnvelopeCreateUnknownError.stage},
+            {"policy", "search", "create"})
+
+        sentinel = "VENDOR-SENTINEL-山田太郎-090-1234"
+        for target, exc_type in (
+                ("search_records", he.EnvelopeSearchError),
+                ("create_record", he.EnvelopeCreateUnknownError)):
+            mocks = {"search_records": AsyncMock(return_value=[]),
+                     "create_record": AsyncMock(return_value="77")}
+            mocks[target] = AsyncMock(side_effect=RuntimeError(sentinel))
+            with patch.dict(os.environ, _ON), \
+                 patch.object(he.kintone, "search_records",
+                              new=mocks["search_records"]), \
+                 patch.object(he.kintone, "create_record",
+                              new=mocks["create_record"]):
+                with self.assertRaises(exc_type) as ctx:
+                    _run(he.file_heir_envelope(_mk_run()))
+            e = ctx.exception
+            for surface in (str(e), repr(e), repr(e.args)):
+                self.assertNotIn(sentinel, surface, (target, surface))
+            self.assertIsNone(e.__context__, target)   # except 外 raise（裁定9）
+            self.assertIsNone(e.__cause__, target)
+            self.assertFalse(vars(e), "vendor 例外を属性へ保存しない（§3B）")
+
+        # policy 段: 固定例外そのもの（vendor 例外の介在なし・I/O 0）
+        with self.assertRaises(he.EnvelopePolicyError) as ctx:
+            he._validated_snapshot(_mk_run(input_hash="ZZZ"))
+        self.assertIsNone(ctx.exception.__context__)
+        self.assertEqual(he.EnvelopePolicyError.stage, "policy")
 
 
 class TestDetailClosedSet(unittest.TestCase):

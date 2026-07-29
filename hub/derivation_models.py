@@ -14,7 +14,10 @@
   訂正・再導出は新行＋supersedes_*_id の連鎖のみ（連鎖の一意性は UNIQUE で担保）。
 """
 
+import hashlib
+import json
 import re
+import unicodedata
 from datetime import datetime
 
 import sqlalchemy as sa
@@ -582,3 +585,197 @@ async def create_heir_decision(**fields) -> int:
                     "で最新 decision を指すこと）")
         r = await s.execute(sa.insert(t).values(**fields))
         return r.inserted_primary_key[0]
+
+
+# ══════════════════════════════════════════════════════════════
+# P3-003-CMD 実装票: canonical input hash（§1.1/§1.1a）・result_hash（§4B）・
+# get_current_head（§4）。置き場所は裁定4（hub/derivation_models）。
+# ══════════════════════════════════════════════════════════════
+# canonical 層の責務は「型固定＋文字面の健全性」のみ（§1.1a fix5 M01・意味検証は
+# 責務外）。違反は canonical 化中止＝PayloadPolicyError（§5A payload_policy 枠・
+# **値は非反射**で位置情報のみ）。canonical bytes は氏名・身分事項を含むため
+# **保存・ログ出力を一切しない**（blob はローカル変数のみ・hash 値だけ返す＝§7-19）。
+
+CANONICAL_SCHEMA_VERSION = 2   # §1.1 の v（fix2 で persons 展開を追加した版）
+# HeirPerson の全 engine 入力 field（§1.1 の固定 pair list・並び順この通り）。
+# エンジンへの field 追加は本定数と v の同時改定のみ（§7-20 が乖離を FAIL させる）
+CANONICAL_PERSON_FIELDS = (
+    "record_id", "name", "alive", "death_date", "death_wareki", "is_decedent",
+    "father_id", "mother_id", "adoptive_father_id", "adoptive_mother_id",
+    "born_before_parents_adoption", "events")
+CANONICAL_EVENT_FIELDS = ("kind", "date", "partner")   # LifeEvent の全 field
+
+_CANON_NUM_RE = re.compile(r"^[0-9]+$")
+_CANON_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _canon_str(value, where: str, *, allow_empty: bool = False,
+               numeric: bool = False, numeric_if_nonempty: bool = False) -> str:
+    """§1.1a: str 型固定・C0/C1 拒否・NFC 正規化・数字列 grammar。
+    違反は値を文言へ載せない（位置情報 where のみ・非反射）。"""
+    if not isinstance(value, str):
+        raise PayloadPolicyError(f"canonical: {where} は str であること（型不正）")
+    for ch in value:
+        o = ord(ch)
+        if o < 0x20 or 0x7F <= o <= 0x9F:
+            raise PayloadPolicyError(
+                f"canonical: {where} に制御文字（C0/C1）が混入（canonical 化中止）")
+    if not value:
+        if allow_empty:
+            return value          # 空文字は "" のまま保持（null と区別・§1.1）
+        raise PayloadPolicyError(f"canonical: {where} は空にできない")
+    v = unicodedata.normalize("NFC", value)
+    if numeric and not _CANON_NUM_RE.fullmatch(v):
+        raise PayloadPolicyError(f"canonical: {where} は数字列であること")
+    if numeric_if_nonempty and v and not _CANON_NUM_RE.fullmatch(v):
+        raise PayloadPolicyError(f"canonical: {where} は空か数字列であること")
+    return v
+
+
+def _canon_bool(value, where: str) -> bool:
+    if type(value) is not bool:    # §1.1a: bool のみ（int 等の暗黙変換をしない）
+        raise PayloadPolicyError(f"canonical: {where} は bool であること（型不正）")
+    return value
+
+
+def _canon_person(p, i: int) -> list:
+    w = f"persons[{i}]"
+    events = []
+    for j, ev in enumerate(getattr(p, "events", []) or []):
+        events.append([
+            _canon_str(getattr(ev, "kind", None), f"{w}.events[{j}].kind"),
+            _canon_str(getattr(ev, "date", None), f"{w}.events[{j}].date",
+                       allow_empty=True),
+            _canon_str(getattr(ev, "partner", None), f"{w}.events[{j}].partner",
+                       allow_empty=True),
+        ])
+    return [
+        ["record_id", _canon_str(getattr(p, "record_id", None),
+                                 f"{w}.record_id", numeric=True)],
+        ["name", _canon_str(getattr(p, "name", None), f"{w}.name",
+                            allow_empty=True)],
+        ["alive", _canon_str(getattr(p, "alive", None), f"{w}.alive")],
+        ["death_date", _canon_str(getattr(p, "death_date", None),
+                                  f"{w}.death_date", allow_empty=True)],
+        ["death_wareki", _canon_str(getattr(p, "death_wareki", None),
+                                    f"{w}.death_wareki", allow_empty=True)],
+        ["is_decedent", _canon_bool(getattr(p, "is_decedent", None),
+                                    f"{w}.is_decedent")],
+        ["father_id", _canon_str(getattr(p, "father_id", None), f"{w}.father_id",
+                                 allow_empty=True, numeric_if_nonempty=True)],
+        ["mother_id", _canon_str(getattr(p, "mother_id", None), f"{w}.mother_id",
+                                 allow_empty=True, numeric_if_nonempty=True)],
+        ["adoptive_father_id", _canon_str(
+            getattr(p, "adoptive_father_id", None), f"{w}.adoptive_father_id",
+            allow_empty=True, numeric_if_nonempty=True)],
+        ["adoptive_mother_id", _canon_str(
+            getattr(p, "adoptive_mother_id", None), f"{w}.adoptive_mother_id",
+            allow_empty=True, numeric_if_nonempty=True)],
+        ["born_before_parents_adoption", _canon_bool(
+            getattr(p, "born_before_parents_adoption", None),
+            f"{w}.born_before_parents_adoption")],
+        ["events", events],
+    ]
+
+
+def compute_input_hash(*, case_app_id, case_record_id, at_date, persons,
+                       person_revisions, declarations, kosekis,
+                       engine_version, frozen_case_version) -> str:
+    """§1.1 canonical schema v2 の input_hash（SHA-256 小文字 hex64）。
+
+    - 材料: persons（全 engine 入力 field）＋person_revisions（併存材料）＋
+      declarations＋kosekis＋at_date＋engine_version＋frozen_case_version（裁定5）。
+    - kosekis は (A) 採用中 JSON null 固定（裁定2・None 以外は中止）。
+    - blob 非残存（§7-19）: 直列化文字列はローカルのみ・module 変数/キャッシュ/
+      戻り値に保持しない（返すのは hash 値のみ）。
+    """
+    if kosekis is not None:
+        raise PayloadPolicyError(
+            "canonical: kosekis は (A) 採用中 JSON null 固定（裁定2・None のみ）")
+    # persons: record_id（int 昇順）で整列した固定 pair list（§1.1）
+    canon_persons = [_canon_person(p, i) for i, p in enumerate(persons)]
+    ids = [cp[0][1] for cp in canon_persons]        # 検証済み record_id
+    if len(set(ids)) != len(ids):
+        raise PayloadPolicyError("canonical: persons の record_id が重複")
+    canon_persons.sort(key=lambda cp: int(cp[0][1]))
+    # person_revisions: [record_id, revision] pair list（int 昇順・str 数字列のみ）
+    if not isinstance(person_revisions, dict):
+        raise PayloadPolicyError("canonical: person_revisions は dict であること")
+    revs = []
+    for k, v in person_revisions.items():
+        revs.append([
+            _canon_str(k, "person_revisions[].record_id", numeric=True),
+            _canon_str(v, "person_revisions[].revision", numeric=True),  # int は拒否
+        ])
+    revs.sort(key=lambda kv: int(kv[0]))
+    if {r[0] for r in revs} != set(ids):
+        raise PayloadPolicyError(
+            "canonical: person_revisions と persons の record_id 集合が不一致"
+            "（$revision 欠落・過剰は canonical 化中止）")
+    # declarations（§1.1: renounced/disqualified=文字列昇順・fetuses=入力順・
+    # adoption_kinds=key int 昇順）
+    renounced = sorted(
+        _canon_str(x, "declarations.renounced[]", numeric=True)
+        for x in getattr(declarations, "renounced", set()))
+    disqualified = sorted(
+        _canon_str(x, "declarations.disqualified[]", numeric=True)
+        for x in getattr(declarations, "disqualified", set()))
+    fetuses = [_canon_str(x, "declarations.fetuses[]")
+               for x in getattr(declarations, "fetuses", [])]
+    kinds = [[_canon_str(k, "declarations.adoption_kinds[].key", numeric=True),
+              _canon_str(v, "declarations.adoption_kinds[].value")]
+             for k, v in getattr(declarations, "adoption_kinds", {}).items()]
+    kinds.sort(key=lambda kv: int(kv[0]))
+
+    at = _canon_str(at_date, "at_date")
+    if not _CANON_DATE_RE.fullmatch(at):
+        raise PayloadPolicyError(
+            "canonical: at_date は YYYY-MM-DD（文字面のみ検査・§1.1a）")
+    canonical = {
+        "v": CANONICAL_SCHEMA_VERSION,
+        "case_app_id": _canon_str(case_app_id, "case_app_id", numeric=True),
+        "case_record_id": _canon_str(case_record_id, "case_record_id",
+                                     numeric=True),
+        "at_date": at,
+        "engine_version": _canon_str(engine_version, "engine_version"),
+        "frozen_case_version": _canon_str(frozen_case_version,
+                                          "frozen_case_version"),
+        "persons": canon_persons,
+        "person_revisions": revs,
+        "declarations": {"renounced": renounced, "disqualified": disqualified,
+                         "fetuses": fetuses, "adoption_kinds": kinds},
+        "kosekis": None,
+    }
+    blob = json.dumps(canonical, ensure_ascii=False, sort_keys=True,
+                      separators=(",", ":"))
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def compute_result_hash(result_payload) -> str:
+    """§4B: validate 通過後の result_payload を §1.1 と同一直列化で SHA-256。
+    heirs の並び順は build_run_payload の出力順を保持（list は並べ替えない）。"""
+    validate_result_payload(result_payload)
+    blob = json.dumps(result_payload, ensure_ascii=False, sort_keys=True,
+                      separators=(",", ":"))
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+async def get_current_head(case_record_id: str):
+    """現 head run（supersede されていない run）の取得（read-only・裁定4・§4）。
+
+    SELECT のみ（write なし）。single-root＋supersedes UNIQUE の DB 制約により
+    head は高々 1 行（複数返る状態は制約破壊＝one_or_none が即時に顕在化させる）。
+    無ければ None。
+    """
+    from hub.db import session_scope
+
+    t = DerivationRun.__table__
+    n = t.alias("n")
+    async with session_scope() as s:
+        row = (await s.execute(
+            sa.select(t).where(
+                t.c.case_record_id == case_record_id,
+                ~sa.exists(sa.select(n.c.id)
+                           .where(n.c.supersedes_run_id == t.c.id)),
+            ))).one_or_none()
+        return row
