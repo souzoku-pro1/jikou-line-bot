@@ -239,6 +239,17 @@ async def execute(pending) -> tuple[str, str, str]:
                 lines.append(f"・要確認 No.{rid} → 戸籍 No.{kid} に案件を紐付け")
                 if not first_id:
                     first_id, first_app = kid, APP_KOSEKI_BOOK
+            elif item.get("derivation_run_id") is not None:
+                # P3-003b fix1 M01: 相続人反映（App36）の応答整形。
+                # 財産行への誤フォールバックを解消（件数と run id のみ・PII なし）
+                line = (f"・要確認 No.{rid} → 相続人反映(App36) "
+                        f"新規{item.get('app36_inserted', 0)}件・"
+                        f"更新{item.get('app36_updated', 0)}件"
+                        f"（run #{item.get('derivation_run_id')}）")
+                held = item.get("app36_held") or 0
+                if held:
+                    line += f"・要確認{held}件（人手収束後に再反映）"
+                lines.append(line)
             else:  # S5-2.5: 財産行の生成/追記
                 zid = str(item.get("zaisan_record_id") or "")
                 action = "追記" if item.get("zaisan") == "updated" else "新規"

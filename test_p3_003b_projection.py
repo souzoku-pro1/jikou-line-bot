@@ -100,7 +100,7 @@ class _ProjBase(unittest.TestCase):
             self.created.append((app.label, dict(fields)))
             return str(900 + len(self.created))
 
-        async def fake_update(app, rid, fields):
+        async def fake_update(app, rid, fields, revision=None):
             self.updated.append((app.label, str(rid), dict(fields)))
 
         self.get = AsyncMock(side_effect=fake_get)
@@ -232,11 +232,14 @@ class TestSingleWritePathSource(unittest.TestCase):
 
     def test_app36_writes_only_inside_confirmed_handler(self):
         # hub/heir_projection の kintone write（create/update）は確定関所
-        # _resolve_heir_derivation の配下のみ（一本経路の機械検査）
+        # _resolve_heir_derivation とその行ヘルパ _project_row の配下のみ
+        # （fix1: 直前再検証の導入で行 write は _project_row へ分離。呼出し元は
+        # _resolve_heir_derivation のみであることも同時に pin＝一本経路は不変）
         import ast
         from pathlib import Path
         tree = ast.parse(Path("hub/heir_projection.py").read_text(encoding="utf-8"))
         owners = []
+        project_row_callers = []
         for top in tree.body:
             if isinstance(top, (ast.AsyncFunctionDef, ast.FunctionDef)):
                 for node in ast.walk(top):
@@ -245,8 +248,88 @@ class TestSingleWritePathSource(unittest.TestCase):
                             and node.func.attr in ("create_record",
                                                    "update_record"):
                         owners.append(top.name)
+                    if isinstance(node, ast.Name) and node.id == "_project_row" \
+                            and top.name != "_project_row":
+                        project_row_callers.append(top.name)
         self.assertTrue(owners)
-        self.assertEqual(set(owners), {"_resolve_heir_derivation"})
+        self.assertEqual(set(owners),
+                         {"_resolve_heir_derivation", "_project_row"})
+        self.assertEqual(set(project_row_callers), {"_resolve_heir_derivation"})
+
+    def test_repo_wide_app36_write_allowed_contexts(self):
+        """L01（R-P3-003B-IMPL-1）: 許可文脈閉集合——repo 全 tracked .py を走査し、
+        APP_SOUZOKUNIN（別名束縛・attribute 参照・KintoneApp("App 36…") 再構築を
+        含む）を引数に取る kintone write 呼出しが、hub/heir_projection の確定関所
+        配下（_resolve_heir_derivation／_project_row）以外に存在しないことを pin。
+        test_*.py は走査除外（mock 束縛のみ・sink AST policy の scan_repo と同じ
+        除外基準）。動的構築（env 名の文字列を実行時に組む経路）は静的検査の
+        原理的限界＝対象外（ast_policy_helpers と同じ明記方針）。"""
+        import ast
+        import subprocess
+        from pathlib import Path
+
+        write_attrs = {"create_record", "update_record", "delete_record",
+                       "create_records"}
+        allowed = {("hub/heir_projection.py", "_resolve_heir_derivation"),
+                   ("hub/heir_projection.py", "_project_row")}
+        files = subprocess.run(["git", "ls-files", "*.py"],
+                               capture_output=True, text=True,
+                               check=True).stdout.splitlines()
+        violations = []
+        for f in files:
+            name = Path(f).name
+            if name.startswith("test_"):
+                continue
+            tree = ast.parse(Path(f).read_text(encoding="utf-8"), filename=f)
+            # ── 束縛収集: APP_SOUZOKUNIN の別名（import asname／代入）＋
+            #    KintoneApp 再構築（"APP_SOUZOKUNIN"/"App 36" リテラル）──
+            bound = set()
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ImportFrom):
+                    for a in node.names:
+                        if a.name == "APP_SOUZOKUNIN":
+                            bound.add(a.asname or a.name)
+                elif isinstance(node, ast.Assign):
+                    v = node.value
+                    src = (
+                        (isinstance(v, ast.Name)
+                         and (v.id == "APP_SOUZOKUNIN" or v.id in bound))
+                        or (isinstance(v, ast.Attribute)
+                            and v.attr == "APP_SOUZOKUNIN")
+                        or (isinstance(v, ast.Call) and any(
+                            isinstance(a, ast.Constant)
+                            and isinstance(a.value, str)
+                            and ("APP_SOUZOKUNIN" in a.value
+                                 or "App 36" in a.value)
+                            for a in v.args)))
+                    if src:
+                        for t in node.targets:
+                            if isinstance(t, ast.Name):
+                                bound.add(t.id)
+            bound.add("APP_SOUZOKUNIN")   # 素の名前・attribute 形は常時対象
+
+            def _is_app36_arg(arg) -> bool:
+                if isinstance(arg, ast.Name) and arg.id in bound:
+                    return True
+                return (isinstance(arg, ast.Attribute)
+                        and arg.attr == "APP_SOUZOKUNIN")
+
+            for top in tree.body:
+                in_func = isinstance(top, (ast.FunctionDef,
+                                           ast.AsyncFunctionDef))
+                owner = top.name if in_func else "<module>"
+                for node in ast.walk(top):
+                    if not isinstance(node, ast.Call) or not node.args:
+                        continue
+                    fn = node.func
+                    attr = fn.attr if isinstance(fn, ast.Attribute) else (
+                        fn.id if isinstance(fn, ast.Name) else "")
+                    if attr in write_attrs and _is_app36_arg(node.args[0]):
+                        if (f, owner) not in allowed:
+                            violations.append(f"{f}:{node.lineno}:{owner}")
+        self.assertEqual(violations, [],
+                         "APP_SOUZOKUNIN への write が確定関所配下以外に存在:\n"
+                         + "\n".join(violations))
 
 
 # ── 関所ゲート（phase 1・すべて write 0 で中止）─────────────────────────────
@@ -478,6 +561,140 @@ class TestProjectionE2E(_ProjBase):
         r = self._resolve(_group(rid))
         self.assertEqual(r["status"], "aborted")
         self.assert_write_zero()                          # 11 の insert も起きない
+
+
+# ── fix1 H01: CAS・書込み直前再検証（R-P3-003B-IMPL-1）─────────────────────
+class TestCasAndPreWriteReverification(_ProjBase):
+    def test_supersede_between_phase1_and_decision_aborts_all(self):
+        """(a) phase 1 通過後に head が supersede された場合、CAS（同一 txn の
+        head 再検証）が検出し decision 含む write 0 で全体中止。"""
+        a = self._mk_run(_payload(_heir("11", "spouse")), ih="a" * 64)
+        b = self._mk_run(_payload(_heir("11", "spouse")), supersedes=a,
+                         ih="b" * 64)
+        # 注入: phase 1 の stale ガードには「a が head」と見せる（凍結窓の再現）。
+        # CAS は実 DB を見る（head=b）ため不一致を検出する
+        stale_head = type("H", (), {"id": a})()
+        with patch.object(hp, "get_current_head",
+                          new=AsyncMock(return_value=stale_head)):
+            r = self._resolve(_group(a))
+        self.assertEqual(r["status"], "aborted")
+        self.assertIn("前提が変化", r["reason"])
+        self.assert_write_zero()                   # decision も App36 も 0
+
+    def test_prewrite_recheck_prevents_blind_insert(self):
+        """(b) phase 1 で 0 件だった冪等キーが write 直前再検索で 1 件出現
+        → 盲目 insert しない（当該行 held・継続・封筒はクローズ）。"""
+        rid = self._mk_run(_payload(_heir("11", "spouse")))
+        race_row = {"$id": {"value": "301"},
+                    "current_derivation_run_id": {"value": "999999"},
+                    "戸籍確認済": {"value": "no"},
+                    "$revision": {"value": "5"}}
+        calls = {"n": 0}
+
+        async def racing_search(app, query, fields=None):
+            import re as _re
+            if _re.search(r'導出元人物ID = "11"', query):
+                calls["n"] += 1
+                return [] if calls["n"] == 1 else [race_row]   # 2回目=出現
+            return []
+        self.search.side_effect = racing_search
+        r = self._resolve(_group(rid))
+        self.assertEqual(r["status"], "resolved")
+        self.assertEqual(r["items"][0]["app36_inserted"], 0)
+        self.assertEqual(r["items"][0]["app36_held"], 1)
+        self.create.assert_not_awaited()           # 盲目 insert なし
+        self.alert.assert_awaited()
+        # 封筒はクローズ（部分成功・二重確定ガードの楔を作らない）
+        self.assertIn(("App 30 (発送管理)", "70",
+                       {"発送ステータス": "完了", "実行済み": "yes"}), self.updated)
+
+    def test_h10_update_revision_conflict_is_held(self):
+        """(c) H10 update の revision 楽観ロック競合 → 当該行 held（要確認分類）。"""
+        from hub.kintone import KintoneConflict
+        rid = self._mk_run(_payload(_heir("11", "spouse")))
+        self.app36_rows["11"] = [{
+            "$id": {"value": "301"},
+            "current_derivation_run_id": {"value": str(rid)},
+            "戸籍確認済": {"value": "no"},
+            "$revision": {"value": "7"}}]
+
+        async def conflicting_update(app, rid_, fields, revision=None):
+            if app.label == "App 36 (相続人)":
+                self.assertEqual(revision, "7")    # 楽観ロックが実伝搬している
+                raise KintoneConflict(409, "GAIA_CO02", "conflict")
+            self.updated.append((app.label, str(rid_), dict(fields)))
+        self.update.side_effect = conflicting_update
+        r = self._resolve(_group(rid))
+        self.assertEqual(r["status"], "resolved")
+        self.assertEqual(r["items"][0]["app36_updated"], 0)
+        self.assertEqual(r["items"][0]["app36_held"], 1)
+        self.alert.assert_awaited()
+
+    def test_happy_update_passes_revision(self):
+        rid = self._mk_run(_payload(_heir("11", "spouse")))
+        self.app36_rows["11"] = [{
+            "$id": {"value": "301"},
+            "current_derivation_run_id": {"value": str(rid)},
+            "戸籍確認済": {"value": "no"},
+            "$revision": {"value": "9"}}]
+        captured = {}
+
+        async def capturing_update(app, rid_, fields, revision=None):
+            if app.label == "App 36 (相続人)":
+                captured["revision"] = revision
+            self.updated.append((app.label, str(rid_), dict(fields)))
+        self.update.side_effect = capturing_update
+        r = self._resolve(_group(rid))
+        self.assertEqual(r["status"], "resolved")
+        self.assertEqual(captured["revision"], "9")   # 再読 revision を使用
+
+
+# ── fix1 M01: heir 成功応答の整形（review_resolve_task E2E）─────────────────
+class TestHeirResultFormatting(unittest.TestCase):
+    def test_success_reply_shows_app36_counts_not_zaisan(self):
+        from types import SimpleNamespace
+
+        from dispatch_bot import review_resolve_task as rt
+
+        async def fake_resolve(group, case_id, decided_by=""):
+            return {"status": "resolved", "case_record_id": "9",
+                    "items": [{"review_record_id": "70",
+                               "derivation_run_id": 31,
+                               "app36_inserted": 2, "app36_updated": 1,
+                               "app36_held": 0}]}
+
+        pending = SimpleNamespace(
+            user_id="ATT1",
+            parsed={"task_params": {"group_source": "heir_derivation",
+                                    "group_idem": "k", "group_items": [],
+                                    "case_record_id": "9",
+                                    "folder_name": "F9"}})
+        with patch.object(rt, "resolve_group", new=fake_resolve):
+            msg, _rid, _url = asyncio.run(rt.execute(pending))
+        self.assertIn("相続人反映(App36) 新規2件・更新1件（run #31）", msg)
+        self.assertNotIn("財産行", msg)                # 誤フォールバック解消
+        self.assertNotIn("No.None", msg)
+
+    def test_success_reply_shows_held_count(self):
+        from types import SimpleNamespace
+
+        from dispatch_bot import review_resolve_task as rt
+
+        async def fake_resolve(group, case_id, decided_by=""):
+            return {"status": "resolved", "case_record_id": "9",
+                    "items": [{"review_record_id": "70",
+                               "derivation_run_id": 31,
+                               "app36_inserted": 1, "app36_updated": 0,
+                               "app36_held": 2}]}
+
+        pending = SimpleNamespace(
+            user_id="ATT1",
+            parsed={"task_params": {"group_source": "heir_derivation",
+                                    "group_idem": "k", "group_items": [],
+                                    "case_record_id": "9"}})
+        with patch.object(rt, "resolve_group", new=fake_resolve):
+            msg, _rid, _url = asyncio.run(rt.execute(pending))
+        self.assertIn("要確認2件（人手収束後に再反映）", msg)
 
 
 # ── PII・続柄値の非露出（要件5・sentinel 方式）───────────────────────────────

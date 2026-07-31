@@ -36,8 +36,10 @@ import sqlalchemy as sa
 
 from hub import kintone
 from hub.derivation_models import (_PERSON_ID_RE, _SHARE_RE, ZOKUGARA_CODES,
-                                   DerivationRun, HeirConfirmationDecision,
-                                   create_heir_decision, get_current_head,
+                                   ChainIntegrityError, DerivationRun,
+                                   HeirConfirmationDecision,
+                                   create_confirmed_decision_for_head,
+                                   get_current_head,
                                    payload_has_zokugara_codes)
 from hub.heir_envelope import APP_SHIPPING, _unit_for_case
 from hub.redact import emit
@@ -315,15 +317,13 @@ async def _resolve_heir_derivation(group, case_record_id: str,
                                   f"収束分類={cls['action']}・書き込みなし）。"
                                   "人手手順で収束後に再確定してください"}
             if not rows:
-                row_plans.append(("insert", pid, zoku, share_disp, None, None))
+                row_plans.append((pid, zoku, share_disp))
                 continue
             row = rows[0]
             app36_id = _v(row, "$id")
             cur = _v(row, "current_derivation_run_id")
-            kakunin = _v(row, "戸籍確認済")
             if cur == str(run.id):
-                row_plans.append(("update", pid, zoku, share_disp,
-                                  app36_id, kakunin))       # 冪等ヒット＝§4A update
+                row_plans.append((pid, zoku, share_disp))   # 冪等ヒット＝§4A update
             elif not cur or not _RUN_ID_RE.fullmatch(cur) \
                     or int(cur) > _INT64_MAX:
                 await _alert_business(
@@ -334,8 +334,7 @@ async def _resolve_heir_derivation(group, case_record_id: str,
                         "reason": f"App36 No.{app36_id} の current が空または"
                                   "不正です（要確認・書き込みなし）"}
             elif int(cur) in ancestors:
-                row_plans.append(("update", pid, zoku, share_disp,
-                                  app36_id, kakunin))       # H10: 祖先→current 前進
+                row_plans.append((pid, zoku, share_disp))   # H10: 祖先→current 前進
             else:
                 # 無関係 run（祖先でも自身でもない・別系列）。子孫 run は stale
                 # ガードで本表前に弾かれている（run=head 確認済み）
@@ -346,56 +345,120 @@ async def _resolve_heir_derivation(group, case_record_id: str,
                 return {"status": "aborted",
                         "reason": f"App36 No.{app36_id} は別系列の導出に紐付いて"
                                   "います（要確認・書き込みなし）"}
-        plans.append((item, run, row_plans))
+        plans.append((item, run, ancestors, row_plans))
 
-    # ── phase 2: HCD confirmed の追記（P3-001 正規経路・run は不改変）──────────
-    for item, run, _rp in plans:
-        await create_heir_decision(
-            derivation_run_id=run.id, decision="confirmed",
-            decided_by=decided_by, decided_at=datetime.now(timezone.utc))
+    # ── phase 2: HCD confirmed の追記（fix1 H01: head CAS 付き・同一 txn 内で
+    #    再検証＋INSERT。phase 1〜2 間の supersede 窓を閉じる）────────────────────
+    for item, run, _anc, _rp in plans:
+        try:
+            await create_confirmed_decision_for_head(
+                case_record_id, derivation_run_id=run.id,
+                decided_by=decided_by, decided_at=datetime.now(timezone.utc))
+        except ChainIntegrityError:
+            return {"status": "aborted",
+                    "reason": f"run #{run.id} の確定中に前提が変化しました"
+                              "（supersede または二重確定を検出・書き込みなし）。"
+                              "最新の封筒から確定し直してください"}
 
-    # ── phase 3: App36 upsert（§4A 書込み表）＋封筒クローズ ────────────────────
+    # ── phase 3: App36 upsert（§4A 書込み表・fix1 H01: 各行 write 直前の再検証
+    #    〔冪等キー再検索＋H10 は revision 楽観ロック〕・要確認行はスキップ継続
+    #    =部分成功。§5 の1件一致状態表が行単位の意味論であることに整合）─────────
     results = []
-    for item, run, row_plans in plans:
+    for item, run, ancestors, row_plans in plans:
         unit = _unit_for_case(str(run.case_app_id))
-        inserted, updated = 0, 0
-        for op, pid, zoku, share_disp, app36_id, kakunin in row_plans:
-            fields = {
-                "続柄": zoku,
-                "データ源": "戸籍読解",
-                "current_derivation_run_id": validate_run_id_str(str(run.id)),
-                "導出元人物ID": pid,
-            }
-            if share_disp is not None:
-                fields["法定相続分"] = share_disp   # share=None は書かない（§3.3）
-            if op == "insert":
-                fields.update({
-                    "案件アプリID": str(run.case_app_id),
-                    "案件レコードID": case_record_id,
-                    "ユニット種別": unit,
-                    "戸籍確認済": "yes",   # §4A: confirmed handler は yes を書ける
-                })
-                await kintone.create_record(APP_SOUZOKUNIN, fields)
-                inserted += 1
-            else:
-                if kakunin == "no":
-                    fields["戸籍確認済"] = "yes"   # no→yes のみ（yes→no は禁止・
-                                                   # yes 既存時は field 自体含めない）
-                await kintone.update_record(APP_SOUZOKUNIN, app36_id, fields)
-                updated += 1
+        counts = {"inserted": 0, "updated": 0, "held": 0}
+        for pid, zoku, share_disp in row_plans:
+            outcome = await _project_row(run, case_record_id, unit, pid, zoku,
+                                         share_disp, ancestors)
+            counts[outcome] += 1
         await kintone.update_record(APP_SHIPPING, item.record_id, {
             "発送ステータス": STATUS_DONE,
             "実行済み": "yes",
         })
         results.append({"review_record_id": item.record_id,
                         "derivation_run_id": run.id,
-                        "app36_inserted": inserted, "app36_updated": updated})
+                        "app36_inserted": counts["inserted"],
+                        "app36_updated": counts["updated"],
+                        "app36_held": counts["held"]})
         logger.info("[HEIR-PROJ] projected review=No.%s run=%s ins=%s upd=%s "
-                    "case=%s",
+                    "held=%s case=%s",
                     emit(item.record_id, "record_id", "log", "operator"),
                     emit(str(run.id), "record_id", "log", "operator"),
-                    emit(inserted, "count", "log", "operator"),
-                    emit(updated, "count", "log", "operator"),
+                    emit(counts["inserted"], "count", "log", "operator"),
+                    emit(counts["updated"], "count", "log", "operator"),
+                    emit(counts["held"], "count", "log", "operator"),
                     emit(case_record_id, "record_id", "log", "operator"))
     return {"status": "resolved", "case_record_id": case_record_id,
             "items": results}
+
+
+async def _project_row(run, case_record_id: str, unit: str, pid: str,
+                       zoku: str, share_disp, ancestors: set[int]) -> str:
+    """1 行の App36 upsert（fix1 H01・R-P3-003B-IMPL-1: write 直前の再検証つき）。
+
+    - **insert 前再検索**: 冪等キー完全一致を write 直前に再実行し、1件以上
+      出現していれば盲目 insert しない（当該行 held＝要確認・警報）。
+    - **H10 update は revision 楽観ロック**（App30 状態機械で確立済みの型・
+      hub.kintone.update_record(revision=...)）。競合（KintoneConflict）＝
+      他プロセスが先に更新＝当該行 held。
+    - **残余（設計受容・§2.2）**: 再検索〜create の微小窓で並行 insert が成立
+      し得る（kintone に条件付き create は無い）。この残余は既実装の重複収束
+      （§5 fix3 M01: 冪等キー2件以上→書かず要確認・同一 head 限定 tiebreak
+      〔$id 最小・提示のみ〕・比較不能系は削除ゼロ）が事後回収する。
+    - 戻り値: "inserted" | "updated" | "held"（held＝当該行 write 0）。
+    """
+    rows = await kintone.search_records(
+        APP_SOUZOKUNIN,
+        f'案件レコードID = "{case_record_id}" and '
+        f'導出元人物ID = "{pid}" order by $id asc limit 2',
+        fields=["$id", "current_derivation_run_id", "戸籍確認済", "$revision"])
+    fields = {
+        "続柄": zoku,
+        "データ源": "戸籍読解",
+        "current_derivation_run_id": validate_run_id_str(str(run.id)),
+        "導出元人物ID": pid,
+    }
+    if share_disp is not None:
+        fields["法定相続分"] = share_disp       # share=None は書かない（§3.3）
+    if not rows:
+        fields.update({
+            "案件アプリID": str(run.case_app_id),
+            "案件レコードID": case_record_id,
+            "ユニット種別": unit,
+            "戸籍確認済": "yes",       # §4A: confirmed handler は yes を書ける
+        })
+        await kintone.create_record(APP_SOUZOKUNIN, fields)
+        return "inserted"
+    if len(rows) >= 2:
+        cls = classify_duplicate_rows(rows, str(run.id))
+        await _alert_business(
+            "【相続人反映: 直前再検証で冪等キー重複】\n"
+            f"案件 No.{case_record_id} / 対象行 {len(rows)} 件 / "
+            f"収束分類: {cls['action']}\n"
+            "当該行は書き込まず要確認としました（収束は人手手順）")
+        return "held"
+    row = rows[0]
+    app36_id = _v(row, "$id")
+    cur = _v(row, "current_derivation_run_id")
+    same = cur == str(run.id)
+    ancestor = (not same and _RUN_ID_RE.fullmatch(cur or "") is not None
+                and int(cur) <= _INT64_MAX and int(cur) in ancestors)
+    if not (same or ancestor):
+        # phase 1 検証後に行状態が変化（insert 競合・current 不正化・別系列化）
+        await _alert_business(
+            "【相続人反映: 直前再検証で行状態が変化】\n"
+            f"案件 No.{case_record_id} / App36 No.{app36_id}\n"
+            "当該行は書き込まず要確認としました")
+        return "held"
+    if _v(row, "戸籍確認済") == "no":
+        fields["戸籍確認済"] = "yes"   # no→yes のみ（yes 既存時は field 自体含めない）
+    try:
+        await kintone.update_record(APP_SOUZOKUNIN, app36_id, fields,
+                                    revision=_v(row, "$revision") or None)
+    except kintone.KintoneConflict:
+        await _alert_business(
+            "【相続人反映: revision 競合】\n"
+            f"案件 No.{case_record_id} / App36 No.{app36_id}\n"
+            "他プロセスが先に更新しました。当該行は書き込まず要確認としました")
+        return "held"
+    return "updated"
