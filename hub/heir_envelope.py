@@ -49,6 +49,12 @@ _DETAIL_KEYS = frozenset({
     "derivation_run_id", "case_record_id", "input_hash",
     "result_hash", "provisional", "lawyer_flags", "冪等キー",
 })
+# P3-003b fix2 M02（R-P3-003B-IMPL-2・設計改定 §9-v2）: projection が保留（held）行の
+# App34 人物 record ID（数字のみ・PII 非搭載）を**起票後に追記**できる拡張キー。
+# 起票時 detail の閉集合（_DETAIL_KEYS・_build_detail の等値ガード）は不変——
+# 本キーは確定関所（hub/heir_projection）だけが書く事後注記であり、find_existing の
+# 冪等照合（冪等キー完全一致）にも影響しない。
+DETAIL_HELD_PERSONS_KEY = "保留人物ID"
 
 
 class EnvelopePolicyError(ValueError):

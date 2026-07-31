@@ -221,7 +221,10 @@ async def execute(pending) -> tuple[str, str, str]:
     case_id = str(params.get("case_record_id") or "")
     folder = str(params.get("folder_name") or f"No{case_id}")
 
-    result = await resolve_group(group, case_id)
+    # P3-003b: 確定者識別を伝搬（heir_derivation の ATTORNEY_ALLOWLIST 検証用。
+    # 既存ハンドラは decided_by を受けない=挙動不変）
+    result = await resolve_group(group, case_id,
+                                 decided_by=getattr(pending, "user_id", ""))
     status = result.get("status")
 
     if status == "resolved":
@@ -236,6 +239,19 @@ async def execute(pending) -> tuple[str, str, str]:
                 lines.append(f"・要確認 No.{rid} → 戸籍 No.{kid} に案件を紐付け")
                 if not first_id:
                     first_id, first_app = kid, APP_KOSEKI_BOOK
+            elif item.get("derivation_run_id") is not None:
+                # P3-003b fix1 M01: 相続人反映（App36）の応答整形。
+                # 財産行への誤フォールバックを解消（件数と run id のみ・PII なし）
+                line = (f"・要確認 No.{rid} → 相続人反映(App36) "
+                        f"新規{item.get('app36_inserted', 0)}件・"
+                        f"更新{item.get('app36_updated', 0)}件"
+                        f"（run #{item.get('derivation_run_id')}）")
+                held = item.get("app36_held") or 0
+                if held:
+                    # fix2 M02: 封筒は要確認のまま残る（再開経路の案内を明示）
+                    line += (f"・要確認{held}件。収束後に同じ封筒を再確定すると"
+                             "残り行を再反映します")
+                lines.append(line)
             else:  # S5-2.5: 財産行の生成/追記
                 zid = str(item.get("zaisan_record_id") or "")
                 action = "追記" if item.get("zaisan") == "updated" else "新規"

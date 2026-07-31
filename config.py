@@ -496,10 +496,18 @@ EXPECTED_KINTONE_SCHEMA = {
             "フリガナ": {"type": "SINGLE_LINE_TEXT"},
             "続柄": {
                 "type": "DROP_DOWN",
+                # P3-003b 裁定2（2026-07-30 実機反映済み）: 孫（代襲）/
+                # 再代襲（曾孫等）/数次承継 の3値を追加（「その他」へ集約しない・計10値）
                 "required_options": ["配偶者", "子", "直系尊属", "兄弟姉妹",
-                                     "甥姪（代襲）", "受遺者（相続人外）", "その他"],
+                                     "甥姪（代襲）", "孫（代襲）",
+                                     "再代襲（曾孫等）", "数次承継",
+                                     "受遺者（相続人外）", "その他"],
             },
             "法定相続分": {"type": "SINGLE_LINE_TEXT"},
+            # P3-003b §2（2026-07-30 実機追加済み・完全一致検索可を確認済み）:
+            # H10 条件付き更新と冪等キー（案件レコードID＋導出元人物ID）の実現 field
+            "current_derivation_run_id": {"type": "SINGLE_LINE_TEXT"},
+            "導出元人物ID": {"type": "SINGLE_LINE_TEXT"},
             "住所": {"type": "SINGLE_LINE_TEXT"},
             "生年月日": {"type": "SINGLE_LINE_TEXT"},
             "本籍": {"type": "SINGLE_LINE_TEXT"},
