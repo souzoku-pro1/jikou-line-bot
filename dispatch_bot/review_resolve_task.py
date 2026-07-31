@@ -221,7 +221,10 @@ async def execute(pending) -> tuple[str, str, str]:
     case_id = str(params.get("case_record_id") or "")
     folder = str(params.get("folder_name") or f"No{case_id}")
 
-    result = await resolve_group(group, case_id)
+    # P3-003b: 確定者識別を伝搬（heir_derivation の ATTORNEY_ALLOWLIST 検証用。
+    # 既存ハンドラは decided_by を受けない=挙動不変）
+    result = await resolve_group(group, case_id,
+                                 decided_by=getattr(pending, "user_id", ""))
     status = result.get("status")
 
     if status == "resolved":

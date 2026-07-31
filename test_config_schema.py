@@ -288,8 +288,10 @@ class TestApp36Schema(unittest.TestCase):
         self.assertEqual(self.app36["app_id_env"], "APP_SOUZOKUNIN")
         self.assertEqual(self.app36["token_env"], "TOKEN_SOUZOKUNIN")
 
-    def test_field_count_is_16(self):
-        self.assertEqual(len(self.app36["fields"]), 16)
+    def test_field_count_is_18(self):
+        # P3-003b（2026-07-30 実機追加済み）: current_derivation_run_id／
+        # 導出元人物ID の2 field 追加で 16→18（時点ピンの追随は正当）
+        self.assertEqual(len(self.app36["fields"]), 18)
 
     def test_is_optional(self):
         self.assertIs(self.app36.get("optional"), True)
@@ -301,12 +303,15 @@ class TestApp36Schema(unittest.TestCase):
                          "SINGLE_LINE_TEXT")
 
     def test_zokugara_options_with_zenkaku_parens(self):
-        """続柄7値・括弧は全角（実機実出力どおり）"""
+        """続柄10値・括弧は全角（実機実出力どおり）。P3-003b 裁定2
+        （2026-07-30 実機反映済み）: 孫（代襲）/再代襲（曾孫等）/数次承継 を追加
+        （「その他」へ集約しない・時点ピンの追随は正当）"""
         f = self.app36["fields"]["続柄"]
         self.assertEqual(f["type"], "DROP_DOWN")
         self.assertEqual(set(f["required_options"]),
                          {"配偶者", "子", "直系尊属", "兄弟姉妹",
-                          "甥姪（代襲）", "受遺者（相続人外）", "その他"})
+                          "甥姪（代襲）", "孫（代襲）", "再代襲（曾孫等）",
+                          "数次承継", "受遺者（相続人外）", "その他"})
 
     def test_status_options_6(self):
         """状態6値（未成年の括弧も全角）"""

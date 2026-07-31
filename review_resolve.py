@@ -391,22 +391,34 @@ async def _resolve_bank(group: ReviewGroup, case_record_id: str) -> dict:
 
 # ハンドラ登録辞書: トップキー → (確定ハンドラ, 必要な kintone env)。
 # 将来の zaisan_sync はキー追加で載せる
+# P3-003b: heir_derivation（相続人導出封筒の確定関所）を追加（ENVELOPE_FLOW §3.1。
+# ハンドラ本体は hub/heir_projection に隔離＝App36 write の一本経路をそこへ閉じる）
+from hub.heir_projection import (  # noqa: E402（登録用 import・循環なし）
+    APP_SOUZOKUNIN,
+    _resolve_heir_derivation,
+)
+
 RESOLVERS = {
     "registry_ingest": (_resolve_registry, (APP_SHIPPING, APP_FUDOSAN, APP_ZAISAN)),
     "koseki_ingest": (_resolve_koseki, (APP_SHIPPING, APP_KOSEKI_BOOK)),
     "valuation_ingest": (_resolve_valuation,
                          (APP_SHIPPING, APP_FUDOSAN, APP_ZAISAN)),
     "bank_ingest": (_resolve_bank, (APP_SHIPPING, APP_ZAISAN)),
+    "heir_derivation": (_resolve_heir_derivation, (APP_SHIPPING, APP_SOUZOKUNIN)),
 }
 
 
-async def resolve_group(group: ReviewGroup, case_record_id: str) -> dict:
+async def resolve_group(group: ReviewGroup, case_record_id: str,
+                        decided_by: str = "") -> dict:
     """確定グループを案件へ確定する（上位=T2 から呼ばれる入口）。
 
     Returns: {"status": "resolved"|"aborted"|"unsupported"|"unavailable", ...}
     - unsupported: RESOLVERS に無いトップキー（明示応答・黙って無視しない）
     - unavailable: そのハンドラが必要とする env の未設定
     - aborted: 二重確定ガード発動（書き込みゼロで中止・理由つき）
+    - decided_by: 確定者の識別（P3-003b・heir_derivation の ATTORNEY_ALLOWLIST
+      検証に使用）。**ハンドラ固有分岐は作らない**——signature に decided_by を
+      持つハンドラへだけ渡す（能力ベース・既存4ハンドラは無変更で互換）
     """
     entry = RESOLVERS.get(group.source)
     if entry is None:
@@ -420,4 +432,7 @@ async def resolve_group(group: ReviewGroup, case_record_id: str) -> dict:
                     "reason": f"{app.label} の env（{app.app_id_env}）が未設定です"}
     if not case_record_id:
         return {"status": "aborted", "reason": "案件レコードIDが指定されていません"}
+    import inspect
+    if "decided_by" in inspect.signature(handler).parameters:
+        return await handler(group, case_record_id, decided_by=decided_by)
     return await handler(group, case_record_id)
