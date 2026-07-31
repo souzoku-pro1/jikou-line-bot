@@ -441,5 +441,57 @@ class TestModuleRootAndShell(unittest.TestCase):
         self.assertEqual(m["scope"], "/app")
 
 
+# ── MAINT-1 D（R-P4-001-3 L01・任意項目の消化）: bucket 集合の前後完全一致 ──
+class TestBucketSetExactness(unittest.TestCase):
+    """試行制限 bucket（_attempts）が、ロック発動・上限退避の前後で「意図した
+    要素以外変化しない」ことを dict 全体の完全一致で pin する（挙動変更なし・
+    テスト追加のみ・MAINT-1）。"""
+
+    def setUp(self):
+        self._saved = dict(_attempts)
+        _attempts.clear()
+
+    def tearDown(self):
+        _attempts.clear()
+        _attempts.update(self._saved)
+
+    def test_lock_trigger_changes_only_target_bucket(self):
+        now = 1000.0
+        others = {"k-unlocked": (990, 2),
+                  "k-locked": (995, ATTEMPT_LIMIT)}
+        _attempts.update(others)
+        _attempts["k-target"] = (992, ATTEMPT_LIMIT - 1)
+        webapp_auth._register_failure("k-target", now)     # ここでロック到達
+        expected = {**others, "k-target": (992, ATTEMPT_LIMIT)}
+        self.assertEqual(_attempts, expected)              # 完全一致（他要素不変）
+        self.assertTrue(webapp_auth._locked("k-target", now))
+        self.assertFalse(webapp_auth._locked("k-unlocked", now))
+
+    def test_prune_removes_only_expired_then_oldest_unlocked(self):
+        now = 10_000.0
+        win = webapp_auth.ATTEMPT_WINDOW_SECONDS
+        buckets = {
+            "k-expired": (int(now - win - 1), 3),          # ①期限切れ=掃除対象
+            "k-locked-oldest": (int(now - 500), ATTEMPT_LIMIT),   # ロック中=保全
+            "k-unlocked-old": (int(now - 400), 1),         # ②最古の非ロック=退避対象
+            "k-unlocked-new": (int(now - 100), 1),
+        }
+        _attempts.update(buckets)
+        with patch.object(webapp_auth, "MAX_BUCKETS", 3):
+            webapp_auth._register_failure("k-target", now)   # 上限超過→退避発動
+        expected = {"k-locked-oldest": (int(now - 500), ATTEMPT_LIMIT),
+                    "k-unlocked-new": (int(now - 100), 1),
+                    "k-target": (int(now), 1)}
+        self.assertEqual(_attempts, expected)   # 期限切れ+最古非ロックのみ消滅
+
+    def test_all_locked_over_limit_is_preserved_exactly(self):
+        now = 10_000.0
+        locked = {f"k-{i}": (int(now - 10 - i), ATTEMPT_LIMIT) for i in range(4)}
+        _attempts.update(locked)
+        with patch.object(webapp_auth, "MAX_BUCKETS", 2):
+            webapp_auth._prune_buckets(now)
+        self.assertEqual(_attempts, locked)     # 全ロック中=保全優先で完全不変
+
+
 if __name__ == "__main__":
     unittest.main()

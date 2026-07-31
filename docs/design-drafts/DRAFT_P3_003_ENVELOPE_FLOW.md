@@ -258,3 +258,21 @@ async def claim_execution(app: kintone.KintoneApp, record: dict) -> bool:
     already_filed として回収・二重起票しない）**。リトライ判断は
     導出コマンド側の責務（契約 pin テスト=TestFailureBehaviorContract・
     ACK 喪失回収=test_ack_lost_create_reconciled_on_retry）。
+
+## 7. 改定記録（2026-07-31・P3-003B-IMPL fix2/MAINT-1・R-P3-003B-IMPL-2/3 対応。
+遡及書き換えにしない・両時点残置）
+
+- **封筒 detail への事後追記キー「保留人物ID」（`DETAIL_HELD_PERSONS_KEY`）の追加**:
+  App36 projection（確定関所・hub/heir_projection＝P3-003B §9-v2 の resumable
+  projection）が、保留（held）行の App34 人物 record ID（数字のみ・PII 非搭載）を
+  **起票済み封筒の detail へ事後追記**できる拡張キーを設ける。
+  - **起票時 detail の閉集合（§2.1・_DETAIL_KEYS・_build_detail の等値ガード）は
+    不変**——本キーは起票時には存在せず、追記主体は heir_projection（fix2 M02）
+    のみ。初版の「detail は閉集合のみ」の記載は**起票時契約として残置**し、
+    事後注記の拡張を本節で追加する（両時点残置）。
+  - **find_existing の冪等照合への非干渉**: 照合は「トップキー heir_derivation＋
+    『冪等キー』完全一致」（§2.2/H01）のみで行われ、本キーの有無は照合結果を
+    変えない（保留人物ID 追記済み封筒も already_filed として回収される＝
+    二重起票しない。統合 pin は test_p3_003b_projection 側）。
+  - 相互参照: `DRAFT_P3_003B_DESIGN` **§9-v2**（封筒クローズ条件＝held=0 のみ・
+    held の耐久可視性は App30 キュー・再開経路）。
