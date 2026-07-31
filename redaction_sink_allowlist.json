@@ -19,6 +19,7 @@
     "daily_healthcheck.py:489:sink:logger",
     "daily_healthcheck.py:513:sink:logger",
     "daily_healthcheck.py:79:sink:logger",
+    "dispatch_bot/heir_derive_task.py:202:sink:logger",
     "dispatch_bot/review_resolve_task.py:74:sink:logger",
     "document_webhook.py:159:logger_exception",
     "hub/address_label.py:48:sink:logger",
@@ -95,7 +96,8 @@
     "units/souzoku/zaisan_sync.py:sink:logger": "P1-107b print→logger 転換・type(e).__name__ 可視の受容債務（fix2 裁定・本文はemit抑止）",
     "hub/service_auth.py:sink:httpexception": "RV-04b dual-accept ゲートの署名経路拒否。status は §6.1（401/403/400/409）・detail は固定文字列で reason 素通しなし（分岐情報を攻撃者に与えない）。機微値は出さない",
     "valuation_ingest.py:sink:httpexception": "RV-10 移行前の ingest ルータ httpexception debt（別PRで回収）",
-    "valuation_ingest.py:sink:logger": "P1-107b print→logger 転換・type(e).__name__ 可視の受容債務（fix2 裁定・本文はemit抑止）"
+    "valuation_ingest.py:sink:logger": "P1-107b print→logger 転換・type(e).__name__ 可視の受容債務（fix2 裁定・本文はemit抑止）",
+    "dispatch_bot/heir_derive_task.py:sink:logger": "P3-003-CMD §6 の [HEIR-CMD] 2軸構造化ログ。値は閉集合 enum（RUN_RESULTS/ENVELOPE_RESULTS・build_heir_cmd_log が合法組合せ表と照合し表外は ValueError）＋emit(record_id) 済み case と run/封筒 の数値 ID のみ。enum は emit の kind 語彙に無く（record_id/count は値域外＝抑止される）、PII 経路なしの理由付き恒久エントリ（hub/service_auth と同型）。非露出は test_p3_003_cmd_impl の sentinel 検査で担保"
   },
   "manifest_note": "新規(file,rule)の台帳追加は manifest への明示登録（理由付き）を必須とする（RP1107B-M01）。既存3検査(no_new/stale/monotonic)は維持。"
 }

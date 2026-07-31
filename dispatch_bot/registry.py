@@ -44,6 +44,8 @@ class TaskSpec:
                                            # （番号選択等。(handled, reply) を返す）
     execute_fn: Callable | None = None     # OK 後の実行（App 30 起票の代わり。
                                            # (message, record_id, record_url) を返す）
+    # ── P3-003-CMD 追加: 語彙一覧の可視条件（flag 連動。None=常に掲載＝既存不変）──
+    visible_fn: Callable | None = None     # False を返す間は catalog に載せない
 
 
 TASK_REGISTRY: dict[str, TaskSpec] = {}
@@ -58,9 +60,12 @@ def get_task(task_type: str | None) -> TaskSpec | None:
 
 
 def catalog_for_prompt() -> str:
-    """解析プロンプトに埋め込むタスク種別一覧（03 §5。レジストリ駆動）"""
-    answer = [s for s in TASK_REGISTRY.values() if s.answer_only]
-    filing = [s for s in TASK_REGISTRY.values() if not s.answer_only]
+    """解析プロンプトに埋め込むタスク種別一覧（03 §5。レジストリ駆動。
+    visible_fn が False の間は掲載しない＝flag OFF の語彙非公開・P3-003-CMD §2）"""
+    visible = [s for s in TASK_REGISTRY.values()
+               if s.visible_fn is None or s.visible_fn()]
+    answer = [s for s in visible if s.answer_only]
+    filing = [s for s in visible if not s.answer_only]
 
     def lines(specs):
         out = []
@@ -228,6 +233,35 @@ register(TaskSpec(
 
 # ── 要確認の確定（S5-2.5 T2。フローは dispatch_bot/review_resolve_task.py に隔離）──
 from dispatch_bot import review_resolve_task  # noqa: E402（循環回避のため末尾 import）
+
+# ── 相続人の導出（P3-003-CMD。フローは dispatch_bot/heir_derive_task.py に隔離）──
+from dispatch_bot import heir_derive_task  # noqa: E402（循環回避のため末尾 import）
+from hub.heir_envelope import heir_derivation_enabled  # noqa: E402
+
+register(TaskSpec(
+    task_type="heir_derivation",
+    display_name="相続人の導出",
+    answer_only=False,
+    destination="heir_derivation",  # DerivationRun 保存＋App30 要確認封筒（起票型ではない）
+    run_at="railway",
+    risk="低",  # 対外効果ゼロ（immutable 台帳への append＋要確認封筒のみ・削除なし）
+    auto_scope="DerivationRun 保存（App36 導出台帳・append のみ）と App30 要確認封筒の起票まで",
+    approval_scope="相続人の確定（App36 反映）は別経路（confirmed decision・P3-003b）",
+    required_fields=["customer_name"],
+    field_questions={"customer_name":
+                     "どの顧客（案件）への指示ですか？氏名を教えてください"},
+    search_apps=["SOUZOKU_KINTONE_APP_ID"],
+    artifacts="DerivationRun（App36 導出台帳）＋App30 要確認封筒",
+    adapter="HeirDerivation",
+    on_failure="失敗は固定文言で LINE 返信（分類名のみ・§5A。構造化ログ [HEIR-CMD]）",
+    hint_for_parser=("案件の相続人を戸籍人物（App 34）から機械導出する。"
+                     "「相続人」「導出」の両語を含む明示指示のみ該当"
+                     "（例:「相続人を導出して」）。customer_name に顧客名のみ入れる"),
+    required_desc="customer_name または 案件No（例: No.4）",
+    execute_fn=heir_derive_task.execute,
+    visible_fn=heir_derivation_enabled,   # flag OFF の間は語彙一覧に載せない（§2）
+))
+
 
 register(TaskSpec(
     task_type="review_resolve",

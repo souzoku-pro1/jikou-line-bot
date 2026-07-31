@@ -53,11 +53,41 @@ _DETAIL_KEYS = frozenset({
 
 class EnvelopePolicyError(ValueError):
     """起票境界の検証違反（grammar 不一致・ユニット解決不能・PII 防御）。
-    起票せず異常扱い＝kintone への write は発生しない。"""
+    起票せず異常扱い＝kintone への write は発生しない（stage="policy"・I/O 0）。"""
+
+    stage = "policy"
 
 
 class EnvelopeDetailPolicyError(EnvelopePolicyError):
     """detail が閉集合外のキーを持つ（PII/payload 混入の芽・保存前に拒否）。"""
+
+
+# ── P3-003-CMD §3B（[人]承認済み・裁定7/9）: 段階別固定例外への公開契約改定 ──
+# 失敗は stage ∈ {"policy", "search", "create"} の固定例外3種で閉じる。
+# vendor 例外は args・属性のいずれにも保持しない（message は固定文のみ）。
+# raise は vendor 例外を捕捉した except ブロックの**外**で行い、
+# __context__ is None・__cause__ is None を実際に満たす（裁定9・from None 不使用）。
+
+class EnvelopeSearchError(RuntimeError):
+    """封筒 search 段の I/O 失敗（stage="search"・write 0）。
+    再指示で封筒のみ再試行できる。vendor 例外は保持しない（§3B）。"""
+
+    stage = "search"
+
+    def __init__(self):
+        super().__init__("heir_envelope: search 段の失敗（stage=search・write 0）")
+
+
+class EnvelopeCreateUnknownError(RuntimeError):
+    """封筒 create の通信失敗＝結果不明（stage="create"・ACK 不明）。
+    「封筒未作成」とは断定できない——再指示時に冪等キーの完全一致検索が
+    reconcile を担う。vendor 例外は保持しない（§3B）。"""
+
+    stage = "create"
+
+    def __init__(self):
+        super().__init__(
+            "heir_envelope: create の結果不明（stage=create・ACK 喪失・再指示で回収）")
 
 
 def heir_derivation_enabled() -> bool:
@@ -188,12 +218,16 @@ async def file_heir_envelope(run) -> dict:
       "already_filed"（既存封筒あり・record_id=既存番号）|
       "disabled"（flag OFF・record_id=None）|
       "not_target"（status が derived/held 以外・record_id=None）}。
-    - **失敗時挙動（fix1 M02→fix2 H02 訂正・握り潰し禁止）**: **検索（search）・
-      起票（create）・検証（policy）のいずれの失敗も例外で伝播**する。握り潰して
-      正常戻り値を返すことは禁止＝**新規起票を成功扱い（"filed"）にするのは
-      create の成功応答を受領した時のみ**。
-      policy 失敗（EnvelopePolicyError/PayloadPolicyError）は kintone I/O 前に送出
-      （write ゼロ）。search 失敗時は create 未到達（write 発行ゼロ）。
+    - **失敗時挙動（fix1 M02→fix2 H02→P3-003-CMD §3B 改定〔[人]承認済み・
+      裁定7/9〕・握り潰し禁止）**: 失敗は**段階別の固定例外3種**で閉じる——
+      policy 失敗（EnvelopePolicyError/PayloadPolicyError・kintone I/O 前＝
+      write ゼロ）／search 失敗（**EnvelopeSearchError**・create 未到達＝
+      write 発行ゼロ）／create 通信失敗（**EnvelopeCreateUnknownError**＝
+      「結果不明（ACK 不明）」）。stage 値域は {"policy","search","create"} で
+      閉じ、vendor 例外は args・属性に保持せず、raise は捕捉 except の**外**
+      （__context__ is None・__cause__ is None）。握り潰して正常戻り値を返す
+      ことは禁止＝**新規起票を成功扱い（"filed"）にするのは create の成功応答を
+      受領した時のみ**。
       **create の通信失敗は「結果不明（ACK 不明）」**——POST が kintone 側で成功し
       応答のみ喪失した可能性があり、**「封筒未作成」とは断定できない**（本関数が
       発行する write は当該単票 create の 1 回のみだが、その結果の確定はしない）。
@@ -211,7 +245,15 @@ async def file_heir_envelope(run) -> dict:
     snap = _validated_snapshot(run)          # H02/M01: kintone I/O 前に検証（write ゼロ）
     unit = _unit_for_case(snap["case_app_id"])   # H03: 案件由来・解決不能は起票中止
 
-    existing = await find_existing(snap["case_record_id"], snap["input_hash"])
+    # ── search 段（§3B 改定）: vendor 例外は except 内で分類のみ・raise は外 ──
+    search_failed = False
+    existing = None
+    try:
+        existing = await find_existing(snap["case_record_id"], snap["input_hash"])
+    except Exception:                        # vendor 例外を保持しない（§3B・裁定9）
+        search_failed = True
+    if search_failed:
+        raise EnvelopeSearchError()          # except 外 → __context__ is None
     if existing:
         logger.info("[HEIR-ENV] duplicate filing blocked run=%s -> No.%s",
                     emit(str(snap["id"]), "record_id", "log", "operator"),
@@ -234,7 +276,15 @@ async def file_heir_envelope(run) -> dict:
                                          ensure_ascii=False),
     }
     # ★単票 API（create_record）必須（§1.4: 一括 API は「レコード追加」Webhook 非発射）
-    rid = str(await kintone.create_record(APP_SHIPPING, fields))
+    # ── create 段（§3B 改定）: 通信失敗＝結果不明（ACK 不明・断定しない）──
+    create_failed = False
+    rid = None
+    try:
+        rid = str(await kintone.create_record(APP_SHIPPING, fields))
+    except Exception:                        # vendor 例外を保持しない（§3B・裁定9）
+        create_failed = True
+    if create_failed:
+        raise EnvelopeCreateUnknownError()   # except 外 → __context__ is None
     logger.info("[HEIR-ENV] filed App30 No.%s run=%s",
                 emit(rid, "record_id", "log", "operator"),
                 emit(str(snap["id"]), "record_id", "log", "operator"))

@@ -27,6 +27,12 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from fractions import Fraction
 
+# ── P3-003-CMD 裁定3（2026-07-27・[人]・凍結エンジンへの承認変更として記録）──
+# canonical input hash（DRAFT_P3_003_CMD §1.1）の材料となる版定数。
+# ロジックは無改変（定数追加のみ）。値の変更は承認変更として記録する。
+FROZEN_CASE_VERSION = "v0.1"    # 凍結テストケース表 09-heir-test-cases.md の版
+ENGINE_VERSION = "r4-3.v1"      # 導出エンジン自体の版（本 module の凍結実装）
+
 
 @dataclass(frozen=True)
 class LifeEvent:
