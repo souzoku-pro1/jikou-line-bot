@@ -341,3 +341,30 @@ current_derivation_run_id に依存するため、移行を点火ゲートとし
    残る（kintone に条件付き create は無い）。既定の重複収束（§5 fix3 M01: 2 件
    以上＝書かず要確認・同一 head 限定 tiebreak〔$id 最小・提示のみ〕・比較不能系は
    削除ゼロ・機械は削除しない）が事後回収する。
+
+### 9-v2. 改定記録 v2（2026-07-31・P3-003B-IMPL fix2・R-P3-003B-IMPL-2
+H01-R2/M02 対応・司令塔の設計改定。遡及書き換えにしない・両時点残置）
+
+1. **§9-3 の「held 発生でも封筒クローズ（部分成功）」判断は撤回**（fix1 時点の
+   記録として残置）。楔（decision 記録済み＋再指示不能）の解消手段を
+   「封筒クローズ」から**確定ハンドラの再開可能化（resumable projection）**へ
+   変更する。
+2. **二重確定ガードの意味の限定（M02）**: 「同一 run への新しい root decision の
+   重複作成を防ぐ」に限定する。root decision 既存でも、run が依然 head かつ封筒が
+   未クローズであれば中止せず、**decision 作成をスキップして phase 3（projection）
+   のみ再実行**する正規の再開経路とする（phase 3 は直前再検証＋same-run 冪等
+   ヒットにより再実行安全）。run が head でない場合は従来どおり stale 中止。
+3. **phase 2 のグループ原子化（H01-R2）**: グループ内全 item の confirmed
+   decision を**単一 DB トランザクション**で処理する（一括 CAS 再検証→一括
+   INSERT→一括 commit・`create_confirmed_decisions_for_heads`）。途中の
+   ChainIntegrityError 等は**全体 rollback**＝decision 含む write 0 で全体中止。
+   同一 run を参照する複数封筒は **1 decision に重複排除**し同一結果で扱う。
+4. **封筒クローズ条件（M02）**: クローズ（完了／実行済み yes）は **held=0 かつ
+   全行 projection 完了の場合のみ**。held>0 は封筒を要確認のまま残す
+   （held の耐久可視性は既存 App30 キューが担う）。封筒 detail へ保留行の
+   **人物 record ID（数字のみ・PII 非搭載・キー「保留人物ID」＝P3-003a detail
+   閉集合への事後注記拡張）**を追記し、操作者が対象行を特定できるようにする。
+   応答は「要確認 N 件。収束後に同じ封筒を再確定すると残り行を再反映します」。
+5. **収束性**: 同一 run の重複封筒（TOCTOU 由来）を後から確定した場合も、再開
+   経路により phase 3 が冪等に走り（全行 same-run ヒット＝§4A update の再適用・
+   新規行を作らない）、当該封筒がクローズされて収束する。

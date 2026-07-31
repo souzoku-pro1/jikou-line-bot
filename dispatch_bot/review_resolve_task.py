@@ -248,7 +248,9 @@ async def execute(pending) -> tuple[str, str, str]:
                         f"（run #{item.get('derivation_run_id')}）")
                 held = item.get("app36_held") or 0
                 if held:
-                    line += f"・要確認{held}件（人手収束後に再反映）"
+                    # fix2 M02: 封筒は要確認のまま残る（再開経路の案内を明示）
+                    line += (f"・要確認{held}件。収束後に同じ封筒を再確定すると"
+                             "残り行を再反映します")
                 lines.append(line)
             else:  # S5-2.5: 財産行の生成/追記
                 zid = str(item.get("zaisan_record_id") or "")

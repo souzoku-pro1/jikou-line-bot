@@ -760,47 +760,59 @@ def compute_result_hash(result_payload) -> str:
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
-async def create_confirmed_decision_for_head(case_record_id: str,
-                                             **fields) -> int:
-    """head CAS 付き confirmed decision INSERT（P3-003b fix1 H01・R-P3-003B-IMPL-1）。
+async def create_confirmed_decisions_for_heads(case_record_id: str,
+                                               run_ids: list[int], *,
+                                               decided_by: str,
+                                               decided_at) -> dict[int, str]:
+    """グループ原子化された head CAS 付き confirmed decision INSERT
+    （P3-003b fix1 H01 → fix2 H01-R2/M02・R-P3-003B-IMPL-2）。
 
-    同一 DB トランザクション内で「現 head の run_id == fields['derivation_run_id']」
-    を再検証してから root decision を INSERT する——phase 1（読取検証）と INSERT の
-    間に run が supersede された窓を閉じる。不一致・root decision 既存は
-    ChainIntegrityError（write 0）。
+    - **単一 DB トランザクション**で処理: 各 run_id について「現 head の run_id と
+      一致」を再検証（CAS）→ root decision 未存在なら INSERT。**途中の失敗は
+      ChainIntegrityError で全体 rollback**（decision 含む write 0）。
+    - 重複 run_id は 1 decision に**重複排除**（同一 run を参照する複数封筒は
+      同一結果で扱う・fix2 H01-R2）。
+    - **root decision 既存の run は INSERT をスキップして "resumed" を返す**
+      （fix2 M02: 二重確定ガードの意味を「同一 run への新しい root decision の
+      重複作成を防ぐ」に限定＝decision 既存時の projection 再実行は正規の再開経路）。
+    - 戻り値: {run_id: "created" | "resumed"}。
 
     残余（受容・重畳担保）: PG read-committed 下では本 txn の SELECT 後に並行
     supersede が commit する超微小窓が理論上残るが、single-root／supersedes
-    UNIQUE の DB 制約と、次回確定時の stale／二重確定ガード
-    （uq_heir_decision_single_root）が重畳で矛盾を遮断する。
+    UNIQUE・uq_heir_decision_single_root の DB 制約と次回確定時の stale ガードが
+    重畳で矛盾を遮断する。
     """
     from hub.db import session_scope
 
-    run_id = fields.get("derivation_run_id")
     t = HeirConfirmationDecision.__table__
     rt = DerivationRun.__table__
     n = rt.alias("n")
-    async with session_scope() as s:
-        head = (await s.execute(
-            sa.select(rt.c.id).where(
-                rt.c.case_record_id == case_record_id,
-                ~sa.exists(sa.select(n.c.id)
-                           .where(n.c.supersedes_run_id == rt.c.id)),
-            ))).one_or_none()
-        if head is None or head.id != run_id:
-            raise ChainIntegrityError(
-                "確定対象 run が head ではなくなっています"
-                "（supersede 検出・CAS 中止・write 0）")
-        root = (await s.execute(
-            sa.select(t.c.id).where(
-                t.c.derivation_run_id == run_id,
-                t.c.supersedes_decision_id.is_(None)).limit(1))).first()
-        if root is not None:
-            raise ChainIntegrityError(
-                "同一 run に root decision が既に存在（二重確定・CAS 中止）")
-        r = await s.execute(sa.insert(t).values(
-            decision="confirmed", **fields))
-        return r.inserted_primary_key[0]
+    unique_ids = list(dict.fromkeys(run_ids))
+    out: dict[int, str] = {}
+    async with session_scope() as s:      # 例外＝全体 rollback（session_scope 契約）
+        for run_id in unique_ids:
+            head = (await s.execute(
+                sa.select(rt.c.id).where(
+                    rt.c.case_record_id == case_record_id,
+                    ~sa.exists(sa.select(n.c.id)
+                               .where(n.c.supersedes_run_id == rt.c.id)),
+                ))).one_or_none()
+            if head is None or head.id != run_id:
+                raise ChainIntegrityError(
+                    "確定対象 run が head ではなくなっています"
+                    "（supersede 検出・CAS 中止・グループ全体 rollback）")
+            root = (await s.execute(
+                sa.select(t.c.id).where(
+                    t.c.derivation_run_id == run_id,
+                    t.c.supersedes_decision_id.is_(None)).limit(1))).first()
+            if root is not None:
+                out[run_id] = "resumed"   # 再開経路（INSERT せず projection のみ）
+                continue
+            await s.execute(sa.insert(t).values(
+                derivation_run_id=run_id, decision="confirmed",
+                decided_by=decided_by, decided_at=decided_at))
+            out[run_id] = "created"
+    return out
 
 
 async def get_current_head(case_record_id: str):

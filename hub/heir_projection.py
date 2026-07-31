@@ -23,10 +23,18 @@
 - **重複収束**（§5 fix3 M01）: 冪等キー 2 件以上一致は書かず要確認。削除を伴う
   収束の提示は「両行の current が同一 head と確認できた場合の $id 最小 tiebreak」
   に限る。比較不能系は削除ゼロ。**機械は削除しない**（提示のみ・実施は[人]）。
+- **再開可能 projection（fix2 M02・設計改定 §9-v2）**: root decision 既存でも
+  run が head かつ封筒未クローズなら中止せず、decision 作成をスキップして
+  phase 3 のみ再実行（直前再検証＋same-run 冪等ヒットにより再実行安全）。
+  封筒クローズは **held=0 の場合のみ**——held>0 は封筒を要確認のまま残し
+  （耐久可視性は App30 キュー）、detail へ保留人物 record ID を追記。
+  phase 2 はグループ全 item を単一 txn で一括 CAS＋一括 INSERT（fix2 H01-R2・
+  途中失敗は全体 rollback＝decision 含む write 0・同一 run は 1 decision に排除）。
 - **PII 規律**: 応答・ログ・警報は件数・record_id・run id のみ
   （氏名・続柄値・payload 値を載せない＝P3-001 非露出契約と同じ規律）。
 """
 
+import json
 import logging
 import os
 import re
@@ -38,10 +46,11 @@ from hub import kintone
 from hub.derivation_models import (_PERSON_ID_RE, _SHARE_RE, ZOKUGARA_CODES,
                                    ChainIntegrityError, DerivationRun,
                                    HeirConfirmationDecision,
-                                   create_confirmed_decision_for_head,
+                                   create_confirmed_decisions_for_heads,
                                    get_current_head,
                                    payload_has_zokugara_codes)
-from hub.heir_envelope import APP_SHIPPING, _unit_for_case
+from hub.heir_envelope import (APP_SHIPPING, DETAIL_HELD_PERSONS_KEY,
+                               _unit_for_case)
 from hub.redact import emit
 
 logger = logging.getLogger("hub.heir_projection")
@@ -165,17 +174,6 @@ async def _load_run(run_id: int):
             sa.select(t).where(t.c.id == run_id))).one_or_none()
 
 
-async def _has_root_decision(run_id: int) -> bool:
-    from hub.db import session_scope
-    t = HeirConfirmationDecision.__table__
-    async with session_scope() as s:
-        row = (await s.execute(
-            sa.select(t.c.id).where(
-                t.c.derivation_run_id == run_id,
-                t.c.supersedes_decision_id.is_(None)).limit(1))).first()
-        return row is not None
-
-
 async def _ancestor_ids(run_row) -> set[int]:
     """run の supersedes 連鎖の祖先 id 集合（自身は含まない・read-only）。"""
     from hub.db import session_scope
@@ -236,11 +234,11 @@ async def _resolve_heir_derivation(group, case_record_id: str,
             return {"status": "aborted",
                     "reason": f"run #{rid_str} が確定対象ではありません"
                               "（案件不一致または対象外 status・書き込みなし）"}
-        # 二重確定ガード（DB 側・uq_heir_decision_single_root と重畳）
-        if await _has_root_decision(run.id):
-            return {"status": "aborted",
-                    "reason": f"run #{run.id} は確定済みです（二重確定を防止・"
-                              "書き込みなし）"}
+        # fix2 M02（設計改定 §9-v2）: root decision 既存はここでは中止しない——
+        # run が依然 head（下の stale ガード）かつ封筒が未クローズ（上の再読で
+        # 確認済み）なら**再開経路**（decision 作成をスキップして projection のみ
+        # 再実行）。二重確定ガードの意味は「同一 run への新しい root decision の
+        # 重複作成を防ぐ」に限定し、phase 2 の一括 CAS 関数内で強制する
         # stale ガード（§3.3・decision INSERT より前＝宙吊り確定を作らない）
         head = await get_current_head(case_record_id)
         if head is None or head.id != run.id:
@@ -347,46 +345,67 @@ async def _resolve_heir_derivation(group, case_record_id: str,
                                   "います（要確認・書き込みなし）"}
         plans.append((item, run, ancestors, row_plans))
 
-    # ── phase 2: HCD confirmed の追記（fix1 H01: head CAS 付き・同一 txn 内で
-    #    再検証＋INSERT。phase 1〜2 間の supersede 窓を閉じる）────────────────────
-    for item, run, _anc, _rp in plans:
-        try:
-            await create_confirmed_decision_for_head(
-                case_record_id, derivation_run_id=run.id,
-                decided_by=decided_by, decided_at=datetime.now(timezone.utc))
-        except ChainIntegrityError:
-            return {"status": "aborted",
-                    "reason": f"run #{run.id} の確定中に前提が変化しました"
-                              "（supersede または二重確定を検出・書き込みなし）。"
-                              "最新の封筒から確定し直してください"}
+    # ── phase 2: HCD confirmed の一括追記（fix2 H01-R2: グループ全 item を単一
+    #    DB トランザクションで一括 CAS→一括 INSERT。途中失敗は全体 rollback＝
+    #    decision 含む write 0。同一 run 参照の複数封筒は 1 decision に重複排除。
+    #    root decision 既存 run は "resumed"＝INSERT せず phase 3 のみ再実行）──────
+    try:
+        await create_confirmed_decisions_for_heads(
+            case_record_id, [run.id for _i, run, _a, _rp in plans],
+            decided_by=decided_by, decided_at=datetime.now(timezone.utc))
+    except ChainIntegrityError:
+        return {"status": "aborted",
+                "reason": "確定中に前提が変化しました（supersede を検出・グループ"
+                          "全体を中止・書き込みなし）。最新の封筒から確定し直して"
+                          "ください"}
 
     # ── phase 3: App36 upsert（§4A 書込み表・fix1 H01: 各行 write 直前の再検証
-    #    〔冪等キー再検索＋H10 は revision 楽観ロック〕・要確認行はスキップ継続
-    #    =部分成功。§5 の1件一致状態表が行単位の意味論であることに整合）─────────
+    #    〔冪等キー再検索＋H10 は revision 楽観ロック〕・要確認行はスキップ継続）──
+    #    fix2 M02（設計改定 §9-v2・fix1 の「held でもクローズ」は撤回）:
+    #    封筒クローズは **held=0 かつ全行 projection 完了の場合のみ**。held>0 は
+    #    封筒を要確認のまま残し（耐久可視性は App30 キュー）、封筒 detail へ
+    #    保留行の人物 record ID（数字のみ・PII 非搭載）を追記。収束後に**同じ封筒を
+    #    再確定**すると再開経路（resumed）で残り行だけが再反映される
     results = []
     for item, run, ancestors, row_plans in plans:
         unit = _unit_for_case(str(run.case_app_id))
         counts = {"inserted": 0, "updated": 0, "held": 0}
+        held_pids: list[str] = []
         for pid, zoku, share_disp in row_plans:
             outcome = await _project_row(run, case_record_id, unit, pid, zoku,
                                          share_disp, ancestors)
             counts[outcome] += 1
-        await kintone.update_record(APP_SHIPPING, item.record_id, {
-            "発送ステータス": STATUS_DONE,
-            "実行済み": "yes",
-        })
+            if outcome == "held":
+                held_pids.append(pid)
+        closed = counts["held"] == 0
+        if closed:
+            await kintone.update_record(APP_SHIPPING, item.record_id, {
+                "発送ステータス": STATUS_DONE,
+                "実行済み": "yes",
+            })
+        else:
+            # held の耐久可視性: 封筒は要確認のまま・detail へ保留人物 ID を追記
+            # （操作者が対象行を特定できる・値は App34 person record ID の数字のみ）
+            detail = dict(item.detail)
+            detail[DETAIL_HELD_PERSONS_KEY] = held_pids
+            await kintone.update_record(APP_SHIPPING, item.record_id, {
+                "チャネル固有データ": json.dumps({"heir_derivation": detail},
+                                                 ensure_ascii=False),
+            })
         results.append({"review_record_id": item.record_id,
                         "derivation_run_id": run.id,
                         "app36_inserted": counts["inserted"],
                         "app36_updated": counts["updated"],
-                        "app36_held": counts["held"]})
+                        "app36_held": counts["held"],
+                        "envelope_closed": closed})
         logger.info("[HEIR-PROJ] projected review=No.%s run=%s ins=%s upd=%s "
-                    "held=%s case=%s",
+                    "held=%s closed=%s case=%s",
                     emit(item.record_id, "record_id", "log", "operator"),
                     emit(str(run.id), "record_id", "log", "operator"),
                     emit(counts["inserted"], "count", "log", "operator"),
                     emit(counts["updated"], "count", "log", "operator"),
                     emit(counts["held"], "count", "log", "operator"),
+                    emit(1 if closed else 0, "count", "log", "operator"),
                     emit(case_record_id, "record_id", "log", "operator"))
     return {"status": "resolved", "case_record_id": case_record_id,
             "items": results}

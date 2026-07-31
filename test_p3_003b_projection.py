@@ -97,11 +97,31 @@ class _ProjBase(unittest.TestCase):
             return list(self.app36_rows.get(m.group(1) if m else "", []))
 
         async def fake_create(app, fields):
+            # fix2: App36 を stateful に模擬（再開経路の phase1/3 再検索が
+            # 直前 write を観測できるようにする）
             self.created.append((app.label, dict(fields)))
-            return str(900 + len(self.created))
+            rid = str(900 + len(self.created))
+            if app.label == "App 36 (相続人)":
+                self.app36_rows.setdefault(fields["導出元人物ID"], []).append({
+                    "$id": {"value": rid},
+                    "current_derivation_run_id":
+                        {"value": fields.get("current_derivation_run_id", "")},
+                    "戸籍確認済": {"value": fields.get("戸籍確認済", "no")},
+                    "$revision": {"value": "1"}})
+            return rid
 
         async def fake_update(app, rid, fields, revision=None):
             self.updated.append((app.label, str(rid), dict(fields)))
+            if app.label == "App 36 (相続人)":
+                for rows in self.app36_rows.values():
+                    for row in rows:
+                        if row.get("$id", {}).get("value") == str(rid):
+                            for k, v in fields.items():
+                                if k in ("current_derivation_run_id",
+                                         "戸籍確認済"):
+                                    row[k] = {"value": v}
+                            rev = row.setdefault("$revision", {"value": "0"})
+                            rev["value"] = str(int(rev["value"] or "0") + 1)
 
         self.get = AsyncMock(side_effect=fake_get)
         self.search = AsyncMock(side_effect=fake_search)
@@ -341,7 +361,11 @@ class TestGatePhase(_ProjBase):
         self.assertIn("確定権限がありません", r["reason"])
         self.assert_write_zero()
 
-    def test_double_confirmation_guard(self):
+    def test_existing_decision_resumes_projection(self):
+        """fix2 M02（設計改定 §9-v2・発注要件2に伴う期待値の再定義＝緩和ではない）:
+        初版の「root decision 既存＝二重確定で中止」を撤回し、run が head かつ
+        封筒未クローズなら decision 作成をスキップして projection のみ再実行する
+        正規の再開経路とする。新しい root decision は重複作成しない。"""
         rid = self._mk_run(_payload(_heir("11", "spouse")))
         from hub.derivation_models import create_heir_decision
         _run(create_heir_decision(derivation_run_id=rid, decision="confirmed",
@@ -349,10 +373,12 @@ class TestGatePhase(_ProjBase):
                                   decided_at=datetime.now(timezone.utc)))
         db.reset_for_tests()
         r = self._resolve(_group(rid))
-        self.assertEqual(r["status"], "aborted")
-        self.assertIn("確定済み", r["reason"])
-        self.create.assert_not_awaited()
-        self.update.assert_not_awaited()
+        self.assertEqual(r["status"], "resolved")      # 中止しない（再開）
+        self.assertEqual(len(self._decisions()), 1)    # decision 重複作成なし
+        self.assertEqual(r["items"][0]["app36_inserted"], 1)   # 残り行を反映
+        self.assertIn(("App 30 (発送管理)", "70",
+                       {"発送ステータス": "完了", "実行済み": "yes"}),
+                      self.updated)                    # held 0 → クローズ
 
     def test_stale_run_rejected(self):
         a = self._mk_run(_payload(_heir("11", "spouse")), ih="a" * 64)
@@ -583,7 +609,10 @@ class TestCasAndPreWriteReverification(_ProjBase):
 
     def test_prewrite_recheck_prevents_blind_insert(self):
         """(b) phase 1 で 0 件だった冪等キーが write 直前再検索で 1 件出現
-        → 盲目 insert しない（当該行 held・継続・封筒はクローズ）。"""
+        → 盲目 insert しない（当該行 held）。fix2 M02（設計改定 §9-v2 への追随・
+        緩和ではない）: held>0 は封筒をクローズせず要確認のまま残し、detail へ
+        保留人物 record ID を追記する。"""
+        import json as _json
         rid = self._mk_run(_payload(_heir("11", "spouse")))
         race_row = {"$id": {"value": "301"},
                     "current_derivation_run_id": {"value": "999999"},
@@ -602,14 +631,24 @@ class TestCasAndPreWriteReverification(_ProjBase):
         self.assertEqual(r["status"], "resolved")
         self.assertEqual(r["items"][0]["app36_inserted"], 0)
         self.assertEqual(r["items"][0]["app36_held"], 1)
+        self.assertIs(r["items"][0]["envelope_closed"], False)
         self.create.assert_not_awaited()           # 盲目 insert なし
         self.alert.assert_awaited()
-        # 封筒はクローズ（部分成功・二重確定ガードの楔を作らない）
-        self.assertIn(("App 30 (発送管理)", "70",
-                       {"発送ステータス": "完了", "実行済み": "yes"}), self.updated)
+        # 封筒はクローズしない（fix2 M02: 耐久可視性は App30 キュー）
+        closes = [u for u in self.updated
+                  if u[0] == "App 30 (発送管理)" and u[2].get("実行済み") == "yes"]
+        self.assertEqual(closes, [])
+        # detail へ保留人物 ID（数字のみ）を追記
+        detail_writes = [u for u in self.updated
+                         if u[0] == "App 30 (発送管理)"
+                         and "チャネル固有データ" in u[2]]
+        self.assertEqual(len(detail_writes), 1)
+        data = _json.loads(detail_writes[0][2]["チャネル固有データ"])
+        self.assertEqual(data["heir_derivation"]["保留人物ID"], ["11"])
 
     def test_h10_update_revision_conflict_is_held(self):
-        """(c) H10 update の revision 楽観ロック競合 → 当該行 held（要確認分類）。"""
+        """(c) H10 update の revision 楽観ロック競合 → 当該行 held。
+        fix2 M02（設計改定 §9-v2 への追随・緩和ではない）: 封筒はクローズしない。"""
         from hub.kintone import KintoneConflict
         rid = self._mk_run(_payload(_heir("11", "spouse")))
         self.app36_rows["11"] = [{
@@ -628,6 +667,10 @@ class TestCasAndPreWriteReverification(_ProjBase):
         self.assertEqual(r["status"], "resolved")
         self.assertEqual(r["items"][0]["app36_updated"], 0)
         self.assertEqual(r["items"][0]["app36_held"], 1)
+        self.assertIs(r["items"][0]["envelope_closed"], False)
+        closes = [u for u in self.updated
+                  if u[0] == "App 30 (発送管理)" and u[2].get("実行済み") == "yes"]
+        self.assertEqual(closes, [])               # クローズしない（fix2 M02）
         self.alert.assert_awaited()
 
     def test_happy_update_passes_revision(self):
@@ -647,6 +690,120 @@ class TestCasAndPreWriteReverification(_ProjBase):
         r = self._resolve(_group(rid))
         self.assertEqual(r["status"], "resolved")
         self.assertEqual(captured["revision"], "9")   # 再読 revision を使用
+
+
+# ── fix2 H01-R2/M02: グループ原子化・再開可能 projection（R-P3-003B-IMPL-2）──
+class TestGroupAtomicityAndResume(_ProjBase):
+    def test_multi_item_same_run_single_decision(self):
+        """(a) 複数 item が同一 run を参照 → decision は 1 件に重複排除・
+        原子的成功・全封筒が同一結果（クローズ）で扱われる。"""
+        rid = self._mk_run(_payload(_heir("11", "spouse")))
+        g = ReviewGroup(source="heir_derivation", idempotency_key="k",
+                        items=[_item(rid, "70"), _item(rid, "71")])
+        r = self._resolve(g)
+        self.assertEqual(r["status"], "resolved")
+        self.assertEqual(len(self._decisions()), 1)     # 重複排除
+        closes = {u[1] for u in self.updated
+                  if u[0] == "App 30 (発送管理)" and u[2].get("実行済み") == "yes"}
+        self.assertEqual(closes, {"70", "71"})          # 両封筒クローズ
+        # item1 は insert・item2 は same-run ヒットの冪等 update（新規行を作らない）
+        self.assertEqual(r["items"][0]["app36_inserted"], 1)
+        self.assertEqual(r["items"][1]["app36_inserted"], 0)
+        self.assertEqual(r["items"][1]["app36_updated"], 1)
+        self.assertEqual(len(self.created), 1)
+
+    def test_group_cas_failure_rolls_back_all_decisions(self):
+        """(b) グループ途中の CAS 失敗 → 単一 txn 全体 rollback＝decision 0 件。
+        （head である b の INSERT 後に a の CAS が失敗する順で直接検証）"""
+        from hub.derivation_models import (ChainIntegrityError,
+                                           create_confirmed_decisions_for_heads)
+        a = self._mk_run(_payload(_heir("11", "spouse")), ih="a" * 64)
+        b = self._mk_run(_payload(_heir("11", "spouse")), supersedes=a,
+                         ih="b" * 64)
+        with self.assertRaises(ChainIntegrityError):
+            _run(create_confirmed_decisions_for_heads(
+                "9", [b, a], decided_by="ATT1",
+                decided_at=datetime.now(timezone.utc)))
+        db.reset_for_tests()
+        self.assertEqual(self._decisions(), [])         # b の分も rollback 済み
+
+    def test_held_then_manual_fix_then_reconfirm_projects_rest(self):
+        """(c) held 発生 → 封筒 open 維持＋保留人物ID 追記 → 人手収束を模擬 →
+        同一封筒の再確定（再開経路）→ 残り行反映 → クローズ。"""
+        import json as _json
+        rid = self._mk_run(_payload(
+            _heir("11", "spouse"),
+            _heir("12", "child", relation="child")))
+        calls = {"12": 0}
+
+        async def racing(app, query, fields=None):
+            import re as _re
+            m = _re.search(r'導出元人物ID = "([0-9]+)"', query)
+            pid = m.group(1) if m else ""
+            if pid == "12":
+                calls["12"] += 1
+                if calls["12"] == 2:   # 1回目確定の write 直前に競合行が出現
+                    self.app36_rows.setdefault("12", []).append({
+                        "$id": {"value": "500"},
+                        "current_derivation_run_id": {"value": "999999"},
+                        "戸籍確認済": {"value": "no"},
+                        "$revision": {"value": "3"}})
+            return list(self.app36_rows.get(pid, []))
+        self.search.side_effect = racing
+
+        r1 = self._resolve(_group(rid))
+        self.assertEqual(r1["status"], "resolved")
+        self.assertEqual(r1["items"][0]["app36_inserted"], 1)   # 11 は反映
+        self.assertEqual(r1["items"][0]["app36_held"], 1)       # 12 は保留
+        self.assertIs(r1["items"][0]["envelope_closed"], False)
+        detail_writes = [u for u in self.updated
+                         if u[0] == "App 30 (発送管理)"
+                         and "チャネル固有データ" in u[2]]
+        data = _json.loads(detail_writes[0][2]["チャネル固有データ"])
+        self.assertEqual(data["heir_derivation"]["保留人物ID"], ["12"])
+        self.assertEqual(len(self._decisions()), 1)
+
+        # 人手収束を模擬: 競合行の current を head run へ揃える（App36 行修正）
+        self.app36_rows["12"][0]["current_derivation_run_id"]["value"] = str(rid)
+        self.updated.clear()
+        r2 = self._resolve(_group(rid))                 # 同一封筒を再確定
+        self.assertEqual(r2["status"], "resolved")
+        self.assertEqual(r2["items"][0]["app36_held"], 0)
+        self.assertIs(r2["items"][0]["envelope_closed"], True)
+        self.assertEqual(len(self._decisions()), 1)     # decision は増えない
+        app36_updates = {u[1] for u in self.updated
+                         if u[0] == "App 36 (相続人)"}
+        self.assertIn("500", app36_updates)             # 残り行（12）が反映された
+        self.assertIn(("App 30 (発送管理)", "70",
+                       {"発送ステータス": "完了", "実行済み": "yes"}), self.updated)
+
+    def test_duplicate_envelope_reconfirm_converges(self):
+        """(d) 同一 run の重複封筒を後から確定 → 再開経路で冪等に走り
+        （same-run ヒット・新規行を作らない）クローズされて収束。"""
+        rid = self._mk_run(_payload(_heir("11", "spouse")))
+        r1 = self._resolve(_group(rid, "70"))
+        self.assertIs(r1["items"][0]["envelope_closed"], True)
+        self.updated.clear()
+        r2 = self._resolve(_group(rid, "71"))           # TOCTOU 由来の重複封筒
+        self.assertEqual(r2["status"], "resolved")
+        self.assertEqual(r2["items"][0]["app36_inserted"], 0)   # 新規行なし
+        self.assertEqual(r2["items"][0]["app36_held"], 0)
+        self.assertIs(r2["items"][0]["envelope_closed"], True)  # 収束
+        self.assertEqual(len(self._decisions()), 1)
+        self.assertEqual(len(self.created), 1)          # insert は初回の 1 件のみ
+
+    def test_resume_rejects_stale_after_supersede(self):
+        """(e) 再開経路も stale run（head 交代後）は拒否する。"""
+        a = self._mk_run(_payload(_heir("11", "spouse")), ih="a" * 64)
+        r1 = self._resolve(_group(a, "70"))             # a を確定（decision 記録）
+        self.assertEqual(r1["status"], "resolved")
+        b = self._mk_run(_payload(_heir("11", "spouse")), supersedes=a,
+                         ih="b" * 64)
+        self.assertGreater(b, a)
+        r2 = self._resolve(_group(a, "71"))             # 旧 run の封筒を再確定
+        self.assertEqual(r2["status"], "aborted")
+        self.assertIn("新しい導出", r2["reason"])
+        self.assertEqual(len(self._decisions()), 1)     # 追加 decision なし
 
 
 # ── fix1 M01: heir 成功応答の整形（review_resolve_task E2E）─────────────────
@@ -694,7 +851,9 @@ class TestHeirResultFormatting(unittest.TestCase):
                                     "case_record_id": "9"}})
         with patch.object(rt, "resolve_group", new=fake_resolve):
             msg, _rid, _url = asyncio.run(rt.execute(pending))
-        self.assertIn("要確認2件（人手収束後に再反映）", msg)
+        # fix2 M02（設計改定 §9-v2 への追随・緩和ではない）: 再開経路の案内文言
+        self.assertIn("要確認2件。収束後に同じ封筒を再確定すると残り行を再反映します",
+                      msg)
 
 
 # ── PII・続柄値の非露出（要件5・sentinel 方式）───────────────────────────────
