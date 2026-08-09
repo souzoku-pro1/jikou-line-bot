@@ -36,7 +36,7 @@ from hub.derivation_models import (ChainIntegrityError, ImmutableRecordError,
                                    PayloadPolicyError, build_run_payload,
                                    compute_input_hash, compute_result_hash,
                                    create_derivation_run, get_current_head,
-                                   validate_result_payload)
+                                   get_leaf_decision, validate_result_payload)
 from hub.heir_envelope import (EnvelopeCreateUnknownError, EnvelopePolicyError,
                                EnvelopeSearchError, file_heir_envelope,
                                heir_derivation_enabled)
@@ -249,6 +249,13 @@ async def _pipeline(state: dict, case_app_id: str, case_record_id: str) -> str:
         state["env"] = "failed:unexpected"   # run 段確定後の想定外の既定（fix4 H01）
         run_obj = head                       # 封筒は head で回収（§4-1）
         base_msg = f"入力に変化はありません（run #{head.id} を維持・追加保存なし）"
+        # P3-003c §5（裁定③=(A)）: head が否認済みかつ入力未変更＝全面 no-op の
+        # 行き止まりを応答で明示（新 run も新封筒も作られない・入力修正が正規経路）。
+        # leaf 読取は read-only・破損（ChainIntegrityError）は既存分類へ委ねる
+        leaf = await get_leaf_decision(head.id)
+        if leaf is not None and leaf.decision == "rejected":
+            base_msg += ("\nこの導出は否認済みです（入力未変更のため新しい導出は"
+                         "作成されません）。入力を修正してから再導出してください")
     else:
         # ── 4. 導出（凍結エンジン・無改変）───────────────────────────────────
         deriv = derive_heirs(persons, declarations, kosekis)

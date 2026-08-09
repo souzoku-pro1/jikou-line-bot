@@ -760,59 +760,170 @@ def compute_result_hash(result_payload) -> str:
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
-async def create_confirmed_decisions_for_heads(case_record_id: str,
-                                               run_ids: list[int], *,
-                                               decided_by: str,
-                                               decided_at) -> dict[int, str]:
-    """グループ原子化された head CAS 付き confirmed decision INSERT
-    （P3-003b fix1 H01 → fix2 H01-R2/M02・R-P3-003B-IMPL-2）。
+DECISIONS = ("confirmed", "held", "rejected")   # ck_heir_decision_decision と逐語一致
 
-    - **単一 DB トランザクション**で処理: 各 run_id について「現 head の run_id と
-      一致」を再検証（CAS）→ root decision 未存在なら INSERT。**途中の失敗は
-      ChainIntegrityError で全体 rollback**（decision 含む write 0）。
-    - 重複 run_id は 1 decision に**重複排除**（同一 run を参照する複数封筒は
-      同一結果で扱う・fix2 H01-R2）。
-    - **root decision 既存の run は INSERT をスキップして "resumed" を返す**
-      （fix2 M02: 二重確定ガードの意味を「同一 run への新しい root decision の
-      重複作成を防ぐ」に限定＝decision 既存時の projection 再実行は正規の再開経路）。
-    - 戻り値: {run_id: "created" | "resumed"}。
 
-    残余（受容・重畳担保）: PG read-committed 下では本 txn の SELECT 後に並行
-    supersede が commit する超微小窓が理論上残るが、single-root／supersedes
-    UNIQUE・uq_heir_decision_single_root の DB 制約と次回確定時の stale ガードが
-    重畳で矛盾を遮断する。
+class DecisionBlockedError(ChainIntegrityError):
+    """P3-003c §3.2-v2 の中止セル（固定文言・値非搭載）。
+
+    code は閉集合: "already_rejected"（leaf=rejected への確定/保留）／
+    "already_confirmed"（leaf=confirmed への保留/否認・取消は別票=裁定④）。
+    ChainIntegrityError の派生＝既存の全体 rollback ハンドリングへ合流する。
+    """
+
+    def __init__(self, code: str):
+        if code not in ("already_rejected", "already_confirmed"):
+            raise ValueError("DecisionBlockedError code は閉集合のみ")
+        self.code = code
+        super().__init__(f"decision 遷移は許可されていません（{code}・全体中止）")
+
+
+async def get_leaf_decision(run_id: int):
+    """decision 鎖の有効 leaf（supersede されていない末端・read-only・P3-003c
+    §3.3-v2）。一本鎖ゆえ高々 1 行。無ければ None。
+
+    複数行＝一本鎖の DB 破損（cross-run supersede 等）→ ChainIntegrityError
+    （fail-closed・§7-19。黙って先勝ちにしない）。leaf 検索は
+    `_select_leaves`（create_decisions_for_heads と共用・単一の正）。
     """
     from hub.db import session_scope
 
+    async with session_scope() as s:
+        rows = await _select_leaves(s, run_id)
+    if len(rows) > 1:
+        raise ChainIntegrityError(
+            "decision 鎖が一本鎖ではありません（破損検出・全体中止）")
+    return rows[0] if rows else None
+
+
+async def _select_leaves(s, run_id: int):
+    """txn 内の有効 leaf 検索（§3.3-v2・create_decisions_for_heads 専用）。"""
+    t = HeirConfirmationDecision.__table__
+    s2 = t.alias("s2")
+    return (await s.execute(
+        sa.select(t.c.id, t.c.decision, t.c.decided_at).where(
+            t.c.derivation_run_id == run_id,
+            ~sa.exists(sa.select(s2.c.id)
+                       .where(s2.c.supersedes_decision_id == t.c.id)),
+        ))).all()
+
+
+async def create_decisions_for_heads(case_record_id: str,
+                                     run_ids: list[int], *,
+                                     decision: str,
+                                     decided_by: str,
+                                     decided_at) -> dict[int, dict]:
+    """グループ原子化された head CAS 付き decision INSERT（P3-003b fix1 H01 →
+    fix2 H01-R2/M02 → **P3-003c §3.3-v2: 有効 leaf 判定へ一般化**）。
+
+    - **単一 DB トランザクション**: 各 run_id について head CAS → **有効 leaf
+      （supersede されていない末端・高々 1 行）を判定**し §3.2-v2 の遷移表どおりに
+      アクション。**途中の失敗は例外で全体 rollback**（decision 含む write 0）。
+    - leaf 判定の 3 分類（fail-closed）: 0 件=root INSERT／1 件=遷移表判定／
+      複数件=一本鎖破損として ChainIntegrityError（§7-19）。
+    - 遷移（§3.2-v2）: leaf=confirmed×確定="resumed"（INSERT なし）・×保留/否認=
+      DecisionBlockedError(already_confirmed)／leaf=held×確定・否認=supersede
+      INSERT・×保留="noop"（INSERT なし）／leaf=rejected×確定・保留=
+      DecisionBlockedError(already_rejected)・×否認="noop"（INSERT なし・
+      side effect 再適用は呼出し側 §4.1）。
+    - **並行 supersede 競合の正規化（fix2 M01）**: uq_heir_decision_supersedes／
+      uq_heir_decision_single_root 由来の IntegrityError は txn 境界で
+      ChainIntegrityError（固定文言）へ正規化する。DB 例外本文は連鎖に残さない
+      （except 外 raise・CMD 裁定9 の構造）。
+    - 重複 run_id は 1 decision に重複排除（fix2 H01-R2 のまま）。
+    - 戻り値: {run_id: {"outcome": "created"|"resumed"|"noop",
+      "decided_at": <当該 decision の保存値>}}——noop/resumed は **leaf の保存
+      decided_at**（§12 M01: 注記の再適用でも時刻を上書きしない）。
+
+    残余（受容・重畳担保）: PG read-committed 下では本 txn の SELECT 後に並行
+    supersede が commit する超微小窓が理論上残るが、single-root／supersedes
+    UNIQUE の DB 制約（→上記正規化で全体 rollback）と次回確定時の stale ガードが
+    重畳で矛盾を遮断する。
+    """
+    from sqlalchemy.exc import IntegrityError
+
+    from hub.db import session_scope
+
+    if decision not in DECISIONS:
+        raise PayloadPolicyError("decision は閉集合（confirmed/held/rejected）のみ")
     t = HeirConfirmationDecision.__table__
     rt = DerivationRun.__table__
     n = rt.alias("n")
     unique_ids = list(dict.fromkeys(run_ids))
-    out: dict[int, str] = {}
-    async with session_scope() as s:      # 例外＝全体 rollback（session_scope 契約）
-        for run_id in unique_ids:
-            head = (await s.execute(
-                sa.select(rt.c.id).where(
-                    rt.c.case_record_id == case_record_id,
-                    ~sa.exists(sa.select(n.c.id)
-                               .where(n.c.supersedes_run_id == rt.c.id)),
-                ))).one_or_none()
-            if head is None or head.id != run_id:
-                raise ChainIntegrityError(
-                    "確定対象 run が head ではなくなっています"
-                    "（supersede 検出・CAS 中止・グループ全体 rollback）")
-            root = (await s.execute(
-                sa.select(t.c.id).where(
-                    t.c.derivation_run_id == run_id,
-                    t.c.supersedes_decision_id.is_(None)).limit(1))).first()
-            if root is not None:
-                out[run_id] = "resumed"   # 再開経路（INSERT せず projection のみ）
-                continue
-            await s.execute(sa.insert(t).values(
-                derivation_run_id=run_id, decision="confirmed",
-                decided_by=decided_by, decided_at=decided_at))
-            out[run_id] = "created"
+    out: dict[int, dict] = {}
+    conflict = False
+    try:
+        async with session_scope() as s:   # 例外＝全体 rollback（session_scope 契約）
+            for run_id in unique_ids:
+                head = (await s.execute(
+                    sa.select(rt.c.id).where(
+                        rt.c.case_record_id == case_record_id,
+                        ~sa.exists(sa.select(n.c.id)
+                                   .where(n.c.supersedes_run_id == rt.c.id)),
+                    ))).one_or_none()
+                if head is None or head.id != run_id:
+                    raise ChainIntegrityError(
+                        "確定対象 run が head ではなくなっています"
+                        "（supersede 検出・CAS 中止・グループ全体 rollback）")
+                leaves = await _select_leaves(s, run_id)
+                if len(leaves) > 1:
+                    raise ChainIntegrityError(
+                        "decision 鎖が一本鎖ではありません（破損検出・全体中止）")
+                leaf = leaves[0] if leaves else None
+                if leaf is None:
+                    await s.execute(sa.insert(t).values(
+                        derivation_run_id=run_id, decision=decision,
+                        decided_by=decided_by, decided_at=decided_at))
+                    out[run_id] = {"outcome": "created", "decided_at": decided_at}
+                elif leaf.decision == "confirmed":
+                    if decision == "confirmed":
+                        out[run_id] = {"outcome": "resumed",
+                                       "decided_at": leaf.decided_at}
+                    else:
+                        raise DecisionBlockedError("already_confirmed")
+                elif leaf.decision == "held":
+                    if decision == "held":
+                        out[run_id] = {"outcome": "noop",
+                                       "decided_at": leaf.decided_at}
+                    else:      # 確定・否認: leaf を supersede（§3.2-v2）
+                        await s.execute(sa.insert(t).values(
+                            derivation_run_id=run_id, decision=decision,
+                            decided_by=decided_by, decided_at=decided_at,
+                            supersedes_decision_id=leaf.id))
+                        out[run_id] = {"outcome": "created",
+                                       "decided_at": decided_at}
+                elif leaf.decision == "rejected":
+                    if decision == "rejected":
+                        out[run_id] = {"outcome": "noop",
+                                       "decided_at": leaf.decided_at}
+                    else:
+                        raise DecisionBlockedError("already_rejected")
+                else:      # ck_heir_decision_decision により到達不能（防御）
+                    raise ChainIntegrityError(
+                        "decision 値が閉集合外です（破損検出・全体中止）")
+    except IntegrityError:
+        conflict = True     # DB 例外本文を連鎖に残さない（except 外で固定 raise）
+    if conflict:
+        raise ChainIntegrityError(
+            "decision の保存が並行実行と競合しました"
+            "（UNIQUE 後詰め・グループ全体 rollback・再指示してください）")
     return out
+
+
+async def create_confirmed_decisions_for_heads(case_record_id: str,
+                                               run_ids: list[int], *,
+                                               decided_by: str,
+                                               decided_at) -> dict[int, str]:
+    """confirmed 専用の薄い wrapper（既存呼出し互換・P3-003b 契約のまま）。
+
+    leaf 判定への一般化（P3-003c）後も confirmed 経路の戻り値契約
+    {run_id: "created" | "resumed"} を維持する。leaf=held への確定は §3.2-v2
+    どおり supersede INSERT（="created"）になる。
+    """
+    res = await create_decisions_for_heads(
+        case_record_id, run_ids, decision="confirmed",
+        decided_by=decided_by, decided_at=decided_at)
+    return {rid: info["outcome"] for rid, info in res.items()}
 
 
 async def get_current_head(case_record_id: str):

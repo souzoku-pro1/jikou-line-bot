@@ -55,6 +55,13 @@ _DETAIL_KEYS = frozenset({
 # 本キーは確定関所（hub/heir_projection）だけが書く事後注記であり、find_existing の
 # 冪等照合（冪等キー完全一致）にも影響しない。
 DETAIL_HELD_PERSONS_KEY = "保留人物ID"
+# P3-003c §4（設計凍結）: [人]の decision（held/rejected/confirmed 更新）の事後注記
+# キー。decision-held（判断・封筒単位）と row-held（保留人物ID・App36 行単位）は
+# **別キーのまま併存**（§0 の粒度・主体分離を キー空間でも保つ・M03）。値は
+# {"decision": <閉集合>, "decided_at": <ISO8601・leaf の保存値>} のみ——decided_by
+# （LINE user ID）は書かない（PII 最小化）。起票時閉集合・冪等照合への非干渉は
+# DETAIL_HELD_PERSONS_KEY と同じ事後注記拡張の型。
+DETAIL_DECISION_KEY = "判断"
 
 
 class EnvelopePolicyError(ValueError):
