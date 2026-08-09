@@ -1,6 +1,8 @@
-# DRAFT: P3-003c held/rejected 語彙の設計（判断保留・否認の decision 経路・設計のみ・実装禁止）
+# DRAFT: P3-003c held/rejected 語彙の設計（判断保留・否認の decision 経路・設計のみ・実装禁止・fix1）
 
 - TASK_ID: P3-003C-D 設計票（設計凍結用 DRAFT・コード/テスト実装禁止）／記録日 2026-08-09
+  （fix1: R-P3-003C-D1 の H01/H02/M01/M02/M03 全所見反映・同日。改定は両時点残置——
+  初版の root 判定案は**撤回**し §3.3-v2 の leaf 判定へ・§10 改定記録）
 - 目的: 凍結 `DRAFT_P3_003_ENVELOPE_FLOW.md`（以下「正本」）§3.2 の残件
   「held/rejected は App36 に触れず封筒のみクローズ（held は件名に保留理由を残すか等の
   細部は実装票で）」を設計凍結する。P3-003b（confirmed 一本・merge 済み #187）の
@@ -8,12 +10,17 @@
 - 正本参照（矛盾を作らない・編集しない）: 正本 §3.2〜3.4／`DRAFT_P3_003B_DESIGN`
   （§4B fix3 H01=機械は App36 write 0・§9-v2=resumable projection・封筒クローズ=held 行 0 のみ）／
   `DRAFT_P3_003_CMD` §8（裁定記録の形式先例）。
-- 実装現実の実査基盤（2026-08-09・read-only・main `861458a`）:
+- 実装現実の実査基盤（2026-08-09・read-only・初版時 main `861458a`。
+  **fix1 BASE 訂正（H02）**: 現 origin/main は `4afc4be`（#190 retirement 票 merge 済み）。
+  本 branch の分岐点（merge-base）は `4afc4be` と一致＝**rebase 不要**・main に対する
+  純差分は本 DRAFT 1 ファイルのみ（機械確認の実出力は §10）。実査引用の対象コードは
+  `861458a`→`4afc4be` 間で不変〔差分は #190＝docs 2 ファイルのみ〕）:
   `hub/derivation_models.py`（HCD 契約・`create_confirmed_decisions_for_heads`）／
   `hub/heir_projection.py`（confirmed handler 3 phase）／`review_resolve.py`
   （RESOLVERS・resolve_group の能力ベース引数）／`dispatch_bot/review_resolve_task.py`
   （T2 語彙・復唱→pending 30分単回）／`hub/approval.py`（App30 状態機械）。
-- 次レビュー: R-P3-003C-D1（設計レビュー・D巡）。
+- 次レビュー: R-P3-003C-D2（fix1 反映後。初版レビュー R-P3-003C-D1=CHANGES_REQUIRED・
+  H01/H02/M01/M02/M03 は §10 改定記録参照）。
 
 ## 0. 用語の一意化（「held」3 概念の分離・本書全体で厳守）
 
@@ -58,8 +65,11 @@ if root is not None:
 いない**。confirmed 一本の現況では root=confirmed しかあり得ないため正しいが、
 **decision-held/rejected を導入した瞬間、「held/rejected の root がある run」への確定
 指示が resumed 扱いになり、否認済み run が App36 へ projection される**。
-→ P3-003c は本ヘルパの root 判定を decision 値込みへ改修することを**必須の前提**とする
-（§3.3）。confirmed 一本のままなら挙動同一＝後方互換（テスト計画 §7-1）。
+→ P3-003c は本ヘルパの判定改修を**必須の前提**とする。
+- （履歴・初版）改修案を「root 判定に decision 値を読む」としていたが、
+  **fix1 H01 で撤回**——root の値だけでは held→confirmed 等の supersede 後の有効判断を
+  表せない（root=held のまま leaf=confirmed になり得る）。**有効 leaf 判定**（§3.3-v2）
+  へ改定した。confirmed 一本のままなら挙動同一＝後方互換（テスト計画 §7-1）は不変。
 
 ### 1.3 T2 の関所型二重確認は汎用機構（review_resolve_task.py:80-100）
 
@@ -130,29 +140,70 @@ if "decided_by" in inspect.signature(handler).parameters:
 - **一括 CAS txn も対称**: グループ全 item を単一 txn・head CAS・途中失敗全体 rollback・
   同一 run 重複排除（fix2 H01-R2 と同一規律）。
 
-### 3.2 supersede 関係（同一 run 内 decision 連鎖の意味論・凍結）
+### 3.2 supersede 関係（初版表・**fix1 M02 で §3.2-v2 の全遷移表へ置換・履歴残置**）
 
-| 先行 root | 後続の指示 | 記録形 | 帰結 |
+（履歴・初版の 6 行表は「先行 root」を軸にしていたが、fix1 H01 の leaf 判定への改定に
+伴い軸を「**有効 leaf**」へ変更し、9 組合せの閉じた表 §3.2-v2 が正となる。初版表は
+git 履歴で参照可能・本文からは v2 表へ一本化する）
+
+### 3.2-v2 全遷移表（fix1 M02・**有効 leaf × 指示 decision の 3×3＋先行なし＝閉じた 10 行**）
+
+前提: 判定軸は「decision 鎖の**有効 leaf**」（supersede されていない末端・§3.3-v2。
+一本鎖ゆえ高々 1 行）。表のアクションはすべて §3.3-v2 の単一トランザクション内で確定する。
+
+| 有効 leaf | 指示 | decision 追記 | 帰結 |
 |---|---|---|---|
-| （なし） | 保留/否認/確定 | **root decision**（supersedes NULL） | 各 decision の帰結（§4） |
-| held | 確定 | **confirmed が held を supersede**（supersedes_decision_id=held.id・新 root は作らない＝single-root 遵守） | projection 実行・封筒クローズ判定へ |
-| held | 保留（再） | INSERT しない（no-op 応答「既に保留です」）＝**同値 decision の連鎖を作らない** | 変化なし |
-| held | 否認 | rejected が held を supersede | 封筒クローズ（§4） |
-| rejected | 確定/保留 | **INSERT しない・aborted**（「否認済みです。再導出してください」）＝rejected は同一 run 上で翻せない（§5・§8-3） | 変化なし |
-| confirmed | 保留/否認 | **INSERT しない・aborted**（projection 済み結果の取消は App36 巻き戻しを伴い本票スコープ外＝別票） | 変化なし |
+| （decision なし） | 確定 | **root confirmed INSERT** | projection → 封筒クローズ判定（row-held=0 でクローズ） |
+| （decision なし） | 保留 | **root held INSERT** | 封筒 open 維持＋判断注記=held（§4） |
+| （decision なし） | 否認 | **root rejected INSERT** | 封筒クローズ＋判断注記=rejected（§4） |
+| leaf=confirmed | 確定 | **なし（"resumed"）** | **封筒 open かつ run=head のときのみ** projection 再開（§9-v2 の正規再開経路）。封筒クローズ済みなら封筒再読で aborted・head でなければ stale aborted |
+| leaf=confirmed | 保留 | **なし・aborted** | 「確定済みです（取消は別途）」——projection 済み結果の取消は App36 巻き戻しを伴い**別票**（裁定④=(A) 採用・§8） |
+| leaf=confirmed | 否認 | **なし・aborted** | 同上（裁定④） |
+| leaf=held | 確定 | **confirmed が leaf を supersede**（supersedes_decision_id=leaf.id） | projection 実行 → 封筒クローズ判定・判断注記を confirmed へ**更新**（M03・§4） |
+| leaf=held | 保留 | **なし（no-op）** | 固定応答「既に保留です」＝同値 decision の連鎖を作らない |
+| leaf=held | 否認 | **rejected が leaf を supersede** | 封筒クローズ＋判断注記=rejected（§4） |
+| leaf=rejected | 確定／保留／否認 | **なし・aborted（3 指示とも）** | 確定/保留=「否認済みです。再導出してください」（不可逆・§5）。**否認（再）=decision 追加なし・既否認の固定応答**「既に否認済みです」 |
 
-- decision 連鎖は `uq_heir_decision_supersedes`（UNIQUE）により一本鎖が DB 強制される
-  ＝「held を 2 つの decision が同時に supersede」は片方が IntegrityError で敗退
-  （並行確定の構造遮断・実査 §1.1）。
+- 表は 10 行で閉じる（leaf は高々 1 行・値は 3 値＋不在の 4 状態 × 指示 3 値 ＝ 12 組の
+  うち leaf=rejected の 3 指示を 1 行に束ねた表記）。**表にない遷移は存在しない**
+  （未知状態は ChainIntegrityError 型の中止・値非表示）。
 
-### 3.3 ヘルパの一般化（§1.2 の要改修点の解消・実装票要件）
+### 3.3 ヘルパの一般化（初版・**fix1 H01 で撤回・履歴残置**）
 
-- `create_confirmed_decisions_for_heads` を decision パラメタ化
-  （案: `create_decisions_for_heads(case_record_id, run_ids, decision=..., ...)`）し、
-  **root 判定で decision 値を読む**:
-  - root=confirmed → 従来どおり "resumed"（projection のみ再実行）
-  - root=held → 指示が confirmed なら **supersede INSERT**（§3.2）・held なら no-op
-  - root=rejected → ChainIntegrityError 型の中止（値は文言に載せない）
+（履歴・初版は「root 判定で decision 値を読む」改修案だったが、root=held が
+confirmed に supersede された後も root 行は held のまま残るため、**root の値では
+有効判断を表せない**。fix1 H01 で撤回し §3.3-v2 の leaf 判定へ改定）
+
+### 3.3-v2 有効 leaf 判定（fix1 H01・実装票要件）
+
+- **判定対象**: decision 鎖の**有効 leaf** ＝ 当該 run の decision 行のうち
+  「他行の `supersedes_decision_id` に参照されていない末端行」。一本鎖
+  （single-root＋supersedes UNIQUE・実査 §1.1）ゆえ**高々 1 行**。
+  ```sql
+  -- 概念 SQL（実装票で確定・read）: 有効 leaf
+  SELECT d.* FROM heir_confirmation_decision d
+  WHERE d.derivation_run_id = :run_id
+    AND NOT EXISTS (SELECT 1 FROM heir_confirmation_decision s
+                    WHERE s.supersedes_decision_id = d.id)
+  ```
+- **単一トランザクション内で判定→アクション**（`create_confirmed_decisions_for_heads`
+  の一括 CAS txn を decision パラメタ化して拡張・グループ原子性/head CAS/途中失敗
+  全体 rollback/同一 run 重複排除の既存規律は不変）:
+  - leaf なし → 指示 decision の **root INSERT**
+  - leaf=confirmed → 指示=確定なら "resumed"（INSERT なし）・保留/否認なら中止（§3.2-v2）
+  - leaf=held → 指示=確定/否認なら **supersede INSERT**（supersedes=leaf.id）・
+    保留なら no-op（INSERT なし）
+  - leaf=rejected → 中止（否認再指示のみ固定応答・いずれも INSERT なし）
+- **uq_heir_decision_supersedes 競合が「二度目の supersede」で発生しない構造**:
+  - **逐次実行では発生しない**——supersede INSERT は同一 txn 内の leaf 判定直後にのみ
+    行われ、supersede された行はその瞬間から leaf でなくなる。次の指示は新 leaf
+    （直前の supersede 行）を見るため、**既に supersede 済みの行を再度 supersede
+    しようとする経路が正常フローに存在しない**。
+  - **並行実行では DB が後詰め**——2 つの txn が同じ leaf を読み双方 INSERT した場合、
+    後着が `uq_heir_decision_supersedes`（UNIQUE）で IntegrityError→**グループ全体
+    rollback**（write 0）。再指示時は新 leaf に基づき §3.2-v2 表どおりの応答になる
+    （例: 先着が confirmed 化済みなら再指示は resumed／中止）。＝ UNIQUE 制約は
+    正常経路の分岐条件ではなく**並行 race の後詰め**としてのみ働く。
 - 既存呼出し（confirmed）は挙動同一を pin（§7-1）。関数名の変更可否は実装票判断
   （公開契約ではないが test が参照）。
 
@@ -170,6 +221,16 @@ if "decided_by" in inspect.signature(handler).parameters:
   起票時閉集合（_DETAIL_KEYS）は不変・`保留人物ID` と同じ「事後注記拡張」の型
   （正本 §7 改定記録の先例に追記する形で改定）。冪等照合（トップキー＋冪等キー完全
   一致）への非干渉も同先例と同じ。
+- **判断注記の更新規則（fix1 M03・司令塔裁定）**: held→confirmed の supersede 時は
+  判断注記キーを **confirmed へ更新する（除去しない）**——注記の終端値は常に有効 leaf
+  と一致し、封筒 detail 単体で「最後の判断」が追える（`"判断": {"decision":
+  "confirmed", ...}` へ上書き。履歴は HCD 鎖が正・detail は最新値のみ）。
+  held→rejected も同様に rejected へ更新。
+- **キーの分離維持（fix1 M03）**: decision 判断注記（キー `判断`・封筒単位・[人]の
+  判断）と row-held の `保留人物ID`（App36 行単位・機械の保留）は**別キーのまま維持**
+  し統合しない——§0 の粒度・主体の相違をキー空間でも保つ（held→confirmed の
+  projection で row-held が発生した場合、`判断`=confirmed と `保留人物ID`=[...] が
+  **併存**するのが正しい状態表現）。
 - held 封筒が要確認一覧に残る間の表示: 一覧の件名は起票時のまま（変更しない・
   kintone 画面では detail 注記で判別可）。**T2 応答側で「保留中」を付記する**かは
   実装票の表示判断（挙動に影響しない）。
@@ -199,6 +260,21 @@ if "decided_by" in inspect.signature(handler).parameters:
   （App36 upsert）へ**到達しない構造**（decision 分岐で phase 3 を confirmed のみに
   ゲート）とし、AST/契約テストで「held/rejected 経路に App36 の kintone 呼出しゼロ」
   を pin する（§7-4）。
+- **分岐位置の固定（fix1 M01・司令塔裁定）**: held/rejected の分岐は
+  **「App30 封筒再読 → run 検証（grammar/実在/case 一致/status）→ head 確認（stale
+  ガード）→ 有効 leaf 判定（§3.3-v2）→ ATTORNEY_ALLOWLIST 検証」の後**、かつ
+  **「App36 row-plan 構築（冪等キー search を含む）より前」**に置く。
+  ＝held/rejected 経路は **App36 への照会（search_records 含む）に構造上到達しない**
+  （「書かない」だけでなく「読まない」を分岐位置で保証・App36 に異常行〔重複・
+  current 不正等〕が存在しても held/rejected の記録は妨げられない——§7-14）。
+- **validation 範囲（fix1 M01・司令塔裁定どおり）**:
+  - **gate 系（3 decision 共通）**: 封筒再読（要確認/実行済み no）・derivation_run_id
+    grammar・run 実在/case 一致/status（derived/held）・head 確認（stale）・
+    有効 leaf 判定・ATTORNEY_ALLOWLIST（裁定①=(A)）。
+  - **projection 系（confirmed のみ）**: 胎児停止・旧 payload（zokugara_code 欠落）
+    判別・写像/share grammar・冪等キー search と 6 状態分類・祖先照会。
+    ＝held/rejected は「結果の中身」を検査しない（判断保留・否認は結果の精密検証を
+    前提としない判断であり、App36 に触れない以上 projection 系検査は不要）。
 - ATTORNEY_ALLOWLIST 検証の適用範囲は §8-1 の裁定事項（App36 write を伴わないため
   H11 の防御根拠が confirmed と同一ではない——ただし判断記録の主体保証の観点で
   推奨は「3 decision とも必須」）。
@@ -223,7 +299,42 @@ if "decided_by" in inspect.signature(handler).parameters:
    allowlist 外 aborted を parametrize）。
 8. **対象外 source**: 保留/否認語彙 × koseki_ingest 等 → unsupported 明示応答。
 
+**fix1 追加（R-P3-003C-D1 指摘の 8 系統・いずれも §3.2-v2 表と 1:1 対応で pin）**:
+
+9. **held→confirmed→row-held→再確定 resume の全連鎖**: 保留 → 確定（supersede
+   INSERT・projection 実行）→ projection 中に row-held 発生（封筒 open 維持・
+   `判断`=confirmed と `保留人物ID` 併存）→ 収束後の再確定 → leaf=confirmed の
+   resumed 経路（decision 追加なし）で残り行のみ再反映 → row-held=0 でクローズ。
+10. **rejected→rejected**: decision 追加なし・既否認の固定応答（DB 行数不変を pin）。
+11. **confirmed→confirmed**: 封筒 open＋run=head のときのみ resume（decision 追加
+    なし）。封筒クローズ済み → 封筒再読 aborted／head でない → stale aborted の
+    3 分岐を parametrize。
+12. **rejected 後・同一 input 再導出の全面 no-op**: 導出コマンドが run を作らない
+    （CMD 裁定5）・封筒を作らない・応答が「否認済み・入力未変更」を明示（§5）。
+13. **rejected 後・入力変更の新 run 経路**: 新 run（supersedes_run_id=旧）→ 新封筒
+    起票 → 新封筒の確定が成功し、**旧封筒への遅れた確定は stale aborted**。
+14. **decision 処理時の App36 無照会（異常行存在下でも）**: App36 に冪等キー重複行・
+    current 不正行が存在する状態で held/rejected を指示 → **App36 への
+    search/create/update 呼出しゼロ**で decision 記録が成功（mock 全記録の検証・
+    §6 分岐位置の構造保証の pin）。
+15. **判断注記の終端一致**: held→confirmed 後に注記=confirmed（除去されない・M03）／
+    held→rejected 後に注記=rejected／注記は常に有効 leaf と一致することを全遷移で
+    確認（`保留人物ID` との併存ケース含む）。
+16. **allowlist 3 値対称拒否**: allowlist 外 decided_by × confirmed/held/rejected の
+    3 指示すべて aborted・DB/kintone write 0（裁定①=(A) の対称適用を parametrize）。
+
 ## 8. 裁定欄（[人]。CMD §8 形式・選択肢+推奨+影響。推測で決めない）
+
+**fix1 裁定確定記録（R-P3-003C-D1 対応指示 2026-08-09・司令塔）**:
+- **①=(A) 確定**——held/rejected の経路に ATTORNEY_ALLOWLIST 検証を含める指定
+  （§6 分岐位置の gate 系に明記）。
+- **④=(A) 確定**——confirmed 済みへの held/rejected は中止・取消は別票（§3.2-v2 表）。
+- **validation 範囲の裁定**——gate 系=3 値共通／projection 系=confirmed のみ（§6）。
+- **M03 の裁定**——held→confirmed は判断注記を confirmed へ更新（除去しない）・
+  decision 注記と row-held の別キー維持（§4）。
+- **②③は初版推奨を前提に fix1 の表・テスト系統を構成**（対応指示のテスト系統
+  9/12/13 が held=封筒 open・rejected=クローズ+再導出一本を前提とするため）。
+  明示裁定は凍結判定時に確認する。⑤⑥は open のまま。
 
 | # | 論点 | 選択肢 | 推奨 | 影響 |
 |---|---|---|---|---|
@@ -234,7 +345,7 @@ if "decided_by" in inspect.signature(handler).parameters:
 | 5 | **保留/否認の理由記録** | (A) 初版は記録しない（amendments NULL） (B) 固定選択肢 enum を amendments へ (C) LINE 自由文を amendments へ | **(A)**——LINE 自由文は PII 混入面が広く（P3-001 非露出契約と衝突しやすい）、固定 enum は理由体系の設計（別裁定）を先に要する。運用上の理由メモは kintone 側（人手）で足りる | (A) 台帳単体では保留理由が追えない（App30/kintone メモ併読） (B)(C) は理由体系/redaction の追加設計が前提 |
 | 6 | **語彙・復唱の文言確定**（§2 の文言・同義語閉集合） | 文言案の承認 or 修正 | §2.2 案を叩き台に[人]確定 | 文言のみ（構造に影響なし） |
 
-## 9. スコープ外（明記）
+## 9. スコープ外（明記・fix1 で不変）
 
 - confirmed 済み projection の取消・App36 巻き戻し（§8-4・別票）。
 - E0–E3 effect level・放棄写像（v2.4 正本依存・従来どおり別票）。
@@ -242,3 +353,31 @@ if "decided_by" in inspect.signature(handler).parameters:
   （検知票は正本 §3.4 の別票のまま・本票の decision が増えても「decision なしの
   yes」検知ロジックは不変）。
 - run-held（機械保留）の解消経路の拡充（導出コマンド票の領分）。
+
+## 10. fix1 改定記録（R-P3-003C-D1・2026-08-09。両時点残置・遡及書き換えにしない）
+
+- **H01（leaf 判定への改定）**: 初版 §3.3「root 判定に decision 値を読む」を撤回し
+  §3.3-v2 の**有効 leaf 判定（単一 txn 内）**へ改定。supersede 後の有効判断を root では
+  表せないため。uq_heir_decision_supersedes は正常経路の分岐条件ではなく並行 race の
+  後詰めであることを構造で明示。
+- **H02（branch 純度の機械確認・BASE 訂正）**: 実出力（2026-08-09）:
+  ```
+  origin/main                      = 4afc4be40e85dca33d0b4b6d2faf0960ac7f8abc（#190 merge）
+  git merge-base origin/main p3-003c-design = 4afc4be40e85dca33d0b4b6d2faf0960ac7f8abc
+  git diff origin/main...p3-003c-design --stat =
+    docs/design-drafts/DRAFT_P3_003C_HELD_REJECTED.md | 244 ++++++++++++++++++++++
+    1 file changed, 244 insertions(+)
+  ```
+  merge-base が現 origin/main と一致＝**rebase 不要**（分岐点が #190 を既に包含）。
+  main に対する純差分は本 DRAFT 1 ファイルのみ。次回レビュー BASE は `4afc4be` へ訂正。
+- **M01（分岐位置）**: held/rejected の分岐位置を「gate 系検証の後・App36 row-plan
+  構築（search 含む）より前」に固定（§6）。validation 範囲の裁定（gate=3 値共通／
+  projection=confirmed のみ）を明記。
+- **M02（全遷移表）**: §3.2 の 6 行表を §3.2-v2 の閉じた 10 行表（有効 leaf 4 状態×
+  指示 3 値）へ置換。rejected→rejected=追加なし固定応答・confirmed→confirmed=
+  open+head 時のみ resume を明文化。
+- **M03（判断注記）**: held→confirmed で注記を confirmed へ更新（除去しない）・
+  decision 注記（`判断`）と row-held（`保留人物ID`）の別キー維持（§4）。
+- **テスト計画**: §7 に 8 系統（9〜16）を追加。
+- 次レビュー: **R-P3-003C-D2**（BASE=origin/main `4afc4be`・TARGET=p3-003c-design の
+  fix1 commit）。
