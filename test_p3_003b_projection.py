@@ -806,6 +806,43 @@ class TestGroupAtomicityAndResume(_ProjBase):
         self.assertEqual(len(self._decisions()), 1)     # 追加 decision なし
 
 
+# ── MAINT-1 B（R-P3-003B-IMPL-3 L01 回収）: held 封筒×find_existing 統合 ─────
+class TestHeldEnvelopeFindExistingIntegration(unittest.TestCase):
+    """held で「保留人物ID」が事後追記された封筒（fix2 M02）が、同一 run の
+    file_heir_envelope 再実行時に冪等キー完全一致照合（P3-003a H01）で
+    already_filed として回収され、二重起票（create）が起きないことの統合 pin。
+    既存の detail 追記テストと完全一致照合テストの「接続」（ENVELOPE_FLOW §7）。"""
+
+    def test_held_envelope_reconciled_as_already_filed(self):
+        import json as _json
+        from types import SimpleNamespace
+
+        from hub import heir_envelope as he
+        ih, rh = "a1" * 32, "b2" * 32
+        run = SimpleNamespace(id=31, case_app_id="26", case_record_id="9",
+                              input_hash=ih, result_hash=rh, status="derived",
+                              provisional=True, lawyer_flags=None)
+        # (1) 起票時 detail（閉集合）＋ projection の事後追記（保留人物ID）を再現
+        detail = he._build_detail(he._validated_snapshot(run))
+        detail[he.DETAIL_HELD_PERSONS_KEY] = ["12"]
+        record = {"$id": {"value": "88"},
+                  "チャネル固有データ":
+                      {"value": _json.dumps({"heir_derivation": detail},
+                                            ensure_ascii=False)}}
+        search = AsyncMock(return_value=[record])
+        create = AsyncMock()
+        env = {"HEIR_DERIVATION_ENABLED": "1",
+               "SOUZOKU_KINTONE_APP_ID": "26", "KINTONE_APP_ID": "21"}
+        # (2) 同一 run で file_heir_envelope を再実行
+        with patch.dict(os.environ, env), \
+             patch.object(he.kintone, "search_records", new=search), \
+             patch.object(he.kintone, "create_record", new=create):
+            r = _run(he.file_heir_envelope(run))
+        # (3) already_filed で回収・create は呼ばれない（追記キーは照合に非干渉）
+        self.assertEqual(r, {"status": "already_filed", "record_id": "88"})
+        create.assert_not_awaited()
+
+
 # ── fix1 M01: heir 成功応答の整形（review_resolve_task E2E）─────────────────
 class TestHeirResultFormatting(unittest.TestCase):
     def test_success_reply_shows_app36_counts_not_zaisan(self):
