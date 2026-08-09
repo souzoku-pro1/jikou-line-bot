@@ -2,7 +2,9 @@
 
 - TASK_ID: P3-003C-D 設計票（設計凍結用 DRAFT・コード/テスト実装禁止）／記録日 2026-08-09
   （fix1: R-P3-003C-D1 の H01/H02/M01/M02/M03 全所見反映・同日。改定は両時点残置——
-  初版の root 判定案は**撤回**し §3.3-v2 の leaf 判定へ・§10 改定記録）
+  初版の root 判定案は**撤回**し §3.3-v2 の leaf 判定へ・§10 改定記録／
+  fix2: R-P3-003C-D2 の H01-R2〔side effect の resumable 化=§4.1〕・M01〔並行競合の
+  例外正規化=§3.3-v2〕・L01〔§10 行数証跡の訂正〕反映・同日・§11 改定記録）
 - 目的: 凍結 `DRAFT_P3_003_ENVELOPE_FLOW.md`（以下「正本」）§3.2 の残件
   「held/rejected は App36 に触れず封筒のみクローズ（held は件名に保留理由を残すか等の
   細部は実装票で）」を設計凍結する。P3-003b（confirmed 一本・merge 済み #187）の
@@ -19,8 +21,9 @@
   `hub/heir_projection.py`（confirmed handler 3 phase）／`review_resolve.py`
   （RESOLVERS・resolve_group の能力ベース引数）／`dispatch_bot/review_resolve_task.py`
   （T2 語彙・復唱→pending 30分単回）／`hub/approval.py`（App30 状態機械）。
-- 次レビュー: R-P3-003C-D2（fix1 反映後。初版レビュー R-P3-003C-D1=CHANGES_REQUIRED・
-  H01/H02/M01/M02/M03 は §10 改定記録参照）。
+- 次レビュー: R-P3-003C-D3（fix2 反映後・H01-R2/M01/L01 の RESOLVED 判定中心・
+  **凍結判定**。経緯: R-P3-003C-D1=CHANGES_REQUIRED〔§10〕→ fix1 → R-P3-003C-D2=
+  前巡 5 所見全 RESOLVED＋新規 H01-R2/M01/L01〔§11〕→ fix2）。
 
 ## 0. 用語の一意化（「held」3 概念の分離・本書全体で厳守）
 
@@ -160,9 +163,9 @@ git 履歴で参照可能・本文からは v2 表へ一本化する）
 | leaf=confirmed | 保留 | **なし・aborted** | 「確定済みです（取消は別途）」——projection 済み結果の取消は App36 巻き戻しを伴い**別票**（裁定④=(A) 採用・§8） |
 | leaf=confirmed | 否認 | **なし・aborted** | 同上（裁定④） |
 | leaf=held | 確定 | **confirmed が leaf を supersede**（supersedes_decision_id=leaf.id） | projection 実行 → 封筒クローズ判定・判断注記を confirmed へ**更新**（M03・§4） |
-| leaf=held | 保留 | **なし（no-op）** | 固定応答「既に保留です」＝同値 decision の連鎖を作らない |
+| leaf=held | 保留 | **なし（no-op）** | 固定応答「既に保留です」＝同値 decision の連鎖を作らない。**ただし封筒 open で判断注記が未適用（前回の後続 write 失敗）なら注記=held を冪等再適用**（§4.1 fix2 H01-R2） |
 | leaf=held | 否認 | **rejected が leaf を supersede** | 封筒クローズ＋判断注記=rejected（§4） |
-| leaf=rejected | 確定／保留／否認 | **なし・aborted（3 指示とも）** | 確定/保留=「否認済みです。再導出してください」（不可逆・§5）。**否認（再）=decision 追加なし・既否認の固定応答**「既に否認済みです」 |
+| leaf=rejected | 確定／保留／否認 | **なし・aborted（3 指示とも）** | 確定/保留=「否認済みです。再導出してください」（不可逆・§5）。**否認（再）=decision 追加なし**——封筒クローズ済みなら既否認の固定応答「既に否認済みです」・**封筒 open（前回の後続 write 失敗）なら注記=rejected とクローズを冪等再適用**（§4.1 fix2 H01-R2） |
 
 - 表は 10 行で閉じる（leaf は高々 1 行・値は 3 値＋不在の 4 状態 × 指示 3 値 ＝ 12 組の
   うち leaf=rejected の 3 指示を 1 行に束ねた表記）。**表にない遷移は存在しない**
@@ -204,6 +207,17 @@ confirmed に supersede された後も root 行は held のまま残るため�
     rollback**（write 0）。再指示時は新 leaf に基づき §3.2-v2 表どおりの応答になる
     （例: 先着が confirmed 化済みなら再指示は resumed／中止）。＝ UNIQUE 制約は
     正常経路の分岐条件ではなく**並行 race の後詰め**としてのみ働く。
+- **並行競合の例外正規化（fix2 M01）**: 上記 race の後着が受ける DB 例外
+  （`uq_heir_decision_supersedes` / `uq_heir_decision_single_root` 由来の
+  IntegrityError）は、txn 境界で **`ChainIntegrityError` へ正規化**する
+  （既存の CAS 中止と同じ固定例外へ合流。同型の新固定例外を設ける場合も
+  「固定文言・値非搭載」の契約は同一）。呼出し側はこれを受けて**グループ全体
+  aborted＋固定応答**（「確定中に前提が変化しました…」型・既存 ChainIntegrityError
+  ハンドリングと同一経路）へ落とす。**vendor/DB 例外本文は応答・ログ・警報へ
+  露出しない**（P3-001 非露出契約と同型・例外連鎖の扱いは CMD 裁定9 の構造を踏襲）。
+- **leaf 検索の fail-closed（fix2・§7-19 と対）**: leaf 検索が**複数行**を返した場合は
+  一本鎖の DB 破損（あってはならない状態）として **ChainIntegrityError 型の中止**
+  （write 0・固定文言・警報）。0 件=decision なし・1 件=正常の 3 分類で閉じる。
 - 既存呼出し（confirmed）は挙動同一を pin（§7-1）。関数名の変更可否は実装票判断
   （公開契約ではないが test が参照）。
 
@@ -234,6 +248,30 @@ confirmed に supersede された後も root 行は held のまま残るため�
 - held 封筒が要確認一覧に残る間の表示: 一覧の件名は起票時のまま（変更しない・
   kintone 画面では detail 注記で判別可）。**T2 応答側で「保留中」を付記する**かは
   実装票の表示判断（挙動に影響しない）。
+
+### 4.1 App30 後続 write の再開規則（fix2 H01-R2・side effect の resumable 化）
+
+decision の DB commit（§3.3-v2 の単一 txn）と App30 の後続 write（判断注記の追記・
+held=open 維持／rejected=完了+yes クローズ）は**別システムで原子性がない**。
+decision commit 成功後に App30 write が失敗すると「decision は記録済み・封筒は
+未注記/未クローズ」の中間状態が残る。これを**同一指示の再発行で冪等回収する**:
+
+- **(a) leaf=held への保留再指示**: decision 追加なしで、**判断注記=held を冪等
+  再適用**する（注記が既に held なら実質 no-op・固定応答「既に保留です」のみ）。
+- **(b) leaf=rejected への否認再指示**: decision 追加なしで、**判断注記=rejected と
+  `発送ステータス:完了＋実行済み:yes` クローズを冪等再適用**する
+  （両方適用済みなら固定応答「既に否認済みです」のみ）。
+- **(c) 再開条件**: side effect 再開は**封筒が open（発送ステータス=要確認 かつ
+  実行済み=no）の場合に限る**。クローズ済み封筒への再指示は従来どおり固定応答
+  （App30 の再読で判定＝gate 系検証と同じ読取を流用・追加照会なし）。
+- **confirmed resume（§9-v2）との対称性（明記）**: 本規則は confirmed の再開経路
+  「root decision 既存でも封筒 open＋run=head なら decision 追加なしで projection
+  のみ再実行」と**同一の構造**——decision（DB・一度きり）と side effect（kintone・
+  冪等再適用可）を分離し、**再指示を正規の再開手段とする**。3 decision すべてが
+  「decision 一度きり＋side effect 冪等」の同型で閉じる。
+- 失敗時の応答: App30 write 失敗自体は既存の例外伝播（握り潰し禁止）どおり
+  aborted 応答で返し、「同じ指示をもう一度送ると続きから再適用されます」を明示する
+  （文言は[人]確認・§8-6 の枠）。
 
 ## 5. (d) rejected 後の再導出・再確定経路
 
@@ -323,6 +361,23 @@ confirmed に supersede された後も root 行は held のまま残るため�
 16. **allowlist 3 値対称拒否**: allowlist 外 decided_by × confirmed/held/rejected の
     3 指示すべて aborted・DB/kintone write 0（裁定①=(A) の対称適用を parametrize）。
 
+**fix2 追加（R-P3-003C-D2 H01-R2/M01 対応の 4 系統）**:
+
+17. **side effect 再開（§4.1）**: decision commit 成功→App30 更新失敗（mock で
+    kintone 例外注入）→ 同一指示の再発行で decision 追加なし＋side effect が
+    冪等再適用される——held（注記=held）／rejected（注記=rejected＋完了+yes）の
+    **両方**を parametrize。再適用完了後のさらなる再指示は固定応答のみ。
+18. **並行 supersede 競合の正規化（§3.3-v2 M01）**: 同一 leaf への並行 supersede
+    （UNIQUE 違反注入）→ **ChainIntegrityError 型へ正規化**され、グループ全体
+    rollback（decision 含む write 0）＋固定 aborted 応答。**DB 例外本文が応答・
+    ログ・警報に非露出**であることを併せて pin。
+19. **leaf 検索の 3 分類 fail-closed（§3.3-v2）**: 0 件=root INSERT 経路／1 件=正常
+    判定／**複数件（一本鎖破損を人工的に構成）=ChainIntegrityError 型中止・write 0**
+    の 3 分岐を parametrize（破損の検出が黙って先勝ちにならないこと）。
+20. **detail 既存キーの保持（§4.1×M03）**: 判断注記の追記・更新時に、封筒 detail の
+    既存キー（冪等キー・derivation_run_id・`保留人物ID` 等）が**すべて保持される**
+    こと（dict 全体置換による欠落の防止・保留人物ID 併存ケースを含む）。
+
 ## 8. 裁定欄（[人]。CMD §8 形式・選択肢+推奨+影響。推測で決めない）
 
 **fix1 裁定確定記録（R-P3-003C-D1 対応指示 2026-08-09・司令塔）**:
@@ -368,6 +423,10 @@ confirmed に supersede された後も root 行は held のまま残るため�
     docs/design-drafts/DRAFT_P3_003C_HELD_REJECTED.md | 244 ++++++++++++++++++++++
     1 file changed, 244 insertions(+)
   ```
+  （**fix2 L01 訂正**: 上記 244 insertions は**初版 `0fc36f4` 時点の値**（fix1 作業時の
+  採取）。fix1 反映後の対象 SHA `3814a02` 時点の実出力は
+  `383 insertions(+)`（1 file changed・同コマンドで再採取 2026-08-09）。
+  両時点残置——D2 レビューの対象 SHA に対する行数証跡としては 383 が正）
   merge-base が現 origin/main と一致＝**rebase 不要**（分岐点が #190 を既に包含）。
   main に対する純差分は本 DRAFT 1 ファイルのみ。次回レビュー BASE は `4afc4be` へ訂正。
 - **M01（分岐位置）**: held/rejected の分岐位置を「gate 系検証の後・App36 row-plan
@@ -380,4 +439,28 @@ confirmed に supersede された後も root 行は held のまま残るため�
   decision 注記（`判断`）と row-held（`保留人物ID`）の別キー維持（§4）。
 - **テスト計画**: §7 に 8 系統（9〜16）を追加。
 - 次レビュー: **R-P3-003C-D2**（BASE=origin/main `4afc4be`・TARGET=p3-003c-design の
-  fix1 commit）。
+  fix1 commit）。→ 実施済み・結果は §11。
+
+## 11. fix2 改定記録（R-P3-003C-D2・2026-08-09。両時点残置・遡及書き換えにしない）
+
+R-P3-003C-D2 判定: **前巡 5 所見（H01/H02/M01/M02/M03）全 RESOLVED**・
+新規 H01-R2/M01/L01。fix2 で以下を反映:
+
+- **H01-R2（side effect の resumable 化）**: decision DB commit 後の App30 後続 write
+  失敗の再開規則を §4.1 に固定——(a) leaf=held+保留再指示=注記 held の冪等再適用
+  (b) leaf=rejected+否認再指示=注記 rejected＋完了/yes クローズの冪等再適用
+  (c) 再開条件=封筒 open（要確認/no）限定・クローズ済みは固定応答。
+  confirmed resume（§9-v2）と対称の「decision 一度きり＋side effect 冪等」構造で
+  3 decision が同型に閉じることを明記。§3.2-v2 表の該当 2 セルへ §4.1 参照を追記。
+- **M01（例外正規化）**: 並行 supersede 競合の IntegrityError
+  （uq_heir_decision_supersedes／uq_heir_decision_single_root 由来）を
+  **ChainIntegrityError へ正規化**（または同型の新固定例外・固定文言・値非搭載）し、
+  グループ全体 aborted＋固定応答へ落とす規則を §3.3-v2 に明記。vendor/DB 例外本文の
+  非露出（既存契約と同型）。あわせて leaf 検索複数件=一本鎖破損の fail-closed を追加。
+- **L01（§10 行数証跡）**: 244 insertions は初版時点値と明記し、対象 SHA `3814a02`
+  時点の実出力 **383 insertions** を訂正併記（両時点残置・§10）。
+- **テスト計画**: §7 に 4 系統（17〜20）を追加（side effect 再開・並行競合正規化・
+  leaf 3 分類 fail-closed・detail 既存キー保持）。
+- 次レビュー: **R-P3-003C-D3**（H01-R2/M01/L01 の RESOLVED 判定中心・**凍結判定**。
+  BASE=origin/main `4afc4be`・TARGET=p3-003c-design の fix2 commit。凍結判定時の
+  [人]明示確認事項: §8 の裁定②③の明示裁定＋⑤⑥）。
