@@ -43,14 +43,16 @@ from datetime import datetime, timezone
 import sqlalchemy as sa
 
 from hub import kintone
-from hub.derivation_models import (_PERSON_ID_RE, _SHARE_RE, ZOKUGARA_CODES,
-                                   ChainIntegrityError, DerivationRun,
+from hub.derivation_models import (_PERSON_ID_RE, _SHARE_RE, DECISIONS,
+                                   ZOKUGARA_CODES, ChainIntegrityError,
+                                   DecisionBlockedError,
+                                   DecisionChainCorruptionError, DerivationRun,
                                    HeirConfirmationDecision,
-                                   create_confirmed_decisions_for_heads,
-                                   get_current_head,
+                                   create_decisions_for_heads,
+                                   get_current_head, get_leaf_decision,
                                    payload_has_zokugara_codes)
-from hub.heir_envelope import (APP_SHIPPING, DETAIL_HELD_PERSONS_KEY,
-                               _unit_for_case)
+from hub.heir_envelope import (APP_SHIPPING, DETAIL_DECISION_KEY,
+                               DETAIL_HELD_PERSONS_KEY, _unit_for_case)
 from hub.redact import emit
 
 logger = logging.getLogger("hub.heir_projection")
@@ -190,24 +192,115 @@ async def _ancestor_ids(run_row) -> set[int]:
     return out
 
 
+# ── P3-003c: §3.2-v2 中止セルの固定応答（値非搭載）─────────────────────────
+_BLOCKED_REASONS = {
+    "already_rejected": "否認済みです。再導出してから確定してください（書き込みなし）",
+    "already_confirmed": "確定済みです（取消は別途・書き込みなし）",
+}
+
+
+def _decision_note(decision: str, decided_at) -> dict:
+    """封筒 detail の判断注記値（P3-003c §4）。decided_at は decision の保存値
+    （再適用時も leaf の保存値＝時刻を上書きしない・§12 M01）。decided_by は
+    載せない（PII 最小化）。
+
+    ISO 表記は UTC へ正準化する——保存層（sqlite テスト）は naive（UTC）で
+    復元されるため、初回適用（tz-aware）と再適用（DB 復元値）で文字列が
+    揺れないよう単一形へ寄せる（冪等再適用の同値性・§4.1）。"""
+    if hasattr(decided_at, "isoformat"):
+        dt = decided_at
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)   # 保存層は UTC（naive 復元）
+        iso = dt.astimezone(timezone.utc).isoformat()
+    else:
+        iso = str(decided_at or "")
+    return {"decision": decision, "decided_at": iso}
+
+
+def _live_detail_base(record: dict, item) -> dict:
+    """detail 再構築の基底（P3-003c fix1 H01）。
+
+    **phase 1 の App30 再読で取得した現在のチャネル固有データを基底**とし、
+    pending 時の ReviewItem.detail スナップショットは再読に detail が無い場合
+    （legacy/テスト封筒）の縮退のみに用いる。これにより pending 承認の間に
+    他経路（row-held 追記・別 decision の注記等）が detail へ追記したキーを
+    上書きで失わない——当該 decision が書くキーだけを基底へ重ねる規則。
+    """
+    raw = _v(record, "チャネル固有データ")
+    if raw:
+        try:
+            inner = json.loads(raw).get("heir_derivation")
+            if isinstance(inner, dict):
+                return dict(inner)
+        except (ValueError, TypeError, AttributeError):
+            pass   # 解釈不能は縮退（snapshot 基底・既存挙動へ収束）
+    return dict(item.detail)
+
+
+def _decision_side_effect_fields(base_detail: dict, decision: str,
+                                 info: dict) -> dict:
+    """held/rejected の App30 単一 update に載せる field 集合（P3-003c §4.1・
+    §12 M01・kintone 呼出しは行わない=一本経路 pin の配下は呼出し元）。
+
+    判断注記（キー 判断）のみを **base_detail（=App30 再読の現在 detail・
+    fix1 H01）** へ上書きし、他の既存キーは全保持。rejected のみ 完了/実行済み
+    yes クローズ。held は封筒 open 維持（クローズ系 field を含めない）。冪等＝
+    noop 時は leaf の保存 decided_at を用いるため内容も不変（§4.1）。
+    """
+    detail = dict(base_detail)   # 再読基底の既存キー（保留人物ID 等）全保持
+    detail[DETAIL_DECISION_KEY] = _decision_note(
+        decision, info.get("decided_at"))
+    fields = {"チャネル固有データ": json.dumps({"heir_derivation": detail},
+                                               ensure_ascii=False)}
+    if decision == "rejected":
+        fields["発送ステータス"] = STATUS_DONE
+        fields["実行済み"] = "yes"
+    return fields
+
+
+async def _alert_chain_corruption(case_record_id: str, exc) -> None:
+    """一本鎖破損の業務警報（fix1 M02・固定分類・件数と ID のみ・値非搭載）。
+
+    正常系の並行 race（CAS 不一致・UNIQUE 競合の正規化＝素の
+    ChainIntegrityError）では呼ばない——破損（データ異常）だけを可視化する。
+    """
+    await _alert_business(
+        "【相続人判断: decision 鎖の破損検出】\n"
+        f"案件 No.{case_record_id} / run #{exc.run_id} / "
+        f"有効 leaf {exc.count} 件\n"
+        "一本鎖でない decision 鎖を検出しました（書き込みなし・人手調査要）")
+    logger.error("[HEIR-PROJ] decision-chain corruption detected "
+                 "(fixed classification only)")
+
+
 # ══════════════════════════════════════════════════════════════
 # 確定関所（confirmed handler・review_resolve.RESOLVERS "heir_derivation"）
 # ══════════════════════════════════════════════════════════════
 
 async def _resolve_heir_derivation(group, case_record_id: str,
-                                   decided_by: str = "") -> dict:
-    """相続人導出封筒の確定（ENVELOPE_FLOW §3.2 の 3 phase）。
+                                   decided_by: str = "",
+                                   decision: str = "confirmed") -> dict:
+    """相続人導出封筒の確定・保留・否認（ENVELOPE_FLOW §3.2＋P3-003c 凍結仕様）。
 
-    phase 1（読取専用・1件でも要確認なら全体中止=write 0）→
+    confirmed: phase 1（読取専用・1件でも要確認なら全体中止=write 0）→
     phase 2（HCD confirmed を 1 行 INSERT・DerivationRun は不改変）→
     phase 3（App36 upsert〔§4A の書込み表〕＋封筒クローズ）。
+
+    held/rejected（P3-003c §6・M01 の分岐位置）: gate 系検証（封筒再読・run 検証・
+    head 確認・leaf 判定・allowlist）の後・**App36 row-plan 構築（search 含む）の前**
+    に分岐＝App36 への照会は構造上ゼロ。decision 記録（§3.3-v2 leaf 判定 txn）→
+    App30 の**単一 update 一括**で判断注記＋（rejected のみ）クローズ（§4.1・§12 M01）。
+    projection 系検査（胎児・写像・旧 payload・冪等 search）は confirmed のみ。
     """
+    if decision not in DECISIONS:
+        return {"status": "aborted",
+                "reason": "不明な判断種別です（書き込みなし）"}
     if not _CASE_RECORD_ID_RE.fullmatch(case_record_id or ""):
         return {"status": "aborted",
                 "reason": "案件レコードIDが数字列ではありません（書き込みなし）"}
     if decided_by not in attorney_allowlist():
-        # 正本 §3.4 H11 防御: allowlist 外の confirmed（=戸籍確認済 yes 遷移を伴う）
-        # は拒否。識別子の値は文言に載せない
+        # 正本 §3.4 H11 防御＋P3-003c 裁定①=(A): 3 decision 対称に allowlist 検証。
+        # 識別子の値は文言に載せない
         return {"status": "aborted",
                 "reason": "確定権限がありません（ATTORNEY_ALLOWLIST 外・書き込みなし）"}
 
@@ -246,6 +339,36 @@ async def _resolve_heir_derivation(group, case_record_id: str,
                     "reason": f"run #{run.id} は最新ではありません（新しい導出が"
                               "あります）。新しい封筒から確定してください"
                               "（書き込みなし）"}
+        # P3-003c §6: 有効 leaf の先行検査（gate 系・3 decision 共通・read-only）。
+        # §3.2-v2 の中止セルを App36 row-plan 構築より**前**に遮断する（App36
+        # 照会ゼロ・§7-3）。正式な判定と INSERT は phase 2 の単一 txn が再実施
+        # （本検査は先行遮断・txn 側の CAS/leaf 判定が正）
+        try:
+            leaf = await get_leaf_decision(run.id)
+        except DecisionChainCorruptionError as e:
+            # fix1 M02: 破損（データ異常）は業務警報＋固定分類ログ。
+            # 正常系の並行 race とは型で区別（race はここに来ない）
+            await _alert_chain_corruption(case_record_id, e)
+            return {"status": "aborted",
+                    "reason": "判断記録の整合が取れません"
+                              "（破損検出・書き込みなし）"}
+        except ChainIntegrityError:
+            return {"status": "aborted",
+                    "reason": "判断記録の整合が取れません"
+                              "（破損検出・書き込みなし）"}
+        if leaf is not None:
+            if leaf.decision == "rejected" and decision != "rejected":
+                return {"status": "aborted",
+                        "reason": _BLOCKED_REASONS["already_rejected"]}
+            if leaf.decision == "confirmed" and decision != "confirmed":
+                return {"status": "aborted",
+                        "reason": _BLOCKED_REASONS["already_confirmed"]}
+        # ── P3-003c §6 M01: held/rejected はここで分岐（gate 系のみ・以降の
+        #    projection 系検査〔胎児・写像・旧 payload・App36 search〕へ進まない
+        #    ＝App36 照会ゼロを分岐位置で構造保証）──────────────────────────────
+        if decision != "confirmed":
+            plans.append((item, run, None, None, _live_detail_base(record, item)))
+            continue
         payload = run.result_payload or {}
         heirs = payload.get("heirs") or []
         # 旧 run（zokugara_code 欠落）＝精密 projection 不可（P3-001 §3.2）
@@ -343,21 +466,63 @@ async def _resolve_heir_derivation(group, case_record_id: str,
                 return {"status": "aborted",
                         "reason": f"App36 No.{app36_id} は別系列の導出に紐付いて"
                                   "います（要確認・書き込みなし）"}
-        plans.append((item, run, ancestors, row_plans))
+        plans.append((item, run, ancestors, row_plans,
+                      _live_detail_base(record, item)))
 
-    # ── phase 2: HCD confirmed の一括追記（fix2 H01-R2: グループ全 item を単一
+    # ── phase 2: HCD decision の一括追記（fix2 H01-R2: グループ全 item を単一
     #    DB トランザクションで一括 CAS→一括 INSERT。途中失敗は全体 rollback＝
     #    decision 含む write 0。同一 run 参照の複数封筒は 1 decision に重複排除。
-    #    root decision 既存 run は "resumed"＝INSERT せず phase 3 のみ再実行）──────
+    #    P3-003c §3.3-v2: 有効 leaf 判定（0/1/複数の fail-closed）＋§3.2-v2 遷移表。
+    #    leaf=confirmed×確定は "resumed"＝INSERT せず phase 3 のみ再実行）──────────
     try:
-        await create_confirmed_decisions_for_heads(
-            case_record_id, [run.id for _i, run, _a, _rp in plans],
-            decided_by=decided_by, decided_at=datetime.now(timezone.utc))
+        decisions = await create_decisions_for_heads(
+            case_record_id, [run.id for _i, run, _a, _rp, _d in plans],
+            decision=decision, decided_by=decided_by,
+            decided_at=datetime.now(timezone.utc))
+    except DecisionBlockedError as e:
+        # §3.2-v2 の中止セル（固定文言・値非搭載・全体 rollback 済み）
+        return {"status": "aborted", "reason": _BLOCKED_REASONS[e.code]}
+    except DecisionChainCorruptionError as e:
+        # fix1 M02: txn 内検出の破損も警報（race 正規化とは型で区別・警報なし側は
+        # 下の ChainIntegrityError 節）
+        await _alert_chain_corruption(case_record_id, e)
+        return {"status": "aborted",
+                "reason": "判断記録の整合が取れません（破損検出・書き込みなし）"}
     except ChainIntegrityError:
         return {"status": "aborted",
                 "reason": "確定中に前提が変化しました（supersede を検出・グループ"
                           "全体を中止・書き込みなし）。最新の封筒から確定し直して"
                           "ください"}
+
+    # ── held/rejected: App30 side effect のみ（§4.1・§12 M01・App36 到達なし。
+    #    封筒ごとに update_record **単一呼出し一括**・write は一本経路 pin の
+    #    とおり本関数配下）─────────────────────────────────────────────────────
+    if decision != "confirmed":
+        results = []
+        for item, run, _ancestors, _row_plans, live_detail in plans:
+            info = decisions.get(run.id) or {}
+            await kintone.update_record(
+                APP_SHIPPING, item.record_id,
+                _decision_side_effect_fields(live_detail, decision, info))
+            results.append({"review_record_id": item.record_id,
+                            "derivation_run_id": run.id,
+                            "decision_outcome": info.get("outcome", "")})
+            # decision は分岐確定済みのため format 文字列へリテラルで焼き込む
+            # （sink 検査: logger 引数は emit() 経由のみ・変数直渡しをしない）
+            if decision == "held":
+                logger.info(
+                    "[HEIR-PROJ] decision=held review=No.%s run=%s case=%s",
+                    emit(item.record_id, "record_id", "log", "operator"),
+                    emit(str(run.id), "record_id", "log", "operator"),
+                    emit(case_record_id, "record_id", "log", "operator"))
+            else:
+                logger.info(
+                    "[HEIR-PROJ] decision=rejected review=No.%s run=%s case=%s",
+                    emit(item.record_id, "record_id", "log", "operator"),
+                    emit(str(run.id), "record_id", "log", "operator"),
+                    emit(case_record_id, "record_id", "log", "operator"))
+        return {"status": "resolved", "decision": decision,
+                "case_record_id": case_record_id, "items": results}
 
     # ── phase 3: App36 upsert（§4A 書込み表・fix1 H01: 各行 write 直前の再検証
     #    〔冪等キー再検索＋H10 は revision 楽観ロック〕・要確認行はスキップ継続）──
@@ -367,7 +532,7 @@ async def _resolve_heir_derivation(group, case_record_id: str,
     #    保留行の人物 record ID（数字のみ・PII 非搭載）を追記。収束後に**同じ封筒を
     #    再確定**すると再開経路（resumed）で残り行だけが再反映される
     results = []
-    for item, run, ancestors, row_plans in plans:
+    for item, run, ancestors, row_plans, live_detail in plans:
         unit = _unit_for_case(str(run.case_app_id))
         counts = {"inserted": 0, "updated": 0, "held": 0}
         held_pids: list[str] = []
@@ -378,15 +543,27 @@ async def _resolve_heir_derivation(group, case_record_id: str,
             if outcome == "held":
                 held_pids.append(pid)
         closed = counts["held"] == 0
+        # P3-003c §4 M03: held→confirmed の supersede 後は判断注記を confirmed へ
+        # **更新**（除去しない・decided_at は decision の保存値）。注記が無い封筒
+        # （held を経ない通常確定）には追記しない（既存挙動不変）。
+        # fix1 H01: 基底は App30 再読の現在 detail（snapshot でなく）
+        detail = dict(live_detail)
+        annotate = DETAIL_DECISION_KEY in detail
+        if annotate:
+            info = decisions.get(run.id) or {}
+            detail[DETAIL_DECISION_KEY] = _decision_note(
+                "confirmed", info.get("decided_at"))
         if closed:
-            await kintone.update_record(APP_SHIPPING, item.record_id, {
-                "発送ステータス": STATUS_DONE,
-                "実行済み": "yes",
-            })
+            # クローズ＋注記更新は単一 update の一括（§12 M01 と同型・呼出し 1 回）
+            fields = {"発送ステータス": STATUS_DONE, "実行済み": "yes"}
+            if annotate:
+                fields["チャネル固有データ"] = json.dumps(
+                    {"heir_derivation": detail}, ensure_ascii=False)
+            await kintone.update_record(APP_SHIPPING, item.record_id, fields)
         else:
             # held の耐久可視性: 封筒は要確認のまま・detail へ保留人物 ID を追記
-            # （操作者が対象行を特定できる・値は App34 person record ID の数字のみ）
-            detail = dict(item.detail)
+            # （操作者が対象行を特定できる・値は App34 person record ID の数字のみ。
+            # 判断注記（confirmed 更新）とは別キー併存＝M03）
             detail[DETAIL_HELD_PERSONS_KEY] = held_pids
             await kintone.update_record(APP_SHIPPING, item.record_id, {
                 "チャネル固有データ": json.dumps({"heir_derivation": detail},

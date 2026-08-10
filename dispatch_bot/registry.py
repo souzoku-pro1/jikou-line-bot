@@ -278,10 +278,12 @@ register(TaskSpec(
     artifacts="App 35 財産行＋App 30 クローズ（完了・実行済み=yes）",
     adapter="ReviewResolve",
     on_failure="更新失敗はLINEにエラー返信（管理者警報つき・既存の警報系）",
-    hint_for_parser=("要確認キュー（App 30）を案件へ確定する。"
-                     "「〇〇さんの要確認を確定して」「要確認を処理して」等。"
+    hint_for_parser=("要確認キュー（App 30）を案件へ確定・保留・否認する。"
+                     "「〇〇さんの要確認を確定して」「要確認を処理して」"
+                     "「要確認を保留して」「要確認を否認して」等。"
                      "customer_name に顧客名。「No.12の案件へ」等の番号指定は "
-                     "task_params.case_record_id に数字のみ入れる"),
+                     "task_params.case_record_id に数字のみ入れる"
+                     "（保留/否認の種別判定はタスク側で決定論に行う）"),
     required_desc="customer_name または 案件No（例: No.12）",
     flow_fn=review_resolve_task.flow,
     flow_reply_fn=review_resolve_task.flow_reply,

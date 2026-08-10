@@ -40,6 +40,30 @@ MSG_NO_CUSTOMER_MATCH = ("候補顧客に該当がありません。氏名の表
 QUESTION_CUSTOMER = ("どの案件（顧客）に確定しますか？氏名または案件No"
                      "（例: No.12）を教えてください")
 
+# ── P3-003c §2.1: decision 語彙の閉集合（曖昧は confirmed に倒さない・聞き返し）──
+_HELD_WORDS = ("保留", "ペンディング")
+_REJECTED_WORDS = ("否認", "差し戻し", "差戻し", "却下")
+MSG_DECISION_AMBIGUOUS = ("保留と否認のどちらの指示か判別できません。"
+                          "「保留して」または「否認して」のどちらか一方で"
+                          "指示し直してください")
+
+
+def _detect_decision(text: str) -> tuple[str | None, str]:
+    """発話から decision 種別を決定論で判定（LLM 解析に依存しない・閉集合）。
+
+    戻り値: (decision, error_msg)。held/rejected の両語を含む曖昧発話は
+    (None, 聞き返し文言)——confirmed に倒さない（§2.1）。どちらも含まなければ
+    confirmed（既存語彙のまま）。"""
+    held = any(w in (text or "") for w in _HELD_WORDS)
+    rejected = any(w in (text or "") for w in _REJECTED_WORDS)
+    if held and rejected:
+        return None, MSG_DECISION_AMBIGUOUS
+    if held:
+        return "held", ""
+    if rejected:
+        return "rejected", ""
+    return "confirmed", ""
+
 
 def _format_group_choices(groups: list[ReviewGroup]) -> str:
     lines = [f"要確認が{len(groups)}グループあります。番号で選んでください:"]
@@ -79,14 +103,19 @@ async def _group_kinds(group: ReviewGroup) -> list[str]:
 
 async def _confirm(user_id: str, parsed: dict, base_text: str,
                    group: ReviewGroup, cand: Candidate) -> str:
-    """復唱→pending 発行（既存 confirm 機構・30分単回。OK で execute が走る）"""
+    """復唱→pending 発行（既存 confirm 機構・30分単回。OK で execute が走る）。
+
+    P3-003c §2.2: held/rejected は復唱に decision 種別と帰結を明示する
+    （特に rejected の不可逆性＝封筒クローズ・再確定は再導出）。文言は
+    裁定⑥の第1案＋案件表示。"""
     from dispatch_bot import confirm, handler  # 遅延 import（循環回避）
     handler._sessions.pop(user_id, None)
+    decision = str((parsed.get("task_params") or {}).get("decision")
+                   or "confirmed")
     folder = f"No{cand.record_id}_{cand.customer_name}"
-    kinds = await _group_kinds(group)
-    kinds_note = f"（{'・'.join(kinds)}）" if kinds else ""
     parsed = {**parsed, "task_type": TASK_TYPE,
               "task_params": {**(parsed.get("task_params") or {}),
+                              "decision": decision,
                               "group_source": group.source,
                               "group_idem": group.idempotency_key,
                               "group_items": [asdict(i) for i in group.items],
@@ -96,7 +125,19 @@ async def _confirm(user_id: str, parsed: dict, base_text: str,
     hit = CaseHit(record_id=cand.record_id, customer_name=cand.customer_name,
                   status=cand.status or "相談カード", unit="相続")
     confirm.create(user_id, parsed, hit, base_text)
-    return (f"要確認{len(group.items)}件{kinds_note}を {folder} の案件に確定します。\n"
+    n = len(group.items)
+    if decision == "held":
+        return (f"要確認{n}件（{folder}）を保留として記録します"
+                "（App36への反映はありません・封筒は要確認のまま残ります）。\n"
+                "OK / キャンセル（30分有効）")
+    if decision == "rejected":
+        return (f"要確認{n}件（{folder}）を否認として記録します"
+                "（App36への反映はありません・この封筒はクローズされ、"
+                "再確定には再導出が必要です）。\n"
+                "OK / キャンセル（30分有効）")
+    kinds = await _group_kinds(group)
+    kinds_note = f"（{'・'.join(kinds)}）" if kinds else ""
+    return (f"要確認{n}件{kinds_note}を {folder} の案件に確定します。\n"
             f"OK / キャンセル（30分有効）")
 
 
@@ -105,6 +146,15 @@ async def _case_step(user_id: str, parsed: dict, base_text: str,
     """案件指定: No.直指定 → 顧客名突合 → 不足は聞き返し"""
     from dispatch_bot import handler, registry  # 遅延 import（循環回避）
     spec = registry.get_task(TASK_TYPE)
+
+    # P3-003c §2.1: decision 語彙（保留/否認）は heir_derivation 封筒のみ対応。
+    # 対象外 source は明示応答（黙って確定に倒さない・pending も張らない）
+    decision = str((parsed.get("task_params") or {}).get("decision")
+                   or "confirmed")
+    if decision != "confirmed" and group.source != "heir_derivation":
+        from review_resolve import MSG_DECISION_UNSUPPORTED
+        handler._sessions.pop(user_id, None)
+        return MSG_DECISION_UNSUPPORTED
 
     params = parsed.get("task_params") or {}
     direct = str(params.get("case_record_id") or "").strip()
@@ -146,6 +196,17 @@ async def _case_step(user_id: str, parsed: dict, base_text: str,
 async def flow(user_id: str, parsed: dict, base_text: str, session) -> str:
     """タスク固有フロー本体（handler の flow_fn フックから呼ばれる）"""
     from dispatch_bot import handler  # 遅延 import（循環回避）
+
+    # P3-003c §2.1: decision 種別を発話から決定論で判定し task_params へ固定
+    # （以降の flow_reply/execute は session/pending 経由でこの値を引き継ぐ）
+    decision, ambiguous_msg = _detect_decision(base_text)
+    if decision is None:
+        handler._sessions.pop(user_id, None)
+        return ambiguous_msg
+    params = dict(parsed.get("task_params") or {})
+    params["decision"] = decision
+    parsed = {**parsed, "task_params": params}
+
     groups = await list_pending_reviews()
     if not groups:
         handler._sessions.pop(user_id, None)
@@ -223,9 +284,26 @@ async def execute(pending) -> tuple[str, str, str]:
 
     # P3-003b: 確定者識別を伝搬（heir_derivation の ATTORNEY_ALLOWLIST 検証用。
     # 既存ハンドラは decided_by を受けない=挙動不変）
-    result = await resolve_group(group, case_id,
-                                 decided_by=getattr(pending, "user_id", ""))
+    # P3-003c: decision 種別を伝搬（confirmed 以外は heir_derivation のみ・
+    # resolve_group 側で能力ベース検査）
+    decision = str(params.get("decision") or "confirmed")
+    kwargs = {"decided_by": getattr(pending, "user_id", "")}
+    if decision != "confirmed":
+        # confirmed は従来呼出しのまま（既存テスト/呼出し互換・能力ベース）
+        kwargs["decision"] = decision
+    result = await resolve_group(group, case_id, **kwargs)
     status = result.get("status")
+
+    if status == "resolved" and result.get("decision") in ("held", "rejected"):
+        # P3-003c: held/rejected の応答（件数のみ・PII なし・帰結を明示）
+        n = len(result.get("items") or [])
+        if result.get("decision") == "held":
+            return (f"要確認{n}件を保留として記録しました"
+                    "（封筒は要確認のまま残ります・App36への反映はありません）\n"
+                    "（kintone内部のみ・対外送信なし）", "", "")
+        return (f"要確認{n}件を否認として記録しました"
+                "（封筒をクローズしました・再確定には再導出が必要です）\n"
+                "（kintone内部のみ・対外送信なし）", "", "")
 
     if status == "resolved":
         lines = [f"要確認{len(result.get('items') or [])}件を {folder} の案件に"

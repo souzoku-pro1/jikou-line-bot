@@ -408,8 +408,13 @@ RESOLVERS = {
 }
 
 
+MSG_DECISION_UNSUPPORTED = ("このグループは確定のみ対応です"
+                            "（保留・否認は相続人導出の封筒のみ）")
+
+
 async def resolve_group(group: ReviewGroup, case_record_id: str,
-                        decided_by: str = "") -> dict:
+                        decided_by: str = "",
+                        decision: str = "confirmed") -> dict:
     """確定グループを案件へ確定する（上位=T2 から呼ばれる入口）。
 
     Returns: {"status": "resolved"|"aborted"|"unsupported"|"unavailable", ...}
@@ -419,7 +424,13 @@ async def resolve_group(group: ReviewGroup, case_record_id: str,
     - decided_by: 確定者の識別（P3-003b・heir_derivation の ATTORNEY_ALLOWLIST
       検証に使用）。**ハンドラ固有分岐は作らない**——signature に decided_by を
       持つハンドラへだけ渡す（能力ベース・既存4ハンドラは無変更で互換）
+    - decision（P3-003c）: "confirmed"|"held"|"rejected"。decided_by と同じ
+      能力ベース伝搬——signature に decision を持たないハンドラへの held/rejected
+      指示は unsupported の明示応答（黙って確定に倒さない・§2.1）
     """
+    if decision not in ("confirmed", "held", "rejected"):
+        return {"status": "aborted",
+                "reason": "不明な判断種別です（書き込みなし）"}
     entry = RESOLVERS.get(group.source)
     if entry is None:
         return {"status": "unsupported",
@@ -433,6 +444,12 @@ async def resolve_group(group: ReviewGroup, case_record_id: str,
     if not case_record_id:
         return {"status": "aborted", "reason": "案件レコードIDが指定されていません"}
     import inspect
-    if "decided_by" in inspect.signature(handler).parameters:
-        return await handler(group, case_record_id, decided_by=decided_by)
-    return await handler(group, case_record_id)
+    params = inspect.signature(handler).parameters
+    if decision != "confirmed" and "decision" not in params:
+        return {"status": "unsupported", "reason": MSG_DECISION_UNSUPPORTED}
+    kwargs = {}
+    if "decided_by" in params:
+        kwargs["decided_by"] = decided_by
+    if "decision" in params:
+        kwargs["decision"] = decision
+    return await handler(group, case_record_id, **kwargs)
