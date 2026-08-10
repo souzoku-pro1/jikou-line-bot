@@ -10,14 +10,18 @@
   plan_hash は正本内容のみ・§2C は起票時の非内容的フィルタ〕・H02〔束ね=自治体×
   対象者×様式・plan_idem 再定義・sibling_death 親エッジ共有規則〕・H03〔open 限定
   回収=却下非抑止の構造化・部分失敗は封筒 open 維持〕・M04〔3 裁定への同期〕・
-  §8-3 改定記録）
+  §8-3 改定記録／
+  fix4: R-SHOKUMU-PLAN-D4 反映・2026-08-11・司令塔裁定——H01-01〔canonical 全候補
+  保存・§2C フィルタは M1 create 直前のみ〕・H01-02〔plan 横断冪等キー=plan_hash
+  除去・HIT 時 line_type 集合比較〕・M01〔§4-v2.1 保証文言の限定〕・M04-01〔§6
+  同期 5 点〕・§8-4 改定記録）
 - 盤面: 8月構想・項目1。判断部品はすべて既存——本票は**結線の設計**であり新エンジンを作らない。
 - 実装現実の実査基盤（2026-08-10・read-only・main `6312112`）:
   `koseki_chain.py`（F5 判定）／`docs/souzoku-houki/10-koseki-matrix.md`（H系列③・凍結）／
   `dispatch_bot/shokumu.py`＋`channels/shokumu_seikyu.py`（M1・実物検収済み）／
   `hub/derivation_models.py`・`hub/heir_projection.py`（P3 系）／`review_resolve.py`（App33 参照・関所型）／
   `hub/heir_envelope.py`（封筒冪等の型）。
-- 次レビュー: R-SHOKUMU-PLAN-D4（**凍結判定**。経緯: D1=凍結不適格→fix1→
+- 次レビュー: R-SHOKUMU-PLAN-D5（**凍結判定**。経緯: D1=凍結不適格→fix1→
   D2=H01/H02/H03+M01〜M04〔M01 のみ RESOLVED〕→fix2。対応は §8 改定記録）。
 
 ## 0. 原則（本票の背骨・§2 で構造化）
@@ -263,7 +267,19 @@ plan_hash の (4) に反映）だが、**App30 の封筒・M1 起票状態の照
      一致の誤爆〔件名・purpose 内の語など〕を排除。**parse 不能な既存レコードは
      照合不成立＝安全側で「未起票扱い」**にせず**要確認へ倒す**——壊れ JSON の
      存在自体が異常のため）。
-  3. いずれかに該当すれば第二段 plan から共通行を**除外**（重複提案しない）。
+  3. **フィルタの適用時点（fix3「除外」→fix4 H01-01 で改定・両時点残置）**:
+     - （履歴・fix3 まで）「該当すれば第二段 plan から共通行を**除外**」——**撤回**:
+       封筒生成時に候補を削除すると candidates が plan_hash（正本内容）と 1:N に
+       なり、状態反転（例: common 封筒を却下した後に full を確定）で共通行を
+       復元できない。
+     - **fix4 正**: 封筒 candidates は**未フィルタの canonical 全候補**
+       （plan_hash と 1:1・§4A）を保存する。本節の照合は **M1 create 直前の
+       実行時にのみ適用**し、該当候補を**skip**（起票しない）——封筒・復唱の
+       表示では「起票済み/取得済み」の注記を付してよい（候補自体は削除しない）。
+     - **状態反転の復元**: common 封筒却下→full 確定の場合、full の candidates に
+       共通行が保持されているため、確定時点の実行時フィルタで「起票済みでない」と
+       判定されれば**自然に復元起票される**（§6-31）——生成時除外ではこの復元が
+       構造的に不可能だった。
   4. **却下の非抑止（fix2 M01→fix3 H03 で構造化・両時点残置）**:
      - （履歴・fix2）「同一材料での再指示は封筒冪等（already_filed）で同一封筒に
        回収」——**撤回**: 却下＝封筒クローズ後は同一封筒への回収が[人]の再オープン
@@ -394,7 +410,9 @@ App31 レコードの更新・無効化（(7)）・被相続人フラグ付替�
 内容を変えるため plan_hash を変え、確定時再計算で stale 検出される。
 
 - **stale 保証との 1:1**（§4「App34/36 変更時 stale」の成立根拠）: 上表のとおり
-  **plan の内容・M1 入力に影響し得る上流の変更は必ず plan_hash を変える**。
+  **候補由来の M1 入力に影響し得る上流変更は必ず plan_hash を変える**
+  （fix4 M01 で限定訂正——確定時再取得値〔§2D・候補由来でない fields 材料〕と
+  非内容的状態〔§2C〕は本保証の対象外＝それぞれ最新読み・実行時フィルタが担う）。
   確定時は材料の現在値から plan_hash を**再計算**して封筒 detail と照合
   （不一致=aborted・write 0）＝§4A の snapshot hash 保存（M02）と一体の設計。
 - **上流訂正（App34/36 変更・再導出・戸籍追加受領）時の失効**:
@@ -410,13 +428,26 @@ App31 レコードの更新・無効化（(7)）・被相続人フラグ付替�
 
 ## 4B. plan 由来 M1 起票の冪等（fix2 H03・決定的冪等キーの新設）
 
-- **M1 冪等キー（決定的・fix3 H02 で再定義＝束ね単位と 1:1・両時点残置）**:
-  `shokumu_plan:{case_record_id}:{plan_hash}:{municipality}:{person_id or "-"}:{様式}`
-  （様式 ∈ `form1|form2`）。**束ね単位（同一自治体×同一対象者×同一様式・§2A）と
-  1:1**——束ねに含めた line_type 集合は**キーに載せず** request_items と監査メタ
-  （`plan_lines`）に記録する（初版の `{line_type}` 込みキーは束ね単位と 1:N に
-  なり得たため撤回）。
-  grammar: `^shokumu_plan:[0-9]{1,10}:[0-9a-f]{64}:[^:]{1,64}:([0-9]{1,10}|-):(form1|form2)$`。
+- **M1 冪等キー（fix3→fix4 H01-02 で再々定義＝plan 横断で安定・両時点残置）**:
+  `shokumu_plan:{case_record_id}:{municipality}:{person_id or "-"}:{様式}`
+  （様式 ∈ `form1|form2`）。**plan_hash をキーから除去**——キーは「案件×宛先×
+  対象者×様式」という**業務上の起票単位**を表し、**全 plan（材料変化後の新 plan
+  含む）を横断して安定**する。plan_hash 込みの旧キー（fix3）では材料が変わる度に
+  キーが変わり、**同一起票単位の既存 M1 下書きを別物として再発行**してしまう
+  （初版 `{line_type}` 込みキー・fix3 `{plan_hash}` 込みキーはいずれも撤回）。
+  束ねに含めた line_type 集合はキーに載せず request_items と監査メタ
+  （`plan_lines`）に記録する。
+  grammar: `^shokumu_plan:[0-9]{1,10}:[^:]{1,64}:([0-9]{1,10}|-):(form1|form2)$`。
+- **照合 HIT 時の line_type 集合比較（fix4 H01-02・凍結）**: plan_idem 一致の既存
+  M1 を見つけたら、既存の監査メタ `plan_lines` と今回束ねの line_type 集合を比較——
+  **一致 = skip 回収**（already_filed・新規 create しない）／**不一致 = 当該候補を
+  要確認**（「同一起票単位で内容の異なる既存下書きがあります」の道案内・
+  **自動 merge・自動再発行は禁止**——既存下書きの取扱いは[人]が承認キューで判断）。
+- **二層の関係（fix4 H01-02 で再記述）**: §2C の既存 M1 照合は**共通行（除票/附票）
+  に限った前段の表示フィルタ**（提案ノイズ低減・削除しない・取り零し許容）。
+  **§4B の plan_idem 照合が最終防壁**であり、**全行類型（束ね単位すべて）を覆う**
+  ——M1 create 直前に必ず通るため、§2C が拾えない行類型・状態でも二重起票は
+  ここで止まる。
 - **保存場所**: 起票する M1 レコードの**チャネル固有データ内・監査メタの
   `plan_idem` キー**（§2D の監査メタ構造。channel JSON の
   parse_channel_data が読む既知キーと衝突しない追加キー＝prepare 挙動不変）。
@@ -452,7 +483,7 @@ heir_envelope 同型の水準（キー閉集合・型・値域 grammar・等値�
 | `app34_snapshot_hash` | `^[0-9a-f]{64}$` | §4-v2 (2) の単独値（確定時比較用） |
 | `app36_rows_hash` | `^[0-9a-f]{64}$` or null（common） | §4-v2 (3) |
 | `matrix_version` | `^[0-9A-Za-z.\-]{1,32}$` | |
-| `candidates` | list（下記の行 dict のみ） | |
+| `candidates` | list（下記の行 dict のみ）。**未フィルタの canonical 全候補＝plan_hash と 1:1**（fix4 H01-01・§2C フィルタで削除しない） | |
 | `冪等キー` | `shokumu_plan:{case}:{plan_hash}` の平文 | find_existing 照合用 |
 
 candidates 行の閉集合: `line_type`（enum＝§2A 行類型 **7 値**〔fix2 H02 で 2 行
@@ -508,8 +539,10 @@ H系列③ §1 の旧記述「受任確定と同時に M1 職務上請求を自�
    先順位放棄フラグ→共通行のみ+警報文言／判定不能（読解 JSON 欠損等）→全体要確認。
 2. **F5 注記の写像**: 「収集見込み（弁護士確認前）」が plan・封筒 detail・応答の
    全てに存在（白画面/断定表示にしない——P4-005 の道案内写像と同じ規律）。
-3. **冪等**: 同一材料→ already_filed（新規起票なし）／App33 追加・新 run・マトリクス
-   版更新→ 新 plan_hash・新封筒／find_existing 型の完全一致検索。
+3. **冪等（fix4 M04-01(ii) で open 限定へ修正・§6-27 との衝突解消）**:
+   同一材料＋**open 封筒あり**→ already_filed（新規起票なし）／同一材料でも
+   **terminal のみ**→ 新規起票（§2C-4 fix3 の却下非抑止と一貫）／App33 追加・
+   新 run・マトリクス版更新→ 新 plan_hash・新封筒／find_existing 型の完全一致検索。
 4. **stale/訂正**: 確定時の plan_hash 再検証——材料変化後の旧封筒確定は aborted・
    write 0・固定文言。
 5. **関所**: 復唱に請求先・種別・通数・「提案であり承認は別」の明示／OK 単回・
@@ -593,6 +626,21 @@ H系列③ §1 の旧記述「受任確定と同時に M1 職務上請求を自�
     open 維持・応答道案内 → **同一封筒の再確定（新しい関所往復）** →
     plan_idem 回収＋残り create → 全件で封筒クローズ——の遷移列を実出力で pin
     （途中で封筒がクローズされる経路・関所を経ない再試行経路が無いこと）。
+
+**fix4 追加（M04-01・裁定への同期）**:
+
+31. **状態反転の復元（H01-01 の実出力 pin）**: common 封筒を[人]が却下（terminal
+    化）→ その後 full 封筒を確定 → full の canonical candidates に保持された
+    共通行が実行時フィルタを通過（M1 未起票・App33 未取得）して**復元起票される**。
+    生成時除外だった場合に失われる経路の再現込み。
+32. **sibling_death 親選定の 4 分岐**: (a) 共有親が一意に特定→対象者確定
+    (b) 共有親なし (c) 両親とも共有に該当（判別不能） (d) 親 ID 欠損——
+    **(b)(c)(d) はいずれも「要入力」**（推測ゼロ・parametrize）。
+33. **plan_lines の grammar**: 7 値 enum（§2A 行類型）のみ・**sort 済み・unique**・
+    enum 外値/重複/非 list は保存境界で拒否（監査メタも grammar 検証の対象）。
+34. **plan_idem HIT の内容不一致**: 同一 plan_idem の既存 M1 の plan_lines と
+    今回束ねの line_type 集合が不一致 → 当該候補は**要確認**（自動 merge・
+    自動再発行が発生しないこと・skip 回収は集合一致時のみ——§4B fix4）。
 
 ## 7. スコープ外（明記）
 
@@ -685,4 +733,28 @@ D3 判定: 凍結不適格（HIGH3+MEDIUM1・M01〜M03 は RESOLVED）。fix3 �
 - **M04**: §6 に 28〜30 を追加（束ね正規化の分離・§2C 状態変化の hash 不変＋
   フィルタ吸収・部分失敗→open→再確定 reconcile の遷移列）＋ §6-27 書換え。
 - 次レビュー: **R-SHOKUMU-PLAN-D4**（**凍結判定**・BASE=origin/main `6312112`・
-  TARGET=shokumu-plan-design の fix3 commit）。
+  TARGET=shokumu-plan-design の fix3 commit）。→ 実施済み・結果は §8-4。
+
+## 8-4. fix4 改定記録（R-SHOKUMU-PLAN-D4・2026-08-11・司令塔裁定。両時点残置）
+
+D4 判定: H02/H03=RESOLVED・H01 分割 2 件＋M01＋M04-01。fix4 で以下を反映:
+
+- **H01-01（裁定=canonical 保存方式）**: 封筒 candidates＝**未フィルタの canonical
+  全候補（plan_hash と 1:1）**を保存（§4A）。§2C フィルタは **M1 create 直前の
+  実行時適用のみ**へ移動（fix3 までの「封筒生成時に候補を除外」は撤回・表示は
+  「起票済み」注記可）。状態反転（common 却下→full 確定）で共通行が復元起票される
+  構造的成立を §2C-3 と §6-31 に明示。
+- **H01-02（裁定=plan 横断冪等キー）**: plan_idem を
+  `shokumu_plan:{case}:{municipality}:{person_id|-}:{form}` へ再々定義
+  （**plan_hash 除去**＝業務上の起票単位として全 plan 横断で安定・grammar 更新・
+  初版/fix3 キーは撤回）。**HIT 時は line_type 集合（plan_lines）比較——一致=skip
+  回収／不一致=要確認（自動 merge・自動再発行禁止）**を凍結。§2C=共通行限定の
+  前段表示フィルタ／§4B=全行類型を覆う最終防壁、の二層関係を再記述。
+- **M01**: §4-v2.1 の保証文言を「**候補由来の M1 入力**に影響し得る上流変更は必ず
+  plan_hash を変える」へ限定訂正（確定時再取得値・非内容的状態は対象外の根拠つき）。
+- **M04-01**: §6 同期 5 点——(i) §6-31 反転ケースの復元起票 (ii) §6-3 を open 限定
+  回収へ修正（§6-27 との衝突解消） (iii) §6-32 sibling_death 4 分岐（後 3 者=要入力）
+  (iv) §6-33 plan_lines grammar（7 値 enum・sort・unique・不正拒否）
+  (v) §6-34 plan_idem 内容不一致=要確認。
+- 次レビュー: **R-SHOKUMU-PLAN-D5**（**凍結判定**・BASE=origin/main `6312112`・
+  TARGET=shokumu-plan-design の fix4 commit）。
