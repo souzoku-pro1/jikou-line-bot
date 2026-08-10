@@ -57,7 +57,9 @@ from hub.webapp_auth import (  # noqa: E402
 from kinship_graph import KinshipGraph, PersonNode  # noqa: E402
 from kinship_renderer import (  # noqa: E402
     GraphvizUnavailable,
+    KinshipRenderError,
     KinshipValidationRejected,
+    to_dot,
 )
 
 _client = TestClient(main.app)
@@ -261,12 +263,79 @@ class TestApiBehavior(_ApiBase):
         self.assertEqual(data["status"], "unavailable")
         self.assertIn("graphviz", data["message"])
 
+    def test_render_error_normalized_without_reflection(self):
+        # fix1 H01: 描画失敗（graphviz 存在・dot 実行エラー）→ 宣言済み閉集合の
+        # unavailable へ正規化。stderr/DOT 断片は応答 body・ログとも非搭載
+        import logging as _logging
+        sentinel = "STDERR_SENTINEL_dot断片<svg破損>"
+        self.render.side_effect = KinshipRenderError(
+            f"dot 実行エラー: {sentinel}")
+        records: list[str] = []
+
+        class _Capture(_logging.Handler):
+            def emit(self, record):
+                records.append(record.getMessage())
+
+        handler = _Capture(level=_logging.DEBUG)
+        root = _logging.getLogger()
+        root.addHandler(handler)
+        try:
+            r = self._get()
+        finally:
+            root.removeHandler(handler)
+        self.assertEqual(r.status_code, 200)
+        data = r.json()
+        self.assertEqual(data["status"], "unavailable")     # 閉集合内へ正規化
+        self.assertIn("描画に失敗しました", data["message"])
+        # graphviz 不在（未導入）の文言とは区別可能（固定文言が異なる）
+        self.assertNotIn("未導入", data["message"])
+        # 非反射（応答 body・ログの両面）
+        self.assertNotIn(sentinel, r.text)
+        self.assertNotIn("dot 実行エラー", r.text)
+        for msg in records:
+            self.assertNotIn(sentinel, msg)
+        # 本 module は logger を持たない（ログ経路自体の不在を静的 pin）
+        src = Path(kv.__file__).read_text(encoding="utf-8")
+        self.assertNotIn("import logging", src)
+        self.assertNotIn("getLogger", src)
+
     def test_empty_case_is_explicit(self):
         self.graph = KinshipGraph()
         data = self._get().json()
         self.assertEqual(data["status"], "empty")
         self.assertIn("人物レコードがありません", data["message"])
         self.render.assert_not_called()
+
+
+class TestEscapeBoundary(unittest.TestCase):
+    """fix1 M01: escape 境界の sentinel pin（多層防御の各層を静的に固定）。
+
+    - (a) DOT 生成層（本クラス）: `_esc` 通過後の DOT 文字列で引用符・backslash が
+      エスケープされ、`<`・`&` が DOT 構文（引用符文字列）を壊さず label に
+      残ることを pin。
+    - (b) XML/SVG 層: ローカルに dot 実行環境が無いため実描画テストは**作らない**
+      （skip 禁止のため）。XML 文字参照化は graphviz の責務であり、**実機確認は
+      点火ゲートの[人]スモーク事項**（Railway 上で sentinel 氏名の実描画を目視）。
+      ブラウザ側は img data URI 文脈（script 実行なし・TestPageStatics）が
+      最終防壁として静的に固定済み。
+    """
+
+    SENT = '山田"<script>&\\太郎'      # 「"」「\」「<」「&」を含む sentinel
+
+    def test_dot_layer_escapes_quote_backslash_and_keeps_ltamp(self):
+        node = PersonNode(record_id="10", name=self.SENT)
+        dot = to_dot(KinshipGraph(nodes=[node]))
+        # 引用符→\"・backslash→\\ にエスケープされた label がそのまま存在
+        self.assertIn('"p10" [label="山田\\"<script>&\\\\太郎"];', dot)
+        # 未エスケープの生 sentinel（引用符が裸のまま）は存在しない
+        self.assertNotIn(f'label="{self.SENT}"', dot)
+        # < と & は DOT 引用符文字列内にそのまま残る（DOT 構文を壊さない・
+        # XML 参照化は下流 graphviz の責務＝この層では変換しない）
+        self.assertIn("<script>", dot)
+        self.assertIn("&", dot)
+        # 行が正しく閉じている（label 途中で引用符が終端していない）
+        line = next(ln for ln in dot.splitlines() if '"p10"' in ln)
+        self.assertTrue(line.rstrip().endswith("];"))
 
 
 class TestPageStatics(unittest.TestCase):
@@ -283,8 +352,12 @@ class TestPageStatics(unittest.TestCase):
         for banned in ("innerHTML", "outerHTML", "insertAdjacentHTML",
                        "document.write", "DOMParser", "srcdoc"):
             self.assertNotIn(banned, src)
-        # SVG は img の data URI（script 実行文脈を持たない埋め込み）のみ
-        self.assertIn("data:image/svg+xml;charset=utf-8,", src)
+        # SVG は img の data URI（script 実行文脈を持たない埋め込み）のみ。
+        # fix1 L01: src 構築が「固定 prefix + encodeURIComponent(data.svg)」の
+        # 連結**そのもの**であること（引数が data.svg であることを含む逐語 pin）
+        self.assertIn('img.src = "data:image/svg+xml;charset=utf-8," '
+                      "+ encodeURIComponent(data.svg);", src)
+        self.assertEqual(src.count("data:image/svg+xml"), 1)   # 構築点は 1 箇所のみ
         self.assertNotIn("<object", src)
         self.assertNotIn("<iframe", src)
         self.assertNotIn("<embed", src)

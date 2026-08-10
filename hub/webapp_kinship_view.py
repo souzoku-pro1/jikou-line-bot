@@ -106,7 +106,7 @@ async def api_kinship(request: Request):
     if not _CASE_RE.fullmatch(case):
         return _bad_request()
     from kinship_graph import load_graph_for_case
-    from kinship_renderer import (GraphvizUnavailable,
+    from kinship_renderer import (GraphvizUnavailable, KinshipRenderError,
                                   KinshipValidationRejected, render_kinship)
 
     graph = await load_graph_for_case(case)
@@ -125,6 +125,15 @@ async def api_kinship(request: Request):
         return {"status": "unavailable", "case_record_id": case,
                 "message": "関係図エンジン（graphviz）が未導入のため描画できません"
                            "（他機能は正常・デプロイ構成の確認が必要です）"}
+    except KinshipRenderError:
+        # fix1 H01: 描画失敗（dot 実行エラー等）の閉集合正規化。Z2 の例外文言は
+        # stderr/DOT 断片を含み得るため**応答・ログとも非搭載**（本 module は
+        # logger を持たない＝ログ経路自体が存在しない）。graphviz 不在（上）とは
+        # 固定文言で区別可能にする
+        return {"status": "unavailable", "case_record_id": case,
+                "message": "関係図の描画に失敗しました（内部エラー・詳細は表示"
+                           "しません。再試行で解消しない場合は管理者へ連絡して"
+                           "ください）"}
     return {"status": "ok", "case_record_id": case,
             "svg": svg.decode("utf-8"),
             "names": {n.record_id: n.name for n in graph.nodes},
