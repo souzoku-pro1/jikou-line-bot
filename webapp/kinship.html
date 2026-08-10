@@ -31,6 +31,7 @@ td,th{border:1px solid #ccc;padding:.3rem .6rem;font-size:.95rem}
   <button id="load">表示</button>
 </div>
 <div id="out"></div>
+<script src="/app/app.js"></script>
 <script>
 function el(tag, cls, text) {
   const node = document.createElement(tag);
@@ -46,8 +47,7 @@ async function load() {
     out.appendChild(el("div", "problems", "案件Noは数字で入力してください"));
     return;
   }
-  const resp = await fetch("/app/api/kinship?case=" + encodeURIComponent(caseId),
-                           {redirect: "follow"});
+  const resp = await app_fetch("/app/api/kinship?case=" + encodeURIComponent(caseId));
   if (resp.redirected || !resp.headers.get("content-type")?.includes("json")) {
     location.href = "/app/login"; return;
   }
@@ -69,6 +69,7 @@ async function load() {
     box.appendChild(ul);
     out.appendChild(box);
     renderOverlay(out, data);
+    renderKosekis(out, data);
     return;
   }
   const fig = el("div", "figure");
@@ -83,6 +84,28 @@ async function load() {
     out.appendChild(el("div", "warn", "注意: " + w));
   }
   renderOverlay(out, data);
+  renderKosekis(out, data);
+}
+function renderKosekis(out, data) {
+  // MAINT-3 B: 取得済み戸籍（App33）の最小一覧（read-only・chain 判定なし）
+  const list = data.kosekis || [];
+  if (!list.length) return;
+  out.appendChild(el("div", "meta", `取得済み戸籍（App33・${list.length}通）`));
+  const table = document.createElement("table");
+  const head = document.createElement("tr");
+  for (const h of ["No.", "本籍", "筆頭者", "従前戸籍（本籍）"]) {
+    head.appendChild(el("th", "", h));
+  }
+  table.appendChild(head);
+  for (const k of list) {
+    const tr = document.createElement("tr");
+    tr.appendChild(el("td", "", k.record_id));
+    tr.appendChild(el("td", "", k.honseki || "（読解なし）"));
+    tr.appendChild(el("td", "", k.hittousha || ""));
+    tr.appendChild(el("td", "", k.juzen_honseki || "—"));
+    table.appendChild(tr);
+  }
+  out.appendChild(table);
 }
 function renderOverlay(out, data) {
   const ov = data.overlay;

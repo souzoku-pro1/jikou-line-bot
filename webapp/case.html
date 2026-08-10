@@ -24,13 +24,14 @@ a{color:#1a3c6e}
 <table id="shipping"><thead><tr><th>ID</th><th>件名</th><th>チャネル</th><th>方向</th><th>発送ステータス</th><th>発送日時</th><th>追跡番号</th><th>送達結果</th></tr></thead><tbody id="shiprows"></tbody></table>
 <h2>チャット（App28）</h2>
 <p id="chat"></p>
+<script src="/app/app.js"></script>
 <script>
 function v(rec, name) { return (rec[name] && rec[name].value) || ""; }
 function td(text) { const e = document.createElement("td"); e.textContent = text; return e; }
 async function load() {
   const id = new URLSearchParams(location.search).get("id") || "";
   if (!/^[0-9]{1,10}$/.test(id)) { document.body.textContent = "不正な ID"; return; }
-  const resp = await fetch("/app/api/cases/" + id, {redirect: "follow"});
+  const resp = await app_fetch("/app/api/cases/" + id);
   if (resp.redirected || !resp.headers.get("content-type")?.includes("json")) {
     location.href = "/app/login"; return;
   }
