@@ -211,44 +211,67 @@ _JS_BANNED = [
     # PC-A 追加の防壁（裁定閉集合への上乗せ・完了報告に明記）: グローバル
     # オブジェクト token 自体を禁止——「変数へ組み立てた文字列で window[v] を
     # 引く」残余経路を入口（グローバル参照）側で塞ぐ。self は Service Worker
-    # （sw.js）のみ許可
+    # （sw.js）の実用途 allowlist（_SW_SELF_ALLOWED）のみ許可（fix4 で縮小）
     ("グローバルオブジェクト参照（window/top/parent/frames）",
      re.compile(r"(?<![A-Za-z0-9_$.])(?:window|top|parent|frames)"
                 r"(?![A-Za-z0-9_$])")),
+    # fix4 追加禁止（R-MAINT-3-4・現用ゼロを実査確認済み）
+    ("document.defaultView",
+     re.compile(r"(?<![A-Za-z0-9_$])defaultView(?![A-Za-z0-9_$])")),
+    ("Reflect",
+     re.compile(r"(?<![A-Za-z0-9_$.])Reflect(?![A-Za-z0-9_$])")),
+    (".constructor 列", re.compile(r"\.\s*constructor(?![A-Za-z0-9_$])")),
 ]
 _JS_BANNED_SELF = (
-    "グローバルオブジェクト参照（self・sw.js 以外で禁止）",
+    "グローバルオブジェクト参照（self・sw.js の実用途 allowlist 以外は禁止）",
     re.compile(r"(?<![A-Za-z0-9_$.])self(?![A-Za-z0-9_$])"))
+# fix4: sw.js で実際に使われている self. 形の逐語 allowlist（実査で列挙）。
+# これ以外の self 出現——self[ を含む——は sw.js でも禁止
+_SW_SELF_ALLOWED = re.compile(
+    r"self\.(?:addEventListener\(|skipWaiting\(|clients\.claim\()")
 _HTML_BANNED = [
     ("インラインイベント属性（on*=）", re.compile(r"\son[a-zA-Z]+\s*=")),
     ("数値文字参照（&#…;）", re.compile(r"&#")),
+    # fix4 追加: javascript: スキーム（大文字小文字非依存）
+    ("javascript: スキーム", re.compile(r"javascript\s*:", re.I)),
 ]
 
 
-# 直前語が JS キーワードなら [ は配列リテラル（computed access でない）
-_JS_KEYWORDS_BEFORE_ARRAY = frozenset(
-    {"of", "in", "return", "typeof", "case", "do", "else", "void", "delete",
-     "new", "yield", "await", "instanceof"})
+# 直前語が JS キーワードなら [ は配列リテラル（computed access でない）。
+# fix4: 除外集合を実需要の最小（for-of と return 直後の配列リテラル）へ縮小
+_JS_KEYWORDS_BEFORE_ARRAY = frozenset({"of", "return"})
 _COMPUTED_RE = re.compile(
     r"([A-Za-z_$][A-Za-z0-9_$]*|\)|\])\s*\[\s*[\"']")
 
 
 def _has_string_computed_access(text: str) -> bool:
     """識別子/閉じ括弧の直後の ["…"]/['…']（文字列リテラル computed access）。
-    keyword（for-of 等）直後の配列リテラルは除外（fix3 の偽陽性対策）。"""
+    keyword（for-of 等）直後の配列リテラルは除外（fix3 の偽陽性対策）。
+    fix4: keyword の直前が `.` の場合（プロパティ名 `obj.return["…"]` 等）は
+    keyword でなく member access のため**除外しない**。"""
     for m in _COMPUTED_RE.finditer(text):
-        if m.group(1) not in _JS_KEYWORDS_BEFORE_ARRAY:
-            return True
+        word = m.group(1)
+        if word in _JS_KEYWORDS_BEFORE_ARRAY:
+            j = m.start(1) - 1
+            while j >= 0 and text[j] in " \t":
+                j -= 1
+            if j < 0 or text[j] != ".":
+                continue               # 真の keyword → 配列リテラル（除外）
+        return True
     return False
 
 
 def _discipline_violations(unit: str, text: str, is_js: bool,
-                           allow_self: bool = False) -> list[str]:
-    """構築規律違反の列挙（fix3 M01）。JS は lexer 適用済みテキストを渡すこと
-    （コメントのみ除外・文字列/テンプレート/正規表現は検査対象のまま）。"""
+                           sw_self_allow: bool = False) -> list[str]:
+    """構築規律違反の列挙（fix3 M01→fix4）。JS は lexer 適用済みテキストを渡す
+    こと（コメントのみ除外・文字列/テンプレート/正規表現は検査対象のまま）。
+    sw_self_allow=True（sw.js のみ）: 実用途 allowlist（_SW_SELF_ALLOWED）に
+    一致する self. 形だけを空白化してから self 禁則を適用する（self[ 等は残る）。"""
     rules = list(_JS_BANNED) if is_js else list(_HTML_BANNED)
-    if is_js and not allow_self:
+    if is_js:
         rules.append(_JS_BANNED_SELF)
+        if sw_self_allow:
+            text = _SW_SELF_ALLOWED.sub(lambda m: " " * len(m.group(0)), text)
     out = []
     for label, pat in rules:
         if pat is None:
@@ -269,8 +292,11 @@ class TestFetchWrapperClosedSet(unittest.TestCase):
       文字列リテラル computed access・\\x/\\u エスケープ・eval/Function・文字列
       引数タイマー・動的 import()・グローバルオブジェクト token（self は sw.js
       のみ）・インラインイベント属性・数値文字参照。
-    残る理論的経路は**上記の禁止構文を将来解除した場合のみ**——解除は司令塔裁定
-    事項（規律変更として本テスト群の改定を伴う）。実行水準の確認は実機スモーク。
+    **脅威モデル（2026-08-10 司令塔裁定・fix4 で明記）**: 本検査群は
+    **善意の回帰**（素直な fetch 追加・禁止構文の不注意な使用）を検出する。
+    **難読化による意図的迂回の防止は、全変更が通る Codex レビュー・司令塔検収・
+    実行時 throw（app_fetch）・実機スモークの責務**であり、本検査の保証範囲外。
+    禁止構文の解除は司令塔裁定事項（規律変更として本テスト群の改定を伴う）。
     """
 
     def _all_sources(self):
@@ -408,7 +434,13 @@ class TestFetchWrapperClosedSet(unittest.TestCase):
 
 
 class TestConstructionDiscipline(unittest.TestCase):
-    """fix3 M01: webapp 全域の構築規律 pin（禁止構文の不在・実査済み=現行ゼロ）。"""
+    """fix3 M01→fix4: webapp 全域の構築規律 pin（禁止構文の不在・実査済み=現行ゼロ）。
+
+    脅威モデル（2026-08-10 司令塔裁定）: 本検査群は**善意の回帰**（素直な fetch
+    追加・禁止構文の不注意な使用）を検出する。難読化による意図的迂回の防止は、
+    全変更が通る Codex レビュー・司令塔検収・実行時 throw・実機スモークの責務で
+    あり、本検査の保証範囲外。
+    """
 
     def test_webapp_has_no_banned_constructs(self):
         for p in sorted(_WEBAPP.iterdir()):
@@ -420,7 +452,7 @@ class TestConstructionDiscipline(unittest.TestCase):
                     text, clean = _js_executable_text(text)
                     self.assertTrue(clean, f"{unit}: lexer が EOF で非 clean")
                 violations = _discipline_violations(
-                    unit, text, is_js, allow_self=(p.name == "sw.js"))
+                    unit, text, is_js, sw_self_allow=(p.name == "sw.js"))
                 self.assertEqual(violations, [])
 
     def test_discipline_detects_codex_bypass_forms(self):
@@ -437,6 +469,12 @@ class TestConstructionDiscipline(unittest.TestCase):
             ('new Function("return this")();', ["Function"]),
             ('setTimeout("code()", 1);', ["setTimeout"]),
             ('import("./m.js");', ["import"]),
+            # fix4 追加禁止の対照
+            ('const dv = document.defaultView;', ["defaultView"]),
+            ('Reflect.get(g, n);', ["Reflect"]),
+            ('const F = ({}).constructor;', ["constructor"]),
+            ('obj.return["fe" + "tch"];', ["computed access"]),   # keyword プロパティ
+            ('self["fe" + "tch"];', ["self", "computed access"]),
         ]
         for snippet, expect_frags in cases:
             with self.subTest(snippet=snippet):
@@ -453,6 +491,29 @@ class TestConstructionDiscipline(unittest.TestCase):
         violations = _discipline_violations("u", html, is_js=False)
         self.assertTrue(any("インラインイベント属性" in v for v in violations))
         self.assertTrue(any("数値文字参照" in v for v in violations))
+
+    def test_discipline_detects_javascript_scheme_case_insensitive(self):
+        for html in ('<a href="javascript:void(0)">x</a>',
+                     '<a href="JaVaScRiPt:f()">x</a>'):
+            with self.subTest(html=html):
+                violations = _discipline_violations("u", html, is_js=False)
+                self.assertTrue(
+                    any("javascript" in v for v in violations))
+
+    def test_sw_self_allowlist_is_exact(self):
+        # sw.js: 実用途 3 形（addEventListener/skipWaiting/clients.claim）のみ許可
+        sw_src = (_WEBAPP / "sw.js").read_text(encoding="utf-8")
+        text, clean = _js_executable_text(sw_src)
+        self.assertTrue(clean)
+        self.assertEqual(
+            _discipline_violations("sw.js", text, True, sw_self_allow=True), [])
+        # allowlist 外の self（self[ 含む）は sw.js 扱いでも検出される
+        for extra in ('self["fe" + "tch"];', "self.importScripts;",
+                      "const s = self;"):
+            with self.subTest(extra=extra):
+                mutated, _ = _js_executable_text(sw_src + "\n" + extra)
+                self.assertTrue(_discipline_violations(
+                    "sw.js", mutated, True, sw_self_allow=True))
 
     def test_string_concat_use_requires_banned_syntax(self):
         # "fe"+"tch" の連結**単体**は禁止対象でない（無害なデータ）が、これを
