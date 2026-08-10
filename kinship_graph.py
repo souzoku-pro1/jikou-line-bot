@@ -252,20 +252,32 @@ async def load_koseki_summaries_for_case(case_record_id: str) -> list[dict]:
         APP_KOSEKI_BOOK,
         f'案件レコードID = "{case_record_id}" order by $id asc limit 100',
         fields=["$id", "読解JSON"])
+
+    def _d(value) -> dict:
+        """dict 以外の型崩れ（"読解不能" 等の文字列・list・数値）は空 dict へ縮退
+        （fix1 M01: 当該項目を空欄にして行は維持・例外を上流へ漏らさない）。"""
+        return value if isinstance(value, dict) else {}
+
+    def _s(value) -> str:
+        """文字列以外の値（list・数値・dict 等）は空欄（fix1 M01）。"""
+        return value.strip() if isinstance(value, str) else ""
+
     out = []
     for r in records:
+        if not isinstance(r, dict):
+            continue                     # レコード形自体の破損は行を構成できない
         try:
-            reading = json.loads(
-                str((r.get("読解JSON") or {}).get("value") or "{}"))
+            reading = json.loads(_s(_d(r.get("読解JSON")).get("value")) or "{}")
         except (ValueError, TypeError):
             reading = {}
-        koseki = (reading.get("戸籍") or {}) if isinstance(reading, dict) else {}
-        juzen = koseki.get("従前戸籍") or {}
+        koseki = _d(_d(reading).get("戸籍"))
+        juzen = _d(koseki.get("従前戸籍"))
+        rid = _d(r.get("$id")).get("value")
         out.append({
-            "record_id": str((r.get("$id") or {}).get("value") or ""),
-            "honseki": str(koseki.get("本籍") or ""),
-            "hittousha": str(koseki.get("筆頭者") or ""),
-            "juzen_honseki": str(juzen.get("本籍") or ""),
+            "record_id": _s(rid if isinstance(rid, str) else str(rid or "")),
+            "honseki": _s(koseki.get("本籍")),
+            "hittousha": _s(koseki.get("筆頭者")),
+            "juzen_honseki": _s(juzen.get("本籍")),
         })
     return out
 
