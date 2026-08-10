@@ -2,15 +2,18 @@
 
 - TASK_ID: SHOKUMU-PLAN-D 設計票（設計凍結用 DRAFT・コード/テスト実装禁止）／記録日 2026-08-10
   （fix1: R-SHOKUMU-PLAN-D1 の H01/H02/H03/M01〜M04 全所見反映・同日。改定は
-  両時点残置——§1.6 追加実査・§2A〜§2C・§4-v2・§4A・§5/§6 追記・§8 改定記録）
+  両時点残置——§1.6 追加実査・§2A〜§2C・§4-v2・§4A・§5/§6 追記・§8 改定記録／
+  fix2: R-SHOKUMU-PLAN-D2 反映・2026-08-11——H01〔hash 材料補完+読値対応表 §4-v2.1〕・
+  H02〔マトリクス 1:1 突合 §2A.2+type 実査 §2A.3〕・H03〔plan 由来 M1 の冪等 §4B〕・
+  M01〔§2C(ii) 厳密化〕・M02〔§4A 相関制約〕・M03〔§2D 出所固定〕・M04〔§6 追加〕）
 - 盤面: 8月構想・項目1。判断部品はすべて既存——本票は**結線の設計**であり新エンジンを作らない。
 - 実装現実の実査基盤（2026-08-10・read-only・main `6312112`）:
   `koseki_chain.py`（F5 判定）／`docs/souzoku-houki/10-koseki-matrix.md`（H系列③・凍結）／
   `dispatch_bot/shokumu.py`＋`channels/shokumu_seikyu.py`（M1・実物検収済み）／
   `hub/derivation_models.py`・`hub/heir_projection.py`（P3 系）／`review_resolve.py`（App33 参照・関所型）／
   `hub/heir_envelope.py`（封筒冪等の型）。
-- 次レビュー: R-SHOKUMU-PLAN-D2（fix1 反映後。D1=凍結不適格〔HIGH3+MEDIUM4〕・
-  対応は §8 改定記録）。
+- 次レビュー: R-SHOKUMU-PLAN-D3（**凍結判定**。経緯: D1=凍結不適格→fix1→
+  D2=H01/H02/H03+M01〜M04〔M01 のみ RESOLVED〕→fix2。対応は §8 改定記録）。
 
 ## 0. 原則（本票の背骨・§2 で構造化）
 
@@ -147,15 +150,47 @@
 - 連鎖ループ（受領→読解→次請求・§1.2 の H10）は**本票スコープ外**——本票は
   「現時点の不足に対する 1 巡分の提案」まで（§7・裁定④）。
 
-## 2A. マトリクス行→M1 入力の写像表（fix1 H03・行類型ごと）
+## 2A. マトリクス行→M1 入力の写像表（fix1 H03・fix2 H02 で完全化）
 
-| 行類型 | request_items.type（FEE_FIELD_BY_TYPE 内） | 様式 | target の person_id 選定規則 | municipality の材料 |
+（fix2 H02: 凍結マトリクスとの 1:1 突合〔§2A.2〕により**欠落 2 行を追加**・
+F5 不足行の request_type は type 実査〔§2A.3〕により**要入力へ改定**——初版の
+「除籍謄本／改製原戸籍」記載は撤回・両時点残置は §8 fix2）
+
+| 行類型（enum・§4A） | request_items.type | 様式 | target の person_id 選定規則 | municipality の材料 |
 |---|---|---|---|---|
-| 共通: 住民票除票 | 住民票の除票 | 様式2（生年月日任意） | **被相続人**＝App34 `被相続人フラグ=yes` 行（第二段では head run.decedent_person_id と一致検証） | 被相続人の App34 `住所最新`（§1.6）→ §2A.1 切り出し |
-| 共通: 戸籍の附票（除票不能時の切替） | 戸籍の附票 | 様式2 | 同上 | 被相続人の App34 `本籍最新` → §2A.1 切り出し |
-| 出生〜死亡連続戸籍（不足分） | 除籍謄本／改製原戸籍（F5 未収集の従前戸籍） | 様式1（**生年月日必須**） | 被相続人 | F5 `未収集[].本籍` → §2A.1 切り出し |
-| 両親双方の死亡確認戸籍（兄弟姉妹系） | 除籍謄本 | 様式1 | **父・母**＝被相続人行の App34 `父人物ID`／`母人物ID`（不在は「要入力」） | 当該親の `本籍最新`（空なら「要入力」） |
-| 申述人の現在戸籍 | 戸籍謄本 | 様式1 | **申述人**——特定の正本が repo に存在しない（§5 裁定⑦へ再掲） | 申述人の `本籍最新`（同上） |
+| `joh_removed`: 住民票除票（共通） | 住民票の除票 | 様式2（生年月日任意） | **被相続人**＝App34 `被相続人フラグ=yes` 行（第二段では head run.decedent_person_id と一致検証） | 被相続人の App34 `住所最新`（§1.6）→ §2A.1 切り出し |
+| `fuhyo`: 戸籍の附票（除票不能時の切替・共通） | 戸籍の附票 | 様式2 | 同上 | 被相続人の App34 `本籍最新` → §2A.1 切り出し |
+| `decedent_joseki`: 被相続人の除籍謄本〔死亡記載〕（**fix2 追加・子セット**） | 除籍謄本 | 様式1（**生年月日必須**） | 被相続人 | 被相続人の `本籍最新` → §2A.1 切り出し |
+| `chain_missing`: 出生〜死亡連続戸籍の F5 不足分 | **要入力（fix2 改定・§2A.3）** | 様式1（**生年月日必須**） | 被相続人 | F5 `未収集[].本籍` → §2A.1 切り出し |
+| `parents_death`: 両親双方の死亡確認戸籍（兄弟姉妹系） | 除籍謄本 | 様式1 | **父・母**＝被相続人行の App34 `父人物ID`／`母人物ID`（不在は「要入力」） | 当該親の `本籍最新`（空なら「要入力」） |
+| `sibling_death`: 申述人の親（兄弟姉妹）の死亡を証する戸籍（**fix2 追加・甥姪セット**） | 除籍謄本 | 様式1 | **当該兄弟姉妹**＝甥姪 heirs 行から App34 `父人物ID`/`母人物ID` で遡って特定（特定不能・複数解釈は「要入力」） | 当該兄弟姉妹の `本籍最新`（空なら「要入力」） |
+| `applicant_current`: 申述人の現在戸籍 | 戸籍謄本 | 様式1 | **常に person_id null＋input_required**（裁定⑦=(C) の機械的固定・§4A 相関制約） | 「要入力」固定 |
+
+### 2A.2 凍結マトリクスとの 1:1 突合表（fix2 H02）
+
+| H系列③ §1/§2 の凍結行 | 写像表の行類型 | 突合 |
+|---|---|---|
+| §1 住民票除票（または戸籍の附票）——全類型共通・最優先 | `joh_removed`／`fuhyo` | 1:1 |
+| §2 子: 被相続人の除籍謄本（死亡記載） | `decedent_joseki` | 1:1（**初版欠落→fix2 補完**） |
+| §2 各類型: 申述人の現在戸籍 | `applicant_current` | 1:1 |
+| §2 親・兄弟姉妹・甥姪: 出生から死亡までの連続戸籍 | `chain_missing`（F5 突合で不足分のみ） | 1:1 |
+| §2 兄弟姉妹・甥姪: 両親双方の死亡が確認できる戸籍 | `parents_death` | 1:1 |
+| §2 甥姪: 申述人の親（被相続人の兄弟姉妹）の死亡を証する戸籍 | `sibling_death` | 1:1（**初版欠落→fix2 補完**） |
+| §2 注記: 先順位放棄（複雑性フラグ） | 展開なし＝共通行のみ+個別確定警報（§3-2） | 1:1 |
+
+実装はマトリクス config データと本表の**機械照合テスト**（§6-13）で凍結——行の
+増減はマトリクス改定（[人]・データ修正）と同時にのみ起きる。
+
+### 2A.3 request_items type の実査と F5 不足行の扱い（fix2 H02・司令塔裁定の適用）
+
+- M1 の type 閉集合（channels/shokumu_seikyu.py `FEE_FIELD_BY_TYPE` :53-60 実査）:
+  **`戸籍謄本・除籍謄本・改製原戸籍・戸籍の附票・住民票・住民票の除票` の 6 種のみ**。
+  `FORM_BY_TYPE`（:92-95）も同 6 種で閉じ、**「連続戸籍一式」「出生から死亡まで」
+  相当の複合 type は存在しない**。
+- → 裁定どおり **F5 不足行の request_type は初版「要入力」に倒す**——不足戸籍が
+  除籍謄本か改製原戸籍かは取得済み戸籍の記載実態（改製/転籍の別）に依存し機械が
+  確定できない。誤 type の請求書印字より道案内が安全。**複合 type の新設は別票**
+  （M1 の様式・料金・丸位置の改定を伴うため本票では行わない）。
 
 - **生年月日（様式1 必須）**: 対象 person の App34 身分事項・出生行の和暦
   （kinship_graph `_first_event_date(events,"出生")` と同一規則）。**取得不能は
@@ -199,11 +234,21 @@
   2. App30 照合——未完了の共通行が既に飛んでいないかを **2 面**で照合:
      (i) **plan 封筒**: トップキー `shokumu_plan`＋`案件レコードID=case`＋
      detail.phase="common"＋発送ステータス=要確認（未クローズ）
-     (ii) **M1 起票**: `チャネル="職務上請求"`＋`案件レコードID=case`＋
-     `チャネル固有データ like "住民票の除票"`（または `"戸籍の附票"`）＋
-     発送ステータスが terminal（完了/エラー）以外——照合キーは §1.6 実査の
-     App30 実 field（チャネル・案件レコードID・チャネル固有データ・発送ステータス）。
+     (ii) **M1 起票**（fix2 M01 で厳密化）: `チャネル="職務上請求"`＋
+     `案件レコードID=case`＋発送ステータスが terminal（完了/エラー）以外で
+     候補を絞った上で、**チャネル固有データを JSON parse して照合**——
+     (a) `request_items[].type` に 住民票の除票/戸籍の附票 を含む、かつ
+     (b) `target` の対象 person（被相続人）または **M1 冪等キー（§4B・
+     `plan_idem` の case+line_type 部分）**が一致、かつ (c) `municipality` が
+     当該候補行と一致——の 3 点一致のみを「起票済み」とみなす（like 文字列
+     一致の誤爆〔件名・purpose 内の語など〕を排除。**parse 不能な既存レコードは
+     照合不成立＝安全側で「未起票扱い」**にせず**要確認へ倒す**——壊れ JSON の
+     存在自体が異常のため）。
   3. いずれかに該当すれば第二段 plan から共通行を**除外**（重複提案しない）。
+  4. **却下の非抑止（fix2 M01・司令塔裁定）**: [人]が plan 封筒を確定せず閉じた
+     （却下した）事実は**再提案を抑止しない**——同一材料での再指示は封筒冪等
+     （already_filed）で同一封筒に回収され、材料が変われば新封筒として再提案される
+     （却下履歴の記録・抑止は本票では持たない）。
 - **第一段未実施案件の取りこぼし防止**: 上記照合で**共通行が存在しない**
   （収集済みでも起票済みでもない）場合、第二段 plan に**共通行を含める**
   （第一段の実施有無に依存しない＝漏れゼロの規則）。
@@ -219,6 +264,22 @@
   `file_from_pending` は Pending（LINE 指示）前提のため直接は呼ばず、
   **同一 field 集合の byte 水準の一致をテストで pin**（§6-12）——将来
   `_fields_shokumu_seikyu` が公開ヘルパ化されれば置換（実装票判断・挙動同一）。
+- **fields 値の出所の固定（fix2 M03）**:
+  - `顧客名表示用`: **App21/26 案件レコードの `顧客名` を確定時に再取得**した値
+    （file_from_pending :110-111 と同一の正本・plan 封筒には保存しない）。
+  - `案件アプリID`: **env 参照**——相続ユニットのため `SOUZOKU_KINTONE_APP_ID`
+    （file_from_pending の `KINTONE_APP_ID` は時効ユニット向けの同型・ユニット別
+    env の選択は unit から解決）。
+  - `ユニット種別`: 案件由来（heir_envelope `_unit_for_case` と同一写像）。
+  - **plan 経路の監査メタ構造**: `{"filed_by": "shokumu_plan", "plan_envelope_no":
+    <App30 record_id>, "plan_hash": <hex64>, "plan_idem": <§4B の M1 冪等キー>}`
+    ——`_audit_meta`（command_id 基点）とはキーを分ける（plan 起票は LINE 指示
+    command でなく封筒確定が起点のため。閉集合・値域は §4B で pin）。
+  - **`_fields_shokumu_seikyu` 変更時の同期方式**: 実装票で
+    **共用関数化を第一候補**（`_fields_shokumu_seikyu` を「channel_json＋監査メタを
+    引数に取る公開ヘルパ」へ挙動同一で抽出し両経路が呼ぶ）。抽出を見送る場合は
+    **byte 一致 pin（§6-12）が変更時に必ず割れる**ことをもって同期を強制する
+    （どちらでも「二重定義の黙った乖離」は構造的に起きない）。
 - 起票後は既存経路のまま: App30「レコード追加」Webhook → /hub/dispatch →
   `channels/shokumu_seikyu.prepare`（`parse_channel_data`→`find_municipality`→
   様式生成→**承認待ち**）。plan 側は prepare に一切関与しない。
@@ -254,20 +315,47 @@ plan_hash = SHA-256（下記 (1)〜(5) の正規化 JSON・sort_keys・ensure_as
 
 1. **入力正本の id**: phase="full" は head run.id（数字）／phase="common" は
    `null`（run 非依存・裁定①(C)）。
-2. **App34 使用 field snapshot hash**（fix1 H01 の追加材料）: 候補生成・M1 入力に
-   **実際に使用した** person 行の使用 field のみを person_id 昇順で並べた
-   正規化 JSON の SHA-256。使用 field の閉集合＝
+2. **App34 使用 field snapshot hash**（fix1 H01→fix2 で補完）: 候補生成・M1 入力に
+   **実際に使用した** person 行を **person_id を JSON 構成要素として明文化**した形
+   `{"<person_id>": {field: 値, ...}, ...}` で person_id 昇順に並べた正規化 JSON の
+   SHA-256。使用 field の閉集合（fix2 で 2 field 追加）＝
    `{"氏名", "住所最新", "本籍最新", "死亡日", "父人物ID", "母人物ID",
-   "身分事項.出生行の年月日"}`（§2A の写像が読む field と**同一集合**・
-   これ以外を hash に入れない＝無関係編集で無駄に失効させない）。
+   "身分事項.出生行の年月日", "被相続人フラグ"}`（§2A の写像・§2B/§2A の
+   被相続人特定が読む field と**同一集合**・これ以外を hash に入れない）。
 3. **App36 行集合 hash**（phase="full" のみ・fix1 H01 の具体化）: 当該案件の
    App36 全行の `($id, $revision, current_derivation_run_id, 導出元人物ID)` を
    $id 昇順で並べた正規化 JSON の SHA-256。
 4. **App33 収集済み集合**: record_id＋読解JSON の SHA-256 の $id 昇順ソート列。
 5. **マトリクス version**（config データの版数文字列）。
+6. **head.decedent_person_id**（fix2 追加・phase="full"）: 被相続人の同一性を
+   run 側からも固定（App34 の被相続人フラグ付替えと run の不整合を検出）。
+7. **App31 照合 snapshot**（fix2 追加）: 候補行ごとの
+   `{"line_type": ..., "app31_record_id": ..., "市区町村名": ..., "有効": ...,
+   "fallback": "ward"|"city"|null}`（採用した市区町村レコード id・名称・有効値・
+   区→市 fallback の採用結果）を line_type 順に並べた正規化 JSON の SHA-256。
+   「要入力」行は `null` エントリ（照合を行っていない事実ごと固定）。
 
-- **stale 保証との 1:1**（§4「App34/36 変更時 stale」の成立根拠）: §2A の写像が
-  読む値はすべて (2) に、§2B の条件が読む App36 状態はすべて (3) に含まれる——
+### 4-v2.1 「§2A/§2B が読む値」↔「hash 材料」対応表（fix2 H01・1:1 の機械的提示）
+
+| plan/M1 入力が読む値 | 読む場所 | hash 材料 |
+|---|---|---|
+| person_id（対象者の同一性） | §2A target 選定 | (2) の JSON キー＋(6) |
+| 氏名・生年月日（出生行）・死亡日 | §2A target／様式1 | (2) |
+| 住所最新・本籍最新 | §2A municipality 材料 | (2) |
+| 父人物ID・母人物ID | §2A `parents_death`/`sibling_death` | (2) |
+| 被相続人フラグ | §2A 被相続人特定 | (2)〔fix2 追加〕 |
+| head run の同一性・heirs/zokugara | §2B 条件 1-2-5 | (1)＋(3)（$revision 経由） |
+| head の被相続人 | §2B・§2A 一致検証 | (6)〔fix2 追加〕 |
+| App36 行の run 一致・確認状態 | §2B 条件 3-4-6 | (3) |
+| App33 収集済み（F5 入力） | §2A `chain_missing`・§2C 充足判定 | (4) |
+| マトリクス行類型・セット | §2A/§2A.2 | (5) |
+| App31 照合結果（宛先の実引当て） | §2A.1・M1 municipality | (7)〔fix2 追加〕 |
+
+→ **読む値で hash 材料に載らないものは存在しない**（本表が §6-12 系テストの正）。
+App31 レコードの更新・無効化（(7)）・被相続人フラグ付替え（(2)/(6)）も plan_hash を
+変え、確定時再計算で stale 検出される。
+
+- **stale 保証との 1:1**（§4「App34/36 変更時 stale」の成立根拠）: 上表のとおり
   **plan の内容・M1 入力に影響し得る上流の変更は必ず plan_hash を変える**。
   確定時は材料の現在値から plan_hash を**再計算**して封筒 detail と照合
   （不一致=aborted・write 0）＝§4A の snapshot hash 保存（M02）と一体の設計。
@@ -277,9 +365,36 @@ plan_hash = SHA-256（下記 (1)〜(5) の正規化 JSON・sort_keys・ensure_as
     封筒 detail と一致」を検証、不一致は aborted（「前提が変わっています。新しい
     請求案から確定してください」・write 0）。stale ガードの型（P3-003B）と同型。
   - 旧封筒の後始末は[人]（要確認→完了 or 下書きの HUMAN_TRANSITIONS・機械は閉じない）。
-- **M1 側の二重起票**: 確定→M1 起票の間で同一 municipality×request_items の既存
-  下書きがある場合の扱いは M1 既存の運用（承認キューで人が見える）に委ね、plan 側は
-  確定封筒のクローズ（実行済み yes）で再確定を遮断（関所の既存二重確定ガード）。
+- **M1 側の二重起票（初版・fix2 H03 で撤回＝§4B が正）**: 初版は「M1 既存の運用に
+  委ねる」としていたが、**M1 の既存二重起票ガード（find_existing）は
+  `command_id`（LINE 指示）基点であり plan 由来の起票には効かない**（D2 指摘）。
+  §4B の plan 由来 M1 冪等キーで置き換える（両時点残置）。
+
+## 4B. plan 由来 M1 起票の冪等（fix2 H03・決定的冪等キーの新設）
+
+- **M1 冪等キー（決定的）**: `shokumu_plan:{case_record_id}:{plan_hash}:{候補キー}`。
+  候補キー = `{line_type}:{municipality}:{person_id or "-"}`（§4A candidates 行の
+  決定キー・同一自治体束ね〔§2A〕後の**M1 起票単位と 1:1**）。
+  grammar: 全体で `^shokumu_plan:[0-9]{1,10}:[0-9a-f]{64}:[a-z_]+:[^:]{1,64}:([0-9]{1,10}|-)$`。
+- **保存場所**: 起票する M1 レコードの**チャネル固有データ内・監査メタの
+  `plan_idem` キー**（§2D の監査メタ構造。channel JSON の
+  parse_channel_data が読む既知キーと衝突しない追加キー＝prepare 挙動不変）。
+- **起票前ガード**: 各候補の create 前に App30 を
+  `チャネル="職務上請求"`＋`案件レコードID=case` で絞り、チャネル固有データを
+  **JSON parse して `plan_idem` の完全一致**を照合（P3-003a find_existing の
+  完全一致型・like の部分一致誤爆なし）。一致あり=当該候補は **already_filed
+  として回収**（新規 create しない）。
+- **部分失敗後の原子性（再確定で回収）**: 確定で n 件を順次起票し k 件目で失敗した
+  場合——作成済み k−1 件は残存（下書き=無害）・plan 封筒は**クローズしない**・
+  応答は「n 件中 k−1 件起票済み。再確定で残りを再試行します」。**再確定は同一
+  plan_hash（stale 検証通過）の下で各候補の plan_idem を再照合し、既存分を
+  already_filed 回収・残りのみ create** → 全件揃った時点で封筒クローズ
+  （実行済み yes）＝**冪等な再実行で完結する原子性**（P3-003c §4.1 の
+  「decision 一度きり＋side effect 冪等」と同型の構造）。
+- **ACK 不明の reconcile（P3-003a §3B 同型）**: create の通信失敗は「未作成」と
+  断定しない（POST 成功・応答喪失があり得る）。例外は伝播（握り潰し禁止）し、
+  再確定時の **plan_idem 完全一致照合が reconcile を兼ねる**（成功していた分は
+  already_filed 回収・二重起票しない）。
 
 ## 4A. plan 封筒 detail の閉集合（fix1 M02・司令塔裁定=person_id のみ保存）
 
@@ -297,10 +412,25 @@ heir_envelope 同型の水準（キー閉集合・型・値域 grammar・等値�
 | `candidates` | list（下記の行 dict のみ） | |
 | `冪等キー` | `shokumu_plan:{case}:{plan_hash}` の平文 | find_existing 照合用 |
 
-candidates 行の閉集合: `line_type`（enum＝§2A 行類型 5 値）・`request_type`
-（FEE_FIELD_BY_TYPE のキー集合内）・`count`（正整数）・`person_id`
-（`^[0-9]{1,10}$` or null）・`municipality`（切り出し結果 or 固定値 `"要入力"`）・
-`status`（enum `{"propose","fulfilled","input_required"}`）。
+candidates 行の閉集合: `line_type`（enum＝§2A 行類型 **7 値**〔fix2 H02 で 2 行
+追加〕）・`request_type`（FEE_FIELD_BY_TYPE のキー集合内 or 固定値 `"要入力"`）・
+`count`（正整数）・`person_id`（`^[0-9]{1,10}$` or null）・`municipality`
+（切り出し結果 or 固定値 `"要入力"`）・`status`
+（enum `{"propose","fulfilled","input_required"}`）。
+
+**candidates の相関制約（fix2 M02・Codex 提示どおり凍結・保存境界で検証）**:
+1. **M1 起票対象は `status="propose"` のみ**（fulfilled/input_required は起票しない）。
+2. **`status="input_required"` の行は write 0**（M1 起票に進まない・道案内表示のみ）。
+3. `municipality="要入力"` の行は**必ず `status="input_required"`**（propose と併存不可）。
+4. `request_type="要入力"` の行も**必ず `status="input_required"`**（§2A.3・同上）。
+5. **`line_type="applicant_current"` は常に `person_id=null` かつ
+   `status="input_required"`**（裁定⑦=(C) の機械的固定）。
+6. **`applicant_current` 以外の行は `person_id` 必須**（null 不可・grammar 適合）。
+7. `status="fulfilled"` は**表示専用**（起票・write の対象に一切ならない）。
+
+相関制約は**保存境界（封筒起票時の detail 検証）で強制**する——違反は
+EnvelopeDetailPolicyError 同型で保存拒否（起票せず異常扱い・kintone write 0）。
+確定側も同じ検証を再実行（保存済み detail の改変・壊れの防御）。
 
 - **氏名・生年月日・住所の実値は保存しない**（司令塔裁定）——封筒は
   **person_id＋snapshot hash のみ**を持ち、確定時に App34 を**再取得**して
@@ -373,14 +503,35 @@ H系列③ §1 の旧記述「受任確定と同時に M1 職務上請求を自�
 16. **承認済み不書込み**: plan 経路の全 kintone write の対象 field に
     `発送ステータス` の値として「承認済」が現れない（SERVER_TRANSITIONS 不変＋
     write 値の閉集合 pin）。
-17. **部分起票の原子性**: 確定で複数 M1 起票を作る途中の失敗（k 件目で例外）→
-    作成済み k−1 件は残存（下書き＝無害）・plan 封筒は**クローズしない**・
-    応答が「n 件中 k−1 件起票済み・再確定で残りを再試行」型の道案内（冪等な
-    再確定で残り分のみ作成される——M1 側の既存二重起票ガード〔件名/監査メタ〕
-    との整合を含めて pin）。
+17. **部分起票の原子性（fix2 H03 で実在ガードの記述へ書換え）**: 確定で n 件を
+    順次起票し k 件目で例外 → 作成済み k−1 件は残存（下書き＝無害）・plan 封筒は
+    **クローズしない**・応答は「n 件中 k−1 件起票済み・再確定で残りを再試行」。
+    再確定は **§4B の `plan_idem` 完全一致照合**で既存 k−1 件を already_filed
+    回収し**残りのみ create**・全件揃いで封筒クローズ——を実出力で pin
+    （初版の「M1 既存ガード〔件名/監査メタ〕」への依存記述は撤回・§4B が正）。
 18. **flag OFF の完全 I/O ゼロ**: `SHOKUMU_PLAN_ENABLED` 未設定で plan 語彙の
     App30 search・create が**ゼロ**（search も呼ばない・P3-003-CMD の冒頭辞退型）。
 19. **（予備）App31 照合順**: §2A.1 の区→市の照合順・両方不在の「要入力」化。
+
+**fix2 追加（M04・D2 指摘の negative）**:
+
+20. **App31 更新後 stale**: plan 起票後に採用 App31 レコードの名称変更・無効化
+    （有効=no）→ §4-v2 (7) の再計算不一致 → 確定 aborted・write 0。
+21. **被相続人フラグ変更 stale**: App34 の被相続人フラグ付替え → (2)/(6) の
+    不一致 → aborted・write 0（run 側 decedent との不整合検出を含む）。
+22. **request_type 未確定の write 0**: `chain_missing` 行（request_type=要入力）が
+    M1 起票に**進まない**（相関制約 2/4・§2A.3——input_required の起票ゼロ）。
+23. **欠落行のマトリクス一致**: `decedent_joseki`・`sibling_death`（fix2 追加行）を
+    含む §2A.2 突合表と config データの機械照合（§6-13 の完全化）。
+24. **M1 冪等キーの照合系**: `plan_idem` 完全一致のみ回収（部分一致・別案件の
+    同型キー・壊れ JSON〔parse 不能→要確認へ倒す・未起票扱いにしない〕を
+    parametrize）。
+25. **ACK 不明後の既存回収**: create 例外（ACK 不明）→ 再確定で当該候補が
+    already_filed 回収され**二重起票ゼロ**（§4B reconcile の実出力 pin）。
+26. **相関制約違反の保存拒否**: §4A 相関制約 1〜7 の各違反形（propose なのに
+    municipality=要入力・applicant_current に person_id 等）が保存境界で拒否。
+27. **却下の非抑止**: 封筒を[人]が閉じた後の再指示 → 同一材料は already_filed・
+    材料変化は新封筒（§2C-4——却下が再提案を止めないこと）。
 
 ## 7. スコープ外（明記）
 
@@ -415,4 +566,37 @@ D1 判定: 凍結不適格（HIGH3+MEDIUM4）。fix1 で以下を反映:
 - **裁定②の適用範囲**: H系列③の旧「受任時自動起票」を**起動時点についてのみ**
   上書きする旨を §5 末尾に明記（内容・優先順位は不変）。
 - 次レビュー: **R-SHOKUMU-PLAN-D2**（BASE=origin/main `6312112`・TARGET=
-  shokumu-plan-design の fix1 commit）。
+  shokumu-plan-design の fix1 commit）。→ 実施済み・結果は下記 fix2 記録。
+
+## 8-2. fix2 改定記録（R-SHOKUMU-PLAN-D2・2026-08-11。両時点残置・遡及書き換えにしない）
+
+D2 判定: H01/H02/H03＋M01〜M04（M01 のみ RESOLVED）。fix2 で以下を反映:
+
+- **H01**: §4-v2 に材料 3 点を補完——person_id を snapshot JSON の構成要素として
+  明文化・`被相続人フラグ` を使用 field 閉集合へ追加・(6) head.decedent_person_id・
+  (7) **App31 照合 snapshot**（採用レコード id/名称/有効/fallback 採用結果）。
+  §4-v2.1 に「読む値↔hash 材料」対応表を新設し 1:1 を機械的に提示。
+- **H02**: §2A.2 凍結マトリクス 1:1 突合表を新設し**欠落 2 行を補完**
+  （`decedent_joseki`〔子: 被相続人の除籍謄本・死亡記載〕・`sibling_death`
+  〔甥姪: 兄弟姉妹の死亡を証する戸籍〕）。§2A.3 で type 閉集合を実査
+  （FEE_FIELD_BY_TYPE 6 種のみ・複合 type 不存在）し、**F5 不足行の request_type
+  は初版「要入力」に倒す**と凍結（type 新設は別票）。
+- **H03**: §4B 新設——plan 由来 M1 の**決定的冪等キー**
+  `shokumu_plan:{case}:{plan_hash}:{line_type}:{municipality}:{person_id|-}` を
+  監査メタ `plan_idem` に保存・起票前の JSON parse 完全一致照合・部分失敗後の
+  再確定回収（原子性）・ACK 不明 reconcile（P3-003a §3B 同型）。初版 §4 の
+  「M1 既存運用に委ねる」記述と §6-17 の旧記述は**撤回**（command_id 基点の
+  既存ガードは plan 由来に効かないため）。
+- **M01**: §2C(ii) を JSON parse 後の 3 点一致（type＋person/plan_idem＋
+  municipality）へ厳密化・parse 不能は要確認へ・**却下=非抑止**（§2C-4）を明記。
+- **M02**: §4A に candidates 相関制約 7 項（propose のみ起票／input_required=
+  write 0／要入力→必ず input_required／applicant_current=常に null+input_required
+  〔裁定⑦の機械的固定〕／他行 person_id 必須／fulfilled=表示専用）＋保存境界検証。
+- **M03**: §2D に fields 値の出所（顧客名表示用=案件レコード再取得・案件アプリID=
+  ユニット別 env・監査メタ構造の定義）と `_fields_shokumu_seikyu` 同期方式
+  （共用関数化第一候補・byte 一致 pin が代替強制）を固定。
+- **M04**: §6 に 20〜27 の 8 系統を追加（App31/被相続人フラグ stale・
+  request_type 未確定 write 0・欠落行照合・plan_idem 照合系・ACK 回収・
+  相関制約違反・却下再提案）。
+- 次レビュー: **R-SHOKUMU-PLAN-D3**（**凍結判定**・BASE=origin/main `6312112`・
+  TARGET=shokumu-plan-design の fix2 commit）。
