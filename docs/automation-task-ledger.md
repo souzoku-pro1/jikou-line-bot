@@ -26,6 +26,42 @@
 
 テスト系譜（本日区間）: 554 → … → 761 → 770 → 784 → 803 → 805 → 818 → 831 → **851**（全PASS）。
 
+## 1a. 完了反映（2026-08-09 追記・P3/P4/P5 系。詳細は各 DRAFT/work-log が正本）
+
+7/08〜8/09 区間の完了を状態同期する（過去分の詳細は work-logs/・PR 履歴が正。
+本節は台帳としての消込のみ）:
+
+| 項目 | PR / 実施 | 備考 |
+|---|---|---|
+| P3-001 導出台帳（DerivationRun+HeirConfirmationDecision・凍結エンジン） | merge 済み（zokugara 改定 #184 含む） | **migration `d5e2b8a1c7f3` は本番 DB 未適用**（実機デー工程・下 2a） |
+| P3-002 TemplateVersion registry | merge 済み | **migration `e7a3c9d2b5f1` は本番 DB 未適用**（同上） |
+| P3-003a 封筒起票（heir_envelope） | merge 済み | flag `HEIR_DERIVATION_ENABLED` 既定 OFF |
+| P3-003-CMD 導出コマンド経路8段 | #186 | 同上（語彙可視性も flag 連動） |
+| P3-003b 関所+projection（confirmed 一本・App36 write 0 原則） | #187（設計 #183） | 同上 |
+| **P3-003c held/rejected 語彙**（ENVELOPE_FLOW §3.2 残件の**消込**） | 設計凍結 **#191**（D3 PASS）・実装 `p3-003c-impl:0ba7fb3`＝**R-P3-003C-IMPL-1 レビュー中** | 「held/rejected の細部は実装票で」の別票は**本票で解消**（裁定①〜⑥確定・残る別票は 取消=裁定④ / H11 検知 / E0–E3 / 放棄写像のみ） |
+| P4-001 認証+PWA shell（案(b) session） | #173 | Release A 先行 3 画面の基盤 |
+| P4-002 案件一覧+詳細 | #176 | read-only proxy API+画面2枚 |
+| P4-004 承認キュー参照 | #182 | 参照のみ（App30 絶対制約と非干渉） |
+| P5-001 条項ライブラリ | #172 | P5-002 以降は書式受入（[人]）待ち |
+| koseki lane2 cutover 完全クローズ（ゲート4+証跡③ retirement 3点充足） | #189・#190 | `2026-08-09_P2-koseki-lane2-D7-close.md`・`_retirement.md` |
+| MAINT-1 小粒バッチ | #188 | held封筒×find_existing 統合pin ほか |
+
+テスト系譜（2026-08-09 時点）: 851 → …（7月区間は work-logs 参照）… → 1911 → **1937**（全PASS）。
+
+## 2a. 未着手項目の解錠条件（2026-08-09 追記・依存注記）
+
+§2/§3 の 7 月裁定項目（正当放置を含む）は**そのまま**とし、現時点の主要ゲートを
+依存注記として固定する:
+
+| ゲート（解錠条件） | 解錠される項目 | 現況 |
+|---|---|---|
+| **scan 20 件到着**（大野提供サンプル・UX 設計素材） | P4-003（書類到着状況・書類ビュー/仕分け結果確認） | [人]待ち |
+| **協議書 Word 書式の受入**（[人]） | P5-002 以降（条項差込み・docx 生成） | [人]待ち |
+| **実機デー（migration 2 本適用→点火群）** | ブロックA（durable=`INBOUND_EVENT_DURABLE_ENABLED`）・ブロックE（`ATTORNEY_ALLOWLIST`→`HEIR_DERIVATION_ENABLED`）・§3 の env 投入 3 種（#7）との同日消化も可 | 事前調査済み（2026-08-09・`2026-08-09_daily-consolidated.md` §2。**alembic 不一致=点火中止条件を実測済み**） |
+| **G-L3-0**（lane3 点火前ゲート・司令塔裁定） | lane3（bank/valuation の署名切替・`SIGNED_LANES` 残 3 lane） | 裁定待ち |
+| **R-P3-003C-IMPL-1 PASS→マージ** | held/rejected 語彙の本番入り（flag OFF のため挙動不変） | レビュー中（`0ba7fb3`） |
+| P3 merge 済み（**解錠済み**） | P4-005（相続人関係図・導出結果重畳含む） | **未着手・次票候補**（scan 不要・先行可） |
+
 ## 2. 登録済み・未着手（司令塔の裁定・指示待ち）
 
 | 項目 | 内容 | 依存・前提 |
