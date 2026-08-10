@@ -1371,5 +1371,7 @@ from hub.webapp_case_views import router as case_views_router  # noqa: E402
 app.include_router(case_views_router)
 from hub.webapp_approval_view import router as approval_view_router  # noqa: E402
 app.include_router(approval_view_router)
+from hub.webapp_kinship_view import router as kinship_view_router  # noqa: E402
+app.include_router(kinship_view_router)
 from hub.webapp_auth import router as webapp_router  # noqa: E402
 app.include_router(webapp_router)
