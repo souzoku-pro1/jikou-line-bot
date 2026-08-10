@@ -159,7 +159,9 @@ def _js_executable_text(src: str) -> tuple[str, bool]:
             if c == "]":
                 state = "regex"
             out.append(c); i += 1; continue
-    clean = (state == "code" and not tpl_stack and not escape)
+    # fix3: EOF が行コメント中（state="line"）は clean（JS 仕様上、行コメントは
+    # 行末または EOF で正しく終端する——前巡の偽陽性解消）
+    clean = (state in ("code", "line") and not tpl_stack and not escape)
     return "".join(out), clean
 
 
@@ -190,8 +192,86 @@ def _scan_units(name: str, src: str) -> list[tuple[str, str, bool]]:
 _FETCH_TOKEN = re.compile(r"(?<![A-Za-z0-9_$])fetch(?![A-Za-z0-9_$])")
 
 
+# ── fix3 M01（司令塔裁定=Codex 第3案）: 構築規律の閉集合禁止 ─────────────────
+# 検出の高度化でなく「API 名を実行時に組み立てる手段」自体を webapp 全域で禁止
+# する。JS 検査は lexer 適用後テキスト（コメントのみ除外・文字列は対象）に行う。
+_JS_BANNED = [
+    ("globalThis",
+     re.compile(r"(?<![A-Za-z0-9_$.])globalThis(?![A-Za-z0-9_$])")),
+    ('文字列リテラル computed access（x["…"]/x[\'…\']）',
+     None),   # 判定は _has_string_computed_access（keyword 直前の配列リテラル除外）
+    ("\\x エスケープ", re.compile(r"\\x[0-9a-fA-F]")),
+    ("\\u エスケープ", re.compile(r"\\u[0-9a-fA-F{]")),
+    ("eval", re.compile(r"(?<![A-Za-z0-9_$.])eval(?![A-Za-z0-9_$])")),
+    ("Function コンストラクタ",
+     re.compile(r"(?<![A-Za-z0-9_$.])(?:new\s+)?Function\s*\(")),
+    ("文字列引数の setTimeout/setInterval",
+     re.compile(r"(?<![A-Za-z0-9_$])set(?:Timeout|Interval)\s*\(\s*[\"'`]")),
+    ("動的 import()", re.compile(r"(?<![A-Za-z0-9_$.])import\s*\(")),
+    # PC-A 追加の防壁（裁定閉集合への上乗せ・完了報告に明記）: グローバル
+    # オブジェクト token 自体を禁止——「変数へ組み立てた文字列で window[v] を
+    # 引く」残余経路を入口（グローバル参照）側で塞ぐ。self は Service Worker
+    # （sw.js）のみ許可
+    ("グローバルオブジェクト参照（window/top/parent/frames）",
+     re.compile(r"(?<![A-Za-z0-9_$.])(?:window|top|parent|frames)"
+                r"(?![A-Za-z0-9_$])")),
+]
+_JS_BANNED_SELF = (
+    "グローバルオブジェクト参照（self・sw.js 以外で禁止）",
+    re.compile(r"(?<![A-Za-z0-9_$.])self(?![A-Za-z0-9_$])"))
+_HTML_BANNED = [
+    ("インラインイベント属性（on*=）", re.compile(r"\son[a-zA-Z]+\s*=")),
+    ("数値文字参照（&#…;）", re.compile(r"&#")),
+]
+
+
+# 直前語が JS キーワードなら [ は配列リテラル（computed access でない）
+_JS_KEYWORDS_BEFORE_ARRAY = frozenset(
+    {"of", "in", "return", "typeof", "case", "do", "else", "void", "delete",
+     "new", "yield", "await", "instanceof"})
+_COMPUTED_RE = re.compile(
+    r"([A-Za-z_$][A-Za-z0-9_$]*|\)|\])\s*\[\s*[\"']")
+
+
+def _has_string_computed_access(text: str) -> bool:
+    """識別子/閉じ括弧の直後の ["…"]/['…']（文字列リテラル computed access）。
+    keyword（for-of 等）直後の配列リテラルは除外（fix3 の偽陽性対策）。"""
+    for m in _COMPUTED_RE.finditer(text):
+        if m.group(1) not in _JS_KEYWORDS_BEFORE_ARRAY:
+            return True
+    return False
+
+
+def _discipline_violations(unit: str, text: str, is_js: bool,
+                           allow_self: bool = False) -> list[str]:
+    """構築規律違反の列挙（fix3 M01）。JS は lexer 適用済みテキストを渡すこと
+    （コメントのみ除外・文字列/テンプレート/正規表現は検査対象のまま）。"""
+    rules = list(_JS_BANNED) if is_js else list(_HTML_BANNED)
+    if is_js and not allow_self:
+        rules.append(_JS_BANNED_SELF)
+    out = []
+    for label, pat in rules:
+        if pat is None:
+            if _has_string_computed_access(text):
+                out.append(f"{unit}: {label}")
+        elif pat.search(text):
+            out.append(f"{unit}: {label}")
+    return out
+
+
 class TestFetchWrapperClosedSet(unittest.TestCase):
-    """A: fetch ラッパー閉集合化の静的 pin（fix1 M02 で実効化）。"""
+    """A: fetch ラッパー閉集合化の静的 pin（fix1 M02→fix2 M01→fix3 M01）。
+
+    本検査群の保証（fix3 で境界を固定）:
+    - **fetch token の物理集約**——識別子/文字列 token としての fetch は app.js
+      の app_fetch ブロック内 1 箇所のみ（コメントのみ除外の字句走査）。
+    - **迂回に必要な構文の全面禁止**（TestConstructionDiscipline）——globalThis・
+      文字列リテラル computed access・\\x/\\u エスケープ・eval/Function・文字列
+      引数タイマー・動的 import()・グローバルオブジェクト token（self は sw.js
+      のみ）・インラインイベント属性・数値文字参照。
+    残る理論的経路は**上記の禁止構文を将来解除した場合のみ**——解除は司令塔裁定
+    事項（規律変更として本テスト群の改定を伴う）。実行水準の確認は実機スモーク。
+    """
 
     def _all_sources(self):
         return {p.name: p.read_text(encoding="utf-8")
@@ -327,6 +407,68 @@ class TestFetchWrapperClosedSet(unittest.TestCase):
         self.assertNotIn('addEventListener("fetch"', sw)
 
 
+class TestConstructionDiscipline(unittest.TestCase):
+    """fix3 M01: webapp 全域の構築規律 pin（禁止構文の不在・実査済み=現行ゼロ）。"""
+
+    def test_webapp_has_no_banned_constructs(self):
+        for p in sorted(_WEBAPP.iterdir()):
+            if not p.is_file():
+                continue
+            src = p.read_text(encoding="utf-8")
+            for unit, text, is_js in _scan_units(p.name, src):
+                if is_js:
+                    text, clean = _js_executable_text(text)
+                    self.assertTrue(clean, f"{unit}: lexer が EOF で非 clean")
+                violations = _discipline_violations(
+                    unit, text, is_js, allow_self=(p.name == "sw.js"))
+                self.assertEqual(violations, [])
+
+    def test_discipline_detects_codex_bypass_forms(self):
+        # Codex 例示の迂回 3 形＋派生形が規律違反として検出されること（unit 対照）
+        cases = [
+            ('globalThis["fe" + "tch"]("/x");',
+             ["globalThis", "computed access"]),
+            ('const f = "\\x66etch";', ["\\x エスケープ"]),
+            ('const f = "\\u0066etch";', ["\\u エスケープ"]),
+            ("const \\u0066etch = 1;", ["\\u エスケープ"]),   # エスケープ識別子
+            ('const w = window; w[v]("/x");',
+             ["グローバルオブジェクト参照"]),
+            ('eval("fe" + "tch");', ["eval"]),
+            ('new Function("return this")();', ["Function"]),
+            ('setTimeout("code()", 1);', ["setTimeout"]),
+            ('import("./m.js");', ["import"]),
+        ]
+        for snippet, expect_frags in cases:
+            with self.subTest(snippet=snippet):
+                text, clean = _js_executable_text(snippet)
+                self.assertTrue(clean)
+                violations = _discipline_violations("u", text, is_js=True)
+                for frag in expect_frags:
+                    self.assertTrue(
+                        any(frag in v for v in violations),
+                        f"{frag} が検出されない: {violations}")
+
+    def test_discipline_detects_html_entity_event_attr(self):
+        html = '<img src=x onerror="&#102;etch(\'/x\')">'
+        violations = _discipline_violations("u", html, is_js=False)
+        self.assertTrue(any("インラインイベント属性" in v for v in violations))
+        self.assertTrue(any("数値文字参照" in v for v in violations))
+
+    def test_string_concat_use_requires_banned_syntax(self):
+        # "fe"+"tch" の連結**単体**は禁止対象でない（無害なデータ）が、これを
+        # API 名として**使う**には computed access / globalThis / eval 等の
+        # 禁止構文が必ず要る——使用形が全て検出されることの対照
+        harmless = 'const s = "fe" + "tch";'
+        text, _ = _js_executable_text(harmless)
+        self.assertEqual(_discipline_violations("u", text, is_js=True), [])
+        for use in ('globalThis[s]("/x");', 'const w = window; w[s]("/x");',
+                    'eval(s + "(\'/x\')");'):
+            with self.subTest(use=use):
+                text, _ = _js_executable_text(harmless + use)
+                self.assertTrue(
+                    _discipline_violations("u", text, is_js=True))
+
+
 class TestJsLexer(unittest.TestCase):
     """fix2 M01: 字句状態機械の対照テスト（前巡の偽陰性2形・偽陽性1形を含む）。"""
 
@@ -386,6 +528,19 @@ class TestJsLexer(unittest.TestCase):
             with self.subTest(snippet=snippet):
                 _text, clean = _js_executable_text(snippet)
                 self.assertFalse(clean)
+
+    def test_eof_in_line_comment_is_clean(self):
+        # fix3: 行コメントで EOF は clean（JS 仕様準拠・前巡の偽陽性解消）
+        text, clean = _js_executable_text("const a = 1; // trailing comment")
+        self.assertTrue(clean)
+        self.assertNotIn("trailing", text)     # コメント本文は除外されている
+
+    def test_nested_template_expression(self):
+        # 入れ子 template（`${`…${…}…`}`）の ${} 入れ子復帰と走査対象化
+        snippet = "const t = `a${`b${fetch(\"/x\")}c`}d`;"
+        text, clean = _js_executable_text(snippet)
+        self.assertTrue(clean)
+        self.assertEqual(_FETCH_TOKEN.findall(text), ["fetch"])
 
 
 class TestKosekiSummaries(unittest.TestCase):
