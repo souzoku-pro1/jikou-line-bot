@@ -306,6 +306,7 @@ class TestLeafFailClosed(_Base):
         # 一本鎖破損（leaf 複数・cross-run supersede 由来の状態）を leaf 検索の
         # 差し替えで模擬する（正規 module 外の core DML を作らない・検査対象は
         # 「複数 leaf を fail-closed で中止する判定」そのもの）
+        from hub.derivation_models import DecisionChainCorruptionError
         rid = self._mk_run()
         self._decide([rid], "held")
         now = datetime.now(timezone.utc)
@@ -313,16 +314,40 @@ class TestLeafFailClosed(_Base):
                 SimpleNamespace(id=2, decision="confirmed", decided_at=now)]
         with patch("hub.derivation_models._select_leaves",
                    new=AsyncMock(return_value=fake)):
-            with self.assertRaises(ChainIntegrityError):
+            with self.assertRaises(DecisionChainCorruptionError) as cm:
                 _run(get_leaf_decision(rid))
             db.reset_for_tests()
-            with self.assertRaises(ChainIntegrityError):
+            # 破損は race と別型（fix1 M02）・件数と run_id のみを属性で保持
+            self.assertEqual(cm.exception.count, 2)
+            self.assertEqual(cm.exception.run_id, rid)
+            with self.assertRaises(DecisionChainCorruptionError):
                 _run(create_decisions_for_heads(
                     "9", [rid], decision="held", decided_by="ATT1",
                     decided_at=now))
             db.reset_for_tests()
         # 破損検出は write 0（行数不変=1）
         self.assertEqual(len(self._decisions()), 1)
+
+    def test_corruption_via_handler_emits_business_alert(self):
+        # fix1 M02: 破損検出は handler 経由で業務警報（固定分類・値非搭載）＋
+        # aborted。App30/App36 write 0
+        rid = self._mk_run()
+        self._decide([rid], "held")
+        now = datetime.now(timezone.utc)
+        fake = [SimpleNamespace(id=1, decision="held", decided_at=now),
+                SimpleNamespace(id=2, decision="confirmed", decided_at=now)]
+        with patch("hub.derivation_models._select_leaves",
+                   new=AsyncMock(return_value=fake)):
+            r = self._resolve(_group(rid), decision="held")
+        self.assertEqual(r["status"], "aborted")
+        self.assertIn("破損検出", r["reason"])
+        self.assertTrue(self.alert.await_count >= 1)
+        alert_text = self.alert.await_args_list[0].args[0]
+        self.assertIn("decision 鎖の破損検出", alert_text)
+        self.assertIn(f"run #{rid}", alert_text)
+        self.assertIn("有効 leaf 2 件", alert_text)
+        self.assertEqual(self.updated, [])
+        self.assert_no_app36_io()
 
 
 # ── §7-18: 並行 supersede 競合の正規化＋DB 例外本文の非露出 ──────────────────
@@ -362,6 +387,9 @@ class TestIntegrityNormalization(_Base):
         self.assertEqual(r["status"], "aborted")
         self.assertNotIn("固有", r["reason"])   # 固定応答（既存文言へ合流）
         self.assert_no_app36_io()
+        # fix1 M02: 正常系の並行 race（正規化 ChainIntegrityError）では
+        # 業務警報を出さない（破損のみ警報＝区別を pin）
+        self.alert.assert_not_awaited()
 
 
 # ── §7-3/§7-4/§7-14: App36 無照会（異常行存在下でも）＋ rejected leaf 遮断 ──
@@ -438,6 +466,89 @@ class TestEnvelopeSideEffects(_Base):
         self.assertEqual(fields["実行済み"], "yes")
         detail = json.loads(fields["チャネル固有データ"])["heir_derivation"]
         self.assertEqual(detail[DETAIL_DECISION_KEY]["decision"], "rejected")
+
+
+# ── fix1 H01: detail 再構築の基底=App30 再読の現在値（3 経路の対照）─────────
+class TestLiveDetailMerge(_Base):
+    """pending 作成後に App30 detail へキーが追加された状況（再読が追加キー入りを
+    返す）で、当該 decision の書くキーのみが上書きされ他キーが保持されることを
+    3 経路で pin（§7-20 の実 App30 状態基準への強化）。"""
+
+    def _set_live_detail(self, detail: dict):
+        self.envelope["チャネル固有データ"] = {"value": json.dumps(
+            {"heir_derivation": detail}, ensure_ascii=False)}
+
+    def _last_shipping_detail(self):
+        fields = [c for c in self.updated
+                  if c[0] == hp.APP_SHIPPING.label][-1][2]
+        return json.loads(fields["チャネル固有データ"])["heir_derivation"]
+
+    def test_held_rejected_preserve_keys_added_after_pending(self):
+        for decision in ("held", "rejected"):
+            with self.subTest(decision=decision):
+                case = "9" if decision == "held" else "8"
+                rid = self._mk_run(case=case)
+                # snapshot（pending 時）には無いキーが App30 側に後追いで存在
+                self._set_live_detail({"derivation_run_id": rid,
+                                       "case_record_id": case, "冪等キー": "k",
+                                       "後追いキー": "added-after-pending"})
+                g = _group(rid)     # item.detail（snapshot）は後追いキーを持たない
+                r = _run(hp._resolve_heir_derivation(
+                    g, case, decided_by="ATT1", decision=decision))
+                db.reset_for_tests()
+                self.assertEqual(r["status"], "resolved")
+                detail = self._last_shipping_detail()
+                self.assertEqual(detail["後追いキー"], "added-after-pending")
+                self.assertEqual(detail[DETAIL_DECISION_KEY]["decision"],
+                                 decision)
+                self.assertEqual(detail["冪等キー"], "k")
+
+    def test_confirmed_annotation_update_preserves_live_keys(self):
+        # (b) confirmed 注記更新: live detail に 判断=held＋後追いキー。
+        # snapshot は後追いキーを持たない → クローズ update で両方保持・注記のみ
+        # confirmed へ更新
+        rid = self._mk_run()
+        self._decide([rid], "held")
+        live = {"derivation_run_id": rid, "case_record_id": "9", "冪等キー": "k",
+                DETAIL_DECISION_KEY: {"decision": "held", "decided_at": "t"},
+                "後追いキー": "x"}
+        self._set_live_detail(live)
+        r = self._resolve(_group(rid))          # 確定（held を supersede）
+        self.assertEqual(r["status"], "resolved")
+        self.assertTrue(r["items"][0]["envelope_closed"])
+        detail = self._last_shipping_detail()
+        self.assertEqual(detail["後追いキー"], "x")
+        self.assertEqual(detail[DETAIL_DECISION_KEY]["decision"], "confirmed")
+
+    def test_rowheld_append_preserves_live_keys(self):
+        # (c) row-held 追記: 直前再検証で行 held → 保留人物ID 追記 update が
+        # live detail の後追いキーを保持
+        rid = self._mk_run(_payload(_heir("11", "child", "1/2")))
+        self._set_live_detail({"derivation_run_id": rid, "case_record_id": "9",
+                               "冪等キー": "k", "後追いキー": "y"})
+        calls = {"n": 0}
+
+        async def racy_search(app, query, fields=None):
+            calls["n"] += 1
+            if calls["n"] > 1:      # phase 1 は 0 件・_project_row 再検索で重複出現
+                return [{"$id": {"value": "955"},
+                         "current_derivation_run_id": {"value": "99999"},
+                         "戸籍確認済": {"value": "no"},
+                         "$revision": {"value": "1"}},
+                        {"$id": {"value": "956"},
+                         "current_derivation_run_id": {"value": "99999"},
+                         "戸籍確認済": {"value": "no"},
+                         "$revision": {"value": "1"}}]
+            return []
+
+        self.search.side_effect = racy_search
+        r = self._resolve(_group(rid))
+        self.assertEqual(r["status"], "resolved")
+        self.assertEqual(r["items"][0]["app36_held"], 1)
+        self.assertFalse(r["items"][0]["envelope_closed"])
+        detail = self._last_shipping_detail()
+        self.assertEqual(detail["後追いキー"], "y")
+        self.assertEqual(detail[DETAIL_HELD_PERSONS_KEY], ["11"])
 
 
 # ── §7-17: side effect の再開（App30 失敗→再指示・時刻不変）──────────────────
@@ -779,10 +890,8 @@ class TestDeriveNoChangeAfterRejected(_Base):
 
 # ── 発注 3: 分岐位置の構造保証（ソース検査）──────────────────────────────────
 class TestBranchStructureSource(unittest.TestCase):
-    def test_decision_branch_precedes_app36_row_plan(self):
-        """held/rejected の分岐（decision != "confirmed" の continue/return）が
-        _resolve_heir_derivation 内で App36 検索（search_records）より前に
-        位置し、held/rejected 側の実行片に App36 参照が無いことを AST で pin。"""
+    @staticmethod
+    def _parse_fn():
         import ast
         from pathlib import Path
         tree = ast.parse(
@@ -790,22 +899,51 @@ class TestBranchStructureSource(unittest.TestCase):
         fn = next(n for n in tree.body
                   if isinstance(n, ast.AsyncFunctionDef)
                   and n.name == "_resolve_heir_derivation")
-        branch_line = search_line = None
+        return tree, fn
+
+    def test_decision_branch_precedes_app36_row_plan(self):
+        """fix1 M01: **分岐実体**（`decision != "confirmed"` を test に持ち body に
+        Continue を含む If＝phase 1 ループ内の早期分岐）を特定し、その行が
+        App36 検索（search_records）の最初の呼出しより構文上前にあることを pin。
+
+        - 冒頭の閉集合検査（`decision not in DECISIONS`＝NotIn）や leaf 先行検査の
+          比較（Return のみ・Continue なし）は **NotEq＋Continue の複合条件で除外**
+          される＝最初に現れる比較を拾う旧方式（比較位置だけで真になり得る）を撤回。
+        - 変異確認（報告事項）: 分岐実体を App36 検索の後へ移すと branch_line >
+          search_line となり本テストは FAIL する（continue が search 後では
+          「App36 照会ゼロ」が破れる改変を検出できる）。
+        """
+        import ast
+        _tree, fn = self._parse_fn()
+        early_branches = []          # (lineno) — NotEq('confirmed') かつ Continue
+        search_line = None
         for node in ast.walk(fn):
-            if (isinstance(node, ast.Compare)
-                    and isinstance(node.left, ast.Name)
-                    and node.left.id == "decision"
-                    and branch_line is None):
-                branch_line = node.lineno
+            if isinstance(node, ast.If):
+                has_ne_confirmed = any(
+                    isinstance(c, ast.Compare)
+                    and isinstance(c.left, ast.Name) and c.left.id == "decision"
+                    and len(c.ops) == 1 and isinstance(c.ops[0], ast.NotEq)
+                    and len(c.comparators) == 1
+                    and isinstance(c.comparators[0], ast.Constant)
+                    and c.comparators[0].value == "confirmed"
+                    for c in ast.walk(node.test))
+                has_continue = any(isinstance(b, ast.Continue)
+                                   for b in ast.walk(node))
+                if has_ne_confirmed and has_continue:
+                    early_branches.append(node.lineno)
             if (isinstance(node, ast.Call)
                     and isinstance(node.func, ast.Attribute)
                     and node.func.attr == "search_records"
                     and search_line is None):
                 search_line = node.lineno
-        self.assertIsNotNone(branch_line)
+        # 分岐実体は正確に 1 箇所（曖昧一致を許さない）
+        self.assertEqual(len(early_branches), 1)
         self.assertIsNotNone(search_line)
-        self.assertLess(branch_line, search_line)
-        # side effect の field 構築ヘルパに App36 参照・kintone 呼出しが無いこと
+        self.assertLess(early_branches[0], search_line)
+
+    def test_side_effect_helper_has_no_app36_reference(self):
+        import ast
+        tree, _fn = self._parse_fn()
         helper = next(n for n in tree.body
                       if isinstance(n, ast.FunctionDef)
                       and n.name == "_decision_side_effect_fields")

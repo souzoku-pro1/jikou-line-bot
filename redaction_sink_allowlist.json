@@ -19,7 +19,7 @@
     "daily_healthcheck.py:489:sink:logger",
     "daily_healthcheck.py:513:sink:logger",
     "daily_healthcheck.py:79:sink:logger",
-    "dispatch_bot/heir_derive_task.py:202:sink:logger",
+    "dispatch_bot/heir_derive_task.py:204:sink:logger",
     "dispatch_bot/review_resolve_task.py:98:sink:logger",
     "document_webhook.py:159:logger_exception",
     "hub/address_label.py:48:sink:logger",

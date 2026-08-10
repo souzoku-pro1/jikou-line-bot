@@ -778,12 +778,28 @@ class DecisionBlockedError(ChainIntegrityError):
         super().__init__(f"decision 遷移は許可されていません（{code}・全体中止）")
 
 
+class DecisionChainCorruptionError(ChainIntegrityError):
+    """一本鎖破損（有効 leaf 複数件）の検出（P3-003c fix1 M02）。
+
+    **データ異常**であり、正常系の並行 race（head CAS 不一致・UNIQUE 競合の
+    正規化＝素の ChainIntegrityError）とは区別する——呼出し側はこの型のときのみ
+    業務警報を発行する。属性は件数と run_id のみ（値非搭載・固定文言）。
+    """
+
+    def __init__(self, run_id: int, count: int):
+        self.run_id = run_id
+        self.count = count
+        super().__init__(
+            "decision 鎖が一本鎖ではありません（破損検出・全体中止）")
+
+
 async def get_leaf_decision(run_id: int):
     """decision 鎖の有効 leaf（supersede されていない末端・read-only・P3-003c
     §3.3-v2）。一本鎖ゆえ高々 1 行。無ければ None。
 
-    複数行＝一本鎖の DB 破損（cross-run supersede 等）→ ChainIntegrityError
-    （fail-closed・§7-19。黙って先勝ちにしない）。leaf 検索は
+    複数行＝一本鎖の DB 破損（cross-run supersede 等）→
+    DecisionChainCorruptionError（fail-closed・§7-19。黙って先勝ちにしない・
+    fix1 M02: 破損は race と別型＝呼出し側が業務警報を発行）。leaf 検索は
     `_select_leaves`（create_decisions_for_heads と共用・単一の正）。
     """
     from hub.db import session_scope
@@ -791,8 +807,7 @@ async def get_leaf_decision(run_id: int):
     async with session_scope() as s:
         rows = await _select_leaves(s, run_id)
     if len(rows) > 1:
-        raise ChainIntegrityError(
-            "decision 鎖が一本鎖ではありません（破損検出・全体中止）")
+        raise DecisionChainCorruptionError(run_id, len(rows))
     return rows[0] if rows else None
 
 
@@ -867,8 +882,7 @@ async def create_decisions_for_heads(case_record_id: str,
                         "（supersede 検出・CAS 中止・グループ全体 rollback）")
                 leaves = await _select_leaves(s, run_id)
                 if len(leaves) > 1:
-                    raise ChainIntegrityError(
-                        "decision 鎖が一本鎖ではありません（破損検出・全体中止）")
+                    raise DecisionChainCorruptionError(run_id, len(leaves))
                 leaf = leaves[0] if leaves else None
                 if leaf is None:
                     await s.execute(sa.insert(t).values(
