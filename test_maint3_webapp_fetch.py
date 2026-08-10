@@ -60,11 +60,128 @@ def _auth_headers():
     return {"Cookie": f"webapp_session={issue_session()}"}
 
 
-def _strip_js_comments(src: str) -> str:
-    """// 行末コメントと /* */ ブロックコメントを除去（fix1 M02: コメント化に
-    よる pin 迂回を照合前に排除。`://`（URL）は行コメント扱いしない）。"""
-    src = re.sub(r"/\*.*?\*/", "", src, flags=re.S)
-    return re.sub(r"(?<!:)//[^\n]*", "", src)
+# ── fix2 M01: JS 字句状態機械（正規表現ベースのコメント除去を撤廃・両時点の
+#    偽陰性/偽陽性を解消）────────────────────────────────────────────────────
+# 除算の直前に来得る有意文字（これ以外の直後の '/' は正規表現リテラル開始と
+# 判定＝標準ヒューリスティック。'}' はブロック終端直後の文再開があり得るため
+# リテラル開始側に倒す——本 webapp のコード形に「} / 除算」となる式は無い）
+_DIV_PREV = set(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_$)]")
+
+
+def _js_executable_text(src: str) -> tuple[str, bool]:
+    """JS ソースから**コメントのみ**を空白化したテキストを返す（fix2 M01）。
+
+    文字単位の状態機械で '…'／"…"／`テンプレート`（\\ エスケープ・${} 内の
+    式コードの入れ子を含む）／// 行コメント／/* */ ブロックコメント／正規表現
+    リテラル（文字クラス [ ] 内の / を終端と誤認しない）を区別する。
+    - **コメント内のみ除外**（空白化・行構造は保持）
+    - **文字列・テンプレート内の fetch は検出対象のまま残す**（"fetch" 文字列
+      アクセス迂回の禁止対象）
+    - 実行コード・正規表現リテラル本文はそのまま残す（保守側＝除外はしない）
+    戻り値: (テキスト, EOF が clean か＝文字列/コメント/正規表現/テンプレートの
+    途中で終わっていないか)。
+    """
+    out: list[str] = []
+    state = "code"
+    tpl_stack: list[int] = []    # `${` の brace 入れ子（code→tpl 復帰管理）
+    prev_sig = ""
+    escape = False
+    i, n = 0, len(src)
+    while i < n:
+        c = src[i]
+        nxt = src[i + 1] if i + 1 < n else ""
+        if state == "code":
+            if c == "/" and nxt == "/":
+                state = "line"; out.append("  "); i += 2; continue
+            if c == "/" and nxt == "*":
+                state = "block"; out.append("  "); i += 2; continue
+            if c == "/" and prev_sig not in _DIV_PREV:
+                state = "regex"; out.append(c); i += 1; continue
+            if c == "'":
+                state = "sq"
+            elif c == '"':
+                state = "dq"
+            elif c == "`":
+                state = "tpl"
+            elif tpl_stack and c == "{":
+                tpl_stack[-1] += 1
+            elif tpl_stack and c == "}":
+                tpl_stack[-1] -= 1
+                if tpl_stack[-1] == 0:
+                    tpl_stack.pop()
+                    state = "tpl"
+            if not c.isspace():
+                prev_sig = c
+            out.append(c); i += 1; continue
+        if state in ("sq", "dq", "tpl"):
+            if escape:
+                escape = False; out.append(c); i += 1; continue
+            if c == "\\":
+                escape = True; out.append(c); i += 1; continue
+            if state == "sq" and c == "'":
+                state = "code"; prev_sig = "'"
+            elif state == "dq" and c == '"':
+                state = "code"; prev_sig = '"'
+            elif state == "tpl":
+                if c == "`":
+                    state = "code"; prev_sig = "`"
+                elif c == "$" and nxt == "{":
+                    out.append("${"); i += 2
+                    tpl_stack.append(1); state = "code"; prev_sig = "{"
+                    continue
+            out.append(c); i += 1; continue
+        if state == "line":
+            if c == "\n":
+                state = "code"; out.append(c)
+            else:
+                out.append(" ")
+            i += 1; continue
+        if state == "block":
+            if c == "*" and nxt == "/":
+                state = "code"; out.append("  "); i += 2; continue
+            out.append(c if c == "\n" else " "); i += 1; continue
+        if state == "regex":
+            if escape:
+                escape = False; out.append(c); i += 1; continue
+            if c == "\\":
+                escape = True; out.append(c); i += 1; continue
+            if c == "[":
+                state = "regex_class"
+            elif c == "/":
+                state = "code"; prev_sig = "/"
+            out.append(c); i += 1; continue
+        if state == "regex_class":
+            if escape:
+                escape = False; out.append(c); i += 1; continue
+            if c == "\\":
+                escape = True; out.append(c); i += 1; continue
+            if c == "]":
+                state = "regex"
+            out.append(c); i += 1; continue
+    clean = (state == "code" and not tpl_stack and not escape)
+    return "".join(out), clean
+
+
+_SCRIPT_RE = re.compile(r"<script[^>]*>(.*?)</script>", re.S)
+
+
+def _scan_units(name: str, src: str) -> list[tuple[str, str, bool]]:
+    """検査単位への分解: (単位名, テキスト, JS lexer 適用有無)。
+
+    - .js: 全体を JS として lexer 適用
+    - .html: <script> 本文は lexer 適用・**script 外の残余は生のまま走査**
+      （HTML コメントも除外しない保守側＝属性ハンドラ等の迂回も token で検出）
+    - その他（.json 等）: 生のまま走査
+    """
+    if name.endswith(".js"):
+        return [(name, src, True)]
+    if name.endswith(".html"):
+        units = [(f"{name}#script{i}", m.group(1), True)
+                 for i, m in enumerate(_SCRIPT_RE.finditer(src))]
+        units.append((f"{name}#html", _SCRIPT_RE.sub("", src), False))
+        return units
+    return [(name, src, False)]
 
 
 # 生 fetch への到達手段の網羅（fix1 M02a）: 識別子 token としての fetch を
@@ -88,21 +205,27 @@ class TestFetchWrapperClosedSet(unittest.TestCase):
         return m.group(1)
 
     def test_raw_fetch_token_unreachable_outside_wrapper(self):
-        # fix1 M02a: コメント除去後の全 webapp ソースで、fetch token
-        # （呼出し・空白付き・fetch?.・(0, fetch)・"fetch" リテラルを包含）は
-        # app.js の app_fetch ブロック内の 1 箇所のみ
+        # fix2 M01: 字句状態機械（コメントのみ除外・文字列/実行コードは走査）で
+        # 全 webapp ソースを検査単位に分解し、fetch token（呼出し・空白付き・
+        # fetch?.・(0, fetch)・"fetch" リテラルを包含）が app.js の app_fetch
+        # ブロック内の 1 箇所のみであることを pin。各 JS 単位に EOF clean の
+        # 健全性 assert を適用
         for name, src in self._all_sources().items():
-            stripped = _strip_js_comments(src)
-            hits = _FETCH_TOKEN.findall(stripped)
-            if name != "app.js":
-                self.assertEqual(
-                    hits, [], f"{name}: ラッパー外に fetch 到達手段がある")
-        app_js = _strip_js_comments((_WEBAPP / "app.js")
-                                    .read_text(encoding="utf-8"))
-        self.assertEqual(len(_FETCH_TOKEN.findall(app_js)), 1)
-        block = _strip_js_comments(self._wrapper_block(
+            for unit, text, is_js in _scan_units(name, src):
+                if is_js:
+                    text, clean = _js_executable_text(text)
+                    self.assertTrue(clean, f"{unit}: lexer が EOF で非 clean")
+                hits = _FETCH_TOKEN.findall(text)
+                if name != "app.js":
+                    self.assertEqual(
+                        hits, [], f"{unit}: ラッパー外に fetch 到達手段がある")
+        app_js_text, clean = _js_executable_text(
+            (_WEBAPP / "app.js").read_text(encoding="utf-8"))
+        self.assertTrue(clean)
+        self.assertEqual(len(_FETCH_TOKEN.findall(app_js_text)), 1)
+        block_text, _ = _js_executable_text(self._wrapper_block(
             (_WEBAPP / "app.js").read_text(encoding="utf-8")))
-        self.assertEqual(len(_FETCH_TOKEN.findall(block)), 1,
+        self.assertEqual(len(_FETCH_TOKEN.findall(block_text)), 1,
                          "生 fetch が app_fetch ブロック外にある")
 
     def test_wrapper_structure_prefix_throw_fetch_order(self):
@@ -112,7 +235,7 @@ class TestFetchWrapperClosedSet(unittest.TestCase):
         # コメント行は除去してから照合（コメント化による迂回を検出）
         src = (_WEBAPP / "app.js").read_text(encoding="utf-8")
         self.assertIn('const APP_API_PREFIX = "/app/api/";', src)
-        block = _strip_js_comments(self._wrapper_block(src))
+        block, _ = _js_executable_text(self._wrapper_block(src))
         lines = [ln.strip() for ln in block.splitlines() if ln.strip()]
         idx_if = next((i for i, ln in enumerate(lines)
                        if ln.startswith("if (")
@@ -155,6 +278,45 @@ class TestFetchWrapperClosedSet(unittest.TestCase):
                           f"{m.group(1)}")
         self.assertEqual(found, 4)
 
+    def test_throw_reachability_by_brace_depth(self):
+        """fix2 L01（(b) 採用・node 不在のため静的解析）: throw が prefix 検査
+        if の**直下（brace 深度 +1）**にあり、fetch 呼出しが if ブロックの外
+        （深度 0）で throw より後にあることを brace 深度で pin。
+
+        限界（明記）: 静的解析であり「実行時に throw が実際に投げられ fetch が
+        呼ばれない」ことの実測ではない（node 実行環境がローカルに無いため
+        (a) 実行テストは採らない）。if(false) ラップ等の**制御条件の無効化**は
+        本検査では検出できず、深度・順序の改変（ブロック外移動・コメント化）
+        のみを検出する。実行水準の確認は実機スモーク（[人]）事項。
+        """
+        src = (_WEBAPP / "app.js").read_text(encoding="utf-8")
+        block, _ = _js_executable_text(self._wrapper_block(src))
+        depth = 0
+        if_depth = throw_depth = fetch_depth = None
+        if_pos = throw_pos = fetch_pos = None
+        for m in re.finditer(r"\{|\}|if \(typeof path|throw new Error"
+                             r"|return fetch\(path", block):
+            tok = m.group(0)
+            if tok == "{":
+                depth += 1
+            elif tok == "}":
+                depth -= 1
+            elif tok.startswith("if ("):
+                if_depth, if_pos = depth, m.start()
+            elif tok.startswith("throw"):
+                throw_depth, throw_pos = depth, m.start()
+            else:
+                fetch_depth, fetch_pos = depth, m.start()
+        self.assertIsNotNone(if_pos, "prefix 検査 if が無い")
+        self.assertIsNotNone(throw_pos, "throw が無い")
+        self.assertIsNotNone(fetch_pos, "fetch 呼出しが無い")
+        self.assertEqual(if_depth, 0)
+        self.assertEqual(throw_depth, 1,
+                         "throw が prefix 検査 if の直下（深度+1）にない")
+        self.assertEqual(fetch_depth, 0, "fetch が if ブロック内にある")
+        self.assertLess(if_pos, throw_pos)
+        self.assertLess(throw_pos, fetch_pos)
+
     def test_no_other_network_apis_anywhere(self):
         for name, src in self._all_sources().items():
             for banned in ("XMLHttpRequest", "WebSocket", "EventSource",
@@ -163,6 +325,67 @@ class TestFetchWrapperClosedSet(unittest.TestCase):
         # sw.js は fetch handler を登録しない（P4-001 裁定の維持）
         sw = (_WEBAPP / "sw.js").read_text(encoding="utf-8")
         self.assertNotIn('addEventListener("fetch"', sw)
+
+
+class TestJsLexer(unittest.TestCase):
+    """fix2 M01: 字句状態機械の対照テスト（前巡の偽陰性2形・偽陽性1形を含む）。"""
+
+    @staticmethod
+    def _hits(snippet: str) -> list[str]:
+        text, clean = _js_executable_text(snippet)
+        assert clean, "対照 snippet は clean EOF 前提"
+        return _FETCH_TOKEN.findall(text)
+
+    def test_false_negative_1_line_comment_marker_in_string(self):
+        # 前巡偽陰性1: "//" を含む文字列の後の実行コード fetch を見逃さない
+        self.assertEqual(
+            self._hits('const marker = "//"; fetch("/x");'), ["fetch"])
+
+    def test_false_negative_2_block_comment_marker_in_string(self):
+        # 前巡偽陰性2: "/*" を含む文字列で以降が丸ごと消えない
+        self.assertEqual(
+            self._hits('const begin = "/*"; fetch("/x"); const end = "*/";'),
+            ["fetch"])
+
+    def test_false_positive_label_line_comment(self):
+        # 前巡偽陽性: `:` 直後の // 行コメント（(?<!:) lookbehind の取り零し）
+        # ——コメント内の fetch は検出しない
+        self.assertEqual(
+            self._hits("switch (x) { default: // fetch(\n }"), [])
+
+    def test_string_fetch_still_detected(self):
+        # 文字列内 fetch は検出対象のまま（"fetch" 動的アクセス迂回の禁止）
+        self.assertEqual(self._hits('const f = window["fetch"];'), ["fetch"])
+
+    def test_template_literal_with_expression_code(self):
+        # テンプレート ${} 内の式コードも走査対象（迂回不可）
+        self.assertEqual(self._hits("const t = `x${fetch(\"/y\")}z`;"),
+                         ["fetch"])
+        self.assertEqual(self._hits("const t = `// not comment`;"), [])
+
+    def test_regex_literal_slashes_do_not_open_comment(self):
+        # 正規表現リテラル内の // をコメントと誤認しない（後続コードを走査）
+        self.assertEqual(
+            self._hits('const re = /https:\\/\\//; fetch("/x");'), ["fetch"])
+        # 文字クラス内の / で終端を誤認しない
+        self.assertEqual(self._hits('const re = /[/]/; fetch("/x");'),
+                         ["fetch"])
+
+    def test_division_not_treated_as_regex(self):
+        # 除算の / を正規表現開始と誤認して後続を飲み込まない
+        self.assertEqual(self._hits('const a = b / c; fetch("/x");'),
+                         ["fetch"])
+
+    def test_comments_do_not_hide_and_are_excluded(self):
+        self.assertEqual(self._hits("// fetch(\n/* fetch( */ const a = 1;"),
+                         [])
+
+    def test_eof_unclean_detected(self):
+        for snippet in ('const s = "unterminated', "/* open comment",
+                        "const t = `open template"):
+            with self.subTest(snippet=snippet):
+                _text, clean = _js_executable_text(snippet)
+                self.assertFalse(clean)
 
 
 class TestKosekiSummaries(unittest.TestCase):
