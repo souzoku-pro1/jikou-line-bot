@@ -1,13 +1,16 @@
-# DRAFT: SHOKUMU-PLAN — 職務上請求の自動判定起票（必要戸籍 plan の提案封筒・設計のみ・実装禁止）
+# DRAFT: SHOKUMU-PLAN — 職務上請求の自動判定起票（必要戸籍 plan の提案封筒・設計のみ・実装禁止・fix1）
 
 - TASK_ID: SHOKUMU-PLAN-D 設計票（設計凍結用 DRAFT・コード/テスト実装禁止）／記録日 2026-08-10
+  （fix1: R-SHOKUMU-PLAN-D1 の H01/H02/H03/M01〜M04 全所見反映・同日。改定は
+  両時点残置——§1.6 追加実査・§2A〜§2C・§4-v2・§4A・§5/§6 追記・§8 改定記録）
 - 盤面: 8月構想・項目1。判断部品はすべて既存——本票は**結線の設計**であり新エンジンを作らない。
 - 実装現実の実査基盤（2026-08-10・read-only・main `6312112`）:
   `koseki_chain.py`（F5 判定）／`docs/souzoku-houki/10-koseki-matrix.md`（H系列③・凍結）／
   `dispatch_bot/shokumu.py`＋`channels/shokumu_seikyu.py`（M1・実物検収済み）／
   `hub/derivation_models.py`・`hub/heir_projection.py`（P3 系）／`review_resolve.py`（App33 参照・関所型）／
   `hub/heir_envelope.py`（封筒冪等の型）。
-- 次レビュー: R-SHOKUMU-PLAN-D1（設計D巡）。
+- 次レビュー: R-SHOKUMU-PLAN-D2（fix1 反映後。D1=凍結不適格〔HIGH3+MEDIUM4〕・
+  対応は §8 改定記録）。
 
 ## 0. 原則（本票の背骨・§2 で構造化）
 
@@ -89,6 +92,29 @@
 - 関所: `review_resolve.RESOLVERS` へのトップキー追加＋T2 既存フロー（復唱→30分
   pending→OK 単回・decided_by 伝搬）。P3-003c で decision 種別伝搬も確立済み。
 
+### 1.6 追加実査（fix1・H02/H03/M03 の根拠）
+
+- **M1 の App30 起票 fields**（dispatch_bot/app30_filer.py `_fields_shokumu_seikyu`
+  :74-88 逐語）:
+  > チャネル固有JSONは channels/shokumu_seikyu.parse_channel_data が通る形式
+  > （request_items/municipality/target/purpose・04 §2）＋監査メタ併記。
+  > 宛先名は空で起票する（prepare が App 31 から施設名で解決して書き戻す）
+  fields = `チャネル="職務上請求"`・`件名=f"職務上請求（{customer}・{municipality}）"`・
+  `宛先名=""`・`チャネル固有データ=json({**channel_json, **監査メタ})`＋共通部
+  （file_from_pending :115-123: `発送ステータス="下書き"`・ユニット種別・顧客名表示用・
+  案件アプリID・案件レコードID・`実行済み="no"`・**単票 API 必須** :124-127）。
+  channel JSON の組立は `dispatch_bot.shokumu.build_channel_json(parsed)`。
+- **App31 照合**（channels/shokumu_seikyu.py `find_municipality` :473-488 逐語）:
+  > キー: チャネル固有データ municipality → 無ければ 宛先名。
+  > 未登録は PrepareDeferred（登録依頼警報・状態は変えない）
+  検索は `市区町村名 = "<name>" and 有効 in ("yes")` の**完全一致**。
+  **本籍・住所文字列から市区町村名を切り出す既存関数は存在しない**（実査結果・
+  `municipality_office_name` は名称→施設名変換のみ）→ §2A で規則を定義。
+- **除票の請求先の正本候補**: App34（人物）に `住所最新`・`本籍最新`
+  （SINGLE_LINE_TEXT・EXPECTED_KINTONE_SCHEMA 実査）が存在。被相続人行の
+  `住所最新`（最後の住所地）を住民票除票の請求先の第一材料とする。**空の場合は
+  「要入力」提示**（推測禁止・道案内型・H03）。
+
 ## 2. 設計骨子（一気通貫・機械は提案まで）
 
 ```
@@ -121,6 +147,82 @@
 - 連鎖ループ（受領→読解→次請求・§1.2 の H10）は**本票スコープ外**——本票は
   「現時点の不足に対する 1 巡分の提案」まで（§7・裁定④）。
 
+## 2A. マトリクス行→M1 入力の写像表（fix1 H03・行類型ごと）
+
+| 行類型 | request_items.type（FEE_FIELD_BY_TYPE 内） | 様式 | target の person_id 選定規則 | municipality の材料 |
+|---|---|---|---|---|
+| 共通: 住民票除票 | 住民票の除票 | 様式2（生年月日任意） | **被相続人**＝App34 `被相続人フラグ=yes` 行（第二段では head run.decedent_person_id と一致検証） | 被相続人の App34 `住所最新`（§1.6）→ §2A.1 切り出し |
+| 共通: 戸籍の附票（除票不能時の切替） | 戸籍の附票 | 様式2 | 同上 | 被相続人の App34 `本籍最新` → §2A.1 切り出し |
+| 出生〜死亡連続戸籍（不足分） | 除籍謄本／改製原戸籍（F5 未収集の従前戸籍） | 様式1（**生年月日必須**） | 被相続人 | F5 `未収集[].本籍` → §2A.1 切り出し |
+| 両親双方の死亡確認戸籍（兄弟姉妹系） | 除籍謄本 | 様式1 | **父・母**＝被相続人行の App34 `父人物ID`／`母人物ID`（不在は「要入力」） | 当該親の `本籍最新`（空なら「要入力」） |
+| 申述人の現在戸籍 | 戸籍謄本 | 様式1 | **申述人**——特定の正本が repo に存在しない（§5 裁定⑦へ再掲） | 申述人の `本籍最新`（同上） |
+
+- **生年月日（様式1 必須）**: 対象 person の App34 身分事項・出生行の和暦
+  （kinship_graph `_first_event_date(events,"出生")` と同一規則）。**取得不能は
+  「要入力」提示**（推測・空欄印字への先回りをしない＝道案内型・司令塔裁定どおり）。
+- **同一自治体の束ね規則**: §2A.1 の切り出し結果（市区町村名）が同一の請求候補は
+  **1 つの M1 起票（request_items 複数行）に束ねる**（M1 は 1 起票=1 宛先・
+  parse_channel_data が複数 items を受ける実装事実 §1.6 による）。
+
+### 2A.1 市区町村名の切り出し規則（新規定義・既存関数なし＝§1.6 実査）
+
+- 入力: 住所/本籍の全文文字列。出力: App31 `市区町村名` 完全一致検索に使う名称。
+- 規則（閉じた文法・実装票で pin）: 先頭の都道府県名（`…都|…道|…府|…県`・
+  任意）を除去した後、**最初の `市`・`区`・`町`・`村` 終端までの最短一致**を
+  切り出す。政令指定都市（「○○市△△区」）は**市までで切らず区まで含める第二候補も
+  生成**し、App31 照合は「区まで」→「市まで」の順に試す（**登録粒度は App31 の
+  運用データ依存＝§5 裁定⑧**）。
+- **切り出し失敗・両候補とも App31 未登録・複数解釈**は municipality を
+  **「要入力」提示**（plan 候補行に理由付きで残す・機械は推測しない）。
+  App31 未登録そのものの救済は M1 既存の PrepareDeferred（登録依頼警報）に一本化。
+
+## 2B. 第二段（続柄別セット）の入力条件（fix1 M01・6 条件で凍結）
+
+第二段の plan 生成は以下 **6 条件をすべて充足**した場合のみ（1 つでも欠ければ
+続柄別セットは生成せず「要確認（条件未充足の列挙＝道案内）」）:
+
+1. head run が**ちょうど 1 件**存在（get_current_head 非 None）。
+2. head run の有効 leaf decision が **confirmed**（P3-003c の leaf 判定を流用）。
+3. App36 の当該案件全行の `current_derivation_run_id` が **head run.id と一致**。
+4. App36 当該全行の `戸籍確認済` が **yes**。
+5. App36 行の `導出元人物ID` 集合と続柄が **head run result_payload.heirs の
+   person_id 集合・zokugara_code 写像と一致**。
+6. 冪等キー重複・欠落・余剰行の**いずれかがあれば全体要確認**（部分生成しない）。
+
+## 2C. 二段の重複排除（fix1 H02・司令塔裁定=照合方式(a)）
+
+- **phase 識別**: plan 封筒 detail に `phase ∈ {"common", "full"}` を持つ
+  （common=第一段・除票/附票のみ／full=第二段・続柄別セット込み）。
+- **第二段生成時の共通行の扱い**（重複排除・照合方式(a)）:
+  1. App33 収集済み照合——除票/附票が**取得済み**（App33 に該当読解あり）なら
+     共通行は「充足」表示のみ（請求候補にしない）。
+  2. App30 照合——未完了の共通行が既に飛んでいないかを **2 面**で照合:
+     (i) **plan 封筒**: トップキー `shokumu_plan`＋`案件レコードID=case`＋
+     detail.phase="common"＋発送ステータス=要確認（未クローズ）
+     (ii) **M1 起票**: `チャネル="職務上請求"`＋`案件レコードID=case`＋
+     `チャネル固有データ like "住民票の除票"`（または `"戸籍の附票"`）＋
+     発送ステータスが terminal（完了/エラー）以外——照合キーは §1.6 実査の
+     App30 実 field（チャネル・案件レコードID・チャネル固有データ・発送ステータス）。
+  3. いずれかに該当すれば第二段 plan から共通行を**除外**（重複提案しない）。
+- **第一段未実施案件の取りこぼし防止**: 上記照合で**共通行が存在しない**
+  （収集済みでも起票済みでもない）場合、第二段 plan に**共通行を含める**
+  （第一段の実施有無に依存しない＝漏れゼロの規則）。
+
+## 2D. M1 結線の具体呼出し先（fix1 M03・実査で固定）
+
+- **channel JSON の組立**: `dispatch_bot.shokumu.build_channel_json(parsed)` を
+  そのまま呼ぶ（parsed.task_params に request_items/municipality/target/unit を
+  詰める＝§1.3 の最小完全集合。purpose は渡さず PURPOSE_BY_UNIT 解決に委ねる）。
+- **App30 初期 fields の組立責務**: plan 確定ハンドラが
+  `_fields_shokumu_seikyu`（§1.6）と**同一の field 集合**を組み立てて
+  `hub.kintone.create_record`（**単票 API**）で起票する。
+  `file_from_pending` は Pending（LINE 指示）前提のため直接は呼ばず、
+  **同一 field 集合の byte 水準の一致をテストで pin**（§6-12）——将来
+  `_fields_shokumu_seikyu` が公開ヘルパ化されれば置換（実装票判断・挙動同一）。
+- 起票後は既存経路のまま: App30「レコード追加」Webhook → /hub/dispatch →
+  `channels/shokumu_seikyu.prepare`（`parse_channel_data`→`find_municipality`→
+  様式生成→**承認待ち**）。plan 側は prepare に一切関与しない。
+
 ## 3. 凍結正本との整合（設計上の不可侵・実装票へ逐語で引き継ぐ）
 
 1. **H系列③マトリクスの凍結**: 続柄別セット・最優先=住民票除票（または戸籍の附票）は
@@ -140,11 +242,35 @@
 
 - **封筒冪等キー**: `shokumu_plan:{case_record_id}:{plan_hash}`（heir_envelope の
   `冪等キー` 平文＋`find_existing` 完全一致の型を流用・二重起票ガード 2 層）。
-- **plan_hash**: plan の**材料**の正規化 hash——(i) 入力正本の id（head run.id または
-  App36 行集合・裁定①に従う） (ii) App33 収集済み戸籍の record_id＋読解 hash の
-  ソート列 (iii) マトリクス version（config データの版）。**提案内容でなく材料を
-  hash する**＝同一材料からの再生成は同一 plan（already_filed 回収）・材料が変われば
-  別 plan（新封筒）。
+- **plan_hash（初版・fix1 H01 で §4-v2 へ具体化＝両時点残置）**: plan の**材料**の
+  正規化 hash——(i) 入力正本の id（head run.id または App36 行集合・裁定①に従う）
+  (ii) App33 収集済み戸籍の record_id＋読解 hash のソート列 (iii) マトリクス version
+  （config データの版）。**提案内容でなく材料を hash する**＝同一材料からの再生成は
+  同一 plan（already_filed 回収）・材料が変われば別 plan（新封筒）。
+
+### 4-v2. plan_hash 材料の具体定義（fix1 H01・stale 保証と 1:1）
+
+plan_hash = SHA-256（下記 (1)〜(5) の正規化 JSON・sort_keys・ensure_ascii なし）:
+
+1. **入力正本の id**: phase="full" は head run.id（数字）／phase="common" は
+   `null`（run 非依存・裁定①(C)）。
+2. **App34 使用 field snapshot hash**（fix1 H01 の追加材料）: 候補生成・M1 入力に
+   **実際に使用した** person 行の使用 field のみを person_id 昇順で並べた
+   正規化 JSON の SHA-256。使用 field の閉集合＝
+   `{"氏名", "住所最新", "本籍最新", "死亡日", "父人物ID", "母人物ID",
+   "身分事項.出生行の年月日"}`（§2A の写像が読む field と**同一集合**・
+   これ以外を hash に入れない＝無関係編集で無駄に失効させない）。
+3. **App36 行集合 hash**（phase="full" のみ・fix1 H01 の具体化）: 当該案件の
+   App36 全行の `($id, $revision, current_derivation_run_id, 導出元人物ID)` を
+   $id 昇順で並べた正規化 JSON の SHA-256。
+4. **App33 収集済み集合**: record_id＋読解JSON の SHA-256 の $id 昇順ソート列。
+5. **マトリクス version**（config データの版数文字列）。
+
+- **stale 保証との 1:1**（§4「App34/36 変更時 stale」の成立根拠）: §2A の写像が
+  読む値はすべて (2) に、§2B の条件が読む App36 状態はすべて (3) に含まれる——
+  **plan の内容・M1 入力に影響し得る上流の変更は必ず plan_hash を変える**。
+  確定時は材料の現在値から plan_hash を**再計算**して封筒 detail と照合
+  （不一致=aborted・write 0）＝§4A の snapshot hash 保存（M02）と一体の設計。
 - **上流訂正（App34/36 変更・再導出・戸籍追加受領）時の失効**:
   - 新 head run／App33 追加 → plan_hash が変わる → 新封筒。**旧封筒は確定時の
     再検証で失効**——確定ハンドラ phase 1 で「材料の現在値から plan_hash を再計算し
@@ -154,6 +280,34 @@
 - **M1 側の二重起票**: 確定→M1 起票の間で同一 municipality×request_items の既存
   下書きがある場合の扱いは M1 既存の運用（承認キューで人が見える）に委ね、plan 側は
   確定封筒のクローズ（実行済み yes）で再確定を遮断（関所の既存二重確定ガード）。
+
+## 4A. plan 封筒 detail の閉集合（fix1 M02・司令塔裁定=person_id のみ保存）
+
+heir_envelope 同型の水準（キー閉集合・型・値域 grammar・等値ガード・トップキー一意）:
+
+| キー | 型・値域（grammar） | 備考 |
+|---|---|---|
+| `case_record_id` | `^[0-9]{1,10}$` | |
+| `phase` | enum `{"common","full"}` | §2C |
+| `run_id` | `^[1-9][0-9]{0,18}$` or null（common） | P3 系 grammar と逐語一致 |
+| `plan_hash` | `^[0-9a-f]{64}$` | §4-v2 |
+| `app34_snapshot_hash` | `^[0-9a-f]{64}$` | §4-v2 (2) の単独値（確定時比較用） |
+| `app36_rows_hash` | `^[0-9a-f]{64}$` or null（common） | §4-v2 (3) |
+| `matrix_version` | `^[0-9A-Za-z.\-]{1,32}$` | |
+| `candidates` | list（下記の行 dict のみ） | |
+| `冪等キー` | `shokumu_plan:{case}:{plan_hash}` の平文 | find_existing 照合用 |
+
+candidates 行の閉集合: `line_type`（enum＝§2A 行類型 5 値）・`request_type`
+（FEE_FIELD_BY_TYPE のキー集合内）・`count`（正整数）・`person_id`
+（`^[0-9]{1,10}$` or null）・`municipality`（切り出し結果 or 固定値 `"要入力"`）・
+`status`（enum `{"propose","fulfilled","input_required"}`）。
+
+- **氏名・生年月日・住所の実値は保存しない**（司令塔裁定）——封筒は
+  **person_id＋snapshot hash のみ**を持ち、確定時に App34 を**再取得**して
+  M1 入力を組み立て、`app34_snapshot_hash` の再計算比較で stale を検出する
+  （＝§4-v2 と一体。municipality は自治体名のみ＝住所全文を封筒へ写さない）。
+- 起票時閉集合の等値ガード・閉集合外キーの保存拒否（EnvelopeDetailPolicyError
+  同型）・トップキー `shokumu_plan` の一意性は heir_envelope の型を逐語で踏襲。
 
 ## 5. 裁定欄（[人]。P3-003C-D §8 形式・選択肢+推奨+影響。推測で決めない）
 
@@ -165,6 +319,14 @@
 | 4 | **連鎖ループ（H10）のスコープ** | (A) 本票は 1 巡分の提案まで・受領→読解→次請求の連鎖は別票 (B) 本票で連鎖まで設計 | **(A)**——§1.2 の反復ループは M5 受領・チェックリスト（H9）に跨り、判断材料（受領分類の実装状態）が別系。1 巡分でも「再指示すれば新材料で新 plan」により実務は回る | (B) はスコープ膨張。(A) は請求のたびに人の指示が要る（初版の意図的制約） |
 | 5 | **確定者の要件** | (A) ATTORNEY_ALLOWLIST 必須（P3-003c と対称） (B) 不要（対外送信の関所は M1 承認が別にあるため） | **(B)**——plan 確定は「M1 の下書きを作る」内部操作であり、対外発信の防壁は既存の承認フロー（弁護士）が担う。二重の弁護士ゲートは運用負担 | (A) だと事務員が請求案を進められない。(B) でも最終防壁（承認済み遷移）は弁護士のまま不変 |
 | 6 | **flag** | 新設 `SHOKUMU_PLAN_ENABLED`（既定 OFF・語彙可視性連動＝P3-003-CMD の型） | 新設（既定 OFF） | 点火は[人]・実機デー系の運用に載せる |
+| 7 | **申述人の特定正本**（fix1 H03 で確定できず再掲） | (A) 案件（App26）の依頼者＝顧客を申述人とみなし、App34 上の対応 person を[人]が確定入力 (B) App34 に「申述人フラグ」field を新設（kintone 実機変更・[人]） (C) 初版は申述人現在戸籍の行を常に「要入力」提示（機械は person を選ばない） | **(C)**——正本が repo に存在せず、誤った申述人での請求提案は実害があるため初版は道案内に倒す | (A)(B) は kintone 設計/運用の確定が前提。(C) は申述人行だけ人の入力が毎回要る |
+| 8 | **App31 の登録粒度**（政令市の市/区・fix1 H03 で確定できず再掲） | (A) 区単位で登録（切り出しは区優先＝§2A.1 の既定） (B) 市単位で登録 | **(A)**——住民票・戸籍事務は区役所所管が通例。§2A.1 は区→市の順で照合するため (B) 運用でも動く | 登録は[人]の App31 運用。粒度が混在しても照合順で吸収されるが、正は一方に揃えるのが望ましい |
+
+**fix1 追記（Codex 助言・裁定②の適用範囲の明確化）**: 裁定②（起動=語彙のみ）は、
+H系列③ §1 の旧記述「受任確定と同時に M1 職務上請求を自動起票」を**起動時点に
+ついてのみ上書き**する（初版は受任フックでなく[人]の語彙指示で起動）。
+**除票/附票の最優先性・内容・優先順位は不変**（マトリクスの凍結は §3-1 のまま・
+受任フック起動の復活は運用実績後の別票裁定）。
 
 ## 6. テスト計画（実装票の受入条件案・系統立て）
 
@@ -189,6 +351,37 @@
    承認待ち で停止することの状態遷移テスト。
 8. **flag**: 既定 OFF で語彙非公開・I/O ゼロ（P3-003-CMD の flag ゲート pin と同型）。
 
+**fix1 追加（M04・Codex 列挙の negative 11 系統）**:
+
+9. **未 confirmed 状態別 write 0**: §2B 条件 2 の否定形——leaf なし／held／rejected の
+   各状態で第二段が生成されず App30/M1 write 0＋条件未充足の道案内応答。
+10. **二段重複なし**: 第一段実施済み（plan 封筒 open／M1 起票済み〔非 terminal〕／
+    App33 取得済み）の 3 面それぞれで第二段に共通行が**含まれない**（§2C の
+    照合 3 分岐 parametrize）＋第一段不存在なら**含まれる**（漏れゼロ）。
+11. **App36 不一致系**: §2B 条件 3〜6 の否定形（run ID 不一致行あり・戸籍確認済 no
+    行あり・person_id 集合不一致・重複/欠落/余剰）→ 全体要確認・write 0。
+12. **App34 訂正 stale**: plan 起票後に使用 field（氏名/住所最新/本籍最新等）を
+    変更 → 確定時の snapshot hash 再計算不一致 → aborted・write 0・固定文言。
+    **非使用 field の変更では失効しない**（§4-v2 (2) の閉集合 pin・両方向）。
+13. **マトリクス同一性 pin**: config データが H系列③ §2 の凍結セットと 1:1
+    （行類型・書類種別・加算関係の byte 水準照合・「その他」集約なし）。
+14. **detail 閉集合違反**: §4A の閉集合外キー・grammar 外値（氏名等の実値混入を
+    含む）が保存拒否（EnvelopeDetailPolicyError 同型）。
+15. **purpose 非上書きの構造 pin**: plan 経路のどこにも purpose キーを書く文が
+    無い（AST・build_channel_json への引数にも purpose を渡さない）＋
+    PURPOSE_BY_UNIT の**文言 byte 一致**（§6-6 と統合）。
+16. **承認済み不書込み**: plan 経路の全 kintone write の対象 field に
+    `発送ステータス` の値として「承認済」が現れない（SERVER_TRANSITIONS 不変＋
+    write 値の閉集合 pin）。
+17. **部分起票の原子性**: 確定で複数 M1 起票を作る途中の失敗（k 件目で例外）→
+    作成済み k−1 件は残存（下書き＝無害）・plan 封筒は**クローズしない**・
+    応答が「n 件中 k−1 件起票済み・再確定で残りを再試行」型の道案内（冪等な
+    再確定で残り分のみ作成される——M1 側の既存二重起票ガード〔件名/監査メタ〕
+    との整合を含めて pin）。
+18. **flag OFF の完全 I/O ゼロ**: `SHOKUMU_PLAN_ENABLED` 未設定で plan 語彙の
+    App30 search・create が**ゼロ**（search も呼ばない・P3-003-CMD の冒頭辞退型）。
+19. **（予備）App31 照合順**: §2A.1 の区→市の照合順・両方不在の「要入力」化。
+
 ## 7. スコープ外（明記）
 
 - 受領→読解→次請求の**連鎖ループ**（H10・M5/チェックリスト H9 連携）——裁定④どおり別票。
@@ -197,3 +390,29 @@
 - App31 市区町村マスタの整備・宛先データの拡充（[人]運用）。
 - 相続放棄以外のユニット（時効援用等）への展開——purpose がユニット別確定である
   ため構造は共通だが、マトリクスは souzoku-houki 固有。初版は相続ユニットのみ。
+
+## 8. fix1 改定記録（R-SHOKUMU-PLAN-D1・2026-08-10。両時点残置・遡及書き換えにしない）
+
+D1 判定: 凍結不適格（HIGH3+MEDIUM4）。fix1 で以下を反映:
+
+- **H01**: plan_hash 材料を §4-v2 で具体化——App34 **使用 field snapshot hash**
+  （閉集合＝§2A 写像の読む field と同一）と App36 行集合 hash（$id/$revision/
+  current/導出元人物ID）を追加。stale 保証が hash 材料と 1:1 で成立する根拠を明記。
+- **H02**（司令塔裁定=照合方式(a)）: §2C——detail に phase 識別・第二段の共通行は
+  App33 収集済み＋App30 二面（plan 封筒/M1 起票・実 field の照合キー）で重複排除・
+  不存在なら第二段に含める（漏れゼロ）。
+- **H03**: §2A 写像表（行類型 5 種×request_type/様式/person_id 規則/municipality
+  材料）・§2A.1 切り出し規則（既存関数なしの実査に基づく新規定義・区→市照合順）・
+  取得不能は「要入力」道案内。**正本が定まらなかった 2 項目**（申述人の特定・
+  App31 登録粒度）は裁定⑦⑧へ再掲。
+- **M01**: §2B——第二段入力条件を Codex 提示の 6 条件で凍結。
+- **M02**（司令塔裁定=person_id のみ保存）: §4A——detail 閉集合を heir_envelope
+  同型水準で具体化・氏名/生年月日/住所の実値非保存・確定時再取得＋hash 比較
+  （H01 と一体設計）。
+- **M03**: §2D——呼出し先を build_channel_json＋`_fields_shokumu_seikyu` 同一
+  field 集合の単票 create に固定（prepare 以降は既存経路・関与しない）。
+- **M04**: §6 に negative 11 系統（9〜19）を追加。
+- **裁定②の適用範囲**: H系列③の旧「受任時自動起票」を**起動時点についてのみ**
+  上書きする旨を §5 末尾に明記（内容・優先順位は不変）。
+- 次レビュー: **R-SHOKUMU-PLAN-D2**（BASE=origin/main `6312112`・TARGET=
+  shokumu-plan-design の fix1 commit）。
