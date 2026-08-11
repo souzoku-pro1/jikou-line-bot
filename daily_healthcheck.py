@@ -24,6 +24,11 @@
   H. inbound_event の未知 provider 検知（既知集合 {stripe, line, kintone} 以外の
      行が存在したら警報・provider 名と件数のみ・MAIN-CONS-fix2 M01 で追加。
      provider 別専任監視〔E/G/kintone〕のいずれにも載らない行の沈黙滞留を遮断）
+  I. App 36（相続人）の「戸籍確認済=yes」に対応する confirmed decision
+     （decided_by あり・有効 leaf）が存在するかを監査する（P3-003C-H11a・
+     正本 DRAFT_APP36 §3.4 H11 検知側。kintone 画面の直接編集は防御側
+     〔ATTORNEY_ALLOWLIST〕で拒否できない＝検知で担保。held/rejected は
+     yes を正当化しない。App36 env / DB 未設定は静かにスキップ）
 
 異常時のみ LINE Push で管理者に通知する。正常時はログのみ。
 
@@ -345,6 +350,116 @@ async def check_unknown_providers() -> list[str]:
 
 
 # ══════════════════════════════════════════════════════════════
+# 監視項目I: App36「戸籍確認済=yes」の decision 監査（P3-003C-H11a・正本 §3.4 検知側）
+# ══════════════════════════════════════════════════════════════
+
+# kintone records.json は limit 省略時 100 件で切れるため、$id カーソルで
+# 全件走査する（silent cap を作らない・No silent caps）
+_APP36_AUDIT_PAGE = 500
+
+
+async def check_app36_confirmed_decisions() -> list[str]:
+    """正本 DRAFT_APP36 §3.4 H11 検知側: 「対応する decision（decided_by あり・
+    confirmed の有効 leaf）が無いのに 戸籍確認済=yes になっている App36 レコード」
+    を検出する（P3-003C-H11a・司令塔裁定=案(a)）。
+
+    防御側（確定関所の ATTORNEY_ALLOWLIST 検証・hub/heir_projection）は kintone
+    画面の直接編集を拒否できないため、防御不能な経路を検知で担保する（正本 §3.4）。
+    判定規則:
+      - 対応付けは App36.current_derivation_run_id → run → 有効 leaf decision
+        （leaf 判定は hub.derivation_models.get_leaf_decision＝単一の正を再利用）
+      - **confirmed の有効 leaf のみが yes を正当化**する。held/rejected の leaf・
+        decision なしは未正当化（P3-003c で decision が増えても「decision なしの
+        yes」検知の意味は不変＝DRAFT_P3_003C §9 残置の宣言どおり）
+      - current が空・grammar 外（validate_run_id_str 不合格）は run 結線なし
+        ＝対応 decision なし（手作成レコードの yes はここに落ちる）
+      - decision 鎖の破損（有効 leaf 複数＝DecisionChainCorruptionError）は
+        confirmed leaf を特定できない＝未正当化として数える（fail-closed）
+
+    静かにスキップ（既存 lazy 原則と同型・App36 未点火のため optional 方式）:
+      - APP_SOUZOKUNIN / TOKEN_SOUZOKUNIN 未設定
+      - DATABASE_URL 未設定
+      - heir_confirmation_decision テーブル不在（migration 未適用）
+    警報文面は件数と recordID のみ（氏名・続柄等の PII 非掲載・RV10 準拠）。
+    """
+    if not (os.environ.get("APP_SOUZOKUNIN") and os.environ.get("TOKEN_SOUZOKUNIN")):
+        logger.info("App36 decision audit skipped (optional / env unset)")
+        return []
+    if not os.environ.get("DATABASE_URL"):
+        logger.info("App36 decision audit skipped (DATABASE_URL unset)")
+        return []
+
+    import sqlalchemy as sa
+
+    from hub import kintone
+    from hub.db import session_scope
+    from hub.derivation_models import (DecisionChainCorruptionError,
+                                       HeirConfirmationDecision,
+                                       get_leaf_decision)
+    from hub.heir_projection import (APP_SOUZOKUNIN, ProjectionPolicyError,
+                                     validate_run_id_str)
+
+    # 戸籍確認済=yes の全件（$id 昇順カーソル）。フィルタはサーバ側
+    # （no のレコードは判定対象外＝取得もしない）
+    rows: list[dict] = []
+    last_id = 0
+    while True:
+        page = await kintone.search_records(
+            APP_SOUZOKUNIN,
+            f'戸籍確認済 in ("yes") and $id > {last_id} '
+            f'order by $id asc limit {_APP36_AUDIT_PAGE}',
+            fields=["$id", "current_derivation_run_id"])
+        rows += page
+        if len(page) < _APP36_AUDIT_PAGE:
+            break
+        last_id = int(str((page[-1].get("$id") or {}).get("value") or "0"))
+
+    unconfirmed: list[str] = []
+    try:
+        for row in rows:
+            rid = str((row.get("$id") or {}).get("value") or "")
+            cur = str((row.get("current_derivation_run_id") or {})
+                      .get("value") or "").strip()
+            try:
+                run_id = int(validate_run_id_str(cur))
+            except ProjectionPolicyError:
+                unconfirmed.append(rid)   # run 結線なし＝対応 decision なし
+                continue
+            try:
+                leaf = await get_leaf_decision(run_id)
+            except DecisionChainCorruptionError:
+                unconfirmed.append(rid)   # 鎖破損＝confirmed leaf を特定できない
+                continue
+            if leaf is None or leaf.decision != "confirmed":
+                unconfirmed.append(rid)   # decision なし / held / rejected
+                continue
+            # 正本文言「decided_by あり」の確認。get_leaf_decision の返却列に
+            # decided_by は無く、共用部品（_select_leaves）は改変しない＝
+            # leaf id での追加 SELECT で確認する（read-only）
+            t = HeirConfirmationDecision.__table__
+            async with session_scope() as s:
+                decided_by = (await s.execute(
+                    sa.select(t.c.decided_by)
+                    .where(t.c.id == leaf.id))).scalar_one_or_none()
+            if not (decided_by or "").strip():
+                unconfirmed.append(rid)
+    except (sa.exc.ProgrammingError, sa.exc.OperationalError) as e:
+        if "heir_confirmation_decision" in str(e).lower():
+            logger.info("App36 decision audit skipped (table not ready)")
+            return []
+        raise
+
+    if not unconfirmed:
+        logger.info("App36 decision audit OK")
+        return []
+    return [
+        f"App36監査: 対応する confirmed decision（decided_by あり）の無い "
+        f"戸籍確認済=yes が {len(unconfirmed)}件 "
+        f"(recordID={unconfirmed[:10]})"
+        "（kintone 直接編集の可能性・正本§3.4 H11 検知側）"]
+
+
+# ══════════════════════════════════════════════════════════════
 # 監視項目F: 業務通知チャネルの dead-man（P1-102・RV-10 §4.2 最小版・統合形）
 # ══════════════════════════════════════════════════════════════
 
@@ -469,6 +584,11 @@ async def run_healthcheck() -> list[str]:
         problems += await check_unknown_providers()  # 監視項目H（MAIN-CONS-fix2 M01）
     except Exception as e:
         problems.append(f"未知provider監視の実行自体が失敗: {type(e).__name__}")
+    try:
+        problems += await check_app36_confirmed_decisions()  # 監視項目I（P3-003C-H11a）
+    except Exception as e:
+        # DB接続情報が例外本文に含まれ得るため分類のみ（RCF-M05流儀）
+        problems.append(f"App36 decision監査の実行自体が失敗: {type(e).__name__}")
     try:
         problems += await check_business_notify_liveness()  # 監視項目F（P1-102）
     except Exception as e:
