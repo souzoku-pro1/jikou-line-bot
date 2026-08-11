@@ -155,32 +155,47 @@
   - **【fix2・FB2-05】engagement_event_id の構成を凍結**:
     - **grammar**: `shokumu_engagement:{case_record_id}:{generation}`——
       固定 namespace（ASCII リテラル `shokumu_engagement`）＋ App26 record ID
-      （数字列 `^[0-9]{1,10}$`・既存 case grammar と逐語一致）＋ 受任世代
-      generation（正の整数・前ゼロなし。初回受任確定=1・結合状態機械が
-      再成立ごとに +1 で採番する単調増加値）。**区切りはコロン・この順序で
-      固定**（要素追加・順序変更は本 DRAFT 改定と同時のみ）。
+      （数字列 `^[0-9]{1,10}$`・既存 case grammar と逐語一致）＋ generation。
+      **区切りはコロン・この順序で固定**（要素追加・順序変更は本 DRAFT 改定と
+      同時のみ）。
+    - **【fix3・FB2-09 裁定=案A】初版は一案件一受任のみ・generation は常に 1**
+      （grammar の `{generation}` は**将来拡張のための桁**であり初版は**定数 1**）。
+      ~~初回受任確定=1・結合状態機械が再成立ごとに +1 で採番する単調増加値~~
+      ~~世代が進むのは結合状態機械が受任確定の再成立を正規に判定した場合のみ~~
+      （fix2 の「再成立ごと +1」記述は**撤回**——再成立の世代状態機械〔受任取消・
+      再契約〕は未設計であり、採番規則だけ先に置くと未定義動作の入口になる）。
+      - **generation=1 の event 台帳が既存の案件で結合状態機械が再成立を検知した
+        場合＝自動処理せず write 0＋要確認通知**。
+      - **generation>1（受任取消・再契約の世代状態機械）は将来の別票で設計**。
     - **documentID・決済 ID の訂正・差替えは新 event_id を生成しない**——
       同一 generation の事実材料が変わった場合は「**内容不一致の要確認**」へ
-      倒す（同一受任の二重起票経路を閉鎖。世代が進むのは結合状態機械が
-      受任確定の再成立を正規に判定した場合のみ）。
-  - **【fix2・FB2-05】状態遷移表（凍結・これが唯一の正）**:
+      倒す（同一受任の二重起票経路を閉鎖）。
+  - **【fix2・FB2-05／fix3・FB2-08 同期版】状態遷移表（凍結・これが唯一の正。
+    §3.2 決定的 join・§4 reconcile の記述は本表を参照する——本表にない遷移を
+    reconcile も起動経路も行わない）**:
 
-    | from | to | 実行主体 |
-    |---|---|---|
-    | （新規） | pending | 受任フック（成立時の先行確保） |
-    | pending | problem_held | 自動起動経路（build_plan 条件不充足） |
-    | pending | envelope_filed | 自動起動経路（封筒作成成功） |
-    | pending | failed | 自動起動経路（実行失敗・例外） |
-    | failed | envelope_filed | 回収成功（再実行・封筒冪等の open 回収） |
-    | failed | reconciled | reconcile（照合で解消を確認） |
-    | problem_held | reconciled | reconcile（語彙起動で封筒作成後の照合収束） |
+    | from | to | 実行主体 | 条件 |
+    |---|---|---|---|
+    | （新規） | pending | 受任フック | 成立時の先行確保（UNIQUE 収束） |
+    | pending | problem_held | 自動起動経路 | build_plan 条件不充足 |
+    | pending | envelope_filed | 自動起動経路 | 封筒作成成功 |
+    | pending | envelope_filed | **reconcile** | idem キー一致の **open 封筒 1 件・内容一致**（ACK-loss 回収） |
+    | pending | reconciled | **reconcile** | **terminal 封筒 1 件・内容一致** |
+    | pending | failed | 自動起動経路 **又は** reconcile | 実行失敗・例外／idem キー保存済み・**封筒 0 件を確認** |
+    | failed | envelope_filed | **reconcile**（**照合による状態収束・起動経路の再実行ではない**） | 既存 open 封筒 1 件を照合 |
+    | failed | reconciled | reconcile | 既存封筒 1 件・内容一致 |
+    | problem_held | reconciled | reconcile | **語彙起動による対応封筒を確認** |
 
     - **terminal 状態 = `envelope_filed` / `reconciled`**（以後の遷移なし）。
     - **同一状態への冪等再実行 = no-op**（重複 webhook・再実行で状態は変わらない）。
     - **禁止遷移（表にない遷移）= write 0＋要確認通知**（黙って上書きしない）。
     - **CAS/UNIQUE 競合・不明状態 = fail-closed**（起票せず要確認へ）。
     - **problem_held / failed からの自動起票はしない**——回収は**人の語彙起動**
-      または **reconcile の通知**経由のみ（機械の自動再試行を作らない）。
+      または **reconcile の照合収束**のみ（機械の自動再試行を作らない）。
+    - **【fix3・FB2-08】failed からの回収の一意化**: **自動再試行はしない**。
+      reconcile 照合で**封筒 0 件なら failed 維持＋通知**（勝手に作らない）。
+      **封筒の新規作成は人の語彙経路のみ**。人が語彙起動で封筒を作った後は、
+      **次回 reconcile が failed→envelope_filed 又は reconciled へ収束**させる。
   - ~~単純 boolean（発火済みフラグ）~~ **不採用**——boolean では problem_held
     （条件未充足で起票見送り）後に「発火済み」となり**回収不能**になる（状態
     閉集合なら problem_held を reconcile・再判定の対象にできる）。
@@ -197,8 +212,11 @@
     更新前のクラッシュでも、台帳の idem キーから封筒を一意に照合できる）。
     - **reconcile の照合**: 台帳の idem キーで App30 を **open/terminal を問わず
       read-only 検索**（決定的 join）。**既存封筒が terminal ＝新規自動起票せず
-      `reconciled` へ収束**。検索結果 **0 件＝回収続行**（failed 系の再実行対象）・
+      `reconciled` へ収束**。検索結果 **0 件＝failed 維持＋通知（fix3・FB2-08 で
+      一意化——~~回収続行（failed 系の再実行対象）~~は撤回・自動再試行しない）**・
       **1 件＝状態収束**・**複数件・内容不一致＝自動統合・自動再発行せず要確認**。
+      **照合の結果として許される状態遷移は §3.2 の状態遷移表が唯一の正**
+      （fix3 相互参照）。
     - **既存の open 限定回収規律（凍結票 `file_plan_envelope`）は不変**——
       本節の「terminal 問わず検索」は reconcile の**読取専用照合**にのみ適用され、
       起票側の冪等（open 限定回収）には手を入れない。
@@ -239,9 +257,25 @@
 - **【fix2・FB2-07】状態意味の分離（本文固定）**:
   - `problem_held` = **条件不充足で人の対応待ち**（build_plan の problems・
     §3.0(vii) の相関系。対応後の起票は人の語彙経路）。
-  - `failed` = **実行失敗で回収待ち**（例外・kintone 不達。回収=再実行 or
-    reconcile 照合）。
+  - `failed` = **実行失敗で回収待ち**（例外・kintone 不達。回収=~~再実行 or~~
+    **reconcile 照合収束または人の語彙起動のみ**〔fix3・FB2-08 一意化——
+    起動経路の自動再実行は存在しない〕）。
   - `reconciled` = **照合完了・新規自動起票が不要と確認された終端**。
+
+## 4a. 実装・点火前提（[人]ゲート一覧・fix3/FB2-10 新設）
+
+**いずれも凍結条件ではなく実装・点火前提**（本 DRAFT の凍結を妨げない）。4 段分離:
+
+1. **(i) App26 CU フィールド追加（[人]専権）**: 締結事実／決済事実／CloudSign
+   documentID／Stripe 決済 ID／受任確定正本／generation 保存先。
+   **field code・型・値域・schema 監視（EXPECTED_KINTONE_SCHEMA 追随）は
+   実装票で固定**。**CU 未適用時は fail-closed**（結合状態機械は成立判定せず・
+   自動起動は発火しない）。
+2. **(ii) event 台帳 migration**（コード実装票の対象・alembic・P3-001 流儀）。
+3. **(iii) flag 投入**: `SHOKUMU_PLAN_AUTOFILE_ENABLED`（[人]・親 flag
+   `SHOKUMU_PLAN_ENABLED` との二重ゲートは §3.3）。
+4. **(iv) 本番点火**（段取り書方式・[人]——ブロックA点火の §8.1 型: 事前
+   read-only 検査→点火→スモーク→観測）。
 
 ## 5. 裁定欄（司令塔）
 
@@ -298,3 +332,26 @@
   人の語彙経路のみ）。
 - **R2 文言の限定**: 「新しい防壁を作らない」を plan 内容・M1 領域に限定——
   engagement_event 台帳は新起動経路固有の冪等制御で新設が正当（誤読防止）。
+
+## 9. fix3 改定記録（R-FB2-D3・2026-08-12・全所見 ACCEPT・FB2-09 は推奨案A採用）
+
+- **FB2-08（HIGH）**: 状態遷移表を reconcile 動作と同期（fix3 同期版へ差し替え・
+  条件列追加）——pending→envelope_filed（reconcile・open 封筒 1 件内容一致）／
+  pending→reconciled（reconcile・terminal 封筒 1 件内容一致）／pending→failed
+  （起動経路又は reconcile・idem キー保存済み封筒 0 件確認）／failed→reconciled
+  （reconcile・既存封筒 1 件内容一致）／problem_held→reconciled（reconcile・
+  語彙起動による対応封筒確認）を追加。**failed からの回収を一意化**（自動再試行
+  なし・封筒 0 件=failed 維持＋通知・新規作成は人の語彙経路のみ・次回 reconcile が
+  収束）。**failed→envelope_filed の主体は reconcile（照合による状態収束）であり
+  起動経路の再実行ではない**と明記。表⇔§3.2/§4 の相互参照を張り「表が唯一の正」を
+  維持（§4 の「回収続行」旧文言・FB2-07 の「回収=再実行」旧文言は撤回・残置）。
+- **FB2-09（HIGH・裁定=案A）**: 初版は**一案件一受任のみ・generation は常に
+  定数 1**（grammar の桁は将来拡張用）。generation=1 既存案件での再成立検知=
+  **自動処理せず write 0＋要確認通知**。generation>1（受任取消・再契約の世代状態
+  機械）は将来の別票。fix2 の「再成立ごと +1」記述を撤回（取り消し線＋理由。
+  注記: 票指定の撤回対象 §3.0(iii)(v) に +1 記述は存在せず、実所在は §3.2 の
+  grammar 節〔fix2〕であったため同所で撤回した。§3.0(iii)(v) は案A と整合のため
+  不変）。
+- **FB2-10（MED）**: §4a「実装・点火前提（[人]ゲート一覧）」新設・4 段分離
+  （App26 CU／event 台帳 migration／flag 投入／本番点火）。いずれも**凍結条件では
+  なく実装・点火前提**と明記。
