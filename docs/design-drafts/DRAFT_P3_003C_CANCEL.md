@@ -157,14 +157,14 @@
 
 | # | 論点 | 選択肢 | 状態 |
 |---|---|---|---|
-| ① | 取消の decision 鎖表現 | §4.1 (A) supersede 型 / (B) 新値 revoked（migration）——**(C) は fix1・CANCEL-03 で選択肢から撤回**（非採用比較対象へ分離） | **OPEN** |
-| ② | App36 巻き戻し方式 | §4.2 (A) yes→no＋残置 / (B) 行無効化 / (C) 触らず検知誘導 | **OPEN** |
-| ③ | 下流波及の責務境界 | §4.3 案（取消封筒起票・成果物は列挙まで・再確定は再導出一本）の承認 or 修正 | **OPEN** |
-| ④ | 取消権限 | (A) ATTORNEY_ALLOWLIST と同一 (B) 取消専用のより狭い allowlist | **OPEN** |
-| ⑤ | write-set / preimage の保存の器（fix1・CANCEL-01） | (A) 封筒 detail（チャネル固有データ） (B) DB 台帳（immutable 追記・run に紐付く projection_log） (C) 監査JSON 添付（person_merge の型） | **OPEN** |
-| ⑥ | 新 run 存在時（対象 run が head でない）の取消可否（fix1・CANCEL-01） | (A) 不可（head のみ取消可・非 head の誤 projection は要確認へ） (B) 可（App36 巻き戻しのみ・台帳表現は head 側と別扱い） | **OPEN** |
-| ⑦ | 取消理由の記録（fix1・CANCEL-04） | (A) 記録なし（P3-003C 裁定⑤と対称） (B) 固定 enum（理由体系の設計が前提） | **OPEN** |
-| ⑧ | legacy confirmed の専用運用（fix2・CANCEL-05） | (A) 取消対象外（人手調査のみ・台帳も追記しない） (B) **App36 を触らず取消台帳のみ追記**する専用経路（台帳上は取消済み・実機修正は人手＝監査可視性を優先） | **OPEN** |
+| ① | 取消の decision 鎖表現 | (A) supersede 型 / (B) 新値 revoked（migration）——(C) は fix1 で撤回済み | **RESOLVED＝(A) supersede 型**（fix5 裁定——schema 不変優先・migration と閉集合検査の改定波及を避ける。H11a 監査との整合も最も素直） |
+| ② | App36 巻き戻し方式 | §4.2 (A)/(B)/(C) | **RESOLVED＝update 行は preimage へ・insert 行は無効化（削除しない）**（fix5 裁定——§4.1a の write-set 区別と 1:1 対応・機械削除禁止の原則維持） |
+| ③ | 下流波及の責務境界 | §4.3 案 | **RESOLVED＝§4.3 案承認**（fix5 裁定——取消封筒起票・成果物は列挙まで・再確定は再導出一本） |
+| ④ | 取消権限 | (A) ATTORNEY_ALLOWLIST と同一 (B) 専用 allowlist | **RESOLVED＝(A)**（fix5 裁定——現体制は単独弁護士・社員弁護士が入る時点で再裁定） |
+| ⑤ | write-set / preimage の保存の器（fix1・CANCEL-01） | (A) 封筒 detail (B) DB 台帳（projection_log） (C) 監査JSON | **RESOLVED＝(B) DB 台帳（projection_log）**（fix5 裁定——immutable 追記・run 紐付けの機械照合に最適・P3-001 流儀） |
+| ⑥ | 新 run 存在時の取消可否（fix1・CANCEL-01） | (A) 不可（head のみ） (B) 可 | **RESOLVED＝(A) 不可**（fix5 裁定——head のみ取消可・非 head の誤 projection は要確認へ。stale ガードと同じ原理） |
+| ⑦ | 取消理由の記録（fix1・CANCEL-04） | (A) 記録なし (B) 固定 enum | **RESOLVED＝(A) 記録なし**（fix5 裁定——P3-003C 裁定⑤と対称・理由体系の設計を前提にしない） |
+| ⑧ | legacy confirmed の専用運用（fix2・CANCEL-05） | (A) 取消対象外 (B) 取消台帳のみ追記 | **RESOLVED＝(B) 取消台帳のみ追記**（fix5 裁定——監査可視性優先・App36 不接触＝実機修正は人手のまま台帳に取消が残る） |
 
 ## 7. 両時点残置
 
@@ -189,3 +189,11 @@
   confirmed のみ自動候補＋関所対象・**legacy confirmed は自動巻き戻し禁止・
   App36 write 0・人手調査**。legacy 専用運用（App36 不接触・取消台帳のみ追記）を
   裁定⑧として新設。
+
+## 10. fix5 改定記録（司令塔裁定の一括反映・2026-08-11・D5=4票 DESIGN_OK 後）
+
+- 裁定①〜⑧を全件 RESOLVED 化（§6 各行に裁定と1行理由）: ①=(A)supersede 型・
+  ②=update 行 preimage 復元/insert 行無効化・③=§4.3 案・④=(A)ALLOWLIST 同一
+  （社員弁護士時に再裁定）・⑤=(B)DB 台帳 projection_log・⑥=(A)head のみ・
+  ⑦=(A)理由記録なし・⑧=(B)取消台帳のみ追記。
+- OPEN 残なし（実装票の着手ゲートは flag・ALLOWLIST 等の既存[人]ゲートのみ）。
