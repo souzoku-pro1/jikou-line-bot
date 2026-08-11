@@ -1,6 +1,6 @@
 # DRAFT: P3-003C-CANCEL — confirmed 済み projection の取消（§8-4 別票）
 
-- status: **DRAFT**（凍結は D 巡後・R-CANCEL-D1 から）
+- status: **FROZEN**（凍結・2026-08-11・R-DOCS-BATCH-1-D8 PASS）
 - TASK_ID: DOCS-BATCH-1 B（起草）／実装は別票
 - 位置づけ: DRAFT_P3_003C_HELD_REJECTED（FROZEN）の**裁定④で別票化された残置**の消込。
   誤確定（confirmed の判断ミス）の救済経路を設計する。
@@ -227,3 +227,15 @@
   consumer 除外＝`取消済み=yes` 読み飛ばし（RV08 有効行ヘルパと同型）。
   **H11a 期待＝no 化により監査対象外（H11a 変更不要）**を明記。update 行＝
   preimage 復元（不変）。旧選択肢 (A)(B)(C) は撤回・取り消し線残置。
+
+## 12. 凍結記録（2026-08-11・R-DOCS-BATCH-1-D8 PASS）
+
+- **巡歴**: 起草（DOCS-BATCH-1 B）→ D1（CANCEL-01〜04・fix1）→ D2（CANCEL-05・
+  fix2）→ D3〜D5（DESIGN_OK・fix5 で裁定①〜⑧全件 RESOLVED）→ D6（CANCEL-06・
+  fix6）→ D7（PASS・不触）→ **D8 PASS＝本凍結**。
+- **凍結条件充足の要旨**: 裁定①〜⑧全件 RESOLVED・取消可能条件/状態機械/
+  postimage 閉集合/2世代分割まで確定・OPEN 残なし。
+- **実装着手ゲートは凍結条件ではなく実装前提**（[人]: App36 `取消済み`
+  フィールドの CU 追加〔§4.2a〕・flag `HEIR_CANCEL_ENABLED` 投入・
+  ATTORNEY_ALLOWLIST 投入〔ブロックE〕）。
+- **以後の変更は設計改定＋司令塔再裁定を要する**。
