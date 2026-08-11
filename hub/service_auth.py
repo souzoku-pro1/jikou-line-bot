@@ -495,6 +495,39 @@ class BodyCachingRoute(APIRoute):
         return handler
 
 
+async def _enforce_signed_request(request: Request) -> None:
+    """署名経路の共通判定（RV-0102-PREP で authorize_ingest から逐語抽出・挙動不変）。
+    通過は None・失敗は HTTPException を送出する。
+
+    - RP1114-H01: 起動時と同じ 4象限（欠損/空・JSON 不正・entry 型不正・実効鍵0）
+      の strict 読込。欠損・空が「空 registry による署名拒否（key_unknown 401）」へ
+      流れる経路を排除し、設定不備はすべて registry_config_error の 503 に統一する。
+    - P1-114: 壊れ registry を沈黙 500 にしない。起動時 fail-fast
+      （validate_registry_startup）の請求時防衛。固定 reason で明示ログし
+      明示 503 を返す（共通 raise に合流＝新規 sink を増やさない・台帳 61 維持。
+      reason は固定コードのみ＝secret/値の実体は出ない）。
+    - 失敗 status は §6.1 のとおり（401/403/400/409・registry 破損は 503）。詳細
+      reason はログにのみ残し、レスポンス body には固定文字列のみ（reason 素通しで
+      攻撃者に分岐情報を与えない）。
+    """
+    raw = await request.body()   # BodyCachingRoute がキャッシュ済み
+    try:
+        registry = load_registry_strict()
+    except ServiceAuthConfigError:
+        status, reason = 503, "registry_config_error"
+    else:
+        eff = effective_signed_path(request.scope)
+        status, reason = await verify_request(request.headers, raw,
+                                              request.method, eff,
+                                              registry=registry)
+    _log_ingest_decision(request.headers, reason)
+    if status != 200:
+        raise HTTPException(status_code=status,
+                            detail="service auth configuration error"
+                            if reason == "registry_config_error"
+                            else "signature verification rejected")
+
+
 async def authorize_ingest(request: Request, *, token: str, token_env: str) -> None:
     """ingest 入口の dual-accept ゲート。受理なら None・拒否は HTTPException を送出。
 
@@ -509,32 +542,9 @@ async def authorize_ingest(request: Request, *, token: str, token_env: str) -> N
             raise HTTPException(status_code=404, detail="Not Found")
         return
     if _has_signature_headers(headers):
-        raw = await request.body()   # BodyCachingRoute がキャッシュ済み
-        try:
-            # RP1114-H01: 起動時と同じ 4象限（欠損/空・JSON 不正・entry 型不正・実効鍵0）
-            # の strict 読込。欠損・空が「空 registry による署名拒否（key_unknown 401）」へ
-            # 流れる経路を排除し、設定不備はすべて registry_config_error の 503 に統一する。
-            registry = load_registry_strict()
-        except ServiceAuthConfigError:
-            # P1-114: 壊れ registry を沈黙 500 にしない。起動時 fail-fast
-            # （validate_registry_startup）の請求時防衛。固定 reason で明示ログし
-            # 明示 503 を返す（下の共通 raise に合流＝新規 sink を増やさない・台帳 61 維持。
-            # reason は固定コードのみ＝secret/値の実体は出ない）。
-            status, reason = 503, "registry_config_error"
-        else:
-            eff = effective_signed_path(request.scope)
-            status, reason = await verify_request(headers, raw, request.method, eff,
-                                                  registry=registry)
-        _log_ingest_decision(headers, reason)
-        if status != 200:
-            # 署名経路の失敗は token へ落とさない（downgrade 防止）。
-            # status は §6.1 のとおり（401/403/400/409・registry 破損は 503）。詳細 reason は
-            # 上のログにのみ残し、レスポンス body には固定文字列のみ（reason 素通しで
-            # 攻撃者に分岐情報を与えない）。
-            raise HTTPException(status_code=status,
-                                detail="service auth configuration error"
-                                if reason == "registry_config_error"
-                                else "signature verification rejected")
+        # RV-0102-PREP: 署名経路の判定・ログ・raise は _enforce_signed_request へ
+        # 逐語共通化（挙動不変・opt-in 入口〔authorize_optionally_signed〕と共用）
+        await _enforce_signed_request(request)
         return
     # 署名ヘッダ皆無 → 旧 query token（Phase A）。
     # RV-04c §6: 当該 path が停止 list（dual-accept ON 時のみ参照）にあれば token を検証せず
@@ -555,5 +565,37 @@ def ingest_guard(token_env: str):
 
     async def _guard(request: Request, token: str = "") -> None:
         await authorize_ingest(request, token=token, token_env=token_env)
+
+    return _guard
+
+
+# ── RV-0102-PREP: 旧 token を持たない受信口（/scan・/ocr/fixed-asset）の
+#    署名 opt-in 事前配線（薄い追加・verify_*/authorize_ingest は挙動不変） ──
+
+async def authorize_optionally_signed(request: Request) -> None:
+    """署名 opt-in 入口の dual-accept ゲート（RV-0102-PREP）。
+
+    /scan・/ocr/fixed-asset は旧 query token を持たない（現行=無認証受理）ため、
+    authorize_ingest（token fallback 前提）は使えない。本ゲートの分岐:
+    - flag OFF: 何もしない（署名ヘッダが付いていても無視＝現行挙動と完全同一）
+    - flag ON・署名ヘッダ在: 署名経路のみで判定（§2.3 全8段・token/無認証へ
+      fallback しない＝downgrade 防止。authorize_ingest の署名分岐と同一実体
+      〔_enforce_signed_request〕）
+    - flag ON・署名ヘッダ皆無: 受理（従来どおり＝現行挙動不変）。非署名の遮断
+      （強制化）と送信側の署名付与（GAS/watcher 点火）は[人]ゲートの別票
+    """
+    if not dual_accept_enabled():
+        return
+    if not _has_signature_headers(request.headers):
+        return
+    await _enforce_signed_request(request)
+
+
+def optional_signature_guard():
+    """署名 opt-in 入口用の依存を生成する（RV-0102-PREP）。
+    使い方: `_auth: None = Depends(optional_signature_guard())`。"""
+
+    async def _guard(request: Request) -> None:
+        await authorize_optionally_signed(request)
 
     return _guard
