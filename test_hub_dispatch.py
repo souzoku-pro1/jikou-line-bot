@@ -190,6 +190,21 @@ class TestPrepareFlow(DispatchTestBase):
         notify_admin.assert_awaited_once()
         self.assertIn("未対応チャネル", notify_admin.await_args.args[0])
 
+    def test_scan_received_channel_notifies_human_wait_not_alert(self):
+        """スキャン受領（設計上アダプタを持たないチャネル・HUMAN_HANDLED_CHANNELS）は
+        「人の確認待ち」文言で通知し、未知チャネルの「未対応チャネル」警報とは
+        区別する（MAINT-4・台帳§2 の文言改善）。状態は変えない点は従来どおり"""
+        store = FakeStore({"9": make_record("下書き", channel="スキャン受領")})
+        adapter = FakeAdapter()
+        _, notify_admin, _ = self.run_with(store, adapter)
+
+        self.assertEqual(store.records["9"]["発送ステータス"]["value"], "下書き")
+        self.assertEqual(store.updates, [])
+        notify_admin.assert_awaited_once()
+        msg = notify_admin.await_args.args[0]
+        self.assertIn("人の確認待ち", msg)
+        self.assertNotIn("未対応チャネル", msg)
+
 
 class TestDispatchFlow(DispatchTestBase):
     def test_approved_auto_channel_ships(self):

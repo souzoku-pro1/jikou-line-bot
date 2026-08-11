@@ -123,17 +123,31 @@ def _summary(record: dict) -> str:
             f"顧客: {record.get('顧客名表示用', {}).get('value', '')}")
 
 
+# 設計上アダプタを持たず人が内容確認するチャネル（閉集合）。
+# 未知チャネル（登録漏れ・改名事故）の警報と区別する（台帳§2 の文言改善）
+HUMAN_HANDLED_CHANNELS = {"スキャン受領"}
+
+
 async def _adapter_for(record: dict):
     """チャネル値からアダプタを解決。未登録は警報のみ（状態は変えない=承認可能性を保全）"""
     channel = record.get("チャネル", {}).get("value", "")
     adapter = channels.get_adapter(channel)
     if adapter is None:
-        await notify.notify_admin_line(
-            "【発送管理: 未対応チャネル】\n"
-            f"レコードNo: {_rid(record)} / チャネル: {channel!r}\n"
-            "このチャネルのアダプタが未実装です（レコードは変更していません）。",
-            throttle_key=f"no_adapter:{channel}",
-        )
+        if channel in HUMAN_HANDLED_CHANNELS:
+            await notify.notify_admin_line(
+                "【発送管理: 人の確認待ち】\n"
+                f"レコードNo: {_rid(record)} / チャネル: {channel!r}\n"
+                "このチャネルは機械処理がありません。内容の確認・後続対応は"
+                "人が行ってください（レコードは変更していません）。",
+                throttle_key=f"no_adapter:{channel}",
+            )
+        else:
+            await notify.notify_admin_line(
+                "【発送管理: 未対応チャネル】\n"
+                f"レコードNo: {_rid(record)} / チャネル: {channel!r}\n"
+                "このチャネルのアダプタが未実装です（レコードは変更していません）。",
+                throttle_key=f"no_adapter:{channel}",
+            )
     return adapter
 
 
