@@ -41,6 +41,14 @@
 
 - R1: **取消も人の操作**（関所型・復唱つき）。機械は取消を提案も実行もしない
   （「機械は確定しない」原則の対称形＝「機械は取り消さない」）。
+  **【fix1・CANCEL-04 具体化】**: (i) 取消の開始は**弁護士の明示操作のみ**
+  （ATTORNEY_ALLOWLIST 検証・裁定④）——検知・監査・エラーからの機械起案を
+  しない。 (ii) **機械は取消理由を生成しない**（理由の記録要否・形式は人の入力
+  か記録なしかを裁定⑦）。 (iii) 影響範囲の収集（対象 run・App36 行・成果物参照の
+  列挙）は**人が対象を指定した後**にのみ実行する読取専用の支援であり、収集結果は
+  復唱に載せる。 (iv) **復唱対象の明記**: 案件レコードID・対象 run id・巻き戻し
+  対象の App36 record ID 集合・（裁定②の帰結たる）巻き戻し内容の要約——
+  値の PII 非搭載規律は既存どおり（record ID・件数のみ）。
 - R2: 取消の decision 鎖への表現は**追記のみ**（immutable 維持・遡及書き換えなし）。
 - R3: App36 巻き戻しは §3.4 の禁止に対する**構造化された例外**として設計する
   （取消関所ハンドラの一本経路のみが実行可・H11a 監査との整合を明記）。
@@ -56,10 +64,36 @@
 |---|---|---|---|
 | (A) supersede 型 | confirmed leaf を **rejected が supersede** する遷移を、取消関所経由のときのみ許可（§3.2-v2 の中止セルを「取消語彙」で解禁） | migration 不要・既存 leaf 判定がそのまま効く（leaf=rejected＝未正当化＝H11a 監査とも自然整合） | 「rejected=結果の否認」と「取消=確定の撤回」の**意味が混ざる**（P3-003C 裁定③が守った意味の単純性を崩す） |
 | (B) 新 decision 値 `revoked` | CHECK 制約へ第4値追加（migration）＋遷移表へ confirmed→revoked 行を追加 | 意味が明確・監査/可視化で取消を区別可能 | **migration 必要**・DECISIONS 閉集合に依存する全検査（AST/テスト/H11a 判定）の改定波及 |
-| (C) run 供給側で吸収 | 取消 decision を作らず、**再導出（新 run・supersede）→ 新 run を held のまま**にする運用で実質取消 | 台帳構造完全不変 | 旧 run の confirmed leaf が残る＝「有効な確定」が見かけ上残置・App36 巻き戻しの根拠記録が台帳に載らない |
-
 （推奨は保留——(A) は H11a 監査（confirmed leaf 消失→検知対象化）との整合が
 最も素直だが、意味論の混合は §8 裁定③の趣旨と衝突し得るため司令塔裁定とする）
+
+**【fix1・CANCEL-03】初版の「案(C) run 供給側で吸収」は取消方式の選択肢から
+外す（撤回・両時点残置のため下に残す）**——(C) は取消の台帳表現を持たず
+「旧 run の confirmed leaf が有効なまま残る」ため、取消方式ではなく
+**非採用の比較対象＝現行運用そのもの**（誤確定は再導出→新 run→confirmed で
+**将来へ向けて訂正**する・DRAFT_P3_003C 裁定④の影響欄の既存原理）である。
+本票が設計するのは「この現行運用では足りない場合（App36 の誤 yes を戻したい・
+台帳に取消を記録したい）」の経路であり、(C) はその不足の説明として §4.1 に
+比較対象として残置する:
+
+> （非採用比較対象・現行運用）取消 decision を作らず、再導出（新 run・supersede）→
+> 新 run の confirmed で前へ回す。台帳構造完全不変だが、旧 run の confirmed leaf が
+> 残り App36 巻き戻しの根拠記録が台帳に載らない。
+
+### 4.1a 取消可能条件と巻き戻しの照合（fix1・CANCEL-01 追加）
+
+- **取消可能条件の固定**: 取消対象は「対象 run の**有効 leaf が confirmed**」の
+  場合**のみ**（held/rejected leaf・decision なし・鎖破損は取消対象外＝それぞれ
+  既存の中止セル/破損警報へ）。**新 run が存在する場合**（対象 run が head でない）
+  の取消可否は裁定⑥。
+- **write-set の保存**: confirmed の projection 実行時に「実際に書いた行と内容」
+  ＝write-set（App36 record ID・**insert / update の区別**・書込み field 集合・
+  書込み**前**の preimage）を保存する（保存の器は裁定⑤）。
+- **巻き戻しの照合**: 取消時、対象行の**現在値が projection の postimage と完全
+  一致する場合のみ**「自動巻き戻し候補」として復唱に載せる。**不一致（projection
+  後に人手編集・他 run の更新あり）は write 0 で要確認**（機械は上書きしない）。
+  insert 行の巻き戻し＝行無効化（裁定②(B) の型）・update 行の巻き戻し＝preimage
+  復元、を候補として区別する。
 
 ### 4.2 App36 巻き戻し（裁定②）
 
@@ -79,6 +113,25 @@
 - 後続 run: 取消後の正しい確定は**再導出→新 run→confirmed**（既存原理を維持・
   取消は「前へ回す」ための前処理と位置づける）。
 
+### 4.4 取消封筒の状態機械（fix1・CANCEL-02 追加）
+
+- **phase 順序の固定**（confirmed handler の3 phase と同型・宙吊りを作らない順）:
+  phase 1=読取専用の全件再検証（取消可能条件・write-set 照合・ALLOWLIST）→
+  phase 2=台帳追記（裁定①の取消表現・単一 txn）→ phase 3=App36 巻き戻し
+  （裁定②）→ 取消封筒クローズ。**phase 2 より前に App36 へ書かない**。
+- **二重取消の冪等キー**: `heir_cancel:{case_record_id}:{run_id}` で取消封筒を
+  一意化（既存 `_already_filed` 型の状態不問照合＝同一 run への取消再起票を抑止。
+  取消済み run への再取消は phase 1 の leaf 再判定で中止）。
+- **ACK 喪失の回収**: phase 2 完了後のクラッシュ（台帳に取消記録あり・App36
+  未巻き戻し）は、**再実行時の phase 1 再検証**が「取消記録済み・巻き戻し未了」を
+  検出して phase 3 のみ再実行（resumed 型・heir_projection fix2 M02 と同型）。
+- **reconcile**: 「取消記録あり×App36 巻き戻し未了×封筒 open」の滞留は
+  daily_healthcheck 系の検査対象にできる（入口・周期は裁定⑦の器と併せて実装票）。
+  H11a 監査（confirmed leaf 無しの yes 検知）が裁定①(A) の場合の**最終網**になる
+  ことを設計上明記（取消後に yes が残置すれば翌朝検知される）。
+- **再実行時の再検証**: いずれの再入も phase 1 を素通りしない（write-set 照合・
+  現在値照合を毎回実施＝盲目再適用しない・CANCEL-01 と同じ照合規律）。
+
 ## 5. flag・テスト骨子
 
 - flag: `HEIR_CANCEL_ENABLED`（新設・既定 OFF・語彙可視性連動＝P3-003-CMD の型）。
@@ -92,11 +145,26 @@
 
 | # | 論点 | 選択肢 | 状態 |
 |---|---|---|---|
-| ① | 取消の decision 鎖表現 | §4.1 (A) supersede 型 / (B) 新値 revoked（migration） / (C) run 側吸収 | **OPEN** |
+| ① | 取消の decision 鎖表現 | §4.1 (A) supersede 型 / (B) 新値 revoked（migration）——**(C) は fix1・CANCEL-03 で選択肢から撤回**（非採用比較対象へ分離） | **OPEN** |
 | ② | App36 巻き戻し方式 | §4.2 (A) yes→no＋残置 / (B) 行無効化 / (C) 触らず検知誘導 | **OPEN** |
 | ③ | 下流波及の責務境界 | §4.3 案（取消封筒起票・成果物は列挙まで・再確定は再導出一本）の承認 or 修正 | **OPEN** |
 | ④ | 取消権限 | (A) ATTORNEY_ALLOWLIST と同一 (B) 取消専用のより狭い allowlist | **OPEN** |
+| ⑤ | write-set / preimage の保存の器（fix1・CANCEL-01） | (A) 封筒 detail（チャネル固有データ） (B) DB 台帳（immutable 追記・run に紐付く projection_log） (C) 監査JSON 添付（person_merge の型） | **OPEN** |
+| ⑥ | 新 run 存在時（対象 run が head でない）の取消可否（fix1・CANCEL-01） | (A) 不可（head のみ取消可・非 head の誤 projection は要確認へ） (B) 可（App36 巻き戻しのみ・台帳表現は head 側と別扱い） | **OPEN** |
+| ⑦ | 取消理由の記録（fix1・CANCEL-04） | (A) 記録なし（P3-003C 裁定⑤と対称） (B) 固定 enum（理由体系の設計が前提） | **OPEN** |
 
 ## 7. 両時点残置
 
 - 本 DRAFT は初版。改定は fix 節を追記し、初版記述は撤回理由と併せて残す。
+
+## 8. fix1 改定記録（R-DOCS-BATCH-1-D1・2026-08-11・全所見 ACCEPT）
+
+- **CANCEL-01**: §4.1a 新設——取消可能条件を「有効 confirmed leaf のみ」に固定・
+  write-set（insert/update 区別・preimage）保存・postimage 完全一致時のみ自動
+  巻き戻し候補・不一致は write 0 要確認。裁定⑤（器）⑥（新 run 存在時）を新設。
+- **CANCEL-02**: §4.4 新設——取消封筒の状態機械（phase 順序固定・二重取消の
+  冪等キー・ACK 喪失の resumed 型回収・reconcile・再入時の毎回再検証）。
+- **CANCEL-03**: §4.1 の案(C) を取消方式の選択肢から**撤回**し「非採用比較対象
+  （現行運用＝新 run で将来へ訂正）」へ分離（裁定①は (A)/(B) の二択に更新）。
+- **CANCEL-04**: §3 R1 を具体化——取消開始は弁護士の明示操作のみ・機械は理由を
+  生成しない・影響収集は人の指定後・復唱対象を明記。裁定⑦（理由記録）を新設。
