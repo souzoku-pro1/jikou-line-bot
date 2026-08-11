@@ -182,8 +182,8 @@
     | pending | envelope_filed | **reconcile** | idem キー一致の **open 封筒 1 件・内容一致**（ACK-loss 回収） |
     | pending | reconciled | **reconcile** | **terminal 封筒 1 件・内容一致** |
     | pending | failed | 自動起動経路 **又は** reconcile | 実行失敗・例外／idem キー保存済み・**封筒 0 件を確認** |
-    | failed | envelope_filed | **reconcile**（**照合による状態収束・起動経路の再実行ではない**） | 既存 open 封筒 1 件を照合 |
-    | failed | reconciled | reconcile | 既存封筒 1 件・内容一致 |
+    | failed | envelope_filed | **reconcile**（**照合による状態収束・起動経路の再実行ではない**） | 既存 **open** 封筒 1 件・**内容一致** |
+    | failed | reconciled | reconcile | 既存 **terminal** 封筒 1 件・**内容一致**（~~既存封筒 1 件~~——fix4・FB2-11 で terminal へ限定） |
     | problem_held | reconciled | reconcile | **語彙起動による対応封筒を確認** |
 
     - **terminal 状態 = `envelope_filed` / `reconciled`**（以後の遷移なし）。
@@ -196,6 +196,12 @@
       reconcile 照合で**封筒 0 件なら failed 維持＋通知**（勝手に作らない）。
       **封筒の新規作成は人の語彙経路のみ**。人が語彙起動で封筒を作った後は、
       **次回 reconcile が failed→envelope_filed 又は reconciled へ収束**させる。
+    - **【fix4・FB2-11】failed 行 2 遷移の排他化**: failed→envelope_filed は
+      「**open** 封筒 1 件・内容一致」・failed→reconciled は「**terminal** 封筒
+      1 件・内容一致」で**観測が排他**——**同一 from 状態×同一観測で遷移先が
+      一意に決まる**（pending 時の ACK-loss 回収規則〔open→envelope_filed／
+      terminal→reconciled〕と**対称**）。旧条件「既存封筒 1 件」は撤回
+      （open 含みでは 2 行が同時成立し**表の決定性が崩れる**ため）。
   - ~~単純 boolean（発火済みフラグ）~~ **不採用**——boolean では problem_held
     （条件未充足で起票見送り）後に「発火済み」となり**回収不能**になる（状態
     閉集合なら problem_held を reconcile・再判定の対象にできる）。
@@ -222,6 +228,11 @@
       起票側の冪等（open 限定回収）には手を入れない。
     - **ACK-loss テスト**（手順 5-6 間クラッシュ・4-5 間クラッシュの両面で
       二重起票ゼロ・reconcile 収束を実測）を**実装票の受け入れ条件へ追加**。
+      **【fix4・FB2-11】failed 分岐 4 件を受け入れ条件へ直接固定**:
+      (1) failed＋open 封筒 1 件・内容一致 → `envelope_filed`
+      (2) failed＋terminal 封筒 1 件・内容一致 → `reconciled`
+      (3) failed＋封筒 0 件 → `failed` 維持＋通知
+      (4) failed＋複数件又は内容不一致 → **write 0＋要確認**。
   - **人が語彙から起動する既存経路は別扱いで常設維持**（本状態機械のゲート外・
     いつでも人が再起動できる回収口）。
 
@@ -355,3 +366,13 @@
 - **FB2-10（MED）**: §4a「実装・点火前提（[人]ゲート一覧）」新設・4 段分離
   （App26 CU／event 台帳 migration／flag 投入／本番点火）。いずれも**凍結条件では
   なく実装・点火前提**と明記。
+
+## 10. fix4 改定記録（R-FB2-D4・2026-08-12・FB2-11 のみ・09/10 は RESOLVED）
+
+- **FB2-11（HIGH）**: 状態遷移表の failed 行 2 遷移を**排他化**——
+  failed→envelope_filed=「open 封筒 1 件・内容一致」／failed→reconciled=
+  「**terminal** 封筒 1 件・内容一致」（旧「既存封筒 1 件」は撤回・取り消し線残置
+  ——open 含みでは 2 行が同時成立し表の決定性が崩れる）。pending 時の ACK-loss
+  回収規則と対称化し「同一 from×同一観測で遷移先一意」を明記。ACK-loss テストへ
+  **failed 分岐 4 件**（open1件→filed／terminal1件→reconciled／0件→維持+通知／
+  複数・不一致→write 0+要確認）を実装票受け入れ条件として直接固定。
