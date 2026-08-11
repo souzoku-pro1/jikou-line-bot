@@ -17,14 +17,18 @@
   同期 5 点〕・§8-4 改定記録／
   fix5: R-SHOKUMU-PLAN-D5 反映・2026-08-11・司令塔裁定=Codex 提案採用——H01
   〔m1_fingerprint 二段構え・plan_lines 比較撤回〕・M01〔canonical candidates の
-  tie-break 全順序〕・§6 対照 4 形・§8-5 改定記録）
+  tie-break 全順序〕・§6 対照 4 形・§8-5 改定記録／
+  fix6: R-SHOKUMU-PLAN-D6 反映・2026-08-11——H01〔fingerprint 材料の A/B 二層化・
+  channel_json 完成形＝A層・正規化規則の完全固定〕・M01〔App31 snapshot 方式A・
+  person_id 正式収載・完全順序と併合規則〕・§6 対照 9 形増補＋1:1 宣言・
+  §8-6 改定記録）
 - 盤面: 8月構想・項目1。判断部品はすべて既存——本票は**結線の設計**であり新エンジンを作らない。
 - 実装現実の実査基盤（2026-08-10・read-only・main `6312112`）:
   `koseki_chain.py`（F5 判定）／`docs/souzoku-houki/10-koseki-matrix.md`（H系列③・凍結）／
   `dispatch_bot/shokumu.py`＋`channels/shokumu_seikyu.py`（M1・実物検収済み）／
   `hub/derivation_models.py`・`hub/heir_projection.py`（P3 系）／`review_resolve.py`（App33 参照・関所型）／
   `hub/heir_envelope.py`（封筒冪等の型）。
-- 次レビュー: R-SHOKUMU-PLAN-D6（**凍結判定**。経緯: D1=凍結不適格→fix1→
+- 次レビュー: R-SHOKUMU-PLAN-D7（**凍結判定の再走**。経緯: D1=凍結不適格→fix1→
   D2=H01/H02/H03+M01〜M04〔M01 のみ RESOLVED〕→fix2。対応は §8 改定記録）。
 
 ## 0. 原則（本票の背骨・§2 で構造化）
@@ -378,11 +382,20 @@ SHA-256。**App30/M1 の起票・封筒状態（§2C が読む非内容的状態
 5. **マトリクス version**（config データの版数文字列）。
 6. **head.decedent_person_id**（fix2 追加・phase="full"）: 被相続人の同一性を
    run 側からも固定（App34 の被相続人フラグ付替えと run の不整合を検出）。
-7. **App31 照合 snapshot**（fix2 追加）: 候補行ごとの
-   `{"line_type": ..., "app31_record_id": ..., "市区町村名": ..., "有効": ...,
-   "fallback": "ward"|"city"|null}`（採用した市区町村レコード id・名称・有効値・
-   区→市 fallback の採用結果）を line_type 順に並べた正規化 JSON の SHA-256。
-   「要入力」行は `null` エントリ（照合を行っていない事実ごと固定）。
+7. **App31 照合 snapshot**（fix2 追加・fix6 M01 で行構造と順序を確定＝方式A）:
+   候補行ごとの `{"line_type": ..., "person_id": <数字列 or "">,
+   "app31_record_id": ..., "市区町村名": ..., "有効": ...,
+   "fallback": "ward"|"city"|""}`——**person_id を行へ正式収載**（fix6・同一
+   line_type で対象者が異なる行の順序を一意化）。「要入力」行は照合系 3 キー
+   （app31_record_id/市区町村名/有効）を `""`・fallback を `""` とする
+   （照合を行っていない事実ごと固定・null 非使用は §4B fix6 と同一規則）。
+   **完全順序（tie-break・fix6）**: `line_type` 定義順 → `person_id`
+   （"" 先頭・数値昇順）→ `市区町村名`（コードポイント昇順）→
+   `app31_record_id`（"" 先頭・数値昇順）→ `有効` → `fallback` 定義順
+   （ward→city→""）。**全キー完全一致の行は 1 行へ併合する**（併合あり・一意）。
+   **snapshot に存在しないキーを比較・順序決定に使わない**（構造 pin・§6-47——
+   candidates 側のみにある status/count 等を snapshot の同一性判定へ持ち込まない）。
+   正規化 JSON（§4B fix6 と同一規則）の SHA-256。
 
 ### 4-v2.1 「§2A/§2B が読む値」↔「hash 材料」対応表（fix2 H01・1:1 の機械的提示）
 
@@ -446,15 +459,59 @@ App31 レコードの更新・無効化（(7)）・被相続人フラグ付替�
   - （履歴・fix4）plan_lines 集合比較のみ——**不足として撤回**: line_type 集合が
     同じでも count・target 実値（生年月日訂正等）・宛先 App31 引当てが異なる既存
     下書きを skip 回収してしまう（古い内容の請求書が生き残る）。
-  - **fix5 正（二段構え）**: plan_idem（業務単位の安定キー）に加え、**正規化した
-    M1 実入力の fingerprint（`m1_fingerprint`）**を監査メタへ保存する。
-    - **材料閉集合**: `request_items`（type/count・type 昇順 sort 済み）＋
-      `target`（M1 へ実際に渡す person_id・氏名・生年月日・本籍・住所・筆頭者）＋
-      `municipality`（採用市区町村名＋App31 レコード id）＋`unit`＋`様式`＋
-      `plan_lines`（sort 済み）。
-    - **正規化規則**: canonical JSON——key は辞書順 sort・配列は定義順（request_items
-      =type 昇順・plan_lines=enum 昇順）に sort・空値は null 統一・ensure_ascii
-      なし——の SHA-256。**入力の並び順だけが異なる場合は同値**になる。
+  - **fix5（二段構え・材料列挙——fix6 で二層化へ改定＝両時点残置）**: 材料閉集合を
+    「request_items＋target（person_id・氏名・生年月日・本籍・住所・筆頭者）＋
+    municipality＋unit＋様式＋plan_lines」・空値 null 統一——**fix6 で撤回**:
+    (i) M1 実入力と監査材料が混在し「実入力に影響する値の漏れ」を構造検査できない
+    (ii) purpose が漏れ・筆頭者は plan 経路が渡さない field だった
+    (iii) null 統一は channel_json 実値（空文字）と乖離。
+  - **fix6 正（二層化・§1.6 実査の実出力形に基づく）**: `m1_fingerprint` ＝
+    **A層＋B層の canonical object の SHA-256**。
+    - **A層＝正規化済み M1 実入力**: plan 経路が M1 へ渡す **channel_json 完成形
+      そのもの**——実査（dispatch_bot/shokumu.py `build_channel_json` :177-183）:
+      ```python
+      return {
+          "request_items": p["request_items"],
+          "municipality": p["municipality"],
+          "target": p.get("target") or {},
+          "purpose": resolved_purpose(p),
+      }
+      ```
+      の 4 キーと 1:1。purpose は **resolved 後の文字列**（`resolved_purpose`
+      :114-119＝明示指定→`PURPOSE_BY_UNIT`。相続放棄=
+      「受任事件（相続放棄申述）の申述に必要な戸籍等の取得のため」:58）。
+      **target は plan 経路の閉集合＝`対象者`・`生年月日`・`本籍`・`住所` の
+      4 キーのみ**——実装スキーマの既知 7 キー（対象者/フリガナ/本籍/住所/筆頭者/
+      世帯主/生年月日）のうち **フリガナ・世帯主・筆頭者は plan 経路では非搭載**と
+      確定（App34 に対応する機械材料が無く、様式生成は「空の項目は印字しない」
+      〔channels/shokumu_seikyu.py:303〕・筆頭者/世帯主も `target.get(...)` の
+      任意参照〔:353・:391〕のため非搭載で様式が成立する）。**plan 経路が target へ
+      この 4 キー以外を書かないことを構造 pin**（§6-42）。
+    - **B層＝監査・引当て補強材料**: `{"app31_record_id": str,
+      "plan_lines": [...], "unit": str, "form": "form1"|"form2"}`。
+    - **不変条件（明文化）**: 「**M1 実入力に影響する値は例外なく A層に含まれる。
+      A層の漏れは設計違反**」——A層は build_channel_json の**出力そのもの**を
+      直列化するため、channel_json へのキー追加・値変更は自動的に A層へ入る
+      （実入力の漏れが構造的に起きない）。
+    - **正規化規則（fix6 で完全固定・実装票が推測ゼロで書ける水準）**:
+      1. canonical JSON: `json.dumps(obj, sort_keys=True, ensure_ascii=False,
+         separators=(",", ":"))` の **UTF-8 bytes** を SHA-256（hex 小文字 64 桁）。
+      2. **型規則**: channel_json 実値の型を固定——`request_items[].count` は
+         **int（JSON 数値）**・その他の値はすべて **str**。**fingerprint 算出時の
+         型変換は禁止**（count を文字列化しない・数字文字列を数値化しない）。
+      3. **欠落・空文字・null の統一規則**: **全キー必須収載**（A層 4 キー・
+         target の 4 キー・B層 4 キーは常に存在させる。キー欠落は保存境界で拒否）。
+         **値なしは空文字 `""` に統一・null は使わない**（channel_json 実装が
+         空値を `""`/空 dict で作る事実と一致——「空文字 vs null の区別」は
+         null 非使用により発生しない）。
+      4. **Unicode 正規化: 不採用（NFC を適用しない）**——App34/kintone 保存値の
+         byte をそのまま比較する（NFC 同一視は表記差の業務判断を機械へ持ち込み、
+         請求書印字値と指紋の乖離を生むため採らない）。
+      5. **同一 type の request_items が複数ある場合**: type 昇順 sort の上で
+         **同一 type は count を合算して 1 エントリへ併合**（束ねで別 line_type が
+         同一 request_type を要求する場合の正規化を一意化）。plan_lines は
+         enum 定義順 sort・unique。
+    ——結果として**入力の並び順だけが異なる場合は同値**になる（§6-38）。
     - **HIT 時の判定**: plan_idem 一致 → `m1_fingerprint` 比較——**一致 = skip
       回収**（already_filed・新規 create しない）／**不一致 = 当該候補を要確認**
       （「同一起票単位で内容の異なる既存下書きがあります」の道案内・**自動 merge・
@@ -541,8 +598,13 @@ EnvelopeDetailPolicyError 同型で保存拒否（起票せず異常扱い・kin
 5. → `status`（propose → fulfilled → input_required）
 6. → `count`（昇順・最終 tie-break。全 6 键一致の重複行は生成時点で 1 行に併合）
 
-**§4-v2 (7)〔App31 照合 snapshot〕の並びにも同一規則を適用**（line_type→person_id
-→municipality の同順・fix5 M01——hash 材料の決定性を candidates と同じ全順序で担保）。
+**§4-v2 (7)〔App31 照合 snapshot〕の並び（fix5→fix6 M01 で確定・両時点残置）**:
+fix5 の「candidates と同一規則を適用（line_type→person_id→municipality）」は
+**不完全として撤回**（snapshot 行に person_id が正式収載されておらず・snapshot に
+存在しないキー〔request_type/status〕を含む順序指定だった）。fix6 は **方式A**——
+snapshot 行へ person_id を正式収載し、**snapshot 自身のキーのみ**による完全順序
+（§4-v2 (7): line_type 定義順→person_id→市区町村名→app31_record_id→有効→
+fallback 定義順・完全一致行は併合）で決定性を担保する。
 
 - **氏名・生年月日・住所の実値は保存しない**（司令塔裁定）——封筒は
   **person_id＋snapshot hash のみ**を持ち、確定時に App34 を**再取得**して
@@ -693,6 +755,39 @@ H系列③ §1 の旧記述「受任確定と同時に M1 職務上請求を自�
 38. **並び順の正規化実効性**: request_items・plan_lines の入力順だけが異なる
     同一内容 → fingerprint **同値**（誤った不一致=要確認の誤爆が出ないこと）。
 
+**fix6 追加（H01/M01 対照の完全化）**:
+
+39. **resolved purpose のみ変更**（明示指定の追加・PURPOSE_BY_UNIT の版差等）→
+    fingerprint **不一致**（A層に purpose が入っている実質検査）。
+40. **App31 record id のみ変更**（同名で別レコードへ引当て替え）→ fingerprint
+    **不一致**（B層 app31_record_id の実質検査）。
+41. **target 搭載 4 field の個別変更**: 対象者／生年月日／本籍／住所を
+    **1 つずつ**変更 → **各々 fingerprint 不一致**（parametrize・A層 target の
+    field 単位実質検査）。
+42. **fingerprint 対象外 field のみ変更 → 同値＋非搭載の構造 pin**: plan 経路が
+    target へ書かない field（フリガナ・世帯主・筆頭者）は fingerprint に影響せず、
+    **そもそも plan 経路の channel_json 組立てが target へ 4 キー以外を書かない**
+    ことを構造 pin（AST/実出力の両面）。
+43. **欠落・空文字・null の正規化境界**: キー欠落＝保存境界で拒否／空値は `""`
+    のみ（null 混入は grammar 拒否）／`""` と欠落が同値扱いにならない（欠落は
+    そもそも保存されない）ことを parametrize。
+44. **同一 type request_items の重複正規化**: 別 line_type 由来の同一 type 2 行 →
+    count 合算の 1 エントリへ併合され fingerprint が一意（併合前の並び・分割に
+    依存しない）。
+45. **App31 snapshot 入力順のみ相違 → plan_hash 同値**（§4-v2 (7) の完全順序
+    sort の実効性・M01）。
+46. **snapshot の完全 tie-break**: 同一 line_type×同一市区町村名で person_id・
+    app31_record_id が異なる複数行 → 完全順序で一意に整列・全キー一致行は
+    1 行へ併合（parametrize）。
+47. **非存在キー参照なしの構造 pin**: snapshot の順序決定・同一性判定が
+    snapshot 自身のキー（line_type/person_id/市区町村名/app31_record_id/有効/
+    fallback）のみを参照する（candidates 側の status/count 等への参照ゼロ・AST pin）。
+
+**宣言（fix6）**: §6 対照（1〜47）は **H01（plan_hash／m1_fingerprint の各保証）・
+M01（canonical 順序の決定性）の保証項目と 1:1** である——保証の各文（§4-v2・
+§4-v2.1・§4A 全順序・§4B fix6・§4-v2 (7)）に対応する対照が本節に存在し、
+対照の無い保証・保証の無い対照は存在しない。
+
 ## 7. スコープ外（明記）
 
 - 受領→読解→次請求の**連鎖ループ**（H10・M5/チェックリスト H9 連携）——裁定④どおり別票。
@@ -830,4 +925,34 @@ D5 判定: H01-01/M01（前巡）=RESOLVED・H01-02=UNRESOLVED＋新 M01。fix5 
 - **§6 対照 4 形追加**（35〜38）: fingerprint 一致 skip／生年月日訂正→不一致／
   count 変化→不一致（fix4 比較の盲点）／並び順のみ相違→同値（正規化の実効性）。
 - 次レビュー: **R-SHOKUMU-PLAN-D6**（**凍結判定**・BASE=origin/main `6312112`・
-  TARGET=shokumu-plan-design の fix5 commit）。
+  TARGET=shokumu-plan-design の fix5 commit）。→ 実施済み・結果は §8-6。
+
+## 8-6. fix6 改定記録（R-SHOKUMU-PLAN-D6・2026-08-11。両時点残置・遡及書き換えにしない）
+
+D6 判定: CHANGES_REQUIRED（H01/M01=HIGH・両方 UNRESOLVED）。fix6 で反映
+（着手前に build_channel_json :177-183・resolved_purpose :114-119・
+PURPOSE_BY_UNIT :56-59・様式生成の target 参照〔:303-313/:350-353/:387-391〕を
+実確認し、実出力形を §4B へ逐語引用）:
+
+- **H01（fingerprint 材料の二層化）**: A層＝**channel_json 完成形そのもの**
+  （request_items/municipality/target/purpose——purpose は resolved 後の文字列）・
+  B層＝監査・引当て補強（app31_record_id/plan_lines/unit/form）。target は
+  plan 経路の閉集合 **4 キー（対象者/生年月日/本籍/住所）**と確定——実装スキーマの
+  既知 7 キーのうち**フリガナ・世帯主・筆頭者は非搭載**（様式生成が任意参照で
+  非搭載でも成立する実装事実に基づく・構造 pin=§6-42）。不変条件「M1 実入力に
+  影響する値は例外なく A層に含まれる。A層の漏れは設計違反」を明文化。fix5 の
+  材料列挙・null 統一は撤回（履歴残置）。
+- **H01（正規化規則の完全固定）**: UTF-8 bytes→SHA-256／separators=(",",":")／
+  ensure_ascii=false／key 辞書順／型固定（count=int・他 str・算出時型変換禁止）／
+  **全キー必須収載＋値なしは "" 統一・null 非使用**（欠落は保存境界で拒否）／
+  **NFC 不採用**（byte 比較・採否と理由を明記）／同一 type request_items は
+  **count 合算で併合**。
+- **M01（App31 snapshot・方式A）**: snapshot 行へ **person_id を正式収載**し、
+  完全順序＝line_type 定義順→person_id→市区町村名→app31_record_id→有効→
+  fallback 定義順（ward→city→""）。**全キー完全一致行は 1 行へ併合**。
+  **snapshot に存在しないキーを比較・順序決定に使わない**構造 pin（§6-47）。
+  fix5 の「candidates と同一規則」指定は不完全として撤回（履歴残置）。
+- **§6 増補（39〜47・9 形）**＋**1:1 宣言**（§6 対照と H01/M01 保証の対応が
+  過不足なく存在する）。
+- 次レビュー: **R-SHOKUMU-PLAN-D7**（**凍結判定の再走**・BASE=origin/main
+  `6312112`・TARGET=shokumu-plan-design の fix6 commit）。
