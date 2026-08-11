@@ -44,11 +44,29 @@
   **【fix1・S6-2-03 で撤回・再設計】初版キーは「同一原本の再送」と「別原本
   （同内容の別ページ・再取得した通帳）」を区別できず、OCR 訂正で内容が変わると
   別行として二重計上される穴があった**。再設計:
-  - **原本 identity**: source doc ID（Drive file ID 等）＋ **source SHA-256**
-    （PDF バイト列）——同一 SHA の再送は同一原本・別 SHA は別原本として扱う。
-  - **行 identity**: 原本 identity × **account identity**（金融機関/支店/口座番号の
-    正規化組）× **page identity**（ページ番号/見開き位置）× **row locator**
-    （ページ内行序数）——「どの原本のどの物理行か」を内容に依存せず一意化する。
+  - ~~**原本 identity**: source doc ID（Drive file ID 等）＋ **source SHA-256**
+    （PDF バイト列）——同一 SHA の再送は同一原本・別 SHA は別原本として扱う。~~
+  - ~~**行 identity**: 原本 identity × account identity × page identity ×
+    row locator~~
+    **【fix3・S6-2-07 で撤回・一本化】fix1 の「原本 identity（doc ID＋SHA）を
+    行 identity に含める」定義は、fix2 の 3 分離（content/provenance/状態）と
+    不整合だった——doc ID（provenance）が identity に入ると、裁定⑩で (A) 収束を
+    選んだ場合に同一内容の行が provenance ごとに別 identity になり二重計上する。
+    行 identity を以下へ**一本化**する:
+  - **行 identity（一本化定義）** = **content identity（source SHA-256）×
+    account identity（金融機関/支店/口座番号の正規化組）× page identity
+    （ページ番号/見開き位置）× row locator（ページ内行序数）**。
+    **provenance（doc ID）は identity に含めない**——この構造は裁定⑩の
+    (A) 収束・(B) 重複疑い の**どちらの帰結とも両立する**（provenance は
+    行 identity と独立に複数保持/照合できる）。
+  - **同一 doc ID＋別 SHA（原本差替え）の supersede 対応付け**は
+    「**同一 provenance lineage（同一 doc ID の SHA 系列）内の row locator 対応**」
+    で定義する（新旧 SHA 間で account/page/row locator が一致する行を対応付けて
+    supersede・対応の取れない行は追加/消失として扱う）。
+  - **検知永続キーの一意性（確認・明記）**: S6-2-04 の検知永続キー＝
+    **規則 ID × 行 identity** は、新定義の下で「同一内容・同一口座・同一物理
+    位置の行に対する同一規則の検知は 1 件」に一意化される（provenance 非依存＝
+    別経路到着・収束の別にかかわらず同一検知に合流し、二重通知しない）。
   - **内容 hash**: 正規化した行内容（日付・摘要・金額・残高）の hash を別途保持し、
     **OCR 訂正・再読解で内容が変わった場合は同一 row locator の行を supersede**
     （追記型・旧行は無効化マークで残置＝二重計上せず履歴も失わない）。
@@ -72,6 +90,23 @@
       **同じ ingestion 状態機械上の回収点**を共有する（原本 complete 未満で
       検知だけ先行しない・検知の reconcile〔S6-2-04〕は ingestion complete を
       前提条件に照合する＝取込途中の部分データで誤検知しない）。
+    - **【fix3・S6-2-08】ingestion 状態の遷移表（確定）**:
+
+      | from | to | 条件 |
+      |---|---|---|
+      | （新規） | open | 原本受理・取込開始 |
+      | open | complete | **期待行集合との照合完了後のみ**（読解が返した全行の保存を突合できた場合） |
+      | open | failed | 取込失敗（読解全断・保存不能） |
+      | failed | open | 再送・再取込の開始（→ complete で回収完了） |
+      | complete | （なし） | **complete からの自動逆遷移は禁止**。後発の欠落発見は**要確認通知**または**明示的 reopen（[人] 操作のみ）** |
+
+      - 状態は**閉集合 {open / complete / failed}**。「partial」は **open の
+        説明語であり enum 値ではない**（部分取込＝open のまま）。
+      - **S6-2-04 の検知 reconcile 前提条件（ingestion complete）は本遷移表上で
+        一意に判定できる**——complete は「期待行集合との照合完了」を通過した
+        行きの遷移でのみ到達し、自動逆遷移が存在しないため、reconcile 時点の
+        complete 判定は単一の状態値読取で確定する（取込中/失敗と誤認する
+        中間状態がない）。
 
 ## 4. 異常検知（スクリーニング規則）
 
@@ -169,3 +204,17 @@
   同一 doc ID＋別 SHA＝原本差替え supersede。別 doc ID＋同一 SHA＝裁定⑩新設。
   原本保存と検知通知の部分失敗回収点を同一 ingestion 状態機械上に揃える
   （検知 reconcile は ingestion complete を前提条件化）。
+
+## 10. fix3 改定記録（R-DOCS-BATCH-1-D3・2026-08-11・S6-2 のみ・他 3 票 DESIGN_OK）
+
+- **S6-2-07**: fix1 の行 identity 定義（原本 identity=doc ID+SHA を含む）を
+  **撤回**（fix2 の 3 分離と不整合＝provenance が identity に混入し、裁定⑩(A)
+  収束時に同一内容行が二重計上される）。行 identity を **content identity ×
+  account × page × row locator に一本化**（provenance 非含有＝裁定⑩の両帰結と
+  両立）。原本差替えの supersede 対応付けは「同一 provenance lineage 内の
+  row locator 対応」で定義。検知永続キー（規則 ID×行 identity）の一意性を明記。
+- **S6-2-08**: ingestion 状態を**遷移表で確定**——閉集合 {open/complete/failed}
+  （partial は open の説明語・enum 値でない）・open→complete は期待行集合との
+  照合完了後のみ・failed→open→complete の再送回収・**complete からの自動逆遷移
+  禁止**（後発欠落は要確認 or 明示的 reopen=[人]）。S6-2-04 の reconcile 前提
+  条件（complete）が遷移表上で一意判定できることを明記。
