@@ -711,19 +711,27 @@ class TestResolveAndM1(_Base):
 
 class TestGuardsAndFlag(_Base):
     def test_flag_off_zero_io(self):
-        """§6-8/§6-18: flag OFF→固定文言辞退・App30 search/create ゼロ・
-        語彙一覧非掲載。"""
+        """§6-8/§6-18（IMPL-fix1 IMPL-04 で強化）: flag OFF→固定文言辞退・
+        build_plan/file_plan_envelope 未呼出し・kintone search/get/create の
+        call count==0 を mock で直接検査・語彙一覧非掲載。"""
         from types import SimpleNamespace
         from dispatch_bot import shokumu_plan_task as task
         from dispatch_bot.registry import catalog_for_prompt
         import hub.kintone as hk
-        with patch.dict(os.environ, {"SHOKUMU_PLAN_ENABLED": ""}):
+        with patch.dict(os.environ, {"SHOKUMU_PLAN_ENABLED": ""}), \
+             patch("dispatch_bot.shokumu_plan_task.build_plan") as bp, \
+             patch("dispatch_bot.shokumu_plan_task.file_plan_envelope") as fe:
             self.assertNotIn("shokumu_plan", catalog_for_prompt())
             with patch("dispatch_bot.confirm.invalidate"):
                 msg, _rid, _url = _run(task.execute(SimpleNamespace(
                     user_id="U1", case=SimpleNamespace(record_id="9"))))
             self.assertEqual(msg, task.MSG_DISABLED)
+            bp.assert_not_called()
+            fe.assert_not_called()
         self.assertEqual(self.created, [])
+        self.assertEqual(hk.search_records.await_count, 0)
+        self.assertEqual(hk.get_record.await_count, 0)
+        self.assertEqual(hk.create_record.await_count, 0)
 
     def test_no_approval_transition_in_source(self):
         """§6-7/§6-16: 承認済みへのサーバ遷移コードの不存在（ソース検査）＋
@@ -768,6 +776,193 @@ class TestGuardsAndFlag(_Base):
         detail = self._envelope_item().detail
         self.assertIn("joh_removed",
                       [c["line_type"] for c in detail["candidates"]])
+
+
+class TestImplFix1(_Base):
+    """R-SHOKUMU-PLAN-IMPL-1 対応の対照（IMPL-01/02/03/05）。"""
+
+    def test_form1_missing_birth_is_input_required(self):
+        """IMPL-01: 様式1 系の対象 person の出生行年月日が空 → input_required
+        （被相続人・父・母・sibling の各形・空のまま propose へ進まない）。"""
+        self.persons[0]["身分事項"] = {"value": []}
+        self._mk_confirmed_run(rank=1)
+        m = self._plan()
+        dj = next(c for c in m.candidates
+                  if c["line_type"] == "decedent_joseki")
+        self.assertEqual(dj["status"], "input_required")
+        joh = next(c for c in m.candidates if c["line_type"] == "joh_removed")
+        self.assertEqual(joh["status"], "propose")   # form2 は影響なし
+        base = [
+            _person("10", "被相続人", honseki="埼玉県川口市A",
+                    death="2026-01-01", decedent="yes", father="1", mother="2",
+                    birth="昭和20年1月1日"),
+            _person("1", "祖父", honseki="埼玉県川口市B", birth="大正10年1月1日"),
+            _person("2", "祖母", honseki="埼玉県川口市C", birth="大正12年2月2日"),
+            _person("20", "兄", father="1", mother="2",
+                    honseki="埼玉県川口市D", birth="昭和18年3月3日"),
+            _person("21", "甥", father="20", mother="30",
+                    birth="昭和50年4月4日"),
+            _person("30", "義姉", birth="昭和22年5月5日"),
+        ]
+        heirs = [{"person_id": "21", "zokugara_code": "nephew_niece_rep",
+                  "share": "1/1"}]
+        for i, missing_pid in enumerate(("1", "2", "20")):
+            with self.subTest(missing=missing_pid):
+                case = f"3{i}"          # 案件を分ける（single-root 制約）
+                self.persons = json.loads(json.dumps(base))
+                for rec in self.persons:
+                    if rec["$id"]["value"] == missing_pid:
+                        rec["身分事項"] = {"value": []}
+                self._mk_confirmed_run(rank=3, heirs=heirs, case=case)
+                m2 = self._plan(case)
+                target_line = ("sibling_death" if missing_pid == "20"
+                               else "parents_death")
+                rows = [c for c in m2.candidates
+                        if c["line_type"] == target_line
+                        and c["person_id"] == missing_pid]
+                self.assertEqual(len(rows), 1, m2.problems)
+                self.assertEqual(rows[0]["status"], "input_required")
+
+    def test_sibling_one_side_missing_parent_id(self):
+        """IMPL-03（司令塔裁定）: 甥の父母人物 ID の**片側欠損×他方一致**でも
+        自動確定せず要入力（欠損側が別の兄弟姉妹である可能性を排除できず
+        半血判定=民法 900④但書を誤り得るため安全側）。"""
+        self.persons = [
+            _person("10", "被相続人", honseki="埼玉県川口市A",
+                    death="2026-01-01", decedent="yes", father="1", mother="2",
+                    birth="昭和20年1月1日"),
+            _person("1", "祖父"), _person("2", "祖母"),
+            _person("20", "兄", father="1", mother="2",
+                    honseki="埼玉県川口市D", birth="昭和18年3月3日"),
+            _person("21", "甥", father="20", mother="",
+                    birth="昭和50年4月4日"),
+        ]
+        self._mk_confirmed_run(rank=3, heirs=[
+            {"person_id": "21", "zokugara_code": "nephew_niece_rep",
+             "share": "1/1"}])
+        m = self._plan()
+        self.assertTrue(any("兄弟姉妹" in x for x in m.problems))
+
+    def test_audit_meta_validation_negatives_on_hit(self):
+        """IMPL-02: 既存 M1 の保存データを改変して HIT 再照合——plan_lines
+        欠落/非 list/重複/順序違反/enum 外・余分キー・不足キー(plan_idem 以外)の
+        各形が**すべて要確認・create 0**（比較不能を一致扱いにしない）。"""
+        self._mk_confirmed_run(rank=1)
+        self._file(self._plan())
+        r1 = self._resolve(self._envelope_item())
+        self.assertEqual(r1["items"][0]["issued"], 2)
+
+        def drop_lines(d):
+            d.pop("plan_lines")
+
+        def non_list(d):
+            d["plan_lines"] = "joh_removed"
+
+        def dup(d):
+            d["plan_lines"] = d["plan_lines"] + d["plan_lines"]
+
+        def unsorted(d):
+            d["plan_lines"] = ["decedent_joseki", "joh_removed"]
+
+        def enum_out(d):
+            d["plan_lines"] = ["not_a_type"]
+
+        def extra_key(d):
+            d["余分"] = 1
+
+        def drop_hash(d):
+            d.pop("plan_hash")
+
+        for mutate in (drop_lines, non_list, dup, unsorted, enum_out,
+                       extra_key, drop_hash):
+            with self.subTest(mutate=mutate.__name__):
+                for rec in self.app30:
+                    if self._is_plan_envelope(rec):
+                        rec["発送ステータス"] = {"value": "要確認"}
+                        rec["実行済み"] = {"value": "no"}
+                saved = []
+                for rec in self.app30:
+                    if (rec.get("チャネル") or {}).get("value") != "職務上請求":
+                        continue
+                    raw = rec["チャネル固有データ"]["value"]
+                    saved.append((rec, raw))
+                    data = json.loads(raw)
+                    if "plan_idem" in data:
+                        mutate(data)
+                        rec["チャネル固有データ"] = {"value": json.dumps(
+                            data, ensure_ascii=False)}
+                n = len([1 for _l, f in self.created
+                         if f.get("チャネル") == "職務上請求"])
+                r = self._resolve(self._envelope_item())
+                self.assertGreater(r["items"][0]["held"], 0, mutate.__name__)
+                self.assertFalse(r["items"][0]["envelope_closed"])
+                self.assertEqual(
+                    len([1 for _l, f in self.created
+                         if f.get("チャネル") == "職務上請求"]), n,
+                    "create 0 が破れた")
+                for rec, raw in saved:
+                    rec["チャネル固有データ"] = {"value": raw}
+
+    def test_fields_parity_with_existing_builder(self):
+        """IMPL-05: M1 App30 fields を既存 _fields_shokumu_seikyu の実出力と
+        直接照合（キー集合＝builder 出力∪file_from_pending 共通部・件名/宛先系/
+        channel_json 4 キーの値一致）。"""
+        from types import SimpleNamespace
+        from dispatch_bot.app30_filer import _fields_shokumu_seikyu
+        self._mk_confirmed_run(rank=1)
+        self._file(self._plan())
+        self._resolve(self._envelope_item())
+        ours = next(f for _l, f in self.created
+                    if f.get("チャネル") == "職務上請求")
+        data = json.loads(ours["チャネル固有データ"])
+        pending = SimpleNamespace(
+            command_id="cmd-x", instruction_text="請求案の確定",
+            user_id="U1",
+            parsed={"task_type": "shokumu_seikyu",
+                    "task_params": {
+                        "request_items": data["request_items"],
+                        "municipality": data["municipality"],
+                        "target": data["target"], "unit": sp.PLAN_UNIT,
+                        "purpose": data["purpose"]}},
+            case=SimpleNamespace(record_id="9", unit="相続"))
+        builder = _fields_shokumu_seikyu(pending, {}, "山田太郎")
+        common = {"発送ステータス", "ユニット種別", "顧客名表示用",
+                  "案件アプリID", "案件レコードID", "実行済み"}
+        self.assertEqual(set(ours), set(builder) | common)
+        for k in ("チャネル", "件名", "宛先名", "宛先郵便番号", "宛先住所"):
+            self.assertEqual(ours[k], builder[k], k)
+        b_json = json.loads(builder["チャネル固有データ"])
+        for k in ("request_items", "municipality", "target", "purpose"):
+            self.assertEqual(data[k], b_json[k], k)
+
+    def test_form1_pdf_end_to_end_with_merged_items(self):
+        """IMPL-05/§6-44(d): 新規経路の併合済み channel_json（除籍謄本×2 の
+        1 エントリ）を既存 build_request_form_pdfs へ実際に通し、様式1 PDF が
+        **1 枚**生成されること（count 合計値の実 end-to-end）。"""
+        from channels.shokumu_seikyu import build_request_form_pdfs
+        office_env = {
+            "OFFICE_NAME": "大野法律事務所", "OFFICE_ZIP": "332-0012",
+            "OFFICE_ADDRESS": "埼玉県川口市本町4-1-6",
+            "OFFICE_TEL": "048-000-0000", "OFFICE_ATTORNEY": "大野太郎",
+            "OFFICE_ATTORNEY_REG": "12345",
+            "OFFICE_BAR_ASSOCIATION": "埼玉弁護士会"}
+        data = {"request_items": [{"type": "除籍謄本", "count": 2}],
+                "municipality": "川口市",
+                "target": {"対象者": "被相続人太郎",
+                           "生年月日": "昭和20年1月1日",
+                           "本籍": "埼玉県川口市大字Y 3",
+                           "住所": "埼玉県川口市大字X 1-2"},
+                "purpose": "受任事件（相続放棄申述）の申述に必要な戸籍等の"
+                           "取得のため"}
+        record = {"$id": {"value": "9"},
+                  "顧客名表示用": {"value": "山田太郎"},
+                  "宛先名": {"value": ""},
+                  "件名": {"value": "職務上請求（川口市）"}}
+        muni = {"市区町村名": {"value": "川口市"}}
+        with patch.dict(os.environ, office_env):
+            pdfs = build_request_form_pdfs(record, data, muni)
+        self.assertEqual(len(pdfs), 1)               # 様式1 PDF 1 枚
+        self.assertTrue(pdfs[0][1].startswith(b"%PDF"))
 
 
 if __name__ == "__main__":

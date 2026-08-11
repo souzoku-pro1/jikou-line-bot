@@ -158,6 +158,59 @@ def m1_fingerprint(channel_json: dict, app31_record_id: str,
     return canonical_sha256({"m1_input": channel_json, "aux": aux})
 
 
+_CHANNEL_JSON_KEYS = ("request_items", "municipality", "target", "purpose")
+
+
+def validate_audit_meta(meta: dict) -> None:
+    """監査メタの共通検証境界（IMPL-fix1 IMPL-02・単一関数）。
+
+    新規保存時と plan_idem HIT 再照合時の**双方**で通す——
+    PLAN_AUDIT_META_KEYS との完全一致（余分・不足キー拒否）＋各値 grammar。
+    不適合は PlanPolicyError（HIT 側は held/要確認へ写像・比較不能を一致扱い
+    にしない＝§2D fix8-5）。
+    """
+    if not isinstance(meta, dict) or set(meta) != set(PLAN_AUDIT_META_KEYS):
+        raise PlanPolicyError("監査メタのキー集合が閉集合と不一致")
+    if meta["filed_by"] != "shokumu_plan":
+        raise PlanPolicyError("filed_by が不正")
+    if not (isinstance(meta["plan_envelope_no"], str)
+            and meta["plan_envelope_no"].isdigit()):
+        raise PlanPolicyError("plan_envelope_no grammar 外")
+    for k in ("plan_hash", "m1_fingerprint"):
+        if not (isinstance(meta[k], str) and _HEX64_RE.fullmatch(meta[k])):
+            raise PlanPolicyError(f"{k} grammar 外")
+    if not (isinstance(meta["plan_idem"], str)
+            and _PLAN_IDEM_RE.fullmatch(meta["plan_idem"])):
+        raise PlanPolicyError("plan_idem grammar 外")
+    lines = meta["plan_lines"]
+    if not isinstance(lines, list) or not lines:
+        raise PlanPolicyError("plan_lines は非空 list のみ")
+    if any(x not in LINE_TYPES for x in lines):
+        raise PlanPolicyError("plan_lines は 7 値 enum のみ")
+    if len(set(lines)) != len(lines):
+        raise PlanPolicyError("plan_lines は unique であること")
+    if lines != sorted(lines, key=LINE_TYPES.index):
+        raise PlanPolicyError("plan_lines は enum 定義順 sort 済みであること")
+
+
+def _extract_audit(channel_data: dict):
+    """既存 M1 のチャネル固有データから監査メタ部を検証つきで抽出（IMPL-02）。
+
+    保存形は channel_json 4 キー＋監査メタ 6 キーの合成（§2D）——**総キー集合の
+    完全一致**（余分・不足キー拒否）＋validate_audit_meta。不適合は None
+    （呼出し側が held/要確認へ倒す・create 0）。
+    """
+    allowed = set(_CHANNEL_JSON_KEYS) | set(PLAN_AUDIT_META_KEYS)
+    if not isinstance(channel_data, dict) or set(channel_data) != allowed:
+        return None
+    meta = {k: channel_data[k] for k in PLAN_AUDIT_META_KEYS}
+    try:
+        validate_audit_meta(meta)
+    except PlanPolicyError:
+        return None
+    return meta
+
+
 # ══════════════════════════════════════════════════════════════
 # 市区町村切り出し・App31 引当て（§2A.1・snapshot は §4-v2 (7) 方式A）
 # ══════════════════════════════════════════════════════════════
@@ -499,6 +552,13 @@ async def build_plan(case_record_id: str) -> PlanMaterials:
         status = status_override or "propose"
         if muni == INPUT_REQUIRED or req == INPUT_REQUIRED:
             status = "input_required"    # 相関制約 3/4（§4A）
+        # IMPL-fix1 IMPL-01: 様式1（生年月日必須・§2A/§1.3）で対象 person の
+        # 出生行年月日が取得不能（空）なら municipality/request_type の要入力と
+        # 同列に input_required（空のまま propose→M1 エラー遷移へ進む経路を遮断）
+        if LINE_FORM[line_type] == "form1" and person_id is not None:
+            rec = by_id.get(person_id)
+            if rec is None or not _birth_wareki(rec):
+                status = "input_required"
         cands.append({"line_type": line_type, "request_type": req, "count": 1,
                       "person_id": person_id, "municipality": muni,
                       "status": status})
@@ -604,12 +664,18 @@ def _resolve_sibling(by_id: dict, dec_id: str, nephew_pid: str) -> str | None:
     dec_parents = {p for p in (_v(dec, "父人物ID"), _v(dec, "母人物ID")) if p}
     if not dec_parents:
         return None                       # (d) 被相続人側の親 ID 欠損
+    # IMPL-fix1 IMPL-03（司令塔裁定）: 「親 ID 欠損」は**片側欠損を含む**——
+    # 甥姪の父母人物 ID の一方でも欠損なら自動確定しない（両側が揃う場合のみ
+    # 共有親判定）。欠損側の親が別の兄弟姉妹である可能性を排除できず、
+    # 半血判定（民法 900 条④但書）を誤り得るため安全側へ固定（要入力）
+    parent_ids = [_v(nephew, "父人物ID"), _v(nephew, "母人物ID")]
+    if not all(parent_ids):
+        return None                      # (d) 片側欠損を含む親 ID 欠損
     hits = []
-    for code in ("父人物ID", "母人物ID"):
-        pid = _v(nephew, code)
+    for pid in parent_ids:
         cand = by_id.get(pid)
-        if not pid or cand is None:
-            continue                      # (d) 親 ID 欠損側は候補にしない
+        if cand is None:
+            return None                  # (d) 参照先レコード不在も欠損扱い
         cand_parents = {p for p in (_v(cand, "父人物ID"),
                                     _v(cand, "母人物ID")) if p}
         if cand_parents & dec_parents:
@@ -909,11 +975,11 @@ async def _issue_m1_for_envelope(item, detail: dict,
                                      b["lines"], PLAN_UNIT, b["form"])
         hit = _match_plan_idem(m1_records, idem)
         if hit is not None:
-            saved = hit.get("m1_fingerprint")
-            if not (isinstance(saved, str) and _HEX64_RE.fullmatch(saved)):
-                held.append(idem)      # 欠落・不正 grammar → 要確認（§2D fix8-5）
+            audit_saved = _extract_audit(hit)     # IMPL-02: 共通検証境界を通す
+            if audit_saved is None:
+                held.append(idem)      # 閉集合/grammar 不適合 → 要確認・create 0
                 continue
-            if saved == fingerprint:
+            if audit_saved["m1_fingerprint"] == fingerprint:
                 recovered.append(idem)     # 一致 = skip 回収（§4B fix5）
                 continue
             held.append(idem)              # 不一致 = 要確認（自動 merge 禁止）
@@ -924,8 +990,7 @@ async def _issue_m1_for_envelope(item, detail: dict,
                  "plan_idem": idem,
                  "m1_fingerprint": fingerprint,
                  "plan_lines": sorted(set(b["lines"]), key=LINE_TYPES.index)}
-        if set(audit) != set(PLAN_AUDIT_META_KEYS):    # 単一定数の両所参照
-            raise PlanPolicyError("監査メタ閉集合が PLAN_AUDIT_META_KEYS と不一致")
+        validate_audit_meta(audit)     # IMPL-02: 保存時も共通検証境界を通す
         # §2D: _fields_shokumu_seikyu と同一 field 集合（byte 水準一致は
         # テストで pin）＋ file_from_pending 共通部。単票 API・**下書き止まり**
         await kintone.create_record(APP_SHIPPING, {
