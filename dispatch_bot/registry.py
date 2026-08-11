@@ -263,6 +263,35 @@ register(TaskSpec(
 ))
 
 
+# ── 職務上請求の請求案（SHOKUMU-PLAN 実装票・裁定②=語彙起動のみ）──────────
+from dispatch_bot import shokumu_plan_task  # noqa: E402（循環回避のため末尾 import）
+from hub.shokumu_plan import shokumu_plan_enabled  # noqa: E402
+
+register(TaskSpec(
+    task_type="shokumu_plan",
+    display_name="職務上請求の請求案",
+    answer_only=False,
+    destination="shokumu_plan",  # App30 要確認封筒（提案のみ・起票確定は関所）
+    run_at="railway",
+    risk="低",  # 対外効果ゼロ（要確認封筒のみ。M1 起票=下書きは関所確定後・承認は既存フロー）
+    auto_scope="必要戸籍 plan の導出と App30 要確認封筒（提案）の起票まで",
+    approval_scope="請求の起票確定は関所（要確認の確定・[人]）・発送は既存 M1 承認フロー",
+    required_fields=["customer_name"],
+    field_questions={"customer_name":
+                     "どの顧客（案件）への指示ですか？氏名を教えてください"},
+    search_apps=["SOUZOKU_KINTONE_APP_ID"],
+    artifacts="App 30 要確認封筒（請求案・canonical 候補一覧）",
+    adapter="ShokumuPlan",
+    on_failure="失敗は固定文言で LINE 返信（分類名のみ・道案内型）",
+    hint_for_parser=("案件の必要戸籍（職務上請求）の請求案を機械導出する。"
+                     "「請求案を出して」「必要戸籍の請求案」等の明示指示のみ該当。"
+                     "customer_name に顧客名のみ入れる"),
+    required_desc="customer_name または 案件No（例: No.4）",
+    execute_fn=shokumu_plan_task.execute,
+    visible_fn=shokumu_plan_enabled,   # flag OFF の間は語彙一覧に載せない
+))
+
+
 register(TaskSpec(
     task_type="review_resolve",
     display_name="要確認の確定",

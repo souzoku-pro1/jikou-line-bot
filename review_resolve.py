@@ -398,6 +398,14 @@ from hub.heir_projection import (  # noqa: E402（登録用 import・循環な�
     _resolve_heir_derivation,
 )
 
+# SHOKUMU-PLAN: 請求案封筒の確定関所（凍結仕様 §2 [3]-[4]。ハンドラ本体は
+# hub/shokumu_plan に隔離・M1 既存 prepare へ委譲・下書き止まり）
+from hub.shokumu_plan import (  # noqa: E402（登録用 import・循環なし）
+    APP_KOSEKI_PERSON as APP_KOSEKI_PERSON_PLAN,
+    _resolve_shokumu_plan,
+)
+from channels.shokumu_seikyu import APP_CITY_MASTER  # noqa: E402
+
 RESOLVERS = {
     "registry_ingest": (_resolve_registry, (APP_SHIPPING, APP_FUDOSAN, APP_ZAISAN)),
     "koseki_ingest": (_resolve_koseki, (APP_SHIPPING, APP_KOSEKI_BOOK)),
@@ -405,6 +413,8 @@ RESOLVERS = {
                          (APP_SHIPPING, APP_FUDOSAN, APP_ZAISAN)),
     "bank_ingest": (_resolve_bank, (APP_SHIPPING, APP_ZAISAN)),
     "heir_derivation": (_resolve_heir_derivation, (APP_SHIPPING, APP_SOUZOKUNIN)),
+    "shokumu_plan": (_resolve_shokumu_plan,
+                     (APP_SHIPPING, APP_KOSEKI_PERSON_PLAN, APP_CITY_MASTER)),
 }
 
 

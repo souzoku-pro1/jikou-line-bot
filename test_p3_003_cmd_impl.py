@@ -175,8 +175,10 @@ class TestRegistryAndVocabulary(unittest.TestCase):
 
     def test_existing_specs_unconditionally_visible(self):
         for t, spec in registry.TASK_REGISTRY.items():
-            if t != "heir_derivation":
-                self.assertIsNone(spec.visible_fn, t)   # 既存タスク無変更の pin
+            if t not in ("heir_derivation", "shokumu_plan"):
+                # flag 連動タスク（heir/SHOKUMU-PLAN・時点ピンの追随）以外は
+                # 無条件掲載＝既存タスク無変更の pin
+                self.assertIsNone(spec.visible_fn, t)
 
 
 # ── §7-2/§7-15/§7-16: flag ゲート境界 ────────────────────────────────────────
