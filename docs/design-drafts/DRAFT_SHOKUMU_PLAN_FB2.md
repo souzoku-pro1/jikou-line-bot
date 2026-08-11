@@ -1,6 +1,6 @@
 # DRAFT: SHOKUMU-PLAN-FB2 — 受任確定フックによる請求案の自動起票
 
-- status: **DRAFT**（凍結は D 巡後・R-FB2-D1 から）
+- status: **FROZEN**（凍結・2026-08-12・R-FB2-D5 PASS）
 - TASK_ID: DOCS-FB2（起草）／実装は別票
 - 位置づけ: SHOKUMU-PLAN 凍結票（DRAFT_SHOKUMU_PLAN.md・FROZEN・main 取り込み済み）
   の**裁定②で別票残置された「受任フック自動起票」**の消込。起動時点のみを扱い、
@@ -376,3 +376,23 @@
   回収規則と対称化し「同一 from×同一観測で遷移先一意」を明記。ACK-loss テストへ
   **failed 分岐 4 件**（open1件→filed／terminal1件→reconciled／0件→維持+通知／
   複数・不一致→write 0+要確認）を実装票受け入れ条件として直接固定。
+
+## 11. 凍結記録（2026-08-12・R-FB2-D5 PASS）
+
+- **巡歴**: 起草（DOCS-FB2・a59dba7）→ D1（FB2-01〜04・fix1＋裁定①〜⑤織り込み）→
+  D2（FB2-05〜07・fix2）→ D3（FB2-08〜10・fix3）→ D4（FB2-11・fix4）→
+  **D5 PASS（凍結適格・凍結阻害所見なし）＝本凍結**。
+- **凍結内容の要旨**: **三層構造**——(1) 結合状態機械（§3.0・7 要件閉集合・
+  受任確定=締結+決済の両方は H系列正本のまま不変） (2) engagement_event 層
+  （§3.2・grammar `shokumu_engagement:{case}:{generation}`・generation は初版
+  定数 1・状態遷移表 9 行=唯一の正・封筒 idem キー先行保存による決定的 join）
+  (3) 封筒層（凍結票 `file_plan_envelope`・open 限定回収の流用・**不変**）。
+  ＋ reconcile 三面照合（受任正本×イベント処理状態×対応封筒・日次・通知/held
+  まで）・裁定①〜⑤確定（(a)H9 フック・(B)event_id 台帳・(A)通知あり・
+  reconcile 導入・相続放棄のみ）。
+- **FB2-12（LOW）＝司令塔 DEFER 残置**: §4 の一部旧一般表現の文言整理は将来の
+  改定時（設計改定＋司令塔再裁定つき）に実施。**実装解釈は §3.2 の確定表が
+  唯一の正で一意**（文言整理の残置は実装を曖昧にしない）。
+- **実装・点火前提**: §4a の 4 段[人]ゲート（App26 CU／event 台帳 migration／
+  flag 投入／本番点火）は**凍結条件ではない**。
+- **以後の変更は設計改定＋司令塔の再裁定を要する**。
