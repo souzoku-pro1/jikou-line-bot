@@ -83,6 +83,9 @@
 - R2: **防壁は凍結票の既存機構をそのまま流用し、新しい防壁を作らない**——
   封筒冪等（plan_hash・open 限定回収）・§2C 実行時フィルタ・§4B plan_idem／
   m1_fingerprint・§2 fail-closed（problems→起票なし）。
+  **【fix2・R2 文言の限定】**本要件は「**plan 内容・M1 領域の防壁を新設しない**」
+  の意に限定する——engagement_event 台帳（§3.2）は**新起動経路（受任フック）固有
+  の冪等制御**であり、plan/M1 の防壁ではなく**新設が正当**（誤読防止の明記）。
 - R3: flag（既定 OFF）配下。`SHOKUMU_PLAN_ENABLED`（語彙・plan 生成の親 flag）が
   OFF なら自動起動も**構造的に不発**（二重ゲート・親 flag 優位）。
 - R4: 失敗・結果不明は封筒規律準拠で回収する（沈黙させない・§4）。
@@ -146,18 +149,61 @@
     判定/起票の成否と独立。起票なしの判定は通知失敗でも維持）。
 - **二重起動の冪等＝裁定②確定: (B) 基礎＋決定的 engagement_event_id**
   （fix1・FB2-02 具体化）:
-  - 受任確定の成立ごとに**決定的 engagement_event_id**（案件 ID＋受任確定の
-    成立識別から決定的に構成・乱数不使用）を発番し、**イベント処理状態**を
-    永続化する。**結果状態は閉集合
+  - 受任確定の成立ごとに**決定的 engagement_event_id**（乱数不使用）を発番し、
+    **イベント処理状態**を永続化する。**結果状態は閉集合
     `{pending / problem_held / envelope_filed / failed / reconciled}`**。
+  - **【fix2・FB2-05】engagement_event_id の構成を凍結**:
+    - **grammar**: `shokumu_engagement:{case_record_id}:{generation}`——
+      固定 namespace（ASCII リテラル `shokumu_engagement`）＋ App26 record ID
+      （数字列 `^[0-9]{1,10}$`・既存 case grammar と逐語一致）＋ 受任世代
+      generation（正の整数・前ゼロなし。初回受任確定=1・結合状態機械が
+      再成立ごとに +1 で採番する単調増加値）。**区切りはコロン・この順序で
+      固定**（要素追加・順序変更は本 DRAFT 改定と同時のみ）。
+    - **documentID・決済 ID の訂正・差替えは新 event_id を生成しない**——
+      同一 generation の事実材料が変わった場合は「**内容不一致の要確認**」へ
+      倒す（同一受任の二重起票経路を閉鎖。世代が進むのは結合状態機械が
+      受任確定の再成立を正規に判定した場合のみ）。
+  - **【fix2・FB2-05】状態遷移表（凍結・これが唯一の正）**:
+
+    | from | to | 実行主体 |
+    |---|---|---|
+    | （新規） | pending | 受任フック（成立時の先行確保） |
+    | pending | problem_held | 自動起動経路（build_plan 条件不充足） |
+    | pending | envelope_filed | 自動起動経路（封筒作成成功） |
+    | pending | failed | 自動起動経路（実行失敗・例外） |
+    | failed | envelope_filed | 回収成功（再実行・封筒冪等の open 回収） |
+    | failed | reconciled | reconcile（照合で解消を確認） |
+    | problem_held | reconciled | reconcile（語彙起動で封筒作成後の照合収束） |
+
+    - **terminal 状態 = `envelope_filed` / `reconciled`**（以後の遷移なし）。
+    - **同一状態への冪等再実行 = no-op**（重複 webhook・再実行で状態は変わらない）。
+    - **禁止遷移（表にない遷移）= write 0＋要確認通知**（黙って上書きしない）。
+    - **CAS/UNIQUE 競合・不明状態 = fail-closed**（起票せず要確認へ）。
+    - **problem_held / failed からの自動起票はしない**——回収は**人の語彙起動**
+      または **reconcile の通知**経由のみ（機械の自動再試行を作らない）。
   - ~~単純 boolean（発火済みフラグ）~~ **不採用**——boolean では problem_held
     （条件未充足で起票見送り）後に「発火済み」となり**回収不能**になる（状態
     閉集合なら problem_held を reconcile・再判定の対象にできる）。
-  - **状態保存と封筒作成の競合・部分失敗**: 状態を `pending` で先に確保
-    （engagement_event_id の UNIQUE で同時発火を一方に収束）→ 封筒作成 →
-    `envelope_filed` へ更新。封筒作成後・状態更新前のクラッシュは、再実行時に
-    封筒冪等（open 限定回収）が既存封筒を返すため**二重起票なしで状態を追記
-    できる**（reconcile の照合対象・§4）。
+  - **状態保存と封筒作成の競合・部分失敗＝【fix2・FB2-06】処理順を固定し
+    決定的 join を確立**:
+    1. `pending` 確保（engagement_event_id の UNIQUE で同時発火を一方に収束）
+    2. `build_plan`（read-only）
+    3. **plan_hash 確定**
+    4. **封筒 idem キー（`shokumu_plan:{case}:{plan_hash}`）を台帳へ先行保存**
+    5. 封筒作成（`file_plan_envelope`）
+    6. `envelope_filed` へ更新
+    ——**イベント台帳と App30 の間に原子的トランザクションは存在しない前提**で、
+    手順 4 の先行保存が台帳↔封筒の**決定的 join キー**になる（封筒作成後・状態
+    更新前のクラッシュでも、台帳の idem キーから封筒を一意に照合できる）。
+    - **reconcile の照合**: 台帳の idem キーで App30 を **open/terminal を問わず
+      read-only 検索**（決定的 join）。**既存封筒が terminal ＝新規自動起票せず
+      `reconciled` へ収束**。検索結果 **0 件＝回収続行**（failed 系の再実行対象）・
+      **1 件＝状態収束**・**複数件・内容不一致＝自動統合・自動再発行せず要確認**。
+    - **既存の open 限定回収規律（凍結票 `file_plan_envelope`）は不変**——
+      本節の「terminal 問わず検索」は reconcile の**読取専用照合**にのみ適用され、
+      起票側の冪等（open 限定回収）には手を入れない。
+    - **ACK-loss テスト**（手順 5-6 間クラッシュ・4-5 間クラッシュの両面で
+      二重起票ゼロ・reconcile 収束を実測）を**実装票の受け入れ条件へ追加**。
   - **人が語彙から起動する既存経路は別扱いで常設維持**（本状態機械のゲート外・
     いつでも人が再起動できる回収口）。
 
@@ -186,7 +232,16 @@
   対応封筒（App30）」の三面照合**を**日次**で実行し、不整合（受任確定済みなのに
   状態なし・pending/problem_held の滞留・envelope_filed なのに封筒不在等）を
   **検出時は通知・`problem_held`/`reconciled` への held 化まで**とする
-  （**自動起票はしない**——起票は次のフック発火 or 語彙経路の人の判断）。
+  （**自動起票はしない**——起票は~~次のフック発火 or~~ **語彙経路の人の判断のみ**。
+  【fix2・FB2-07】「次のフック発火」は撤回——同一受任 generation のフックは
+  一度きり〔engagement_event_id の一回性〕であり再発火は設計上存在しない。
+  起票の再試行入口は人の語彙経路のみ）。
+- **【fix2・FB2-07】状態意味の分離（本文固定）**:
+  - `problem_held` = **条件不充足で人の対応待ち**（build_plan の problems・
+    §3.0(vii) の相関系。対応後の起票は人の語彙経路）。
+  - `failed` = **実行失敗で回収待ち**（例外・kintone 不達。回収=再実行 or
+    reconcile 照合）。
+  - `reconciled` = **照合完了・新規自動起票が不要と確認された終端**。
 
 ## 5. 裁定欄（司令塔）
 
@@ -220,3 +275,26 @@
   込み・(b)(c) 不採用理由を §3.1 へ転記）。**裁定④**: reconcile 導入（三面照合・
   日次・通知/held まで）。**裁定⑤**: 初版は相続放棄のみ。
 - 裁定欄 5 件を全件 RESOLVED 化（各行に裁定＋1行理由）。
+
+## 8. fix2 改定記録（R-FB2-D2・2026-08-12・全所見 ACCEPT）
+
+- **FB2-05（HIGH）**: engagement_event_id を凍結——grammar
+  `shokumu_engagement:{case_record_id}:{generation}`（固定 namespace・数字列
+  case grammar 逐語一致・世代=正の整数の単調増加・コロン区切り・順序固定）。
+  documentID/決済 ID の訂正・差替えは**新 event_id を生成せず「内容不一致の
+  要確認」**（二重起票経路の閉鎖）。**状態遷移表を凍結**（許可遷移7行・実行主体・
+  terminal={envelope_filed, reconciled}・同一状態冪等 no-op・禁止遷移=write 0＋
+  要確認通知・CAS/UNIQUE 競合と不明状態=fail-closed・problem_held/failed からの
+  自動起票なし）。
+- **FB2-06（HIGH）**: イベント台帳×封筒層の**決定的 join** を確立——処理順を
+  6 段（pending 確保→build_plan→plan_hash 確定→**封筒 idem キーの台帳先行保存**→
+  封筒作成→envelope_filed）で固定。reconcile は台帳 idem キーで open/terminal
+  問わず read-only 検索（0 件=回収続行・1 件=状態収束・複数/内容不一致=自動統合
+  せず要確認・terminal 既存=reconciled 収束）。**原子的 txn なし前提の ACK-loss
+  テストを実装票受け入れ条件へ追加**。凍結票の open 限定回収規律は不変と明記。
+- **FB2-07（MED）**: 状態意味の分離を本文固定（problem_held=人の対応待ち／
+  failed=回収待ち／reconciled=照合完了の終端）。「次のフック発火」文言を撤回
+  （取り消し線＋理由=同一 generation の再発火は設計上存在しない。起票再試行は
+  人の語彙経路のみ）。
+- **R2 文言の限定**: 「新しい防壁を作らない」を plan 内容・M1 領域に限定——
+  engagement_event 台帳は新起動経路固有の冪等制御で新設が正当（誤読防止）。
