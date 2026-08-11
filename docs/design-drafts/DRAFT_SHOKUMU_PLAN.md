@@ -24,14 +24,17 @@
   §8-6 改定記録／
   fix7: R-SHOKUMU-PLAN-D7 反映・2026-08-11・司令塔裁定——H01〔count 併合を
   channel_json 完成前へ・byte 一致不変条件〕・M01〔有効=コードポイント順〕・
-  §6-44/46 増補＋1:1 宣言更新・§8-7 改定記録）
+  §6-44/46 増補＋1:1 宣言更新・§8-7 改定記録／
+  fix8: R-SHOKUMU-PLAN-D8 反映・2026-08-11・最小同期——H02〔§2D 監査メタ閉集合へ
+  m1_fingerprint を追加し §4B と同期・受入条件 6 点〕・§6-48/49 増補＋1:1 宣言
+  更新・§8-8 改定記録）
 - 盤面: 8月構想・項目1。判断部品はすべて既存——本票は**結線の設計**であり新エンジンを作らない。
 - 実装現実の実査基盤（2026-08-10・read-only・main `6312112`）:
   `koseki_chain.py`（F5 判定）／`docs/souzoku-houki/10-koseki-matrix.md`（H系列③・凍結）／
   `dispatch_bot/shokumu.py`＋`channels/shokumu_seikyu.py`（M1・実物検収済み）／
   `hub/derivation_models.py`・`hub/heir_projection.py`（P3 系）／`review_resolve.py`（App33 参照・関所型）／
   `hub/heir_envelope.py`（封筒冪等の型）。
-- 次レビュー: R-SHOKUMU-PLAN-D8（**凍結判定の再走**。経緯: D1=凍結不適格→fix1→
+- 次レビュー: R-SHOKUMU-PLAN-D9（**凍結判定・H02 同期確認の軽量再走**。経緯: D1=凍結不適格→fix1→
   D2=H01/H02/H03+M01〜M04〔M01 のみ RESOLVED〕→fix2。対応は §8 改定記録）。
 
 ## 0. 原則（本票の背骨・§2 で構造化）
@@ -322,11 +325,30 @@ plan_hash の (4) に反映）だが、**App30 の封筒・M1 起票状態の照
     （file_from_pending の `KINTONE_APP_ID` は時効ユニット向けの同型・ユニット別
     env の選択は unit から解決）。
   - `ユニット種別`: 案件由来（heir_envelope `_unit_for_case` と同一写像）。
-  - **plan 経路の監査メタ構造**: `{"filed_by": "shokumu_plan", "plan_envelope_no":
-    <App30 record_id>, "plan_hash": <hex64>, "plan_idem": <§4B の M1 冪等キー>,
-    "plan_lines": [<line_type>...]}`（fix3 H02: 束ねに含めた行類型集合の記録）
+  - **plan 経路の監査メタ構造（fix3→fix8 で §4B と同期・両時点残置）**:
+    - （履歴・fix3〜fix7）旧閉集合は `m1_fingerprint` を含まなかった——**fix8 で
+      同期**（fix5/6 が §4B 側へ導入した保存キーの §2D への反映漏れ＝D8 H02）。
+    - **fix8 正（閉集合）**:
+      ```json
+      {
+        "filed_by": "shokumu_plan",
+        "plan_envelope_no": "<App30 record_id>",
+        "plan_hash": "<hex64>",
+        "plan_idem": "<§4B のキー>",
+        "m1_fingerprint": "<hex64>",
+        "plan_lines": ["<line_type>", "..."]
+      }
+      ```
     ——`_audit_meta`（command_id 基点）とはキーを分ける（plan 起票は LINE 指示
     command でなく封筒確定が起点のため。閉集合・値域は §4B で pin）。
+    **受入条件（fix8・実装票の必須要件）**:
+    1. 監査メタのキー閉集合に **`m1_fingerprint` が存在**する。
+    2. grammar は `^[0-9a-f]{64}$`。
+    3. **App30 create 時に保存**する（起票と同時・後書きしない）。
+    4. plan_idem HIT 時の再照合は**既存保存値を JSON parse して完全一致比較**。
+    5. **欠落・不正 grammar・parse 不能は skip 回収せず要確認へ落とす**（安全側——
+       比較不能な既存下書きを「一致」扱いにしない）。
+    6. **§2D と §4B の監査メタキー集合が byte 水準で一致**する構造 pin（§6-48）。
   - **`_fields_shokumu_seikyu` 変更時の同期方式**: 実装票で
     **共用関数化を第一候補**（`_fields_shokumu_seikyu` を「channel_json＋監査メタを
     引数に取る公開ヘルパ」へ挙動同一で抽出し両経路が呼ぶ）。抽出を見送る場合は
@@ -807,12 +829,23 @@ H系列③ §1 の旧記述「受任確定と同時に M1 職務上請求を自�
     snapshot 自身のキー（line_type/person_id/市区町村名/app31_record_id/有効/
     fallback）のみを参照する（candidates 側の status/count 等への参照ゼロ・AST pin）。
 
-**宣言（fix6→fix7 で更新）**: §6 対照（1〜47・fix7 増補〔44 の 4 点・46 の 3 形〕
-込み）は **H01（plan_hash／m1_fingerprint の各保証・channel_json 完成前併合と
-byte 一致不変条件）・M01（canonical 順序の決定性・`有効` コードポイント順を含む
-完全 tie-break）の保証項目と 1:1** である——保証の各文（§4-v2・§4-v2.1・§4A
-全順序・§4B fix6/fix7・§4-v2 (7) fix7）に対応する対照が本節に存在し、
-対照の無い保証・保証の無い対照は存在しない。
+**fix8 追加（H02・監査メタ同期）**:
+
+48. **監査メタ閉集合の §2D/§4B 同期 pin**: §2D の監査メタキー閉集合（filed_by/
+    plan_envelope_no/plan_hash/plan_idem/m1_fingerprint/plan_lines）と §4B の
+    保存キー集合が **byte 水準で一致**する（単一の定数を両所が参照する実装を
+    含めて pin——二重定義の黙った乖離を構造的に遮断）。
+49. **m1_fingerprint の照合安全側**: 既存 M1 の監査メタで `m1_fingerprint` が
+    **欠落・grammar 不正（hex64 外）・JSON parse 不能**のいずれか → **skip 回収
+    せず当該候補を要確認**へ（比較不能を「一致」扱いにしない・parametrize）。
+
+**宣言（fix6→fix7→fix8 で更新）**: §6 対照（1〜49・fix7 増補〔44 の 4 点・46 の
+3 形〕・fix8 増補〔48・49〕込み）は **H01（plan_hash／m1_fingerprint の各保証・
+channel_json 完成前併合と byte 一致不変条件）・M01（canonical 順序の決定性・
+`有効` コードポイント順を含む完全 tie-break）・H02（監査メタ閉集合の §2D/§4B
+同期と保存・照合の安全側）の保証項目と 1:1** である——保証の各文（§4-v2・
+§4-v2.1・§4A 全順序・§4B fix6/fix7・§4-v2 (7) fix7・§2D fix8 受入条件）に
+対応する対照が本節に存在し、対照の無い保証・保証の無い対照は存在しない。
 
 ## 7. スコープ外（明記）
 
@@ -1003,4 +1036,20 @@ D7 判定: CHANGES_REQUIRED（H01/M01=HIGH・残余 2 点のみ）。fix7 で反
 - **1:1 宣言を更新**（§6 対照〔34〜47＋増補〕と H01/M01 保証の対応が過不足なく
   存在することを再宣言）。
 - 次レビュー: **R-SHOKUMU-PLAN-D8**（**凍結判定の再走**・BASE=origin/main
-  `6312112`・TARGET=shokumu-plan-design の fix7 commit）。
+  `6312112`・TARGET=shokumu-plan-design の fix7 commit）。→ 実施済み・結果は §8-8。
+
+## 8-8. fix8 改定記録（R-SHOKUMU-PLAN-D8・2026-08-11・最小同期。両時点残置）
+
+D8 判定: CHANGES_REQUIRED——ただし **H01/M01 は両方 RESOLVED**（再改定禁止）。
+残余は新規 **H02（§2D 監査メタ閉集合と m1_fingerprint 保存の同期漏れ）の 1 点のみ**。
+fix8 で反映:
+
+- **H02**: §2D の監査メタ閉集合へ `m1_fingerprint`（hex64）を追加し §4B と同期
+  （fix3〜fix7 の旧閉集合は「fix8 で同期」明記の上残置）。受入条件 6 点を明示——
+  キー存在／grammar `^[0-9a-f]{64}$`／App30 create 時保存／HIT 再照合は既存保存値の
+  JSON parse 完全一致／欠落・不正 grammar・parse 不能は skip せず要確認（安全側）／
+  §2D と §4B のキー集合 byte 一致の構造 pin。
+- **§6 増補**: 48（閉集合同期 pin）・49（fingerprint 欠落/不正/parse 不能→要確認）。
+  1:1 宣言を H02 込みへ更新。
+- 次レビュー: **R-SHOKUMU-PLAN-D9**（**凍結判定・H02 同期確認の軽量再走**・
+  BASE=origin/main `6312112`・TARGET=shokumu-plan-design の fix8 commit）。
