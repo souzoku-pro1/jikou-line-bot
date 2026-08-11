@@ -9,8 +9,15 @@ import httpx
 import anthropic
 from pydantic import BaseModel, Field, AliasChoices
 from fastapi import FastAPI, Request, HTTPException, UploadFile, File, Form, BackgroundTasks
+from fastapi import APIRouter, Depends
 
 app = FastAPI()
+
+# RV-0102-PREP: /scan・/ocr/fixed-asset の署名 opt-in 事前配線用 router。
+# BodyCachingRoute は flag ON かつ署名ヘッダ在時のみ生 body をキャッシュ
+# （flag OFF/署名皆無は完全 passthrough＝現行挙動と byte 同一）。
+from hub.service_auth import BodyCachingRoute, optional_signature_guard
+signed_optin_router = APIRouter(route_class=BodyCachingRoute)
 
 from cloudsign_webhook import router as cloudsign_router
 from document_webhook import router as document_router
@@ -953,8 +960,9 @@ async def _update_kintone_record(record_id: str, extracted: dict) -> None:
             raise Exception(f"kintone更新エラー {resp.status_code}: {resp.text}")
 
 
-@app.post("/ocr/fixed-asset")
-async def ocr_fixed_asset(file: UploadFile = File(...),
+@signed_optin_router.post("/ocr/fixed-asset")
+async def ocr_fixed_asset(_auth: None = Depends(optional_signature_guard()),
+                          file: UploadFile = File(...),
                           case_hint: str | None = Form(default=None)):
     """
     PDFをアップロードすると固定資産税評価額・年度をOCRで抽出し
@@ -1167,8 +1175,9 @@ async def _post_scan_to_kintone(app_id: str, api_token: str, fields: dict) -> st
         return resp.json()["id"]
 
 
-@app.post("/scan")
-async def scan(req: ScanRequest):
+@signed_optin_router.post("/scan")
+async def scan(req: ScanRequest,
+               _auth: None = Depends(optional_signature_guard())):
     """
     GASからbase64エンコードされたPDFとフォルダ名を受け取り、
     OCR → Claude抽出 → kintone登録する。
@@ -1234,6 +1243,13 @@ async def scan(req: ScanRequest):
         "kintone_record_id": record_id,
         "extracted": extracted,
     }
+
+
+# RV-0102-PREP: /scan・/ocr/fixed-asset を署名 opt-in router 経由で公開
+# （path・handler・応答は従来と同一。追加は前段の optional_signature_guard のみ）
+app.include_router(signed_optin_router)
+
+
 def _stripe_journal_enabled() -> bool:
     """InboundEvent journal（P1-005a・D10）。既定OFF＝完全に従来挙動。
     ONへの切替は env STRIPE_EVENT_JOURNAL_ENABLED=1（大野が投入）"""

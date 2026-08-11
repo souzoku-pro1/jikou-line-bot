@@ -426,12 +426,15 @@ class TestCustomerBotUnaffected(unittest.TestCase):
             p = getattr(r, "path", "")
             if p:
                 by_path.setdefault(p, r)
-        # ingest 5入口は BodyCachingRoute
-        for p in INGEST_PATHS:
+        # ingest 5入口＋署名 opt-in 2入口（RV-0102-PREP で /scan・/ocr/fixed-asset を
+        # 事前配線＝適用集合の意図的拡張。multipart の署名検証に BodyCachingRoute が
+        # 必須のため。flag OFF/署名皆無は passthrough＝挙動不変）は BodyCachingRoute
+        for p in INGEST_PATHS + ["/scan", "/ocr/fixed-asset"]:
             self.assertIn(p, by_path, p)
             self.assertIsInstance(by_path[p], svc.BodyCachingRoute, p)
-        # 顧客Bot・その他は BodyCachingRoute でない（結線が漏れていない）
-        for p in ["/webhook", "/health", "/scan", "/ocr/fixed-asset"]:
+        # 顧客Bot・その他は BodyCachingRoute でない（結線が漏れていない・
+        # 顧客 Bot 非適用の不変量は維持）
+        for p in ["/webhook", "/health"]:
             self.assertNotIsInstance(by_path.get(p), svc.BodyCachingRoute, p)
 
     def test_process_line_event_head_smoke(self):
