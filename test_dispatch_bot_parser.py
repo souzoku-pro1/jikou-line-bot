@@ -48,13 +48,14 @@ class TestRegistry(unittest.TestCase):
     def test_registered_tasks(self):
         """S5-2.5 で review_resolve・R4-2b で person_merge・R4-2e で
         person_confirm 追加（2026-07-07 裁定）・P3-003-CMD で heir_derivation
-        追加（2026-07-30・時点ピンの追随は正当）。それ以外は未登録のまま。
+        追加（2026-07-30）・SHOKUMU-PLAN で shokumu_plan 追加（2026-08-11・
+        いずれも時点ピンの追随は正当）。それ以外は未登録のまま。
         heir_derivation は flag OFF の間 catalog に載らない（登録はされる・
         掲載可視性は test_p3_003_cmd_impl 側で検査）"""
         self.assertEqual(set(registry.TASK_REGISTRY),
                          {"soufu_annai", "shokumu_seikyu", "sortation_assign",
                           "review_resolve", "person_merge", "person_confirm",
-                          "heir_derivation"})
+                          "heir_derivation", "shokumu_plan"})
         spec = registry.get_task("soufu_annai")
         self.assertFalse(spec.answer_only)
         self.assertEqual(spec.destination, "app30")
