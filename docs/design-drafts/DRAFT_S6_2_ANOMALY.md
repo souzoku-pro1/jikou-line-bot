@@ -52,9 +52,26 @@
   - **内容 hash**: 正規化した行内容（日付・摘要・金額・残高）の hash を別途保持し、
     **OCR 訂正・再読解で内容が変わった場合は同一 row locator の行を supersede**
     （追記型・旧行は無効化マークで残置＝二重計上せず履歴も失わない）。
-  - **再送と別原本の区別**: 同一 SHA 再送＝完全 skip（idempotent）・別 SHA で
-    account/期間が重なる場合は「別原本の重複疑い」として検知系とは別の要確認へ
-    （機械はどちらが正か決めない）。
+  - ~~再送と別原本の区別: 同一 SHA 再送＝完全 skip（idempotent）・別 SHA で
+    account/期間が重なる場合は「別原本の重複疑い」として検知系とは別の要確認へ~~
+    **【fix2・S6-2-06 で精密化・初版の「同一 SHA＝完全 skip」を撤回（部分取込の
+    再送を skip すると不足行が永久に欠落する穴）】3 概念を分離する**:
+    - **content identity** = SHA-256（バイト列の同一性）
+    - **provenance** = source doc ID（Drive file ID 等・「どこから来たか」）
+    - **ingestion 状態** = 原本単位の取込状態 `open（取込中/部分）→ complete →
+      failed`
+    - 組合せ規則:
+      1. **同一 SHA の再送**: ingestion 状態が **complete のときのみ skip**。
+         **open / partial / failed は既存行 identity と照合して不足行のみ回収**
+         （部分取込の再送が完了経路になる）。
+      2. **同一 doc ID＋別 SHA**: **原本差替え**（再スキャン・訂正版）として
+         旧原本由来の行を supersede（追記型・§3 の内容 hash 規則と同じ型）。
+      3. **別 doc ID＋同一 SHA**: 同一内容が別経路から到着（コピー・再アップ
+         ロード）——収束（単一原本へ束ねる）か重複疑い（要確認）かは**裁定⑩**。
+    - **部分失敗の回収点を揃える**: 原本保存（行データ化）と検知通知の両段は
+      **同じ ingestion 状態機械上の回収点**を共有する（原本 complete 未満で
+      検知だけ先行しない・検知の reconcile〔S6-2-04〕は ingestion complete を
+      前提条件に照合する＝取込途中の部分データで誤検知しない）。
 
 ## 4. 異常検知（スクリーニング規則）
 
@@ -122,6 +139,7 @@
 | ⑦ | 低 confidence 行の扱い（fix1・S6-2-05） | (A) 判定不能行として件数通知のみ（検知には使わない） (B) 閾値以上の金額行のみ低 confidence でも要確認へ載せる（見逃しより誤検知側） | **OPEN** |
 | ⑧ | 検知永続の器（fix1・S6-2-04） | (A) DB 台帳（検知 1 行=1 レコード・状態列） (B) kintone 新 App（可視性優先） | **OPEN** |
 | ⑨ | OCR 訂正 supersede の運用（fix1・S6-2-03） | 再読解で内容が変わった行の検知は (A) 自動再判定（旧検知は closed へ機械遷移させず要確認注記） (B) 人手再スクリーニング指示のみ | **OPEN** |
+| ⑩ | 別 doc ID＋同一 SHA の扱い（fix2・S6-2-06） | (A) 収束（単一原本へ束ね・provenance を複数保持） (B) 重複疑いとして要確認（機械は束ねない） | **OPEN** |
 
 ## 7. 両時点残置
 
@@ -141,3 +159,13 @@
   人のみ）・ACK 不明 reconcile・並行実行の UNIQUE 収束を §4 へ追加。器は裁定⑧。
 - **S6-2-05**: 低 confidence 行の扱いを裁定⑦として新設（初版は「低 confidence で
   保持」までで検知への使用可否が未定だった）。
+
+## 9. fix2 改定記録（R-DOCS-BATCH-1-D2・2026-08-11・前巡全所見 RESOLVED）
+
+- **S6-2-06（裁定どおり）**: content identity（SHA-256）／provenance（doc ID）／
+  ingestion 状態（open/complete/failed）の**3 分離**へ精密化。fix1 の「同一 SHA
+  再送＝完全 skip」を**撤回**（部分取込の再送で不足行が永久欠落する穴）——
+  complete のみ skip・open/partial は既存行 identity 照合で不足行のみ回収。
+  同一 doc ID＋別 SHA＝原本差替え supersede。別 doc ID＋同一 SHA＝裁定⑩新設。
+  原本保存と検知通知の部分失敗回収点を同一 ingestion 状態機械上に揃える
+  （検知 reconcile は ingestion complete を前提条件化）。
