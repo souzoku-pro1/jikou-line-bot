@@ -162,12 +162,12 @@
 | # | 論点 | 選択肢 | 状態 |
 |---|---|---|---|
 | ① | flag 方式 | (A) 新設 `PERSON_MERGE_SOFT_ENABLED`（旧 flag と併存・両 ON で soft が優先） (B) `PERSON_MERGE_ENABLED` の意味を soft へ切替（旧物理削除 route はコードごと消えるため flag 追加なし） | **RESOLVED＝(B)**（fix2・RV08-04 司令塔裁定・§4 の全象限表参照） |
-| ② | 無効化行の下流除外の実装単位 | (A) 各 consumer の検索クエリへ except 条件を横展開 (B) App34 読取の共通ヘルパを新設し一点除外（ヘルパ化は影響大＝実装票で rg 全数調査後に裁定） | **OPEN** |
-| ③ | 無効化フィールドの名称・値 | 上記 3.1 案（統合状態/統合先人物ID/統合日時）の承認 or 修正（work-log 注記の「『統合済み無効』状態の区別」要求を満たす形） | **OPEN** |
-| ④ | 過去削除分の復元 tool の置き場 | (A) 手動 CLI（08 手順書拡張・実行は[人]） (B) 関所語彙（封筒起票→確定で復元） | **OPEN** |
-| ⑤ | 勝者転記の巻き戻し範囲（unmerge 時） | (A) 転記フィールドの機械巻き戻しはしない（監査JSON を見て人手） (B) 監査JSON の差分から機械提案（適用は人） | **OPEN** |
-| ⑥ | **App34 ID 保持箇所の全数と保存先の意味論**（fix1・RV08-01） | rg 全数調査で「App34 `$id` を保持する全 consumer・全保存先」を列挙し、各保存先の意味論を**履歴（統合時点の値として凍結・付け替えない）／current（勝者へ付け替える）／種類別（親エッジ・App36 導出元人物ID・監査JSON 等の個別裁定）**へ分類する。**本調査の完了を設計凍結の条件とする** | **OPEN** |
-| ⑦ | 部分失敗回収の器（fix1・RV08-02） | operation_id・preimage/postimage の保存先＝(A) 監査JSON＋封筒 detail のみ (B) DB 台帳併用（immutable 追記型） | **OPEN** |
+| ② | 無効化行の下流除外の実装単位 | (A) 各 consumer へ横展開 (B) 共通ヘルパ一点除外 | **RESOLVED＝(B) 既定**（fix5 裁定——単一の正の確立パターン。⑥の全数調査で影響過大と実装票が判断した場合は (A) を対案提示可） |
+| ③ | 無効化フィールドの名称・値 | §3.1 案（統合状態/統合先人物ID/統合日時） | **RESOLVED＝§3.1 案承認**（fix5 裁定——「統合済み無効」の区別要求を満たす） |
+| ④ | 過去削除分の復元 tool の置き場 | (A) 手動 CLI (B) 関所語彙 | **RESOLVED＝(A) 手動 CLI**（fix5 裁定——過去削除分は低頻度・08 手順書拡張で足り、関所語彙の新設コストを避ける） |
+| ⑤ | 勝者転記の巻き戻し範囲（unmerge 時） | (A) 人手のみ (B) 機械提案 | **RESOLVED＝postimage 完全一致のみ自動巻き戻し候補・変更検出は要確認**（fix5 裁定——§3.2a と同一の照合規律へ統一・盲目巻き戻しをしない） |
+| ⑥ | **App34 ID 保持箇所の全数と保存先の意味論**（fix1・RV08-01） | rg 全数調査＋履歴/current/種類別の分類・**調査完了が凍結条件** | **RESOLVED＝§10 に全数調査を収載（fix5・本票内で実施）**。App36 `導出元人物ID` は**「履歴として敗者 ID を残す＝付け替えない」を既定方針**。個別論点は §10 の選択肢欄（凍結条件は**充足**） |
+| ⑦ | 部分失敗回収の器（fix1・RV08-02） | (A) 監査JSON＋封筒 detail (B) DB 台帳併用 | **RESOLVED＝(B) DB 台帳**（fix5 裁定——immutable 追記・P3-001 流儀。kintone 添付は検索・機械照合に不向き） |
 
 ## 7. 両時点残置
 
@@ -193,3 +193,56 @@
   現行挙動不変」を**撤回**（flag ON の挙動変更〔物理削除→soft〕は意図的な安全
   方向の変更と明記）し、flag×コード状態の全象限表（fallback 経路の不存在込み）を
   追加。
+
+## 10. App34 ID 保持箇所の全数調査（fix5・裁定⑥の収載・2026-08-11 rg 実測）
+
+対象: 非テストコード全体（`人物ID`／`person_id`／`decedent_person_id`／
+`input_person_ids` の rg 全数）。ヒットファイル: config.py・
+dispatch_bot/heir_derive_task.py・heir_derivation.py・hub/derivation_models.py・
+hub/heir_envelope.py・hub/heir_projection.py・hub/shokumu_plan.py・
+hub/webapp_kinship_view.py・kinship_graph.py・koseki_person_sync.py・
+person_merge_exec.py（＋alembic migration・tracking_pg_harness＝schema/合成で対象外）。
+
+### 10.1 保存先（App34 ID が永続化される場所）と意味論分類
+
+| 保存先 | 保持形 | 分類 | 統合時の扱い |
+|---|---|---|---|
+| App34 親エッジ4（父/母/養父/養母人物ID） | kintone 恒常 | **current** | 勝者へ付け替え（既存 `_find_referrers`/`PARENT_EDGE_FIELDS` を維持） |
+| App36 `導出元人物ID`（heir_projection :615 write・:427/:609 検索＝冪等キー片翼） | kintone 恒常 | **履歴（既定方針・fix5 裁定）** | **付け替えない**＝敗者 ID を残す。正しい反映は再導出→新 run→confirmed の既存原理（下 10.2-i） |
+| DerivationRun（DB immutable）: `decedent_person_id`・`input_person_ids`・`input_person_revisions` キー・`result_payload.heirs[].person_id` | DB 恒常 | **履歴** | 付け替え禁止は immutable trigger が構造保証。再導出が正 |
+| App30 封筒 detail: person_merge `勝者候補/敗者候補/ペアキー` | kintone 恒常 | **履歴** | 統合裁定の記録・不変（`_already_filed` の再起票抑止にも使用） |
+| App30 封筒 detail: heir_derivation `保留人物ID`（DETAIL_HELD_PERSONS_KEY） | kintone 恒常 | **種類別**（10.2-ii） | 記録としては履歴・未クローズ封筒の再確定時は再検証で遮断 |
+| App30 封筒 detail: shokumu_plan candidates `person_id`・`plan_idem` キー・M1 target | kintone 恒常 | **履歴＋実行時再計算** | 確定時 stale 再計算が App34 を読み直すため、無効化は有効行 filter（RV08-03）で自然反映 |
+| 監査JSON（App30 成果物添付・敗者レコード verbatim/参照付け替え計画） | 添付 | **履歴** | verbatim 保持・付け替え禁止（復元の原資） |
+
+### 10.2 個別論点（停止せず選択肢提示・実装票で確定）
+
+- **(i) App36 導出元人物ID が敗者 ID のまま残る帰結**: shokumu_plan §2B-5
+  （App36 の person 集合×run payload の一致検証）は敗者 ID 残置で**不一致＝条件
+  未充足へ安全側に落ちる**（自然遮断・実測済みの 6 条件設計）。選択肢:
+  (a) この自然遮断のみで足りるとする（既定案・追加実装なし）
+  (b) 無効化行を指す App36 行の可視化検査（daily_healthcheck 監査 or 関所警告）を
+  追加する——採否は実装票。
+- **(ii) 未クローズ封筒の保留人物ID**: 再確定（resumed 経路）の phase 1 再検証で
+  当該 person が無効化行なら**要確認へ倒す**（RV08-03 の「直接 get の状態確認」
+  規約に含める・既定案）。対案=封筒 detail の書き換え（不採用推奨・履歴改変になる）。
+- **(iii) koseki_person_sync の冪等キー（戸籍レコードID＋氏名）**: 無効化行が
+  冪等ヒットした場合に**再生成を抑止する現行挙動を維持**（重複人物の再出現を
+  防ぐ・既定案）か、有効行のみ照合（無効化後に再生成を許す）か——実装票で
+  kinship 側の要請と併せ確定。
+
+### 10.3 実行時 read のみの consumer（保存しない・RV08-03 有効行 filter の適用対象）
+
+kinship_graph／webapp_kinship_view／heir_derivation（HeirPerson.record_id 読取）／
+heir_derive_task（App34 全件読取→run 起票）／shokumu_plan `_load_persons`／
+person_confirm 系。いずれも保存先ではなく、裁定②(B) の共通ヘルパ一点除外の
+適用面（§4 の新 consumer 機械検査の対象リスト初期値）。
+
+## 11. fix5 改定記録（司令塔裁定の一括反映・2026-08-11・D5=4票 DESIGN_OK 後）
+
+- 裁定②〜⑦を RESOLVED 化（§6 の各行に裁定内容と1行理由を記載）。
+- **裁定⑥は本 fix 内で rg 全数調査を実施し §10 へ収載**——保存先7類型の
+  履歴/current/種類別分類・App36 `導出元人物ID`=「履歴として敗者 ID を残す＝
+  付け替えない」の既定方針・個別論点3件（§10.2・停止せず選択肢提示）。
+- **凍結条件の充足状態**: 裁定⑥の凍結条件（全数調査の収載）は**充足**。
+  未充足の残条件なし（§5 の[人]ゲート2件は実装着手前提であり凍結条件ではない）。
