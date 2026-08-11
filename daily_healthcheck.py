@@ -358,6 +358,26 @@ async def check_unknown_providers() -> list[str]:
 _APP36_AUDIT_PAGE = 500
 
 
+def _is_missing_decision_table(exc) -> bool:
+    """H11A-01: 「heir_confirmation_decision テーブル不存在（migration 未適用）」
+    と厳密に識別できた場合のみ True（＝静かにスキップしてよい）。
+
+    - PostgreSQL: SQLSTATE 42P01（undefined_table）を orig 属性から判定
+      （psycopg3 は sqlstate・psycopg2 は pgcode）
+    - SQLite: 「no such table: heir_confirmation_decision」の限定一致
+
+    それ以外の ProgrammingError/OperationalError（権限不足・schema 不整合・
+    列欠落・DB 障害等）は False＝呼出し側が再送出し、run_healthcheck の
+    「実行自体が失敗: <分類名>」警報へ合流させる（メッセージへのテーブル名
+    混入だけで不存在と誤認しない）。
+    """
+    orig = getattr(exc, "orig", None)
+    sqlstate = getattr(orig, "sqlstate", None) or getattr(orig, "pgcode", None)
+    if sqlstate == "42P01":
+        return True
+    return "no such table: heir_confirmation_decision" in str(orig or exc)
+
+
 async def check_app36_confirmed_decisions() -> list[str]:
     """正本 DRAFT_APP36 §3.4 H11 検知側: 「対応する decision（decided_by あり・
     confirmed の有効 leaf）が無いのに 戸籍確認済=yes になっている App36 レコード」
@@ -379,7 +399,8 @@ async def check_app36_confirmed_decisions() -> list[str]:
     静かにスキップ（既存 lazy 原則と同型・App36 未点火のため optional 方式）:
       - APP_SOUZOKUNIN / TOKEN_SOUZOKUNIN 未設定
       - DATABASE_URL 未設定
-      - heir_confirmation_decision テーブル不在（migration 未適用）
+      - heir_confirmation_decision テーブル不在（migration 未適用。H11A-01:
+        42P01 / no such table の厳密識別のみ・その他の DB 異常は再送出）
     警報文面は件数と recordID のみ（氏名・続柄等の PII 非掲載・RV10 準拠）。
     """
     if not (os.environ.get("APP_SOUZOKUNIN") and os.environ.get("TOKEN_SOUZOKUNIN")):
@@ -444,7 +465,10 @@ async def check_app36_confirmed_decisions() -> list[str]:
             if not (decided_by or "").strip():
                 unconfirmed.append(rid)
     except (sa.exc.ProgrammingError, sa.exc.OperationalError) as e:
-        if "heir_confirmation_decision" in str(e).lower():
+        # H11A-01: 静かにスキップは「テーブル不存在」と厳密に識別できた場合のみ。
+        # それ以外（権限不足・schema 不整合・列欠落・DB 障害等）は再送出＝
+        # run_healthcheck の分類名のみ警報へ合流（沈黙させない）
+        if _is_missing_decision_table(e):
             logger.info("App36 decision audit skipped (table not ready)")
             return []
         raise
