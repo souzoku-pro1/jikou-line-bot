@@ -55,7 +55,7 @@ NEXT-BATCH-SURVEY（司令塔側文書）の **#1〜#5・#7A・#10 を消込**�
 | 項目 | PR / 実施 | 備考 |
 |---|---|---|
 | MAINT-4 小粒束ね4点（App38 死活監視登録・App30「人の確認待ち」文言・担保内容空化・App25 実機追随）＝**§2 の4行の消込** | **#198** | テスト 2019→2035 |
-| P3-003C-H11→**H11a**（App36「戸籍確認済=yes」decision 監査・監視項目I・案(a)裁定） | **#199**（初版+fix1） | テスト →2057。**8/11 の migration 適用＋App36 env 投入済みにより追加点火なしで実働**（初実働検分=翌朝 daily_healthcheck 3点・`2026-08-11_block-a-ignition.md` §7） |
+| P3-003C-H11→**H11a**（App36「戸籍確認済=yes」decision 監査・監視項目I・案(a)裁定） | **#199**（初版+fix1） | テスト →2057。**8/11 の migration 適用＋App36 env 投入済みにより追加点火なしで実働**——ただし実働は前提3点の成立が条件（E2-01 補記）: **(i) `DATABASE_URL` 設定済み (ii) `HEALTHCHECK_DISABLED` ≠ 1 (iii) HEALTHCHECK scheduler が startup で登録済み**（`[HEALTHCHECK] scheduler registered` ログ）。初実働検分=翌朝 daily_healthcheck **4点**（scheduler 登録ログ確認を含む・`2026-08-11_block-a-ignition.md` §7 の3点＋(iii)） |
 | RV-0102-PREP（/scan・/ocr/fixed-asset の署名 opt-in 事前配線） | **#200**（IMPL-BATCH-1 A） | テスト →2073。強制化・GAS/watcher 点火は[人]別途 |
 | **ブロックA点火完了**（migration 2本適用→`INBOUND_EVENT_DURABLE_ENABLED=1`→§8.1 P0 全通過） | 2026-08-11 実施（[人]+PC-A 検分） | 正本: `2026-08-11_block-a-ignition.md`。残観測=§8.2 P1（24h） |
 | **SHOKUMU-PLAN-FB1 は DEFER 裁定**（供給方法が一意に定まらず停止→読解語彙拡張票へ付け替え） | IMPL-BATCH-1 B 停止報告 | 受け皿: `DRAFT_KOSEKI_VOCAB_EXT.md`（DOCS-BATCH-1 C 起草・D巡待ち）。FB1 再発行は同票 merge・実機 CU 後 |
