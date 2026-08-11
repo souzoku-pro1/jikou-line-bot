@@ -21,14 +21,17 @@
   fix6: R-SHOKUMU-PLAN-D6 反映・2026-08-11——H01〔fingerprint 材料の A/B 二層化・
   channel_json 完成形＝A層・正規化規則の完全固定〕・M01〔App31 snapshot 方式A・
   person_id 正式収載・完全順序と併合規則〕・§6 対照 9 形増補＋1:1 宣言・
-  §8-6 改定記録）
+  §8-6 改定記録／
+  fix7: R-SHOKUMU-PLAN-D7 反映・2026-08-11・司令塔裁定——H01〔count 併合を
+  channel_json 完成前へ・byte 一致不変条件〕・M01〔有効=コードポイント順〕・
+  §6-44/46 増補＋1:1 宣言更新・§8-7 改定記録）
 - 盤面: 8月構想・項目1。判断部品はすべて既存——本票は**結線の設計**であり新エンジンを作らない。
 - 実装現実の実査基盤（2026-08-10・read-only・main `6312112`）:
   `koseki_chain.py`（F5 判定）／`docs/souzoku-houki/10-koseki-matrix.md`（H系列③・凍結）／
   `dispatch_bot/shokumu.py`＋`channels/shokumu_seikyu.py`（M1・実物検収済み）／
   `hub/derivation_models.py`・`hub/heir_projection.py`（P3 系）／`review_resolve.py`（App33 参照・関所型）／
   `hub/heir_envelope.py`（封筒冪等の型）。
-- 次レビュー: R-SHOKUMU-PLAN-D7（**凍結判定の再走**。経緯: D1=凍結不適格→fix1→
+- 次レビュー: R-SHOKUMU-PLAN-D8（**凍結判定の再走**。経緯: D1=凍結不適格→fix1→
   D2=H01/H02/H03+M01〜M04〔M01 のみ RESOLVED〕→fix2。対応は §8 改定記録）。
 
 ## 0. 原則（本票の背骨・§2 で構造化）
@@ -391,7 +394,11 @@ SHA-256。**App30/M1 の起票・封筒状態（§2C が読む非内容的状態
    （照合を行っていない事実ごと固定・null 非使用は §4B fix6 と同一規則）。
    **完全順序（tie-break・fix6）**: `line_type` 定義順 → `person_id`
    （"" 先頭・数値昇順）→ `市区町村名`（コードポイント昇順）→
-   `app31_record_id`（"" 先頭・数値昇順）→ `有効` → `fallback` 定義順
+   `app31_record_id`（"" 先頭・数値昇順）→ `有効`（**fix7 で比較規則を補完**——
+   保存文字列の **UTF-8 コードポイント昇順・"" 先頭**＝市区町村名と同規則・
+   値域に依存しない機械的順序。値域 grammar〔`yes|no|""` 等〕を保存境界で固定する
+   場合もあり得るが、**順序の一意性はコードポイント順で担保**する。fix6 の
+   順序未指定は撤回）→ `fallback` 定義順
    （ward→city→""）。**全キー完全一致の行は 1 行へ併合する**（併合あり・一意）。
    **snapshot に存在しないキーを比較・順序決定に使わない**（構造 pin・§6-47——
    candidates 側のみにある status/count 等を snapshot の同一性判定へ持ち込まない）。
@@ -507,10 +514,17 @@ App31 レコードの更新・無効化（(7)）・被相続人フラグ付替�
       4. **Unicode 正規化: 不採用（NFC を適用しない）**——App34/kintone 保存値の
          byte をそのまま比較する（NFC 同一視は表記差の業務判断を機械へ持ち込み、
          請求書印字値と指紋の乖離を生むため採らない）。
-      5. **同一 type の request_items が複数ある場合**: type 昇順 sort の上で
-         **同一 type は count を合算して 1 エントリへ併合**（束ねで別 line_type が
-         同一 request_type を要求する場合の正規化を一意化）。plan_lines は
-         enum 定義順 sort・unique。
+      5. **同一 type の request_items（fix6 の「算出時併合」と読める記述は
+         fix7 で撤回・方式A＝司令塔裁定・両時点残置）**: count 合算併合は
+         **fingerprint 算出時の正規化ではなく、plan 側の channel_json 完成前の
+         正規化**として行う——束ね（§2A）で channel_json を組み立てる時点で
+         type 昇順 sort＋同一 type の count 合算を適用し、**併合済みの
+         channel_json を (a) fingerprint A層 (b) App30 create（§2D）
+         (c) M1 prepare（App30 経由）のすべてへ同一 object として渡す**。
+         plan_lines は enum 定義順 sort・unique（従来どおり）。
+         **不変条件（fix7・明文化）**: 「**fingerprint へ渡した A層と App30
+         create へ渡した channel_json は byte 一致する。fingerprint 内部だけの
+         併合は設計違反**」——指紋と実起票が別内容になる経路を構造的に持たない。
     ——結果として**入力の並び順だけが異なる場合は同値**になる（§6-38）。
     - **HIT 時の判定**: plan_idem 一致 → `m1_fingerprint` 比較——**一致 = skip
       回収**（already_filed・新規 create しない）／**不一致 = 当該候補を要確認**
@@ -771,21 +785,33 @@ H系列③ §1 の旧記述「受任確定と同時に M1 職務上請求を自�
 43. **欠落・空文字・null の正規化境界**: キー欠落＝保存境界で拒否／空値は `""`
     のみ（null 混入は grammar 拒否）／`""` と欠落が同値扱いにならない（欠落は
     そもそも保存されない）ことを parametrize。
-44. **同一 type request_items の重複正規化**: 別 line_type 由来の同一 type 2 行 →
-    count 合算の 1 エントリへ併合され fingerprint が一意（併合前の並び・分割に
-    依存しない）。
+44. **同一 type request_items の重複正規化（fix7 で 4 点へ増補・方式A の実質検査）**:
+    (a) 分割入力（`[{除籍謄本,1},{除籍謄本,1}]`）が channel_json 完成前に
+    `[{除籍謄本,2}]` へ併合される（fingerprint が一意・分割に依存しない）
+    (b) **併合済み channel_json が実際の App30 起票（create fields のチャネル固有
+    データ）に使用される**（併合前の形が App30 へ流れない）
+    (c) **fingerprint A層と App30 create へ渡した channel_json の byte 一致**
+    （§4B fix7 不変条件の実出力 pin）
+    (d) 併合済み入力が**既存 M1 経由で様式1 PDF 1 枚・count 合計値（2 通）**で
+    生成される（prepare 挙動の end-to-end 確認・M1 側は無改変のまま）。
 45. **App31 snapshot 入力順のみ相違 → plan_hash 同値**（§4-v2 (7) の完全順序
     sort の実効性・M01）。
-46. **snapshot の完全 tie-break**: 同一 line_type×同一市区町村名で person_id・
-    app31_record_id が異なる複数行 → 完全順序で一意に整列・全キー一致行は
-    1 行へ併合（parametrize）。
+46. **snapshot の完全 tie-break（fix7 で 3 形へ増補）**: 同一 line_type×同一
+    市区町村名で person_id・app31_record_id が異なる複数行 → 完全順序で一意に
+    整列（parametrize）。加えて——
+    (a) **先行 4 キー同一・`有効` のみ相違** → コードポイント昇順（"" 先頭）で
+    一意に整列（fix7 の比較規則の実質検査）
+    (b) **先行 5 キー同一・`fallback` のみ相違** → 定義順（ward→city→""）で一意
+    (c) **全 6 キー一致の複数行** → 1 行へ併合（併合規則の実出力 pin）。
 47. **非存在キー参照なしの構造 pin**: snapshot の順序決定・同一性判定が
     snapshot 自身のキー（line_type/person_id/市区町村名/app31_record_id/有効/
     fallback）のみを参照する（candidates 側の status/count 等への参照ゼロ・AST pin）。
 
-**宣言（fix6）**: §6 対照（1〜47）は **H01（plan_hash／m1_fingerprint の各保証）・
-M01（canonical 順序の決定性）の保証項目と 1:1** である——保証の各文（§4-v2・
-§4-v2.1・§4A 全順序・§4B fix6・§4-v2 (7)）に対応する対照が本節に存在し、
+**宣言（fix6→fix7 で更新）**: §6 対照（1〜47・fix7 増補〔44 の 4 点・46 の 3 形〕
+込み）は **H01（plan_hash／m1_fingerprint の各保証・channel_json 完成前併合と
+byte 一致不変条件）・M01（canonical 順序の決定性・`有効` コードポイント順を含む
+完全 tie-break）の保証項目と 1:1** である——保証の各文（§4-v2・§4-v2.1・§4A
+全順序・§4B fix6/fix7・§4-v2 (7) fix7）に対応する対照が本節に存在し、
 対照の無い保証・保証の無い対照は存在しない。
 
 ## 7. スコープ外（明記）
@@ -955,4 +981,26 @@ PURPOSE_BY_UNIT :56-59・様式生成の target 参照〔:303-313/:350-353/:387-
 - **§6 増補（39〜47・9 形）**＋**1:1 宣言**（§6 対照と H01/M01 保証の対応が
   過不足なく存在する）。
 - 次レビュー: **R-SHOKUMU-PLAN-D7**（**凍結判定の再走**・BASE=origin/main
-  `6312112`・TARGET=shokumu-plan-design の fix6 commit）。
+  `6312112`・TARGET=shokumu-plan-design の fix6 commit）。→ 実施済み・結果は §8-7。
+
+## 8-7. fix7 改定記録（R-SHOKUMU-PLAN-D7・2026-08-11・司令塔裁定。両時点残置）
+
+D7 判定: CHANGES_REQUIRED（H01/M01=HIGH・残余 2 点のみ）。fix7 で反映:
+
+- **H01（方式A・司令塔裁定）**: 同一 type の count 合算併合を「fingerprint 算出時の
+  正規化」から「**plan 側 channel_json 完成前の正規化**」へ移動（§4B 正規化規則 5・
+  fix6 の「算出時併合」と読める記述は撤回・残置）。併合済み channel_json を
+  (a) fingerprint A層 (b) App30 create (c) M1 prepare の全てへ**同一 object**として
+  渡すことを明記し、不変条件化——「**fingerprint へ渡した A層と App30 create へ
+  渡した channel_json は byte 一致する。fingerprint 内部だけの併合は設計違反**」。
+  §6-44 を 4 点へ増補（分割入力の併合／併合済みが実起票に使用／byte 一致／
+  既存 M1 経由で様式1 PDF 1 枚・count 合計 2 通）。
+- **M01（司令塔裁定）**: snapshot 完全順序の第 5 キー `有効` の比較規則を固定——
+  **保存文字列の UTF-8 コードポイント昇順（"" 先頭）**＝市区町村名と同規則・
+  値域に依存しない機械的順序（値域 grammar を保存境界で固定する場合も順序の
+  一意性はコードポイント順で担保。fix6 の順序未指定は撤回・補完）。
+  §6-46 を 3 形へ増補（有効のみ相違／fallback のみ相違／全 6 キー一致の併合）。
+- **1:1 宣言を更新**（§6 対照〔34〜47＋増補〕と H01/M01 保証の対応が過不足なく
+  存在することを再宣言）。
+- 次レビュー: **R-SHOKUMU-PLAN-D8**（**凍結判定の再走**・BASE=origin/main
+  `6312112`・TARGET=shokumu-plan-design の fix7 commit）。
