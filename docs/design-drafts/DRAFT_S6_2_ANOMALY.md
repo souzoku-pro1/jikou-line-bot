@@ -76,12 +76,15 @@
     再送を skip すると不足行が永久に欠落する穴）】3 概念を分離する**:
     - **content identity** = SHA-256（バイト列の同一性）
     - **provenance** = source doc ID（Drive file ID 等・「どこから来たか」）
-    - **ingestion 状態** = 原本単位の取込状態 `open（取込中/部分）→ complete →
-      failed`
+    - **ingestion 状態** = 原本単位の取込状態 ~~`open（取込中/部分）→ complete →
+      failed`~~（**fix4・S6-2-09: この矢印表記は撤回**——遷移の正は fix3 の
+      遷移表〔S6-2-08〕のみ。閉集合 {open/complete/failed}・partial は open の
+      説明語であり enum 値でない）
     - 組合せ規則:
       1. **同一 SHA の再送**: ingestion 状態が **complete のときのみ skip**。
-         **open / partial / failed は既存行 identity と照合して不足行のみ回収**
-         （部分取込の再送が完了経路になる）。
+         **open（部分取込を含む）/ failed は既存行 identity と照合して不足行のみ
+         回収**（部分取込の再送が完了経路になる。~~open / partial / failed~~ の
+         3 値列挙は fix4・S6-2-09 で訂正——partial は状態値でない）。
       2. **同一 doc ID＋別 SHA**: **原本差替え**（再スキャン・訂正版）として
          旧原本由来の行を supersede（追記型・§3 の内容 hash 規則と同じ型）。
       3. **別 doc ID＋同一 SHA**: 同一内容が別経路から到着（コピー・再アップ
@@ -218,3 +221,12 @@
   照合完了後のみ・failed→open→complete の再送回収・**complete からの自動逆遷移
   禁止**（後発欠落は要確認 or 明示的 reopen=[人]）。S6-2-04 の reconcile 前提
   条件（complete）が遷移表上で一意判定できることを明記。
+
+## 11. fix4 改定記録（R-DOCS-BATCH-1-D4・2026-08-11・S6-2-09＝fix2 旧表記の撤回処理漏れ）
+
+- **S6-2-09**: §3 に残置していた fix2 旧表記 2 箇所を撤回処理——
+  (i) `open（取込中/部分）→ complete → failed` の**矢印表記を取り消し線化**
+  (ii) 同一 SHA 再送の回収対象「open / partial / failed」を
+  **「open（部分取込を含む）/ failed」へ訂正**（partial は状態値でない）。
+- **fix3 の遷移表（S6-2-08）が ingestion 状態の唯一の正であり、fix2 の矢印表記と
+  partial 列挙は撤回する**。
