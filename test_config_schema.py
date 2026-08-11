@@ -387,6 +387,125 @@ class TestApp37Schema(unittest.TestCase):
             self.assertIn(spec["type"], VALID_TYPES, f"{code} の型が不正")
 
 
+class TestApp25Schema(unittest.TestCase):
+    """App 25（不動産）監視エントリの追随更新の検証（MAINT-4・台帳§2:
+    2026-07-07 実機変化=担保内容追加・担保抵当権3値・種別4値への追随）"""
+
+    def setUp(self):
+        self.app25 = EXPECTED_KINTONE_SCHEMA["不動産 (相続)"]
+
+    def test_kind_options_are_live_4_values(self):
+        """種別4値（registry_ingest.KIND_TO_APP25 の写像先・2026-07-07 実機確認値）"""
+        f = self.app25["fields"]["種別"]
+        self.assertEqual(f["type"], "DROP_DOWN")
+        self.assertEqual(set(f["required_options"]),
+                         {"土地", "建物", "マンション(区分所有)", "その他"})
+
+    def test_tanpo_naiyou_registered_existence_only(self):
+        """担保内容は 2026-07-07 実機追加（registry_ingest 冒頭の確認記録）。
+        型の実出力が未保存のため type: None（存在監視のみ）で登録し、
+        推測型の登録による日次誤警報を避ける（MAINT-4 の裁量記録）"""
+        self.assertEqual(self.app25["fields"]["担保内容"], {"type": None})
+
+    def test_tanpo_teitouken_required_options_are_code_dependency_only(self):
+        """担保抵当権の required はコードが書く 有/無 のみ（実機3値化は
+        選択肢の追加＝subset 照合で誤警報にならない・第3値の字面は台帳未記録）"""
+        f = self.app25["fields"]["担保抵当権"]
+        self.assertEqual(f["type"], "DROP_DOWN")
+        self.assertEqual(set(f["required_options"]), {"有", "無"})
+
+
+class TestApp38Schema(unittest.TestCase):
+    """App 38（仕分けログ）のスキーマ定義検証（MAINT-4 で死活監視へ登録。
+    正本: docs/instructions/cu-app38-sortation-log.md の13フィールド・
+    2026-07-07 実機検収合格 PR #68・台帳§1）"""
+
+    def setUp(self):
+        self.app38 = EXPECTED_KINTONE_SCHEMA["App 38 (仕分けログ)"]
+
+    def test_env_names(self):
+        self.assertEqual(self.app38["app_id_env"], "APP_SORTATION_LOG")
+        self.assertEqual(self.app38["token_env"], "TOKEN_SORTATION_LOG")
+
+    def test_field_count_is_13(self):
+        self.assertEqual(len(self.app38["fields"]), 13)
+
+    def test_is_optional(self):
+        """env 未設定の環境では監視スキップ（App 33〜37 と同じ optional 方式）"""
+        self.assertIs(self.app38.get("optional"), True)
+
+    def test_state_options_4(self):
+        """状態4値（照会中→確定→実行済み・取消。指示書 §3 フィールド11/13 どおり）"""
+        f = self.app38["fields"]["状態"]
+        self.assertEqual(f["type"], "DROP_DOWN")
+        self.assertEqual(set(f["required_options"]),
+                         {"照会中", "確定", "実行済み", "取消"})
+
+    def test_writer_fields_present(self):
+        """sortation_ingest._log_ask / sortation_assign.execute が書く全キーが
+        監視対象に含まれること"""
+        for code in ("ファイル名", "Drive_fileId", "Drive_URL", "書類種類",
+                     "確信度", "判定理由", "候補一覧", "状態",
+                     "仕分け先レコードID", "仕分け先氏名",
+                     "仕分け先フォルダ名", "確定日時"):
+            self.assertIn(code, self.app38["fields"])
+
+    def test_datetime_fields(self):
+        for code in ("確定日時", "実行日時"):
+            self.assertEqual(self.app38["fields"][code]["type"], "DATETIME", code)
+
+    def test_all_types_valid(self):
+        for code, spec in self.app38["fields"].items():
+            self.assertIn(spec["type"], VALID_TYPES, f"{code} の型が不正")
+
+
+class TestHealthcheckExistenceOnlyType(unittest.TestCase):
+    """check_kintone_schema の type: None（存在監視のみ・MAINT-4）の挙動:
+    実機型が何であれ型不一致警報を出さない・フィールド消失は従来どおり警報"""
+
+    SCHEMA = {"x": {"app_id_env": "X_APP", "token_env": "X_TOKEN",
+                    "fields": {"担保内容": {"type": None}}}}
+
+    def _run(self, properties):
+        import asyncio
+        from unittest.mock import patch
+
+        import daily_healthcheck
+
+        class _Resp:
+            is_success = True
+
+            def json(self):
+                return {"properties": properties}
+
+        class _Client:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+            async def get(self, *a, **kw):
+                return _Resp()
+
+        env = {"KINTONE_SUBDOMAIN": "testsub", "X_APP": "25", "X_TOKEN": "t"}
+        with patch.dict(os.environ, env, clear=True), \
+                patch.object(daily_healthcheck, "EXPECTED_KINTONE_SCHEMA",
+                             self.SCHEMA), \
+                patch.object(daily_healthcheck.httpx, "AsyncClient", _Client):
+            return asyncio.run(daily_healthcheck.check_kintone_schema())
+
+    def test_existing_field_any_type_is_ok(self):
+        for live_type in ("SINGLE_LINE_TEXT", "MULTI_LINE_TEXT"):
+            with self.subTest(live=live_type):
+                self.assertEqual(self._run({"担保内容": {"type": live_type}}), [])
+
+    def test_missing_field_still_alarms(self):
+        problems = self._run({})
+        self.assertEqual(len(problems), 1)
+        self.assertIn("担保内容", problems[0])
+
+
 class TestHealthcheckOptionalSkip(unittest.TestCase):
     """check_kintone_schema の env 未設定時の挙動
     （optional=スキップ・警報なし / 非optional=警報。既存挙動の回帰込み）"""
@@ -424,6 +543,11 @@ class TestHealthcheckOptionalSkip(unittest.TestCase):
     def test_app37_env_unset_is_silently_skipped(self):
         """App 37 の env 未設定は警報ゼロ（optional 方式・App 33〜36 と同じ）"""
         schema = {"App 37 (割付)": EXPECTED_KINTONE_SCHEMA["App 37 (割付)"]}
+        self.assertEqual(self._run(schema), [])
+
+    def test_app38_env_unset_is_silently_skipped(self):
+        """App 38 の env 未設定は警報ゼロ（optional 方式・App 33〜37 と同じ・MAINT-4）"""
+        schema = {"App 38 (仕分けログ)": EXPECTED_KINTONE_SCHEMA["App 38 (仕分けログ)"]}
         self.assertEqual(self._run(schema), [])
 
     def test_non_optional_env_unset_still_alarms(self):

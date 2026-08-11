@@ -175,12 +175,21 @@ EXPECTED_KINTONE_SCHEMA = {
             "所在": {"type": "SINGLE_LINE_TEXT"},
             "固定資産税評価額": {"type": "NUMBER"},
             "固定資産税評価年度": {"type": "NUMBER"},
-            # 書き: registry_to_kintone.py（手動CLI）
-            # 注意: 同スクリプトが書く「担保内容」はフォームに存在せず、「種別」の
-            # 選択肢に「区分建物」が無い（2026-07-03 確認・スクリプト側の要修正事項）。
-            # 存在しないフィールドは監視に登録しない
+            # 書き: registry_ingest.py（S5-2）・registry_to_kintone.py（手動CLI）
+            # 2026-07-07 実機変化への追随（MAINT-4・台帳§2）:
+            # - 「担保内容」は 2026-07-07 実機追加をフォーム設計APIで確認済み
+            #   （registry_ingest.py 冒頭の記録）。ただし型の実出力が保存されて
+            #   いないため、型を推測登録すると誤警報になり得る——型検査なしの
+            #   存在監視（type: None）で登録し、次回フォーム設計API実出力の
+            #   採取時に型を固定する
+            # - 「種別」は実機4値（KIND_TO_APP25 の写像先・2026-07-07 確認値）
+            # - 「担保抵当権」は実機3値へ変化（第3値の字面は台帳未記録）。
+            #   required_options はコードが書く 有/無 のみ（subset 照合のため
+            #   実機側の選択肢追加は誤警報にならない）
             "地番": {"type": "SINGLE_LINE_TEXT"},
-            "種別": {"type": "DROP_DOWN", "required_options": ["土地", "建物"]},
+            "種別": {"type": "DROP_DOWN",
+                     "required_options": ["土地", "建物",
+                                          "マンション(区分所有)", "その他"]},
             "地目": {"type": "SINGLE_LINE_TEXT"},
             "地積": {"type": "NUMBER"},
             "床面積1階": {"type": "SINGLE_LINE_TEXT"},
@@ -192,6 +201,7 @@ EXPECTED_KINTONE_SCHEMA = {
             "階数": {"type": "SINGLE_LINE_TEXT"},
             "持分割合": {"type": "SINGLE_LINE_TEXT"},
             "担保抵当権": {"type": "DROP_DOWN", "required_options": ["有", "無"]},
+            "担保内容": {"type": None},
             "備考": {"type": "MULTI_LINE_TEXT"},
             "状況": {"type": "SINGLE_LINE_TEXT"},
         },
@@ -561,6 +571,38 @@ EXPECTED_KINTONE_SCHEMA = {
             "代償金額": {"type": "NUMBER"},
             "条件メモ": {"type": "MULTI_LINE_TEXT"},
             "有効": {"type": "RADIO_BUTTON", "required_options": ["yes", "no"]},
+        },
+    },
+    # ── 仕分けログ（書類仕分け第2段②・sortation_ingest / dispatch_bot.sortation_assign）──
+    # 2026-07-07 実機検収合格（PR #68・台帳§1）。13 フィールドの正本は
+    # docs/instructions/cu-app38-sortation-log.md（一字一句この指示書どおりに
+    # 作成し検収済み）。MAINT-4 で App 35〜37 と同形式の死活監視に登録
+    "App 38 (仕分けログ)": {
+        "app_id_env": "APP_SORTATION_LOG",
+        "token_env": "TOKEN_SORTATION_LOG",
+        # env 未設定の環境では監視をスキップ（設定されたら自動的に監視対象になる）
+        "optional": True,
+        "fields": {
+            # 判定対象の識別（sortation_ingest._log_ask が書く）
+            "ファイル名": {"type": "SINGLE_LINE_TEXT"},
+            "Drive_fileId": {"type": "SINGLE_LINE_TEXT"},
+            "Drive_URL": {"type": "SINGLE_LINE_TEXT"},
+            # 判定結果（ask 判定の台帳）
+            "書類種類": {"type": "SINGLE_LINE_TEXT"},
+            "確信度": {"type": "NUMBER"},
+            "判定理由": {"type": "MULTI_LINE_TEXT"},
+            "候補一覧": {"type": "MULTI_LINE_TEXT"},
+            # 確定内容（dispatch_bot.sortation_assign.execute が書く）
+            "仕分け先レコードID": {"type": "SINGLE_LINE_TEXT"},
+            "仕分け先氏名": {"type": "SINGLE_LINE_TEXT"},
+            "仕分け先フォルダ名": {"type": "SINGLE_LINE_TEXT"},
+            # 状態機械（照会中→確定→実行済み・取消。実行済みへの遷移は GAS=③の責務）
+            "状態": {
+                "type": "DROP_DOWN",
+                "required_options": ["照会中", "確定", "実行済み", "取消"],
+            },
+            "確定日時": {"type": "DATETIME"},
+            "実行日時": {"type": "DATETIME"},
         },
     },
 }

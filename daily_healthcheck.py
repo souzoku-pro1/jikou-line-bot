@@ -137,7 +137,9 @@ async def check_kintone_schema() -> list[str]:
                     "（フィールドコードが変更・削除された可能性）"
                 )
                 continue
-            if actual.get("type") != expected["type"]:
+            # type: None は存在監視のみ（型の実出力が未保存のフィールド。
+            # 例: App 25 担保内容——削除・改名の検知は行い、型は照合しない）
+            if expected["type"] is not None and actual.get("type") != expected["type"]:
                 problems.append(
                     f"{app_label}: フィールド「{code}」の型が想定と不一致 "
                     f"(想定={expected['type']} 実際={actual.get('type')})"

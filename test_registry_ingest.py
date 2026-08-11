@@ -276,6 +276,29 @@ class TestFudosanMatching(_Base):
         self.assertEqual(resp.json()["results"][0]["fudosan"], "created")
 
 
+class TestOtsukuTransfer(_Base):
+    def test_no_active_mortgage_blanks_tanpo_naiyou(self):
+        """乙区 有効権利あり=無 のとき「登記記録の乙区に記録されている事項はない」
+        等の原文を担保内容に書かない（空=フィールド自体を送らない・MAINT-4
+        台帳§2 の軽微改善）。担保抵当権=無 の転記は従来どおり"""
+        p = prop(乙区={"有効権利あり": False,
+                       "内容": "登記記録の乙区に記録されている事項はない",
+                       "confidence": 0.8})
+        kt = _KT()
+        self.post(kt, reading={"物件": [p]}, data={"case_hint": "100"})
+        env, fields = kt.by_env(kt.created, "KINTONE_FUDOSAN_APP_ID")[0]
+        self.assertEqual(fields["担保抵当権"], "無")
+        self.assertNotIn("担保内容", fields)
+
+    def test_active_mortgage_keeps_tanpo_naiyou(self):
+        """有効権利あり=有 は内容原文をそのまま転記（既存挙動の対照固定）"""
+        kt = _KT()
+        self.post(kt, data={"case_hint": "100"})
+        env, fields = kt.by_env(kt.created, "KINTONE_FUDOSAN_APP_ID")[0]
+        self.assertEqual(fields["担保抵当権"], "有")
+        self.assertEqual(fields["担保内容"], "抵当権（株式会社〇〇銀行）")
+
+
 class TestKindMappingAndBuilding(_Base):
     def test_kubun_tatemono_maps_to_mansion(self):
         """種別写像は転記層: 区分建物→マンション(区分所有)・不明→その他"""
