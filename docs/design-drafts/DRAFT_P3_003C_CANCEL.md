@@ -86,6 +86,18 @@
   場合**のみ**（held/rejected leaf・decision なし・鎖破損は取消対象外＝それぞれ
   既存の中止セル/破損警報へ）。**新 run が存在する場合**（対象 run が head でない）
   の取消可否は裁定⑥。
+  **【fix2・CANCEL-05 追加】さらに「write-set の schema version と存在」を取消
+  可能条件に含める**——対象 confirmed の write-set が (i) 存在し (ii) 本設計の
+  schema version で解釈可能、の両方を phase 1 で確認する（欠落・旧 version・
+  parse 不能は下記 legacy 扱い）。
+- **【fix2・CANCEL-05 裁定＝2世代分割】confirmed の世代で経路を分ける**:
+  - **write-set 保存開始後の confirmed**: 自動巻き戻し候補＋関所対象（§4.1a の
+    照合規律どおり）。
+  - **legacy confirmed（write-set 保存開始前・欠落・schema 不明）**:
+    **自動巻き戻し禁止・App36 へ write 0・人手調査**へ倒す（postimage 照合の
+    根拠が無い巻き戻しは盲目適用になるため）。legacy に対する「App36 は触らず
+    **取消台帳のみ追記**する専用運用」（台帳上は取消済み・実機修正は人手）は
+    裁定⑧。
 - **write-set の保存**: confirmed の projection 実行時に「実際に書いた行と内容」
   ＝write-set（App36 record ID・**insert / update の区別**・書込み field 集合・
   書込み**前**の preimage）を保存する（保存の器は裁定⑤）。
@@ -152,6 +164,7 @@
 | ⑤ | write-set / preimage の保存の器（fix1・CANCEL-01） | (A) 封筒 detail（チャネル固有データ） (B) DB 台帳（immutable 追記・run に紐付く projection_log） (C) 監査JSON 添付（person_merge の型） | **OPEN** |
 | ⑥ | 新 run 存在時（対象 run が head でない）の取消可否（fix1・CANCEL-01） | (A) 不可（head のみ取消可・非 head の誤 projection は要確認へ） (B) 可（App36 巻き戻しのみ・台帳表現は head 側と別扱い） | **OPEN** |
 | ⑦ | 取消理由の記録（fix1・CANCEL-04） | (A) 記録なし（P3-003C 裁定⑤と対称） (B) 固定 enum（理由体系の設計が前提） | **OPEN** |
+| ⑧ | legacy confirmed の専用運用（fix2・CANCEL-05） | (A) 取消対象外（人手調査のみ・台帳も追記しない） (B) **App36 を触らず取消台帳のみ追記**する専用経路（台帳上は取消済み・実機修正は人手＝監査可視性を優先） | **OPEN** |
 
 ## 7. 両時点残置
 
@@ -168,3 +181,11 @@
   （現行運用＝新 run で将来へ訂正）」へ分離（裁定①は (A)/(B) の二択に更新）。
 - **CANCEL-04**: §3 R1 を具体化——取消開始は弁護士の明示操作のみ・機械は理由を
   生成しない・影響収集は人の指定後・復唱対象を明記。裁定⑦（理由記録）を新設。
+
+## 9. fix2 改定記録（R-DOCS-BATCH-1-D2・2026-08-11・前巡全所見 RESOLVED）
+
+- **CANCEL-05（裁定＝2世代分割）**: §4.1a へ (i) 取消可能条件に write-set の
+  **schema version／存在確認**を追加 (ii) **世代分割**——write-set 保存開始後の
+  confirmed のみ自動候補＋関所対象・**legacy confirmed は自動巻き戻し禁止・
+  App36 write 0・人手調査**。legacy 専用運用（App36 不接触・取消台帳のみ追記）を
+  裁定⑧として新設。
