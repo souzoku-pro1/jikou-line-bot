@@ -14,14 +14,17 @@
   fix4: R-SHOKUMU-PLAN-D4 反映・2026-08-11・司令塔裁定——H01-01〔canonical 全候補
   保存・§2C フィルタは M1 create 直前のみ〕・H01-02〔plan 横断冪等キー=plan_hash
   除去・HIT 時 line_type 集合比較〕・M01〔§4-v2.1 保証文言の限定〕・M04-01〔§6
-  同期 5 点〕・§8-4 改定記録）
+  同期 5 点〕・§8-4 改定記録／
+  fix5: R-SHOKUMU-PLAN-D5 反映・2026-08-11・司令塔裁定=Codex 提案採用——H01
+  〔m1_fingerprint 二段構え・plan_lines 比較撤回〕・M01〔canonical candidates の
+  tie-break 全順序〕・§6 対照 4 形・§8-5 改定記録）
 - 盤面: 8月構想・項目1。判断部品はすべて既存——本票は**結線の設計**であり新エンジンを作らない。
 - 実装現実の実査基盤（2026-08-10・read-only・main `6312112`）:
   `koseki_chain.py`（F5 判定）／`docs/souzoku-houki/10-koseki-matrix.md`（H系列③・凍結）／
   `dispatch_bot/shokumu.py`＋`channels/shokumu_seikyu.py`（M1・実物検収済み）／
   `hub/derivation_models.py`・`hub/heir_projection.py`（P3 系）／`review_resolve.py`（App33 参照・関所型）／
   `hub/heir_envelope.py`（封筒冪等の型）。
-- 次レビュー: R-SHOKUMU-PLAN-D5（**凍結判定**。経緯: D1=凍結不適格→fix1→
+- 次レビュー: R-SHOKUMU-PLAN-D6（**凍結判定**。経緯: D1=凍結不適格→fix1→
   D2=H01/H02/H03+M01〜M04〔M01 のみ RESOLVED〕→fix2。対応は §8 改定記録）。
 
 ## 0. 原則（本票の背骨・§2 で構造化）
@@ -438,19 +441,40 @@ App31 レコードの更新・無効化（(7)）・被相続人フラグ付替�
   束ねに含めた line_type 集合はキーに載せず request_items と監査メタ
   （`plan_lines`）に記録する。
   grammar: `^shokumu_plan:[0-9]{1,10}:[^:]{1,64}:([0-9]{1,10}|-):(form1|form2)$`。
-- **照合 HIT 時の line_type 集合比較（fix4 H01-02・凍結）**: plan_idem 一致の既存
-  M1 を見つけたら、既存の監査メタ `plan_lines` と今回束ねの line_type 集合を比較——
-  **一致 = skip 回収**（already_filed・新規 create しない）／**不一致 = 当該候補を
-  要確認**（「同一起票単位で内容の異なる既存下書きがあります」の道案内・
-  **自動 merge・自動再発行は禁止**——既存下書きの取扱いは[人]が承認キューで判断）。
+- **照合 HIT 時の比較（fix4=plan_lines 集合→fix5 H01 で m1_fingerprint へ改定・
+  司令塔裁定=Codex 提案採用・両時点残置）**:
+  - （履歴・fix4）plan_lines 集合比較のみ——**不足として撤回**: line_type 集合が
+    同じでも count・target 実値（生年月日訂正等）・宛先 App31 引当てが異なる既存
+    下書きを skip 回収してしまう（古い内容の請求書が生き残る）。
+  - **fix5 正（二段構え）**: plan_idem（業務単位の安定キー）に加え、**正規化した
+    M1 実入力の fingerprint（`m1_fingerprint`）**を監査メタへ保存する。
+    - **材料閉集合**: `request_items`（type/count・type 昇順 sort 済み）＋
+      `target`（M1 へ実際に渡す person_id・氏名・生年月日・本籍・住所・筆頭者）＋
+      `municipality`（採用市区町村名＋App31 レコード id）＋`unit`＋`様式`＋
+      `plan_lines`（sort 済み）。
+    - **正規化規則**: canonical JSON——key は辞書順 sort・配列は定義順（request_items
+      =type 昇順・plan_lines=enum 昇順）に sort・空値は null 統一・ensure_ascii
+      なし——の SHA-256。**入力の並び順だけが異なる場合は同値**になる。
+    - **HIT 時の判定**: plan_idem 一致 → `m1_fingerprint` 比較——**一致 = skip
+      回収**（already_filed・新規 create しない）／**不一致 = 当該候補を要確認**
+      （「同一起票単位で内容の異なる既存下書きがあります」の道案内・**自動 merge・
+      自動再発行は禁止**——既存下書きの取扱いは[人]が承認キューで判断）。
+  - **§4-v2.1 との接続（fix5・明記）**: §4-v2.1 の保証「候補由来の M1 入力に
+    影響し得る上流変更は必ず plan_hash を変える」により、上流訂正は必ず新 plan
+    （新封筒）を生む。新 plan の確定時、同一 plan_idem の旧下書きが残っていれば
+    **m1_fingerprint が必ず不一致**（M1 入力が変わった＝fingerprint 材料が変わった）
+    となり要確認へ倒れる——**追跡例**: 生年月日を App34 で訂正 → snapshot hash
+    変化 → plan_hash 変化 → 新封筒 → 確定 → plan_idem HIT（業務単位は同一）→
+    fingerprint 不一致（target.生年月日が相違）→ 要確認（古い下書きの生き残りゼロ）。
 - **二層の関係（fix4 H01-02 で再記述）**: §2C の既存 M1 照合は**共通行（除票/附票）
   に限った前段の表示フィルタ**（提案ノイズ低減・削除しない・取り零し許容）。
   **§4B の plan_idem 照合が最終防壁**であり、**全行類型（束ね単位すべて）を覆う**
   ——M1 create 直前に必ず通るため、§2C が拾えない行類型・状態でも二重起票は
   ここで止まる。
 - **保存場所**: 起票する M1 レコードの**チャネル固有データ内・監査メタの
-  `plan_idem` キー**（§2D の監査メタ構造。channel JSON の
-  parse_channel_data が読む既知キーと衝突しない追加キー＝prepare 挙動不変）。
+  `plan_idem`＋`m1_fingerprint`（fix5）キー**（§2D の監査メタ構造。channel JSON の
+  parse_channel_data が読む既知キーと衝突しない追加キー＝prepare 挙動不変。
+  `m1_fingerprint` grammar: `^[0-9a-f]{64}$`）。
 - **起票前ガード**: 各候補の create 前に App30 を
   `チャネル="職務上請求"`＋`案件レコードID=case` で絞り、チャネル固有データを
   **JSON parse して `plan_idem` の完全一致**を照合（P3-003a find_existing の
@@ -483,7 +507,7 @@ heir_envelope 同型の水準（キー閉集合・型・値域 grammar・等値�
 | `app34_snapshot_hash` | `^[0-9a-f]{64}$` | §4-v2 (2) の単独値（確定時比較用） |
 | `app36_rows_hash` | `^[0-9a-f]{64}$` or null（common） | §4-v2 (3) |
 | `matrix_version` | `^[0-9A-Za-z.\-]{1,32}$` | |
-| `candidates` | list（下記の行 dict のみ）。**未フィルタの canonical 全候補＝plan_hash と 1:1**（fix4 H01-01・§2C フィルタで削除しない） | |
+| `candidates` | list（下記の行 dict のみ）。**未フィルタの canonical 全候補＝plan_hash と 1:1**（fix4 H01-01・§2C フィルタで削除しない）。**並び順は決定的（fix5 M01・下記 tie-break 全順序）** | |
 | `冪等キー` | `shokumu_plan:{case}:{plan_hash}` の平文 | find_existing 照合用 |
 
 candidates 行の閉集合: `line_type`（enum＝§2A 行類型 **7 値**〔fix2 H02 で 2 行
@@ -505,6 +529,20 @@ candidates 行の閉集合: `line_type`（enum＝§2A 行類型 **7 値**〔fix2
 相関制約は**保存境界（封筒起票時の detail 検証）で強制**する——違反は
 EnvelopeDetailPolicyError 同型で保存拒否（起票せず異常扱い・kintone write 0）。
 確定側も同じ検証を再実行（保存済み detail の改変・壊れの防御）。
+
+**candidates の決定的並び順（fix5 M01・tie-break 全順序で凍結）**: candidates は
+次の**完全順序**で sort して保存する（生成過程・入力順に依存しない＝同一材料から
+常に byte 同一の canonical detail・plan_hash の決定性の前提）:
+1. `line_type`（§2A の enum 定義順: joh_removed → fuhyo → decedent_joseki →
+   chain_missing → parents_death → sibling_death → applicant_current）
+2. → `person_id`（null を先頭・非 null は数値昇順）
+3. → `municipality`（"要入力" を先頭・他は UTF-8 コードポイント昇順）
+4. → `request_type`（"要入力" を先頭・他は FEE_FIELD_BY_TYPE 定義順）
+5. → `status`（propose → fulfilled → input_required）
+6. → `count`（昇順・最終 tie-break。全 6 键一致の重複行は生成時点で 1 行に併合）
+
+**§4-v2 (7)〔App31 照合 snapshot〕の並びにも同一規則を適用**（line_type→person_id
+→municipality の同順・fix5 M01——hash 材料の決定性を candidates と同じ全順序で担保）。
 
 - **氏名・生年月日・住所の実値は保存しない**（司令塔裁定）——封筒は
   **person_id＋snapshot hash のみ**を持ち、確定時に App34 を**再取得**して
@@ -638,9 +676,22 @@ H系列③ §1 の旧記述「受任確定と同時に M1 職務上請求を自�
     **(b)(c)(d) はいずれも「要入力」**（推測ゼロ・parametrize）。
 33. **plan_lines の grammar**: 7 値 enum（§2A 行類型）のみ・**sort 済み・unique**・
     enum 外値/重複/非 list は保存境界で拒否（監査メタも grammar 検証の対象）。
-34. **plan_idem HIT の内容不一致**: 同一 plan_idem の既存 M1 の plan_lines と
-    今回束ねの line_type 集合が不一致 → 当該候補は**要確認**（自動 merge・
-    自動再発行が発生しないこと・skip 回収は集合一致時のみ——§4B fix4）。
+34. **m1_fingerprint 不一致（fix4=plan_lines 比較→fix5 で実質検査へ書換え）**:
+    同一 plan_idem の既存 M1 の `m1_fingerprint` と今回の正規化 M1 実入力の
+    fingerprint が不一致 → 当該候補は**要確認**（自動 merge・自動再発行が発生
+    しないこと・skip 回収は fingerprint 一致時のみ——§4B fix5）。
+
+**fix5 追加（H01 対照 4 形）**:
+
+35. **fingerprint 一致 skip**: 同一 plan_idem・同一 M1 実入力 → skip 回収
+    （新規 create ゼロ・already_filed 応答）。
+36. **生年月日訂正後の不一致**: App34 で target の生年月日を訂正 → 新 plan 経由の
+    確定で plan_idem HIT・fingerprint 不一致 → 要確認（§4B の追跡例の実出力 pin・
+    古い下書きが skip 回収で生き残らないこと）。
+37. **request_items.count 変化**: 同一 line_type 集合のまま count のみ変化 →
+    fingerprint 不一致 → 要確認（fix4 の plan_lines 比較では検出不能だった形）。
+38. **並び順の正規化実効性**: request_items・plan_lines の入力順だけが異なる
+    同一内容 → fingerprint **同値**（誤った不一致=要確認の誤爆が出ないこと）。
 
 ## 7. スコープ外（明記）
 
@@ -757,4 +808,26 @@ D4 判定: H02/H03=RESOLVED・H01 分割 2 件＋M01＋M04-01。fix4 で以下�
   (iv) §6-33 plan_lines grammar（7 値 enum・sort・unique・不正拒否）
   (v) §6-34 plan_idem 内容不一致=要確認。
 - 次レビュー: **R-SHOKUMU-PLAN-D5**（**凍結判定**・BASE=origin/main `6312112`・
-  TARGET=shokumu-plan-design の fix4 commit）。
+  TARGET=shokumu-plan-design の fix4 commit）。→ 実施済み・結果は §8-5。
+
+## 8-5. fix5 改定記録（R-SHOKUMU-PLAN-D5・2026-08-11・司令塔裁定=Codex 提案採用。両時点残置）
+
+D5 判定: H01-01/M01（前巡）=RESOLVED・H01-02=UNRESOLVED＋新 M01。fix5 で反映:
+
+- **H01（m1_fingerprint 二段構え）**: plan_idem（業務単位の安定キー）＋**正規化
+  M1 実入力の fingerprint**（材料閉集合: request_items〔sort 済み〕・target 実値
+  〔person_id/氏名/生年月日/本籍/住所/筆頭者〕・municipality〔採用名+App31 id〕・
+  unit・様式・plan_lines／canonical JSON・key sort・配列 sort・SHA-256）を監査メタ
+  へ保存。HIT 判定=「plan_idem 一致→fingerprint 比較→一致=skip 回収／不一致=
+  要確認（自動 merge・自動再発行禁止）」。fix4 の plan_lines 集合比較は**不足として
+  撤回**（count・target 実値・宛先引当ての相違を見逃す）。§4-v2.1 の plan_hash
+  保証と fingerprint 検出の接続を追跡例（生年月日訂正→新 plan→HIT→不一致→要確認）
+  つきで明記。§6-34 を fingerprint 不一致の実質検査へ書換え。
+- **M01（canonical 順序）**: candidates の決定的並び順を tie-break 全順序
+  （line_type 定義順→person_id→municipality→request_type→status→count・
+  全键一致は 1 行併合）で凍結（§4A）。§4-v2 (7) App31 snapshot の並びにも同一
+  規則を適用（hash 決定性の担保）。
+- **§6 対照 4 形追加**（35〜38）: fingerprint 一致 skip／生年月日訂正→不一致／
+  count 変化→不一致（fix4 比較の盲点）／並び順のみ相違→同値（正規化の実効性）。
+- 次レビュー: **R-SHOKUMU-PLAN-D6**（**凍結判定**・BASE=origin/main `6312112`・
+  TARGET=shokumu-plan-design の fix5 commit）。
