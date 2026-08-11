@@ -16,6 +16,7 @@
 - App 36 には触れない・App 34 への書き込みゼロ（読み取り専用）
 """
 
+import json
 from dataclasses import dataclass, field
 
 from hub import kintone
@@ -230,6 +231,55 @@ def validate_for_rendering(graph: KinshipGraph,
             problems.append(f"No.{d.record_id} {d.name}: 被相続人の死亡日（DATE）が"
                             "未確定です（確認時に和暦から確定してください）")
     return problems
+
+
+APP_KOSEKI_BOOK = kintone.KintoneApp(
+    "App 33 (戸籍読解)", "APP_KOSEKI_BOOK", "TOKEN_KOSEKI_BOOK")
+
+
+async def load_koseki_summaries_for_case(case_record_id: str) -> list[dict]:
+    """案件の取得済み戸籍（App 33）の最小表示情報（読み取り専用・MAINT-3 B）。
+
+    - 読解JSON の 戸籍.本籍／筆頭者／従前戸籍.本籍 のみ（P4-005 画面の
+      「取得済み戸籍」一覧用）。**chain 判定・収集見込みの表示はしない**——
+      参考判定の提示は SHOKUMU-PLAN 票の領分（koseki_chain の規律に従う）。
+    - env 未設定は空リスト（縮退・他機能に影響させない）。読解JSON の解釈不能
+      行は空欄表示（行自体は record_id で見える＝黙って落とさない）。
+    """
+    if not (APP_KOSEKI_BOOK.app_id() and APP_KOSEKI_BOOK.token()):
+        return []
+    records = await kintone.search_records(
+        APP_KOSEKI_BOOK,
+        f'案件レコードID = "{case_record_id}" order by $id asc limit 100',
+        fields=["$id", "読解JSON"])
+
+    def _d(value) -> dict:
+        """dict 以外の型崩れ（"読解不能" 等の文字列・list・数値）は空 dict へ縮退
+        （fix1 M01: 当該項目を空欄にして行は維持・例外を上流へ漏らさない）。"""
+        return value if isinstance(value, dict) else {}
+
+    def _s(value) -> str:
+        """文字列以外の値（list・数値・dict 等）は空欄（fix1 M01）。"""
+        return value.strip() if isinstance(value, str) else ""
+
+    out = []
+    for r in records:
+        if not isinstance(r, dict):
+            continue                     # レコード形自体の破損は行を構成できない
+        try:
+            reading = json.loads(_s(_d(r.get("読解JSON")).get("value")) or "{}")
+        except (ValueError, TypeError):
+            reading = {}
+        koseki = _d(_d(reading).get("戸籍"))
+        juzen = _d(koseki.get("従前戸籍"))
+        rid = _d(r.get("$id")).get("value")
+        out.append({
+            "record_id": _s(rid if isinstance(rid, str) else str(rid or "")),
+            "honseki": _s(koseki.get("本籍")),
+            "hittousha": _s(koseki.get("筆頭者")),
+            "juzen_honseki": _s(juzen.get("本籍")),
+        })
+    return out
 
 
 async def load_graph_for_case(case_record_id: str) -> KinshipGraph:

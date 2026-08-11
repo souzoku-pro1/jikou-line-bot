@@ -26,6 +26,7 @@ a{color:#1a3c6e}
   <span id="page"></span>
 </div>
 <div id="items"></div>
+<script src="/app/app.js"></script>
 <script>
 let offset = 0;
 const limit = 20;
@@ -33,7 +34,7 @@ function v(rec, name) { return (rec[name] && rec[name].value) || ""; }
 async function load() {
   const q = new URLSearchParams({limit: limit, offset: offset});
   if (document.getElementById("all").checked) q.set("all", "1");
-  const resp = await fetch("/app/api/approvals?" + q, {redirect: "follow"});
+  const resp = await app_fetch("/app/api/approvals?" + q);
   if (resp.redirected || !resp.headers.get("content-type")?.includes("json")) {
     location.href = "/app/login"; return;
   }

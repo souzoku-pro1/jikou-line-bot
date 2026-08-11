@@ -105,7 +105,8 @@ async def api_kinship(request: Request):
     case = request.query_params.get("case", "")
     if not _CASE_RE.fullmatch(case):
         return _bad_request()
-    from kinship_graph import load_graph_for_case
+    from kinship_graph import (load_graph_for_case,
+                               load_koseki_summaries_for_case)
     from kinship_renderer import (GraphvizUnavailable, KinshipRenderError,
                                   KinshipValidationRejected, render_kinship)
 
@@ -113,6 +114,9 @@ async def api_kinship(request: Request):
     if not graph.nodes:
         return {"status": "empty", "case_record_id": case,
                 "message": "この案件に人物レコードがありません（App 34 未登録）"}
+    # MAINT-3 B: 取得済み戸籍（App33）の最小一覧（正本 §2 の App33 言及の範囲・
+    # read-only・chain 判定なし）。env 未設定は空リスト（縮退）
+    kosekis = await load_koseki_summaries_for_case(case)
     overlay = await _overlay_for_case(case)
     try:
         # heir_scope=True: 相続人確定に必要な人物へ検証・描画とも絞る（既存思想）
@@ -120,7 +124,8 @@ async def api_kinship(request: Request):
     except KinshipValidationRejected as e:
         # Z1 の「拒否は道案内」をそのまま写像（誰の何が未充足かの列挙）
         return {"status": "not_renderable", "case_record_id": case,
-                "problems": list(e.problems), "overlay": overlay}
+                "problems": list(e.problems), "overlay": overlay,
+                "kosekis": kosekis}
     except GraphvizUnavailable:
         return {"status": "unavailable", "case_record_id": case,
                 "message": "関係図エンジン（graphviz）が未導入のため描画できません"
@@ -138,7 +143,8 @@ async def api_kinship(request: Request):
             "svg": svg.decode("utf-8"),
             "names": {n.record_id: n.name for n in graph.nodes},
             "warnings": list(graph.warnings),
-            "overlay": overlay}
+            "overlay": overlay,
+            "kosekis": kosekis}
 
 
 @router.get("/app/kinship")

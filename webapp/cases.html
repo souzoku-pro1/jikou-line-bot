@@ -26,6 +26,7 @@ a{color:#1a3c6e}
   <thead><tr><th>ID</th><th>顧客名</th><th>status</th><th>問い合わせ業者名</th><th>更新日時</th></tr></thead>
   <tbody id="rows"></tbody>
 </table>
+<script src="/app/app.js"></script>
 <script>
 let offset = 0;
 const limit = 20;
@@ -34,7 +35,7 @@ async function load() {
   const st = document.getElementById("status").value;
   const q = new URLSearchParams({limit: limit, offset: offset});
   if (st) q.set("status", st);
-  const resp = await fetch("/app/api/cases?" + q, {redirect: "follow"});
+  const resp = await app_fetch("/app/api/cases?" + q);
   if (resp.redirected || !resp.headers.get("content-type")?.includes("json")) {
     location.href = "/app/login"; return;      // 未認証（session 失効）
   }
