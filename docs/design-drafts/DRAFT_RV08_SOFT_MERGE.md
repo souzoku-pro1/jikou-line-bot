@@ -114,8 +114,23 @@
 
 ## 4. flag・移行・テスト骨子
 
-- flag: 新設 `PERSON_MERGE_SOFT_ENABLED`（既定 OFF）**か** `PERSON_MERGE_ENABLED`
-  の意味変更かは裁定①。既定 OFF の間は現行挙動不変（両時点残置）。
+- ~~flag: 新設 `PERSON_MERGE_SOFT_ENABLED`（既定 OFF）**か** `PERSON_MERGE_ENABLED`
+  の意味変更かは裁定①。既定 OFF の間は現行挙動不変（両時点残置）~~
+  **【fix2・RV08-04 裁定確定＝(B) 採用】`PERSON_MERGE_ENABLED` の意味を soft merge
+  へ置換する。新 flag は作らない。物理削除コードは完全除去。**
+  - **「現行挙動不変」の撤回（理由付き残置）**: flag ON 時の挙動は
+    **物理削除 → soft merge へ変わる**。これは**意図的な安全方向の変更**であり
+    「flag ON の従来挙動維持」を設計目標にしない（物理削除を残す fallback は
+    RV-08 の趣旨〔削除の恒久禁止〕に反するため）。
+  - **flag × コード状態の全象限表**:
+
+    | flag | 挙動 | 物理削除への経路 |
+    |---|---|---|
+    | `PERSON_MERGE_ENABLED` ON | **soft merge**（無効化 update・§3.1） | **なし**（delete 呼出しはコードに存在しない・AST pin） |
+    | 同 OFF（未設定含む） | merge 実行不発（候補検出・関所とも既存どおり辞退） | なし（同上） |
+
+  - fallback 経路の不存在は R3 の AST pin（App34 向け delete_record 不在）が
+    構造で保証する（設定・env の組合せいかんで物理削除に戻る象限が存在しない）。
 - テスト要件（骨子）: (i) soft merge 実行で delete が発行されない（mock で
   delete 呼出しゼロを assert） (ii) 無効化 update の field 集合固定
   (iii) 監査失敗時は無効化も行われない（順序固定の回帰） (iv) 無効化行が
@@ -146,7 +161,7 @@
 
 | # | 論点 | 選択肢 | 状態 |
 |---|---|---|---|
-| ① | flag 方式 | (A) 新設 `PERSON_MERGE_SOFT_ENABLED`（旧 flag と併存・両 ON で soft が優先） (B) `PERSON_MERGE_ENABLED` の意味を soft へ切替（旧物理削除 route はコードごと消えるため flag 追加なし） | **OPEN** |
+| ① | flag 方式 | (A) 新設 `PERSON_MERGE_SOFT_ENABLED`（旧 flag と併存・両 ON で soft が優先） (B) `PERSON_MERGE_ENABLED` の意味を soft へ切替（旧物理削除 route はコードごと消えるため flag 追加なし） | **RESOLVED＝(B)**（fix2・RV08-04 司令塔裁定・§4 の全象限表参照） |
 | ② | 無効化行の下流除外の実装単位 | (A) 各 consumer の検索クエリへ except 条件を横展開 (B) App34 読取の共通ヘルパを新設し一点除外（ヘルパ化は影響大＝実装票で rg 全数調査後に裁定） | **OPEN** |
 | ③ | 無効化フィールドの名称・値 | 上記 3.1 案（統合状態/統合先人物ID/統合日時）の承認 or 修正（work-log 注記の「『統合済み無効』状態の区別」要求を満たす形） | **OPEN** |
 | ④ | 過去削除分の復元 tool の置き場 | (A) 手動 CLI（08 手順書拡張・実行は[人]） (B) 関所語彙（封筒起票→確定で復元） | **OPEN** |
@@ -170,3 +185,11 @@
   裁定⑦（回収の器）を新設。
 - **RV08-03**: §4 テスト骨子へ有効行定義の構造検査（閉集合 pin・新 consumer 機械
   検査・直接 get の状態確認・negative 骨子）を追加。
+
+## 9. fix2 改定記録（R-DOCS-BATCH-1-D2・2026-08-11・前巡全所見 RESOLVED）
+
+- **RV08-04（裁定＝推奨形採用）**: 裁定①を **(B)＝`PERSON_MERGE_ENABLED` の意味
+  置換**で確定。新 flag 不使用・物理削除コード完全除去。§4 の「既定 OFF の間は
+  現行挙動不変」を**撤回**（flag ON の挙動変更〔物理削除→soft〕は意図的な安全
+  方向の変更と明記）し、flag×コード状態の全象限表（fallback 経路の不存在込み）を
+  追加。
