@@ -432,17 +432,55 @@ def _autoreply_paused() -> bool:
     return os.environ.get("AUTOREPLY_PAUSED") == "1"
 
 
-async def _handle_paused_inbound(user_id: str, user_text: str) -> None:
+class PausedInboundError(RuntimeError):
+    """pause 経路の記録/通知失敗（AUTOREPLY-01・分類名のみ・PII 非搭載）。
+    durable 経路では wrapper が捕捉して inbound event を failed へ倒す
+    （既存の retry/reconcile 機構で再処理可能）。"""
+
+
+_APP_CHATLOG_KT = hub_kintone.KintoneApp(
+    "App 28 (チャットログ)", "APP_CHATLOG", "TOKEN_CHATLOG")
+
+
+async def _paused_chatlog_already_saved(idem_key: str) -> bool:
+    """AUTOREPLY-01(iii): retry 時の App28 重複防止。冪等キー
+    （category="paused:{webhook_event_id}"・SINGLE_LINE_TEXT の完全一致検索）で
+    既存確認する。確認自体の失敗は False（=保存を試行）へ倒す——重複は欠落より
+    安全側（記録主義）。"""
+    if not (_APP_CHATLOG_KT.app_id() and _APP_CHATLOG_KT.token()):
+        return False
+    try:
+        rows = await hub_kintone.search_records(
+            _APP_CHATLOG_KT,
+            f'category = "{idem_key}" order by $id asc limit 1',
+            fields=["$id"])
+    except Exception:
+        logger.info("[AUTOREPLY_PAUSED] idempotency pre-check failed "
+                    "(fall back to save)")
+        return False
+    return bool(rows)
+
+
+async def _handle_paused_inbound(user_id: str, user_text: str,
+                                 webhook_event_id: str | None = None) -> None:
     """AUTOREPLY_PAUSED=1 の受信処理（既存「人対応」経路と同型・返信 0 件）:
 
     - 顧客へは一切送信しない（自動応答・定型文・承認キュー投入とも発生しない。
       **Claude API 呼び出しもスキップ**＝無駄な消費と「生成したのに送らない」
       状態を作らない）
-    - App28（チャットログ）へ受信内容を記録（方向=user・auto_sent=no）
-    - 弁護士へ業務チャネル（DISPATCHBOT）通知。表示名は App21 の顧客名
-      （best-effort 参照・redact は人対応と同じ emit 経路）。**App21 レコードの
-      無い新規/未紐付け顧客は PII 配慮の匿名ID**（LINE userId の SHA-256 先頭
-      8桁・実体の特定は App28 で行う）
+    - **App28 記録と管理者通知は独立に試行**（AUTOREPLY-01(i)・片方の失敗で
+      もう片方をスキップしない）。記録失敗時は通知本文へ失敗分類を含める
+      （「記録に失敗しています」を人が知れる）
+    - **いずれかの失敗は PausedInboundError で上位へ伝播**（AUTOREPLY-01(ii)・
+      durable 経路=failed へ→retry で再処理・非 durable 経路=分類付き ERROR
+      ログ済みのまま送出）
+    - **retry の冪等性**（AUTOREPLY-01(iii)）: durable 経路は App28 の
+      category へ冪等キー paused:{webhook_event_id} を保存し、再処理時は
+      完全一致検索で既存確認＝重複レコードを作らない。通知の再送は許容
+      （重複通知は沈黙より安全側）
+    - 表示名は App21 顧客名（best-effort・redact は人対応と同じ emit 経路）。
+      App21 レコードの無い新規顧客は PII 配慮の匿名ID（userId の SHA-256
+      先頭8桁・実体の特定は App28 で行う）
     - inbound_event 耐久化は本関数の上流（webhook 受理時）で完了済み＝継続。
       Stripe/CloudSign webhook は別 endpoint＝無影響
     """
@@ -461,20 +499,59 @@ async def _handle_paused_inbound(user_id: str, user_text: str) -> None:
     if not display_name:
         anon = hashlib.sha256(user_id.encode("utf-8")).hexdigest()[:8]
         display_name = f"新規/未紐付け(匿名ID:{anon})"
-    # (b) 受信記録 →(c) 通知 の順序は「人対応」経路と同型
-    await save_to_chatlog(user_id, "user", user_text, "", "no")
+
+    # ── (b) 受信記録（独立試行・durable 時は冪等キーつき） ──────────────────
+    idem_key = f"paused:{webhook_event_id}" if webhook_event_id else ""
+    save_error = ""
+    if idem_key and await _paused_chatlog_already_saved(idem_key):
+        logger.info("[AUTOREPLY_PAUSED] chatlog already saved (idempotent "
+                    "retry, skip save)")
+    else:
+        try:
+            await save_to_chatlog(user_id, "user", user_text, idem_key, "no")
+        except Exception as e:
+            save_error = type(e).__name__
+            # P1-107b 転換ログと同型（分類名＋本文は emit 抑止・PII 非搭載）
+            logger.error("[AUTOREPLY_PAUSED] chatlog save failed user=%s "
+                         "cls=%s: %s",
+                         emit(user_id, "external_ref", "log", "operator"),
+                         type(e).__name__,
+                         emit(str(e), "vendor_raw", "log", "operator"))
+
+    # ── (c) 管理者通知（独立試行・保存失敗でもスキップしない） ───────────────
+    notify_error = ""
     if ATTORNEY_LINE_USER_ID:
         from hub.notify import notify_business
-        await notify_business(
-            ATTORNEY_LINE_USER_ID,
-            f"【自動返信停止中】"
-            f"{emit(display_name, 'name', 'line_business', 'attorney')}"
-            f"：{emit(user_text, 'freetext', 'line_business', 'attorney')}",
-        )
+        text = (f"【自動返信停止中】"
+                f"{emit(display_name, 'name', 'line_business', 'attorney')}"
+                f"：{emit(user_text, 'freetext', 'line_business', 'attorney')}")
+        if save_error:
+            text += (f"\n⚠ App28 への受信記録に失敗しています"
+                     f"（分類: {save_error}）。この通知が唯一の受信痕跡の"
+                     "可能性があります（再処理で記録を回復します）")
+        try:
+            sent = await notify_business(ATTORNEY_LINE_USER_ID, text)
+        except Exception as e:
+            notify_error = type(e).__name__
+            # P1-107b 転換ログと同型（分類名＋本文は emit 抑止・PII 非搭載）
+            logger.error("[AUTOREPLY_PAUSED] notify failed user=%s cls=%s: %s",
+                         emit(user_id, "external_ref", "log", "operator"),
+                         type(e).__name__,
+                         emit(str(e), "vendor_raw", "log", "operator"))
+        else:
+            if not sent:
+                notify_error = "notify_business_declined"
+                logger.error("[AUTOREPLY_PAUSED] notify declined "
+                             "(recipient/allowlist/token・fixed text only)")
     else:
         logger.info(
             "[AUTOREPLY_PAUSED] ATTORNEY_LINE_USER_ID not set, "
             "admin notify skipped")
+
+    # ── (ii) 失敗の伝播（durable=failed・非 durable=上記 ERROR ログ＋送出） ──
+    if save_error or notify_error:
+        raise PausedInboundError(
+            f"save={save_error or 'ok'} notify={notify_error or 'ok'}")
 
 
 async def _process_line_event(reply_token: str, user_id: str, user_text: str) -> None:
@@ -482,13 +559,15 @@ async def _process_line_event(reply_token: str, user_id: str, user_text: str) ->
     logger.info("[PROCESS] start user_id=%s text=%s",
                 emit(user_id, "external_ref", "log", "operator"),
                 emit(user_text[:30], "freetext", "log", "operator"))
+    # ── ①全体停止 flag（AUTOREPLY_PAUSED・全ての外部作用より前に判定。
+    #    App21 レコードの有無・ヒアリングセッション中かを問わず全停止）。
+    #    **try の外**＝pause 経路の失敗は握りつぶさず上位へ伝播する
+    #    （AUTOREPLY-01(ii)。非 durable 経路の冪等キーは無し=event id 不在。
+    #    durable 経路は wrapper 側の pause 分岐が event id つきで処理する）──────
+    if _autoreply_paused():
+        await _handle_paused_inbound(user_id, user_text, None)
+        return
     try:
-        # ── ①全体停止 flag（AUTOREPLY_PAUSED・全ての外部作用より前に判定。
-        #    App21 レコードの有無・ヒアリングセッション中かを問わず全停止）────
-        if _autoreply_paused():
-            await _handle_paused_inbound(user_id, user_text)
-            return
-
         # ── ルーティング判定 ──────────────────────────────────────────────
         in_hearing_session = (
             user_id in conversation_histories
@@ -616,12 +695,18 @@ async def _process_line_event(reply_token: str, user_id: str, user_text: str) ->
 async def _process_line_event_durable(reply_token: str, user_id: str, user_text: str,
                                       webhook_event_id: str) -> None:
     """RV-05-13 Phase A: coarse observe（received→processing→completed/failed）で
-    HOTFIX-01 型の背景タスク全滅を可視化する。**_process_line_event 本体は不変**（wrap のみ）。"""
+    HOTFIX-01 型の背景タスク全滅を可視化する。**_process_line_event 本体は不変**
+    （wrap のみ・シグネチャも不変）。AUTOREPLY-01(iii): pause 時は wrapper 側で
+    分岐し webhook_event_id を冪等キーとして引き渡す（pause 経路の失敗は
+    except 節が failed へ倒す＝retry/reconcile で再処理可能）。"""
     from hub.durable_inbound import (mark_line_processing, mark_line_completed,
                                      mark_line_failed)
     try:
         await mark_line_processing(webhook_event_id)
-        await _process_line_event(reply_token, user_id, user_text)
+        if _autoreply_paused():
+            await _handle_paused_inbound(user_id, user_text, webhook_event_id)
+        else:
+            await _process_line_event(reply_token, user_id, user_text)
         await mark_line_completed(webhook_event_id)
     except Exception as e:
         # 失敗を durable に可視化する（HOTFIX-01 型の沈黙を防ぐ）。記録後は握って背景

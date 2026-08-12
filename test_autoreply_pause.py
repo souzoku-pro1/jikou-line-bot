@@ -64,12 +64,15 @@ class _Base(unittest.TestCase):
         self.notify = AsyncMock(return_value=True)
         self.customer = AsyncMock()
         self.app21 = AsyncMock(return_value=None)
+        self.idem_check = AsyncMock(return_value=False)   # 既定=未保存
         for p in [
             patch.object(main, "_line_reply_with_fallback", new=self.reply),
             patch.object(main, "ask_claude", new=self.claude),
             patch.object(main, "save_to_chatlog", new=self.chatlog),
             patch.object(main, "handle_customer_message", new=self.customer),
             patch.object(main, "get_app21_record", new=self.app21),
+            patch.object(main, "_paused_chatlog_already_saved",
+                         new=self.idem_check),
             patch.object(main, "ATTORNEY_LINE_USER_ID", "U-attorney"),
             patch.object(main, "emit",
                          new=lambda v, *a, **k: str(v)),   # 内容検証用に素通し
@@ -161,6 +164,111 @@ class TestPausedOn(_Base):
         self.chatlog.assert_awaited_once()
         self.notify.assert_not_awaited()
         self._assert_no_autoreply_side_effects()
+
+
+class TestFailClosed(_Base):
+    """AUTOREPLY-01: 記録/通知の独立試行・失敗の伝播・retry 冪等性"""
+
+    def _durable_marks(self):
+        from hub import durable_inbound as di
+        marks = {"processing": AsyncMock(), "completed": AsyncMock(),
+                 "failed": AsyncMock()}
+        for name, mock in (("mark_line_processing", marks["processing"]),
+                           ("mark_line_completed", marks["completed"]),
+                           ("mark_line_failed", marks["failed"])):
+            p = patch.object(di, name, new=mock)
+            p.start()
+            self.addCleanup(p.stop)
+        return marks
+
+    def test_save_failure_notify_still_sent_and_durable_failed(self):
+        """(i)(ii) save 失敗 → 通知は届く（失敗分類つき=人が知れる）＋
+        durable は completed でなく failed（retry 可能）"""
+        self.chatlog.side_effect = RuntimeError("kintone down")
+        marks = self._durable_marks()
+        with patch.dict(os.environ, {"AUTOREPLY_PAUSED": "1"}):
+            run(main._process_line_event_durable("rt", USER, "本文", "evt-1"))
+        self.notify.assert_awaited_once()
+        text = self.notify.await_args.args[1]
+        self.assertIn("受信記録に失敗しています", text)
+        self.assertIn("RuntimeError", text, "失敗分類を通知に含める")
+        marks["failed"].assert_awaited_once()
+        self.assertEqual(marks["failed"].await_args.args,
+                         ("evt-1", "PausedInboundError"))
+        marks["completed"].assert_not_awaited()
+        self.reply.assert_not_awaited()
+
+    def test_notify_failure_record_kept_and_durable_failed(self):
+        """(i)(ii) notify 失敗 → 記録は残る＋durable failed"""
+        self.notify.side_effect = RuntimeError("push down")
+        marks = self._durable_marks()
+        with patch.dict(os.environ, {"AUTOREPLY_PAUSED": "1"}):
+            run(main._process_line_event_durable("rt", USER, "本文", "evt-2"))
+        self.chatlog.assert_awaited_once()
+        marks["failed"].assert_awaited_once()
+        marks["completed"].assert_not_awaited()
+
+    def test_notify_declined_is_also_failure(self):
+        """notify_business の False（allowlist 外等の未送信）も失敗として伝播"""
+        self.notify.return_value = False
+        marks = self._durable_marks()
+        with patch.dict(os.environ, {"AUTOREPLY_PAUSED": "1"}):
+            run(main._process_line_event_durable("rt", USER, "本文", "evt-3"))
+        self.chatlog.assert_awaited_once()
+        marks["failed"].assert_awaited_once()
+        marks["completed"].assert_not_awaited()
+
+    def test_both_failures_attempted_independently(self):
+        """(i) 両方失敗 → 双方とも試行されている（片方の失敗で他方を
+        スキップしない）＋durable failed"""
+        self.chatlog.side_effect = RuntimeError("kintone down")
+        self.notify.side_effect = RuntimeError("push down")
+        marks = self._durable_marks()
+        with patch.dict(os.environ, {"AUTOREPLY_PAUSED": "1"}):
+            run(main._process_line_event_durable("rt", USER, "本文", "evt-4"))
+        self.chatlog.assert_awaited_once()
+        self.notify.assert_awaited_once()
+        marks["failed"].assert_awaited_once()
+        marks["completed"].assert_not_awaited()
+
+    def test_retry_is_idempotent_for_chatlog_but_renotifies(self):
+        """(iii) retry で App28 増分 0（冪等キーの既存確認）・通知は再送・
+        2 回目は completed へ収束"""
+        self.notify.side_effect = [RuntimeError("push down"), True]
+        self.idem_check.side_effect = [False, True]   # 1回目=未保存/2回目=保存済み
+        marks = self._durable_marks()
+        with patch.dict(os.environ, {"AUTOREPLY_PAUSED": "1"}):
+            run(main._process_line_event_durable("rt", USER, "本文", "evt-5"))
+            run(main._process_line_event_durable("rt", USER, "本文", "evt-5"))
+        self.assertEqual(self.chatlog.await_count, 1, "App28 増分 0（冪等）")
+        self.assertEqual(self.chatlog.await_args.args,
+                         (USER, "user", "本文", "paused:evt-5", "no"),
+                         "冪等キーを category へ保存（inbound event 識別子）")
+        self.assertEqual(self.notify.await_count, 2, "通知は再送（沈黙より安全側）")
+        marks["failed"].assert_awaited_once()
+        marks["completed"].assert_awaited_once()
+
+    def test_success_path_still_completes(self):
+        """成功経路の completed 回帰（fail-closed 化による退行なし）"""
+        marks = self._durable_marks()
+        with patch.dict(os.environ, {"AUTOREPLY_PAUSED": "1"}):
+            run(main._process_line_event_durable("rt", USER, "本文", "evt-6"))
+        marks["completed"].assert_awaited_once()
+        marks["failed"].assert_not_awaited()
+
+    def test_non_durable_failure_logs_and_raises(self):
+        """(ii) 非 durable 経路: 分類付き ERROR ログ（PII 非搭載）＋送出"""
+        self.chatlog.side_effect = RuntimeError("kintone down")
+        with patch.dict(os.environ, {"AUTOREPLY_PAUSED": "1"}), \
+                self.assertLogs("main", level="ERROR") as logs, \
+                self.assertRaises(main.PausedInboundError) as ctx:
+            run(main._process_line_event("rt", USER, "秘密の本文"))
+        joined = "\n".join(logs.output)
+        self.assertIn("chatlog save failed", joined)
+        self.assertIn("cls=RuntimeError", joined)
+        self.assertNotIn("秘密の本文", joined, "ERROR ログに本文を載せない")
+        self.assertNotIn("秘密の本文", str(ctx.exception),
+                         "例外メッセージは分類のみ（PII 非搭載）")
 
 
 class TestPausedOff(_Base):
