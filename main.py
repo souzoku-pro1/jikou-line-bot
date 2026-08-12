@@ -425,11 +425,198 @@ async def ask_claude(user_id: str, user_message: str) -> str:
     return reply_text
 
 
+def _autoreply_paused() -> bool:
+    """①全体停止 flag（AUTOREPLY-PAUSE-IMPL）: env AUTOREPLY_PAUSED=1 のとき
+    顧客Bot の自動返信を全停止する。**未設定/他値=従来動作と完全一致**。
+    判定はあらゆる外部作用（App21 参照・Claude・LINE 送信）より前に行う。"""
+    return os.environ.get("AUTOREPLY_PAUSED") == "1"
+
+
+class PausedInboundError(RuntimeError):
+    """pause 経路の記録/通知失敗（AUTOREPLY-01・分類名のみ・PII 非搭載）。
+    durable 経路では wrapper が捕捉して inbound event を failed へ倒す
+    （既存の retry/reconcile 機構で再処理可能）。"""
+
+
+class PausedChatlogConfigError(RuntimeError):
+    """pause 経路 strict writer: APP_CHATLOG/TOKEN_CHATLOG 未設定
+    （AUTOREPLY-02(i)・fail-open な save_to_chatlog と違い未設定を例外化＝
+    「保存された」との誤認を防ぎ durable failed → retry へ倒す）。"""
+
+
+_APP_CHATLOG_KT = hub_kintone.KintoneApp(
+    "App 28 (チャットログ)", "APP_CHATLOG", "TOKEN_CHATLOG")
+
+
+async def _save_paused_chatlog(user_id: str, role: str, message: str,
+                               category: str, auto_sent: str) -> None:
+    """AUTOREPLY-02: pause 経路専用の strict writer（fail-closed）。
+    既存 save_to_chatlog は fail-open（env 未設定=silent skip・HTTP 失敗=
+    warning のみ）のまま他経路の契約として維持し、停止経路の保存だけを
+    厳格化する:
+
+    (i)   APP_CHATLOG/TOKEN_CHATLOG 未設定 → PausedChatlogConfigError
+    (ii)  kintone HTTP 4xx/5xx・通信エラー → KintoneError（hub_kintone._write
+          が正規化して送出・書き込みはリトライしない）
+    (iii) 成功時のみ正常 return
+
+    シグネチャ・保存フィールドは save_to_chatlog と同一（App28 のレコード形は
+    変えない）。"""
+    if not (_APP_CHATLOG_KT.app_id() and _APP_CHATLOG_KT.token()):
+        raise PausedChatlogConfigError(
+            f"{_APP_CHATLOG_KT.app_id_env}/{_APP_CHATLOG_KT.token_env} not set")
+    await hub_kintone.create_record(_APP_CHATLOG_KT, {
+        "line_user_id": user_id,
+        "role": role,
+        "message": message,
+        "category": category,
+        "auto_sent": auto_sent,
+    })
+
+
+async def _paused_chatlog_already_saved(idem_key: str) -> bool:
+    """AUTOREPLY-01(iii): retry 時の App28 重複防止。冪等キー
+    （category="paused:{webhook_event_id}"・SINGLE_LINE_TEXT の完全一致検索）で
+    既存確認する。確認自体の失敗は False（=保存を試行）へ倒す——重複は欠落より
+    安全側（記録主義）。
+
+    AUTOREPLY-03/04 役割分担: **並行一意性（同一 webhook_event_id の同時 2 処理の
+    排除）は durable 状態機械が担保する**——(a) record_line_event の排他 claim
+    （同時重複配送は勝者 1 者のみ処理登録・fresh processing 中の再配送は
+    "duplicate"=登録 skip）＋ (b) mark_line_processing の所有権取得
+    （AUTOREPLY-04・初回 new タスクは received→processing の guard 付き UPDATE
+    で所有権を取得できたときのみ処理＝「初回 new タスク×reattempt タスク」の
+    併走窓も閉じている。いずれも hub/durable_inbound.py）。本検索が受け持つのは
+    **順次 retry（failed → LINE 再配送）の冪等担保のみ**であり、check-then-act
+    の隙間を突く並行実行は前提にない（決定的一意制約は導入しない・小機能に
+    対する過剰実装を避ける）。"""
+    if not (_APP_CHATLOG_KT.app_id() and _APP_CHATLOG_KT.token()):
+        return False
+    try:
+        rows = await hub_kintone.search_records(
+            _APP_CHATLOG_KT,
+            f'category = "{idem_key}" order by $id asc limit 1',
+            fields=["$id"])
+    except Exception:
+        logger.info("[AUTOREPLY_PAUSED] idempotency pre-check failed "
+                    "(fall back to save)")
+        return False
+    return bool(rows)
+
+
+async def _handle_paused_inbound(user_id: str, user_text: str,
+                                 webhook_event_id: str | None = None) -> None:
+    """AUTOREPLY_PAUSED=1 の受信処理（既存「人対応」経路と同型・返信 0 件）:
+
+    - 顧客へは一切送信しない（自動応答・定型文・承認キュー投入とも発生しない。
+      **Claude API 呼び出しもスキップ**＝無駄な消費と「生成したのに送らない」
+      状態を作らない）
+    - **App28 記録と管理者通知は独立に試行**（AUTOREPLY-01(i)・片方の失敗で
+      もう片方をスキップしない）。記録失敗時は通知本文へ失敗分類を含める
+      （「記録に失敗しています」を人が知れる）
+    - **いずれかの失敗は PausedInboundError で上位へ伝播**（AUTOREPLY-01(ii)・
+      durable 経路=failed へ→retry で再処理・非 durable 経路=分類付き ERROR
+      ログ済みのまま送出）
+    - **App28 保存は pause 専用 strict writer**（AUTOREPLY-02・
+      _save_paused_chatlog）: env 未設定・HTTP 4xx/5xx を例外化し、成功時のみ
+      正常 return（fail-open な save_to_chatlog の契約は他経路向けに不変）
+    - **retry の冪等性**（AUTOREPLY-01(iii)）: durable 経路は App28 の
+      category へ冪等キー paused:{webhook_event_id} を保存し、再処理時は
+      完全一致検索で既存確認＝重複レコードを作らない。通知の再送は許容
+      （重複通知は沈黙より安全側）。**並行一意性は durable 状態機械
+      （record_line_event の排他 claim＋mark_line_processing の所有権取得・
+      AUTOREPLY-04）が担保**し、この検索は順次 retry の冪等担保のみを
+      受け持つ（AUTOREPLY-03・_paused_chatlog_already_saved の docstring 参照）
+    - 表示名は App21 顧客名（best-effort・redact は人対応と同じ emit 経路）。
+      App21 レコードの無い新規顧客は PII 配慮の匿名ID（userId の SHA-256
+      先頭8桁・実体の特定は App28 で行う）
+    - inbound_event 耐久化は本関数の上流（webhook 受理時）で完了済み＝継続。
+      Stripe/CloudSign webhook は別 endpoint＝無影響
+    """
+    logger.info("[AUTOREPLY_PAUSED] inbound recorded (no reply) user_id=%s",
+                emit(user_id, "external_ref", "log", "operator"))
+    display_name = ""
+    try:
+        app21_record = await get_app21_record(user_id)
+        if app21_record is not None:
+            display_name = (
+                app21_record.get("顧客名", {}).get("value", "") or "")
+    except Exception:
+        # 表示名の解決は best-effort（失敗しても記録と通知を止めない）
+        logger.info("[AUTOREPLY_PAUSED] App21 lookup failed "
+                    "(fallback to anonymous id)")
+    if not display_name:
+        anon = hashlib.sha256(user_id.encode("utf-8")).hexdigest()[:8]
+        display_name = f"新規/未紐付け(匿名ID:{anon})"
+
+    # ── (b) 受信記録（独立試行・durable 時は冪等キーつき） ──────────────────
+    idem_key = f"paused:{webhook_event_id}" if webhook_event_id else ""
+    save_error = ""
+    if idem_key and await _paused_chatlog_already_saved(idem_key):
+        logger.info("[AUTOREPLY_PAUSED] chatlog already saved (idempotent "
+                    "retry, skip save)")
+    else:
+        try:
+            await _save_paused_chatlog(user_id, "user", user_text, idem_key,
+                                       "no")
+        except Exception as e:
+            save_error = type(e).__name__
+            # P1-107b 転換ログと同型（分類名＋本文は emit 抑止・PII 非搭載）
+            logger.error("[AUTOREPLY_PAUSED] chatlog save failed user=%s "
+                         "cls=%s: %s",
+                         emit(user_id, "external_ref", "log", "operator"),
+                         type(e).__name__,
+                         emit(str(e), "vendor_raw", "log", "operator"))
+
+    # ── (c) 管理者通知（独立試行・保存失敗でもスキップしない） ───────────────
+    notify_error = ""
+    if ATTORNEY_LINE_USER_ID:
+        from hub.notify import notify_business
+        text = (f"【自動返信停止中】"
+                f"{emit(display_name, 'name', 'line_business', 'attorney')}"
+                f"：{emit(user_text, 'freetext', 'line_business', 'attorney')}")
+        if save_error:
+            text += (f"\n⚠ App28 への受信記録に失敗しています"
+                     f"（分類: {save_error}）。この通知が唯一の受信痕跡の"
+                     "可能性があります（再処理で記録を回復します）")
+        try:
+            sent = await notify_business(ATTORNEY_LINE_USER_ID, text)
+        except Exception as e:
+            notify_error = type(e).__name__
+            # P1-107b 転換ログと同型（分類名＋本文は emit 抑止・PII 非搭載）
+            logger.error("[AUTOREPLY_PAUSED] notify failed user=%s cls=%s: %s",
+                         emit(user_id, "external_ref", "log", "operator"),
+                         type(e).__name__,
+                         emit(str(e), "vendor_raw", "log", "operator"))
+        else:
+            if not sent:
+                notify_error = "notify_business_declined"
+                logger.error("[AUTOREPLY_PAUSED] notify declined "
+                             "(recipient/allowlist/token・fixed text only)")
+    else:
+        logger.info(
+            "[AUTOREPLY_PAUSED] ATTORNEY_LINE_USER_ID not set, "
+            "admin notify skipped")
+
+    # ── (ii) 失敗の伝播（durable=failed・非 durable=上記 ERROR ログ＋送出） ──
+    if save_error or notify_error:
+        raise PausedInboundError(
+            f"save={save_error or 'ok'} notify={notify_error or 'ok'}")
+
+
 async def _process_line_event(reply_token: str, user_id: str, user_text: str) -> None:
     """LINEイベントの重い処理（BackgroundTasksで非同期実行）"""
     logger.info("[PROCESS] start user_id=%s text=%s",
                 emit(user_id, "external_ref", "log", "operator"),
                 emit(user_text[:30], "freetext", "log", "operator"))
+    # ── ①全体停止 flag（AUTOREPLY_PAUSED・全ての外部作用より前に判定。
+    #    App21 レコードの有無・ヒアリングセッション中かを問わず全停止）。
+    #    **try の外**＝pause 経路の失敗は握りつぶさず上位へ伝播する
+    #    （AUTOREPLY-01(ii)。非 durable 経路の冪等キーは無し=event id 不在。
+    #    durable 経路は wrapper 側の pause 分岐が event id つきで処理する）──────
+    if _autoreply_paused():
+        await _handle_paused_inbound(user_id, user_text, None)
+        return
     try:
         # ── ルーティング判定 ──────────────────────────────────────────────
         in_hearing_session = (
@@ -556,14 +743,34 @@ async def _process_line_event(reply_token: str, user_id: str, user_text: str) ->
 
 
 async def _process_line_event_durable(reply_token: str, user_id: str, user_text: str,
-                                      webhook_event_id: str) -> None:
+                                      webhook_event_id: str,
+                                      already_claimed: bool = False) -> None:
     """RV-05-13 Phase A: coarse observe（received→processing→completed/failed）で
-    HOTFIX-01 型の背景タスク全滅を可視化する。**_process_line_event 本体は不変**（wrap のみ）。"""
+    HOTFIX-01 型の背景タスク全滅を可視化する。**_process_line_event 本体は不変**
+    （wrap のみ）。AUTOREPLY-01(iii): pause 時は wrapper 側で分岐し
+    webhook_event_id を冪等キーとして引き渡す（pause 経路の失敗は except 節が
+    failed へ倒す＝retry/reconcile で再処理可能）。
+
+    AUTOREPLY-04（処理所有権の単一化）: 同一 webhook_event_id の処理実行は
+    厳密に 1 者——
+    - 初回 new タスク: mark_line_processing で所有権を取得（received→processing
+      の guard 付き UPDATE・原子的）。取得失敗＝自タスクの実行前に再配送の排他
+      claim（record_line_event）が state を動かした＝所有権は reattempt タスク側
+      → **何もせず退出**（completed/failed も書かない・所有者の state を壊さない）
+    - reattempt タスク: record_line_event の排他 claim で所有権取得済み
+      （already_claimed=True・webhook 側が outcome で判別して渡す）"""
     from hub.durable_inbound import (mark_line_processing, mark_line_completed,
                                      mark_line_failed)
     try:
-        await mark_line_processing(webhook_event_id)
-        await _process_line_event(reply_token, user_id, user_text)
+        if not already_claimed and not await mark_line_processing(webhook_event_id):
+            logger.info("[DURABLE] ownership not acquired (claimed by "
+                        "redelivery) id=%s",
+                        emit(webhook_event_id, "record_id", "log", "operator"))
+            return
+        if _autoreply_paused():
+            await _handle_paused_inbound(user_id, user_text, webhook_event_id)
+        else:
+            await _process_line_event(reply_token, user_id, user_text)
         await mark_line_completed(webhook_event_id)
     except Exception as e:
         # 失敗を durable に可視化する（HOTFIX-01 型の沈黙を防ぐ）。記録後は握って背景
@@ -618,8 +825,11 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
                 # record_line_event が "reattempt" を返し、下で再処理を登録する
                 # （INSERT 後クラッシュ／部分 insert 失敗の永久滞留を断つ）。
                 continue
+            # AUTOREPLY-04: reattempt は record_line_event の排他 claim で所有権
+            # 取得済み＝already_claimed=True。new は task 側で所有権を取得する
             background_tasks.add_task(_process_line_event_durable,
-                                     reply_token, user_id, user_text, webhook_event_id)
+                                     reply_token, user_id, user_text, webhook_event_id,
+                                     outcome == "reattempt")
         else:
             background_tasks.add_task(_process_line_event, reply_token, user_id, user_text)
         logger.info("[WEBHOOK] queued user_id=%s text=%s",
