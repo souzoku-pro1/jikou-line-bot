@@ -37,6 +37,7 @@
 
 import json
 import logging
+import os
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -94,6 +95,9 @@ PARENT_EDGE_FIELDS = ("父人物ID", "母人物ID", "養父人物ID", "養母人
 
 # 和集合マージするサブテーブル
 SUBTABLE_UNION_FIELDS = ("登場戸籍", "身分事項")
+
+# RV08-IMPL-10: reconcile のカーソルページ幅（テストで縮小 patch 可能）
+_RECONCILE_PAGE = 200
 
 JST = timezone(timedelta(hours=9))
 
@@ -616,16 +620,31 @@ async def reconcile_merge_operations() -> dict:
     起動タイミング: RV05 startup reconcile 流儀（main.py _on_startup・
     PERSON_MERGE_ENABLED=1 のときのみ・失敗しても起動を止めない）。
     手動起動も可（関数を直接呼ぶ）。
+
+    RV08-IMPL-10: list_open_operations の **id カーソルページング**で全未完了
+    operation を有限回で走査完了する（打ち切りなし——open 封筒の operation が
+    多数滞留しても後方の「封筒 closed×台帳 open」へ必ず到達する）。統計は
+    walked/still_open/reconciled/alerted。滞留数が閾値
+    （env MERGE_OPEN_OPS_ALERT_THRESHOLD・既定 20）を超えたら業務警報を
+    **1 回**発する（沈黙しない）。
     """
-    stats = {"checked": 0, "reconciled": 0, "still_open": 0, "alerted": 0}
+    stats = {"walked": 0, "reconciled": 0, "still_open": 0, "alerted": 0}
     if not merge_enabled():
         return stats
     if not (APP_SHIPPING.app_id() and APP_SHIPPING.token()
             and APP_KOSEKI_PERSON.app_id() and APP_KOSEKI_PERSON.token()):
         return stats
-    ops = await list_open_operations()
+    cursor = 0
+    ops: list[dict] = []
+    while True:
+        page = await list_open_operations(after_id=cursor,
+                                          limit=_RECONCILE_PAGE)
+        if not page:
+            break
+        ops.extend(page)
+        cursor = page[-1]["row_id"]   # 厳密単調増加＝有限回で必ず終端
     for op in ops:
-        stats["checked"] += 1
+        stats["walked"] += 1
         try:
             envelope = await kintone.get_record(APP_SHIPPING,
                                                 op["envelope_record_id"])
@@ -694,6 +713,26 @@ async def reconcile_merge_operations() -> dict:
                     "open の完了化） review=No.%s",
                     emit(op["envelope_record_id"], "record_id", "log",
                          "operator"))
+    logger.info("[PERSON_MERGE_EXEC] reconcile stats walked=%s still_open=%s "
+                "reconciled=%s alerted=%s",
+                emit(stats["walked"], "count", "log", "operator"),
+                emit(stats["still_open"], "count", "log", "operator"),
+                emit(stats["reconciled"], "count", "log", "operator"),
+                emit(stats["alerted"], "count", "log", "operator"))
+    # RV08-IMPL-10: 異常な滞留数は業務警報を 1 回発する（沈黙しない・件数のみ）
+    threshold = int(os.environ.get("MERGE_OPEN_OPS_ALERT_THRESHOLD", "20"))
+    if stats["walked"] > threshold:
+        from hub import notify
+        try:
+            await notify.notify_admin_line(
+                "【名寄せ統合: 未完了 operation の滞留】\n"
+                f"未完了 {stats['walked']} 件（閾値 {threshold} 超・"
+                f"open封筒 {stats['still_open']} 件・要確認 {stats['alerted']} 件）\n"
+                "封筒キューの未処理と要確認警報を確認してください",
+                throttle_key="merge_reconcile_backlog")
+        except Exception:
+            logger.error("[PERSON_MERGE_EXEC] backlog alert failed "
+                         "(fixed classification only)")
     return stats
 
 

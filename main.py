@@ -114,9 +114,9 @@ async def _on_startup():
         try:
             from person_merge_exec import reconcile_merge_operations
             stats = await reconcile_merge_operations()
-            logger.info("[RV08] startup reconcile: checked=%s reconciled=%s "
+            logger.info("[RV08] startup reconcile: walked=%s reconciled=%s "
                         "still_open=%s alerted=%s",
-                        emit(stats["checked"], "count", "log", "operator"),
+                        emit(stats["walked"], "count", "log", "operator"),
                         emit(stats["reconciled"], "count", "log", "operator"),
                         emit(stats["still_open"], "count", "log", "operator"),
                         emit(stats["alerted"], "count", "log", "operator"))

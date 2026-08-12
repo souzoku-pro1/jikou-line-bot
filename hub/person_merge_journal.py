@@ -19,6 +19,7 @@
 
 import hashlib
 import json
+from contextlib import asynccontextmanager
 from datetime import datetime
 
 import sqlalchemy as sa
@@ -147,17 +148,42 @@ def fingerprint_with_updates(record: dict, updates: dict) -> str:
 
 # ── 追記・照会（読み書きは本モジュール経由のみ） ─────────────────────────────
 
+async def stages_in_session(session, operation_id: str) -> dict[str, dict]:
+    """operation_id の stage → payload 写像（呼出し元の session/txn 内で読む版。
+    RV08-IMPL-08 の直列化区間からロック下の再読に使う）。"""
+    t = PersonMergeOperation.__table__
+    rows = (await session.execute(
+        sa.select(t.c.stage, t.c.payload)
+        .where(t.c.operation_id == operation_id)
+        .order_by(t.c.id.asc()))).all()
+    return {r.stage: r.payload for r in rows}
+
+
+async def insert_stage_in_session(session, *, operation_id: str, pair_key: str,
+                                  envelope_record_id: str, winner_id: str,
+                                  loser_id: str, stage: str,
+                                  payload: dict) -> None:
+    """呼出し元の session/txn 内で 1 行追記する（commit は呼出し元＝
+    RV08-IMPL-08 の直列化区間ではロック解放と同時に確定する）。"""
+    session.add(PersonMergeOperation(
+        operation_id=operation_id, pair_key=pair_key,
+        envelope_record_id=envelope_record_id,
+        winner_id=winner_id, loser_id=loser_id,
+        stage=stage, payload=payload))
+    await session.flush()   # UNIQUE 競合をこの場で顕在化（黙って commit 時に落とさない）
+
+
 async def record_stage(*, operation_id: str, pair_key: str,
                        envelope_record_id: str, winner_id: str, loser_id: str,
                        stage: str, payload: dict) -> None:
-    """台帳へ 1 行追記する。失敗は MergeJournalError（呼出し元 fail-closed）。"""
+    """台帳へ 1 行追記する（独立 txn）。失敗は MergeJournalError（fail-closed）。"""
     try:
         async with session_scope() as session:
-            session.add(PersonMergeOperation(
-                operation_id=operation_id, pair_key=pair_key,
+            await insert_stage_in_session(
+                session, operation_id=operation_id, pair_key=pair_key,
                 envelope_record_id=envelope_record_id,
                 winner_id=winner_id, loser_id=loser_id,
-                stage=stage, payload=payload))
+                stage=stage, payload=payload)
     except Exception as e:
         raise MergeJournalError(type(e).__name__) from e
 
@@ -168,46 +194,70 @@ async def find_stages(operation_id: str) -> dict[str, dict]:
     使う。失敗は MergeJournalError（判定不能のまま書かせない・fail-closed）。"""
     try:
         async with session_scope() as session:
-            t = PersonMergeOperation.__table__
-            rows = (await session.execute(
-                sa.select(t.c.stage, t.c.payload)
-                .where(t.c.operation_id == operation_id)
-                .order_by(t.c.id.asc()))).all()
+            return await stages_in_session(session, operation_id)
     except Exception as e:
         raise MergeJournalError(type(e).__name__) from e
-    return {r.stage: r.payload for r in rows}
 
 
-async def list_open_operations(limit: int = 100) -> list[dict]:
-    """未完了 operation（preimage あり・postimage なし）の全列挙
-    （RV08-IMPL-07 reconcile 用・restore 系は対象外＝merge 操作のみ）。
-    Returns: [{"operation_id","pair_key","envelope_record_id",
+@asynccontextmanager
+async def restore_serialization(operation_id: str):
+    """復元 CLI の臨界区間の直列化（RV08-IMPL-08）。stage 閉集合は不変——
+    ロックは既存行/既存テーブルの DB 機構のみで実現する:
+
+    - **postgresql**: 当該 operation の既存行（pending の preimage 行）への
+      `SELECT ... FOR UPDATE`＝行ロック。競合プロセスは commit まで待機する
+      （FOR UPDATE は UPDATE を発行しないため immutable trigger に抵触しない）。
+    - **sqlite**: 0 行 UPDATE（`WHERE 1=0`）で RESERVED（DB 単位の書込み）ロックを
+      先頭で取得＝以後の書込み txn を直列化。行に触れないため BEFORE UPDATE
+      trigger（FOR EACH ROW）は発火しない。busy timeout は driver 既定（5 秒）。
+
+    区間内で stages_in_session（ロック下の再読）→ kintone create/relink →
+    insert_stage_in_session（完了記録）を行い、`async with` の正常終了＝commit で
+    ロックを解放する。例外時は rollback（完了記録は残らない・preimage は独立 txn
+    で保存済みのため回収可能性は不変）。"""
+    async with session_scope() as session:
+        t = PersonMergeOperation.__table__
+        if session.get_bind().dialect.name == "postgresql":
+            await session.execute(
+                sa.select(t.c.id).where(t.c.operation_id == operation_id)
+                .with_for_update())
+        else:
+            await session.execute(
+                sa.update(t).where(sa.text("1=0"))
+                .values(operation_id=t.c.operation_id))
+        yield session
+
+
+async def list_open_operations(after_id: int = 0, limit: int = 100) -> list[dict]:
+    """未完了 operation（preimage あり・postimage なし）の**カーソルページング**
+    列挙（RV08-IMPL-10・restore 系は対象外＝merge 操作のみ）。
+    未完了判定は SQL 側（NOT EXISTS）で行い、`id > after_id` のカーソルで
+    全件を有限回で走査できる（打ち切りなし）。
+    Returns: [{"row_id","operation_id","pair_key","envelope_record_id",
                "winner_id","loser_id","payload"}]。失敗は MergeJournalError。"""
     try:
         async with session_scope() as session:
             t = PersonMergeOperation.__table__
+            d = PersonMergeOperation.__table__.alias("d")
             rows = (await session.execute(
-                sa.select(t.c.operation_id, t.c.pair_key,
+                sa.select(t.c.id, t.c.operation_id, t.c.pair_key,
                           t.c.envelope_record_id, t.c.winner_id,
-                          t.c.loser_id, t.c.stage, t.c.payload)
-                .order_by(t.c.id.asc()))).all()
+                          t.c.loser_id, t.c.payload)
+                .where(t.c.stage == STAGE_PREIMAGE,
+                       t.c.id > int(after_id),
+                       sa.not_(t.c.operation_id.like("restore-%")),
+                       sa.not_(sa.exists().where(
+                           (d.c.operation_id == t.c.operation_id)
+                           & d.c.stage.in_((STAGE_POSTIMAGE, STAGE_RESTORE)))))
+                .order_by(t.c.id.asc())
+                .limit(int(limit)))).all()
     except Exception as e:
         raise MergeJournalError(type(e).__name__) from e
-    done = {r.operation_id for r in rows
-            if r.stage in (STAGE_POSTIMAGE, STAGE_RESTORE)}
-    out = []
-    for r in rows:
-        if r.operation_id.startswith("restore-"):
-            continue   # 復元 CLI の pending は CLI 再実行が回収経路（reconcile 対象外）
-        if r.stage == STAGE_PREIMAGE and r.operation_id not in done:
-            out.append({"operation_id": r.operation_id,
-                        "pair_key": r.pair_key,
-                        "envelope_record_id": r.envelope_record_id,
-                        "winner_id": r.winner_id, "loser_id": r.loser_id,
-                        "payload": r.payload})
-        if len(out) >= limit:
-            break
-    return out
+    return [{"row_id": r.id, "operation_id": r.operation_id,
+             "pair_key": r.pair_key,
+             "envelope_record_id": r.envelope_record_id,
+             "winner_id": r.winner_id, "loser_id": r.loser_id,
+             "payload": r.payload} for r in rows]
 
 
 async def find_open_operation(envelope_record_id: str,

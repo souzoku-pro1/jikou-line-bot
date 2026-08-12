@@ -162,6 +162,10 @@ _APP34_READER_MANIFEST = {
     ("koseki_person_sync.py", "sync_missing_persons"): {
         "search": "exempt",
         "reason": "戸籍単位の人物生成済み判定（存在確認のみ・§10.2(iii) と同根）"},
+    ("koseki_person_sync.py", "sync_persons_from_koseki"): {
+        "get": "exempt",
+        "reason": "over-approx 検出（RV08-IMPL-09）: APP_KOSEKI_PERSON 参照は"
+                  "env 存在チェックのみ・get は App33（戸籍）で App34 read なし"},
     ("person_merge_exec.py", "_find_referrers"): {
         "search": "exempt",
         "reason": "無効化行の親エッジも付け替え/監査対象（preimage 保全）"},
@@ -178,9 +182,10 @@ _APP34_READER_MANIFEST = {
     ("person_restore_cli.py", "_classify_relink"): {
         "get": "exempt",
         "reason": "per-edge 三値照合（勝者=適用/新ID=skip/第三者変更=write 0）"},
-    ("person_restore_cli.py", "_restore"): {
+    ("person_restore_cli.py", "_converge_existing"): {
         "get": "exempt",
-        "reason": "done-path の fingerprint 現況照合（不一致=write 0 要確認）"},
+        "reason": "done-path の fingerprint 現況照合（不一致=write 0 要確認・"
+                  "親エッジは per-edge 三値照合の冪等追適用のみ）"},
 }
 
 # get 結果の許可された流入先（状態確認・照合系の閉集合）
@@ -226,32 +231,74 @@ def _walk_local(node):
         yield from _walk_local(child)
 
 
-def _app34_calls(local_nodes):
-    """局所 node 群から App34 への search/get 呼出しを抽出する"""
-    searches, gets = [], []
+def _refs_app34(local_nodes) -> tuple[bool, set]:
+    """RV08-IMPL-09: APP_KOSEKI_PERSON の参照検出（直接＋**単純 alias 1 hop**）。
+    Returns: (参照の有無, 参照名の集合={APP_KOSEKI_PERSON}∪alias 名)"""
+    names = {"APP_KOSEKI_PERSON"}
+    direct = False
     for n in local_nodes:
-        if isinstance(n, ast.Call):
-            name = _call_name(n)
-            if name in ("search_records", "get_record") and n.args \
-                    and _is_app34_arg(n.args[0]):
-                (searches if name == "search_records" else gets).append(n)
+        if isinstance(n, ast.Name) and n.id == "APP_KOSEKI_PERSON":
+            direct = True
+        elif isinstance(n, ast.Attribute) and n.attr == "APP_KOSEKI_PERSON":
+            direct = True
+        if isinstance(n, ast.Assign) and len(n.targets) == 1 \
+                and isinstance(n.targets[0], ast.Name):
+            for c in ast.walk(n.value):
+                if (isinstance(c, ast.Name) and c.id == "APP_KOSEKI_PERSON") \
+                        or (isinstance(c, ast.Attribute)
+                            and c.attr == "APP_KOSEKI_PERSON"):
+                    names.add(n.targets[0].id)
+                    direct = True
+                    break
+    return direct, names
+
+
+def _read_calls(local_nodes):
+    return [n for n in local_nodes if isinstance(n, ast.Call)
+            and _call_name(n) in ("search_records", "get_record")]
+
+
+def _app34_calls(local_nodes):
+    """精密側: 引数（**位置・keyword とも**）が APP_KOSEKI_PERSON
+    （alias 1 hop 込み）を参照する search/get 呼出し（規律検査の対象）"""
+    _direct, names = _refs_app34(local_nodes)
+    searches, gets = [], []
+    for n in _read_calls(local_nodes):
+        linked = False
+        for sub in list(n.args) + [kw.value for kw in n.keywords]:
+            for c in ast.walk(sub):
+                if (isinstance(c, ast.Name) and c.id in names) or \
+                        (isinstance(c, ast.Attribute)
+                         and c.attr == "APP_KOSEKI_PERSON"):
+                    linked = True
+                    break
+        if linked:
+            (searches if _call_name(n) == "search_records"
+             else gets).append(n)
     return searches, gets
 
 
 def _reader_functions(tree) -> dict:
-    """module 内の App34 reader を関数単位で列挙する。
-    Returns: {関数名（module 直下は "<module>"）: (fn_node, searches, gets)}"""
+    """module 内の App34 reader を関数単位で列挙する（RV08-IMPL-09・
+    **取りこぼし方向を塞ぐ過大近似**: 本体が APP_KOSEKI_PERSON を直接または
+    alias 1 hop で参照し、かつ search_records/get_record を呼ぶ関数はすべて
+    reader＝manifest 照合対象）。
+    Returns: {関数名（module 直下は "<module>"）:
+              (fn_node, 精密searches, 精密gets, 全read呼出し)}"""
     out = {}
-    module_local = list(_walk_local(tree))
-    s, g = _app34_calls(module_local)
-    if s or g:
-        out["<module>"] = (tree, s, g)
+
+    def probe(name, node):
+        local = list(_walk_local(node))
+        direct, _names = _refs_app34(local)
+        reads = _read_calls(local)
+        if direct and reads:
+            s, g = _app34_calls(local)
+            out[name] = (node, s, g, reads)
+
+    probe("<module>", tree)
     for fn in ast.walk(tree):
         if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            local = list(_walk_local(fn))
-            s, g = _app34_calls(local)
-            if s or g:
-                out[fn.name] = (fn, s, g)
+            probe(fn.name, fn)
     return out
 
 
@@ -439,25 +486,28 @@ class TestStructuralPins(unittest.TestCase):
             + "\n".join(f"{m}:{f}" for m, f in sorted(listed - found)))
 
     def test_manifest_kinds_match_reads(self):
-        """manifest の search/get 宣言が実際の読取種別と一致（宣言漏れ=FAIL）"""
+        """manifest の search/get 宣言が実際の読取種別と一致（宣言漏れ=FAIL。
+        RV08-IMPL-09: 種別判定は over-approx 側=当該関数の全 read 呼出し）"""
         for key, spec in _APP34_READER_MANIFEST.items():
-            _fn, searches, gets = self.readers[key]
-            if searches:
+            _fn, _s, _g, reads = self.readers[key]
+            has_search = any(_call_name(c) == "search_records" for c in reads)
+            has_get = any(_call_name(c) == "get_record" for c in reads)
+            if has_search:
                 self.assertIn("search", spec,
                               f"{key}: search があるのに規律宣言なし")
-            if gets:
+            if has_get:
                 self.assertIn("get", spec, f"{key}: get があるのに規律宣言なし")
             if "search" in spec:
-                self.assertTrue(searches, f"{key}: search 宣言が stale")
+                self.assertTrue(has_search, f"{key}: search 宣言が stale")
             if "get" in spec:
-                self.assertTrue(gets, f"{key}: get 宣言が stale")
+                self.assertTrue(has_get, f"{key}: get 宣言が stale")
 
     def test_filter_disciplines_hold(self):
         """(a) search=filter の各関数: filter Call＋戻り値使用（関数内 AST）"""
         for (rel, fname), spec in _APP34_READER_MANIFEST.items():
             if spec.get("search") != "filter":
                 continue
-            fn, _s, _g = self.readers[(rel, fname)]
+            fn, _s, _g, _r = self.readers[(rel, fname)]
             self.assertEqual(check_filter_discipline(fn), [],
                              f"{rel}:{fname} の filter 規律違反")
 
@@ -466,7 +516,7 @@ class TestStructuralPins(unittest.TestCase):
         for (rel, fname), spec in _APP34_READER_MANIFEST.items():
             if spec.get("get") != "guard":
                 continue
-            fn, _s, _g = self.readers[(rel, fname)]
+            fn, _s, _g, _r = self.readers[(rel, fname)]
             self.assertEqual(check_guard_discipline(fn, self.trees[rel]), [],
                              f"{rel}:{fname} の guard 規律違反")
 
@@ -581,6 +631,45 @@ class TestReaderCheckerNegatives(unittest.TestCase):
             "    return rec\n")
         problems = check_guard_discipline(fn, tree)
         self.assertTrue(any("停止分岐" in p for p in problems))
+
+    def test_keyword_arg_form_is_detected(self):
+        """RV08-IMPL-09 negative: keyword 引数（app=APP_KOSEKI_PERSON）でも
+        reader として検出され、精密側の search にも計上されること"""
+        tree = ast.parse(
+            "async def f(q):\n"
+            "    return await kintone.search_records(\n"
+            "        app=APP_KOSEKI_PERSON, query=q)\n")
+        readers = _reader_functions(tree)
+        self.assertIn("f", readers)
+        _fn, searches, _gets, _reads = readers["f"]
+        self.assertEqual(len(searches), 1, "keyword 形も精密検査の対象")
+
+    def test_alias_form_is_detected(self):
+        """RV08-IMPL-09 negative: 単純 alias（変数代入 1 hop）経由でも
+        reader として検出され、精密側の get にも計上されること"""
+        tree = ast.parse(
+            "async def f(rid):\n"
+            "    target = APP_KOSEKI_PERSON\n"
+            "    return await kintone.get_record(target, rid)\n")
+        readers = _reader_functions(tree)
+        self.assertIn("f", readers)
+        _fn, _s, gets, _reads = readers["f"]
+        self.assertEqual(len(gets), 1, "alias 1 hop も精密検査の対象")
+
+    def test_overapprox_env_check_plus_other_app_read_is_reader(self):
+        """RV08-IMPL-09: APP_KOSEKI_PERSON を env チェックでのみ参照し
+        別 app を read する関数も（過大近似で）reader として検出＝manifest
+        照合対象になること（取りこぼし方向を塞ぐ）"""
+        tree = ast.parse(
+            "async def f(rid):\n"
+            "    if not APP_KOSEKI_PERSON.app_id():\n"
+            "        return None\n"
+            "    return await kintone.get_record(APP_KOSEKI_BOOK, rid)\n")
+        readers = _reader_functions(tree)
+        self.assertIn("f", readers)
+        _fn, _s, gets, reads = readers["f"]
+        self.assertEqual(len(gets), 0, "精密側は App34 read なし")
+        self.assertEqual(len(reads), 1, "over-approx 側で read を計上")
 
 
 # ══════════════════════════════════════════════════════════════
@@ -755,6 +844,7 @@ class _StatefulKT:
         self.fail_next_update_on = None   # record_id（App34）で 1 回だけ失敗
         self.fail_next_upload_containing = None   # filename 部分一致で 1 回失敗
         self.fail_next_close = False              # 封筒クローズで 1 回失敗
+        self.envelopes = {}     # 追加封筒（record_id -> 封筒 dict・reconcile 用）
         self.person_update_log = []       # (record_id, fields)
 
     def _apply(self, rec, fields):
@@ -772,7 +862,7 @@ class _StatefulKT:
 
     async def get_record(self, app, rid):
         if app.app_id_env == "APP_SHIPPING":
-            return self.envelope
+            return self.envelopes.get(str(rid), self.envelope)
         rec = self.persons.get(str(rid))
         if rec is None:
             raise kintone.KintoneError(404, "GAIA_RE01", "not found")
@@ -1026,7 +1116,7 @@ class TestJournalAndRecovery(unittest.TestCase):
         writes_before = list(kt.person_update_log)
         uploads_before = dict(kt.filenames)
         stats = run(reconcile_merge_operations())
-        self.assertEqual((stats["checked"], stats["reconciled"],
+        self.assertEqual((stats["walked"], stats["reconciled"],
                           stats["alerted"]), (1, 1, 0))
         rows = _journal_rows()
         self.assertEqual([r.stage for r in rows],
@@ -1038,7 +1128,7 @@ class TestJournalAndRecovery(unittest.TestCase):
                          "App34 への書き込みゼロ")
         self.assertEqual(kt.filenames, uploads_before, "添付の二重化なし")
         stats2 = run(reconcile_merge_operations())
-        self.assertEqual(stats2["checked"], 0, "回収済み＝open operation なし")
+        self.assertEqual(stats2["walked"], 0, "回収済み＝open operation なし")
 
     def test_reconcile_mismatch_alerts_without_completion(self):
         """RV08-IMPL-07: 閉集合検証の不一致（第三者変更）→ 追記せず警報
@@ -1071,6 +1161,55 @@ class TestJournalAndRecovery(unittest.TestCase):
         self.assertEqual((stats["still_open"], stats["reconciled"],
                           stats["alerted"]), (1, 0, 0))
         self.assertEqual([r.stage for r in _journal_rows()], [STAGE_PREIMAGE])
+
+    @staticmethod
+    def _open_envelope_stub():
+        return {"発送ステータス": {"value": "要確認"},
+                "実行済み": {"value": "no"},
+                "成果物": {"value": []},
+                "チャネル固有データ": {"value": ""}}
+
+    def test_paging_reaches_trailing_closed_operation(self):
+        """RV08-IMPL-10 negative: open 封筒の operation が多数滞留していても、
+        カーソルページング（縮小ページで複数回）により**後方**の
+        「封筒 closed×台帳 open」へ必ず到達して回収されること＋滞留閾値超で
+        業務警報が 1 回発されること"""
+        import person_merge_exec as pme
+        kt = _StatefulKT(person(6, "鈴木 誠", state="有効"),
+                         person(9, "鈴木 誠", state="有効"))
+        self._arm(kt)
+        # 前方に open 封筒の未完了 operation を 5 件滞留させる
+        for i in range(5):
+            rid = str(801 + i)
+            kt.envelopes[rid] = self._open_envelope_stub()
+            run(record_stage(
+                operation_id=f"bulk{i}", pair_key=f"person_merge:bulk{i}",
+                envelope_record_id=rid, winner_id="6", loser_id="9",
+                stage=STAGE_PREIMAGE,
+                payload={"winner": {"id": "6", "pre": "0" * 64,
+                                    "post": "0" * 64},
+                         "loser": {"id": "9", "pre": "0" * 64,
+                                   "post": "0" * 64},
+                         "repoint": []}))
+        # 後方に closed×open（完了マークだけ失敗した merge）を 1 件
+        r1 = self._merge_with_flaky_postimage_row(kt)
+        self.assertEqual(r1["status"], "merged")
+        alert = AsyncMock(return_value=True)
+        with patch.object(pme, "_RECONCILE_PAGE", 2), \
+                patch.dict(os.environ,
+                           {"MERGE_OPEN_OPS_ALERT_THRESHOLD": "3"}), \
+                patch("hub.notify.notify_admin_line", new=alert):
+            stats = run(pme.reconcile_merge_operations())
+        self.assertEqual(stats["walked"], 6, "全未完了を有限回で走査完了")
+        self.assertEqual(stats["still_open"], 5)
+        self.assertEqual(stats["reconciled"], 1,
+                         "後方の closed×open が回収される（打ち切りなし）")
+        self.assertEqual(stats["alerted"], 0)
+        alert.assert_awaited_once()   # 滞留閾値超の業務警報は 1 回（沈黙しない）
+        self.assertIn("滞留", alert.await_args.args[0])
+        post_rows = [r for r in _journal_rows() if r.stage == STAGE_POSTIMAGE]
+        self.assertEqual(len(post_rows), 1)
+        self.assertEqual(post_rows[0].operation_id, r1["operation_id"])
 
     def test_loser_merged_to_other_winner_aborts(self):
         """敗者が別の勝者へ無効化済み → 要確認・書き込みなし（直接 get 規約）"""
@@ -1247,14 +1386,14 @@ class TestRestoreCli(unittest.TestCase):
         self._arm(kt)
         path = self._write_audit(_legacy_audit())
         from hub.person_merge_journal import MergeJournalError
-        real = person_restore_cli.record_stage
+        real = person_restore_cli.insert_stage_in_session
 
-        async def flaky(*a, **kw):
+        async def flaky(session, **kw):
             if kw.get("stage") == STAGE_RESTORE:
                 raise MergeJournalError("boom")
-            return await real(*a, **kw)
+            return await real(session, **kw)
 
-        with patch("person_restore_cli.record_stage", new=flaky):
+        with patch("person_restore_cli.insert_stage_in_session", new=flaky):
             with self.assertRaises(SystemExit) as ctx:
                 person_restore_cli.main([path, "--execute"])
         self.assertIn("既存復元へ収束", str(ctx.exception))
@@ -1282,14 +1421,14 @@ class TestRestoreCli(unittest.TestCase):
         self._arm(kt)
         path = self._write_audit(audit)
         from hub.person_merge_journal import MergeJournalError
-        real = person_restore_cli.record_stage
+        real = person_restore_cli.insert_stage_in_session
 
-        async def flaky(*a, **kw):
+        async def flaky(session, **kw):
             if kw.get("stage") == STAGE_RESTORE:
                 raise MergeJournalError("boom")
-            return await real(*a, **kw)
+            return await real(session, **kw)
 
-        with patch("person_restore_cli.record_stage", new=flaky):
+        with patch("person_restore_cli.insert_stage_in_session", new=flaky):
             with self.assertRaises(SystemExit):
                 person_restore_cli.main([path, "--execute"])
         self.assertEqual([rid for rid, _f in kt.created], ["901"])
@@ -1301,6 +1440,45 @@ class TestRestoreCli(unittest.TestCase):
                          "採用は復元操作ID 一致の No.901（No.700 ではない）")
         self.assertNotIn("700", [rid for rid, _f in kt.updates],
                          "No.700 には一切書かない")
+
+    def test_concurrent_execute_serializes_to_single_create(self):
+        """RV08-IMPL-08 negative（interleave 再現）: 並行 2 実行でも DB 直列化
+        （sqlite=RESERVED ロック）により App34 create は合計 1 回。ロック保持側の
+        完了後、待機側はロック下の再読で restore 行を観測し create 0 で収束"""
+        arm_db(self)
+        kt = _CliKT({"12": _edge_row(12, "丙")})
+        self._arm(kt)
+        audit = _legacy_audit()
+        entered = asyncio.Event()
+        gate = asyncio.Event()
+        orig_create = kt.create_record
+        creates = {"n": 0}
+
+        async def slow_create(app, fields):
+            creates["n"] += 1
+            entered.set()          # A が臨界区間内（ロック保持中）に到達
+            await gate.wait()      # B の開始を待ってから完了させる
+            return await orig_create(app, fields)
+
+        async def scenario():
+            with patch("hub.kintone.create_record", new=slow_create):
+                task_a = asyncio.create_task(
+                    person_restore_cli._restore(
+                        json.loads(json.dumps(audit)), True))
+                await asyncio.wait_for(entered.wait(), timeout=10)
+                task_b = asyncio.create_task(
+                    person_restore_cli._restore(
+                        json.loads(json.dumps(audit)), True))
+                await asyncio.sleep(0.3)   # B を pending 観測→ロック待ちへ進める
+                gate.set()
+                await asyncio.wait_for(asyncio.gather(task_a, task_b),
+                                       timeout=30)
+        run(scenario())
+        self.assertEqual(creates["n"], 1, "並行 2 実行でも create は合計 1 回")
+        self.assertEqual(len(kt.created), 1)
+        stages = [r.stage for r in _journal_rows()]
+        self.assertEqual(stages, [STAGE_PREIMAGE, STAGE_RESTORE],
+                         "restore 完了行は 1 行のみ（二重完了なし）")
 
     def test_partial_relink_failure_then_resume(self):
         """RV08-IMPL-02: 親エッジ途中失敗 → 再実行は適用済み skip・未適用のみ続行"""

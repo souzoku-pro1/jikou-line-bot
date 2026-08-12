@@ -48,8 +48,11 @@ from hub.person_merge_journal import (
     MergeJournalError,
     find_stages,
     fingerprint_with_updates,
+    insert_stage_in_session,
     record_fingerprint,
     record_stage,
+    restore_serialization,
+    stages_in_session,
 )
 from hub.person_validity import RESTORE_OPERATION_FIELD
 from person_merge import APP_KOSEKI_PERSON, _v
@@ -205,41 +208,21 @@ async def _restore(audit: dict, execute: bool) -> None:
     except MergeJournalError as e:
         raise SystemExit(
             f"操作台帳(DB)を照会できないため復元を中止しました（書き込みなし）: {e}")
-    done = stages.get(STAGE_RESTORE)
-    pending = stages.get(STAGE_PREIMAGE)
-
-    if done:
-        # 復元済み: 保存内容と現況の一致確認のみ（create 0）
-        new_id = str(done.get("restored_new_id") or "")
-        try:
-            rec = await kintone.get_record(APP_KOSEKI_PERSON, new_id)
-        except kintone.KintoneError:
-            raise SystemExit(
-                f"復元済み記録の No.{new_id} を取得できません"
-                "（要人手確認・書き込みなし）")
-        if _subset_fp(rec, payload) != payload_fp:
-            raise SystemExit(
-                f"復元済みの No.{new_id} は保存内容と一致しません"
-                "（その後の編集あり・要人手確認・書き込みなし）")
-        todo, notes = await _classify_relink(repoint_plans, winner_id, new_id)
-        for rid, fs in todo:      # 収束: 未適用の親エッジのみ適用（冪等）
-            await kintone.update_record(APP_KOSEKI_PERSON, rid,
-                                        {f: new_id for f in fs})
-        for note in notes:
-            print(f"  ⚠ 再結線スキップ: {note}")
-        print(f"RESTORED(既存復元へ収束): 旧No.{old_id} → 新No.{new_id}・"
-              f"親エッジ追適用 {len(todo)}件（create 0）")
+    if stages.get(STAGE_RESTORE):
+        await _converge_existing(stages[STAGE_RESTORE], payload, payload_fp,
+                                 repoint_plans, winner_id, old_id)
         return
-
-    new_id: str | None = None
+    pending = stages.get(STAGE_PREIMAGE)
     if pending:
         if str(pending.get("payload_fp") or "") != payload_fp:
             raise SystemExit(
                 "復元途中の operation が残っていますが、監査JSONの内容が前回と"
                 "一致しません（要人手確認・書き込みなし）")
-        new_id = await _find_restored_candidate(payload, payload_fp, op_id)
     else:
-        # ── preimage（pending）先行保存: create 前・RV08-IMPL-02 ─────────────
+        # ── preimage（pending）先行保存: create 前・**独立 txn**（RV08-IMPL-02。
+        #    臨界区間 txn に同居させない＝途中失敗で rollback されると ACK 喪失
+        #    回収の pending 標識が消えるため）。UNIQUE(operation_id, stage) が
+        #    fresh 経路の並行実行をここで直列化する（敗者は書き込みなし中止） ──
         try:
             await record_stage(
                 operation_id=op_id, pair_key=pair_key,
@@ -250,48 +233,114 @@ async def _restore(audit: dict, execute: bool) -> None:
                          "relink_plan": repoint_plans})
         except MergeJournalError as e:
             raise SystemExit(
-                f"操作台帳(DB)へ記録できないため復元を中止しました"
-                f"（書き込みなし）: {e}")
+                "操作台帳(DB)へ記録できないため復元を中止しました（書き込み"
+                "なし。並行実行との競合の場合は再実行で既存復元へ収束します）: "
+                f"{e}")
 
+    # ── 臨界区間（RV08-IMPL-08: DB ロックで直列化。pending 読取→復元操作ID
+    #    検索→create→restore 記録を単一実行に保証。ロック保持側の完了後、
+    #    待機側はロック下の再読で restore 行を観測し create 0 で収束する）───────
+    todo: list = []
+    new_id = None
     try:
-        if new_id is None:
-            # RV08-IMPL-05: 復元操作ID を本体保存（ACK 喪失回収の決定的同定キー）
-            new_id = str(await kintone.create_record(
-                APP_KOSEKI_PERSON,
-                {**payload, RESTORE_OPERATION_FIELD: op_id}))
-            print(f"  create: 新No.{new_id}")
-        else:
-            print(f"  create 0（作成済み 新No.{new_id} を再利用）")
-        todo, notes = await _classify_relink(repoint_plans, winner_id, new_id)
-        for rid, fs in todo:
-            await kintone.update_record(APP_KOSEKI_PERSON, rid,
-                                        {f: new_id for f in fs})
-        for note in notes:
-            print(f"  ⚠ 再結線スキップ: {note}")
-    except (kintone.KintoneError, kintone.KintoneConflict) as e:
-        raise SystemExit(
-            "復元の途中で失敗しました。**再実行で回収できます**"
-            "（決定的 operation_id の台帳照合により create は増えません）: "
-            f"{type(e).__name__}")
-
-    # ── 完了記録（stage=restore・lineage）。失敗しても App34 は完了済み＝
-    #    再実行すると pending＋候補照合で「既存復元へ収束」する ────────────────
-    try:
-        await record_stage(
-            operation_id=op_id, pair_key=pair_key,
-            envelope_record_id=str(audit.get("封筒レコードID") or ""),
-            winner_id=winner_id, loser_id=old_id,
-            stage=STAGE_RESTORE,
-            payload={"restored_new_id": new_id, "old_id": old_id,
-                     "relinked": [{"id": rid, "fields": fs}
-                                  for rid, fs in todo],
-                     "relink_skipped": len(notes)})
+        async with restore_serialization(op_id) as session:
+            stages2 = await stages_in_session(session, op_id)
+            if stages2.get(STAGE_RESTORE):
+                done2 = stages2[STAGE_RESTORE]
+            else:
+                done2 = None
+                pend2 = stages2.get(STAGE_PREIMAGE) or {}
+                if str(pend2.get("payload_fp") or "") != payload_fp:
+                    raise SystemExit(
+                        "復元途中の operation が残っていますが、監査JSONの内容が"
+                        "前回と一致しません（要人手確認・書き込みなし）")
+                new_id = await _find_restored_candidate(payload, payload_fp,
+                                                        op_id)
+                if new_id is None:
+                    try:
+                        # RV08-IMPL-05: 復元操作ID を本体保存
+                        #（ACK 喪失回収の決定的同定キー）
+                        new_id = str(await kintone.create_record(
+                            APP_KOSEKI_PERSON,
+                            {**payload, RESTORE_OPERATION_FIELD: op_id}))
+                        print(f"  create: 新No.{new_id}")
+                    except (kintone.KintoneError,
+                            kintone.KintoneConflict) as e:
+                        raise SystemExit(
+                            "復元の途中で失敗しました。**再実行で回収できます**"
+                            "（決定的 operation_id の台帳照合により create は"
+                            f"増えません）: {type(e).__name__}")
+                else:
+                    print(f"  create 0（作成済み 新No.{new_id} を再利用）")
+                todo, notes = await _classify_relink(repoint_plans, winner_id,
+                                                     new_id)
+                try:
+                    for rid, fs in todo:
+                        await kintone.update_record(APP_KOSEKI_PERSON, rid,
+                                                    {f: new_id for f in fs})
+                except (kintone.KintoneError, kintone.KintoneConflict) as e:
+                    raise SystemExit(
+                        "復元の途中で失敗しました。**再実行で回収できます**"
+                        "（決定的 operation_id の台帳照合により create は"
+                        f"増えません）: {type(e).__name__}")
+                for note in notes:
+                    print(f"  ⚠ 再結線スキップ: {note}")
+                # 完了記録（stage=restore・lineage）＝ロック解放と同時に確定
+                await insert_stage_in_session(
+                    session, operation_id=op_id, pair_key=pair_key,
+                    envelope_record_id=str(audit.get("封筒レコードID") or ""),
+                    winner_id=winner_id, loser_id=old_id,
+                    stage=STAGE_RESTORE,
+                    payload={"restored_new_id": new_id, "old_id": old_id,
+                             "relinked": [{"id": rid, "fields": fs}
+                                          for rid, fs in todo],
+                             "relink_skipped": len(notes)})
     except MergeJournalError as e:
         raise SystemExit(
-            "復元完了の台帳記録に失敗しました（App34 の復元・再結線は完了済み）。"
+            "復元完了の台帳記録（直列化区間）に失敗しました。"
             f"**再実行すると既存復元へ収束します**: {e}")
+    except SystemExit:
+        raise
+    except Exception as e:
+        # commit 失敗等（create/relink 実施後）。preimage は独立 txn で保存済み
+        # ＝再実行が復元操作ID 検索で既存復元へ収束する
+        raise SystemExit(
+            "復元完了の台帳記録に失敗しました（App34 の復元・再結線は完了済みの"
+            "可能性があります）。**再実行すると既存復元へ収束します**: "
+            f"{type(e).__name__}")
+    if done2 is not None:
+        # 待機側: ロック保持側の完了を観測 → create 0 で収束
+        await _converge_existing(done2, payload, payload_fp,
+                                 repoint_plans, winner_id, old_id)
+        return
     print(f"RESTORED: 旧No.{old_id} → 新No.{new_id}・"
           f"親エッジ再結線 {len(todo)}件・台帳記録済み")
+
+
+async def _converge_existing(done: dict, payload: dict, payload_fp: str,
+                             repoint_plans: list, winner_id: str,
+                             old_id: str) -> None:
+    """復元済み operation への収束（create 0）: 保存内容と現況の fingerprint
+    一致確認＋未適用の親エッジのみ追適用（冪等・盲目上書きなし）。"""
+    new_id = str(done.get("restored_new_id") or "")
+    try:
+        rec = await kintone.get_record(APP_KOSEKI_PERSON, new_id)
+    except kintone.KintoneError:
+        raise SystemExit(
+            f"復元済み記録の No.{new_id} を取得できません"
+            "（要人手確認・書き込みなし）")
+    if _subset_fp(rec, payload) != payload_fp:
+        raise SystemExit(
+            f"復元済みの No.{new_id} は保存内容と一致しません"
+            "（その後の編集あり・要人手確認・書き込みなし）")
+    todo, notes = await _classify_relink(repoint_plans, winner_id, new_id)
+    for rid, fs in todo:      # 収束: 未適用の親エッジのみ適用（冪等）
+        await kintone.update_record(APP_KOSEKI_PERSON, rid,
+                                    {f: new_id for f in fs})
+    for note in notes:
+        print(f"  ⚠ 再結線スキップ: {note}")
+    print(f"RESTORED(既存復元へ収束): 旧No.{old_id} → 新No.{new_id}・"
+          f"親エッジ追適用 {len(todo)}件（create 0）")
 
 
 def main(argv=None) -> None:
