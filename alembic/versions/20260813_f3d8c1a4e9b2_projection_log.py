@@ -34,6 +34,7 @@ def upgrade() -> None:
         sa.Column("case_record_id", sa.Text, nullable=False),
         sa.Column("app36_record_id", sa.Text, nullable=False),
         sa.Column("op", sa.Text, nullable=False),
+        sa.Column("stage", sa.Text, nullable=False),
         sa.Column("fields_written", _JSON, nullable=False),
         sa.Column("preimage", _JSON, nullable=False),
         sa.Column("schema_version", sa.Integer, nullable=False),
@@ -41,6 +42,8 @@ def upgrade() -> None:
                   server_default=sa.func.now()),
         sa.CheckConstraint("op IN ('insert', 'update')",
                            name="ck_projection_log_op"),
+        sa.CheckConstraint("stage IN ('pending', 'completed')",
+                           name="ck_projection_log_stage"),
     )
     op.create_index("ix_projection_log_run", "projection_log",
                     ["derivation_run_id"])

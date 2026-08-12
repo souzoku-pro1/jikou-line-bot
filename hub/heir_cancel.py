@@ -101,30 +101,42 @@ async def _find_cancel_envelope(idem_key: str) -> dict | None:
 def _consolidate_write_set(rows: list[dict]) -> list[dict] | None:
     """write-set の App36 行単位への正規化（§4.1a・単一の正）。
 
-    resumed 再確定により同一行へ複数 log があり得る——**最初の log** が真の
-    op と preimage（初回書込み前の値）、**最後の log** の fields_written が
-    最新 postimage。schema version が 1 件でも解釈不能なら None（legacy 扱い・
-    CANCEL-05）。"""
+    resumed 再確定により同一行へ複数 log（pending/completed）があり得る——
+    - **op / preimage は最初の log**（真実・不変。CANCEL-IMPL-01 の先行保存に
+      より preimage は常に初回書込み前の値）。
+    - **postimage は全 log の fields_written を id 順に順次適用して合成**
+      （CANCEL-IMPL-03。「最後の log で全面置換」は初回のみ書いた field
+      〔案件アプリID・ユニット種別等〕が照合から漏れ、第三者変更を
+      見逃すため廃止）。
+    - app36_record_id 未確定（""）の pending（create の ACK 喪失で completed も
+      再確定回収も無い迷子）は対象外＝巻き戻し不能（H11a 監査が最終網・§4.4）。
+    schema version が 1 件でも解釈不能なら None（legacy 扱い・CANCEL-05）。"""
     by_rid: dict[str, dict] = {}
     for r in rows:   # id 昇順（load_write_set 契約）
         if r.get("schema_version") != WRITESET_SCHEMA_VERSION:
             return None
         rid = str(r["app36_record_id"])
+        if not rid:
+            continue
         if rid not in by_rid:
             by_rid[rid] = {"app36_record_id": rid, "op": r["op"],
-                           "preimage": dict(r["preimage"]),
-                           "postimage": dict(r["fields_written"])}
-        else:
-            by_rid[rid]["postimage"] = dict(r["fields_written"])
+                           "preimage": dict(r["preimage"]), "postimage": {}}
+        by_rid[rid]["postimage"].update(r["fields_written"])   # 順次適用合成
     return list(by_rid.values())
 
 
 async def _verify_rows(entries: list[dict]) -> tuple[list[dict], list[str]]:
-    """postimage 完全一致照合（§4.1a・読取専用・毎回実施＝盲目適用しない）。
+    """三値判定つき照合（§4.1a・CANCEL-IMPL-02・読取専用・毎回実施＝盲目適用
+    しない）。行ごとに:
 
-    一致行は $revision つきの巻き戻し候補、不一致・取得不能は要確認
-    （record ID のみ返す・write 0）。取消済み行（既に無効化済み＝resumed の
-    巻き戻し済み分）は完了扱いでどちらにも載せない。"""
+    - **rollback 候補**: 現在値が postimage（順次適用合成）と完全一致。
+    - **rollback 済み（完了扱い）**: 現在値が rollback 後の姿と完全一致——
+      update 行=preimage の全 field 一致／insert 行=**無効化 postimage 閉集合
+      （戸籍確認済=no ＋ 取消済み=yes）の完全一致**（取消済み=yes だけでは
+      完了にしない＝無効化後に 戸籍確認済 だけ人手 yes 化された行は要確認へ）。
+    - **それ以外＝第三者変更**: write 0 で要確認（機械は上書きしない）。
+    完了行は再適用しない（再実行時の App36 再書込み 0・部分失敗の残行のみ回収）。
+    取得不能も要確認（fail-closed）。"""
     candidates: list[dict] = []
     mismatched: list[str] = []
     for e in entries:
@@ -134,8 +146,17 @@ async def _verify_rows(entries: list[dict]) -> tuple[list[dict], list[str]]:
         except kintone.KintoneError:
             mismatched.append(rid)          # 取得不能=要確認（fail-closed）
             continue
+        rolled_state = (dict(e["preimage"]) if e["op"] == "update"
+                        else {"戸籍確認済": "no", CANCELLED_FIELD: CANCELLED_YES})
+        if rolled_state and all(_v(rec, code) == str(val)
+                                for code, val in rolled_state.items()):
+            continue                        # rollback 済み＝完了扱い（再適用 0）
         if e["op"] == "insert" and _v(rec, CANCELLED_FIELD) == CANCELLED_YES:
-            continue                        # 巻き戻し済み（resumed 回収の残余なし）
+            # 無効化マーカーは立つが閉集合が崩れている（例: 無効化後に
+            # 戸籍確認済 だけ人手 yes 化）＝第三者変更・要確認（再無効化で
+            # 人手変更を上書きしない・CANCEL-IMPL-02）
+            mismatched.append(rid)
+            continue
         if all(_v(rec, code) == str(val)
                for code, val in e["postimage"].items()):
             candidates.append({**e, "revision": _v(rec, "$revision") or None})

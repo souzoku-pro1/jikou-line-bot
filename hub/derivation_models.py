@@ -142,6 +142,12 @@ class ProjectionLog(DerivationBase):
     __table_args__ = (
         sa.CheckConstraint("op IN ('insert', 'update')",
                            name="ck_projection_log_op"),
+        # CANCEL-IMPL-01（RV08 fix2 の先行保存パターン）: pending=App36 書込み
+        # **前**の先行保存（真正 preimage・意図した write）・completed=書込み
+        # 成功後の完了追記。ACK 喪失（書込み成功・completed 欠落）は pending が
+        # 真実の op/preimage を保持し続ける＝再確定時に回収（再構成しない）
+        sa.CheckConstraint("stage IN ('pending', 'completed')",
+                           name="ck_projection_log_stage"),
         sa.Index("ix_projection_log_run", "derivation_run_id"),
     )
 
@@ -151,6 +157,7 @@ class ProjectionLog(DerivationBase):
     case_record_id: Mapped[str] = mapped_column(sa.Text, nullable=False)
     app36_record_id: Mapped[str] = mapped_column(sa.Text, nullable=False)
     op: Mapped[str] = mapped_column(sa.Text, nullable=False)   # insert / update
+    stage: Mapped[str] = mapped_column(sa.Text, nullable=False)  # pending / completed
     fields_written: Mapped[dict] = mapped_column(_JSON, nullable=False)
     preimage: Mapped[dict] = mapped_column(_JSON, nullable=False)  # insert は {}
     schema_version: Mapped[int] = mapped_column(sa.Integer, nullable=False)
@@ -1004,22 +1011,29 @@ async def get_current_head(case_record_id: str):
 # ══════════════════════════════════════════════════════════════
 
 async def append_projection_log(*, derivation_run_id: int, case_record_id: str,
-                                app36_record_id: str, op: str,
+                                app36_record_id: str, op: str, stage: str,
                                 fields_written: dict, preimage: dict) -> int:
     """write-set の 1 行追記（confirmed handler 専用・immutable・§4.1a）。
 
-    kintone write の**成功後**に呼ぶ（実際に書いた行と内容のみ記録）。
-    kintone write と本追記の間のクラッシュ残余（行あり・log なし）は resumed
-    再実行の再書込みで回収され、取り切れない場合も H11a 監査が最終網（§4.4）。
+    CANCEL-IMPL-01（RV08 fix2 先行保存パターン）:
+    - stage="pending": App36 書込み**前**に先行保存（真正 preimage・意図した
+      write・insert は app36_record_id 未確定=""）。先行保存の失敗は伝播＝
+      当該行の App36 write は発生しない（write-set 無しの書込みを作らない）。
+    - stage="completed": 書込み成功**後**の完了追記。completed の欠落
+      （ACK 喪失）は pending が真実を保持＝再確定時に回収され、後から
+      write-set を再構成（誤生成）することはない。
     """
     if op not in ("insert", "update"):
         raise PayloadPolicyError("projection_log.op は閉集合（insert/update）のみ")
+    if stage not in ("pending", "completed"):
+        raise PayloadPolicyError(
+            "projection_log.stage は閉集合（pending/completed）のみ")
     from hub.db import session_scope
     t = ProjectionLog.__table__
     async with session_scope() as s:
         res = await s.execute(sa.insert(t).values(
             derivation_run_id=derivation_run_id, case_record_id=case_record_id,
-            app36_record_id=str(app36_record_id), op=op,
+            app36_record_id=str(app36_record_id), op=op, stage=stage,
             fields_written=fields_written, preimage=preimage,
             schema_version=WRITESET_SCHEMA_VERSION).returning(t.c.id))
         return int(res.scalar_one())
@@ -1037,6 +1051,7 @@ async def load_write_set(derivation_run_id: int) -> list[dict]:
             sa.select(t).where(t.c.derivation_run_id == derivation_run_id)
             .order_by(t.c.id.asc()))).all()
     return [{"id": r.id, "app36_record_id": r.app36_record_id, "op": r.op,
+             "stage": r.stage,
              "fields_written": dict(r.fields_written or {}),
              "preimage": dict(r.preimage or {}),
              "schema_version": r.schema_version} for r in rows]

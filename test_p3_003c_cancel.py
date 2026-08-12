@@ -179,11 +179,11 @@ class _Base(unittest.TestCase):
             rec[k] = {"value": v}
         self.app36[str(rid)] = rec
 
-    def _log(self, run_id, case, rid, op, written, pre):
+    def _log(self, run_id, case, rid, op, written, pre, stage="completed"):
         _run(append_projection_log(
             derivation_run_id=run_id, case_record_id=case,
-            app36_record_id=str(rid), op=op, fields_written=written,
-            preimage=pre))
+            app36_record_id=str(rid), op=op, stage=stage,
+            fields_written=written, preimage=pre))
         db.reset_for_tests()
 
     def _seed_confirmed_with_writeset(self, case="9"):
@@ -491,10 +491,13 @@ class TestWriteSetCapture(_Base):
         self.assertEqual(outcome, "inserted")
         ws = _run(load_write_set(run_id))
         db.reset_for_tests()
-        self.assertEqual(len(ws), 1)
-        self.assertEqual(ws[0]["op"], "insert")
+        # CANCEL-IMPL-01: 先行保存（pending・record_id 未確定）→ 完了追記
+        self.assertEqual([(w["stage"], w["op"]) for w in ws],
+                         [("pending", "insert"), ("completed", "insert")])
+        self.assertEqual(ws[0]["app36_record_id"], "")
+        self.assertNotEqual(ws[1]["app36_record_id"], "")
         self.assertEqual(ws[0]["preimage"], {})
-        self.assertEqual(ws[0]["fields_written"]["戸籍確認済"], "yes")
+        self.assertEqual(ws[1]["fields_written"]["戸籍確認済"], "yes")
         self.assertEqual(ws[0]["schema_version"], WRITESET_SCHEMA_VERSION)
 
     def test_project_row_update_captures_preimage(self):
@@ -509,10 +512,13 @@ class TestWriteSetCapture(_Base):
         self.assertEqual(outcome, "updated")
         ws = _run(load_write_set(run_id))
         db.reset_for_tests()
-        self.assertEqual(ws[0]["op"], "update")
-        self.assertEqual(ws[0]["preimage"]["続柄"], "配偶者",
-                         "書込み前の値を preimage として保存")
-        self.assertEqual(set(ws[0]["preimage"]) , set(ws[0]["fields_written"]),
+        # CANCEL-IMPL-01: pending（App36 書込み前・真正 preimage）→ completed
+        self.assertEqual([(w["stage"], w["op"]) for w in ws],
+                         [("pending", "update"), ("completed", "update")])
+        for w in ws:
+            self.assertEqual(w["preimage"]["続柄"], "配偶者",
+                             "書込み前の値を preimage として保存")
+        self.assertEqual(set(ws[0]["preimage"]), set(ws[0]["fields_written"]),
                          "preimage は書込み field と同じ code 集合")
 
     def test_projection_log_is_immutable(self):
@@ -526,6 +532,155 @@ class TestWriteSetCapture(_Base):
         with self.assertRaises(Exception):   # DB trigger（immutable）
             _run(_mutate())
         db.reset_for_tests()
+
+
+class TestAckLossAndThreeState(_Base):
+    """CANCEL-IMPL-01/02/03 の negative 固定"""
+
+    def _insert_fields(self, run_id, case="9"):
+        return {"続柄": "子", "データ源": "戸籍読解",
+                "current_derivation_run_id": str(run_id),
+                "導出元人物ID": "11", "案件アプリID": "26",
+                "案件レコードID": case, "ユニット種別": "相続一般",
+                "戸籍確認済": "yes"}
+
+    def test_01_insert_ack_loss_then_reconfirm_then_cancel_invalidates(self):
+        """insert 成功→completed log 失敗→再確定→取消: 行は insert として
+        no＋取消済み=yes 化される（pending から op を回収・再構成しない）"""
+        from types import SimpleNamespace
+        run_id = self._mk_run("9")
+        self._confirm_run("9", run_id)
+        fields = self._insert_fields(run_id)
+        # 原初 projection: pending のみ（completed 追記前にクラッシュ）
+        self._log(run_id, "9", "", "insert", fields, {}, stage="pending")
+        self._app36_row("901", **fields)
+        # 再確定（resumed）: 冪等ヒット=update 経路だが pending insert を回収
+        run = SimpleNamespace(id=run_id, case_app_id="26")
+        outcome = _run(hp_project_row(run, "9", "相続一般", "11", "子", None))
+        db.reset_for_tests()
+        self.assertEqual(outcome, "updated")
+        ws = _run(load_write_set(run_id))
+        db.reset_for_tests()
+        self.assertEqual([(w["stage"], w["op"]) for w in ws],
+                         [("pending", "insert"), ("completed", "insert")],
+                         "回収＝元の op を引き継ぐ（update として再構成しない）")
+        result = self._cancel()
+        self.assertEqual(result["rolled_back"], 1)
+        self.assertEqual(self.app36["901"]["戸籍確認済"]["value"], "no")
+        self.assertEqual(self.app36["901"][CANCELLED_FIELD]["value"], "yes")
+
+    def test_01_update_ack_loss_then_reconfirm_restores_true_preimage(self):
+        """update 成功→completed log 失敗→再確定→取消: 最初の真正 preimage
+        へ復元（再確定時の現在値=書込み後の値を preimage に誤保存しない）"""
+        from types import SimpleNamespace
+        run_id = self._mk_run("9")
+        self._confirm_run("9", run_id)
+        written = {"続柄": "子", "データ源": "戸籍読解",
+                   "current_derivation_run_id": str(run_id),
+                   "導出元人物ID": "11"}
+        true_pre = {"続柄": "配偶者", "データ源": "手入力",
+                    "current_derivation_run_id": "1", "導出元人物ID": "11"}
+        self._log(run_id, "9", "902", "update", written, true_pre,
+                  stage="pending")
+        self._app36_row("902", **written, 戸籍確認済="yes", 法定相続分="")
+        run = SimpleNamespace(id=run_id, case_app_id="26")
+        outcome = _run(hp_project_row(run, "9", "相続一般", "11", "子", None))
+        db.reset_for_tests()
+        self.assertEqual(outcome, "updated")
+        self._cancel()
+        for code, val in true_pre.items():
+            self.assertEqual(self.app36["902"][code]["value"], val,
+                             "最初の真正 preimage へ復元")
+
+    def test_01_pending_save_failure_means_no_app36_write(self):
+        """先行保存の失敗＝当該行 write 0（write-set の無い書込みを作らず、
+        後から誤った write-set を生成することもない）"""
+        from types import SimpleNamespace
+        run_id = self._mk_run("9")
+        run = SimpleNamespace(id=run_id, case_app_id="26")
+        from hub import heir_projection as hp
+        with patch.object(hp, "append_projection_log",
+                          new=AsyncMock(side_effect=RuntimeError("no table"))):
+            with self.assertRaises(RuntimeError):
+                _run(hp_project_row(run, "9", "相続一般", "11", "子", None))
+            db.reset_for_tests()
+        self.create.assert_not_awaited()
+        self.assertEqual(_run(load_write_set(run_id)), [],
+                         "write-set は生成されない（legacy 扱いへ倒れる）")
+        db.reset_for_tests()
+
+    def test_02_rerun_after_close_failure_writes_nothing_and_closes(self):
+        """update 復元成功→封筒 close 失敗→再実行: App36 再書込み 0＋封筒
+        close（current==preimage＝rollback 済みの完了扱い・三値判定）"""
+        self._seed_confirmed_with_writeset()
+        first = self._cancel()
+        self.assertTrue(first["envelope_closed"])
+        for e in self.envelopes:   # close 失敗（=open のまま残った）を模擬
+            e["実行済み"] = {"value": "no"}
+        n_app36 = len(self._app36_writes())
+        second = self._cancel()
+        self.assertEqual(second["status"], "cancelled")
+        self.assertEqual(len(self._app36_writes()), n_app36,
+                         "完了行の再適用 0（App36 再書込みなし）")
+        self.assertTrue(second["envelope_closed"], "封筒は close へ収束")
+
+    def test_02_partial_failure_rerun_recovers_remaining_only(self):
+        """複数行の一部復元成功→失敗→再実行: 完了行を再適用せず残行のみ回収"""
+        self._seed_confirmed_with_writeset()
+        real_update = self.update.side_effect
+
+        async def fail_802(app, rid, fields, revision=None):
+            if app.label.startswith("App 36") and str(rid) == "802":
+                raise kintone.KintoneConflict(409, "GAIA_CO02", "")
+            return await real_update(app, rid, fields, revision=revision)
+        self.update.side_effect = fail_802
+        first = self._cancel()
+        self.assertEqual(first["rolled_back"], 1)     # 801 のみ成功
+        self.assertFalse(first["envelope_closed"])
+        self.update.side_effect = real_update
+        n_801 = len([u for u in self._app36_writes() if u[1] == "801"])
+        second = self._cancel()
+        self.assertEqual(second["rolled_back"], 1, "残行(802)のみ回収")
+        self.assertTrue(second["envelope_closed"])
+        self.assertEqual(
+            len([u for u in self._app36_writes() if u[1] == "801"]), n_801,
+            "完了行(801)は再適用しない")
+
+    def test_02_reyessed_insert_row_not_treated_as_completed(self):
+        """insert 無効化後に 戸籍確認済 だけ人手 yes 化→完了扱いせず要確認
+        （完了判定は rollback postimage〔no＋yes〕の完全一致のみ）"""
+        self._seed_confirmed_with_writeset()
+        self._cancel()
+        self.app36["801"]["戸籍確認済"] = {"value": "yes"}   # 人手 yes 化
+        for e in self.envelopes:
+            e["実行済み"] = {"value": "no"}
+        n_801 = len([u for u in self._app36_writes() if u[1] == "801"])
+        result = self._cancel()
+        self.assertEqual(result["held"], 1, "要確認へ（完了扱いしない）")
+        self.assertFalse(result["envelope_closed"])
+        self.assertEqual(
+            len([u for u in self._app36_writes() if u[1] == "801"]), n_801,
+            "write 0（機械は上書きしない）")
+
+    def test_03_composed_postimage_catches_first_log_only_field_edit(self):
+        """insert log→同一 run update log→初回のみの field（ユニット種別）を
+        第三者変更→取消は write 0＋要確認（順次適用合成が検出する。最後の
+        log での全面置換では見逃す形）"""
+        run_id = self._mk_run("9")
+        self._confirm_run("9", run_id)
+        ins = self._insert_fields(run_id)
+        upd = {"続柄": "子", "データ源": "戸籍読解",
+               "current_derivation_run_id": str(run_id), "導出元人物ID": "11"}
+        self._log(run_id, "9", "903", "insert", ins, {})
+        self._log(run_id, "9", "903", "update", upd,
+                  {k: ins[k] for k in upd}, stage="completed")
+        self._app36_row("903", **ins)
+        self.app36["903"]["ユニット種別"] = {"value": "時効援用"}  # 第三者変更
+        result = self._cancel()
+        self.assertEqual(result["rolled_back"], 0)
+        self.assertEqual(result["held"], 1, "合成 postimage 不一致＝要確認")
+        self.assertEqual([u for u in self._app36_writes() if u[1] == "903"],
+                         [], "write 0")
 
 
 class TestConsumerExclusion(_Base):
@@ -562,14 +717,167 @@ class TestConsumerExclusion(_Base):
                          "取消済み行は update 対象にならず新規 insert")
 
 
-class TestReaderManifestClosure(unittest.TestCase):
-    """App36 reader manifest 閉包検査（RV08 test_rv08_soft_merge の型を適用）。
+# ══════════════════════════════════════════════════════════════
+# App36 reader manifest 閉包検査（CANCEL-IMPL-04・RV08 fix3 水準）
+# checker は test_rv08_soft_merge の App34 checker の**流用（複製・App36 適応）**。
+# 共通ヘルパ化は merge 後の別票（既存テスト不触の規律を優先・レビュー対応の
+# 確立パターン）。App36 特有の差分: KintoneApp("App 36 …") のインライン再構築
+# 検出（shokumu_plan）を binding 収集に統合。
+# ══════════════════════════════════════════════════════════════
 
-    manifest は (module, function) → 規律。search=filter は関数内で
-    filter_active_heir_rows を通すこと・exempt は理由必須。閉包は両方向
-    （未登録 reader=FAIL・実体の無い entry=FAIL）。App36 参照は
-    APP_SOUZOKUNIN 名参照に加え KintoneApp("App 36…") 再構築も検出する
-    （shokumu_plan の inline 構築を取りこぼさない）。"""
+import ast as _ast
+
+
+def _cx_call_name(node):
+    f = node.func
+    if isinstance(f, _ast.Attribute):
+        return f.attr
+    if isinstance(f, _ast.Name):
+        return f.id
+    return ""
+
+
+def _cx_walk_local(node):
+    """入れ子 def/class に降りない bounded walk（呼出しを最内関数へ帰属）。"""
+    stack = list(_ast.iter_child_nodes(node))
+    while stack:
+        n = stack.pop()
+        yield n
+        if isinstance(n, (_ast.FunctionDef, _ast.AsyncFunctionDef,
+                          _ast.ClassDef)):
+            continue
+        stack.extend(_ast.iter_child_nodes(n))
+
+
+def _cx_is_app36_ctor(node):
+    return (isinstance(node, _ast.Call) and _cx_call_name(node) == "KintoneApp"
+            and any(isinstance(a, _ast.Constant) and isinstance(a.value, str)
+                    and ("App 36" in a.value or a.value == "APP_SOUZOKUNIN")
+                    for a in node.args))
+
+
+def _cx_app36_names(fn):
+    """App36 束縛名の収集（単純 alias 1 hop・KintoneApp 再構築の変数化を含む）。"""
+    names = {"APP_SOUZOKUNIN"}
+    for n in _cx_walk_local(fn):
+        if isinstance(n, _ast.Assign) and len(n.targets) == 1 \
+                and isinstance(n.targets[0], _ast.Name):
+            v = n.value
+            if (isinstance(v, _ast.Name) and v.id in names) \
+                    or (isinstance(v, _ast.Attribute)
+                        and v.attr == "APP_SOUZOKUNIN") \
+                    or _cx_is_app36_ctor(v):
+                names.add(n.targets[0].id)
+    return names
+
+
+def _cx_is_app36_expr(e, names):
+    return ((isinstance(e, _ast.Name) and e.id in names)
+            or (isinstance(e, _ast.Attribute) and e.attr == "APP_SOUZOKUNIN")
+            or _cx_is_app36_ctor(e))
+
+
+def _cx_scan(fn):
+    """(refs_app36, 全 read 呼出し, App36 search 呼出し〔位置引数/keyword〕)。
+
+    enumeration は**過大近似**: APP_SOUZOKUNIN 参照（alias/再構築含む）+
+    read 呼出し（対象 app を問わない）= reader（見逃し方向を構造的に塞ぐ。
+    偽陽性は manifest の exempt+理由で解消＝RV08 fix3 の型）。"""
+    names = _cx_app36_names(fn)
+    refs = any(_cx_is_app36_expr(n, names) for n in _cx_walk_local(fn))
+    reads, app36_searches = [], []
+    for n in _cx_walk_local(fn):
+        if isinstance(n, _ast.Call) \
+                and _cx_call_name(n) in ("search_records", "get_record"):
+            reads.append(_cx_call_name(n))
+            app_arg = n.args[0] if n.args else None
+            for kw in n.keywords:
+                if kw.arg == "app":
+                    app_arg = kw.value
+            if app_arg is not None and _cx_is_app36_expr(app_arg, names) \
+                    and _cx_call_name(n) == "search_records":
+                app36_searches.append(n)
+    return refs, reads, app36_searches
+
+
+def _cx_helper_filters(module_tree):
+    """helper 一段解決: 本体が filter_active_heir_rows を呼ぶ同 module 関数名。"""
+    out = set()
+    for top in _ast.walk(module_tree):
+        if isinstance(top, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
+            for n in _cx_walk_local(top):
+                if isinstance(n, _ast.Call) \
+                        and _cx_call_name(n) == "filter_active_heir_rows":
+                    out.add(top.name)
+    return out
+
+
+def _cx_filter_violations(fn, module_tree):
+    """search=filter 規律検査（RV08 check_filter_discipline の App36 適応）:
+    (i) 各 App36 search の結果が filter_active_heir_rows（または helper 一段
+    解決した同等関数）へ到達すること (ii) filter の戻り値が使用されること
+    （bare Expr=捨て置き・未使用 Assign は FAIL）。"""
+    violations = []
+    parents = {}
+    for n in _ast.walk(fn):
+        for c in _ast.iter_child_nodes(n):
+            parents[c] = n
+    helpers = _cx_helper_filters(module_tree) | {"filter_active_heir_rows"}
+    _refs, _reads, searches = _cx_scan(fn)
+    if not searches:
+        violations.append("manifest は search=filter だが App36 search が無い"
+                          "（stale）")
+        return violations
+    filter_calls = [n for n in _cx_walk_local(fn)
+                    if isinstance(n, _ast.Call)
+                    and _cx_call_name(n) in helpers]
+
+    def _consumes(call, var):
+        return any(isinstance(a, _ast.Name) and a.id == var
+                   for a in call.args)
+
+    for sc in searches:
+        p = parents.get(sc)
+        if isinstance(p, _ast.Await):
+            p = parents.get(p)
+        if isinstance(p, _ast.Call) and _cx_call_name(p) in helpers:
+            continue                        # 直接 filter(await search(...))
+        if isinstance(p, _ast.Assign) and len(p.targets) == 1 \
+                and isinstance(p.targets[0], _ast.Name):
+            var = p.targets[0].id
+            if any(_consumes(fc, var) for fc in filter_calls
+                   if fc.lineno >= p.lineno):
+                continue
+            violations.append(f"search 結果 {var} が filter に到達しない")
+            continue
+        violations.append("search 結果が filter に到達しない（束縛なし）")
+
+    for fc in filter_calls:
+        stmt = fc
+        while stmt in parents and not isinstance(stmt, _ast.stmt):
+            stmt = parents[stmt]
+        if isinstance(stmt, _ast.Expr):
+            violations.append("filter 戻り値が捨て置かれている")
+            continue
+        if isinstance(stmt, _ast.Assign) and len(stmt.targets) == 1 \
+                and isinstance(stmt.targets[0], _ast.Name):
+            var = stmt.targets[0].id
+            used = any(isinstance(n, _ast.Name) and n.id == var
+                       and isinstance(n.ctx, _ast.Load)
+                       and n.lineno > stmt.lineno
+                       for n in _cx_walk_local(fn))
+            if not used:
+                violations.append(f"filter 戻り値 {var} が後続で未使用")
+    return violations
+
+
+class TestReaderManifestClosure(unittest.TestCase):
+    """App36 reader manifest 閉包検査（CANCEL-IMPL-04・RV08 fix3 水準）。
+
+    - 過大近似 enumeration（APP_SOUZOKUNIN 参照+read 呼出し=reader）・
+      keyword 引数・単純 alias 1 hop・KintoneApp("App 36…") 再構築を検出。
+    - search=filter: filter 到達+戻り値使用（捨て置き=FAIL）・helper 一段解決。
+    - exempt は理由必須。閉包は両方向。"""
 
     MANIFEST = {
         ("hub/heir_projection.py", "_resolve_heir_derivation"):
@@ -584,13 +892,12 @@ class TestReaderManifestClosure(unittest.TestCase):
                       "行が人手で yes 化された場合も検知対象に載せる設計）"},
         ("hub/heir_cancel.py", "_verify_rows"): {
             "get": "exempt",
-            "reason": "取消関所の postimage 照合（write-set 記載行の直接 get・"
-                      "取消済み行も読んで完了判定する必要がある・§4.1a）"},
+            "reason": "取消関所の postimage/三値照合（write-set 記載行の直接 "
+                      "get・取消済み行も読んで完了判定する必要がある・§4.1a）"},
     }
 
     @classmethod
     def setUpClass(cls):
-        import ast
         import subprocess
         from pathlib import Path
         repo = Path(__file__).parent
@@ -598,44 +905,23 @@ class TestReaderManifestClosure(unittest.TestCase):
                                capture_output=True, text=True,
                                check=True).stdout.splitlines()
         cls.readers = {}
-        cls.sources = {}
+        cls.trees = {}
         for f in files:
             name = Path(f).name
             if (name.startswith("test_") or name == "conftest.py"
                     or f.startswith("legacy/") or f.startswith("alembic/")):
                 continue
-            src = (repo / f).read_text(encoding="utf-8")
-            tree = ast.parse(src)
-            for top in ast.walk(tree):
-                if not isinstance(top, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    continue
-                refs_app36 = False
-                reads = []
-                filters = False
-                for node in ast.walk(top):
-                    if isinstance(node, ast.Name) and node.id == "APP_SOUZOKUNIN":
-                        refs_app36 = True
-                    if isinstance(node, ast.Attribute) \
-                            and node.attr == "APP_SOUZOKUNIN":
-                        refs_app36 = True
-                    if isinstance(node, ast.Call):
-                        fn = node.func
-                        attr = fn.attr if isinstance(fn, ast.Attribute) else (
-                            fn.id if isinstance(fn, ast.Name) else "")
-                        if attr == "KintoneApp" and any(
-                                isinstance(a, ast.Constant)
-                                and isinstance(a.value, str)
-                                and ("App 36" in a.value
-                                     or a.value == "APP_SOUZOKUNIN")
-                                for a in node.args):
-                            refs_app36 = True
-                        if attr in ("search_records", "get_record"):
-                            reads.append(attr)
-                        if attr == "filter_active_heir_rows":
-                            filters = True
-                if refs_app36 and reads:
-                    cls.readers[(f, top.name)] = {"reads": set(reads),
-                                                  "filters": filters}
+            tree = _ast.parse((repo / f).read_text(encoding="utf-8"))
+            cls.trees[f] = tree
+            probes = [("<module>", tree)]
+            probes += [(t.name, t) for t in _ast.walk(tree)
+                       if isinstance(t, (_ast.FunctionDef,
+                                         _ast.AsyncFunctionDef))]
+            for fname, node in probes:
+                refs, reads, searches = _cx_scan(node)
+                if refs and reads:
+                    cls.readers[(f, fname)] = {"node": node, "module": tree,
+                                               "searches": searches}
 
     def test_manifest_is_exact_closure(self):
         found = set(self.readers)
@@ -649,9 +935,10 @@ class TestReaderManifestClosure(unittest.TestCase):
     def test_filter_disciplines_hold(self):
         for key, decl in self.MANIFEST.items():
             if decl.get("search") == "filter":
-                self.assertTrue(self.readers[key]["filters"],
-                                f"{key}: search=filter 宣言だが "
-                                "filter_active_heir_rows を通していない")
+                r = self.readers[key]
+                self.assertEqual(
+                    _cx_filter_violations(r["node"], r["module"]), [],
+                    f"{key}: search=filter 規律違反")
 
     def test_exempt_entries_have_reasons(self):
         for key, decl in self.MANIFEST.items():
@@ -666,6 +953,94 @@ class TestReaderManifestClosure(unittest.TestCase):
             encoding="utf-8")
         self.assertNotIn("filter_active_heir_rows", src)
         self.assertNotIn("app36_validity", src)
+
+
+class TestReaderCheckerNegatives(unittest.TestCase):
+    """checker 自体の穴を塞ぐ fixture（RV08 の meta 層の型・CANCEL-IMPL-04）"""
+
+    def _fn(self, src):
+        tree = _ast.parse(src)
+        fn = next(t for t in tree.body
+                  if isinstance(t, (_ast.FunctionDef, _ast.AsyncFunctionDef)))
+        return fn, tree
+
+    def test_keyword_arg_form_detected_and_disciplined(self):
+        fn, tree = self._fn(
+            "async def f():\n"
+            "    rows = await kintone.search_records(app=APP_SOUZOKUNIN,"
+            " query='q')\n"
+            "    rows = filter_active_heir_rows(rows)\n"
+            "    return rows\n")
+        refs, reads, searches = _cx_scan(fn)
+        self.assertTrue(refs)
+        self.assertEqual(len(searches), 1, "keyword 形の App36 search を検出")
+        self.assertEqual(_cx_filter_violations(fn, tree), [])
+
+    def test_alias_one_hop_detected(self):
+        fn, tree = self._fn(
+            "async def f():\n"
+            "    a = APP_SOUZOKUNIN\n"
+            "    rows = await kintone.search_records(a, 'q')\n"
+            "    return rows\n")
+        refs, reads, searches = _cx_scan(fn)
+        self.assertTrue(refs)
+        self.assertEqual(len(searches), 1, "alias 1 hop の App36 search を検出")
+        self.assertTrue(_cx_filter_violations(fn, tree),
+                        "filter 未到達は FAIL")
+
+    def test_inline_ctor_detected(self):
+        fn, tree = self._fn(
+            "async def f():\n"
+            "    rows = await kintone.search_records(\n"
+            "        kintone.KintoneApp('App 36 (相続人)', 'APP_SOUZOKUNIN',"
+            " 'TOKEN_SOUZOKUNIN'), 'q')\n"
+            "    return rows\n")
+        refs, reads, searches = _cx_scan(fn)
+        self.assertTrue(refs)
+        self.assertEqual(len(searches), 1, "KintoneApp 再構築を検出")
+
+    def test_filter_result_discarded_fails(self):
+        fn, tree = self._fn(
+            "async def f():\n"
+            "    rows = await kintone.search_records(APP_SOUZOKUNIN, 'q')\n"
+            "    filter_active_heir_rows(rows)\n"
+            "    return rows\n")
+        v = _cx_filter_violations(fn, tree)
+        self.assertTrue(any("捨て置" in x for x in v), v)
+
+    def test_filter_result_assigned_but_unused_fails(self):
+        fn, tree = self._fn(
+            "async def f():\n"
+            "    rows = await kintone.search_records(APP_SOUZOKUNIN, 'q')\n"
+            "    active = filter_active_heir_rows(rows)\n"
+            "    return rows\n")
+        v = _cx_filter_violations(fn, tree)
+        self.assertTrue(any("未使用" in x for x in v), v)
+
+    def test_helper_one_hop_resolution_passes(self):
+        fn, tree = self._fn(
+            "async def f():\n"
+            "    rows = await kintone.search_records(APP_SOUZOKUNIN, 'q')\n"
+            "    return _pick(rows)\n"
+            "def _pick(rows):\n"
+            "    return filter_active_heir_rows(rows)\n")
+        self.assertEqual(_cx_filter_violations(fn, tree), [],
+                         "helper 一段解決（同 module 内の filter helper）")
+
+    def test_unlisted_sibling_reader_detected(self):
+        tree = _ast.parse(
+            "async def listed():\n"
+            "    rows = await kintone.search_records(APP_SOUZOKUNIN, 'q')\n"
+            "    return filter_active_heir_rows(rows)\n"
+            "async def unlisted():\n"
+            "    return await kintone.get_record(APP_SOUZOKUNIN, '1')\n")
+        found = []
+        for t in _ast.walk(tree):
+            if isinstance(t, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
+                refs, reads, _se = _cx_scan(t)
+                if refs and reads:
+                    found.append(t.name)
+        self.assertIn("unlisted", found, "過大近似が未登録 reader を検出")
 
 
 class TestH11aUnchanged(_Base):
