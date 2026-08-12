@@ -108,6 +108,20 @@ async def _on_startup():
                         emit(stats["to_unknown"], "count", "log", "operator"))
         except Exception:
             logger.warning("[RV05] startup reconcile skipped (db not ready)")
+    # RV08-IMPL-07: 「封筒 closed×台帳 open」operation の回収（閉集合検証つき
+    # 完了化・検証不一致は警報）。flag OFF は import せず一切実行しない（M-06 流儀）。
+    if os.environ.get("PERSON_MERGE_ENABLED") == "1":
+        try:
+            from person_merge_exec import reconcile_merge_operations
+            stats = await reconcile_merge_operations()
+            logger.info("[RV08] startup reconcile: checked=%s reconciled=%s "
+                        "still_open=%s alerted=%s",
+                        emit(stats["checked"], "count", "log", "operator"),
+                        emit(stats["reconciled"], "count", "log", "operator"),
+                        emit(stats["still_open"], "count", "log", "operator"),
+                        emit(stats["alerted"], "count", "log", "operator"))
+        except Exception:
+            logger.warning("[RV08] startup reconcile skipped (db not ready)")
 
 
 @app.on_event("shutdown")

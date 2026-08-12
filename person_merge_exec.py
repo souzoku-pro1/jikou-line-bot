@@ -48,6 +48,7 @@ from hub.person_merge_journal import (
     MergeJournalError,
     find_open_operation,
     fingerprint_with_updates,
+    list_open_operations,
     record_fingerprint,
     record_stage,
 )
@@ -56,6 +57,7 @@ from hub.person_validity import (
     MERGE_LINEAGE_FIELD,
     MERGE_STATE_FIELD,
     MERGE_STATE_MERGED,
+    RESTORE_OPERATION_FIELD,
     is_active_person,
 )
 from hub.redact import emit
@@ -78,6 +80,9 @@ FORBIDDEN_FIELDS = ("確認状態", "確認者", "確認日時", "グラフ確�
 # RV-08: 無効化3フィールド（操作メタデータ・転記/復元の対象外）
 MERGE_ADMIN_FIELDS = (MERGE_STATE_FIELD, MERGE_LINEAGE_FIELD,
                       MERGE_DATETIME_FIELD)
+# RV08-IMPL-05: 復元操作ID を含む操作メタデータ全4フィールド（転記/復元の対象外。
+# 復元済みレコードが再び敗者→復元される場合も旧 operation_id を持ち越さない）
+OPERATION_ADMIN_FIELDS = MERGE_ADMIN_FIELDS + (RESTORE_OPERATION_FIELD,)
 
 # kintone GET レコードのシステムフィールド型（転記・復元の対象外）
 SYSTEM_TYPES = {"RECORD_NUMBER", "__ID__", "__REVISION__", "CREATOR",
@@ -173,7 +178,7 @@ def build_merge_payload(winner: dict, loser: dict) -> dict:
         if not isinstance(cell, dict) or cell.get("type") in SYSTEM_TYPES:
             continue
         if code in FORBIDDEN_FIELDS or code == "名寄せ確定" \
-                or code in MERGE_ADMIN_FIELDS:
+                or code in OPERATION_ADMIN_FIELDS:
             continue
         if code in SUBTABLE_UNION_FIELDS:
             rows = _union_rows(winner.get(code), cell)
@@ -224,7 +229,7 @@ def restore_payload_from_audit(audit: dict) -> dict:
     for code, cell in record.items():
         if not isinstance(cell, dict) or cell.get("type") in SYSTEM_TYPES:
             continue
-        if code in MERGE_ADMIN_FIELDS:
+        if code in OPERATION_ADMIN_FIELDS:
             continue
         if cell.get("type") == "SUBTABLE":
             payload[code] = [_clean_row(row) for row in cell.get("value") or []]
@@ -529,8 +534,8 @@ async def execute_merge(cand: MergeCandidate) -> dict:
     # ── postimage 台帳記録＝**全処理完了マーク**（RV08-IMPL-04: kintone 側の
     #    全書込み・添付・封筒クローズの後の最後尾。中間失敗は preimage のみの
     #    open operation として find_open_operation が同一 operation_id で回収）。
-    #    ここでの失敗は業務効果（kintone）完了後＝封筒クローズ済みでガードにより
-    #    再実行不能のため、merged＋警告で返し operation は open のまま残置する ──
+    #    ここでの失敗＝「封筒 closed×台帳 open」は reconcile_merge_operations が
+    #    閉集合検証つきで完了化する（RV08-IMPL-07・検知でなく回収）────────────────
     result = {"status": "merged", "winner_id": cand.winner_id,
               "loser_id": cand.loser_id, "repointed": repoint_plans,
               "operation_id": operation_id,
@@ -545,12 +550,9 @@ async def execute_merge(cand: MergeCandidate) -> dict:
                                 "fp": record_fingerprint(post_winner)},
                      "loser": {"id": cand.loser_id,
                                "fp": record_fingerprint(post_loser)}})
-    except MergeJournalError as e:
+    except MergeJournalError:
         logger.error("[PERSON_MERGE_EXEC] 完了マーク（postimage 台帳記録）に失敗"
-                     "（封筒はクローズ済み・operation は open のまま残置・"
-                     "固定分類のみ）")
-        result["warning"] = ("台帳の完了記録（postimage）に失敗しました"
-                            f"（統合自体は完了・封筒クローズ済み）: {e}")
+                     "（封筒はクローズ済み・reconcile 経路が回収・固定分類のみ）")
 
     logger.info("[PERSON_MERGE_EXEC] merged winner=No.%s loser=No.%s(disabled) "
                 "review=No.%s repointed=%s",
@@ -595,3 +597,119 @@ async def reject_pair(cand: MergeCandidate) -> dict:
                 emit(cand.review_record_id, "record_id", "log", "operator"))
     return {"status": "rejected", "pair_key": cand.pair_key,
             "review_record_id": cand.review_record_id}
+
+
+async def reconcile_merge_operations() -> dict:
+    """「封筒 closed × 台帳 open」operation の回収（RV08-IMPL-07・裁定=reconcile
+    追記方式）。postimage 台帳記録（全処理完了マーク・最後尾）だけが失敗した
+    operation を、**閉集合検証の成立時のみ**同一 operation_id へ postimage stage を
+    追記して完了化する（stage 閉集合は不変・App34/封筒への書き込みゼロ）。
+
+    閉集合検証（3点・全成立が条件）:
+      (i)   App34 全対象行（勝者・敗者・付け替え行）の現在 fingerprint が
+            preimage 記録の expected-post と**完全一致**
+      (ii)  監査JSON・postimage の両添付 filename が封筒 成果物 に存在
+      (iii) 封筒が closed（発送ステータス=完了・実行済み=yes）
+    検証不一致は**追記せず警報**（要確認・沈黙しない）。封筒が open のままの
+    operation は通常の再実行（find_open_operation）の管轄＝本経路の対象外。
+
+    起動タイミング: RV05 startup reconcile 流儀（main.py _on_startup・
+    PERSON_MERGE_ENABLED=1 のときのみ・失敗しても起動を止めない）。
+    手動起動も可（関数を直接呼ぶ）。
+    """
+    stats = {"checked": 0, "reconciled": 0, "still_open": 0, "alerted": 0}
+    if not merge_enabled():
+        return stats
+    if not (APP_SHIPPING.app_id() and APP_SHIPPING.token()
+            and APP_KOSEKI_PERSON.app_id() and APP_KOSEKI_PERSON.token()):
+        return stats
+    ops = await list_open_operations()
+    for op in ops:
+        stats["checked"] += 1
+        try:
+            envelope = await kintone.get_record(APP_SHIPPING,
+                                                op["envelope_record_id"])
+        except kintone.KintoneError:
+            await _alert_reconcile(op, "封筒を取得できません")
+            stats["alerted"] += 1
+            continue
+        closed = _v(envelope, "発送ステータス") == STATUS_DONE \
+            and _v(envelope, "実行済み") == "yes"
+        if not closed:
+            stats["still_open"] += 1   # 通常 resume の管轄（対象外）
+            continue
+        stored = op["payload"] or {}
+        problems: list[str] = []
+        # (i) App34 全対象行の postimage 完全一致
+        fps = {}
+        for side in ("winner", "loser"):
+            info = stored.get(side) or {}
+            rid = str(info.get("id") or "")
+            try:
+                rec = await kintone.get_record(APP_KOSEKI_PERSON, rid)
+            except kintone.KintoneError:
+                problems.append(f"{side} No.{rid} 取得不能")
+                continue
+            fps[side] = record_fingerprint(rec)
+            if fps[side] != str(info.get("post") or ""):
+                problems.append(f"{side} No.{rid} postimage 不一致")
+        for entry in stored.get("repoint") or []:
+            rid = str(entry.get("id") or "")
+            try:
+                row = await kintone.get_record(APP_KOSEKI_PERSON, rid)
+            except kintone.KintoneError:
+                problems.append(f"付け替え対象 No.{rid} 取得不能")
+                continue
+            if record_fingerprint(_edge_view(row)) != str(entry.get("post") or ""):
+                problems.append(f"付け替え対象 No.{rid} postimage 不一致")
+        # (ii) 両添付 filename の存在
+        names = _artifact_names(envelope)
+        audit_name = f"名寄せ統合監査_{op['winner_id']}-{op['loser_id']}.json"
+        post_name = f"名寄せ統合監査_{op['winner_id']}-{op['loser_id']}_postimage.json"
+        for fn, label in ((audit_name, "監査JSON"), (post_name, "postimage")):
+            if fn not in names:
+                problems.append(f"{label} 添付なし")
+        if problems:
+            await _alert_reconcile(op, "・".join(problems))
+            stats["alerted"] += 1
+            continue
+        try:
+            await record_stage(
+                operation_id=op["operation_id"], pair_key=op["pair_key"],
+                envelope_record_id=op["envelope_record_id"],
+                winner_id=op["winner_id"], loser_id=op["loser_id"],
+                stage=STAGE_POSTIMAGE,
+                payload={"winner": {"id": op["winner_id"],
+                                    "fp": fps.get("winner", "")},
+                         "loser": {"id": op["loser_id"],
+                                   "fp": fps.get("loser", "")},
+                         "reconciled": True})
+        except MergeJournalError:
+            # 並行 reconcile / 台帳一時不調は次回 startup で再回収（沈黙させない）
+            logger.error("[PERSON_MERGE_EXEC] reconcile の完了マーク追記に失敗"
+                         "（次回 startup で再回収・固定分類のみ）")
+            continue
+        stats["reconciled"] += 1
+        logger.info("[PERSON_MERGE_EXEC] reconciled operation（封筒 closed×台帳 "
+                    "open の完了化） review=No.%s",
+                    emit(op["envelope_record_id"], "record_id", "log",
+                         "operator"))
+    return stats
+
+
+async def _alert_reconcile(op: dict, reason: str) -> None:
+    """reconcile 検証不一致の業務警報（要確認・沈黙しない・PII なし=ID/固定文言）"""
+    from hub import notify
+    try:
+        await notify.notify_admin_line(
+            "【名寄せ統合: 完了マーク未記録の operation を検証しましたが"
+            "完了化できません（要確認）】\n"
+            f"封筒 No.{op['envelope_record_id']} / 勝者 No.{op['winner_id']} / "
+            f"敗者 No.{op['loser_id']}\n"
+            f"不一致: {reason}\n"
+            "台帳の open operation は残置しています（人手確認のうえ対処して"
+            "ください）",
+            throttle_key=f"merge_reconcile:{op['operation_id']}")
+    except Exception:
+        logger.error("[PERSON_MERGE_EXEC] reconcile alert failed "
+                     "(fixed classification only)")

@@ -23,6 +23,10 @@ APP_KOSEKI_PERSON = kintone.KintoneApp(
 MERGE_STATE_FIELD = "統合状態"
 MERGE_LINEAGE_FIELD = "統合先人物ID"
 MERGE_DATETIME_FIELD = "統合日時"
+# App34 復元操作ID（RV08-IMPL-05・裁定=専用フィールド方式）: 復元 CLI が create 時に
+# 決定的 restore operation_id（SHA-256 hex・非PII）を本体保存する器。ACK 喪失後の
+# 回収はこのフィールドの完全一致検索＝個体の決定的同定（氏名検索を廃止）
+RESTORE_OPERATION_FIELD = "復元操作ID"
 
 MERGE_STATE_ACTIVE = "有効"
 MERGE_STATE_MERGED = "統合済み無効"

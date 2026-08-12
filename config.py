@@ -411,6 +411,10 @@ EXPECTED_KINTONE_SCHEMA = {
             },
             "統合先人物ID": {"type": "SINGLE_LINE_TEXT"},
             "統合日時": {"type": "DATETIME"},
+            # RV08-IMPL-05（裁定=専用フィールド方式）: 復元 CLI が決定的
+            # restore operation_id（SHA-256 hex・非PII）を本体保存する器。
+            # ACK 喪失回収の完全一致検索キー（氏名検索の誤採用を構造排除）
+            "復元操作ID": {"type": "SINGLE_LINE_TEXT"},
             # 相続人導出（候補=機械・資格確定=弁護士）
             "相続人候補": {
                 "type": "DROP_DOWN",

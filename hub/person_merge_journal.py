@@ -178,6 +178,38 @@ async def find_stages(operation_id: str) -> dict[str, dict]:
     return {r.stage: r.payload for r in rows}
 
 
+async def list_open_operations(limit: int = 100) -> list[dict]:
+    """未完了 operation（preimage あり・postimage なし）の全列挙
+    （RV08-IMPL-07 reconcile 用・restore 系は対象外＝merge 操作のみ）。
+    Returns: [{"operation_id","pair_key","envelope_record_id",
+               "winner_id","loser_id","payload"}]。失敗は MergeJournalError。"""
+    try:
+        async with session_scope() as session:
+            t = PersonMergeOperation.__table__
+            rows = (await session.execute(
+                sa.select(t.c.operation_id, t.c.pair_key,
+                          t.c.envelope_record_id, t.c.winner_id,
+                          t.c.loser_id, t.c.stage, t.c.payload)
+                .order_by(t.c.id.asc()))).all()
+    except Exception as e:
+        raise MergeJournalError(type(e).__name__) from e
+    done = {r.operation_id for r in rows
+            if r.stage in (STAGE_POSTIMAGE, STAGE_RESTORE)}
+    out = []
+    for r in rows:
+        if r.operation_id.startswith("restore-"):
+            continue   # 復元 CLI の pending は CLI 再実行が回収経路（reconcile 対象外）
+        if r.stage == STAGE_PREIMAGE and r.operation_id not in done:
+            out.append({"operation_id": r.operation_id,
+                        "pair_key": r.pair_key,
+                        "envelope_record_id": r.envelope_record_id,
+                        "winner_id": r.winner_id, "loser_id": r.loser_id,
+                        "payload": r.payload})
+        if len(out) >= limit:
+            break
+    return out
+
+
 async def find_open_operation(envelope_record_id: str,
                               pair_key: str) -> dict | None:
     """未完了 operation（preimage あり・postimage なし）の最新 1 件を返す。

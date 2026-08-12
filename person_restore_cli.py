@@ -10,14 +10,20 @@ R-RV08-IMPL-1 反映（RV08-IMPL-01/02: 決定的 operation_id・冪等復元・
   （監査種別・封筒レコードID・旧敗者ID・元 merge operation_id〔旧監査は空〕）のみ
   から SHA-256 で決定的に構成する（uuid 不使用）。同一監査JSONは常に同一
   operation_id ＝連続 --execute・ACK 喪失後の再実行でも App34 create は合計 1 回。
+- **復元操作ID の本体保存（RV08-IMPL-05・裁定=専用フィールド方式）**: create の
+  payload に App34「復元操作ID」（SINGLE_LINE_TEXT・非PII=SHA-256 hex）として
+  operation_id を保存する。ACK 喪失後の回収は
+  `復元操作ID = "<operation_id>"` の完全一致検索＝**個体の決定的同定**
+  （氏名検索は廃止——同氏名・同内容の既存人物への誤採用を構造で排除）。
+  三値固定: 0件=create 続行／1件=採用（fingerprint 再検証つき）／
+  複数件=write 0＋要確認（構造上起きないはずだが fail-closed）。
 - **fail-closed＋段階回収（RV08-IMPL-02）**: create 前に preimage（pending）行を
   immutable 台帳へ先行保存する。台帳が使えない（DB 不可・migration 未適用）なら
   App34 へ一切書かない。create 後の各失敗点（ACK 喪失・親エッジ途中失敗・
   完了記録失敗）は再実行で**既存復元へ収束**する:
     完了行あり → 現況 fingerprint 一致なら create 0 で既存新 ID を返す・不一致は
-    write 0 要確認 ／ pending のみ → 氏名検索＋payload fingerprint 照合で
-    作成済みレコードを発見（一致=再利用・候補はあるが不一致=write 0 要確認・
-    候補なし=create）／ 親エッジは現在値で per-edge 照合
+    write 0 要確認 ／ pending のみ → 復元操作ID 検索（上記三値）／
+    親エッジは現在値で per-edge 照合
     （勝者のまま=適用・新 ID=skip・第三者変更=write 0 で要人手）。
 - 既定は **dry-run**（kintone 読み取りのみで計画を表示・台帳照合は --execute 時）。
   PERSON_MERGE_ENABLED には依存しない（手動起動自体が明示承認）。
@@ -45,6 +51,7 @@ from hub.person_merge_journal import (
     record_fingerprint,
     record_stage,
 )
+from hub.person_validity import RESTORE_OPERATION_FIELD
 from person_merge import APP_KOSEKI_PERSON, _v
 from person_merge_exec import (
     PARENT_EDGE_FIELDS,
@@ -134,38 +141,37 @@ async def _classify_relink(plans: list, winner_id: str,
 
 
 async def _find_restored_candidate(payload: dict, payload_fp: str,
-                                   winner_id: str, old_id: str) -> str | None:
-    """ACK 喪失後の作成済みレコード探索（RV08-IMPL-01/02）。
-    氏名で検索し payload fingerprint の完全一致のみ再利用。候補はあるが不一致は
-    要確認（SystemExit・write 0）——編集済みレコードへの盲目相乗り・重複 create の
-    双方を塞ぐ。氏名が無い payload は判定不能＝要確認（fail-closed）。"""
-    name = str(payload.get("氏名") or "")
-    if not name:
-        raise SystemExit(
-            "復元途中の operation が残っていますが、payload に 氏名 が無く"
-            "作成済みレコードを特定できません（要人手確認・書き込みなし）")
+                                   op_id: str) -> str | None:
+    """ACK 喪失後の作成済みレコード探索（RV08-IMPL-05・専用フィールド方式）。
+    `復元操作ID = "<operation_id>"` の完全一致検索＝個体の決定的同定。三値固定:
+      0件 → None（create 続行＝回収規則どおり）
+      1件 → 採用（payload fingerprint の再検証つき・不一致は要確認 write 0）
+      複数件 → write 0＋要確認（構造上起きないはずだが fail-closed）
+    同氏名・同内容の既存人物（復元操作ID なし）は検索に載らない＝誤採用しない。"""
     records = await kintone.search_records(
         APP_KOSEKI_PERSON,
-        f'氏名 = "{_escape(name)}" order by $id asc limit 100',
+        f'{RESTORE_OPERATION_FIELD} = "{_escape(op_id)}"'
+        ' order by $id asc limit 10',
         fields=["$id"])
-    candidates = []
-    for r in records:
-        rid = _v(r, "$id")
-        if rid in (winner_id, old_id):
-            continue
-        try:
-            rec = await kintone.get_record(APP_KOSEKI_PERSON, rid)
-        except kintone.KintoneError:
-            continue
-        candidates.append((rid, _subset_fp(rec, payload)))
-    matched = [rid for rid, fp in candidates if fp == payload_fp]
-    if matched:
-        return matched[0]
-    if candidates:
+    if not records:
+        return None
+    if len(records) >= 2:
+        ids = "・".join(f"No.{_v(r, '$id')}" for r in records)
         raise SystemExit(
-            "復元途中の operation が残っていますが、既存レコードは保存内容と"
-            f"一致しません（候補{len(candidates)}件・要人手確認・書き込みなし）")
-    return None
+            f"復元操作ID が複数レコードに存在します（{ids}・構造上想定外・"
+            "要人手確認・書き込みなし）")
+    rid = _v(records[0], "$id")
+    try:
+        rec = await kintone.get_record(APP_KOSEKI_PERSON, rid)
+    except kintone.KintoneError:
+        raise SystemExit(
+            f"復元操作ID 一致の No.{rid} を取得できません"
+            "（要人手確認・書き込みなし）")
+    if _subset_fp(rec, payload) != payload_fp:
+        raise SystemExit(
+            f"復元操作ID 一致の No.{rid} は保存内容と一致しません"
+            "（その後の編集あり・要人手確認・書き込みなし）")
+    return rid
 
 
 async def _restore(audit: dict, execute: bool) -> None:
@@ -231,8 +237,7 @@ async def _restore(audit: dict, execute: bool) -> None:
             raise SystemExit(
                 "復元途中の operation が残っていますが、監査JSONの内容が前回と"
                 "一致しません（要人手確認・書き込みなし）")
-        new_id = await _find_restored_candidate(payload, payload_fp,
-                                                winner_id, old_id)
+        new_id = await _find_restored_candidate(payload, payload_fp, op_id)
     else:
         # ── preimage（pending）先行保存: create 前・RV08-IMPL-02 ─────────────
         try:
@@ -250,7 +255,10 @@ async def _restore(audit: dict, execute: bool) -> None:
 
     try:
         if new_id is None:
-            new_id = str(await kintone.create_record(APP_KOSEKI_PERSON, payload))
+            # RV08-IMPL-05: 復元操作ID を本体保存（ACK 喪失回収の決定的同定キー）
+            new_id = str(await kintone.create_record(
+                APP_KOSEKI_PERSON,
+                {**payload, RESTORE_OPERATION_FIELD: op_id}))
             print(f"  create: 新No.{new_id}")
         else:
             print(f"  create 0（作成済み 新No.{new_id} を再利用）")
