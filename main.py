@@ -438,15 +438,55 @@ class PausedInboundError(RuntimeError):
     （既存の retry/reconcile 機構で再処理可能）。"""
 
 
+class PausedChatlogConfigError(RuntimeError):
+    """pause 経路 strict writer: APP_CHATLOG/TOKEN_CHATLOG 未設定
+    （AUTOREPLY-02(i)・fail-open な save_to_chatlog と違い未設定を例外化＝
+    「保存された」との誤認を防ぎ durable failed → retry へ倒す）。"""
+
+
 _APP_CHATLOG_KT = hub_kintone.KintoneApp(
     "App 28 (チャットログ)", "APP_CHATLOG", "TOKEN_CHATLOG")
+
+
+async def _save_paused_chatlog(user_id: str, role: str, message: str,
+                               category: str, auto_sent: str) -> None:
+    """AUTOREPLY-02: pause 経路専用の strict writer（fail-closed）。
+    既存 save_to_chatlog は fail-open（env 未設定=silent skip・HTTP 失敗=
+    warning のみ）のまま他経路の契約として維持し、停止経路の保存だけを
+    厳格化する:
+
+    (i)   APP_CHATLOG/TOKEN_CHATLOG 未設定 → PausedChatlogConfigError
+    (ii)  kintone HTTP 4xx/5xx・通信エラー → KintoneError（hub_kintone._write
+          が正規化して送出・書き込みはリトライしない）
+    (iii) 成功時のみ正常 return
+
+    シグネチャ・保存フィールドは save_to_chatlog と同一（App28 のレコード形は
+    変えない）。"""
+    if not (_APP_CHATLOG_KT.app_id() and _APP_CHATLOG_KT.token()):
+        raise PausedChatlogConfigError(
+            f"{_APP_CHATLOG_KT.app_id_env}/{_APP_CHATLOG_KT.token_env} not set")
+    await hub_kintone.create_record(_APP_CHATLOG_KT, {
+        "line_user_id": user_id,
+        "role": role,
+        "message": message,
+        "category": category,
+        "auto_sent": auto_sent,
+    })
 
 
 async def _paused_chatlog_already_saved(idem_key: str) -> bool:
     """AUTOREPLY-01(iii): retry 時の App28 重複防止。冪等キー
     （category="paused:{webhook_event_id}"・SINGLE_LINE_TEXT の完全一致検索）で
     既存確認する。確認自体の失敗は False（=保存を試行）へ倒す——重複は欠落より
-    安全側（記録主義）。"""
+    安全側（記録主義）。
+
+    AUTOREPLY-03 役割分担: **並行一意性（同一 webhook_event_id の同時 2 処理の
+    排除）は durable 状態機械が担保する**（record_line_event の排他 claim・
+    hub/durable_inbound.py。同時重複配送は勝者 1 者のみ処理登録・fresh
+    processing 中の再配送は "duplicate"=登録 skip）。本検索が受け持つのは
+    **順次 retry（failed → LINE 再配送）の冪等担保のみ**であり、check-then-act
+    の隙間を突く並行実行は前提にない（決定的一意制約は導入しない・小機能に
+    対する過剰実装を避ける）。"""
     if not (_APP_CHATLOG_KT.app_id() and _APP_CHATLOG_KT.token()):
         return False
     try:
@@ -474,10 +514,16 @@ async def _handle_paused_inbound(user_id: str, user_text: str,
     - **いずれかの失敗は PausedInboundError で上位へ伝播**（AUTOREPLY-01(ii)・
       durable 経路=failed へ→retry で再処理・非 durable 経路=分類付き ERROR
       ログ済みのまま送出）
+    - **App28 保存は pause 専用 strict writer**（AUTOREPLY-02・
+      _save_paused_chatlog）: env 未設定・HTTP 4xx/5xx を例外化し、成功時のみ
+      正常 return（fail-open な save_to_chatlog の契約は他経路向けに不変）
     - **retry の冪等性**（AUTOREPLY-01(iii)）: durable 経路は App28 の
       category へ冪等キー paused:{webhook_event_id} を保存し、再処理時は
       完全一致検索で既存確認＝重複レコードを作らない。通知の再送は許容
-      （重複通知は沈黙より安全側）
+      （重複通知は沈黙より安全側）。**並行一意性は durable 状態機械
+      （record_line_event の排他 claim）が担保**し、この検索は順次 retry の
+      冪等担保のみを受け持つ（AUTOREPLY-03・_paused_chatlog_already_saved
+      の docstring 参照）
     - 表示名は App21 顧客名（best-effort・redact は人対応と同じ emit 経路）。
       App21 レコードの無い新規顧客は PII 配慮の匿名ID（userId の SHA-256
       先頭8桁・実体の特定は App28 で行う）
@@ -508,7 +554,8 @@ async def _handle_paused_inbound(user_id: str, user_text: str,
                     "retry, skip save)")
     else:
         try:
-            await save_to_chatlog(user_id, "user", user_text, idem_key, "no")
+            await _save_paused_chatlog(user_id, "user", user_text, idem_key,
+                                       "no")
         except Exception as e:
             save_error = type(e).__name__
             # P1-107b 転換ログと同型（分類名＋本文は emit 抑止・PII 非搭載）
