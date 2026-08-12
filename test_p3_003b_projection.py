@@ -291,7 +291,10 @@ class TestSingleWritePathSource(unittest.TestCase):
         write_attrs = {"create_record", "update_record", "delete_record",
                        "create_records"}
         allowed = {("hub/heir_projection.py", "_resolve_heir_derivation"),
-                   ("hub/heir_projection.py", "_project_row")}
+                   ("hub/heir_projection.py", "_project_row"),
+                   # P3-003C-CANCEL §4.2: 取消関所の一本経路（巻き戻し=
+                   # preimage 復元/無効化。許可文脈の追加は凍結票の設計どおり）
+                   ("hub/heir_cancel.py", "_rollback_row")}
         files = subprocess.run(["git", "ls-files", "*.py"],
                                capture_output=True, text=True,
                                check=True).stdout.splitlines()

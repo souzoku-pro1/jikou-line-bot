@@ -175,7 +175,7 @@ class TestRegistryAndVocabulary(unittest.TestCase):
 
     def test_existing_specs_unconditionally_visible(self):
         for t, spec in registry.TASK_REGISTRY.items():
-            if t not in ("heir_derivation", "shokumu_plan"):
+            if t not in ("heir_derivation", "shokumu_plan", "heir_cancel"):
                 # flag 連動タスク（heir/SHOKUMU-PLAN・時点ピンの追随）以外は
                 # 無条件掲載＝既存タスク無変更の pin
                 self.assertIsNone(spec.visible_fn, t)

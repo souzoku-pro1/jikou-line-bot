@@ -555,6 +555,17 @@ EXPECTED_KINTONE_SCHEMA = {
                 "type": "DROP_DOWN",
                 "required_options": ["ヒアリング", "戸籍読解", "手入力"],
             },
+            # P3-003C-CANCEL（DRAFT_P3_003C_CANCEL §4.2a・CANCEL-06）: insert 行
+            # 取消の無効化フィールド。[人] CU 追加後に監視対象化（CU 適用前に
+            # 本エントリを含む branch を merge すると healthcheck NG になる——
+            # merge は CU 適用後・RV-08 と同型の順序）。
+            # 値は hub/app36_validity.CANCELLED_VALUES と一字一句一致
+            # （test_p3_003c_cancel が閉集合を pin）。yes を書けるのは取消関所
+            # （hub/heir_cancel）の一本経路のみ
+            "取消済み": {
+                "type": "RADIO_BUTTON",
+                "required_options": ["no", "yes"],
+            },
         },
     },
     # ── 割付（S系列・docs/souzoku-shorui/01 §3〔設計上は App 38 表記・実機は 37〕）──
