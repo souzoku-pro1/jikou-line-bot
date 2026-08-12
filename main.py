@@ -425,12 +425,70 @@ async def ask_claude(user_id: str, user_message: str) -> str:
     return reply_text
 
 
+def _autoreply_paused() -> bool:
+    """①全体停止 flag（AUTOREPLY-PAUSE-IMPL）: env AUTOREPLY_PAUSED=1 のとき
+    顧客Bot の自動返信を全停止する。**未設定/他値=従来動作と完全一致**。
+    判定はあらゆる外部作用（App21 参照・Claude・LINE 送信）より前に行う。"""
+    return os.environ.get("AUTOREPLY_PAUSED") == "1"
+
+
+async def _handle_paused_inbound(user_id: str, user_text: str) -> None:
+    """AUTOREPLY_PAUSED=1 の受信処理（既存「人対応」経路と同型・返信 0 件）:
+
+    - 顧客へは一切送信しない（自動応答・定型文・承認キュー投入とも発生しない。
+      **Claude API 呼び出しもスキップ**＝無駄な消費と「生成したのに送らない」
+      状態を作らない）
+    - App28（チャットログ）へ受信内容を記録（方向=user・auto_sent=no）
+    - 弁護士へ業務チャネル（DISPATCHBOT）通知。表示名は App21 の顧客名
+      （best-effort 参照・redact は人対応と同じ emit 経路）。**App21 レコードの
+      無い新規/未紐付け顧客は PII 配慮の匿名ID**（LINE userId の SHA-256 先頭
+      8桁・実体の特定は App28 で行う）
+    - inbound_event 耐久化は本関数の上流（webhook 受理時）で完了済み＝継続。
+      Stripe/CloudSign webhook は別 endpoint＝無影響
+    """
+    logger.info("[AUTOREPLY_PAUSED] inbound recorded (no reply) user_id=%s",
+                emit(user_id, "external_ref", "log", "operator"))
+    display_name = ""
+    try:
+        app21_record = await get_app21_record(user_id)
+        if app21_record is not None:
+            display_name = (
+                app21_record.get("顧客名", {}).get("value", "") or "")
+    except Exception:
+        # 表示名の解決は best-effort（失敗しても記録と通知を止めない）
+        logger.info("[AUTOREPLY_PAUSED] App21 lookup failed "
+                    "(fallback to anonymous id)")
+    if not display_name:
+        anon = hashlib.sha256(user_id.encode("utf-8")).hexdigest()[:8]
+        display_name = f"新規/未紐付け(匿名ID:{anon})"
+    # (b) 受信記録 →(c) 通知 の順序は「人対応」経路と同型
+    await save_to_chatlog(user_id, "user", user_text, "", "no")
+    if ATTORNEY_LINE_USER_ID:
+        from hub.notify import notify_business
+        await notify_business(
+            ATTORNEY_LINE_USER_ID,
+            f"【自動返信停止中】"
+            f"{emit(display_name, 'name', 'line_business', 'attorney')}"
+            f"：{emit(user_text, 'freetext', 'line_business', 'attorney')}",
+        )
+    else:
+        logger.info(
+            "[AUTOREPLY_PAUSED] ATTORNEY_LINE_USER_ID not set, "
+            "admin notify skipped")
+
+
 async def _process_line_event(reply_token: str, user_id: str, user_text: str) -> None:
     """LINEイベントの重い処理（BackgroundTasksで非同期実行）"""
     logger.info("[PROCESS] start user_id=%s text=%s",
                 emit(user_id, "external_ref", "log", "operator"),
                 emit(user_text[:30], "freetext", "log", "operator"))
     try:
+        # ── ①全体停止 flag（AUTOREPLY_PAUSED・全ての外部作用より前に判定。
+        #    App21 レコードの有無・ヒアリングセッション中かを問わず全停止）────
+        if _autoreply_paused():
+            await _handle_paused_inbound(user_id, user_text)
+            return
+
         # ── ルーティング判定 ──────────────────────────────────────────────
         in_hearing_session = (
             user_id in conversation_histories
