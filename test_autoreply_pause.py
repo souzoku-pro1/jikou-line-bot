@@ -409,8 +409,10 @@ class TestConcurrentUniquenessPin(unittest.TestCase):
     役割分担（本 suite が固定する契約）:
     - **並行一意性**（同一 webhook_event_id の同時 2 処理の排除）=
       record_line_event の排他 claim（hub/durable_inbound.py・UPDATE の
-      guard+RETURNING で勝者 1 者のみ）と webhook 側の "duplicate"=登録 skip
-      （main.py）が担保する
+      guard+RETURNING で勝者 1 者のみ）＋ webhook 側の "duplicate"=登録 skip
+      （main.py）＋ mark_line_processing の所有権取得（AUTOREPLY-04・
+      「初回 new タスク×reattempt タスク」の併走窓は
+      TestOwnershipSingleWinner が固定）が担保する
     - **順次 retry の冪等**（failed → LINE 再配送での App28 増分 0）=
       _paused_chatlog_already_saved の category 完全一致検索が担保する
       （TestFailClosed.test_retry_is_idempotent_for_chatlog_but_renotifies）
@@ -484,6 +486,146 @@ class TestConcurrentUniquenessPin(unittest.TestCase):
             self.assertEqual(r2.status_code, 200)
             paused.assert_awaited_once()  # 競合の無い event は 1 回だけ処理
             self.assertEqual(paused.await_args.args[2], "pz-free")
+        db.reset_for_tests()
+
+
+class TestOwnershipSingleWinner(unittest.TestCase):
+    """AUTOREPLY-04: 「初回 new タスク×再配送 reattempt タスク」の併走窓を
+    閉じる——初回タスクを保留したまま同一 event を再配送し（reattempt claim
+    成立）、**両方のタスクを実行しても処理は合計 1 回**を直接固定する。
+    所有権: 初回 new タスク=mark_line_processing の guard 付き UPDATE で取得・
+    reattempt タスク=record_line_event の排他 claim で取得済み
+    （already_claimed=True）。共有機構（hub/durable_inbound）の修正のため、
+    pause 経路（strict writer 合計 1 回）と通常経路（_process_line_event
+    合計 1 回）の両方を直接測る。DB は sqlite 実体。"""
+
+    def setUp(self):
+        self._dir = tempfile.mkdtemp(prefix="pause04_")
+        self._env = patch.dict(os.environ, {
+            "DATABASE_URL": f"sqlite+aiosqlite:///{self._dir}/n.db",
+            "INBOUND_EVENT_DURABLE_ENABLED": "1"})
+        self._env.start()
+        db.reset_for_tests()
+
+        async def _create():
+            eng = db.get_async_engine()
+            async with eng.begin() as c:
+                await c.run_sync(InboundBase.metadata.create_all)
+        run(_create())
+        db.reset_for_tests()
+
+        # pause 経路の外部作用のみ mock（durable 状態機械は実体を通す）
+        self.strict = AsyncMock()
+        self.notify = AsyncMock(return_value=True)
+        self.proc = AsyncMock()
+        for p in [
+            patch.object(main, "_save_paused_chatlog", new=self.strict),
+            patch.object(main, "_paused_chatlog_already_saved",
+                         new=AsyncMock(return_value=False)),
+            patch.object(main, "get_app21_record",
+                         new=AsyncMock(return_value=None)),
+            patch.object(main, "ATTORNEY_LINE_USER_ID", "U-attorney"),
+            patch("hub.notify.notify_business", new=self.notify),
+        ]:
+            p.start()
+            self.addCleanup(p.stop)
+
+    def tearDown(self):
+        db.reset_for_tests()
+        self._env.stop()
+        shutil.rmtree(self._dir, ignore_errors=True)
+
+    def _run_db(self, coro):
+        """asyncio.run 1回ごとに engine の loop 束縛を解く（_DbMixin と同流儀）"""
+        r = run(coro)
+        db.reset_for_tests()
+        return r
+
+    def _state(self, event_id):
+        async def _q():
+            async with db.session_scope() as s:
+                return (await s.execute(
+                    sa.select(InboundEvent.state)
+                    .where(InboundEvent.external_event_id == event_id)
+                )).scalar_one()
+        return self._run_db(_q())
+
+    def _new_then_reattempt(self, event_id):
+        """初回 new タスクを保留したまま同一 event を再配送（reattempt claim）"""
+        kw = dict(user_id=USER, signature_result="verified",
+                  payload=b"p", event_type="message")
+
+        async def _deliver():
+            o1 = await di.record_line_event(webhook_event_id=event_id, **kw)
+            o2 = await di.record_line_event(webhook_event_id=event_id, **kw)
+            return o1, o2
+        o1, o2 = self._run_db(_deliver())
+        self.assertEqual((o1, o2), ("new", "reattempt"))
+        return event_id
+
+    def test_pause_path_both_tasks_run_strict_writer_called_once(self):
+        """pause 経路: reattempt タスク→保留していた初回 new タスクの順に
+        両方実行しても _save_paused_chatlog 呼出し合計 1 回・通知も 1 回・
+        初回タスクは所有権を取得できず退出（done を failed 等で上書きしない）"""
+        eid = self._new_then_reattempt("pz-own-1")
+        with patch.dict(os.environ, {"AUTOREPLY_PAUSED": "1"}):
+            self._run_db(main._process_line_event_durable(
+                "rt", USER, "本文", eid, already_claimed=True))   # reattempt
+            self._run_db(
+                main._process_line_event_durable("rt", USER, "本文", eid))  # 初回
+        self.assertEqual(self.strict.await_count, 1,
+                         "併走窓でも App28 保存は合計 1 回")
+        self.assertEqual(self.notify.await_count, 1)
+        self.assertEqual(self._state(eid), "done")
+
+    def test_pause_path_stale_new_task_after_claim_skips(self):
+        """pause 経路（逆順）: 再配送 claim 後に初回 new タスクが先に走っても
+        所有権を取得できず 0 回・その後の reattempt タスクで 1 回"""
+        eid = self._new_then_reattempt("pz-own-2")
+        with patch.dict(os.environ, {"AUTOREPLY_PAUSED": "1"}):
+            self._run_db(
+                main._process_line_event_durable("rt", USER, "本文", eid))  # 初回
+            self.assertEqual(self.strict.await_count, 0,
+                             "所有権なし＝処理せず退出")
+            self.assertEqual(self._state(eid), "processing",
+                             "非所有タスクは所有者の state を動かさない")
+            self._run_db(main._process_line_event_durable(
+                "rt", USER, "本文", eid, already_claimed=True))   # reattempt
+        self.assertEqual(self.strict.await_count, 1)
+        self.assertEqual(self._state(eid), "done")
+
+    def test_normal_path_same_window_processes_once(self):
+        """通常経路（非 pause）: 同じ併走窓で _process_line_event も合計 1 回
+        （共有機構の修正＝通常経路の保証も直接測る）"""
+        eid = self._new_then_reattempt("pz-own-3")
+        os.environ.pop("AUTOREPLY_PAUSED", None)
+        with patch.object(main, "_process_line_event", new=self.proc):
+            self._run_db(main._process_line_event_durable(
+                "rt", USER, "本文", eid, already_claimed=True))   # reattempt
+            self._run_db(
+                main._process_line_event_durable("rt", USER, "本文", eid))  # 初回
+        self.assertEqual(self.proc.await_count, 1,
+                         "併走窓でも通常処理は合計 1 回")
+        self.assertEqual(self._state(eid), "done")
+        self.strict.assert_not_awaited()
+
+    def test_webhook_registers_reattempt_as_claimed(self):
+        """webhook 側の配線: reattempt の登録は already_claimed=True・new は
+        False（デフォルト）で登録される（所有権の受け渡しを end-to-end で固定）"""
+        calls = []
+
+        async def _spy(reply_token, user_id, user_text, webhook_event_id,
+                       already_claimed=False):
+            calls.append((webhook_event_id, already_claimed))
+
+        client = TestClient(main.app)
+        with patch.object(main, "_process_line_event_durable", new=_spy):
+            body, sig = _line_body(event_id="pz-wire")
+            client.post("/webhook", content=body,
+                        headers={"X-Line-Signature": sig})   # new（タスクは spy）
+            client.post("/webhook", content=body,
+                        headers={"X-Line-Signature": sig})   # 未終端→reattempt
+        self.assertEqual(calls, [("pz-wire", False), ("pz-wire", True)])
         db.reset_for_tests()
 
 

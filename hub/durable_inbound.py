@@ -174,18 +174,29 @@ async def record_line_event(*, webhook_event_id: str, user_id: str,
     return outcome
 
 
-async def mark_line_processing(webhook_event_id: str) -> None:
-    """coarse observe: 処理開始（received→processing・claimed_at=now()）。HOTFIX-01 型の
-    「processing に到達しない」滞留を可視化する。H-NEW-02: claimed_at を SQL 側 now() で
-    同時に設定し、本番経路（新規 insert→本 mark）の fresh processing が重複配送の
-    NULL stale 救済（旧行向け）に拾われて併走することを防ぐ。
-    fence 不要（Phase A は競合 consumer なし・§H-01）。"""
+async def mark_line_processing(webhook_event_id: str) -> bool:
+    """処理開始＝**所有権の取得**（received→processing・claimed_at=now()・
+    AUTOREPLY-04）。取得できたか（guard 成立=rowcount 1）を返し、呼び出し側
+    （初回 new タスク）は False なら**処理せず退出**する——初回タスクの実行前に
+    再配送の排他 claim（record_line_event）が state を動かしていた場合、旧実装
+    （戻り値なし・そのまま続行）では「初回 new タスク×reattempt タスク」が
+    併走した。reattempt タスクは record_line_event で claim（所有権）取得済みの
+    ため本関数を通らない（呼び出し側 already_claimed=True）。
+
+    従来どおりの役割も維持: HOTFIX-01 型の「processing に到達しない」滞留の
+    可視化・H-NEW-02（claimed_at を SQL 側 now() で同時設定し fresh processing が
+    NULL stale 救済に拾われる併走を防ぐ）。guard（state=="received"）と UPDATE の
+    原子性で勝者 1 者が決まるため fence token は不要。"""
     async with session_scope() as s:
-        await s.execute(sa.update(InboundEvent)
+        owned = await s.execute(sa.update(InboundEvent)
                         .where(InboundEvent.dedup_key == line_dedup_key(webhook_event_id),
                                InboundEvent.state == "received")
-                        .values(state="processing", claimed_at=sa.func.now()))
-    count("B", "processing", webhook_event_id)
+                        .values(state="processing", claimed_at=sa.func.now())
+                        .returning(InboundEvent.id))
+        acquired = owned.scalar_one_or_none() is not None
+    count("B", "processing" if acquired else "processing_skip_not_owner",
+          webhook_event_id)
+    return acquired
 
 
 async def mark_line_completed(webhook_event_id: str) -> None:

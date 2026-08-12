@@ -480,10 +480,13 @@ async def _paused_chatlog_already_saved(idem_key: str) -> bool:
     既存確認する。確認自体の失敗は False（=保存を試行）へ倒す——重複は欠落より
     安全側（記録主義）。
 
-    AUTOREPLY-03 役割分担: **並行一意性（同一 webhook_event_id の同時 2 処理の
-    排除）は durable 状態機械が担保する**（record_line_event の排他 claim・
-    hub/durable_inbound.py。同時重複配送は勝者 1 者のみ処理登録・fresh
-    processing 中の再配送は "duplicate"=登録 skip）。本検索が受け持つのは
+    AUTOREPLY-03/04 役割分担: **並行一意性（同一 webhook_event_id の同時 2 処理の
+    排除）は durable 状態機械が担保する**——(a) record_line_event の排他 claim
+    （同時重複配送は勝者 1 者のみ処理登録・fresh processing 中の再配送は
+    "duplicate"=登録 skip）＋ (b) mark_line_processing の所有権取得
+    （AUTOREPLY-04・初回 new タスクは received→processing の guard 付き UPDATE
+    で所有権を取得できたときのみ処理＝「初回 new タスク×reattempt タスク」の
+    併走窓も閉じている。いずれも hub/durable_inbound.py）。本検索が受け持つのは
     **順次 retry（failed → LINE 再配送）の冪等担保のみ**であり、check-then-act
     の隙間を突く並行実行は前提にない（決定的一意制約は導入しない・小機能に
     対する過剰実装を避ける）。"""
@@ -521,9 +524,9 @@ async def _handle_paused_inbound(user_id: str, user_text: str,
       category へ冪等キー paused:{webhook_event_id} を保存し、再処理時は
       完全一致検索で既存確認＝重複レコードを作らない。通知の再送は許容
       （重複通知は沈黙より安全側）。**並行一意性は durable 状態機械
-      （record_line_event の排他 claim）が担保**し、この検索は順次 retry の
-      冪等担保のみを受け持つ（AUTOREPLY-03・_paused_chatlog_already_saved
-      の docstring 参照）
+      （record_line_event の排他 claim＋mark_line_processing の所有権取得・
+      AUTOREPLY-04）が担保**し、この検索は順次 retry の冪等担保のみを
+      受け持つ（AUTOREPLY-03・_paused_chatlog_already_saved の docstring 参照）
     - 表示名は App21 顧客名（best-effort・redact は人対応と同じ emit 経路）。
       App21 レコードの無い新規顧客は PII 配慮の匿名ID（userId の SHA-256
       先頭8桁・実体の特定は App28 で行う）
@@ -740,16 +743,30 @@ async def _process_line_event(reply_token: str, user_id: str, user_text: str) ->
 
 
 async def _process_line_event_durable(reply_token: str, user_id: str, user_text: str,
-                                      webhook_event_id: str) -> None:
+                                      webhook_event_id: str,
+                                      already_claimed: bool = False) -> None:
     """RV-05-13 Phase A: coarse observe（received→processing→completed/failed）で
     HOTFIX-01 型の背景タスク全滅を可視化する。**_process_line_event 本体は不変**
-    （wrap のみ・シグネチャも不変）。AUTOREPLY-01(iii): pause 時は wrapper 側で
-    分岐し webhook_event_id を冪等キーとして引き渡す（pause 経路の失敗は
-    except 節が failed へ倒す＝retry/reconcile で再処理可能）。"""
+    （wrap のみ）。AUTOREPLY-01(iii): pause 時は wrapper 側で分岐し
+    webhook_event_id を冪等キーとして引き渡す（pause 経路の失敗は except 節が
+    failed へ倒す＝retry/reconcile で再処理可能）。
+
+    AUTOREPLY-04（処理所有権の単一化）: 同一 webhook_event_id の処理実行は
+    厳密に 1 者——
+    - 初回 new タスク: mark_line_processing で所有権を取得（received→processing
+      の guard 付き UPDATE・原子的）。取得失敗＝自タスクの実行前に再配送の排他
+      claim（record_line_event）が state を動かした＝所有権は reattempt タスク側
+      → **何もせず退出**（completed/failed も書かない・所有者の state を壊さない）
+    - reattempt タスク: record_line_event の排他 claim で所有権取得済み
+      （already_claimed=True・webhook 側が outcome で判別して渡す）"""
     from hub.durable_inbound import (mark_line_processing, mark_line_completed,
                                      mark_line_failed)
     try:
-        await mark_line_processing(webhook_event_id)
+        if not already_claimed and not await mark_line_processing(webhook_event_id):
+            logger.info("[DURABLE] ownership not acquired (claimed by "
+                        "redelivery) id=%s",
+                        emit(webhook_event_id, "record_id", "log", "operator"))
+            return
         if _autoreply_paused():
             await _handle_paused_inbound(user_id, user_text, webhook_event_id)
         else:
@@ -808,8 +825,11 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
                 # record_line_event が "reattempt" を返し、下で再処理を登録する
                 # （INSERT 後クラッシュ／部分 insert 失敗の永久滞留を断つ）。
                 continue
+            # AUTOREPLY-04: reattempt は record_line_event の排他 claim で所有権
+            # 取得済み＝already_claimed=True。new は task 側で所有権を取得する
             background_tasks.add_task(_process_line_event_durable,
-                                     reply_token, user_id, user_text, webhook_event_id)
+                                     reply_token, user_id, user_text, webhook_event_id,
+                                     outcome == "reattempt")
         else:
             background_tasks.add_task(_process_line_event, reply_token, user_id, user_text)
         logger.info("[WEBHOOK] queued user_id=%s text=%s",
