@@ -134,17 +134,19 @@ class TestNumberCommands(_Base):
         await handler.handle_message(user, "名寄せ候補を見せて")
 
     async def test_multi_merge_confirmation(self):
-        """「1と3を統合して」: 復唱に統合される氏名・レコード番号・消える番号を
-        明示。復唱段階では実行が走らない（二段確認）"""
+        """「1と3を統合して」: 復唱に統合される氏名・レコード番号・無効化される
+        番号を明示（RV-08: 削除ではなく無効化）。復唱段階では実行が走らない
+        （二段確認）"""
         self.arm()
         await self._open_list()
         reply = await handler.handle_message("U1", "1と3を統合して")
         self.assertIn("以下の2件を統合します", reply)
         self.assertIn("No.9 鈴木 誠 を No.6 鈴木 誠 に統合"
-                      "（No.9 のレコードは削除されます）", reply)
+                      "（No.9 のレコードは無効化されます）", reply)
         self.assertIn("No.18 鈴木 チョ子 を No.13 鈴木 チヨ子 に統合"
-                      "（No.18 のレコードは削除されます）", reply)
-        self.assertIn("物理削除", reply)
+                      "（No.18 のレコードは無効化されます）", reply)
+        self.assertIn("統合済み無効", reply)
+        self.assertNotIn("物理削除", reply, "RV-08: 削除を予告しない")
         self.assertIn("OK / キャンセル", reply)
         self.merge.assert_not_awaited()
         self.reject.assert_not_awaited()

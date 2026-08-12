@@ -180,8 +180,10 @@ class TestApp34Schema(unittest.TestCase):
         self.assertEqual(self.app34["token_env"], "TOKEN_KOSEKI_PERSON")
 
     def test_field_count_is_34(self):
-        """完全形35 = トップレベル34（サブテーブル2本含む）＋登場戸籍の続柄原文（テーブル内）"""
-        self.assertEqual(len(self.app34["fields"]), 34)
+        """完全形35 = トップレベル34（サブテーブル2本含む）＋登場戸籍の続柄原文（テーブル内）。
+        RV-08（DRAFT_RV08 §3.1・裁定③）で無効化3フィールド（統合状態/統合先人物ID/
+        統合日時）を追加＝トップレベル 34+3=37（[人] CU 追加とセットの凍結票追随）"""
+        self.assertEqual(len(self.app34["fields"]), 37)
 
     def test_is_optional(self):
         self.assertIs(self.app34.get("optional"), True)

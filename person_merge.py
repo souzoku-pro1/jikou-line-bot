@@ -36,6 +36,7 @@ import unicodedata
 from dataclasses import dataclass, field
 
 from hub import kintone
+from hub.person_validity import MERGE_STATE_FIELD, filter_active_persons
 from hub.redact import emit
 
 logger = logging.getLogger("person_merge")
@@ -323,7 +324,10 @@ async def detect_merge_candidates() -> dict:
 
     person_records = await kintone.search_records(
         APP_KOSEKI_PERSON, "order by $id asc limit 500",
-        fields=["$id", "氏名", "案件レコードID", "名寄せ確定", "身分事項", "登場戸籍"])
+        fields=["$id", "氏名", "案件レコードID", "名寄せ確定", "身分事項", "登場戸籍",
+                MERGE_STATE_FIELD])
+    # RV-08 §3.1: 無効化行を候補に載せない（検出 logic 不変・入力集合の絞りのみ）
+    person_records = filter_active_persons(person_records)
     koseki_records = await kintone.search_records(
         APP_KOSEKI_BOOK, "order by $id asc limit 500",
         fields=["$id", "読解JSON"])
