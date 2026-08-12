@@ -21,7 +21,8 @@
   物理削除コードは完全除去（delete_record 呼出し不在は AST 検査で恒久 pin。
   flag×コード状態の全象限で物理削除への経路は存在しない・§4 全象限表）
 - 順序固定は維持（§3.1）: ガード再読 → 監査JSON生成・封筒添付 → 参照付け替え →
-  勝者更新 → **敗者無効化 update** → postimage 監査 → 封筒クローズ。
+  勝者更新 → **敗者無効化 update** → postimage 監査添付 → 封筒クローズ →
+  postimage 台帳記録（＝**全処理完了マーク**・RV08-IMPL-04）。
   **監査添付が成功するまで App 34 に書かない**（既存規律の維持）
 - **部分失敗の回収（§3.2a）**: 1 実行に operation_id を発番し、DB 操作台帳
   （hub/person_merge_journal・immutable 追記・裁定⑦(B)）へ preimage/postimage の
@@ -323,7 +324,8 @@ async def _note_partial(cand: MergeCandidate, operation_id: str,
 async def execute_merge(cand: MergeCandidate) -> dict:
     """1ペアの統合実行（RV-08 soft merge）。順序固定（部分成功設計・§3.1）:
     ガード再読 → 台帳照合/preimage 記録 → 監査JSON生成・封筒添付 →
-    参照付け替え → 勝者更新 → 敗者無効化 → postimage 記録/添付 → 封筒クローズ。
+    参照付け替え → 勝者更新 → 敗者無効化 → postimage 添付 → 封筒クローズ →
+    postimage 台帳記録（全処理完了マーク・RV08-IMPL-04）。
     **監査添付が成功するまで App 34 に書かない**"""
     if not merge_enabled():
         return {"status": "unavailable",
@@ -489,20 +491,12 @@ async def execute_merge(cand: MergeCandidate) -> dict:
         if do_loser:
             await kintone.update_record(APP_KOSEKI_PERSON, cand.loser_id,
                                         disable)
-        # ── postimage（§3.2a 両監査: 台帳=完了マーク・封筒=値の監査） ─────────
-        reached = "postimage記録"
+        # ── postimage 監査の封筒添付（値の監査・§3.2a）。二重添付防止の一次
+        #    判定は封筒 成果物 の filename（server 側の真値）・部分失敗時の
+        #    detail 追記（operation_id/到達段）が補助記録（RV08-IMPL-04） ────────
+        reached = "postimage添付"
         post_winner = await kintone.get_record(APP_KOSEKI_PERSON, cand.winner_id)
         post_loser = await kintone.get_record(APP_KOSEKI_PERSON, cand.loser_id)
-        await record_stage(
-            operation_id=operation_id, pair_key=cand.pair_key,
-            envelope_record_id=cand.review_record_id,
-            winner_id=cand.winner_id, loser_id=cand.loser_id,
-            stage=STAGE_POSTIMAGE,
-            payload={"winner": {"id": cand.winner_id,
-                                "fp": record_fingerprint(post_winner)},
-                     "loser": {"id": cand.loser_id,
-                               "fp": record_fingerprint(post_loser)}})
-        reached = "postimage添付"
         if post_name not in attached:
             postimage = {
                 "監査種別": "person_merge_postimage",
@@ -525,12 +519,6 @@ async def execute_merge(cand: MergeCandidate) -> dict:
             "発送ステータス": STATUS_DONE,
             "実行済み": "yes",
         })
-    except MergeJournalError as e:
-        await _note_partial(cand, operation_id, reached)
-        return {"status": "partial", "operation_id": operation_id,
-                "reason": f"操作台帳(DB)への postimage 記録に失敗しました"
-                          f"（到達段={reached}・封筒は要確認のまま・再指示で"
-                          f"回収できます）: {e}"}
     except Exception as e:
         await _note_partial(cand, operation_id, reached)
         return {"status": "partial", "operation_id": operation_id,
@@ -538,16 +526,39 @@ async def execute_merge(cand: MergeCandidate) -> dict:
                           "要確認のまま・再指示で回収できます）: "
                           f"{str(e)[:200]}"}
 
+    # ── postimage 台帳記録＝**全処理完了マーク**（RV08-IMPL-04: kintone 側の
+    #    全書込み・添付・封筒クローズの後の最後尾。中間失敗は preimage のみの
+    #    open operation として find_open_operation が同一 operation_id で回収）。
+    #    ここでの失敗は業務効果（kintone）完了後＝封筒クローズ済みでガードにより
+    #    再実行不能のため、merged＋警告で返し operation は open のまま残置する ──
+    result = {"status": "merged", "winner_id": cand.winner_id,
+              "loser_id": cand.loser_id, "repointed": repoint_plans,
+              "operation_id": operation_id,
+              "review_record_id": cand.review_record_id}
+    try:
+        await record_stage(
+            operation_id=operation_id, pair_key=cand.pair_key,
+            envelope_record_id=cand.review_record_id,
+            winner_id=cand.winner_id, loser_id=cand.loser_id,
+            stage=STAGE_POSTIMAGE,
+            payload={"winner": {"id": cand.winner_id,
+                                "fp": record_fingerprint(post_winner)},
+                     "loser": {"id": cand.loser_id,
+                               "fp": record_fingerprint(post_loser)}})
+    except MergeJournalError as e:
+        logger.error("[PERSON_MERGE_EXEC] 完了マーク（postimage 台帳記録）に失敗"
+                     "（封筒はクローズ済み・operation は open のまま残置・"
+                     "固定分類のみ）")
+        result["warning"] = ("台帳の完了記録（postimage）に失敗しました"
+                            f"（統合自体は完了・封筒クローズ済み）: {e}")
+
     logger.info("[PERSON_MERGE_EXEC] merged winner=No.%s loser=No.%s(disabled) "
                 "review=No.%s repointed=%s",
                 emit(cand.winner_id, "record_id", "log", "operator"),
                 emit(cand.loser_id, "record_id", "log", "operator"),
                 emit(cand.review_record_id, "record_id", "log", "operator"),
                 emit(len(repoint_plans), "count", "log", "operator"))
-    return {"status": "merged", "winner_id": cand.winner_id,
-            "loser_id": cand.loser_id, "repointed": repoint_plans,
-            "operation_id": operation_id,
-            "review_record_id": cand.review_record_id}
+    return result
 
 
 async def reject_pair(cand: MergeCandidate) -> dict:

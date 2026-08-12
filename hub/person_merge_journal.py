@@ -162,6 +162,22 @@ async def record_stage(*, operation_id: str, pair_key: str,
         raise MergeJournalError(type(e).__name__) from e
 
 
+async def find_stages(operation_id: str) -> dict[str, dict]:
+    """operation_id の stage → payload 写像（(operation_id, stage) UNIQUE のため
+    各 stage 高々 1 行）。復元 CLI の決定的 operation_id 照合（RV08-IMPL-01/02）が
+    使う。失敗は MergeJournalError（判定不能のまま書かせない・fail-closed）。"""
+    try:
+        async with session_scope() as session:
+            t = PersonMergeOperation.__table__
+            rows = (await session.execute(
+                sa.select(t.c.stage, t.c.payload)
+                .where(t.c.operation_id == operation_id)
+                .order_by(t.c.id.asc()))).all()
+    except Exception as e:
+        raise MergeJournalError(type(e).__name__) from e
+    return {r.stage: r.payload for r in rows}
+
+
 async def find_open_operation(envelope_record_id: str,
                               pair_key: str) -> dict | None:
     """未完了 operation（preimage あり・postimage なし）の最新 1 件を返す。
