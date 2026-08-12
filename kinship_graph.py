@@ -20,6 +20,7 @@ import json
 from dataclasses import dataclass, field
 
 from hub import kintone
+from hub.person_validity import MERGE_STATE_FIELD, filter_active_persons
 
 APP_KOSEKI_PERSON = kintone.KintoneApp(
     "App 34 (人物)", "APP_KOSEKI_PERSON", "TOKEN_KOSEKI_PERSON")
@@ -289,5 +290,7 @@ async def load_graph_for_case(case_record_id: str) -> KinshipGraph:
         f'案件レコードID = "{case_record_id}" order by $id asc limit 100',
         fields=["$id", "氏名", "性別", "続柄メモ", "生死区分", "死亡日",
                 "被相続人フラグ", "相続資格", "名寄せ確定", "確認状態",
-                "父人物ID", "母人物ID", "養父人物ID", "養母人物ID", "身分事項"])
-    return build_graph(records)
+                "父人物ID", "母人物ID", "養父人物ID", "養母人物ID", "身分事項",
+                MERGE_STATE_FIELD])
+    # RV-08: 無効化行（統合済み無効）はグラフに載せない（一点除外・裁定②(B)）
+    return build_graph(filter_active_persons(records))

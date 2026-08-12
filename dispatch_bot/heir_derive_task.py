@@ -42,6 +42,7 @@ from hub.derivation_models import (ChainIntegrityError,
 from hub.heir_envelope import (EnvelopeCreateUnknownError, EnvelopePolicyError,
                                EnvelopeSearchError, file_heir_envelope,
                                heir_derivation_enabled)
+from hub.person_validity import filter_active_persons
 from hub.redact import emit
 
 TASK_TYPE = "heir_derivation"
@@ -52,10 +53,10 @@ APP_KOSEKI_PERSON = kintone.KintoneApp(
 
 # App34 読取 field（persons_from_records の入力＋$revision＋混入検証キー。
 # 案件参照フィールドコードは R4-1 書込み実装（koseki_person_sync._person_fields）
-# と逐語一致: 「案件アプリID」「案件レコードID」）
+# と逐語一致: 「案件アプリID」「案件レコードID」。統合状態は RV-08 有効行 filter 用）
 _APP34_FIELDS = ["$id", "$revision", "案件アプリID", "案件レコードID", "氏名",
                  "生死区分", "死亡日", "被相続人フラグ", "父人物ID", "母人物ID",
-                 "養父人物ID", "養母人物ID", "身分事項"]
+                 "養父人物ID", "養母人物ID", "身分事項", "統合状態"]
 _APP34_LIMIT = 500   # kintone 1 リクエスト上限。上限充足＝取りこぼしの疑い→中止
 
 MSG_DISABLED = "相続人導出は現在無効です（HEIR_DERIVATION_ENABLED 未設定）"
@@ -225,6 +226,9 @@ async def _pipeline(state: dict, case_app_id: str, case_record_id: str) -> str:
     if len(records) >= _APP34_LIMIT:
         raise PayloadPolicyError(
             "canonical: 対象人物が読取上限に達し全数取得を保証できない（中止）")
+    # RV-08: 無効化行（統合済み無効）は導出入力に含めない（一点除外・裁定②(B)。
+    # input_person_ids / revisions / input_hash のいずれにも載らない）
+    records = filter_active_persons(records)
     revisions = _extract_revisions(records, case_record_id)
     persons = persons_from_records(records)
     declarations = Declarations()            # 裁定1: 供給源未確認の間は空

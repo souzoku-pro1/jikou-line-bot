@@ -1,28 +1,36 @@
-"""person_merge_exec.py（R4-2b T1 統合実行）のテスト
+"""person_merge_exec.py（R4-2b T1 統合実行 → RV-08 soft merge）のテスト
 
 検証:
 転記規則（勝者既存値の不上書き・空フィールドのみ転記・サブテーブル和集合と
 重複行排除・追加行なしは不書込）・確認済み系不触・名寄せ確定=確定 は人の確定
 操作経路のみ・監査JSONラウンドトリップ（敗者の全フィールド＋全サブテーブル行が
-欠落なく復元可能）・順序固定（監査添付の成功が削除の前提: 添付失敗→削除・更新・
-クローズの全不発）・親エッジ参照の付け替え（削除前）・二重実行ガード（封筒再読）・
-「別人」クローズ＋裁定記録（App 34 不触）・棄却済みペアの再起票恒久抑止
-（スコアラー連携）・フラグ無効/env未設定の完全不発・封筒一覧の解釈。
-kintone は全てモック。
+欠落なく復元可能）・順序固定（監査添付の成功が**無効化**の前提: 添付失敗→
+無効化・更新・クローズの全不発）・親エッジ参照の付け替え（無効化前）・
+二重実行ガード（封筒再読）・「別人」クローズ＋裁定記録（App 34 不触）・
+棄却済みペアの再起票恒久抑止（スコアラー連携）・フラグ無効/env未設定の完全不発・
+封筒一覧の解釈。
+RV-08（DRAFT_RV08_SOFT_MERGE 凍結・2026-08-11）で本スイートの実行系期待値を
+物理削除→soft merge へ更新した（削除→無効化 update は凍結票が命じる意図的な
+安全方向の挙動変更・§4。削除・skip・その他の緩和なし）。
+kintone は全てモック・操作台帳は sqlite。
 """
 
 import asyncio
 import json
 import os
+import shutil
+import tempfile
 import unittest
 from unittest.mock import patch
 
 os.environ.setdefault("KINTONE_SUBDOMAIN", "testsub")
 os.environ.setdefault("ANTHROPIC_API_KEY", "dummy_key_for_import_only")
 
+import hub.db as db  # noqa: E402
 import person_merge  # noqa: E402
 import person_merge_exec  # noqa: E402
 from hub import kintone  # noqa: E402
+from hub.person_merge_journal import PersonMergeJournalBase  # noqa: E402
 from person_merge_exec import (  # noqa: E402
     MergeCandidate, build_merge_payload, execute_merge, list_merge_candidates,
     reject_pair, restore_payload_from_audit,
@@ -140,9 +148,9 @@ class _KT:
         self.updated.append((app.app_id_env, str(record_id), fields))
 
     async def delete_record(self, app, record_id):
-        assert app.app_id_env == "APP_KOSEKI_PERSON", "削除は App 34 のみ"
-        self.sequence.append(("delete", str(record_id)))
-        self.deleted.append(str(record_id))
+        # RV-08 R3: 統合実行から delete_record が呼ばれたら即 FAIL（恒久 pin）
+        raise AssertionError(
+            "RV-08: person_merge から delete_record は呼ばれてはならない")
 
     async def upload_file(self, app, filename, content, mime):
         if self.upload_fail:
@@ -171,6 +179,24 @@ def arm(tc, kt, env=_ENV):
     for p in [patch.dict(os.environ, env), *kt.patches()]:
         p.start()
         tc.addCleanup(p.stop)
+
+
+def arm_db(tc):
+    """RV-08 操作台帳用の sqlite（P3 系テストと同じ流儀）"""
+    d = tempfile.mkdtemp(prefix="rv08_")
+    p = patch.dict(os.environ, {"DATABASE_URL": f"sqlite+aiosqlite:///{d}/j.db"})
+    p.start()
+    tc.addCleanup(p.stop)
+    db.reset_for_tests()
+
+    async def _create():
+        eng = db.get_async_engine()
+        async with eng.begin() as c:
+            await c.run_sync(PersonMergeJournalBase.metadata.create_all)
+    run(_create())
+    db.reset_for_tests()
+    tc.addCleanup(lambda: (db.reset_for_tests(),
+                           shutil.rmtree(d, ignore_errors=True)))
 
 
 WINNER = dict(name="鈴木 誠", furigana="スズキマコト", biko="",
@@ -245,28 +271,40 @@ class TestExecuteMerge(unittest.TestCase):
     """統合実行の順序固定・監査・参照付け替え・ガード"""
 
     def test_full_flow_order_and_close(self):
-        """順序: 監査添付 → 勝者更新 → 敗者削除 → 封筒クローズ"""
+        """順序（RV-08 §3.1）: 監査添付 → 勝者更新 → 敗者無効化 →
+        postimage 監査 → 封筒クローズ（物理削除なし）"""
         kt = _default_kt()
         arm(self, kt)
+        arm_db(self)
         result = run(execute_merge(candidate()))
         self.assertEqual(result["status"], "merged")
         kinds = [s[0] for s in kt.sequence]
-        self.assertEqual(kinds, ["upload", "update", "update", "delete",
-                                 "update"],
-                         "添付→(成果物更新)→勝者更新→削除→クローズ")
+        self.assertEqual(kinds, ["upload", "update", "update", "update",
+                                 "upload", "update", "update"],
+                         "監査添付→(成果物)→勝者更新→敗者無効化→"
+                         "postimage添付→(成果物)→クローズ")
         self.assertEqual(kt.sequence[1][1], "APP_SHIPPING", "監査添付が先頭")
         self.assertEqual(kt.sequence[2][1], "APP_KOSEKI_PERSON")
         winner_update = kt.sequence[2][3]
         self.assertEqual(winner_update["名寄せ確定"], "確定",
                          "人の確定操作の結果として確定へ遷移")
         self.assertEqual(winner_update["備考"], "旧戸籍由来")
-        self.assertEqual(kt.deleted, ["9"], "敗者の物理削除")
+        # RV-08: 敗者は削除せず無効化 update（field 集合固定）
+        disable = kt.sequence[3]
+        self.assertEqual((disable[1], disable[2]), ("APP_KOSEKI_PERSON", "9"))
+        self.assertEqual(disable[3]["統合状態"], "統合済み無効")
+        self.assertEqual(disable[3]["統合先人物ID"], "6")
+        self.assertEqual(
+            set(disable[3]), {"統合状態", "統合先人物ID", "統合日時"},
+            "無効化 update の field 集合は3つに固定")
+        self.assertEqual(kt.deleted, [], "物理削除ゼロ（RV-08 R1/R3）")
+        self.assertTrue(result.get("operation_id"), "operation_id が貫通する")
         close = kt.shipping_updates()[-1][1]
         self.assertEqual(close["発送ステータス"], "完了")
         self.assertEqual(close["実行済み"], "yes")
 
     def test_audit_attach_failure_blocks_all_writes(self):
-        """監査保存失敗 → 削除・勝者更新・付け替え・クローズの全不発（順序固定）"""
+        """監査保存失敗 → 無効化・勝者更新・付け替え・クローズの全不発（順序固定）"""
         kt = _default_kt(upload_fail=True,
                          referrers=[{"$id": {"value": "12"},
                                      "父人物ID": {"value": "9"},
@@ -274,10 +312,11 @@ class TestExecuteMerge(unittest.TestCase):
                                      "養父人物ID": {"value": ""},
                                      "養母人物ID": {"value": ""}}])
         arm(self, kt)
+        arm_db(self)
         result = run(execute_merge(candidate()))
         self.assertEqual(result["status"], "aborted")
         self.assertIn("監査JSONの保存に失敗", result["reason"])
-        self.assertEqual(kt.deleted, [], "監査なしで削除しない")
+        self.assertEqual(kt.deleted, [], "削除はいかなる場合もゼロ")
         self.assertEqual(kt.updated, [], "App 34 への書き込みもゼロ")
 
     def test_audit_roundtrip_completeness(self):
@@ -285,6 +324,7 @@ class TestExecuteMerge(unittest.TestCase):
         loser = person_record(9, **LOSER)
         kt = _KT(persons={"6": person_record(6, **WINNER), "9": loser})
         arm(self, kt)
+        arm_db(self)
         run(execute_merge(candidate()))
         audit = kt.audit()
         # 取得→JSON化→復元→同値比較（レコード verbatim 保持）
@@ -305,26 +345,31 @@ class TestExecuteMerge(unittest.TestCase):
         self.assertEqual(audit["封筒レコードID"], "90")
         self.assertTrue(audit["成立シグナル"])
 
-    def test_reference_repointing_before_delete(self):
-        """敗者を親エッジで参照する人物は削除前に勝者へ付け替える"""
+    def test_reference_repointing_before_disable(self):
+        """敗者を親エッジで参照する人物は敗者無効化前に勝者へ付け替える"""
         kt = _default_kt(referrers=[{"$id": {"value": "12"},
                                      "父人物ID": {"value": "9"},
                                      "母人物ID": {"value": "7"},
                                      "養父人物ID": {"value": ""},
                                      "養母人物ID": {"value": ""}}])
         arm(self, kt)
+        arm_db(self)
         result = run(execute_merge(candidate()))
         repoint = [(r, f) for r, f in kt.person_updates("12")]
         self.assertEqual(repoint, [("12", {"父人物ID": "6"})],
                          "一致したフィールドのみ・母人物ID(別人)は触らない")
-        delete_pos = kt.sequence.index(("delete", "9"))
+        disable_pos = next(i for i, s in enumerate(kt.sequence)
+                           if s[0] == "update" and s[1] == "APP_KOSEKI_PERSON"
+                           and s[2] == "9")
         repoint_pos = next(i for i, s in enumerate(kt.sequence)
                            if s[0] == "update" and s[2] == "12")
-        self.assertLess(repoint_pos, delete_pos, "付け替えは削除前")
+        self.assertLess(repoint_pos, disable_pos, "付け替えは無効化前")
         self.assertEqual(result["repointed"],
                          [{"person_record_id": "12", "fields": ["父人物ID"]}])
         self.assertEqual(kt.audit()["参照付け替え"], result["repointed"],
                          "監査JSONにも付け替えを記録")
+        self.assertTrue(kt.audit()["参照付け替え前レコード"],
+                        "付け替え対象行の preimage も監査に残す（§3.2a）")
 
     def test_guard_envelope_no_longer_pending(self):
         """封筒が要確認でなくなっていたら書き込みゼロで中止（二重実行ガード）"""

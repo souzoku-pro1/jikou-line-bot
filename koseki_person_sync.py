@@ -173,6 +173,11 @@ async def _find_existing(koseki_id: str, name: str) -> str:
     ⚠ 戸籍レコードID は SUBTABLE（登場戸籍）内のフィールドのため、kintone クエリ
     仕様上 `=` 演算子が使えない（GAIA_IQ07・2026-07-07 実機で発生）——**`in` を使う**。
     トップレベルの 氏名 は従来どおり `=`。
+
+    **RV-08 §10.2(iii)（確定事項）**: soft merge の無効化行（統合済み無効）も
+    冪等ヒットの対象のまま＝**有効行 filter を意図的に通さない**。無効化行が
+    ヒットした場合は再生成を抑止する（現行挙動の維持・重複人物の再出現を防ぐ。
+    無効化後の再生成を許す変更は行わない——test_rv08_soft_merge が pin）。
     """
     records = await kintone.search_records(
         APP_KOSEKI_PERSON,

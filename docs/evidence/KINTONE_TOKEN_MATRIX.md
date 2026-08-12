@@ -28,7 +28,7 @@
 | `TOKEN_CITY_MASTER` | `APP_CITY_MASTER` | App 31（市区町村マスタ） | R | shokumu_seikyu.py:480・import_city_master.py（投入時のみW） |
 | `TOKEN_ENCLOSURE` | `APP_ENCLOSURE` | App 32（同封物ブロックマスタ） | R | soufu_annai.py:61/319 |
 | `TOKEN_KOSEKI_BOOK` | `APP_KOSEKI_BOOK` | App 33（戸籍読解） | R / **W** | koseki_ingest.py:164・koseki_reader.py:308（読解結果更新）・review_resolve.py:244・koseki_person_sync.py:205 |
-| `TOKEN_KOSEKI_PERSON` | `APP_KOSEKI_PERSON` | App 34（人物） | R / **W** / **★D** | koseki_person_sync.py:189（起票）・person_confirm.py:131（確認更新）・person_merge.py:303・person_merge_exec.py:283（勝者更新）・**:286 delete_record（敗者物理削除）** |
+| `TOKEN_KOSEKI_PERSON` | `APP_KOSEKI_PERSON` | App 34（人物） | R / **W**（~~★D~~ RV-08 で D 要求消滅） | koseki_person_sync.py（起票）・person_confirm.py（確認更新）・person_merge.py（自動候補マーク）・person_merge_exec.py（勝者更新・**敗者無効化 update**）・person_restore_cli.py（復元 create/親エッジ再結線）——**delete_record 呼出しは RV-08 実装で完全除去（AST pin・2026-08-12）** |
 | `TOKEN_ZAISAN` | `APP_ZAISAN` | App 35（財産） | R / **W** | registry_ingest.py:300/320・valuation_ingest.py・bank_ingest.py:186/208・zaisan_sync.py |
 | `TOKEN_SOUZOKUNIN` | `APP_SOUZOKUNIN` | App 36（相続人） | （現状参照コードなし） | config.py監視定義のみ。R4-3未実装のため書込みコード不在 |
 | `TOKEN_WARITSUKE` | `APP_WARITSUKE` | App 37（割付） | （現状参照コードなし） | config.py監視定義のみ |
@@ -51,6 +51,11 @@
   - 実権限に削除が**無い** → merge実行時に kintone 403 で失敗（安全側だが機能不全）
   → kintone 管理画面（アプリ設定 → APIトークン → 該当トークンのアクセス権）で
     「レコード削除」チェックの有無を確認する必要がある。
+- **【2026-08-12 追記・RV-08 実装（rv08-impl）】** soft merge 化により
+  `delete_record` 呼出しはコードから完全除去（AST pin）＝**コード要求は R/W のみ**。
+  凍結票 §3.3 の順序どおり **R3（本実装の merge）→ R4（削除権限の除去）**:
+  merge 後は削除権限を外しても機能不全にならないため、[人] が kintone 画面で
+  「レコード削除」チェックを**外す**こと（上記の実権限確認と同時に実施可）。
 
 ## 実権限確認が必要な項目（BLOCKED_NEEDS_HUMAN・kintone画面）
 

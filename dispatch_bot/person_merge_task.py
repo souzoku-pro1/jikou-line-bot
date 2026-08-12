@@ -11,7 +11,8 @@
 - 確定操作は番号指定: 「1と3を統合して」（複数一括）／「2は別人」（棄却）／
   「全部統合して」（保留フラグなしの候補全件——保留つきは対象外と復唱）
 - 復唱→OK の二段確認は関所と同じ型（confirm 機構・30分単回）。復唱には
-  統合される人物の氏名・レコード番号・敗者側の消えるレコード番号を明示する
+  統合される人物の氏名・レコード番号・敗者側の無効化されるレコード番号を明示する
+  （RV-08 soft merge: 敗者は物理削除せず「統合済み無効」で残置）
 - env フラグは PERSON_MERGE_ENABLED を共用（無効時は一覧提示も不発）
 - 実行は Railway 直（kintone 内部のみ・Drive・LINE顧客側・対外送信なし）
 """
@@ -78,13 +79,14 @@ def _confirm(user_id: str, session, action: str,
     lines = [f"以下の{len(targets)}件を統合します:"]
     for c in targets:
         lines.append(f"・{c.loser_label()} を {c.winner_label()} に統合"
-                     f"（No.{c.loser_id} のレコードは削除されます）")
+                     f"（No.{c.loser_id} のレコードは無効化されます）")
         if c.pending_case:
             lines.append(f"  ⚠ 保留つき: {c.pending_reason or '案件参照が相違'}"
                          "（勝者側の案件参照が残ります）")
     if held_count:
         lines.append(f"※ 保留（案件相違）つきの{held_count}件は対象外です")
-    lines.append("敗者レコードは物理削除されます（復元用の監査JSONを封筒に添付）。")
+    lines.append("敗者レコードは削除せず「統合済み無効」で残置します"
+                 "（RV-08 soft merge・監査JSONを封筒に添付）。")
     lines.append("OK / キャンセル（30分有効）")
     return "\n".join(lines)
 
@@ -172,7 +174,8 @@ async def execute(pending) -> tuple[str, str, str]:
                                 for p in result["repointed"])
                 note = f"（親エッジ付け替え: {nos}）"
             lines.append(f"・{cand.loser_label()} を {cand.winner_label()} に"
-                         f"統合しました。No.{cand.loser_id} は削除・監査JSONを"
+                         f"統合しました。No.{cand.loser_id} は無効化（統合済み"
+                         f"無効・残置）・監査JSONを"
                          f"封筒 No.{cand.review_record_id} に添付{note}")
             first_id = first_id or cand.winner_id
         elif status == "rejected":

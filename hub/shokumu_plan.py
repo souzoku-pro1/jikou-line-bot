@@ -33,6 +33,7 @@ from dataclasses import dataclass, field
 
 from hub import kintone
 from hub.heir_envelope import _unit_for_case
+from hub.person_validity import MERGE_STATE_FIELD, filter_active_persons
 
 APP_SHIPPING = kintone.KintoneApp(
     "App 30 (発送管理)", "APP_SHIPPING", "TOKEN_SHIPPING")
@@ -476,11 +477,14 @@ class PlanMaterials:
 
 
 async def _load_persons(case_record_id: str) -> list[dict]:
-    return await kintone.search_records(
+    records = await kintone.search_records(
         APP_KOSEKI_PERSON,
         f'案件レコードID = "{case_record_id}" order by $id asc limit 500',
         fields=["$id", "氏名", "住所最新", "本籍最新", "死亡日", "父人物ID",
-                "母人物ID", "被相続人フラグ", "身分事項"])
+                "母人物ID", "被相続人フラグ", "身分事項", MERGE_STATE_FIELD])
+    # RV-08: 無効化行（統合済み無効）は plan 対象に載せない（一点除外・裁定②(B)。
+    # 確定時の stale 再計算も本関数を通るため無効化が自然反映される・§10.1）
+    return filter_active_persons(records)
 
 
 async def _load_kosekis(case_record_id: str) -> list[dict]:

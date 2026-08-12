@@ -23,6 +23,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from hub import kintone
+from hub.person_validity import MERGE_STATE_FIELD, filter_active_persons
 from hub.redact import emit
 from person_merge import APP_KOSEKI_PERSON, merge_enabled, _v
 
@@ -77,7 +78,9 @@ async def list_case_persons(case_record_id: str) -> list[PersonRow]:
         APP_KOSEKI_PERSON,
         f'案件レコードID = "{case_record_id}" order by $id asc limit 100',
         fields=["$id", "氏名", "名寄せ確定", "確認状態", "生死区分", "死亡日",
-                "被相続人フラグ", "身分事項"])
+                "被相続人フラグ", "身分事項", MERGE_STATE_FIELD])
+    # RV-08: 無効化行（統合済み無効）は確認一覧に載せない（一点除外・裁定②(B)）
+    records = filter_active_persons(records)
     return [PersonRow(
         record_id=_v(r, "$id"), name=_v(r, "氏名"),
         meyose=_v(r, "名寄せ確定"), kakunin=_v(r, "確認状態"),

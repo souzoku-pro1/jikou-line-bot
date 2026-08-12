@@ -53,6 +53,7 @@ from hub.derivation_models import (_PERSON_ID_RE, _SHARE_RE, DECISIONS,
                                    payload_has_zokugara_codes)
 from hub.heir_envelope import (APP_SHIPPING, DETAIL_DECISION_KEY,
                                DETAIL_HELD_PERSONS_KEY, _unit_for_case)
+from hub.person_validity import APP_KOSEKI_PERSON, is_active_person
 from hub.redact import emit
 
 logger = logging.getLogger("hub.heir_projection")
@@ -588,6 +589,20 @@ async def _resolve_heir_derivation(group, case_record_id: str,
             "items": results}
 
 
+async def _source_person_inactive(pid: str) -> bool:
+    """RV-08 RV08-03「直接 get の状態確認」規約: App34 env 設定時のみ検査
+    （optional・lazy 原則＝未設定環境では従来挙動不変）。無効化行
+    （統合済み無効）と取得不能（レコード不在等）は True＝呼出し元が当該行を
+    要確認へ倒す（fail-closed・盲目 projection しない）。"""
+    if not (APP_KOSEKI_PERSON.app_id() and APP_KOSEKI_PERSON.token()):
+        return False
+    try:
+        person = await kintone.get_record(APP_KOSEKI_PERSON, pid)
+    except kintone.KintoneError:
+        return True
+    return not is_active_person(person)
+
+
 async def _project_row(run, case_record_id: str, unit: str, pid: str,
                        zoku: str, share_disp, ancestors: set[int]) -> str:
     """1 行の App36 upsert（fix1 H01・R-P3-003B-IMPL-1: write 直前の再検証つき）。
@@ -602,7 +617,17 @@ async def _project_row(run, case_record_id: str, unit: str, pid: str,
       （§5 fix3 M01: 冪等キー2件以上→書かず要確認・同一 head 限定 tiebreak
       〔$id 最小・提示のみ〕・比較不能系は削除ゼロ）が事後回収する。
     - 戻り値: "inserted" | "updated" | "held"（held＝当該行 write 0）。
+    - **RV-08 §10.2(ii)**: 導出元人物（App34）が soft merge で無効化されていれば
+      当該行は held（要確認・write 0）。resumed 経路の保留人物再検証もここを通る
+      （封筒 detail の書き換えはしない＝履歴改変禁止・既存 held 機構のみ使用）。
     """
+    if await _source_person_inactive(pid):
+        await _alert_business(
+            "【相続人反映: 導出元人物が無効化済み】\n"
+            f"案件 No.{case_record_id} / 人物 No.{pid}\n"
+            "当該行は書き込まず要確認としました（soft merge の無効化行・"
+            "再導出→確定が正規経路です）")
+        return "held"
     rows = await kintone.search_records(
         APP_SOUZOKUNIN,
         f'案件レコードID = "{case_record_id}" and '
