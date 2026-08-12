@@ -207,6 +207,18 @@ rollback 時の残置行の照合・手動閉鎖（§6・03-common §12.1 RMC-M0
 期待集合との**機械照合で不足があれば非0終了＝点火中止**。**secret 値は表示しない**
 （flag 値・スキーマ名等の非 secret は表示可。DATABASE_PUBLIC_URL 経由・repo 直下で実行）:
 
+> **Windows 実行注記（2026-08-11 追記・司令塔裁定済み）**: 検査 2/4（psycopg async）は
+> Windows の既定 ProactorEventLoop と非互換で素のままでは落ちる。script 先頭に
+> ```python
+> if sys.platform == 'win32':
+>     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+> ```
+> を付加して実行する（**SELECT 内容は逐語同一のまま**・検査 1 は sync engine のため不要）。
+> 根拠実測: 2026-08-09 事前調査（`2026-08-09_daily-consolidated.md` §2.3）および
+> 2026-08-11 点火当日の §8.1(a) 全検査（`2026-08-11_block-a-ignition.md` §1・同対処で
+> 全 OK 実測）。あわせて Windows コンソール（cp932）では script 内日本語出力が
+> 文字化けするが、判定は exit code と OK/NG 行で機械確認できる（実行には影響しない）。
+
 ```bash
 cd /c/work/jikou-line-bot
 
