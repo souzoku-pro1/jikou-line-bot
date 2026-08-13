@@ -318,3 +318,37 @@ register(TaskSpec(
     flow_reply_fn=review_resolve_task.flow_reply,
     execute_fn=review_resolve_task.execute,
 ))
+
+
+# ── 相続人確定の取消（P3-003C-CANCEL。フローは dispatch_bot/heir_cancel_task.py に隔離）──
+from dispatch_bot import heir_cancel_task  # noqa: E402（循環回避のため末尾 import）
+from hub.heir_cancel import heir_cancel_enabled  # noqa: E402
+
+register(TaskSpec(
+    task_type="heir_cancel",
+    display_name="相続人確定の取消",
+    answer_only=False,
+    destination="heir_cancel",  # decision 台帳追記＋App36 巻き戻し＋取消封筒
+    run_at="railway",
+    risk="中",  # App36 の巻き戻しを伴う（対外送信なし・行削除なし・台帳は追記のみ）
+    auto_scope=("取消台帳の追記と、反映結果と現在値が完全一致する App36 行の"
+                "巻き戻し（update 行=反映前の値へ復元／insert 行=無効化）まで"),
+    approval_scope="取消後の正しい確定は再導出→確定（confirmed decision・P3-003b）",
+    required_fields=["customer_name"],
+    field_questions={"customer_name": heir_cancel_task.QUESTION_CUSTOMER},
+    search_apps=["SOUZOKU_KINTONE_APP_ID"],
+    artifacts="取消 decision（supersede rejected）＋App30 取消封筒＋App36 巻き戻し",
+    adapter="HeirCancel",
+    on_failure="失敗は固定文言で LINE 返信（分類名のみ・要確認行は封筒 open で可視化）",
+    hint_for_parser=("確定済みの相続人反映（App36）を取り消す。「相続人」と"
+                     "「取消/取り消し」の両語を含む明示指示のみ該当"
+                     "（例:「No.12の相続人確定を取り消して」）。単なる"
+                     "「キャンセル」「やめて」は intent=cancel（復唱の中止）であり"
+                     "本タスクではない。customer_name に顧客名のみ、"
+                     "「No.12」等の番号指定は task_params.case_record_id に数字のみ"),
+    required_desc="customer_name または 案件No（例: No.12）",
+    flow_fn=heir_cancel_task.flow,
+    flow_reply_fn=heir_cancel_task.flow_reply,
+    execute_fn=heir_cancel_task.execute,
+    visible_fn=heir_cancel_enabled,   # flag OFF の間は語彙一覧に載せない（P3-003-CMD の型）
+))

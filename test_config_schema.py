@@ -291,10 +291,12 @@ class TestApp36Schema(unittest.TestCase):
         self.assertEqual(self.app36["app_id_env"], "APP_SOUZOKUNIN")
         self.assertEqual(self.app36["token_env"], "TOKEN_SOUZOKUNIN")
 
-    def test_field_count_is_18(self):
+    def test_field_count_is_19(self):
         # P3-003b（2026-07-30 実機追加済み）: current_derivation_run_id／
-        # 導出元人物ID の2 field 追加で 16→18（時点ピンの追随は正当）
-        self.assertEqual(len(self.app36["fields"]), 18)
+        # 導出元人物ID の2 field 追加で 16→18（時点ピンの追随は正当）。
+        # P3-003C-CANCEL（CU 適用後 merge・RV-08 と同型の順序）: 取消済み の
+        # 1 field 追加で 18→19（時点ピンの追随）
+        self.assertEqual(len(self.app36["fields"]), 19)
 
     def test_is_optional(self):
         self.assertIs(self.app36.get("optional"), True)

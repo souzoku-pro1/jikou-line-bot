@@ -43,13 +43,16 @@ from datetime import datetime, timezone
 import sqlalchemy as sa
 
 from hub import kintone
+from hub.app36_validity import CANCELLED_FIELD, filter_active_heir_rows
 from hub.derivation_models import (_PERSON_ID_RE, _SHARE_RE, DECISIONS,
                                    ZOKUGARA_CODES, ChainIntegrityError,
                                    DecisionBlockedError,
                                    DecisionChainCorruptionError, DerivationRun,
                                    HeirConfirmationDecision,
+                                   append_projection_log,
                                    create_decisions_for_heads,
                                    get_current_head, get_leaf_decision,
+                                   load_write_set,
                                    payload_has_zokugara_codes)
 from hub.heir_envelope import (APP_SHIPPING, DETAIL_DECISION_KEY,
                                DETAIL_HELD_PERSONS_KEY, _unit_for_case)
@@ -426,7 +429,10 @@ async def _resolve_heir_derivation(group, case_record_id: str,
                 APP_SOUZOKUNIN,
                 f'案件レコードID = "{case_record_id}" and '
                 f'導出元人物ID = "{pid}" order by $id asc limit 2',
-                fields=["$id", "current_derivation_run_id", "戸籍確認済"])
+                fields=["$id", "current_derivation_run_id", "戸籍確認済",
+                        CANCELLED_FIELD])
+            # P3-003C-CANCEL §4.2: 取消済み行は読み飛ばし（共通 filter・単一の正）
+            rows = filter_active_heir_rows(rows)
             if len(rows) >= 2:
                 cls = classify_duplicate_rows(rows, str(run.id))
                 await _alert_business(
@@ -632,7 +638,14 @@ async def _project_row(run, case_record_id: str, unit: str, pid: str,
         APP_SOUZOKUNIN,
         f'案件レコードID = "{case_record_id}" and '
         f'導出元人物ID = "{pid}" order by $id asc limit 2',
-        fields=["$id", "current_derivation_run_id", "戸籍確認済", "$revision"])
+        # P3-003C-CANCEL §4.1a: 書込み対象 field の現在値も取得し preimage を
+        # write-set へ保存する（$revision 楽観ロックと同一読取＝preimage の
+        # 整合は revision が担保）。取消済み filter 用に CANCELLED_FIELD も取得
+        fields=["$id", "current_derivation_run_id", "戸籍確認済", "$revision",
+                "続柄", "データ源", "法定相続分", "導出元人物ID",
+                CANCELLED_FIELD])
+    # P3-003C-CANCEL §4.2: 取消済み行は読み飛ばし（共通 filter・単一の正）
+    rows = filter_active_heir_rows(rows)
     fields = {
         "続柄": zoku,
         "データ源": "戸籍読解",
@@ -641,6 +654,11 @@ async def _project_row(run, case_record_id: str, unit: str, pid: str,
     }
     if share_disp is not None:
         fields["法定相続分"] = share_disp       # share=None は書かない（§3.3）
+    # CANCEL-IMPL-01: 当該行の既存 log（回収用・id 昇順）。record_id 一致に
+    # 加え「app36_record_id 未確定の pending insert」（completed 欠落=ACK 喪失・
+    # create 前クラッシュ）を 導出元人物ID で対応付ける
+    run_logs = [l for l in await load_write_set(run.id)
+                if l["fields_written"].get("導出元人物ID") == pid]
     if not rows:
         fields.update({
             "案件アプリID": str(run.case_app_id),
@@ -648,7 +666,23 @@ async def _project_row(run, case_record_id: str, unit: str, pid: str,
             "ユニット種別": unit,
             "戸籍確認済": "yes",       # §4A: confirmed handler は yes を書ける
         })
-        await kintone.create_record(APP_SOUZOKUNIN, fields)
+        # CANCEL-IMPL-01（先行保存）: App36 書込み**前**に pending を保存。
+        # 保存失敗は伝播＝当該行 write 0（write-set の無い書込みを作らず、
+        # 後から write-set を再構成＝誤生成もしない）。既存 pending（create 前
+        # クラッシュの残置）は再利用＝二重追記しない
+        if not any(l["op"] == "insert" and not l["app36_record_id"]
+                   for l in run_logs):
+            await append_projection_log(
+                derivation_run_id=run.id, case_record_id=case_record_id,
+                app36_record_id="", op="insert", stage="pending",
+                fields_written=fields, preimage={})
+        new_id = await kintone.create_record(APP_SOUZOKUNIN, fields)
+        # 裁定⑤: 書込み成功後の完了追記。失敗（ACK 喪失）は pending が真実を
+        # 保持＝resumed 再確定の回収経路が完了を追記する（§4.4）
+        await append_projection_log(
+            derivation_run_id=run.id, case_record_id=case_record_id,
+            app36_record_id=str(new_id), op="insert", stage="completed",
+            fields_written=fields, preimage={})
         return "inserted"
     if len(rows) >= 2:
         cls = classify_duplicate_rows(rows, str(run.id))
@@ -673,6 +707,22 @@ async def _project_row(run, case_record_id: str, unit: str, pid: str,
         return "held"
     if _v(row, "戸籍確認済") == "no":
         fields["戸籍確認済"] = "yes"   # no→yes のみ（yes 既存時は field 自体含めない）
+    # CANCEL-IMPL-01（回収・再構成しない）: 当該行の log が既にあれば元の
+    # op/preimage をそのまま使う——再確定（resumed）時に「書込み後の現在値」を
+    # preimage として誤保存しない（ACK 喪失＝completed 欠落でも pending の
+    # 真正 preimage が正）。無ければ本 write が初回＝pending を先行保存
+    orig = [l for l in run_logs
+            if l["app36_record_id"] == app36_id or not l["app36_record_id"]]
+    if orig:
+        op_orig = orig[0]["op"]
+        pre_orig = dict(orig[0]["preimage"])
+    else:
+        op_orig = "update"
+        pre_orig = {code: _v(row, code) for code in fields}
+        await append_projection_log(
+            derivation_run_id=run.id, case_record_id=case_record_id,
+            app36_record_id=app36_id, op="update", stage="pending",
+            fields_written=fields, preimage=pre_orig)
     try:
         await kintone.update_record(APP_SOUZOKUNIN, app36_id, fields,
                                     revision=_v(row, "$revision") or None)
@@ -682,4 +732,10 @@ async def _project_row(run, case_record_id: str, unit: str, pid: str,
             f"案件 No.{case_record_id} / App36 No.{app36_id}\n"
             "他プロセスが先に更新しました。当該行は書き込まず要確認としました")
         return "held"
+    # 裁定⑤: 完了追記（op/preimage は最初の log の値＝真実を引き継ぐ。
+    # revision 楽観ロック成功が「読取後に他更新なし」を担保）
+    await append_projection_log(
+        derivation_run_id=run.id, case_record_id=case_record_id,
+        app36_record_id=app36_id, op=op_orig, stage="completed",
+        fields_written=fields, preimage=pre_orig)
     return "updated"

@@ -32,6 +32,7 @@ import re
 from dataclasses import dataclass, field
 
 from hub import kintone
+from hub.app36_validity import CANCELLED_FIELD, filter_active_heir_rows
 from hub.heir_envelope import _unit_for_case
 from hub.person_validity import MERGE_STATE_FIELD, filter_active_persons
 
@@ -706,7 +707,9 @@ async def _second_stage_conditions(case_record_id: str):
                            "TOKEN_SOUZOKUNIN"),
         f'案件レコードID = "{case_record_id}" order by $id asc limit 100',
         fields=["$id", "$revision", "current_derivation_run_id",
-                "導出元人物ID", "戸籍確認済", "続柄"])
+                "導出元人物ID", "戸籍確認済", "続柄", CANCELLED_FIELD])
+    # P3-003C-CANCEL §4.2: 取消済み行は読み飛ばし（共通 filter・単一の正）
+    rows = filter_active_heir_rows(rows)
     heirs = (head.result_payload or {}).get("heirs") or []
     expect = {str(h.get("person_id") or ""):
               ZOKUGARA_CODE_TO_APP36.get(h.get("zokugara_code"), "")
@@ -735,7 +738,11 @@ async def _app36_rows_hash(case_record_id: str) -> str:
         kintone.KintoneApp("App 36 (相続人)", "APP_SOUZOKUNIN",
                            "TOKEN_SOUZOKUNIN"),
         f'案件レコードID = "{case_record_id}" order by $id asc limit 100',
-        fields=["$id", "$revision", "current_derivation_run_id", "導出元人物ID"])
+        fields=["$id", "$revision", "current_derivation_run_id", "導出元人物ID",
+                CANCELLED_FIELD])
+    # P3-003C-CANCEL §4.2: 取消済み行は読み飛ばし（hash 対象からも除外＝
+    # 消費側の見え方と一致・canonical tuple の構成 field は不変）
+    rows = filter_active_heir_rows(rows)
     tuples = sorted(
         ([_v(r, "$id"), _v(r, "$revision"),
           _v(r, "current_derivation_run_id"), _v(r, "導出元人物ID")]

@@ -120,6 +120,51 @@ class HeirConfirmationDecision(DerivationBase):
         sa.BigInteger, sa.ForeignKey("heir_confirmation_decision.id"))
 
 
+# P3-003C-CANCEL §4.1a: write-set の schema version（取消可能条件の一部。
+# 版上げは正本改定と同時のみ——旧 version の write-set は legacy 扱い＝
+# 自動巻き戻し禁止・裁定⑧）
+WRITESET_SCHEMA_VERSION = 1
+
+
+class ProjectionLog(DerivationBase):
+    """P3-003C-CANCEL 裁定⑤=(B): confirmed projection の write-set 台帳
+    （immutable 追記・P3-001 流儀）。
+
+    confirmed handler（hub/heir_projection._project_row）が App36 へ実際に
+    書いた行ごとに 1 行追記する: App36 record ID・insert/update の区別・
+    書込み field 集合（=postimage）・書込み**前**の preimage。取消関所
+    （hub/heir_cancel）はこれを根拠に postimage 完全一致照合の上でのみ
+    自動巻き戻し候補を作る（§4.1a・盲目適用しない）。値は record ID・
+    field code・App36 の機械由来値のみ（氏名等の PII は projection の
+    書込み対象外＝本台帳にも載らない）。"""
+
+    __tablename__ = "projection_log"
+    __table_args__ = (
+        sa.CheckConstraint("op IN ('insert', 'update')",
+                           name="ck_projection_log_op"),
+        # CANCEL-IMPL-01（RV08 fix2 の先行保存パターン）: pending=App36 書込み
+        # **前**の先行保存（真正 preimage・意図した write）・completed=書込み
+        # 成功後の完了追記。ACK 喪失（書込み成功・completed 欠落）は pending が
+        # 真実の op/preimage を保持し続ける＝再確定時に回収（再構成しない）
+        sa.CheckConstraint("stage IN ('pending', 'completed')",
+                           name="ck_projection_log_stage"),
+        sa.Index("ix_projection_log_run", "derivation_run_id"),
+    )
+
+    id: Mapped[int] = mapped_column(_BigIntPK, primary_key=True, autoincrement=True)
+    derivation_run_id: Mapped[int] = mapped_column(
+        sa.BigInteger, sa.ForeignKey("derivation_run.id"), nullable=False)
+    case_record_id: Mapped[str] = mapped_column(sa.Text, nullable=False)
+    app36_record_id: Mapped[str] = mapped_column(sa.Text, nullable=False)
+    op: Mapped[str] = mapped_column(sa.Text, nullable=False)   # insert / update
+    stage: Mapped[str] = mapped_column(sa.Text, nullable=False)  # pending / completed
+    fields_written: Mapped[dict] = mapped_column(_JSON, nullable=False)
+    preimage: Mapped[dict] = mapped_column(_JSON, nullable=False)  # insert は {}
+    schema_version: Mapped[int] = mapped_column(sa.Integer, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now())
+
+
 # ── (i) ORM 層の immutable 強制 ──────────────────────────────────────────────
 
 def _reject_mutation(mapper, connection, target):  # noqa: ARG001
@@ -128,7 +173,7 @@ def _reject_mutation(mapper, connection, target):  # noqa: ARG001
         "訂正は新行＋supersedes 連鎖で行う)")
 
 
-for _cls in (DerivationRun, HeirConfirmationDecision):
+for _cls in (DerivationRun, HeirConfirmationDecision, ProjectionLog):
     sa.event.listen(_cls, "before_update", _reject_mutation)
     sa.event.listen(_cls, "before_delete", _reject_mutation)
 
@@ -153,7 +198,7 @@ def immutable_trigger_ddl(table: str) -> dict[str, list[str]]:
     }
 
 
-for _table in ("derivation_run", "heir_confirmation_decision"):
+for _table in ("derivation_run", "heir_confirmation_decision", "projection_log"):
     _ddl = immutable_trigger_ddl(_table)
     _tbl = DerivationBase.metadata.tables[_table]
     for _stmt in _ddl["sqlite"]:
@@ -959,3 +1004,130 @@ async def get_current_head(case_record_id: str):
                            .where(n.c.supersedes_run_id == t.c.id)),
             ))).one_or_none()
         return row
+
+
+# ══════════════════════════════════════════════════════════════
+# P3-003C-CANCEL: write-set 台帳（裁定⑤）と取消 decision（裁定①=(A) supersede 型）
+# ══════════════════════════════════════════════════════════════
+
+async def append_projection_log(*, derivation_run_id: int, case_record_id: str,
+                                app36_record_id: str, op: str, stage: str,
+                                fields_written: dict, preimage: dict) -> int:
+    """write-set の 1 行追記（confirmed handler 専用・immutable・§4.1a）。
+
+    CANCEL-IMPL-01（RV08 fix2 先行保存パターン）:
+    - stage="pending": App36 書込み**前**に先行保存（真正 preimage・意図した
+      write・insert は app36_record_id 未確定=""）。先行保存の失敗は伝播＝
+      当該行の App36 write は発生しない（write-set 無しの書込みを作らない）。
+    - stage="completed": 書込み成功**後**の完了追記。completed の欠落
+      （ACK 喪失）は pending が真実を保持＝再確定時に回収され、後から
+      write-set を再構成（誤生成）することはない。
+    """
+    if op not in ("insert", "update"):
+        raise PayloadPolicyError("projection_log.op は閉集合（insert/update）のみ")
+    if stage not in ("pending", "completed"):
+        raise PayloadPolicyError(
+            "projection_log.stage は閉集合（pending/completed）のみ")
+    from hub.db import session_scope
+    t = ProjectionLog.__table__
+    async with session_scope() as s:
+        res = await s.execute(sa.insert(t).values(
+            derivation_run_id=derivation_run_id, case_record_id=case_record_id,
+            app36_record_id=str(app36_record_id), op=op, stage=stage,
+            fields_written=fields_written, preimage=preimage,
+            schema_version=WRITESET_SCHEMA_VERSION).returning(t.c.id))
+        return int(res.scalar_one())
+
+
+async def load_write_set(derivation_run_id: int) -> list[dict]:
+    """run の write-set 読取（read-only・id 昇順）。取消関所（phase 1）専用。
+
+    同一 App36 行へ複数 log（resumed 再実行）がある場合の解釈は呼出し側
+    （hub/heir_cancel._consolidate_write_set）が単一の正。"""
+    from hub.db import session_scope
+    t = ProjectionLog.__table__
+    async with session_scope() as s:
+        rows = (await s.execute(
+            sa.select(t).where(t.c.derivation_run_id == derivation_run_id)
+            .order_by(t.c.id.asc()))).all()
+    return [{"id": r.id, "app36_record_id": r.app36_record_id, "op": r.op,
+             "stage": r.stage,
+             "fields_written": dict(r.fields_written or {}),
+             "preimage": dict(r.preimage or {}),
+             "schema_version": r.schema_version} for r in rows]
+
+
+async def create_cancel_decision(case_record_id: str, run_id: int, *,
+                                 decided_by: str, decided_at) -> str:
+    """取消関所専用の decision 追記（P3-003C-CANCEL 裁定①=(A) supersede 型）。
+
+    **confirmed leaf を rejected が supersede する遷移を、この関数（取消関所の
+    一本経路＝hub/heir_cancel 配下）のみ許可**する。一般経路
+    （create_decisions_for_heads）の §3.2-v2 中止セル already_confirmed は不変＝
+    確定/保留/否認コマンドからの confirmed→rejected は引き続き遮断される。
+
+    単一 txn: head CAS（裁定⑥=head のみ取消可）→ 有効 leaf 再判定 →
+    supersede INSERT。戻り値:
+      "created" — confirmed leaf を rejected で supersede した（取消記録）。
+      "resumed" — leaf が既に取消記録（rejected が confirmed を supersede）
+                  ＝phase 2 済み・ACK 喪失回収（INSERT なし・§4.4）。
+    それ以外の leaf（なし/held/通常否認）・非 head は ChainIntegrityError
+    （固定文言・呼出し側 phase 1 が先行遮断済み＝ここは race の最終防衛）。
+    UNIQUE 競合は ChainIntegrityError へ正規化（DB 例外本文は連鎖に残さない）。
+    """
+    from sqlalchemy.exc import IntegrityError
+
+    from hub.db import session_scope
+
+    t = HeirConfirmationDecision.__table__
+    rt = DerivationRun.__table__
+    n = rt.alias("n")
+    conflict = False
+    outcome = ""
+    try:
+        async with session_scope() as s:
+            head = (await s.execute(
+                sa.select(rt.c.id).where(
+                    rt.c.case_record_id == case_record_id,
+                    ~sa.exists(sa.select(n.c.id)
+                               .where(n.c.supersedes_run_id == rt.c.id)),
+                ))).one_or_none()
+            if head is None or head.id != run_id:
+                raise ChainIntegrityError(
+                    "取消対象 run が head ではありません（裁定⑥・全体中止）")
+            leaves = await _select_leaves(s, run_id)
+            if len(leaves) > 1:
+                raise DecisionChainCorruptionError(run_id, len(leaves))
+            leaf = leaves[0] if leaves else None
+            if leaf is None or leaf.decision == "held":
+                raise ChainIntegrityError(
+                    "取消対象の有効 leaf が confirmed ではありません"
+                    "（取消可能条件外・全体中止）")
+            if leaf.decision == "rejected":
+                sup = (await s.execute(
+                    sa.select(t.c.supersedes_decision_id)
+                    .where(t.c.id == leaf.id))).scalar_one_or_none()
+                parent_decision = None
+                if sup is not None:
+                    parent_decision = (await s.execute(
+                        sa.select(t.c.decision)
+                        .where(t.c.id == sup))).scalar_one_or_none()
+                if parent_decision == "confirmed":
+                    outcome = "resumed"   # 取消記録済み（ACK 喪失回収・§4.4）
+                else:
+                    raise ChainIntegrityError(
+                        "取消対象の有効 leaf が confirmed ではありません"
+                        "（否認済み・取消可能条件外・全体中止）")
+            elif leaf.decision == "confirmed":
+                await s.execute(sa.insert(t).values(
+                    derivation_run_id=run_id, decision="rejected",
+                    decided_by=decided_by, decided_at=decided_at,
+                    supersedes_decision_id=leaf.id))
+                outcome = "created"
+    except IntegrityError:
+        conflict = True     # DB 例外本文を連鎖に残さない（except 外で固定 raise）
+    if conflict:
+        raise ChainIntegrityError(
+            "取消記録の保存が並行実行と競合しました"
+            "（UNIQUE 後詰め・全体 rollback・再指示してください）")
+    return outcome
