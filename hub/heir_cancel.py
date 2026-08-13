@@ -108,21 +108,35 @@ def _consolidate_write_set(rows: list[dict]) -> list[dict] | None:
       （CANCEL-IMPL-03。「最後の log で全面置換」は初回のみ書いた field
       〔案件アプリID・ユニット種別等〕が照合から漏れ、第三者変更を
       見逃すため廃止）。
-    - app36_record_id 未確定（""）の pending（create の ACK 喪失で completed も
-      再確定回収も無い迷子）は対象外＝巻き戻し不能（H11a 監査が最終網・§4.4）。
-    schema version が 1 件でも解釈不能なら None（legacy 扱い・CANCEL-05）。"""
-    by_rid: dict[str, dict] = {}
-    for r in rows:   # id 昇順（load_write_set 契約）
+    - **CANCEL-IMPL-05（裁定=(b) fail-closed 中止方式）**: app36_record_id
+      未確定（""）の pending は、**対応する completed（同一 導出元人物ID）が
+      あれば回収済みの正常形**（entries は completed 側から構成）。無ければ
+      **現世代の未回収 pending**＝legacy ではなく第2戻り値で検出を返す
+      （呼出し側 phase 1 が write 0 で中止・projection の回収=再確定が先）。
+    schema version が 1 件でも解釈不能なら (None, [])（legacy 扱い・CANCEL-05。
+    legacy は「write-set 保存開始前=log が一切ない・欠落・旧 schema version」
+    に**限定**され、現世代 pending の存在は legacy ではない）。
+
+    戻り値: (entries | None, 未回収 pending の 導出元人物ID リスト)。"""
+    for r in rows:
         if r.get("schema_version") != WRITESET_SCHEMA_VERSION:
-            return None
+            return None, []
+    completed_pids = {r["fields_written"].get("導出元人物ID")
+                      for r in rows if r["stage"] == "completed"}
+    by_rid: dict[str, dict] = {}
+    unrecovered: list[str] = []
+    for r in rows:   # id 昇順（load_write_set 契約）
         rid = str(r["app36_record_id"])
         if not rid:
+            pid = str(r["fields_written"].get("導出元人物ID") or "")
+            if pid not in completed_pids:
+                unrecovered.append(pid)    # 現世代の未回収 pending（中止対象）
             continue
         if rid not in by_rid:
             by_rid[rid] = {"app36_record_id": rid, "op": r["op"],
                            "preimage": dict(r["preimage"]), "postimage": {}}
         by_rid[rid]["postimage"].update(r["fields_written"])   # 順次適用合成
-    return list(by_rid.values())
+    return list(by_rid.values()), unrecovered
 
 
 async def _verify_rows(entries: list[dict]) -> tuple[list[dict], list[str]]:
@@ -222,15 +236,37 @@ async def plan_cancel(case_record_id: str, decided_by: str) -> dict:
                     "reason": f"run #{head.id} は否認済みです"
                               "（取消対象外・書き込みなし）"}
 
-    # write-set の存在・schema version 確認（CANCEL-05・2世代分割）
+    # write-set の存在・schema version 確認（CANCEL-05・2世代分割。legacy は
+    # 「保存開始前=log が一切ない・欠落・旧 schema version」に限定）
     ws = await load_write_set(head.id)
-    entries = _consolidate_write_set(ws)
-    if not entries:
+    entries, unrecovered = _consolidate_write_set(ws)
+    if not ws or entries is None:
         # legacy confirmed（write-set 欠落・旧 version・解釈不能）: 自動巻き戻し
         # 禁止・App36 write 0・取消台帳のみ追記（裁定⑧）・実機修正は人手調査
         return {"status": "plan", "mode": "legacy", "case_record_id":
                 case_record_id, "run_id": head.id, "idem_key": idem_key,
                 "candidates": [], "mismatched": [], "record_ids": []}
+    if unrecovered:
+        # CANCEL-IMPL-05（裁定=(b)）: 現世代の未回収 pending（record_id 未確定・
+        # 対応 completed なし）＝projection が回収未了。**取消 decision 追記前・
+        # 封筒作成前に write 0 で中止**（completed 行だけ巻き戻して封筒を
+        # 閉じる混在処理もしない）。回収の正規経路は同じ封筒の再確定（resumed）
+        await _alert_business(
+            "【相続人取消: projection 未回収の行】\n"
+            f"案件 No.{case_record_id} / run #{head.id} / "
+            f"未回収 {len(unrecovered)} 件\n"
+            "projection 未回収の行があります。再確定（封筒回収）を先に完了して"
+            "ください（取消は行っていません・書き込みなし）")
+        return {"status": "aborted",
+                "reason": f"projection 未回収の行があります"
+                          f"（{len(unrecovered)} 件）。再確定（封筒回収）を先に"
+                          "完了してください（書き込みなし）"}
+    if not entries:
+        # 防御（到達しない想定: ws 非空・schema 一致・未回収なしなら entries は
+        # 非空）。fail-closed に中止（legacy へは倒さない・裁定⑧の限定を維持）
+        return {"status": "aborted",
+                "reason": "write-set の解釈に失敗しました（書き込みなし・"
+                          "人手調査要）"}
     candidates, mismatched = await _verify_rows(entries)
     return {"status": "plan",
             "mode": "resumed" if resumed else "auto",

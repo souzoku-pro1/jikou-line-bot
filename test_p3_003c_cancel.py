@@ -683,6 +683,112 @@ class TestAckLossAndThreeState(_Base):
                          [], "write 0")
 
 
+class TestUnrecoveredPendingFailClosed(_Base):
+    """CANCEL-IMPL-05（裁定=(b) fail-closed 中止方式）: 現世代の未回収 pending
+    （record_id 空・対応 completed なし）は legacy ではなく中止＋要確認通知。
+    legacy は「log が一切ない・欠落・旧 schema version」に限定。"""
+
+    def _insert_fields(self, run_id, case="9"):
+        return {"続柄": "子", "データ源": "戸籍読解",
+                "current_derivation_run_id": str(run_id),
+                "導出元人物ID": "11", "案件アプリID": "26",
+                "案件レコードID": case, "ユニット種別": "相続一般",
+                "戸籍確認済": "yes"}
+
+    def _seed_unrecovered(self, with_row=True):
+        run_id = self._mk_run("9")
+        self._confirm_run("9", run_id)
+        fields = self._insert_fields(run_id)
+        self._log(run_id, "9", "", "insert", fields, {}, stage="pending")
+        if with_row:
+            self._app36_row("901", **fields)
+        return run_id
+
+    def _assert_aborted_fail_closed(self, run_id, result):
+        self.assertEqual(result["status"], "aborted")
+        self.assertIn("projection 未回収の行があります", result["reason"])
+        self.assertIn("再確定（封筒回収）を先に完了してください",
+                      result["reason"])
+        self.assertNotEqual(result.get("mode"), "legacy",
+                            "legacy 完了にしない")
+        self.assertEqual(self._app36_writes(), [], "write 0")
+        self.assertEqual([c for c in self.created
+                          if c[0].startswith("App 30")], [],
+                         "取消封筒を作成しない（decision 追記前・封筒作成前の中止）")
+        self.assertEqual(self._leaf(run_id).decision, "confirmed",
+                         "取消 decision を追記しない")
+        text = "".join(str(c.args) for c in self.alert.await_args_list)
+        self.assertIn("projection 未回収の行", text, "要確認通知（固定文面）")
+        self.assertNotIn("山田", text, "PII 非搭載（案件/run/件数のみ）")
+
+    def test_i_pending_with_row_and_no_completed_aborts(self):
+        """(i) pending insert＋App36 実在・completed なし→legacy 完了しない
+        （中止＋要確認）"""
+        run_id = self._seed_unrecovered(with_row=True)
+        result = self._cancel()
+        self._assert_aborted_fail_closed(run_id, result)
+
+    def test_ii_pending_without_row_aborts(self):
+        """(ii) pending insert＋App36 不存在（create 前クラッシュ）→
+        legacy 完了しない（中止）"""
+        run_id = self._seed_unrecovered(with_row=False)
+        result = self._cancel()
+        self._assert_aborted_fail_closed(run_id, result)
+
+    def test_iii_mixed_completed_and_unrecovered_pending_aborts(self):
+        """(iii) completed 行＋未回収 pending insert の混在→封筒を閉じない
+        （completed 行だけの部分巻き戻しもしない・全体中止）"""
+        run_id = self._mk_run("9")
+        self._confirm_run("9", run_id)
+        upd_written = {"続柄": "配偶者", "データ源": "戸籍読解",
+                       "current_derivation_run_id": str(run_id),
+                       "導出元人物ID": "12"}
+        self._log(run_id, "9", "802", "update", upd_written,
+                  {"続柄": "子", "データ源": "手入力",
+                   "current_derivation_run_id": "1", "導出元人物ID": "12"})
+        self._app36_row("802", **upd_written)
+        self._log(run_id, "9", "", "insert", self._insert_fields(run_id), {},
+                  stage="pending")   # pid 11 の未回収 pending（混在形）
+        result = self._cancel()
+        self._assert_aborted_fail_closed(run_id, result)
+
+    def test_iv_recovered_pending_does_not_false_stop(self):
+        """(iv) pending blank＋対応 completed actual がある正常形→誤停止しない
+        （通常取消が成立）"""
+        run_id = self._mk_run("9")
+        self._confirm_run("9", run_id)
+        fields = self._insert_fields(run_id)
+        self._log(run_id, "9", "", "insert", fields, {}, stage="pending")
+        self._log(run_id, "9", "801", "insert", fields, {},
+                  stage="completed")   # 回収済み（同一 導出元人物ID）
+        self._app36_row("801", **fields)
+        result = self._cancel()
+        self.assertEqual(result["status"], "cancelled")
+        self.assertEqual(result["rolled_back"], 1)
+        self.assertTrue(result["envelope_closed"])
+        self.assertEqual(self.app36["801"][CANCELLED_FIELD]["value"], "yes")
+
+    def test_recovery_path_end_to_end(self):
+        """中止→projection 回収（再確定）→再度取消→正常成立（回復経路）"""
+        from types import SimpleNamespace
+        run_id = self._seed_unrecovered(with_row=True)
+        first = self._cancel()
+        self.assertEqual(first["status"], "aborted")
+        # projection の回収（同じ封筒の再確定）: pending から op/preimage を
+        # 回収して completed を追記
+        run = SimpleNamespace(id=run_id, case_app_id="26")
+        outcome = _run(hp_project_row(run, "9", "相続一般", "11", "子", None))
+        db.reset_for_tests()
+        self.assertEqual(outcome, "updated")
+        second = self._cancel()
+        self.assertEqual(second["status"], "cancelled")
+        self.assertEqual(second["rolled_back"], 1)
+        self.assertTrue(second["envelope_closed"])
+        self.assertEqual(self.app36["901"]["戸籍確認済"]["value"], "no")
+        self.assertEqual(self.app36["901"][CANCELLED_FIELD]["value"], "yes")
+        self.assertEqual(self._leaf(run_id).decision, "rejected")
+
+
 class TestConsumerExclusion(_Base):
     """consumer 除外（取消済み=yes の読み飛ばし・共通 filter・単一の正）"""
 
