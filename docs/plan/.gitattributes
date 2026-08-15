@@ -1,0 +1,4 @@
+# 本ディレクトリは repo 外正本の写しを一字一句そのまま保持する。
+# core.autocrlf=true の環境で checkout すると CRLF 化して原本 SHA-256 との
+# 一致検証が壊れるため、改行を LF に固定する。
+*.md text eol=lf
