@@ -83,10 +83,14 @@ async def _on_startup():
     # そのまま送出して起動を失敗させる（署名リクエスト毎の沈黙 500 の排除）。
     # flag OFF は registry 非参照＝現行挙動不変。
     from hub.service_auth import (validate_registry_startup,
-                                  validate_legacy_disabled_paths_startup)
+                                  validate_legacy_disabled_paths_startup,
+                                  validate_signed_required_paths_startup)
     validate_registry_startup()
     # RV-04c H07: 旧 query 停止 path list の起動時 strict 検証（異常形は固定文言で起動停止）。
     validate_legacy_disabled_paths_startup()
+    # RV02-ENFORCE: 署名必須 path 集合の起動時 strict 検証（dual-accept と独立に実効のため
+    # flag では gate しない。異常形は固定文言で起動停止）。
+    validate_signed_required_paths_startup()
     # RV-04c D2-M01: KINTONE_WEBHOOK_TOKEN_NEXT の残置を起動ログに固定文言で警告（値は出さない）。
     from daily_healthcheck import check_next_token_residual
     if check_next_token_residual():

@@ -52,6 +52,11 @@ _LEGACY_DISABLED_ENV = "SERVICE_AUTH_LEGACY_DISABLED_PATHS"
 _KNOWN_INGEST_PATHS = frozenset({
     "/koseki/ingest", "/registry/ingest", "/bank/ingest",
     "/sortation/ingest", "/valuation/ingest"})
+# RV02-ENFORCE: 署名 opt-in 入口の非署名遮断 path 集合（既定 未設定＝どこも遮断しない
+# ＝二重受理のまま）。列挙できるのは opt-in 2 入口のみ（closed set）。列挙 path は
+# dual-accept flag の状態に関わらず署名必須（強い方が勝つ・runbook §3-3/§4(e)）。
+_SIGNED_REQUIRED_ENV = "SERVICE_AUTH_SIGNED_REQUIRED_PATHS"
+_SIGNED_OPTIN_PATHS = frozenset({"/scan", "/ocr/fixed-asset"})
 
 # §2.2: 署名経路で必須の 7 ヘッダ。欠落は第1段で missing_header（bad_sig 任せにしない）。
 _REQUIRED_HEADERS = ("X-Sig-Version", "X-Sig-Key-Id", "X-Sig-Caller",
@@ -208,9 +213,12 @@ def validate_registry_startup() -> int:
     （欠損/空・JSON/構造不正・entry 型不正・実効鍵数0＝RP1114-H01）で検証し、不正なら
     ServiceAuthConfigError で**起動を止める**（署名リクエスト毎の沈黙 500 を排除する）。
     flag OFF は何もしない（registry 非参照＝現行挙動不変）。戻り値=実効鍵数（起動ログ用）。
+    RV02-ENFORCE: SERVICE_AUTH_SIGNED_REQUIRED_PATHS が非空なら flag OFF でも検証する
+    （列挙 path は flag と独立に署名検証へ入るため、壊れ registry の fail-fast を
+    その象限にも効かせる。両 env とも未設定なら従来どおり何もしない）。
     RP1114-M01: 送出する例外は**固定文言のみ**（`from None` で元例外の詳細メッセージ
     〔key_id・フィールド名・registry 断片〕を連鎖表示させない）。"""
-    if not dual_accept_enabled():
+    if not dual_accept_enabled() and not signed_required_paths():
         return 0
     try:
         return len(load_registry_strict())
@@ -218,26 +226,32 @@ def validate_registry_startup() -> int:
         raise ServiceAuthConfigError(_CONFIG_ERROR_FIXED_MSG) from None
 
 
-def _parse_legacy_disabled_strict(raw: str) -> frozenset:
+def _parse_legacy_disabled_strict(raw: str, *, known: frozenset | None = None,
+                                  msg: str | None = None) -> frozenset:
     """RV-04c H07: SERVICE_AUTH_LEGACY_DISABLED_PATHS を厳格集合検証。
     未設定/空は空集合。以下は ServiceAuthConfigError（固定文言で起動停止）:
     未知値・重複・末尾 slash・空要素・全角（非 ASCII）。実 routing raw path と同一
-    （無正規化・完全一致）で照合するため、設定側で正しい形のみ受け付ける。"""
+    （無正規化・完全一致）で照合するため、設定側で正しい形のみ受け付ける。
+    RV02-ENFORCE: `known`（許可 closed set）と `msg`（固定文言）を引数化し
+    SERVICE_AUTH_SIGNED_REQUIRED_PATHS と parser 実体を共用する（既定値は従来どおり
+    ＝legacy 用途は挙動不変・新規パース実装は作らない）。"""
+    known = _KNOWN_INGEST_PATHS if known is None else known
+    msg = _LEGACY_ERROR_FIXED_MSG if msg is None else msg
     if not raw.strip():
         return frozenset()
     items = raw.split(",")
     seen = set()
     for it in items:
         if it == "" or it != it.strip():
-            raise ServiceAuthConfigError(_LEGACY_ERROR_FIXED_MSG)   # 空要素/前後空白
+            raise ServiceAuthConfigError(msg)   # 空要素/前後空白
         if any(ord(c) > 127 for c in it):
-            raise ServiceAuthConfigError(_LEGACY_ERROR_FIXED_MSG)   # 全角等
+            raise ServiceAuthConfigError(msg)   # 全角等
         if len(it) > 1 and it.endswith("/"):
-            raise ServiceAuthConfigError(_LEGACY_ERROR_FIXED_MSG)   # 末尾 slash
-        if it not in _KNOWN_INGEST_PATHS:
-            raise ServiceAuthConfigError(_LEGACY_ERROR_FIXED_MSG)   # 未知値
+            raise ServiceAuthConfigError(msg)   # 末尾 slash
+        if it not in known:
+            raise ServiceAuthConfigError(msg)   # 未知値
         if it in seen:
-            raise ServiceAuthConfigError(_LEGACY_ERROR_FIXED_MSG)   # 重複
+            raise ServiceAuthConfigError(msg)   # 重複
         seen.add(it)
     return frozenset(seen)
 
@@ -266,6 +280,36 @@ def legacy_disabled_paths() -> frozenset:
         return frozenset()
     try:
         return _parse_legacy_disabled_strict(os.environ.get(_LEGACY_DISABLED_ENV, ""))
+    except ServiceAuthConfigError:
+        return frozenset()
+
+
+_SIGNED_REQUIRED_ERROR_FIXED_MSG = "signed required paths configuration invalid"
+
+
+def validate_signed_required_paths_startup() -> frozenset:
+    """RV02-ENFORCE: SERVICE_AUTH_SIGNED_REQUIRED_PATHS の起動時 strict 検証
+    （異常形は固定文言で起動停止・H07/P1-114 方式合流）。許可 closed set は
+    署名 opt-in 2 入口のみ（ingest 5 lane は列挙不可＝本 env の作用域を構造で限定）。
+    列挙 path は dual-accept flag と独立に実効（強い方が勝つ）ため、legacy 側
+    （validate_legacy_disabled_paths_startup）と異なり flag では gate しない。"""
+    raw = os.environ.get(_SIGNED_REQUIRED_ENV, "")
+    try:
+        return _parse_legacy_disabled_strict(
+            raw, known=_SIGNED_OPTIN_PATHS, msg=_SIGNED_REQUIRED_ERROR_FIXED_MSG)
+    except ServiceAuthConfigError:
+        raise ServiceAuthConfigError(_SIGNED_REQUIRED_ERROR_FIXED_MSG) from None
+
+
+def signed_required_paths() -> frozenset:
+    """実行時アクセサ（RV02-ENFORCE）。dual-accept flag では gate しない
+    （列挙 path は flag OFF でも署名必須＝強い方が勝つ）。parse 失敗は空集合
+    ＝二重受理へ縮退（legacy_disabled_paths と同じ保守側。異常形は起動 strict
+    検証〔validate_signed_required_paths_startup〕が止める前提）。"""
+    try:
+        return _parse_legacy_disabled_strict(
+            os.environ.get(_SIGNED_REQUIRED_ENV, ""),
+            known=_SIGNED_OPTIN_PATHS, msg=_SIGNED_REQUIRED_ERROR_FIXED_MSG)
     except ServiceAuthConfigError:
         return frozenset()
 
@@ -468,13 +512,45 @@ def _has_signature_headers(headers) -> bool:
     return any(k.lower().startswith("x-sig-") for k in headers)
 
 
-def _log_ingest_decision(headers, reason: str) -> None:
+def _log_ingest_decision(headers, reason: str, path_label: str | None = None) -> None:
     """署名経路の判定結果を emit 契約でログ（key_id/caller_id/reason のみ可視・
-    secret/署名値/顧客情報は出さない）。reason は固定コード（record_id 値域で素通し）。"""
-    logger.info("service-auth ingest decision key_id=%s caller=%s reason=%s",
+    secret/署名値/顧客情報は出さない）。reason は固定コード（record_id 値域で素通し）。
+    RV02-ENFORCE: path_label 指定時は path= を付加（unsigned_accepted /
+    signed_required_blocked の path 別計数用。label は _optin_path_label 経由の
+    record_id 値域文字列のみ・従来呼び出しは無指定＝ログ形式不変）。"""
+    if path_label is None:
+        logger.info("service-auth ingest decision key_id=%s caller=%s reason=%s",
+                    emit(headers.get("X-Sig-Key-Id", ""), "record_id", "log", "operator"),
+                    emit(headers.get("X-Sig-Caller", ""), "record_id", "log", "operator"),
+                    emit(reason, "record_id", "log", "operator"))
+        return
+    logger.info("service-auth ingest decision key_id=%s caller=%s reason=%s path=%s",
                 emit(headers.get("X-Sig-Key-Id", ""), "record_id", "log", "operator"),
                 emit(headers.get("X-Sig-Caller", ""), "record_id", "log", "operator"),
-                emit(reason, "record_id", "log", "operator"))
+                emit(reason, "record_id", "log", "operator"),
+                emit(path_label, "record_id", "log", "operator"))
+
+
+def _optin_path_label(eff) -> str:
+    """RV02-ENFORCE: 実効 path を record_id 値域（英数・_・-）のログ label へ変換する
+    （`/scan`→`scan`・`/ocr/fixed-asset`→`ocr_fixed-asset`）。normalize 不能
+    （raw_path 欠落・非 ASCII・% 等）は固定 label（値域外文字は emit 側でも抑止される
+    ＝二重の防御）。"""
+    p = normalize_path(eff) if eff is not None else None
+    if not p:
+        return "invalid_path"
+    return p.strip("/").replace("/", "_") or "invalid_path"
+
+
+def _in_signed_required(scope) -> bool:
+    """RV02-ENFORCE: 実効 path が署名必須集合に載っているか。集合が空なら常に False
+    （既定＝完全に従来挙動）。非空のとき raw_path 欠落（eff=None）は **True＝fail-closed**
+    （H01 の流儀。属否を証明できない要求を受理側に倒さない。実 ASGI では到達しない）。"""
+    required = signed_required_paths()
+    if not required:
+        return False
+    eff = effective_signed_path(scope)
+    return eff is None or eff in required
 
 
 class BodyCachingRoute(APIRoute):
@@ -482,13 +558,16 @@ class BodyCachingRoute(APIRoute):
     ルート。これにより署名検証（content_sha256）と後続の UploadFile/Form 受理が同一 body
     で共存できる（Starlette の body キャッシュ）。**flag OFF/署名ヘッダ皆無時は完全な
     passthrough**（生 body を読まない＝現行挙動と byte 同一）。適用は ingest 5 入口のみで、
-    顧客 Bot（/webhook 等）には一切適用しない。"""
+    顧客 Bot（/webhook 等）には一切適用しない。
+    RV02-ENFORCE: 署名必須集合の path は flag OFF でも署名検証へ入る（強い方が勝つ）ため、
+    署名ヘッダ在ならキャッシュ条件にも同集合を合流する（両 env 未設定時は従来と byte 同一）。"""
 
     def get_route_handler(self):
         original = super().get_route_handler()
 
         async def handler(request: Request):
-            if dual_accept_enabled() and _has_signature_headers(request.headers):
+            if _has_signature_headers(request.headers) and (
+                    dual_accept_enabled() or _in_signed_required(request.scope)):
                 await request.body()   # form parse 前に _body をキャッシュ
             return await original(request)
 
@@ -573,20 +652,36 @@ def ingest_guard(token_env: str):
 #    署名 opt-in 事前配線（薄い追加・verify_*/authorize_ingest は挙動不変） ──
 
 async def authorize_optionally_signed(request: Request) -> None:
-    """署名 opt-in 入口の dual-accept ゲート（RV-0102-PREP）。
+    """署名 opt-in 入口の dual-accept ゲート（RV-0102-PREP・RV02-ENFORCE で強制化の器を追加）。
 
-    /scan・/ocr/fixed-asset は旧 query token を持たない（現行=無認証受理）ため、
-    authorize_ingest（token fallback 前提）は使えない。本ゲートの分岐:
+    /scan・/ocr/fixed-asset は旧 query token を持たない（RV-0102-PREP 時点=無認証受理）ため、
+    authorize_ingest（token fallback 前提）は使えない。本ゲートの分岐（上から先勝ち）:
+    - **署名必須集合（SERVICE_AUTH_SIGNED_REQUIRED_PATHS）に在る path**（RV02-ENFORCE）:
+      dual-accept flag の状態に関わらず署名必須（**強い方が勝つ**）。
+      署名ヘッダ皆無は 404（legacy_blocked と同じ「存在しないフリ」流儀・
+      reason=signed_required_blocked で path 別計数）。署名在は §2.3 全8段で判定。
     - flag OFF: 何もしない（署名ヘッダが付いていても無視＝現行挙動と完全同一）
     - flag ON・署名ヘッダ在: 署名経路のみで判定（§2.3 全8段・token/無認証へ
       fallback しない＝downgrade 防止。authorize_ingest の署名分岐と同一実体
       〔_enforce_signed_request〕）
-    - flag ON・署名ヘッダ皆無: 受理（従来どおり＝現行挙動不変）。非署名の遮断
-      （強制化）と送信側の署名付与（GAS/watcher 点火）は[人]ゲートの別票
+    - flag ON・署名ヘッダ皆無: 受理（従来どおり）。RV02-ENFORCE: 二重受理中の非署名受理を
+      reason=unsigned_accepted で path 別計数（runbook §4(d) 到達率実測の材料・
+      挙動は不変＝ログのみ）。強制化への切替は上記 env への path 追加（[人]ゲート）
     """
+    if _in_signed_required(request.scope):
+        if not _has_signature_headers(request.headers):
+            _log_ingest_decision(
+                request.headers, "signed_required_blocked",
+                path_label=_optin_path_label(effective_signed_path(request.scope)))
+            raise HTTPException(status_code=404, detail="Not Found")
+        await _enforce_signed_request(request)
+        return
     if not dual_accept_enabled():
         return
     if not _has_signature_headers(request.headers):
+        _log_ingest_decision(
+            request.headers, "unsigned_accepted",
+            path_label=_optin_path_label(effective_signed_path(request.scope)))
         return
     await _enforce_signed_request(request)
 
