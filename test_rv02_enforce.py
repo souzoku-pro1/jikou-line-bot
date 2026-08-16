@@ -26,7 +26,7 @@ from hub import service_auth as svc  # noqa: E402
 from hub.service_auth import ServiceAuthConfigError  # noqa: E402
 
 from test_rv04b_dual_accept import (  # noqa: E402
-    _DbMixin, _FLAG, _REGENV, _client, _nonce, _sig_headers)
+    _DbMixin, _FLAG, _REGENV, _client, _nofile_multipart, _nonce, _sig_headers)
 from test_rv0102_prep_signed_optin import (  # noqa: E402
     REG_OPTIN_JSON, _ENV_ON, _OCR, _SCAN, _pdf_multipart, _scan_body)
 
@@ -267,6 +267,160 @@ class TestUnsignedAcceptedCounting(unittest.TestCase):
             os.environ.pop(_REQ, None)
             with self.assertNoLogs(_LOGGER, level="INFO"):
                 self.assertEqual(_post_scan_unsigned().status_code, 400)
+
+
+# ── RV02-ENFORCE-01: encoded alias（percent-encoding 迂回）の negative 固定 ───
+_SCAN_ALIAS = "/s%63an"            # routing 層が /scan へ decode する encoded alias
+_OCR_ALIAS = "/ocr/fixed-asse%74"  # 同 /ocr/fixed-asset
+
+
+def _post_scan_alias_unsigned():
+    return _client.post(_SCAN_ALIAS, content=_scan_body(),
+                        headers={"Content-Type": "application/json"})
+
+
+class TestEncodedAliasBlocked(unittest.TestCase):
+    """routing 層は /s%63an を /scan へ decode して handler へ届けるため、raw path の
+    集合照合だけでは署名必須遮断も unsigned_accepted 計数も迂回される（fix1 前の実測:
+    400＝handler 到達）。正規化後照合＋正規化不能 fail-closed（reason=bad_path_blocked・
+    404 の存在しないフリ）による入口遮断を固定する。"""
+
+    def test_i_flag_off_required_scan_alias_no_handler_effect(self):
+        # (i) DUAL_ACCEPT OFF・required=/scan・署名なし POST /s%63an → handler 作用 0
+        with patch.dict(os.environ, {"GOOGLE_VISION_API_KEY": "dummy_vision",
+                                     _REQ: "/scan"}):
+            os.environ.pop(_FLAG, None)
+            with self.assertLogs(_LOGGER, level="INFO") as cm:
+                r = _post_scan_alias_unsigned()
+            self.assertEqual(r.status_code, 404)
+            self.assertEqual(r.json()["detail"], "Not Found")
+            self.assertNotIn("未対応のフォルダ名", r.text)   # handler 非到達
+            self.assertTrue(any(
+                "reason=bad_path_blocked path=invalid_path" in m
+                for m in cm.output), cm.output)
+
+    def test_ii_flag_on_alias_not_counted_unsigned_accepted(self):
+        # (ii) DUAL_ACCEPT ON でも同要求が unsigned_accepted に混入しない
+        with patch.dict(os.environ, {**_ENV_ON, _REQ: "/scan"}):
+            with self.assertLogs(_LOGGER, level="INFO") as cm:
+                r = _post_scan_alias_unsigned()
+            self.assertEqual(r.status_code, 404)
+            self.assertFalse(any("unsigned_accepted" in m for m in cm.output),
+                             cm.output)
+
+    def test_ii_flag_on_required_unset_alias_not_counted(self):
+        # (ii) 補: required 未設定×DUAL ON でも alias は受理計数に混入しない
+        # （fix1 前は unsigned_accepted path=invalid_path で handler 到達していた）
+        with patch.dict(os.environ, _ENV_ON):
+            os.environ.pop(_REQ, None)
+            with self.assertLogs(_LOGGER, level="INFO") as cm:
+                r = _post_scan_alias_unsigned()
+            self.assertEqual(r.status_code, 404)
+            self.assertNotIn("未対応のフォルダ名", r.text)
+            self.assertFalse(any("unsigned_accepted" in m for m in cm.output),
+                             cm.output)
+            self.assertTrue(any("reason=bad_path_blocked" in m for m in cm.output),
+                            cm.output)
+
+    def test_iii_signed_alias_does_not_bypass_verification(self):
+        # (iii) /scan 宛の正しい署名を alias に載せても署名検証を迂回して handler へ
+        # 到達しない（required 列挙時・非列挙時とも入口 404 で遮断）
+        body = _scan_body()
+        for tag, extra in (("required", {_REQ: "/scan"}), ("unset", {})):
+            with self.subTest(quadrant=tag):
+                with patch.dict(os.environ, {**_ENV_ON, **extra}):
+                    if not extra:
+                        os.environ.pop(_REQ, None)
+                    h = _sig_headers(_SCAN, body, _nonce("rv02f1-alias-" + tag))
+                    h["Content-Type"] = "application/json"
+                    r = _client.post(_SCAN_ALIAS, content=body, headers=h)
+                    self.assertEqual(r.status_code, 404, r.text)
+                    self.assertNotIn("未対応のフォルダ名", r.text)
+
+    def test_iv_ocr_alias_blocked(self):
+        # (iv) /ocr/fixed-asset の encoded alias も同様（fix1 前は 500=handler 到達）
+        with patch.dict(os.environ, {"GOOGLE_VISION_API_KEY": "dummy_vision",
+                                     _REQ: "/ocr/fixed-asset"}):
+            os.environ.pop(_FLAG, None)
+            ct, body = _pdf_multipart()
+            r = _client.post(_OCR_ALIAS, content=body,
+                             headers={"Content-Type": ct})
+            self.assertEqual(r.status_code, 404, r.text)
+
+    def test_v_trailing_slash_redirect_no_handler_effect(self):
+        # (v) /scan/ は redirect_slashes の 307 → /scan 再要求。追随後もゲートが
+        # 遮断し handler に到達しない（redirect が遮断を跳び越える経路がない）
+        with patch.dict(os.environ, {"GOOGLE_VISION_API_KEY": "dummy_vision",
+                                     _REQ: "/scan"}):
+            os.environ.pop(_FLAG, None)
+            r = _client.post("/scan/", content=_scan_body(),
+                             headers={"Content-Type": "application/json"},
+                             follow_redirects=True)
+            self.assertEqual(r.status_code, 404)
+            self.assertNotIn("未対応のフォルダ名", r.text)
+
+    def test_vi_partial_list_only_canonical_unlisted_accepted(self):
+        # (vi) required 部分列挙時: 非列挙の**正規** path のみ従来どおり受理。
+        # 非列挙の encoded alias は受理されず unsigned_accepted にも混入しない
+        with patch.dict(os.environ, {**_ENV_ON, _REQ: "/scan"}):
+            self.assertEqual(_post_ocr_unsigned().status_code, 500)   # 正規は従来どおり
+            ct, body = _pdf_multipart()
+            with self.assertLogs(_LOGGER, level="INFO") as cm:
+                r = _client.post(_OCR_ALIAS, content=body,
+                                 headers={"Content-Type": ct})
+            self.assertEqual(r.status_code, 404)
+            self.assertFalse(any("unsigned_accepted" in m for m in cm.output),
+                             cm.output)
+
+    def test_vii_non_post_method_not_reaching_handler(self):
+        # (vii) method 境界: /scan の routing 許可は POST のみ＝POST 以外は 405 で
+        # 業務 handler に到達しない（既定・required 列挙の双方で明文化）
+        with patch.dict(os.environ, {"GOOGLE_VISION_API_KEY": "dummy_vision"}):
+            os.environ.pop(_FLAG, None)
+            os.environ.pop(_REQ, None)
+            self.assertEqual(_client.get(_SCAN).status_code, 405)
+        with patch.dict(os.environ, {"GOOGLE_VISION_API_KEY": "dummy_vision",
+                                     _REQ: "/scan"}):
+            os.environ.pop(_FLAG, None)
+            r = _client.get(_SCAN)
+            self.assertEqual(r.status_code, 405)
+            self.assertNotIn("未対応のフォルダ名", r.text)
+
+
+class TestLegacyDisabledAliasBlocked(unittest.TestCase):
+    """票 3（対象範囲の確認）: legacy 停止 list（SERVICE_AUTH_LEGACY_DISABLED_PATHS）にも
+    同種の encoded alias 迂回が実測で存在した（fix1 前: /koseki/inges%74?token=有効 が
+    停止 lane の handler へ 400 到達）ため、同修正（正規化後照合＋正規化不能
+    fail-closed）を適用して固定する。"""
+
+    _ENV = {**_ENV_ON, "SERVICE_AUTH_LEGACY_DISABLED_PATHS": "/koseki/ingest",
+            "KOSEKI_INGEST_TOKEN": "koseki-legacy-token",
+            "BANK_INGEST_TOKEN": "bank-legacy-token"}
+
+    def test_disabled_lane_alias_with_valid_token_blocked(self):
+        with patch.dict(os.environ, self._ENV):
+            ct, body = _nofile_multipart()
+            with self.assertLogs(_LOGGER, level="INFO") as cm:
+                r = _client.post("/koseki/inges%74?token=koseki-legacy-token",
+                                 content=body, headers={"Content-Type": ct})
+            self.assertEqual(r.status_code, 404, r.text)
+            self.assertNotIn("PDF", r.text)   # handler 非到達
+            # legacy_blocked（停止 lane への正規試行）の計数にも混入しない
+            self.assertFalse(any("reason=legacy_blocked" in m for m in cm.output),
+                             cm.output)
+            self.assertTrue(any("reason=bad_path_blocked" in m for m in cm.output),
+                            cm.output)
+
+    def test_disabled_list_canonical_behavior_unchanged(self):
+        # 正規 path の挙動は不変: 停止 lane=404（legacy_blocked）・非停止 lane=通過
+        with patch.dict(os.environ, self._ENV):
+            ct, body = _nofile_multipart()
+            r_blocked = _client.post("/koseki/ingest?token=koseki-legacy-token",
+                                     content=body, headers={"Content-Type": ct})
+            self.assertEqual(r_blocked.status_code, 404)
+            r_pass = _client.post("/bank/ingest?token=bank-legacy-token",
+                                  content=body, headers={"Content-Type": ct})
+            self.assertEqual(r_pass.status_code, 400)   # ゲート通過→file 無し 400
 
 
 # ── strict parser（既存実装共用・closed set 差し替え）と起動時検証 ────────────

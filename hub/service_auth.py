@@ -544,13 +544,17 @@ def _optin_path_label(eff) -> str:
 
 def _in_signed_required(scope) -> bool:
     """RV02-ENFORCE: 実効 path が署名必須集合に載っているか。集合が空なら常に False
-    （既定＝完全に従来挙動）。非空のとき raw_path 欠落（eff=None）は **True＝fail-closed**
-    （H01 の流儀。属否を証明できない要求を受理側に倒さない。実 ASGI では到達しない）。"""
+    （既定＝完全に従来挙動）。
+    RV02-ENFORCE-01: 照合は normalize_path 後の path で行う（routing 層は %63 等を
+    decode して handler へ届けるため、raw 比較では encoded alias〔/s%63an 等〕が
+    非列挙扱いになり非署名で素通りする）。非空のとき正規化不能（raw_path 欠落・
+    percent-encoding・非 ASCII 等）は **True＝fail-closed**（H01 の流儀。属否を
+    証明できない要求を受理側に倒さない）。"""
     required = signed_required_paths()
     if not required:
         return False
-    eff = effective_signed_path(scope)
-    return eff is None or eff in required
+    npath = normalize_path(effective_signed_path(scope))
+    return npath is None or npath in required
 
 
 class BodyCachingRoute(APIRoute):
@@ -628,10 +632,19 @@ async def authorize_ingest(request: Request, *, token: str, token_env: str) -> N
     # 署名ヘッダ皆無 → 旧 query token（Phase A）。
     # RV-04c §6: 当該 path が停止 list（dual-accept ON 時のみ参照）にあれば token を検証せず
     # 404（存在しないフリの既存流儀）。停止 lane への旧 token 試行は下で計数（retirement §7）。
+    # RV02-ENFORCE-01: 停止 list との照合も normalize_path 後の path で行う（encoded
+    # alias〔/koseki/inges%74 等〕は routing 層で decode され停止 lane の handler へ
+    # 到達するため、raw 比較では停止を迂回できる＝実測で確認済み）。正規化不能は
+    # 属否を証明できないまま token 経路へ流さず fail-closed（404 同流儀・
+    # legacy_blocked 計数とは reason を分離）。list 未設定時は本分岐に入らない
+    # ＝従来挙動不変。
     disabled = legacy_disabled_paths()
     if disabled:
-        eff = effective_signed_path(request.scope)
-        if eff in disabled:
+        npath = normalize_path(effective_signed_path(request.scope))
+        if npath is None:
+            _log_ingest_decision(headers, "bad_path_blocked")
+            raise HTTPException(status_code=404, detail="Not Found")
+        if npath in disabled:
             _log_ingest_decision(headers, "legacy_blocked")
             raise HTTPException(status_code=404, detail="Not Found")
     if not verify_token(token, token_env):
@@ -667,12 +680,27 @@ async def authorize_optionally_signed(request: Request) -> None:
     - flag ON・署名ヘッダ皆無: 受理（従来どおり）。RV02-ENFORCE: 二重受理中の非署名受理を
       reason=unsigned_accepted で path 別計数（runbook §4(d) 到達率実測の材料・
       挙動は不変＝ログのみ）。強制化への切替は上記 env への path 追加（[人]ゲート）
+
+    RV02-ENFORCE-01: いずれかの env が有効な間は、分岐前に raw path を normalize_path で
+    正規化して照合する。正規化不能（encoded alias・raw_path 欠落等）は routing 層の decode
+    で handler に到達し得るため、比較不能のまま受理側へ倒さず 404（存在しないフリ・
+    reason=bad_path_blocked）で入口遮断する。unsigned_accepted / signed_required_blocked の
+    計数には混入させない（(d) 到達率実測の信頼性維持）。署名ヘッダ付きでも同じ入口で遮断
+    ＝署名検証の迂回経路を作らない。両 env とも未設定時は正規化前に return＝従来と byte 同一。
     """
-    if _in_signed_required(request.scope):
+    required = signed_required_paths()
+    if not required and not dual_accept_enabled():
+        return
+    npath = normalize_path(effective_signed_path(request.scope))
+    if npath is None:
+        _log_ingest_decision(request.headers, "bad_path_blocked",
+                             path_label="invalid_path")
+        raise HTTPException(status_code=404, detail="Not Found")
+    if npath in required:
         if not _has_signature_headers(request.headers):
             _log_ingest_decision(
                 request.headers, "signed_required_blocked",
-                path_label=_optin_path_label(effective_signed_path(request.scope)))
+                path_label=_optin_path_label(npath))
             raise HTTPException(status_code=404, detail="Not Found")
         await _enforce_signed_request(request)
         return
@@ -681,7 +709,7 @@ async def authorize_optionally_signed(request: Request) -> None:
     if not _has_signature_headers(request.headers):
         _log_ingest_decision(
             request.headers, "unsigned_accepted",
-            path_label=_optin_path_label(effective_signed_path(request.scope)))
+            path_label=_optin_path_label(npath))
         return
     await _enforce_signed_request(request)
 
