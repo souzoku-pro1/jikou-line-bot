@@ -39,6 +39,7 @@ import time
 from decimal import Decimal
 
 import anthropic
+import anyio
 from fastapi import APIRouter, Request
 from fastapi.responses import RedirectResponse, Response
 
@@ -60,6 +61,11 @@ _QUESTION_MAX_CHARS = 2000
 _CHAT_LIMIT = 30
 _MAX_SOURCES = 50                 # 出典の記録上限（超過は注記で明示）
 _API_TIMEOUT_SECONDS = 120.0
+# Q-01: 消費量の固定上限（いずれも超過は fail-closed・黙って続行しない）
+TOTAL_TIMEOUT_SECONDS = 300       # 1 質問全体の wall-clock 上限
+_MAX_TOOL_CALLS_TOTAL = 20        # 全 turn 合計の tool 呼び出し数上限
+_MAX_TOOL_USE_PER_TURN = 5        # 1 response 内の tool_use 数上限
+_MAX_TOOL_RESULT_BYTES = 50_000   # tool 結果（canonical JSON）の byte 上限
 
 # レート制限（固定窓・単一利用者前提のプロセス内カウンタ。webapp_auth の流儀）
 RATE_WINDOW_SECONDS = 600
@@ -77,6 +83,9 @@ NO_SOURCE_ANSWER = (
 ERROR_ANSWER = (
     "回答を生成できませんでした（時間切れまたは一時的なエラー）。しばらくして"
     "再試行してください。")
+TOO_LARGE_RESULT = (
+    "対象が大きすぎます。案件や条件を絞って再質問してください（この呼び出しの"
+    "結果は破棄され、回答の根拠には採用されません）。")
 
 # 要件4/7 の注記（サーバ機械判定の固定文言・閉集合）
 FLAG_NOTES = {
@@ -110,6 +119,9 @@ _SYSTEM = (
     "- 相続案件は list_souzoku_cases/get_souzoku_case から、時効案件は "
     "list_jikou_cases/get_jikou_case から辿る。案件番号が分からない場合は"
     "一覧を取得して絞り込む。\n"
+    "- 回答を終えるときは必ず submit_answer ツールを 1 回呼ぶ。source_refs "
+    "には、回答で実際に使用した出典（この会話で読み取りツールが返した "
+    "app と record_id）だけを列挙する。読んでいない記録は挙げない。\n"
     "- 回答は要点先行で簡潔に。表形式の羅列より短い文章を優先する。")
 
 
@@ -129,21 +141,33 @@ def _file(name: str) -> Response:
 
 def _record_source(ctx: dict, app_label: str, app_id: str, record_id: str,
                    pdf_url=None) -> None:
-    key = (app_label, str(record_id))
+    """Q-02(i): grammar 成立（app_id=数字列・record_id=数字列）のときのみ
+    有効出典として記録する。空・不正値は出典に数えない（fail-closed）。"""
+    app_id_s = str(app_id or "")
+    rid_s = str(record_id or "")
+    if not app_id_s.isdigit() or not _RECORD_ID_RE.fullmatch(rid_s):
+        return
+    key = (app_label, rid_s)
+    if key in ctx["source_keys"]:
+        return
+    ctx["source_keys"].add(key)
+    base = config.kintone_record_link_base()
+    url = f"{base}/{app_id_s}/show#record={rid_s}" if base is not None else None
+    entry = {"app": app_label, "record_id": rid_s, "url": url}
+    if pdf_url:
+        entry["pdf_url"] = pdf_url
+    ctx["sources"].append(entry)
+
+
+def _merge_source(ctx: dict, entry: dict) -> None:
+    """採用確定した tool 呼び出しの出典を本 ctx へ統合（上限つき）。"""
+    key = (entry["app"], entry["record_id"])
     if key in ctx["source_keys"]:
         return
     if len(ctx["sources"]) >= _MAX_SOURCES:
         ctx["flags"].add("sources_truncated")
         return
     ctx["source_keys"].add(key)
-    base = config.kintone_record_link_base()
-    url = None
-    if base is not None and str(app_id).isdigit() and \
-            _RECORD_ID_RE.fullmatch(str(record_id)):
-        url = f"{base}/{app_id}/show#record={record_id}"
-    entry = {"app": app_label, "record_id": str(record_id), "url": url}
-    if pdf_url:
-        entry["pdf_url"] = pdf_url
     ctx["sources"].append(entry)
 
 
@@ -372,6 +396,40 @@ _TOOLS = [
      "input_schema": _case_id_schema("jikou_case_record_id")},
 ]
 
+# Q-02(ii): 最終回答は submit_answer の構造化出力のみで受け付ける（本文 text
+# での回答は採用しない）。source_refs はサーバ実測の出典集合との subset 照合に
+# かける（参照欠落・実測集合外・切捨て領域参照は fail-closed）。
+SUBMIT_TOOL_NAME = "submit_answer"
+_SUBMIT_TOOL = {
+    "name": SUBMIT_TOOL_NAME,
+    "description": "最終回答の提出。回答本文と、回答で実際に使用した出典参照"
+                   "（この会話で読み取りツールが返したレコードの app と "
+                   "record_id のみ）を必ず指定する。回答を終えるときは必ず"
+                   "このツールを 1 回呼ぶ。",
+    "strict": True,
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "answer": {"type": "string",
+                       "description": "日本語の最終回答（簡潔に）"},
+            "source_refs": {
+                "type": "array",
+                "description": "回答で使用した出典参照の閉集合",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "app": {"type": "string"},
+                        "record_id": {"type": "string"},
+                    },
+                    "required": ["app", "record_id"],
+                    "additionalProperties": False,
+                }},
+        },
+        "required": ["answer", "source_refs"],
+        "additionalProperties": False,
+    },
+}
+
 _DISPATCH = {
     "list_souzoku_cases": _t_list_souzoku_cases,
     "get_souzoku_case": _t_get_souzoku_case,
@@ -388,17 +446,29 @@ _DISPATCH = {
 
 async def _dispatch(name: str, args: dict, ctx: dict) -> tuple:
     """tool 実行（閉集合外・引数 grammar 外・実行失敗はすべて is_error の固定
-    文言＝詳細を LLM/応答へ流さない。kintone へは検証済み値のみ到達）。"""
+    文言＝詳細を LLM/応答へ流さない。kintone へは検証済み値のみ到達）。
+
+    Q-01(iv): 結果は canonical JSON の byte 上限で検査し、超過は**呼び出し
+    ごと破棄**して固定文言で絞り込み再質問を誘導する（黙って切り捨てない）。
+    破棄した呼び出しの出典・flag は本 ctx へ統合しない＝モデルがその領域を
+    参照しても実測集合外として fail-closed になる（Q-02(iii)）。"""
     handler = _DISPATCH.get(name)
     if handler is None:
         return "未定義のツールです（読み取り専用の閉集合のみ使用できます）", True
+    sub = {"sources": [], "source_keys": set(), "flags": set()}
     try:
-        result = await handler(args if isinstance(args, dict) else {}, ctx)
+        result = await handler(args if isinstance(args, dict) else {}, sub)
     except Exception:
         return "取得に失敗しました（対象アプリに到達できないか一時的なエラー）", True
     if result is None:
         return "引数が不正です（案件レコード番号は数字のみ）", True
-    return json.dumps(result, ensure_ascii=False, default=str), False
+    payload = json.dumps(result, ensure_ascii=False, default=str)
+    if len(payload.encode("utf-8")) > _MAX_TOOL_RESULT_BYTES:
+        return TOO_LARGE_RESULT, True
+    for entry in sub["sources"]:
+        _merge_source(ctx, entry)
+    ctx["flags"] |= sub["flags"]
+    return payload, False
 
 
 # ── コスト概算（Decimal・float 非経由） ──────────────────────────────────────
@@ -429,9 +499,41 @@ def _anthropic_client():
     return _client_holder[0]
 
 
+def _validated_submission(args, ctx: dict):
+    """Q-02(ii)(iii): submit_answer の subset 照合。回答で使用したと申告された
+    source_refs がすべて**サーバ実測の出典集合**に載っているときのみ採用する。
+    参照欠落（refs 空）・型不正・実測集合外（未記録・切捨て領域含む）は
+    None＝fail-closed（no_source）。返り値は (answer, 採用出典 list)。"""
+    if not isinstance(args, dict):
+        return None
+    answer = args.get("answer")
+    refs = args.get("source_refs")
+    if not isinstance(answer, str) or not answer.strip():
+        return None
+    if not isinstance(refs, list) or not refs:
+        return None
+    by_key = {(s["app"], s["record_id"]): s for s in ctx["sources"]}
+    picked = []
+    seen = set()
+    for ref in refs:
+        if not isinstance(ref, dict):
+            return None
+        key = (str(ref.get("app") or ""), str(ref.get("record_id") or ""))
+        if key not in by_key:
+            return None                  # 実測集合外＝根拠なし参照
+        if key in seen:
+            continue
+        seen.add(key)
+        picked.append(by_key[key])
+    if not picked:
+        return None
+    return answer.strip(), picked
+
+
 async def _answer_question(question: str) -> dict:
     """1 質問の回答生成。戻り値は qa_store 保存形（answer/status/sources/notes/
-    model/tokens/cost/elapsed）。失敗・出典ゼロは固定文言へ fail-closed。"""
+    model/tokens/cost/elapsed）。失敗・出典ゼロは固定文言へ fail-closed。
+    Q-01: 全体 wall-clock timeout・全 turn 合計/1 turn の tool 数上限つき。"""
     started = time.monotonic()
     ctx = {"sources": [], "source_keys": set(), "flags": set()}
     usage = {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0}
@@ -439,8 +541,11 @@ async def _answer_question(question: str) -> dict:
 
     def _finish(answer: str, status: str) -> dict:
         notes = [FLAG_NOTES[f] for f in FLAG_NOTES if f in ctx["flags"]]
+        # Q-02: 出典は「採用された回答が使用した参照」のみ。fail-closed 応答
+        # （no_source/error）に実測出典を添えない（回答と出典の対応を崩さない）
+        sources = ctx["sources"] if status == "ok" else []
         return {"answer": answer, "status": status,
-                "sources": ctx["sources"], "notes": notes, "model": model,
+                "sources": sources, "notes": notes, "model": model,
                 "input_tokens": usage["input"],
                 "output_tokens": usage["output"],
                 "cache_read_tokens": usage["cache_read"],
@@ -452,44 +557,64 @@ async def _answer_question(question: str) -> dict:
 
     client = _anthropic_client()
     messages = [{"role": "user", "content": question}]
+    total_calls = 0
     try:
-        for _ in range(_MAX_TURNS):
-            resp = await client.messages.create(
-                model=model, max_tokens=_MAX_TOKENS,
-                system=[{"type": "text", "text": _SYSTEM,
-                         "cache_control": {"type": "ephemeral"}}],
-                tools=_TOOLS, messages=messages)
-            u = resp.usage
-            if u is not None:
-                usage["input"] += int(u.input_tokens or 0)
-                usage["output"] += int(u.output_tokens or 0)
-                usage["cache_read"] += int(u.cache_read_input_tokens or 0)
-                usage["cache_write"] += int(u.cache_creation_input_tokens or 0)
-            if resp.stop_reason == "tool_use":
-                messages.append({"role": "assistant", "content": resp.content})
-                results = []
-                for block in resp.content:
-                    if block.type == "tool_use":
+        # Q-01(i): 質問全体の wall-clock 上限（anyio.fail_after=asyncio.timeout
+        # 相当。asyncio は read-only checker の禁止 import 集合のため anyio）
+        with anyio.fail_after(TOTAL_TIMEOUT_SECONDS):
+            for _ in range(_MAX_TURNS):
+                resp = await client.messages.create(
+                    model=model, max_tokens=_MAX_TOKENS,
+                    system=[{"type": "text", "text": _SYSTEM,
+                             "cache_control": {"type": "ephemeral"}}],
+                    tools=_TOOLS + [_SUBMIT_TOOL], messages=messages)
+                u = resp.usage
+                if u is not None:
+                    usage["input"] += int(u.input_tokens or 0)
+                    usage["output"] += int(u.output_tokens or 0)
+                    usage["cache_read"] += int(u.cache_read_input_tokens or 0)
+                    usage["cache_write"] += int(
+                        u.cache_creation_input_tokens or 0)
+                if resp.stop_reason == "tool_use":
+                    blocks = [b for b in resp.content if b.type == "tool_use"]
+                    submits = [b for b in blocks
+                               if b.name == SUBMIT_TOOL_NAME]
+                    if submits:
+                        validated = _validated_submission(submits[0].input,
+                                                          ctx)
+                        if validated is None:
+                            return _finish(NO_SOURCE_ANSWER, "no_source")
+                        answer, picked = validated
+                        ctx["sources"] = picked   # 出典=回答で使用した閉集合
+                        return _finish(answer, "ok")
+                    # Q-01(iii): 1 response 内の tool_use 数上限
+                    if len(blocks) > _MAX_TOOL_USE_PER_TURN:
+                        return _finish(ERROR_ANSWER, "error")
+                    # Q-01(ii): 全 turn 合計の tool 呼び出し数上限
+                    total_calls += len(blocks)
+                    if total_calls > _MAX_TOOL_CALLS_TOTAL:
+                        return _finish(ERROR_ANSWER, "error")
+                    messages.append({"role": "assistant",
+                                     "content": resp.content})
+                    results = []
+                    for block in blocks:
                         content, is_error = await _dispatch(
                             block.name, block.input, ctx)
                         results.append({"type": "tool_result",
                                         "tool_use_id": block.id,
                                         "content": content,
                                         "is_error": is_error})
-                messages.append({"role": "user", "content": results})
-                continue
-            if resp.stop_reason in ("end_turn", "max_tokens"):
-                text = "".join(b.text for b in resp.content
-                               if b.type == "text").strip()
-                if not ctx["sources"] or not text:
-                    # 要件3: 出典ゼロの断定回答は返さない（fail-closed）
+                    messages.append({"role": "user", "content": results})
+                    continue
+                if resp.stop_reason in ("end_turn", "max_tokens"):
+                    # Q-02: submit_answer を経ない本文回答は採用しない
+                    # （参照欠落＝出典ゼロ扱いの fail-closed）
                     return _finish(NO_SOURCE_ANSWER, "no_source")
-                return _finish(text, "ok")
-            # refusal / pause_turn 等の想定外 stop は fail-closed
-            return _finish(ERROR_ANSWER, "error")
-        return _finish(ERROR_ANSWER, "error")     # turn 上限
+                # refusal / pause_turn 等の想定外 stop は fail-closed
+                return _finish(ERROR_ANSWER, "error")
+            return _finish(ERROR_ANSWER, "error")     # turn 上限
     except Exception:
-        # timeout・API エラー等——推測で埋めた回答を返さない
+        # wall-clock timeout・API エラー等——推測で埋めた回答を返さない
         return _finish(ERROR_ANSWER, "error")
 
 

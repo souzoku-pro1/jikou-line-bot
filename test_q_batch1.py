@@ -91,6 +91,11 @@ def _tool_use(name, args, tid="tu1"):
     return SimpleNamespace(type="tool_use", name=name, input=args, id=tid)
 
 
+def _submit(answer, refs, tid="sub1"):
+    return _tool_use("submit_answer",
+                     {"answer": answer, "source_refs": refs}, tid)
+
+
 def _text(t):
     return SimpleNamespace(type="text", text=t)
 
@@ -177,6 +182,18 @@ class TestToolClosedSet(unittest.TestCase):
 
     def test_dispatch_matches_tools(self):
         self.assertEqual(set(wq._DISPATCH), set(_EXPECTED_TOOLS))
+
+    def test_submit_tool_separated_and_structured(self):
+        # Q-02(ii): 最終回答は submit_answer の構造化出力のみ。読み取り閉集合
+        # （_TOOLS/_DISPATCH）には含めない（kintone へ到達しない）
+        self.assertEqual(wq.SUBMIT_TOOL_NAME, "submit_answer")
+        self.assertNotIn(wq.SUBMIT_TOOL_NAME, wq._DISPATCH)
+        self.assertNotIn(wq.SUBMIT_TOOL_NAME,
+                         [t["name"] for t in wq._TOOLS])
+        schema = wq._SUBMIT_TOOL["input_schema"]
+        self.assertEqual(schema["required"], ["answer", "source_refs"])
+        self.assertFalse(schema["additionalProperties"])
+        self.assertTrue(wq._SUBMIT_TOOL["strict"])
 
     def test_no_write_semantics_in_tool_names(self):
         for banned in ("create", "update", "delete", "upload", "write",
@@ -288,8 +305,9 @@ class TestAskFlow(_DbMixin):
         stub = _stub_client([
             _resp("tool_use",
                   [_tool_use("list_case_heirs", {"case_record_id": "12"})]),
-            _resp("end_turn",
-                  [_text("案件 No.12 の相続人のうち戸籍未確認は山田一郎です。")]),
+            _resp("tool_use",
+                  [_submit("案件 No.12 の相続人のうち戸籍未確認は山田一郎です。",
+                           [{"app": "App36(相続人)", "record_id": "201"}])]),
         ])
         r = self._post("案件12の戸籍未確認は？", stub)
         self.assertEqual(r.status_code, 303)
@@ -316,7 +334,8 @@ class TestAskFlow(_DbMixin):
         self.assertGreaterEqual(rec["elapsed_ms"], 0)
 
     def test_no_source_assertion_fails_closed(self):
-        # 要件3: tool を一度も呼ばず断定した回答は返さない
+        # 要件3: tool を一度も呼ばず断定した回答は返さない（submit を経ない
+        # 本文回答も採用しない=Q-02）
         stub = _stub_client([
             _resp("end_turn", [_text("相続人は山田一郎で確定です。")]),
         ])
@@ -363,7 +382,9 @@ class TestGradingAndCost(unittest.TestCase):
         stub = _stub_client([
             _resp("tool_use",
                   [_tool_use("list_case_kosekis", {"case_record_id": "9"})]),
-            _resp("end_turn", [_text("戸籍は3通取得済みです。")]),
+            _resp("tool_use",
+                  [_submit("戸籍は取得済みです。",
+                           [{"app": "App33(戸籍読解)", "record_id": "70"}])]),
         ])
         pdf = "https://drive.google.com/file/d/1AbC-dEfG_hIjKlMnOpQrStUv/view"
         rows = [{"record_id": "70", "honseki": "川口市", "hittousha": "山田",
@@ -383,7 +404,9 @@ class TestGradingAndCost(unittest.TestCase):
         stub = _stub_client([
             _resp("tool_use",
                   [_tool_use("list_case_assets", {"case_record_id": "9"})]),
-            _resp("end_turn", [_text("評価額合計は100万円です。")]),
+            _resp("tool_use",
+                  [_submit("評価額合計は100万円です。",
+                           [{"app": "App35(財産)", "record_id": "301"}])]),
         ])
         assets = {"records": [_rec(**{"$id": "301", "財産種別": "不動産_土地",
                                       "評価額": "1000000",
@@ -418,7 +441,9 @@ class TestPiiSentinel(_DbMixin):
         stub = _stub_client([
             _resp("tool_use",
                   [_tool_use("list_case_heirs", {"case_record_id": "12"})]),
-            _resp("end_turn", [_text(sent_a)]),
+            _resp("tool_use",
+                  [_submit(sent_a,
+                           [{"app": "App36(相続人)", "record_id": "201"}])]),
         ])
         heirs = {"records": [_rec(**{"$id": "201", "氏名": "n",
                                      "戸籍確認済": "yes"})],
@@ -520,6 +545,189 @@ class TestQaStore(_DbMixin):
 
     def test_status_closed_set_pinned(self):
         self.assertEqual(qa_store.STATUS_VALUES, ("ok", "no_source", "error"))
+
+
+# ── Q-01: 消費量の上限（4 境界の negative） ───────────────────────────────────
+def _small_heirs():
+    return {"records": [_rec(**{"$id": "201", "氏名": "n",
+                                "戸籍確認済": "yes"})],
+            "excluded_cancelled_count": 0}
+
+
+class TestConsumptionLimits(unittest.TestCase):
+    def setUp(self):
+        wq._ask_times.clear()
+
+    def _answer(self, stub, heirs=None):
+        with patch.dict(os.environ, _ENV), \
+             patch.object(wq, "_anthropic_client", lambda: stub), \
+             patch.object(wq.souzoku_dash, "_load_heirs",
+                          AsyncMock(return_value=heirs if heirs is not None
+                                    else _small_heirs())):
+            return _run(wq._answer_question("質問"))
+
+    def test_1_too_many_tool_use_in_one_response(self):
+        # (iii) 1 response 内の tool_use 数上限（超過=ERROR・dispatch 非到達）
+        blocks = [_tool_use("list_case_heirs", {"case_record_id": str(i)},
+                            tid=f"tu{i}") for i in range(1, 7)]   # 6 > 5
+        stub = _stub_client([_resp("tool_use", blocks)])
+        load = AsyncMock(return_value=_small_heirs())
+        with patch.dict(os.environ, _ENV), \
+             patch.object(wq, "_anthropic_client", lambda: stub), \
+             patch.object(wq.souzoku_dash, "_load_heirs", load):
+            result = _run(wq._answer_question("質問"))
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["answer"], wq.ERROR_ANSWER)
+        load.assert_not_called()
+
+    def test_2_total_tool_calls_capped(self):
+        # (ii) 全 turn 合計 20 を超えたら fail-closed（5×5=25 で 5turn 目に超過）
+        def turn(k):
+            return _resp("tool_use", [
+                _tool_use("list_case_heirs", {"case_record_id": str(k * 10 + i)},
+                          tid=f"t{k}-{i}") for i in range(5)])
+        stub = _stub_client([turn(k) for k in range(5)])
+        result = self._answer(stub)
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["answer"], wq.ERROR_ANSWER)
+        self.assertEqual(stub.messages.create.await_count, 5)
+
+    def test_3_huge_tool_result_discarded_with_guidance(self):
+        # (iv) 巨大 loader 結果は「黙って切り捨てず」固定文言で再質問誘導・
+        # 出典にも数えない（切捨て領域参照は Q-02 側で拒否される）
+        huge = {"records": [_rec(**{"$id": str(200 + i),
+                                    "氏名": "山" * 200})
+                            for i in range(300)],
+                "excluded_cancelled_count": 0}
+        ctx = {"sources": [], "source_keys": set(), "flags": set()}
+        with patch.dict(os.environ, _ENV), \
+             patch.object(wq.souzoku_dash, "_load_heirs",
+                          AsyncMock(return_value=huge)):
+            content, is_error = _run(wq._dispatch(
+                "list_case_heirs", {"case_record_id": "12"}, ctx))
+        self.assertTrue(is_error)
+        self.assertEqual(content, wq.TOO_LARGE_RESULT)
+        self.assertEqual(ctx["sources"], [])       # 出典へ統合しない
+        # end-to-end: 破棄領域を引用した submit は no_source へ fail-closed
+        stub = _stub_client([
+            _resp("tool_use",
+                  [_tool_use("list_case_heirs", {"case_record_id": "12"})]),
+            _resp("tool_use",
+                  [_submit("大量データに基づく回答",
+                           [{"app": "App36(相続人)", "record_id": "205"}])]),
+        ])
+        result = self._answer(stub, heirs=huge)
+        self.assertEqual(result["status"], "no_source")
+        self.assertEqual(result["answer"], wq.NO_SOURCE_ANSWER)
+        self.assertEqual(result["sources"], [])
+
+    def test_4_wall_clock_timeout(self):
+        # (i) 全体 wall-clock timeout（API が沈黙しても固定文言へ）
+        async def slow(*args, **kwargs):
+            await asyncio.sleep(0.5)
+        stub = SimpleNamespace(messages=SimpleNamespace(
+            create=AsyncMock(side_effect=slow)))
+        with patch.dict(os.environ, _ENV), \
+             patch.object(wq, "_anthropic_client", lambda: stub), \
+             patch.object(wq, "TOTAL_TIMEOUT_SECONDS", 0.05):
+            result = _run(wq._answer_question("質問"))
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["answer"], wq.ERROR_ANSWER)
+
+
+# ── Q-02: 出典と回答の対応保証（negative） ────────────────────────────────────
+class TestSourceCorrespondence(unittest.TestCase):
+    def setUp(self):
+        wq._ask_times.clear()
+
+    def _ctx(self):
+        return {"sources": [], "source_keys": set(), "flags": set()}
+
+    def test_invalid_ids_not_recorded_as_sources(self):
+        # (i) 空・grammar 外の app_id/record_id は出典に数えない
+        ctx = self._ctx()
+        wq._record_source(ctx, "App36(相続人)", "36", "")        # 空 ID
+        wq._record_source(ctx, "App36(相続人)", "36", "abc")     # 非数字
+        wq._record_source(ctx, "App36(相続人)", "", "201")       # app 空
+        wq._record_source(ctx, "App36(相続人)", "x36", "201")    # app 非数字
+        self.assertEqual(ctx["sources"], [])
+        wq._record_source(ctx, "App36(相続人)", "36", "201")     # 正常形
+        self.assertEqual(len(ctx["sources"]), 1)
+
+    def _answer(self, stub):
+        with patch.dict(os.environ, _ENV), \
+             patch.object(wq, "_anthropic_client", lambda: stub), \
+             patch.object(wq.souzoku_dash, "_load_heirs",
+                          AsyncMock(return_value=_small_heirs())):
+            return _run(wq._answer_question("質問"))
+
+    def test_assertion_after_unrelated_tool_rejected(self):
+        # (iv) 無関係 tool 1 回後の断定（refs 空）は通らない
+        stub = _stub_client([
+            _resp("tool_use",
+                  [_tool_use("list_case_heirs", {"case_record_id": "12"})]),
+            _resp("tool_use", [_submit("断定回答", [])]),
+        ])
+        result = self._answer(stub)
+        self.assertEqual(result["status"], "no_source")
+        self.assertEqual(result["answer"], wq.NO_SOURCE_ANSWER)
+
+    def test_unrecorded_source_reference_rejected(self):
+        # (iv) 実測集合に無い source 参照は拒否
+        stub = _stub_client([
+            _resp("tool_use",
+                  [_tool_use("list_case_heirs", {"case_record_id": "12"})]),
+            _resp("tool_use",
+                  [_submit("読んでいない記録を引用",
+                           [{"app": "App36(相続人)", "record_id": "999"}])]),
+        ])
+        result = self._answer(stub)
+        self.assertEqual(result["status"], "no_source")
+        self.assertEqual(result["sources"], [])
+
+    def test_sources_narrowed_to_cited_subset(self):
+        # (ii) 出典=回答で使用した参照の閉集合（読んだが引用しない記録は
+        # 出典に載せない）
+        heirs = {"records": [
+            _rec(**{"$id": "201", "氏名": "a", "戸籍確認済": "yes"}),
+            _rec(**{"$id": "202", "氏名": "b", "戸籍確認済": "yes"})],
+            "excluded_cancelled_count": 0}
+        stub = _stub_client([
+            _resp("tool_use",
+                  [_tool_use("list_case_heirs", {"case_record_id": "12"})]),
+            _resp("tool_use",
+                  [_submit("No.201 についての回答",
+                           [{"app": "App36(相続人)", "record_id": "201"}])]),
+        ])
+        with patch.dict(os.environ, _ENV), \
+             patch.object(wq, "_anthropic_client", lambda: stub), \
+             patch.object(wq.souzoku_dash, "_load_heirs",
+                          AsyncMock(return_value=heirs)):
+            result = _run(wq._answer_question("質問"))
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual([s["record_id"] for s in result["sources"]], ["201"])
+
+    def test_malformed_refs_rejected(self):
+        for bad in ("not-a-list", [{"app": "App36(相続人)"}], ["x"], None):
+            with self.subTest(refs=repr(bad)[:20]):
+                out = wq._validated_submission(
+                    {"answer": "a", "source_refs": bad},
+                    {"sources": [{"app": "App36(相続人)", "record_id": "201",
+                                  "url": None}],
+                     "source_keys": set(), "flags": set()})
+                self.assertIsNone(out)
+
+
+# ── レビュー留保: SQLAlchemy echo/debug の無効 pin ────────────────────────────
+class TestDbEchoDisabled(_DbMixin):
+    def test_engine_echo_disabled(self):
+        # SQL bind（質問・回答が INSERT パラメータとして流れる）が engine echo
+        # で emit されない構造の pin（本番=echo 無効・db.py に echo 指定なし）
+        eng = db.get_async_engine()
+        self.assertFalse(bool(eng.sync_engine.echo))
+        src = Path(db.__file__).read_text(encoding="utf-8")
+        self.assertNotIn("echo=True", src)
+        self.assertNotIn('echo="debug"', src)
 
 
 if __name__ == "__main__":
