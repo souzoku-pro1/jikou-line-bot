@@ -371,6 +371,37 @@ async def sw_js(request: Request):
     return _file("sw.js", "application/javascript")
 
 
+@router.get("/app/shell.js")
+@_gate
+async def shell_js(request: Request):
+    """共通画面枠（ヘッダ・ナビ・ログアウト）の DOM 構築 JS（PWA-BATCH-1 A(iii)）。"""
+    return _file("shell.js", "application/javascript")
+
+
+@router.get("/app/icons/icon-192.png")
+@_gate
+async def icon_192(request: Request):
+    """ホーム画面アイコン（PWA-BATCH-1 A(i)。webapp/icons/ 配下＝固定名のみ配信）。"""
+    return _file("icons/icon-192.png", "image/png")
+
+
+@router.get("/app/icons/icon-512.png")
+@_gate
+async def icon_512(request: Request):
+    return _file("icons/icon-512.png", "image/png")
+
+
+@router.post("/app/logout")
+@_gate
+async def logout(request: Request):
+    """ログアウト（PWA-BATCH-1 A(iii)）。当該ブラウザの cookie 削除のみ——
+    session は無状態の署名付き値のため、サーバ側の全失効手段は従来どおり
+    WEBAPP_SESSION_SECRET の差し替え（P4-001 裁定のまま・自動 rotation なし）。"""
+    resp = RedirectResponse("/app/login", status_code=303)
+    resp.delete_cookie(_COOKIE, path="/app")
+    return resp
+
+
 @router.get("/app/{_rest:path}")
 @_gate
 async def app_unknown(request: Request):

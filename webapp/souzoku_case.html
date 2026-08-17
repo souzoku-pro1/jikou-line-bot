@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>相続案件ダッシュボード - 案件管理（仮）</title>
+<style>
+body{font-family:sans-serif;max-width:960px;margin:1.5rem auto;padding:0 1rem}
+table{border-collapse:collapse;width:100%;margin-bottom:1.2rem}
+th,td{border:1px solid #ccc;padding:.35rem .6rem;font-size:.92rem;text-align:left;word-break:break-all}
+th{background:#f6f6f6}
+h2{margin:.9rem 0 .4rem}
+a{color:#1a3c6e}
+.notice{background:#fff7e0;border:1px solid #e0c060;border-radius:6px;padding:.6rem .8rem;font-size:.9rem;margin:.6rem 0}
+.warn{color:#a04000;font-size:.9rem}
+.muted{color:#666;font-size:.9rem}
+</style>
+</head>
+<body>
+<h1>相続案件ダッシュボード</h1>
+<p><a href="/app/souzoku">← 相続案件一覧</a></p>
+<!-- PWA-BATCH-1 B(ii)(iv): read-only の1画面参照ビュー。確定・承認・編集の
+     操作 UI は一切置かない（機械は確定しない）。状態注記は表示する -->
+<p class="notice" id="notice"></p>
+<h2>進行状態</h2>
+<table id="progress"></table>
+<h2>案件（相談カード）</h2>
+<table id="case"></table>
+<h2>相続人一覧（App36・取消済みは共通filterで除外）</h2>
+<p class="warn" id="heirs-note"></p>
+<table id="heirs"><thead><tr><th>ID</th><th>氏名</th><th>続柄</th><th>法定相続分</th><th>状態</th><th>戸籍確認済</th><th>印鑑証明</th><th>データ源</th><th>原本</th></tr></thead><tbody id="heir-rows"></tbody></table>
+<h2>人物情報（App34・統合済み無効は共通filterで除外）</h2>
+<p class="warn" id="persons-note"></p>
+<table id="persons"><thead><tr><th>ID</th><th>氏名</th><th>続柄メモ</th><th>生死区分</th><th>被相続人</th><th>名寄せ</th><th>相続人候補</th><th>相続資格</th><th>確認状態</th><th>原本</th></tr></thead><tbody id="person-rows"></tbody></table>
+<h2>財産目録（App35）</h2>
+<p class="warn" id="assets-note"></p>
+<table id="assets"><thead><tr><th>ID</th><th>財産種別</th><th>名義</th><th>評価額</th><th>評価方法</th><th>評価基準日</th><th>評価確定</th><th>データ源</th><th>有効</th><th>原本</th></tr></thead><tbody id="asset-rows"></tbody></table>
+<h2>直近生成書類（App30・この案件の絞込）</h2>
+<p class="warn" id="docs-note"></p>
+<table id="docs"><thead><tr><th>ID</th><th>件名</th><th>チャネル</th><th>方向</th><th>発送ステータス</th><th>発送日時</th><th>成果物</th><th>原本</th></tr></thead><tbody id="doc-rows"></tbody></table>
+<script src="/app/app.js"></script>
+<script src="/app/shell.js"></script>
+<script>
+function v(rec, name) { return (rec[name] && rec[name].value) || ""; }
+function td(content) {
+  const e = document.createElement("td");
+  if (content instanceof Node) { e.appendChild(content); } else { e.textContent = content; }
+  return e;
+}
+function noteFail(id) {
+  document.getElementById(id).textContent =
+    "このセクションは取得できませんでした（一部データ欠落・再読み込みで再試行）";
+}
+function recLink(base, appId, recId) {
+  if (!base || !appId || !recId) { return document.createTextNode(""); }
+  const a = document.createElement("a");
+  a.href = base + "/" + encodeURIComponent(appId) + "/show#record=" +
+    encodeURIComponent(recId);
+  a.textContent = "kintone";
+  a.target = "_blank";
+  a.rel = "noopener noreferrer";
+  return a;
+}
+function kvRow(table, label, value) {
+  const tr = document.createElement("tr");
+  const th = document.createElement("th"); th.textContent = label;
+  tr.appendChild(th);
+  tr.appendChild(td(value));
+  table.appendChild(tr);
+}
+async function load() {
+  const id = new URLSearchParams(location.search).get("id") || "";
+  if (!/^[0-9]{1,10}$/.test(id)) { document.body.textContent = "不正な ID"; return; }
+  const resp = await app_fetch("/app/api/souzoku/cases/" + id);
+  if (resp.redirected || !resp.headers.get("content-type")?.includes("json")) {
+    location.href = "/app/login"; return;
+  }
+  if (!resp.ok) { document.getElementById("case").textContent = "取得できませんでした"; return; }
+  const data = await resp.json();
+  document.getElementById("notice").textContent = data.notice;
+  const links = data.links || null;
+  const base = links ? links.base : "";
+  const apps = links ? links.apps : {};
+
+  // 案件（相談カード）: レコード素通し表示（内部専用・kintone 直視と同格）
+  const caseTable = document.getElementById("case");
+  for (const pair of Object.entries(data.case)) {
+    if (pair[0].startsWith("$")) { continue; }
+    kvRow(caseTable, pair[0],
+          typeof pair[1].value === "string" ? pair[1].value
+                                            : JSON.stringify(pair[1].value));
+  }
+
+  // 相続人（App36）
+  let heirs = [];
+  if (data.heirs.ok) {
+    heirs = data.heirs.records;
+    const ex = data.heirs.excluded_cancelled_count;
+    document.getElementById("heirs-note").textContent =
+      ex > 0 ? `取消済み ${ex} 行を表示から除外しています（行削除はされていません）` : "";
+    const rows = document.getElementById("heir-rows");
+    for (const rec of heirs) {
+      const tr = document.createElement("tr");
+      const conf = v(rec, "戸籍確認済");
+      const cells = [v(rec, "$id"), v(rec, "氏名"), v(rec, "続柄"),
+                     v(rec, "法定相続分"), v(rec, "状態"),
+                     conf === "yes" ? "yes（確定）" : "no【未確定】",
+                     v(rec, "印鑑証明"), v(rec, "データ源"),
+                     recLink(base, apps.heir, v(rec, "$id"))];
+      for (const c of cells) { tr.appendChild(td(c)); }
+      rows.appendChild(tr);
+    }
+  } else { noteFail("heirs-note"); }
+
+  // 人物（App34）
+  let persons = [];
+  if (data.persons.ok) {
+    persons = data.persons.records;
+    const ex = data.persons.excluded_merged_count;
+    document.getElementById("persons-note").textContent =
+      ex > 0 ? `統合済み無効 ${ex} 行を表示から除外しています（soft merge の敗者行）` : "";
+    const rows = document.getElementById("person-rows");
+    for (const rec of persons) {
+      const tr = document.createElement("tr");
+      const nayose = v(rec, "名寄せ確定");
+      const cells = [v(rec, "$id"), v(rec, "氏名"), v(rec, "続柄メモ"),
+                     v(rec, "生死区分"),
+                     v(rec, "被相続人フラグ") === "yes" ? "被相続人" : "",
+                     nayose === "確定" ? "確定" : `${nayose || "未設定"}【未確定】`,
+                     v(rec, "相続人候補"), v(rec, "相続資格"),
+                     v(rec, "確認状態"),
+                     recLink(base, apps.person, v(rec, "$id"))];
+      for (const c of cells) { tr.appendChild(td(c)); }
+      rows.appendChild(tr);
+    }
+  } else { noteFail("persons-note"); }
+
+  // 財産（App35）: 合計は 有効=no 以外の評価額。未確定評価の混在は明示（①§6.9）
+  let assets = [];
+  if (data.assets.ok) {
+    assets = data.assets.records;
+    const rows = document.getElementById("asset-rows");
+    let total = 0;
+    let unconfirmed = 0;
+    for (const rec of assets) {
+      const tr = document.createElement("tr");
+      const amount = v(rec, "評価額");
+      const fixed = v(rec, "評価確定");
+      if (v(rec, "有効") !== "no" && amount !== "") {
+        total += Number(amount) || 0;
+        if (fixed !== "yes") { unconfirmed += 1; }
+      }
+      const cells = [v(rec, "$id"), v(rec, "財産種別"), v(rec, "名義"),
+                     amount === "" ? "" : Number(amount).toLocaleString("ja-JP"),
+                     v(rec, "評価方法"), v(rec, "評価基準日"),
+                     fixed === "yes" ? "yes" : "no【未確定】",
+                     v(rec, "データ源"), v(rec, "有効"),
+                     recLink(base, apps.asset, v(rec, "$id"))];
+      for (const c of cells) { tr.appendChild(td(c)); }
+      rows.appendChild(tr);
+    }
+    document.getElementById("assets-note").textContent =
+      `評価額合計（有効行）: ${total.toLocaleString("ja-JP")} 円` +
+      (unconfirmed > 0 ? `——未確定評価 ${unconfirmed} 件を含む参考値です` : "");
+  } else { noteFail("assets-note"); }
+
+  // 直近生成書類（App30）
+  if (data.documents.ok) {
+    const rows = document.getElementById("doc-rows");
+    if (data.documents.records.length === 0) {
+      document.getElementById("docs-note").textContent =
+        "この案件の発送管理レコードはありません（0件）";
+    }
+    for (const rec of data.documents.records) {
+      const tr = document.createElement("tr");
+      const fv = v(rec, "成果物");
+      const files = Array.isArray(fv) ? fv.map((f) => f.name).join(" / ") : "";
+      const cells = [v(rec, "$id"), v(rec, "件名"), v(rec, "チャネル"),
+                     v(rec, "方向"), v(rec, "発送ステータス"),
+                     v(rec, "発送日時"), files,
+                     recLink(base, apps.shipping, v(rec, "$id"))];
+      for (const c of cells) { tr.appendChild(td(c)); }
+      rows.appendChild(tr);
+    }
+  } else { noteFail("docs-note"); }
+
+  // 進行状態（機械的データのみ・法務判断の自動化なし）
+  const prog = document.getElementById("progress");
+  kvRow(prog, "書類ステータス（相談カード）", v(data.case, "書類ステータス") || "（未設定）");
+  if (data.derivation.ok) {
+    const head = data.derivation.head;
+    kvRow(prog, "相続人導出（DerivationRun）",
+          head ? `run #${head.run_id} / ${head.run_status}` +
+                 (head.provisional ? "（暫定・未確定）" : "")
+               : "導出結果なし");
+  } else {
+    kvRow(prog, "相続人導出（DerivationRun）", "取得できませんでした");
+  }
+  if (data.heirs.ok) {
+    const conf = heirs.filter((r) => v(r, "戸籍確認済") === "yes").length;
+    kvRow(prog, "相続人（App36）",
+          `有効 ${heirs.length} 行 / 戸籍確認済 ${conf} 行` +
+          (data.heirs.excluded_cancelled_count > 0
+            ? ` / 取消済み除外 ${data.heirs.excluded_cancelled_count} 行` : ""));
+  }
+  if (data.persons.ok) {
+    const un = persons.filter((r) => v(r, "名寄せ確定") !== "確定").length;
+    kvRow(prog, "人物（App34）",
+          `有効 ${persons.length} 行 / 名寄せ未確定 ${un} 行` +
+          (data.persons.excluded_merged_count > 0
+            ? ` / 統合済み無効除外 ${data.persons.excluded_merged_count} 行` : ""));
+  }
+  if (data.assets.ok) {
+    const fixed = assets.filter((r) => v(r, "評価確定") === "yes").length;
+    kvRow(prog, "財産（App35）", `${assets.length} 件 / 評価確定 ${fixed} 件`);
+  }
+}
+load();
+</script>
+</body>
+</html>

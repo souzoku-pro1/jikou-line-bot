@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>案件管理（仮）</title>
 <link rel="manifest" href="/app/manifest.json">
+<link rel="apple-touch-icon" href="/app/icons/icon-192.png">
 <style>
 body{font-family:sans-serif;max-width:720px;margin:2rem auto;padding:0 1rem}
 .card{border:1px solid #ccc;border-radius:8px;padding:1rem;margin:.5rem 0;color:#666}
@@ -12,11 +13,14 @@ body{font-family:sans-serif;max-width:720px;margin:2rem auto;padding:0 1rem}
 </head>
 <body>
 <h1>案件管理（仮）ダッシュボード</h1>
-<!-- P4-001 shell → P4-002 で案件画面を結線（read-only） -->
+<!-- P4-001 shell → P4-002 で案件画面を結線（read-only）→ PWA-BATCH-1 で
+     相続案件ダッシュボード・共通画面枠を追加（read-only のまま） -->
+<div class="card"><a href="/app/souzoku">相続案件ダッシュボード</a></div>
 <div class="card"><a href="/app/cases">案件一覧</a></div>
 <div class="card">書類到着状況（P4-003・scan 到着ゲート後）</div>
 <div class="card"><a href="/app/approvals">承認キュー参照</a></div>
 <div class="card"><a href="/app/kinship">相続人関係図</a></div>
 <script src="/app/app.js"></script>
+<script src="/app/shell.js"></script>
 </body>
 </html>

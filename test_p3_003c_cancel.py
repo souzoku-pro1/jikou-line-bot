@@ -992,6 +992,10 @@ class TestReaderManifestClosure(unittest.TestCase):
         ("hub/shokumu_plan.py", "_second_stage_conditions"):
             {"search": "filter"},
         ("hub/shokumu_plan.py", "_app36_rows_hash"): {"search": "filter"},
+        # PWA-BATCH-1: 相続案件ダッシュボード（read-only 表示・filter 経由で
+        # 取消済みを除外し、除外件数のみ注記用に返す）
+        ("hub/webapp_souzoku_dashboard.py", "_load_heirs"):
+            {"search": "filter"},
         ("daily_healthcheck.py", "check_app36_confirmed_decisions"): {
             "search": "exempt",
             "reason": "H11a は最終網（凍結票 §4.2/§4.4: H11a 変更不要・取消済み"

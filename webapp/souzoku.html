@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>相続案件 - 案件管理（仮）</title>
+<style>
+body{font-family:sans-serif;max-width:960px;margin:1.5rem auto;padding:0 1rem}
+table{border-collapse:collapse;width:100%}
+th,td{border:1px solid #ccc;padding:.4rem .6rem;font-size:.95rem;text-align:left}
+input,button{font-size:1rem;padding:.3rem .6rem;margin:0 .3rem .8rem 0}
+a{color:#1a3c6e}
+</style>
+</head>
+<body>
+<h1>相続案件</h1>
+<!-- PWA-BATCH-1 B(i): 案件選択（read-only）。氏名検索は取得済みページの
+     クライアント側絞込のみ（自由文字列を kintone query へ埋めない既存規律） -->
+<div>
+  <input id="q" type="search" placeholder="氏名・被相続人名で絞込（表示中のページ内）">
+  <button id="prev">前へ</button><button id="next">次へ</button>
+  <span id="page"></span>
+</div>
+<table>
+  <thead><tr><th>ID</th><th>氏名</th><th>被相続人名</th><th>書類ステータス</th><th>登録日時</th><th>更新日時</th></tr></thead>
+  <tbody id="rows"></tbody>
+</table>
+<script src="/app/app.js"></script>
+<script src="/app/shell.js"></script>
+<script>
+let offset = 0;
+const limit = 50;
+let loaded = [];
+function v(rec, name) { return (rec[name] && rec[name].value) || ""; }
+function render() {
+  const q = document.getElementById("q").value.trim();
+  const rows = document.getElementById("rows");
+  rows.replaceChildren();
+  let shown = 0;
+  for (const rec of loaded) {
+    if (q && !(v(rec, "氏名").includes(q) || v(rec, "被相続人名").includes(q))) {
+      continue;
+    }
+    shown += 1;
+    const tr = document.createElement("tr");
+    const id = v(rec, "$id");
+    const link = document.createElement("a");
+    link.href = "/app/souzoku/case?id=" + encodeURIComponent(id);
+    link.textContent = id;
+    const cells = [link, v(rec, "氏名"), v(rec, "被相続人名"),
+                   v(rec, "書類ステータス"), v(rec, "登録日時"),
+                   v(rec, "更新日時")];
+    for (const c of cells) {
+      const td = document.createElement("td");
+      if (c instanceof Node) { td.appendChild(c); } else { td.textContent = c; }
+      tr.appendChild(td);
+    }
+    rows.appendChild(tr);
+  }
+  document.getElementById("page").textContent =
+    `offset ${offset}（${shown}/${loaded.length}件表示）`;
+  document.getElementById("prev").disabled = offset === 0;
+  document.getElementById("next").disabled = loaded.length < limit;
+}
+async function load() {
+  const p = new URLSearchParams({limit: limit, offset: offset});
+  const resp = await app_fetch("/app/api/souzoku/cases?" + p);
+  if (resp.redirected || !resp.headers.get("content-type")?.includes("json")) {
+    location.href = "/app/login"; return;      // 未認証（session 失効）
+  }
+  const data = await resp.json();
+  loaded = data.records;
+  render();
+}
+document.getElementById("q").addEventListener("input", render);
+document.getElementById("prev").addEventListener("click", () => { offset = Math.max(0, offset - limit); load(); });
+document.getElementById("next").addEventListener("click", () => { offset += limit; load(); });
+load();
+</script>
+</body>
+</html>

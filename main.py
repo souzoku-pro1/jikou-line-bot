@@ -1617,5 +1617,8 @@ from hub.webapp_approval_view import router as approval_view_router  # noqa: E40
 app.include_router(approval_view_router)
 from hub.webapp_kinship_view import router as kinship_view_router  # noqa: E402
 app.include_router(kinship_view_router)
+# PWA-BATCH-1: 相続案件ダッシュボード（read-only）。catch-all より先に結線
+from hub.webapp_souzoku_dashboard import router as souzoku_dash_router  # noqa: E402
+app.include_router(souzoku_dash_router)
 from hub.webapp_auth import router as webapp_router  # noqa: E402
 app.include_router(webapp_router)
