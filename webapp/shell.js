@@ -6,6 +6,7 @@
     ["/app", "ホーム"],
     ["/app/souzoku", "相続案件"],
     ["/app/cases", "案件一覧"],
+    ["/app/q", "質問"],
     ["/app/approvals", "承認"],
     ["/app/kinship", "関係図"],
   ];
