@@ -198,7 +198,10 @@ class TestFieldClosedSets(unittest.TestCase):
         self.assertEqual(sd._ASSET_FIELDS,
                          ["$id", "財産種別", "名義", "評価額", "評価方法",
                           "評価基準日", "評価確定", "データ源", "有効"])
-        self.assertEqual(sd._DOC_FIELDS,
+        self.assertEqual(sd._DOC_FETCH_FIELDS,
+                         ["$id", "件名", "チャネル", "方向", "発送ステータス",
+                          "発送日時", "成果物", "Drive_fileId"])
+        self.assertEqual(sd._DOC_VIEW_FIELDS,
                          ["$id", "件名", "チャネル", "方向", "発送ステータス",
                           "発送日時", "成果物"])
         # 「取得するが表示しない」PII の不在 pin（PWA-01 指定の代表）
@@ -378,7 +381,7 @@ class TestDashboardApi(unittest.TestCase):
         self.assertEqual(calls[4].args[1],
                          '案件アプリID = "26" and 案件レコードID = "12" '
                          "order by 更新日時 desc limit 20")
-        self.assertEqual(calls[4].kwargs.get("fields"), sd._DOC_FIELDS)
+        self.assertEqual(calls[4].kwargs.get("fields"), sd._DOC_FETCH_FIELDS)
         # filter が状態 field を読めることの pin（黙った縮小の防波堤）
         self.assertIn("統合状態", sd._PERSON_FETCH_FIELDS)
         self.assertIn("取消済み", sd._HEIR_FETCH_FIELDS)

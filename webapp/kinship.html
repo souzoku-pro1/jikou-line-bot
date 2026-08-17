@@ -93,7 +93,7 @@ function renderKosekis(out, data) {
   out.appendChild(el("div", "meta", `取得済み戸籍（App33・${list.length}通）`));
   const table = document.createElement("table");
   const head = document.createElement("tr");
-  for (const h of ["No.", "本籍", "筆頭者", "従前戸籍（本籍）"]) {
+  for (const h of ["No.", "本籍", "筆頭者", "従前戸籍（本籍）", "原本PDF"]) {
     head.appendChild(el("th", "", h));
   }
   table.appendChild(head);
@@ -103,6 +103,19 @@ function renderKosekis(out, data) {
     tr.appendChild(el("td", "", k.honseki || "（読解なし）"));
     tr.appendChild(el("td", "", k.hittousha || ""));
     tr.appendChild(el("td", "", k.juzen_honseki || "—"));
+    // PWA-PDF-LINK: サーバが grammar 検証済みの Drive 直リンクのみリンク化
+    // （参照なし行は「—」＝壊れたリンクを出さない。閲覧は開く人の Google
+    // ログイン権限に依存・サーバは PDF を中継しない）
+    const tdPdf = el("td", "", "—");
+    if (k.pdf_url && k.pdf_url.startsWith("https://drive.google.com/file/d/")) {
+      const a = document.createElement("a");
+      a.href = k.pdf_url;
+      a.textContent = "PDF";
+      a.target = "_blank";
+      a.rel = "noopener noreferrer";
+      tdPdf.replaceChildren(a);
+    }
+    tr.appendChild(tdPdf);
     table.appendChild(tr);
   }
   out.appendChild(table);
