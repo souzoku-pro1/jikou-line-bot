@@ -851,3 +851,19 @@ def get_admin_line_user_id() -> str:
         os.environ.get("LINE_ADMIN_USER_ID", "")
         or os.environ.get("ATTORNEY_LINE_USER_ID", "")
     )
+
+
+def kintone_record_link_base():
+    """PWA 表示用: kintone レコード原本リンクの base（PWA-BATCH-1）。
+
+    正規形（サブドメイン英数ハイフンのみ）のときだけ "https://<sub>.cybozu.com/k"
+    を返し、それ以外（未設定・フル URL 形式等）は None＝リンク非表示の縮退。
+    read-only の URL 文字列組み立てのみ（API 呼出しなし）。PWA 側 module は
+    read-only checker の禁止 import 集合（os）により env を直接読めないため、
+    env 由来値の解決は本 module に置く。
+    """
+    sub = os.environ.get("KINTONE_SUBDOMAIN", "").strip()
+    if sub and len(sub) <= 64 and all(
+            c.isascii() and (c.isalnum() or c == "-") for c in sub):
+        return f"https://{sub}.cybozu.com/k"
+    return None

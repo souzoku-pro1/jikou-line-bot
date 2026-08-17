@@ -156,6 +156,9 @@ _APP34_READER_MANIFEST = {
     ("person_confirm.py", "list_case_persons"): {"search": "filter"},
     ("dispatch_bot/heir_derive_task.py", "_pipeline"): {"search": "filter"},
     ("hub/shokumu_plan.py", "_load_persons"): {"search": "filter"},
+    # PWA-BATCH-1: 相続案件ダッシュボード（read-only 表示・filter 経由で
+    # 統合済み無効を除外し、除外件数のみ注記用に返す）
+    ("hub/webapp_souzoku_dashboard.py", "_load_persons"): {"search": "filter"},
     ("koseki_person_sync.py", "_find_existing"): {
         "search": "exempt",
         "reason": "§10.2(iii) 冪等ヒット維持（無効化行もヒット＝再生成抑止・確定事項）"},
