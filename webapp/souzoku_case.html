@@ -68,6 +68,10 @@ function kvRow(table, label, value) {
   tr.appendChild(td(value));
   table.appendChild(tr);
 }
+// PWA-03: 金額表示の固定 format——数字列は文字列のまま3桁区切り（数値化しない
+// ＝2^53 超でも桁落ちなし）。grammar 外の値は加工せずそのまま表示
+function comma(s) { return s.replace(/\B(?=(\d{3})+(?!\d))/g, ","); }
+function fmtAmount(s) { return /^[0-9]+$/.test(s) ? comma(s) : s; }
 async function load() {
   const id = new URLSearchParams(location.search).get("id") || "";
   if (!/^[0-9]{1,10}$/.test(id)) { document.body.textContent = "不正な ID"; return; }
@@ -82,14 +86,15 @@ async function load() {
   const base = links ? links.base : "";
   const apps = links ? links.apps : {};
 
-  // 案件（相談カード）: レコード素通し表示（内部専用・kintone 直視と同格）
+  // 案件（相談カード）: PWA-01 閉集合の明示描画（全 field 列挙ループ禁止——
+  // field 追加が黙って公開範囲を広げない。表示は下記 6 項目の閉集合のみ）
   const caseTable = document.getElementById("case");
-  for (const pair of Object.entries(data.case)) {
-    if (pair[0].startsWith("$")) { continue; }
-    kvRow(caseTable, pair[0],
-          typeof pair[1].value === "string" ? pair[1].value
-                                            : JSON.stringify(pair[1].value));
-  }
+  kvRow(caseTable, "氏名（顧客）", v(data.case, "氏名"));
+  kvRow(caseTable, "被相続人名", v(data.case, "被相続人名"));
+  kvRow(caseTable, "続柄", v(data.case, "続柄"));
+  kvRow(caseTable, "書類ステータス", v(data.case, "書類ステータス"));
+  kvRow(caseTable, "登録日時", v(data.case, "登録日時"));
+  kvRow(caseTable, "最終更新", v(data.case, "更新日時"));
 
   // 相続人（App36）
   let heirs = [];
@@ -135,23 +140,17 @@ async function load() {
     }
   } else { noteFail("persons-note"); }
 
-  // 財産（App35）: 合計は 有効=no 以外の評価額。未確定評価の混在は明示（①§6.9）
+  // 財産（App35）: 合計はサーバ側の全件整数集計（PWA-02/03）。集計不能・
+  // 取得不完全のときは合計を表示しない（不完全な値を完全値として出さない）
   let assets = [];
   if (data.assets.ok) {
     assets = data.assets.records;
     const rows = document.getElementById("asset-rows");
-    let total = 0;
-    let unconfirmed = 0;
     for (const rec of assets) {
       const tr = document.createElement("tr");
-      const amount = v(rec, "評価額");
       const fixed = v(rec, "評価確定");
-      if (v(rec, "有効") !== "no" && amount !== "") {
-        total += Number(amount) || 0;
-        if (fixed !== "yes") { unconfirmed += 1; }
-      }
       const cells = [v(rec, "$id"), v(rec, "財産種別"), v(rec, "名義"),
-                     amount === "" ? "" : Number(amount).toLocaleString("ja-JP"),
+                     fmtAmount(v(rec, "評価額")),
                      v(rec, "評価方法"), v(rec, "評価基準日"),
                      fixed === "yes" ? "yes" : "no【未確定】",
                      v(rec, "データ源"), v(rec, "有効"),
@@ -159,9 +158,21 @@ async function load() {
       for (const c of cells) { tr.appendChild(td(c)); }
       rows.appendChild(tr);
     }
-    document.getElementById("assets-note").textContent =
-      `評価額合計（有効行）: ${total.toLocaleString("ja-JP")} 円` +
-      (unconfirmed > 0 ? `——未確定評価 ${unconfirmed} 件を含む参考値です` : "");
+    const t = data.assets.total;
+    let note = "";
+    if (!t.computable) {
+      note = "評価額に集計不能な値が含まれるため、合計は表示しません" +
+             "（該当行の評価額を確認してください）";
+    } else {
+      note = `評価額合計（有効 ${t.counted} 件）: ${comma(t.amount)} 円`;
+      if (t.unconfirmed_count > 0) {
+        note += `——未確定評価 ${t.unconfirmed_count} 件を含む参考値です`;
+      }
+      if (t.blank_count > 0) {
+        note += `／金額未入力 ${t.blank_count} 件（0円ではなく合計対象外）`;
+      }
+    }
+    document.getElementById("assets-note").textContent = note;
   } else { noteFail("assets-note"); }
 
   // 直近生成書類（App30）

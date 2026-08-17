@@ -1,24 +1,32 @@
 """PWA-BATCH-1: PWA 骨格＋相続案件ダッシュボード（read-only）のテスト。
 
-固定する仕様（docs/plan/2026-08_pwa-product-design_v2.4.md 該当章＋本票）:
+固定する仕様（docs/plan/2026-08_pwa-product-design_v2.4.md 該当章＋本票＋
+R-PWA-1 fix1）:
 - 全新規 route が P4-001 の関所（_gate）必須・公開例外なし（機械検査）。
   未認証は既存関所の確立挙動どおり一律 303→/app/login（内容非提供・
   API も JSON を返さない）。
 - read-only: kintone 書込み API 呼出しゼロ（AST 機械検査・P4-002 最終形
   checker 共用）。ダッシュボード router に GET 以外の route が存在しない
   （「機械は確定しない」——確定・承認・編集の経路が構造的に無い）。
+- PWA-01: field 閉集合（取得=UI 表示・API 使用と 1:1・完全一致 pin）＋応答投影
+  （未許可 field は fixture に現れても応答へ出ない）＋全 field 列挙ループの
+  不在（構造 pin）。
+- PWA-02: App34/36/35 は $id 厳密単調増加カーソルで全件取得（複数 page・
+  後続 page の無効行除外・後続 page の合計算入・途中失敗 PARTIAL・カーソル
+  単調増加/重複欠落なし）。
+- PWA-03: 評価額集計はサーバ側 Python int（任意精度）・厳密 grammar
+  ^[0-9]+$ のみ加算・不正は「集計不能」（0 円へ落とさない）・空値と 0 円の
+  区別・有効=no 非算入・2^53 超の桁落ちなし・JSON は文字列。
 - App34 読取は filter_active_persons・App36 読取は filter_active_heir_rows
   経由（除外件数のみ注記用に返す）。manifest 閉包検査への登録は
   test_rv08_soft_merge / test_p3_003c_cancel 側。
-- PII 非出力: module は logging を import しない（構造）＋sentinel 実測
-  （業務データがログへ流れない・応答へは流れる）。
-- 業務データ応答は Cache-Control: no-store, private（P4-004 共通契約の適用実測）。
-- Service Worker: 業務データ非キャッシュの実測（fetch handler・Cache Storage の
-  不在＝キャッシュ経路が構造的に存在しない。P4-001 fix1 H01 裁定の維持）。
-- manifest/アイコン/shell/logout の配信と認証境界。
+- PII 非出力: module は logging を import しない（構造）＋sentinel 実測。
+- 業務データ応答は Cache-Control: no-store, private（P4-004 共通契約）。
+- Service Worker: 業務データ非キャッシュの実測（P4-001 fix1 H01 裁定の維持）。
 """
 
 import ast
+import asyncio
 import logging
 import os
 import unittest
@@ -80,6 +88,10 @@ def _rec(**fields):
 
 def _head(run_id=7, status="confirmed", provisional=False):
     return SimpleNamespace(id=run_id, status=status, provisional=provisional)
+
+
+def _run(coro):
+    return asyncio.run(coro)
 
 
 # ── 認証境界（未認証 negative 全 route・関所の機械検査） ─────────────────────
@@ -161,6 +173,94 @@ class TestReadOnlyMachineCheck(unittest.TestCase):
         self.assertNotIn("logging", imported)
 
 
+# ── PWA-01: field 閉集合（完全一致 pin・応答投影・構造 pin） ──────────────────
+class TestFieldClosedSets(unittest.TestCase):
+    def test_fields_sets_pinned_exactly(self):
+        self.assertEqual(sd._CASE_LIST_FIELDS,
+                         ["$id", "氏名", "被相続人名", "書類ステータス",
+                          "登録日時", "更新日時"])
+        self.assertEqual(sd._CASE_FIELDS,
+                         ["$id", "氏名", "被相続人名", "続柄", "書類ステータス",
+                          "登録日時", "更新日時"])
+        self.assertEqual(sd._PERSON_FETCH_FIELDS,
+                         ["$id", "氏名", "続柄メモ", "生死区分", "被相続人フラグ",
+                          "名寄せ確定", "相続人候補", "相続資格", "確認状態",
+                          "統合状態"])
+        self.assertEqual(sd._PERSON_VIEW_FIELDS,
+                         ["$id", "氏名", "続柄メモ", "生死区分", "被相続人フラグ",
+                          "名寄せ確定", "相続人候補", "相続資格", "確認状態"])
+        self.assertEqual(sd._HEIR_FETCH_FIELDS,
+                         ["$id", "氏名", "続柄", "法定相続分", "状態",
+                          "戸籍確認済", "印鑑証明", "データ源", "取消済み"])
+        self.assertEqual(sd._HEIR_VIEW_FIELDS,
+                         ["$id", "氏名", "続柄", "法定相続分", "状態",
+                          "戸籍確認済", "印鑑証明", "データ源"])
+        self.assertEqual(sd._ASSET_FIELDS,
+                         ["$id", "財産種別", "名義", "評価額", "評価方法",
+                          "評価基準日", "評価確定", "データ源", "有効"])
+        self.assertEqual(sd._DOC_FIELDS,
+                         ["$id", "件名", "チャネル", "方向", "発送ステータス",
+                          "発送日時", "成果物"])
+        # 「取得するが表示しない」PII の不在 pin（PWA-01 指定の代表）
+        for banned in ("生年月日", "死亡日", "住所最新", "本籍最新", "導出元人物ID"):
+            self.assertNotIn(banned, sd._PERSON_FETCH_FIELDS, banned)
+        self.assertNotIn("住所", sd._HEIR_FETCH_FIELDS)
+        self.assertNotIn("本籍", sd._HEIR_FETCH_FIELDS)
+        self.assertNotIn("連絡先", sd._HEIR_FETCH_FIELDS)
+
+    def test_projection_drops_unlisted_fields(self):
+        # 未許可 PII field を fixture へ追加しても応答へ出ない（二重の防御の
+        # 投影側。取得 fields 指定の側は query pin テストで固定）
+        rows = [_rec(**{"$id": "1", "氏名": "山田太郎",
+                        "住所": "SENTINEL-住所-11AA",
+                        "電話番号": "SENTINEL-TEL-22BB"})]
+        out = sd._project(rows, sd._CASE_LIST_FIELDS)
+        self.assertEqual(set(out[0]), {"$id", "氏名"})
+
+    def test_dashboard_response_never_carries_unlisted_fields(self):
+        sent = "SENTINEL-未許可-33CC"
+        case = [_rec(**{"$id": "12", "氏名": "山田太郎", "住所": sent})]
+        persons = [_rec(**{"$id": "101", "氏名": "山田一郎", "生年月日": sent,
+                           "住所最新": sent})]
+        heirs = [_rec(**{"$id": "201", "氏名": "山田一郎", "住所": sent,
+                         "取消済み": "no"})]
+        assets = [_rec(**{"$id": "301", "財産種別": "預貯金", "特定情報": sent})]
+        docs = [_rec(**{"$id": "401", "件名": "職務上請求書", "宛先住所": sent})]
+        search = AsyncMock(side_effect=[case, persons, heirs, assets, docs])
+        with patch.dict(os.environ, _ENV), \
+             patch.object(hub_kintone, "search_records", search), \
+             patch.object(derivation_models, "get_current_head",
+                          AsyncMock(return_value=None)):
+            r = _client.get("/app/api/souzoku/cases/12",
+                            headers=_auth_headers(), follow_redirects=False)
+        self.assertEqual(r.status_code, 200)
+        self.assertNotIn(sent, r.text)
+        body = r.json()
+        # filter 専用 field（統合状態・取消済み）も応答（VIEW）には出ない
+        self.assertNotIn("取消済み", body["heirs"]["records"][0])
+        self.assertNotIn("統合状態", body["persons"]["records"][0])
+
+    def test_all_searches_specify_fields_and_no_entries_loop(self):
+        # 構造 pin: field 追加が黙って公開範囲を広げない——
+        # (i) module 内の全 search_records 呼出しが fields= を指定
+        tree = ast.parse(Path(sd.__file__).read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) \
+                    and node.func.attr == "search_records":
+                kw = {k.arg for k in node.keywords}
+                self.assertIn("fields", kw,
+                              f"行{node.lineno}: fields 指定のない search_records")
+        # (ii) 全 field 取得の get_record 呼出しが存在しない（AST 検査）
+        called = {node.func.attr for node in ast.walk(tree)
+                  if isinstance(node, ast.Call)
+                  and isinstance(node.func, ast.Attribute)}
+        self.assertNotIn("get_record", called)
+        # (iii) 画面側の全 field 列挙ループの不在（閉集合の明示描画のみ）
+        from hub.webapp_auth import WEBAPP_ROOT
+        page = (WEBAPP_ROOT / "souzoku_case.html").read_text(encoding="utf-8")
+        self.assertNotIn("Object.entries", page)
+
+
 # ── 案件一覧 API ─────────────────────────────────────────────────────────────
 class TestSouzokuCasesApi(unittest.TestCase):
     def _get(self, url, mock_search):
@@ -179,9 +279,13 @@ class TestSouzokuCasesApi(unittest.TestCase):
         self.assertEqual(query, "order by 更新日時 desc limit 20 offset 0")
         self.assertEqual(mock.call_args.kwargs.get("fields"),
                          sd._CASE_LIST_FIELDS)
-        self.assertEqual(sd._CASE_LIST_FIELDS,
-                         ["$id", "氏名", "被相続人名", "書類ステータス",
-                          "登録日時", "更新日時"])
+
+    def test_list_response_projected_to_closed_set(self):
+        mock = AsyncMock(return_value=[_rec(**{"$id": "1", "氏名": "山田太郎",
+                                               "電話番号": "090-SENT"})])
+        r = self._get("/app/api/souzoku/cases", mock)
+        self.assertNotIn("090-SENT", r.text)
+        self.assertNotIn("電話番号", r.json()["records"][0])
 
     def test_invalid_paging_fixed_400_no_reflection_no_call(self):
         for qs in ("limit=51", "limit=0", "limit=abc", "offset=-1", "offset=x"):
@@ -195,10 +299,9 @@ class TestSouzokuCasesApi(unittest.TestCase):
 
 # ── ダッシュボード API（filter 経由・状態注記・リンク・PARTIAL） ──────────────
 class TestDashboardApi(unittest.TestCase):
-    _CASE = {"$id": {"value": "12"},
-             "氏名": {"value": "山田太郎"},
-             "被相続人名": {"value": "山田花子"},
-             "書類ステータス": {"value": "送付状作成済"}}
+    def _case_row(self):
+        return _rec(**{"$id": "12", "氏名": "山田太郎", "被相続人名": "山田花子",
+                       "書類ステータス": "送付状作成済"})
 
     def _persons_raw(self):
         return [_rec(**{"$id": "101", "氏名": "山田一郎", "名寄せ確定": "確定"}),
@@ -219,24 +322,21 @@ class TestDashboardApi(unittest.TestCase):
         return [_rec(**{"$id": "401", "件名": "職務上請求書",
                         "発送ステータス": "下書き"})]
 
-    def _call(self, record_id="12", search_side=None, head=None,
-              get_mock=None):
+    def _call(self, record_id="12", search_side=None, head=None):
         search_mock = AsyncMock(
             side_effect=search_side if search_side is not None else
-            [self._persons_raw(), self._heirs_raw(), self._assets(),
-             self._docs()])
-        get_mock = get_mock or AsyncMock(return_value=self._CASE)
+            [[self._case_row()], self._persons_raw(), self._heirs_raw(),
+             self._assets(), self._docs()])
         head_mock = AsyncMock(return_value=head)
         with patch.dict(os.environ, _ENV), \
-             patch.object(hub_kintone, "get_record", get_mock), \
              patch.object(hub_kintone, "search_records", search_mock), \
              patch.object(derivation_models, "get_current_head", head_mock):
             r = _client.get(f"/app/api/souzoku/cases/{record_id}",
                             headers=_auth_headers(), follow_redirects=False)
-        return r, get_mock, search_mock
+        return r, search_mock
 
     def test_filters_and_exclusion_counts(self):
-        r, _get, search = self._call(head=_head())
+        r, _search = self._call(head=_head())
         self.assertEqual(r.status_code, 200)
         body = r.json()
         # App34: 統合済み無効は filter 済み・除外件数のみ注記用
@@ -248,6 +348,7 @@ class TestDashboardApi(unittest.TestCase):
             [h["$id"]["value"] for h in body["heirs"]["records"]], ["201"])
         self.assertEqual(body["heirs"]["excluded_cancelled_count"], 1)
         self.assertEqual(body["assets"]["records"][0]["$id"]["value"], "301")
+        self.assertEqual(body["assets"]["total"]["amount"], "1000000")
         self.assertEqual(body["documents"]["records"][0]["$id"]["value"], "401")
         self.assertEqual(body["derivation"]["head"],
                          {"run_id": 7, "run_status": "confirmed",
@@ -255,29 +356,35 @@ class TestDashboardApi(unittest.TestCase):
         self.assertEqual(body["notice"], sd.NOTICE_READONLY)
 
     def test_queries_and_fields_pinned(self):
-        _r, _get, search = self._call(head=None)
+        _r, search = self._call(head=None)
         calls = search.call_args_list
         apps = [c.args[0] for c in calls]
-        self.assertEqual(apps, [sd.APP_KOSEKI_PERSON, sd.APP_SOUZOKUNIN,
-                                sd.APP_ZAISAN, sd.APP_SHIPPING])
-        self.assertEqual(calls[0].args[1],
-                         '案件レコードID = "12" order by $id asc limit 200')
-        self.assertEqual(calls[0].kwargs.get("fields"), sd._PERSON_FIELDS)
+        self.assertEqual(apps, [sd.APP_SOUZOKU_CASES, sd.APP_KOSEKI_PERSON,
+                                sd.APP_SOUZOKUNIN, sd.APP_ZAISAN,
+                                sd.APP_SHIPPING])
+        self.assertEqual(calls[0].args[1], '$id = "12" limit 1')
+        self.assertEqual(calls[0].kwargs.get("fields"), sd._CASE_FIELDS)
         self.assertEqual(calls[1].args[1],
-                         '案件レコードID = "12" order by $id asc limit 200')
-        self.assertEqual(calls[1].kwargs.get("fields"), sd._HEIR_FIELDS)
-        self.assertEqual(calls[2].kwargs.get("fields"), sd._ASSET_FIELDS)
+                         '案件レコードID = "12" and $id > 0 '
+                         "order by $id asc limit 100")
+        self.assertEqual(calls[1].kwargs.get("fields"),
+                         sd._PERSON_FETCH_FIELDS)
+        self.assertEqual(calls[2].args[1],
+                         '案件レコードID = "12" and $id > 0 '
+                         "order by $id asc limit 100")
+        self.assertEqual(calls[2].kwargs.get("fields"), sd._HEIR_FETCH_FIELDS)
+        self.assertEqual(calls[3].kwargs.get("fields"), sd._ASSET_FIELDS)
         # App30 は案件アプリID＋案件レコードID の両絞込（時効/相続の同居 app）
-        self.assertEqual(calls[3].args[1],
+        self.assertEqual(calls[4].args[1],
                          '案件アプリID = "26" and 案件レコードID = "12" '
                          "order by 更新日時 desc limit 20")
-        self.assertEqual(calls[3].kwargs.get("fields"), sd._DOC_FIELDS)
+        self.assertEqual(calls[4].kwargs.get("fields"), sd._DOC_FIELDS)
         # filter が状態 field を読めることの pin（黙った縮小の防波堤）
-        self.assertIn("統合状態", sd._PERSON_FIELDS)
-        self.assertIn("取消済み", sd._HEIR_FIELDS)
+        self.assertIn("統合状態", sd._PERSON_FETCH_FIELDS)
+        self.assertIn("取消済み", sd._HEIR_FETCH_FIELDS)
 
     def test_links_material_from_validated_env_only(self):
-        r, *_ = self._call(head=None)
+        r, _ = self._call(head=None)
         links = r.json()["links"]
         self.assertEqual(links["base"], "https://testsub.cybozu.com/k")
         self.assertEqual(links["apps"],
@@ -287,18 +394,23 @@ class TestDashboardApi(unittest.TestCase):
     def test_bad_record_id_fixed_404_no_kintone_call(self):
         for bad in ("abc", "1e3", "12345678901", "1;drop"):
             with self.subTest(rid=bad):
-                r, get_mock, search_mock = self._call(record_id=bad)
+                r, search_mock = self._call(record_id=bad)
                 self.assertEqual(r.status_code, 404)
                 self.assertEqual(r.content, b"")
-                get_mock.assert_not_called()
                 search_mock.assert_not_called()
+
+    def test_nonexistent_case_fixed_404(self):
+        r, search = self._call(search_side=[[]])
+        self.assertEqual(r.status_code, 404)
+        self.assertEqual(r.content, b"")
+        self.assertEqual(search.call_count, 1)   # 単票検索のみ・後続 section 無し
 
     def test_partial_degradation_section_flag_no_detail(self):
         # PARTIAL（①§6）: section 取得失敗は ok=false の固定 flag のみ・
         # 他 section は表示継続・例外詳細は応答へ非搭載
-        r, *_ = self._call(search_side=[
-            RuntimeError("boom-SENTINEL"), self._heirs_raw(),
-            self._assets(), self._docs()], head=None)
+        r, _ = self._call(search_side=[
+            [self._case_row()], RuntimeError("boom-SENTINEL"),
+            self._heirs_raw(), self._assets(), self._docs()], head=None)
         self.assertEqual(r.status_code, 200)
         body = r.json()
         self.assertEqual(body["persons"], {"ok": False})
@@ -307,15 +419,184 @@ class TestDashboardApi(unittest.TestCase):
 
     def test_business_data_response_is_no_store(self):
         # 業務データ応答の保存禁止（P4-004 共通契約の適用実測・①§12.5）
-        r, *_ = self._call(head=None)
+        r, _ = self._call(head=None)
         self.assertEqual(r.headers.get("cache-control"), "no-store, private")
+
+
+# ── PWA-02: $id カーソル全件ページング（レビュー指定 5 本） ───────────────────
+def _p36(i, cancelled="", **extra):
+    f = {"$id": str(i), "氏名": f"相続人{i}", "続柄": "子"}
+    if cancelled:
+        f["取消済み"] = cancelled
+    f.update(extra)
+    return _rec(**f)
+
+
+def _p34(i, state="", **extra):
+    f = {"$id": str(i), "氏名": f"人物{i}"}
+    if state:
+        f["統合状態"] = state
+    f.update(extra)
+    return _rec(**f)
+
+
+def _p35(i, amount, valid="yes", fixed="yes"):
+    return _rec(**{"$id": str(i), "財産種別": "預貯金", "評価額": amount,
+                   "評価確定": fixed, "有効": valid})
+
+
+class TestCursorPaging(unittest.TestCase):
+    def _patch(self, side):
+        return patch.object(hub_kintone, "search_records",
+                            AsyncMock(side_effect=side))
+
+    def test_multi_page_full_fetch_and_cursor_queries(self):
+        # (1) 複数 page 全件取得＋(5) カーソル単調増加・重複欠落なし
+        page1 = [_p36(i) for i in range(1, 101)]          # 100 件=満 page
+        page2 = [_p36(101), _p36(102)]                    # 端数 page で終端
+        with self._patch([page1, page2]) as mock:
+            out = _run(sd._load_heirs("12"))
+        ids = [r["$id"]["value"] for r in out["records"]]
+        self.assertEqual(ids, [str(i) for i in range(1, 103)])   # 重複・欠落なし
+        self.assertEqual(out["excluded_cancelled_count"], 0)
+        q1 = mock.call_args_list[0].args[1]
+        q2 = mock.call_args_list[1].args[1]
+        self.assertIn("$id > 0 ", q1)
+        self.assertIn("$id > 100 ", q2)                   # 前 page 末尾がカーソル
+        self.assertEqual(mock.call_count, 2)
+
+    def test_later_page_invalid_rows_excluded(self):
+        # (2) 後続 page の無効行（取消済み/統合済み無効）も除外される
+        page1 = [_p36(i) for i in range(1, 101)]
+        page2 = [_p36(101, cancelled="yes"), _p36(102)]
+        with self._patch([page1, page2]):
+            heirs = _run(sd._load_heirs("12"))
+        self.assertEqual(len(heirs["records"]), 101)
+        self.assertEqual(heirs["excluded_cancelled_count"], 1)
+        self.assertNotIn("101",
+                         [r["$id"]["value"] for r in heirs["records"]])
+        p1 = [_p34(i) for i in range(1, 101)]
+        p2 = [_p34(101, state="統合済み無効"), _p34(102)]
+        with self._patch([p1, p2]):
+            persons = _run(sd._load_persons("12"))
+        self.assertEqual(len(persons["records"]), 101)
+        self.assertEqual(persons["excluded_merged_count"], 1)
+
+    def test_later_page_assets_counted_into_total(self):
+        # (3) 後続 page の財産も合計へ算入（全件基準の合計）
+        page1 = [_p35(i, "1") for i in range(1, 101)]
+        page2 = [_p35(101, "5")]
+        with self._patch([page1, page2]):
+            out = _run(sd._load_assets("12"))
+        self.assertEqual(len(out["records"]), 101)
+        self.assertEqual(out["total"]["amount"], "105")
+        self.assertEqual(out["total"]["counted"], 101)
+
+    def test_mid_page_failure_raises_to_partial(self):
+        # (4) 途中 page 失敗＝section 全体を PARTIAL（部分結果を完全値として
+        # 返さない）。API 層では _guarded が ok=False へ写像する
+        page1 = [_p35(i, "1") for i in range(1, 101)]
+        with self._patch([page1, RuntimeError("boom")]):
+            with self.assertRaises(RuntimeError):
+                _run(sd._load_assets("12"))
+        with self._patch([page1, RuntimeError("boom")]):
+            self.assertEqual(_run(sd._guarded(sd._load_assets("12"))),
+                             {"ok": False})   # _guarded が PARTIAL へ写像
+
+    def test_cursor_monotonicity_guard(self):
+        # (5) 補: カーソルの重複・逆行・非数字は例外（無限 loop・重複計上の遮断）
+        dup = [_p36(5), _p36(5)]
+        with self._patch([dup]):
+            with self.assertRaises(ValueError):
+                _run(sd._load_heirs("12"))
+        backward = [_p36(5), _p36(3)]
+        with self._patch([backward]):
+            with self.assertRaises(ValueError):
+                _run(sd._load_heirs("12"))
+        nonnum = [_rec(**{"$id": "x5", "氏名": "n"})]
+        with self._patch([nonnum]):
+            with self.assertRaises(ValueError):
+                _run(sd._load_heirs("12"))
+
+    def test_runaway_page_limit_guard(self):
+        # 満 page が続く限り取得し続けるが、上限超過は例外＝PARTIAL（暴走防御）
+        pages = ([[_p36(i) for i in range(k * 100 + 1, k * 100 + 101)]
+                  for k in range(0, 101)])
+        with self._patch(list(pages)):
+            with self.assertRaises(RuntimeError):
+                _run(sd._load_heirs("12"))
+
+
+# ── PWA-03: 金額の整数集計（レビュー指定 6 本） ───────────────────────────────
+class TestAmountAggregation(unittest.TestCase):
+    def test_1_boundary_2pow53_exact(self):
+        # 2^53=9007199254740992 近傍の加算が正確（float なら丸まる値）
+        rows = [_p35(1, "9007199254740993"), _p35(2, "9007199254740993")]
+        t = sd._sum_assets(rows)
+        self.assertTrue(t["computable"])
+        self.assertEqual(t["amount"], "18014398509481986")
+
+    def test_2_invalid_strings_not_silently_zero(self):
+        for bad in ("1.5", "1e3", "-3", "1,000", "１００", " 1", "0x10"):
+            with self.subTest(value=bad):
+                t = sd._sum_assets([_p35(1, bad), _p35(2, "100")])
+                self.assertEqual(t, {"computable": False})   # 部分合計も返さない
+
+    def test_3_blank_distinct_from_zero(self):
+        t = sd._sum_assets([_p35(1, ""), _p35(2, "0")])
+        self.assertTrue(t["computable"])
+        self.assertEqual(t["amount"], "0")
+        self.assertEqual(t["counted"], 1)        # "0" は 0 円として算入
+        self.assertEqual(t["blank_count"], 1)    # 空値は 0 円でなく対象外
+
+    def test_4_unconfirmed_note_maintained(self):
+        t = sd._sum_assets([_p35(1, "100", fixed="no"), _p35(2, "50")])
+        self.assertEqual(t["amount"], "150")
+        self.assertEqual(t["unconfirmed_count"], 1)
+
+    def test_5_invalid_flag_no_rows_excluded(self):
+        # 有効=no は金額があっても非算入（grammar 検査の対象にもしない）
+        t = sd._sum_assets([_p35(1, "999", valid="no"), _p35(2, "1")])
+        self.assertEqual(t["amount"], "1")
+        self.assertEqual(t["counted"], 1)
+        t2 = sd._sum_assets([_p35(1, "bad-value", valid="no"), _p35(2, "1")])
+        self.assertTrue(t2["computable"])        # 無効行の不正値は集計に無関係
+        self.assertEqual(t2["amount"], "1")
+
+    def test_6_beyond_safe_integer_no_truncation(self):
+        rows = [_p35(1, "90071992547409934567"), _p35(2, "1")]
+        t = sd._sum_assets(rows)
+        self.assertEqual(t["amount"], "90071992547409934568")   # 任意精度・桁落ちなし
+
+    def test_api_returns_uncomputable_flag_and_string_amount(self):
+        case = [_rec(**{"$id": "12", "氏名": "山田太郎"})]
+        assets = [_p35(301, "1.5")]
+        search = AsyncMock(side_effect=[case, [], [], assets, []])
+        with patch.dict(os.environ, _ENV), \
+             patch.object(hub_kintone, "search_records", search), \
+             patch.object(derivation_models, "get_current_head",
+                          AsyncMock(return_value=None)):
+            r = _client.get("/app/api/souzoku/cases/12",
+                            headers=_auth_headers(), follow_redirects=False)
+        body = r.json()
+        self.assertTrue(body["assets"]["ok"])    # 行表示は継続
+        self.assertEqual(body["assets"]["total"], {"computable": False})
+
+    def test_page_uses_string_formatting_not_number(self):
+        # 構造 pin: 画面側に数値化 API（Number/parse/toLocaleString）が無い
+        # ＝金額は文字列のまま固定 format（2^53 超でも桁落ちしない）
+        from hub.webapp_auth import WEBAPP_ROOT
+        page = (WEBAPP_ROOT / "souzoku_case.html").read_text(encoding="utf-8")
+        for banned in ("Number(", "parseInt", "parseFloat", "toLocaleString"):
+            self.assertNotIn(banned, page, banned)
+        self.assertIn("集計不能", page)          # 集計不能注記の描画分岐が存在
 
 
 # ── PII sentinel（業務データがログへ流れない実測） ────────────────────────────
 class TestPiiSentinel(unittest.TestCase):
     def test_sentinel_pii_reaches_response_but_never_logs(self):
         sent_name = "SENTINEL-氏名-73AF"
-        case = _rec(**{"$id": "12", "氏名": sent_name})
+        case = [_rec(**{"$id": "12", "氏名": sent_name})]
         persons = [_rec(**{"$id": "101", "氏名": sent_name})]
         records = []
 
@@ -330,10 +611,9 @@ class TestPiiSentinel(unittest.TestCase):
         root.setLevel(logging.DEBUG)
         try:
             with patch.dict(os.environ, _ENV), \
-                 patch.object(hub_kintone, "get_record",
-                              AsyncMock(return_value=case)), \
                  patch.object(hub_kintone, "search_records",
-                              AsyncMock(side_effect=[persons, [], [], []])), \
+                              AsyncMock(side_effect=[case, persons, [], [],
+                                                     []])), \
                  patch.object(derivation_models, "get_current_head",
                               AsyncMock(return_value=None)):
                 r = _client.get("/app/api/souzoku/cases/12",
