@@ -675,18 +675,23 @@ async def q_ask(request: Request):
     _inflight.append(1)
     try:
         result = await _answer_question(question)
+        # Q-UX-1(C): 完了した回答生成（ok/no_source）のみ計上。error は数えない
+        if result["status"] != "error":
+            _count_completed_ask(time.time())
+        result["answer"] = result["answer"] + "\n\n" + DISCLAIMER
+        try:
+            qa_id = await qa_store.save_qa(user_id="owner", question=question,
+                                           **result)
+        except Exception:
+            return RedirectResponse("/app/q?e=save", status_code=303)
+        return RedirectResponse(f"/app/q?done={qa_id}", status_code=303)
     finally:
+        # Q-UX-1-fix1（R-Q-UX-1 Q-UX-01）: marker は POST 処理全体（レート計上・
+        # DISCLAIMER 付加・qa_store.save_qa・303 生成まで）を覆い、保存成功・
+        # 保存例外のいずれでも最後に必ず解放する（解放後まで重複 POST は e=busy）。
+        # NB: worker 複数化時は in-memory marker では不成立——共有ストア/DB
+        # ロック方式への改定が必要（現行は単一 worker 前提・Codex 所見の記録）
         del _inflight[:]
-    # Q-UX-1(C): 完了した回答生成（ok/no_source）のみ計上。error は数えない
-    if result["status"] != "error":
-        _count_completed_ask(time.time())
-    result["answer"] = result["answer"] + "\n\n" + DISCLAIMER
-    try:
-        qa_id = await qa_store.save_qa(user_id="owner", question=question,
-                                       **result)
-    except Exception:
-        return RedirectResponse("/app/q?e=save", status_code=303)
-    return RedirectResponse(f"/app/q?done={qa_id}", status_code=303)
 
 
 router.add_api_route("/app/q/ask", _gate(q_ask), methods=["POST"])

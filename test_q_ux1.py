@@ -132,6 +132,106 @@ class TestSingleFlight(_UxMixin):
         self.assertEqual(len(wq._ask_times), 1)   # 完了 1 件のみ計上
 
 
+def _result(status="ok"):
+    """_answer_question の戻り値形（qa_store 保存形）の固定 stub。"""
+    return {"answer": "回答本文", "status": status, "sources": [], "notes": [],
+            "model": "claude-sonnet-4-6", "input_tokens": 1,
+            "output_tokens": 1, "cache_read_tokens": 0, "cost_usd": "0",
+            "elapsed_ms": 1}
+
+
+class TestSingleFlightCoversSave(_UxMixin):
+    """Q-UX-1-fix1（R-Q-UX-1 Q-UX-01 HIGH）: marker は保存（save_qa）と 303
+    生成まで解放されない——回答生成完了〜保存完了の窓も無防備にしない。"""
+
+    def _rows(self):
+        with patch.dict(os.environ, _ENV):
+            r = _client.get("/app/api/q/history?limit=50",
+                            headers=_auth_headers(), follow_redirects=False)
+        return len(r.json()["records"])
+
+    def test_second_post_during_save_rejected_live(self):
+        # 1 本目: _answer_question は完了済み・save_qa を待機させた状態で
+        # 2 本目 POST → e=busy。_answer_question 呼出し増分 0・qa_record
+        # 増分なし・レート計上増分なし
+        gate = threading.Event()
+        entered = threading.Event()
+        real_save = wq.qa_store.save_qa
+
+        async def slow_save(**kwargs):
+            entered.set()
+            while not gate.is_set():
+                await asyncio.sleep(0.005)
+            return await real_save(**kwargs)
+
+        answer = AsyncMock(return_value=_result("ok"))
+        results = {}
+
+        def _first():
+            results["first"] = _client.post(
+                "/app/q/ask", data={"question": "q1"},
+                headers=_auth_headers(), follow_redirects=False)
+
+        with patch.dict(os.environ, _ENV), \
+             patch.object(wq, "_answer_question", answer), \
+             patch.object(wq.qa_store, "save_qa", slow_save):
+            t = threading.Thread(target=_first)
+            t.start()
+            try:
+                self.assertTrue(entered.wait(timeout=5),
+                                "1 本目が save_qa 待機に入らない")
+                # ここで 1 本目は回答生成完了・レート計上済み・保存待機中
+                self.assertEqual(answer.await_count, 1)
+                self.assertEqual(len(wq._ask_times), 1)
+                self.assertEqual(self._rows(), 0)       # 行はまだ無い
+                r2 = _client.post("/app/q/ask", data={"question": "q2"},
+                                  headers=_auth_headers(),
+                                  follow_redirects=False)
+                self.assertEqual(r2.status_code, 303)
+                self.assertEqual(r2.headers["location"], "/app/q?e=busy")
+                self.assertEqual(answer.await_count, 1)   # 二重実行なし
+                self.assertEqual(len(wq._ask_times), 1)   # 二重計上なし
+                self.assertEqual(self._rows(), 0)         # 二重行なし
+            finally:
+                gate.set()
+                t.join(timeout=10)
+        self.assertFalse(t.is_alive())
+        self.assertTrue(
+            results["first"].headers["location"].startswith("/app/q?done="))
+        self.assertEqual(self._rows(), 1)                 # 1 本目のみ保存
+        self.assertEqual(len(wq._ask_times), 1)
+        self.assertEqual(wq._inflight, [])                # 保存成功後に解放
+
+    def test_marker_released_after_save_success(self):
+        with patch.dict(os.environ, _ENV), \
+             patch.object(wq, "_answer_question",
+                          AsyncMock(return_value=_result("ok"))):
+            r = _client.post("/app/q/ask", data={"question": "q"},
+                             headers=_auth_headers(), follow_redirects=False)
+        self.assertTrue(r.headers["location"].startswith("/app/q?done="))
+        self.assertEqual(wq._inflight, [])
+
+    def test_marker_released_after_save_exception(self):
+        # 保存例外（e=save）でも marker は最後に必ず解放される
+        with patch.dict(os.environ, _ENV), \
+             patch.object(wq, "_answer_question",
+                          AsyncMock(return_value=_result("ok"))), \
+             patch.object(wq.qa_store, "save_qa",
+                          AsyncMock(side_effect=RuntimeError("db down"))):
+            r = _client.post("/app/q/ask", data={"question": "q"},
+                             headers=_auth_headers(), follow_redirects=False)
+        self.assertEqual(r.status_code, 303)
+        self.assertEqual(r.headers["location"], "/app/q?e=save")
+        self.assertEqual(wq._inflight, [])
+        # 次の質問は busy にならない（解放の実効確認）
+        with patch.dict(os.environ, _ENV), \
+             patch.object(wq, "_answer_question",
+                          AsyncMock(return_value=_result("ok"))):
+            r2 = _client.post("/app/q/ask", data={"question": "q"},
+                              headers=_auth_headers(), follow_redirects=False)
+        self.assertTrue(r2.headers["location"].startswith("/app/q?done="))
+
+
 # ── (C) レート計上の調整 ─────────────────────────────────────────────────────
 class TestRateAccounting(_UxMixin):
     def test_error_attempt_not_counted(self):
