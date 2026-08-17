@@ -31,6 +31,9 @@
 - コスト・安全: 1 質問のコスト概算（Decimal・float 非経由）を Q&A 台帳に記録。
   質問レート制限（スライディング窓・完了計上＝Q-UX-1(C)）＋single-flight
   （処理中の重複 POST は実行しない＝Q-UX-1(B)）。API 呼出しは timeout 付き・
+- Q-CHAT-1 会話化: 直近の会話（前回リセット以降・二重上限つき）を文脈として
+  注入。履歴は文脈情報であり出典ではない（出典は当該 turn 内の実測 tool 結果
+  のみ＝subset 照合不変）。「新しい話題」で境界を永続化（qa_topic_reset）。
   turn 上限付きで、失敗時は推測で埋めず固定文言へ fail-closed。
 """
 
@@ -67,6 +70,16 @@ TOTAL_TIMEOUT_SECONDS = 300       # 1 質問全体の wall-clock 上限
 _MAX_TOOL_CALLS_TOTAL = 20        # 全 turn 合計の tool 呼び出し数上限
 _MAX_TOOL_USE_PER_TURN = 5        # 1 response 内の tool_use 数上限
 _MAX_TOOL_RESULT_BYTES = 50_000   # tool 結果（canonical JSON）の byte 上限
+
+# Q-CHAT-1(A): 会話文脈の二重上限。直近 10 往復かつ合計 6000 字（質問+回答の
+# 文字数合計）。6000 字 ≒ 日本語でおおむね 6〜9k tokens ≒ 入力 $0.02〜0.03/問
+# の上乗せ（Sonnet $3/MTok）で、直近数往復は無切詰めで残る均衡点。1 回答は
+# 800 字で末尾切り詰め（要約のための追加 API 呼出しはしない＝票の指定）。
+# 超過は古い側から往復ごと丸ごと落とす（新しい側優先）
+_HISTORY_MAX_EXCHANGES = 10
+_HISTORY_MAX_TOTAL_CHARS = 6000
+_HISTORY_ANSWER_MAX_CHARS = 800
+_HISTORY_TRUNC_MARK = "…（以下省略）"
 
 # レート制限（スライディング窓・単一利用者前提のプロセス内カウンタ）。
 # Q-UX-1(C) 裁定: 「完了した回答生成」（ok/no_source）のみ計上する——error
@@ -539,10 +552,47 @@ def _validated_submission(args, ctx: dict):
     return answer.strip(), picked
 
 
-async def _answer_question(question: str) -> dict:
+def _strip_disclaimer(answer: str) -> str:
+    """履歴注入時のノイズ削減: 保存回答から定型文（DISCLAIMER）を除去。"""
+    return answer.replace("\n\n" + DISCLAIMER, "").replace(DISCLAIMER, "")
+
+
+def _build_history(rows: list) -> list:
+    """Q-CHAT-1(A): 会話文脈 message 列（古→新の user/assistant 交互）を組む。
+
+    rows は list_context_qa の戻り（新しい順・リセット境界より後・error 除外
+    済み）。二重上限: 直近 _HISTORY_MAX_EXCHANGES 往復かつ合計
+    _HISTORY_MAX_TOTAL_CHARS 字。超過は古い側から往復ごと丸ごと落とし、長い
+    回答は _HISTORY_ANSWER_MAX_CHARS 字で末尾切り詰め（要約生成のための追加
+    API 呼出しはしない）。履歴は**文脈情報であり出典ではない**——出典は当該
+    質問の turn 内で実測した tool 結果のみ（subset 照合は不変）。"""
+    picked = []
+    total = 0
+    for row in rows[:_HISTORY_MAX_EXCHANGES]:
+        q = str(row.get("question") or "").strip()
+        a = _strip_disclaimer(str(row.get("answer") or "")).strip()
+        if len(a) > _HISTORY_ANSWER_MAX_CHARS:
+            a = a[:_HISTORY_ANSWER_MAX_CHARS] + _HISTORY_TRUNC_MARK
+        if not q or not a:
+            continue
+        if total + len(q) + len(a) > _HISTORY_MAX_TOTAL_CHARS:
+            break                        # 新しい側優先・これより古い側は落とす
+        total += len(q) + len(a)
+        picked.append((q, a))
+    messages = []
+    for q, a in reversed(picked):        # 古→新
+        messages.append({"role": "user", "content": q})
+        messages.append({"role": "assistant", "content": a})
+    return messages
+
+
+async def _answer_question(question: str, history: list | None = None) -> dict:
     """1 質問の回答生成。戻り値は qa_store 保存形（answer/status/sources/notes/
     model/tokens/cost/elapsed）。失敗・出典ゼロは固定文言へ fail-closed。
-    Q-01: 全体 wall-clock timeout・全 turn 合計/1 turn の tool 数上限つき。"""
+    Q-01: 全体 wall-clock timeout・全 turn 合計/1 turn の tool 数上限つき。
+    Q-CHAT-1: history（_build_history の戻り＝上限適用済み message 列）を
+    質問の前に注入する。履歴注入分の入力 tokens は usage 経由でコスト概算に
+    そのまま反映される。"""
     started = time.monotonic()
     ctx = {"sources": [], "source_keys": set(), "flags": set()}
     usage = {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0}
@@ -565,7 +615,7 @@ async def _answer_question(question: str) -> dict:
                 "elapsed_ms": int((time.monotonic() - started) * 1000)}
 
     client = _anthropic_client()
-    messages = [{"role": "user", "content": question}]
+    messages = list(history or []) + [{"role": "user", "content": question}]
     total_calls = 0
     try:
         # Q-01(i): 質問全体の wall-clock 上限（anyio.fail_after=asyncio.timeout
@@ -674,7 +724,16 @@ async def q_ask(request: Request):
                                 status_code=303)
     _inflight.append(1)
     try:
-        result = await _answer_question(question)
+        # Q-CHAT-1(A): 直近の会話（前回リセット以降）を文脈として注入。文脈は
+        # 補助情報のため、読めない場合（migration 未適用等）は無文脈で続行
+        # （質問機能自体は fail-open・出典規律は turn 内実測のみで不変）
+        try:
+            context_rows = await qa_store.list_context_qa(
+                limit=_HISTORY_MAX_EXCHANGES)
+        except Exception:
+            context_rows = []
+        result = await _answer_question(question,
+                                        history=_build_history(context_rows))
         # Q-UX-1(C): 完了した回答生成（ok/no_source）のみ計上。error は数えない
         if result["status"] != "error":
             _count_completed_ask(time.time())
@@ -697,6 +756,22 @@ async def q_ask(request: Request):
 router.add_api_route("/app/q/ask", _gate(q_ask), methods=["POST"])
 
 
+async def q_reset(request: Request):
+    """Q-CHAT-1(B): 話題リセット（「新しい話題」）。以降の質問は過去履歴を
+    一切参照しない。質問ではないためレート計上はしない（API コストもゼロ）。
+    回答生成中は境界が処理中の保存行とねじれるため busy で弾く。PRG で戻る。"""
+    if _inflight:
+        return RedirectResponse("/app/q?e=busy", status_code=303)
+    try:
+        await qa_store.save_topic_reset(user_id="owner")
+    except Exception:
+        return RedirectResponse("/app/q?e=save", status_code=303)
+    return RedirectResponse("/app/q", status_code=303)
+
+
+router.add_api_route("/app/q/reset", _gate(q_reset), methods=["POST"])
+
+
 @router.get("/app/api/q/history")
 @_gate
 async def q_history(request: Request):
@@ -714,5 +789,14 @@ async def q_history(request: Request):
         records = None                   # DB 未設定/不達は空でなく明示 flag
     if records is None:
         return {"records": [], "available": False}
+    # Q-CHAT-1(B): リセット境界の可視化。境界が読めない場合（migration 未適用
+    # 等）は「リセット無し」へ縮退（台帳表示自体は生かす=fail-open）
+    try:
+        boundary = await qa_store.latest_reset_boundary()
+    except Exception:
+        boundary = None
+    for rec in records:
+        rec["after_reset"] = boundary is not None and rec["id"] > boundary
     return {"records": records, "available": True,
-            "limit": limit, "offset": offset}
+            "limit": limit, "offset": offset,
+            "has_reset": boundary is not None}

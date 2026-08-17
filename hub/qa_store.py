@@ -51,6 +51,21 @@ qa_record = sa.Table(
 )
 
 
+# Q-CHAT-1(B): 話題リセット境界。リセット時点の qa_record 最大 id を保存し、
+# 会話文脈はこの境界より後（id >）の行のみ参照する（id 単調増加基準＝時計
+# 精度に依存しない）。qa_record 本体・status 閉集合には触れない
+qa_topic_reset = sa.Table(
+    "qa_topic_reset", metadata,
+    sa.Column("id", sa.BigInteger().with_variant(sa.Integer(), "sqlite"),
+              primary_key=True, autoincrement=True),
+    sa.Column("created_at", sa.DateTime(timezone=True), nullable=False,
+              server_default=sa.func.now()),
+    sa.Column("user_id", sa.Text, nullable=False),
+    sa.Column("last_qa_id", sa.BigInteger().with_variant(
+        sa.Integer(), "sqlite"), nullable=False, server_default="0"),
+)
+
+
 async def save_qa(*, user_id: str, question: str, answer: str, status: str,
                   sources: list, notes: list, model: str, input_tokens: int,
                   output_tokens: int, cache_read_tokens: int, cost_usd: str,
@@ -91,4 +106,40 @@ async def list_qa(*, limit: int, offset: int) -> list[dict]:
         rows = (await session.execute(
             sa.select(qa_record).order_by(qa_record.c.id.desc())
             .limit(limit).offset(offset))).fetchall()
+        return [_row_to_dict(r) for r in rows]
+
+
+async def save_topic_reset(*, user_id: str) -> int:
+    """Q-CHAT-1(B): 話題リセットを記録し id を返す。境界は現時点の qa_record
+    最大 id（無ければ 0）＝以降の質問は境界より後の行だけを文脈にする。"""
+    async with session_scope() as session:
+        last = (await session.execute(sa.select(
+            sa.func.coalesce(sa.func.max(qa_record.c.id), 0)))).scalar()
+        result = await session.execute(sa.insert(qa_topic_reset).values(
+            user_id=user_id, last_qa_id=int(last or 0)))
+        return int(result.inserted_primary_key[0])
+
+
+async def latest_reset_boundary() -> int | None:
+    """最新の話題リセット境界（qa_record id）。リセット未実行は None。"""
+    async with session_scope() as session:
+        row = (await session.execute(
+            sa.select(qa_topic_reset.c.last_qa_id)
+            .order_by(qa_topic_reset.c.id.desc()).limit(1))).first()
+        return int(row[0]) if row else None
+
+
+async def list_context_qa(*, limit: int) -> list[dict]:
+    """Q-CHAT-1(A): 会話文脈用の直近 Q&A（新しい順・最大 limit 件）。
+    最後のリセット境界より後の行のみ・status=error（回答生成が完了しなかった
+    もの）は文脈価値が無いため除外。履歴は文脈情報であり出典ではない。"""
+    async with session_scope() as session:
+        row = (await session.execute(
+            sa.select(qa_topic_reset.c.last_qa_id)
+            .order_by(qa_topic_reset.c.id.desc()).limit(1))).first()
+        query = sa.select(qa_record).where(qa_record.c.status != "error")
+        if row is not None:
+            query = query.where(qa_record.c.id > int(row[0]))
+        rows = (await session.execute(
+            query.order_by(qa_record.c.id.desc()).limit(limit))).fetchall()
         return [_row_to_dict(r) for r in rows]
