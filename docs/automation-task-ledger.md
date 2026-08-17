@@ -60,6 +60,20 @@ NEXT-BATCH-SURVEY（司令塔側文書）の **#1〜#5・#7A・#10 を消込**�
 | **ブロックA点火完了**（migration 2本適用→`INBOUND_EVENT_DURABLE_ENABLED=1`→§8.1 P0 全通過） | 2026-08-11 実施（[人]+PC-A 検分） | 正本: `2026-08-11_block-a-ignition.md`。残観測=§8.2 P1（24h） |
 | **SHOKUMU-PLAN-FB1 は DEFER 裁定**（供給方法が一意に定まらず停止→読解語彙拡張票へ付け替え） | IMPL-BATCH-1 B 停止報告 | 受け皿: `DRAFT_KOSEKI_VOCAB_EXT.md`（DOCS-BATCH-1 C 起草・D巡待ち）。FB1 再発行は同票 merge・実機 CU 後 |
 
+## 1c. 完了反映（2026-08-17 追記・8/12〜17 消込）
+
+8/11 更新（`10b0380`）以降の merge・実施を状態同期する（詳細は各 work-log・
+PR が正本。本節は台帳としての消込のみ）:
+
+| 項目 | PR / 実施 | 備考 |
+|---|---|---|
+| AUTOREPLY-PAUSE（①全体停止 flag `AUTOREPLY_PAUSED`・受信記録/通知は継続。fix1〜3=fail-closed 化・strict writer 化・処理所有権の単一化） | **#206**（2026-08-13 merge） | flag 投入は[人]（未投入=挙動不変） |
+| P3-003C-CANCEL 実装（取消関所 `hub/heir_cancel`・App36 有効性 filter `hub/app36_validity`・write-set 台帳。fix1=write-set 先行保存/三値判定・fix2=未回収 pending の fail-closed 中止） | **#207**（2026-08-14 merge・f1b9dad） | migration **`f3d8c1a4e9b2`（projection_log）は本番適用済み**（2026-08-14。2026-08-17 に current=head・immutable trigger・CHECK 閉集合・ROWS=0 を再実測）。点火は[人]ゲート `HEIR_CANCEL_ENABLED`（未設定=OFF）。CANCEL-IMPL-06（LOW・型注釈）は司令塔持ち票 |
+| RV02 封鎖: `SERVICE_AUTH_SIGNED_REQUIRED_PATHS` の器＋encoded alias 遮断（fix1・legacy 停止 list にも同修正。正規化後照合・fail-closed 入口遮断） | **#208**（2026-08-16 merge・420fcf6） | alias 遮断は本番実測済み（404・`bad_path_blocked` 計数）。**(c-0) registry 更新実施済み**（2026-08-16: `gas-ingest-2026-07a` へ `/scan` 追記＋新 kid `pc-watcher-2026-08a`〔/ocr/fixed-asset・expires 2026-10-01 JST〕）。残[人]ゲート=(c) GAS/watcher 署名付与→(d) unsigned_accepted 到達率実測→(e) 強制化 env 投入。手順書=RV02-CLOSE-PLAN（branch plan-audit `09877ec`） |
+| PWA-BATCH-1（PWA 骨格＋相続案件ダッシュボード read-only。R-PWA-1 HIGH3 反映=field 閉集合 FETCH/VIEW・`$id` 全件カーソル・サーバ側整数集計） | **#209**（2026-08-17 merge・6a6380d） | **ブロック F env（`WEBAPP_PASSWORD_HASH`+`WEBAPP_SESSION_SECRET`）2026-08-17 投入済み=P4-001 の本番ログイン有効**（起動 4 象限通過・スモーク 4 点 OK・誤パスワード固定拒否実測）。残=大野の実機確認 5 段階（ホーム画面追加〜キャッシュ非保持） |
+
+テスト系譜（2026-08-17 時点）: 2073 → **2295**（全PASS・`--ignore=test_triage_classification.py` 基準）。
+
 ## 2a. 未着手項目の解錠条件（2026-08-09 追記・依存注記）
 
 §2/§3 の 7 月裁定項目（正当放置を含む）は**そのまま**とし、現時点の主要ゲートを
@@ -72,7 +86,7 @@ NEXT-BATCH-SURVEY（司令塔側文書）の **#1〜#5・#7A・#10 を消込**�
 | **実機デー（migration 2 本適用→点火群）** | ブロックA（durable=`INBOUND_EVENT_DURABLE_ENABLED`）・ブロックE（`ATTORNEY_ALLOWLIST`→`HEIR_DERIVATION_ENABLED`）・§3 の env 投入 3 種（#7）との同日消化も可 | **2026-08-11 前半消化**: migration 2本適用済み（current=heads=`e7a3c9d2b5f1` 実測）・**ブロックA点火完了**（§8.1 P0 全通過・`2026-08-11_block-a-ignition.md`）。**残=ブロックE**（ALLOWLIST→flag の順・[人]）＋§3 env 3種＋§8.2 P1 観測 |
 | **G-L3-0**（lane3 点火前ゲート・司令塔裁定） | lane3（bank/valuation の署名切替・`SIGNED_LANES` 残 3 lane） | 裁定待ち |
 | **R-P3-003C-IMPL-1 PASS→マージ** | held/rejected 語彙の本番入り（flag OFF のため挙動不変） | レビュー中（`0ba7fb3`） |
-| P3 merge 済み（**解錠済み**） | P4-005（相続人関係図・導出結果重畳含む） | **未着手・次票候補**（scan 不要・先行可） |
+| P3 merge 済み（**解錠済み**） | P4-005（相続人関係図・導出結果重畳含む） | ~~未着手・次票候補（scan 不要・先行可）~~ **実装・merge 済み**（**#194**・2026-08-10。App33 取得済み戸籍一覧は MAINT-3 B=#195 で追加）——本行は 8/11 更新時点で既に stale だった（2026-08-17 消込） |
 
 ## 2. 登録済み・未着手（司令塔の裁定・指示待ち）
 
