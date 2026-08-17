@@ -91,8 +91,11 @@ _HEIR_FETCH_FIELDS = ["$id", "氏名", "続柄", "法定相続分", "状態", "�
 _HEIR_VIEW_FIELDS = [f for f in _HEIR_FETCH_FIELDS if f != CANCELLED_FIELD]
 _ASSET_FIELDS = ["$id", "財産種別", "名義", "評価額", "評価方法", "評価基準日",
                  "評価確定", "データ源", "有効"]
-_DOC_FIELDS = ["$id", "件名", "チャネル", "方向", "発送ステータス", "発送日時",
-               "成果物"]
+# PWA-PDF-LINK: Drive_fileId は取得のみ（PDF 直リンクの導出材料）。応答 VIEW
+# には生 ID を出さず、grammar 検証済みの導出 URL（_pdf_url）だけを行に付与する
+_DOC_FETCH_FIELDS = ["$id", "件名", "チャネル", "方向", "発送ステータス",
+                     "発送日時", "成果物", "Drive_fileId"]
+_DOC_VIEW_FIELDS = [f for f in _DOC_FETCH_FIELDS if f != "Drive_fileId"]
 
 # 未確定注記（①§2.7「機械は確定しない」の画面反映・固定文言）
 NOTICE_READONLY = (
@@ -255,8 +258,16 @@ async def _load_documents(case_record_id: str) -> dict:
         APP_SHIPPING,
         f'案件アプリID = "{app_id}" and 案件レコードID = "{case_record_id}" '
         "order by 更新日時 desc limit 20",
-        fields=_DOC_FIELDS)
-    return {"records": _project(rows, _DOC_FIELDS)}
+        fields=_DOC_FETCH_FIELDS)
+    projected = _project(rows, _DOC_VIEW_FIELDS)
+    # PWA-PDF-LINK: Drive 参照（Drive_fileId）が grammar を満たす行にのみ
+    # 直リンク URL を付与（config 側で検証済みの導出値のみ・生 ID 非搭載。
+    # 参照なし/不正は key 自体を付けない＝画面はリンク非表示）
+    for raw, out in zip(rows, projected):
+        url = config.drive_pdf_view_url(_v(raw, "Drive_fileId"))
+        if url is not None:
+            out["_pdf_url"] = url
+    return {"records": projected}
 
 
 async def _load_derivation(case_record_id: str) -> dict:

@@ -19,6 +19,7 @@
 import json
 from dataclasses import dataclass, field
 
+import config
 from hub import kintone
 from hub.person_validity import MERGE_STATE_FIELD, filter_active_persons
 
@@ -252,7 +253,9 @@ async def load_koseki_summaries_for_case(case_record_id: str) -> list[dict]:
     records = await kintone.search_records(
         APP_KOSEKI_BOOK,
         f'案件レコードID = "{case_record_id}" order by $id asc limit 100',
-        fields=["$id", "読解JSON"])
+        # PWA-PDF-LINK: Drive_fileId は原本 PDF 直リンクの導出材料（表示は
+        # grammar 検証済み URL のみ・生 ID は応答へ出さない）
+        fields=["$id", "読解JSON", "Drive_fileId"])
 
     def _d(value) -> dict:
         """dict 以外の型崩れ（"読解不能" 等の文字列・list・数値）は空 dict へ縮退
@@ -274,12 +277,19 @@ async def load_koseki_summaries_for_case(case_record_id: str) -> list[dict]:
         koseki = _d(_d(reading).get("戸籍"))
         juzen = _d(koseki.get("従前戸籍"))
         rid = _d(r.get("$id")).get("value")
-        out.append({
+        row = {
             "record_id": _s(rid if isinstance(rid, str) else str(rid or "")),
             "honseki": _s(koseki.get("本籍")),
             "hittousha": _s(koseki.get("筆頭者")),
             "juzen_honseki": _s(juzen.get("本籍")),
-        })
+        }
+        # PWA-PDF-LINK: Drive 参照が grammar を満たす行にのみ pdf_url を付与
+        # （参照なし/不正は key 自体なし＝画面はリンク非表示・従来行と同形）
+        pdf_url = config.drive_pdf_view_url(
+            _s(_d(r.get("Drive_fileId")).get("value")))
+        if pdf_url is not None:
+            row["pdf_url"] = pdf_url
+        out.append(row)
     return out
 
 

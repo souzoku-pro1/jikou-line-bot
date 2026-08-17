@@ -37,7 +37,7 @@ a{color:#1a3c6e}
 <table id="assets"><thead><tr><th>ID</th><th>財産種別</th><th>名義</th><th>評価額</th><th>評価方法</th><th>評価基準日</th><th>評価確定</th><th>データ源</th><th>有効</th><th>原本</th></tr></thead><tbody id="asset-rows"></tbody></table>
 <h2>直近生成書類（App30・この案件の絞込）</h2>
 <p class="warn" id="docs-note"></p>
-<table id="docs"><thead><tr><th>ID</th><th>件名</th><th>チャネル</th><th>方向</th><th>発送ステータス</th><th>発送日時</th><th>成果物</th><th>原本</th></tr></thead><tbody id="doc-rows"></tbody></table>
+<table id="docs"><thead><tr><th>ID</th><th>件名</th><th>チャネル</th><th>方向</th><th>発送ステータス</th><th>発送日時</th><th>成果物</th><th>PDF</th><th>原本</th></tr></thead><tbody id="doc-rows"></tbody></table>
 <script src="/app/app.js"></script>
 <script src="/app/shell.js"></script>
 <script>
@@ -57,6 +57,20 @@ function recLink(base, appId, recId) {
   a.href = base + "/" + encodeURIComponent(appId) + "/show#record=" +
     encodeURIComponent(recId);
   a.textContent = "kintone";
+  a.target = "_blank";
+  a.rel = "noopener noreferrer";
+  return a;
+}
+// PWA-PDF-LINK: サーバが grammar 検証済みの Drive 直リンク（_pdf_url）のみを
+// リンク化する。参照なし行は空（壊れたリンクを出さない）。閲覧は開く人の
+// Google ログイン権限に依存（サーバは PDF を中継しない）
+function pdfLink(url) {
+  if (!url || !url.startsWith("https://drive.google.com/file/d/")) {
+    return document.createTextNode("");
+  }
+  const a = document.createElement("a");
+  a.href = url;
+  a.textContent = "PDF";
   a.target = "_blank";
   a.rel = "noopener noreferrer";
   return a;
@@ -189,6 +203,7 @@ async function load() {
       const cells = [v(rec, "$id"), v(rec, "件名"), v(rec, "チャネル"),
                      v(rec, "方向"), v(rec, "発送ステータス"),
                      v(rec, "発送日時"), files,
+                     pdfLink(rec._pdf_url),
                      recLink(base, apps.shipping, v(rec, "$id"))];
       for (const c of cells) { tr.appendChild(td(c)); }
       rows.appendChild(tr);

@@ -867,3 +867,21 @@ def kintone_record_link_base():
             c.isascii() and (c.isalnum() or c == "-") for c in sub):
         return f"https://{sub}.cybozu.com/k"
     return None
+
+
+def drive_pdf_view_url(file_id):
+    """PWA 表示用: Google Drive ファイルの直接閲覧 URL（PWA-PDF-LINK）。
+
+    grammar（ASCII 英数・`-`・`_` のみ・10〜100 文字）を満たすときだけ
+    "https://drive.google.com/file/d/<id>/view" を返し、それ以外（空・型不正・
+    区切り文字や記号を含む値）は None＝リンク化しない（URL インジェクション
+    防止・壊れたリンクを出さない）。閲覧権限は開く人の Google ログインに
+    依存し、サーバはファイルを中継しない（「アプリにデータを持たせない」）。
+    """
+    if not isinstance(file_id, str):
+        return None
+    if not (10 <= len(file_id) <= 100):
+        return None
+    if not all(c.isascii() and (c.isalnum() or c in "-_") for c in file_id):
+        return None
+    return f"https://drive.google.com/file/d/{file_id}/view"
