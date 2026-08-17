@@ -762,11 +762,20 @@ async def q_reset(request: Request):
     回答生成中は境界が処理中の保存行とねじれるため busy で弾く。PRG で戻る。"""
     if _inflight:
         return RedirectResponse("/app/q?e=busy", status_code=303)
+    # Q-CHAT-1-fix1（R-Q-CHAT-1 Q-CHAT-01）: reset も同じ single-flight 所有権を
+    # 取得し、境界保存完了と 303 生成まで保持する（check→append の間に await
+    # なし＝原子的）。これで reset 処理中の ask は e=busy で遮断され、ask⇔reset
+    # の**双方向**排他が成立——質問の帰属（旧話題/新話題）が DB 到達順でなく
+    # 実行順で決定的になる
+    _inflight.append(1)
     try:
-        await qa_store.save_topic_reset(user_id="owner")
-    except Exception:
-        return RedirectResponse("/app/q?e=save", status_code=303)
-    return RedirectResponse("/app/q", status_code=303)
+        try:
+            await qa_store.save_topic_reset(user_id="owner")
+        except Exception:
+            return RedirectResponse("/app/q?e=save", status_code=303)
+        return RedirectResponse("/app/q", status_code=303)
+    finally:
+        del _inflight[:]                 # 保存成功・保存例外いずれも必ず解放
 
 
 router.add_api_route("/app/q/reset", _gate(q_reset), methods=["POST"])
