@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>質問 - 案件管理（仮）</title>
+<style>
+body{font-family:sans-serif;max-width:960px;margin:1.5rem auto;padding:0 1rem}
+textarea{width:100%;min-height:5rem;font-size:1rem;padding:.5rem;box-sizing:border-box}
+button{font-size:1rem;padding:.4rem 1.2rem;margin-top:.4rem}
+a{color:#1a3c6e}
+.entry{border:1px solid #ccc;border-radius:8px;padding:.8rem 1rem;margin:.8rem 0}
+.entry.latest{border-color:#1a3c6e;box-shadow:0 0 0 2px #dce6f5}
+.q{font-weight:bold;margin-bottom:.4rem}
+.answer{white-space:pre-wrap;word-break:break-word;font-family:inherit;margin:.4rem 0;font-size:.97rem}
+.notice{background:#fff7e0;border:1px solid #e0c060;border-radius:6px;padding:.5rem .8rem;font-size:.88rem;margin:.4rem 0}
+.err{background:#fdecec;border:1px solid #d08080;border-radius:6px;padding:.5rem .8rem;margin:.6rem 0}
+.meta{color:#666;font-size:.82rem;margin-top:.4rem}
+.src{font-size:.88rem;margin:.15rem 0}
+.status-bad{color:#a02020;font-size:.88rem;font-weight:bold}
+.hint{color:#555;font-size:.9rem}
+</style>
+</head>
+<body>
+<h1>質問（案件参照）</h1>
+<!-- Q-BATCH-1: 読み取り専用の案件質問応答。質問は form POST（access log に
+     載る GET query を使わない）→ 303 で本画面へ戻り、Q&A 台帳を再読込して表示。
+     回答は参考情報（機械は確定しない）・出典はサーバ実測記録 -->
+<p class="hint">kintone の記録を読み取り専用で参照して回答します。回答の生成には
+1〜2 分かかることがあります（送信後はこの画面に戻るまでお待ちください）。</p>
+<form method="post" action="/app/q/ask">
+  <textarea name="question" maxlength="2000"
+    placeholder="例: 案件 No.9 の相続人のうち戸籍確認が終わっていないのは誰？"></textarea>
+  <div><button type="submit">質問する</button></div>
+</form>
+<div id="flash"></div>
+<h2>Q&amp;A 台帳（新しい順）</h2>
+<div id="entries"><p class="hint">読み込み中…</p></div>
+<script src="/app/app.js"></script>
+<script src="/app/shell.js"></script>
+<script>
+function el(tag, cls, text) {
+  const node = document.createElement(tag);
+  if (cls) { node.className = cls; }
+  if (text !== undefined) { node.textContent = text; }
+  return node;
+}
+function link(url, label) {
+  if (!url || !url.startsWith("https://")) { return null; }
+  const a = document.createElement("a");
+  a.href = url;
+  a.textContent = label;
+  a.target = "_blank";
+  a.rel = "noopener noreferrer";
+  return a;
+}
+function renderEntry(rec, highlight) {
+  const box = el("div", highlight ? "entry latest" : "entry");
+  box.appendChild(el("div", "q", "Q. " + rec.question));
+  if (rec.status !== "ok") {
+    box.appendChild(el("div", "status-bad",
+      rec.status === "no_source" ? "出典なし（fail-closed 応答）" : "エラー応答"));
+  }
+  box.appendChild(el("div", "answer", rec.answer));
+  for (const note of rec.notes || []) {
+    box.appendChild(el("div", "notice", "注記: " + note));
+  }
+  const srcs = rec.sources || [];
+  if (srcs.length) {
+    box.appendChild(el("div", "meta", "出典（サーバ実測記録）:"));
+    for (const s of srcs) {
+      const line = el("div", "src", s.app + " No." + s.record_id + " ");
+      const k = link(s.url, "kintone");
+      if (k) { line.appendChild(k); }
+      const p = link(s.pdf_url, " PDF");
+      if (p) { line.appendChild(document.createTextNode(" / ")); line.appendChild(p); }
+      box.appendChild(line);
+    }
+  }
+  box.appendChild(el("div", "meta",
+    `${rec.created_at}｜model: ${rec.model}｜tokens in/out: ` +
+    `${rec.input_tokens}/${rec.output_tokens}｜概算 $${rec.cost_usd}｜` +
+    `${rec.elapsed_ms}ms`));
+  return box;
+}
+async function load() {
+  const params = new URLSearchParams(location.search);
+  const flash = document.getElementById("flash");
+  const e = params.get("e");
+  if (e === "rate") {
+    flash.appendChild(el("div", "err",
+      "質問が多すぎます（10分あたり10問まで）。しばらくして再試行してください。"));
+  } else if (e === "input") {
+    flash.appendChild(el("div", "err", "質問を入力してください（2000文字まで）。"));
+  } else if (e === "save") {
+    flash.appendChild(el("div", "err",
+      "回答の保存に失敗しました（DB に接続できません）。管理者に確認してください。"));
+  }
+  const resp = await app_fetch("/app/api/q/history?limit=20");
+  if (resp.redirected || !resp.headers.get("content-type")?.includes("json")) {
+    location.href = "/app/login"; return;
+  }
+  const data = await resp.json();
+  const wrap = document.getElementById("entries");
+  wrap.replaceChildren();
+  if (!data.available) {
+    wrap.appendChild(el("p", "err", "Q&A 台帳（DB）に接続できません。"));
+    return;
+  }
+  if (!data.records.length) {
+    wrap.appendChild(el("p", "hint", "まだ質問はありません。"));
+    return;
+  }
+  const done = params.get("done");
+  for (const rec of data.records) {
+    wrap.appendChild(renderEntry(rec, done !== null && String(rec.id) === done));
+  }
+}
+load();
+</script>
+</body>
+</html>

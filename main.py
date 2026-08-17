@@ -1620,5 +1620,8 @@ app.include_router(kinship_view_router)
 # PWA-BATCH-1: 相続案件ダッシュボード（read-only）。catch-all より先に結線
 from hub.webapp_souzoku_dashboard import router as souzoku_dash_router  # noqa: E402
 app.include_router(souzoku_dash_router)
+# Q-BATCH-1: 案件質問応答（read-only tool use・大野裁定 2026-08-17=PWA 搭載）
+from hub.webapp_q import router as webapp_q_router  # noqa: E402
+app.include_router(webapp_q_router)
 from hub.webapp_auth import router as webapp_router  # noqa: E402
 app.include_router(webapp_router)
