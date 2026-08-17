@@ -356,12 +356,19 @@ class TestAskFlow(_DbMixin):
         self.assertIn(wq.ERROR_ANSWER, rec["answer"])
 
     def test_rate_limit_fixed_redirect_no_api_call(self):
+        # Q-UX-1(C): e=rate は回復までの目安秒 retry を伴う（質問文は載せない・
+        # 従来の「/app/q?e=rate 固定」から retry 付きへ強化。API 非呼出しは不変）
         now = time.time()
         wq._ask_times.extend([now] * wq.RATE_LIMIT)
         stub = _stub_client([])
         r = self._post("質問", stub)
         self.assertEqual(r.status_code, 303)
-        self.assertEqual(r.headers["location"], "/app/q?e=rate")
+        location = r.headers["location"]
+        self.assertTrue(location.startswith("/app/q?e=rate&retry="), location)
+        retry = int(location.split("retry=", 1)[1])
+        # 直前に now で満杯にした窓 → ほぼ丸ごと RATE_WINDOW_SECONDS 残る
+        self.assertGreaterEqual(retry, wq.RATE_WINDOW_SECONDS - 5)
+        self.assertLessEqual(retry, wq.RATE_WINDOW_SECONDS + 1)
         stub.messages.create.assert_not_called()
 
     def test_empty_question_rejected(self):

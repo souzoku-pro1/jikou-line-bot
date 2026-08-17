@@ -29,7 +29,8 @@
   値のログ反射経路を構造的に持たない）。応答は関所の no-store 契約に乗る。
   質問文は **form POST**（access log に query が載る GET を使わない）。
 - コスト・安全: 1 質問のコスト概算（Decimal・float 非経由）を Q&A 台帳に記録。
-  質問レート制限（固定窓・webapp_auth の流儀）。API 呼出しは timeout 付き・
+  質問レート制限（スライディング窓・完了計上＝Q-UX-1(C)）＋single-flight
+  （処理中の重複 POST は実行しない＝Q-UX-1(B)）。API 呼出しは timeout 付き・
   turn 上限付きで、失敗時は推測で埋めず固定文言へ fail-closed。
 """
 
@@ -67,10 +68,18 @@ _MAX_TOOL_CALLS_TOTAL = 20        # 全 turn 合計の tool 呼び出し数上�
 _MAX_TOOL_USE_PER_TURN = 5        # 1 response 内の tool_use 数上限
 _MAX_TOOL_RESULT_BYTES = 50_000   # tool 結果（canonical JSON）の byte 上限
 
-# レート制限（固定窓・単一利用者前提のプロセス内カウンタ。webapp_auth の流儀）
+# レート制限（スライディング窓・単一利用者前提のプロセス内カウンタ）。
+# Q-UX-1(C) 裁定: 「完了した回答生成」（ok/no_source）のみ計上する——error
+# （時間切れ・API エラー＝回答生成が完了しなかったもの）と、single-flight で
+# 弾いた重複 POST は数えない。制限中も新規計上しない（窓を延長しない）ため、
+# 最初の RATE_LIMIT 件が期限切れになれば必ず自然回復する。
 RATE_WINDOW_SECONDS = 600
 RATE_LIMIT = 10
 _ask_times: list = []
+# Q-UX-1(B): single-flight marker（処理中は 1 要素・完了/失敗で必ず空へ）。
+# 診断 Q-RATE-DIAG で実測された「1 回の質問操作が再送・連打で複数 POST に
+# 増幅される」形をサーバ側でも遮断する（増幅分は実行も計上もしない）。
+_inflight: list = []
 
 # ── 固定文言（閉集合・テストで pin） ─────────────────────────────────────────
 DISCLAIMER = (
@@ -620,13 +629,20 @@ async def _answer_question(question: str) -> dict:
 
 # ── レート制限（固定窓・暴走防止） ───────────────────────────────────────────
 
-def _rate_limited(now: float) -> bool:
+def _rate_status(now: float) -> tuple:
+    """(制限中か, 回復までの目安秒) を返す。判定のみで計上はしない（計上は
+    q_ask が回答生成の完了後に _count_completed_ask で行う＝Q-UX-1(C)）。"""
     cutoff = now - RATE_WINDOW_SECONDS
     _ask_times[:] = [t for t in _ask_times if t > cutoff]
     if len(_ask_times) >= RATE_LIMIT:
-        return True
+        # 最古の計上が窓から抜けるまでの秒数（切り上げ・最低 1 秒）
+        return True, max(int(min(_ask_times) + RATE_WINDOW_SECONDS - now) + 1, 1)
+    return False, 0
+
+
+def _count_completed_ask(now: float) -> None:
+    """完了した回答生成（ok/no_source）を 1 件計上する。error は呼ばない。"""
     _ask_times.append(now)
-    return False
 
 
 # ── routes（全て _gate・質問は form POST=access log に載らない） ─────────────
@@ -646,9 +662,24 @@ async def q_ask(request: Request):
     question = str(form.get("question") or "").strip()
     if not question or len(question) > _QUESTION_MAX_CHARS:
         return RedirectResponse("/app/q?e=input", status_code=303)
-    if _rate_limited(time.time()):
-        return RedirectResponse("/app/q?e=rate", status_code=303)
-    result = await _answer_question(question)
+    # Q-UX-1(B): single-flight——処理中に来た POST（再送・連打の増幅分）は
+    # 実行せず戻す。レート計上もしない。check→append の間に await が無いため
+    # 単一 event loop 上で原子的
+    if _inflight:
+        return RedirectResponse("/app/q?e=busy", status_code=303)
+    limited, retry = _rate_status(time.time())
+    if limited:
+        # Q-UX-1(C): 回復までの目安秒を添える（質問文は含まない・PII 規律維持）
+        return RedirectResponse(f"/app/q?e=rate&retry={retry}",
+                                status_code=303)
+    _inflight.append(1)
+    try:
+        result = await _answer_question(question)
+    finally:
+        del _inflight[:]
+    # Q-UX-1(C): 完了した回答生成（ok/no_source）のみ計上。error は数えない
+    if result["status"] != "error":
+        _count_completed_ask(time.time())
     result["answer"] = result["answer"] + "\n\n" + DISCLAIMER
     try:
         qa_id = await qa_store.save_qa(user_id="owner", question=question,

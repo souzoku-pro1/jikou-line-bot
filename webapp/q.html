@@ -5,40 +5,68 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>質問 - 案件管理（仮）</title>
 <style>
-body{font-family:sans-serif;max-width:960px;margin:1.5rem auto;padding:0 1rem}
-textarea{width:100%;min-height:5rem;font-size:1rem;padding:.5rem;box-sizing:border-box}
-button{font-size:1rem;padding:.4rem 1.2rem;margin-top:.4rem}
+/* Q-UX-1(A): LINE 風チャット。質問=右の吹き出し・回答=左・時系列（最新が下）・
+   入力欄は画面下部固定（flex 列レイアウト・chat 領域のみスクロール） */
+html,body{height:100%}
+body{font-family:sans-serif;max-width:960px;margin:0 auto;padding:.6rem 1rem;
+  box-sizing:border-box;display:flex;flex-direction:column;background:#eef1f5}
 a{color:#1a3c6e}
-.entry{border:1px solid #ccc;border-radius:8px;padding:.8rem 1rem;margin:.8rem 0}
-.entry.latest{border-color:#1a3c6e;box-shadow:0 0 0 2px #dce6f5}
-.q{font-weight:bold;margin-bottom:.4rem}
-.answer{white-space:pre-wrap;word-break:break-word;font-family:inherit;margin:.4rem 0;font-size:.97rem}
-.notice{background:#fff7e0;border:1px solid #e0c060;border-radius:6px;padding:.5rem .8rem;font-size:.88rem;margin:.4rem 0}
-.err{background:#fdecec;border:1px solid #d08080;border-radius:6px;padding:.5rem .8rem;margin:.6rem 0}
-.meta{color:#666;font-size:.82rem;margin-top:.4rem}
-.src{font-size:.88rem;margin:.15rem 0}
-.status-bad{color:#a02020;font-size:.88rem;font-weight:bold}
-.hint{color:#555;font-size:.9rem}
+#chat{flex:1;overflow-y:auto;padding:.4rem .2rem;display:flex;
+  flex-direction:column;gap:.55rem}
+.row{display:flex;flex-direction:column}
+.row.me{align-items:flex-end}
+.row.bot{align-items:flex-start}
+.bubble{max-width:82%;padding:.55rem .8rem;border-radius:14px;
+  white-space:pre-wrap;word-break:break-word;font-size:.97rem;line-height:1.5}
+.me .bubble{background:#8ee36a;border-bottom-right-radius:4px}
+.bot .bubble{background:#fff;border:1px solid #d8dde5;
+  border-bottom-left-radius:4px}
+.bot .bubble.bad{background:#f6f6f6;color:#555}
+.bot .bubble.errb{background:#fdecec;border-color:#d08080}
+.sysrow{display:flex;justify-content:center}
+.sys{background:#dfe4ec;color:#444;font-size:.85rem;border-radius:10px;
+  padding:.3rem .8rem;max-width:90%}
+.sys.err{background:#f7d9d9;color:#7a1f1f}
+.notice{background:#fff7e0;border:1px solid #e0c060;border-radius:8px;
+  padding:.35rem .6rem;font-size:.82rem;margin-top:.3rem;max-width:82%}
+.src{font-size:.82rem;margin-top:.25rem;max-width:82%}
+.meta{color:#8a8f98;font-size:.74rem;margin-top:.2rem}
+.typing{color:#666;font-style:normal}
+.typing .dots{display:inline-block;animation:blink 1.2s infinite}
+@keyframes blink{0%,100%{opacity:.2}50%{opacity:1}}
+#composer{display:flex;gap:.5rem;align-items:flex-end;padding:.55rem 0 .3rem;
+  border-top:1px solid #d8dde5;background:#eef1f5}
+#composer textarea{flex:1;min-height:2.6rem;max-height:8rem;font-size:1rem;
+  padding:.5rem;box-sizing:border-box;border:1px solid #c8cdd5;
+  border-radius:10px;resize:vertical;font-family:inherit}
+#composer button{font-size:1rem;padding:.5rem 1.1rem;border-radius:10px;
+  border:1px solid #1a3c6e;background:#1a3c6e;color:#fff}
+#composer button:disabled{background:#9aa7bd;border-color:#9aa7bd}
+.hint{color:#555;font-size:.82rem;margin:.15rem 0 0}
 </style>
 </head>
 <body>
-<h1>質問（案件参照）</h1>
-<!-- Q-BATCH-1: 読み取り専用の案件質問応答。質問は form POST（access log に
-     載る GET query を使わない）→ 303 で本画面へ戻り、Q&A 台帳を再読込して表示。
-     回答は参考情報（機械は確定しない）・出典はサーバ実測記録 -->
-<p class="hint">kintone の記録を読み取り専用で参照して回答します。回答の生成には
-1〜2 分かかることがあります（送信後はこの画面に戻るまでお待ちください）。</p>
-<form method="post" action="/app/q/ask">
+<!-- Q-UX-1: 質問は従来どおり native form POST（access log に載る GET query を
+     使わない。ラッパー閉集合維持のため本画面の通信は app_fetch の GET 履歴
+     読込のみ）→ 303 PRG で本画面へ戻り、チャットログを再描画。
+     送信中は submit ハンドラが吹き出し＋「回答を作成中…」を即時表示し、
+     二重送信をクライアント側でも遮断（サーバ側 single-flight と二段） -->
+<div id="chat"><div class="sysrow"><div class="sys">読み込み中…</div></div></div>
+<form id="composer" method="post" action="/app/q/ask">
   <textarea name="question" maxlength="2000"
-    placeholder="例: 案件 No.9 の相続人のうち戸籍確認が終わっていないのは誰？"></textarea>
-  <div><button type="submit">質問する</button></div>
+    placeholder="質問を入力（例: 案件 No.9 の相続人のうち戸籍確認が終わっていないのは誰？）"></textarea>
+  <button type="submit">送信</button>
 </form>
-<div id="flash"></div>
-<h2>Q&amp;A 台帳（新しい順）</h2>
-<div id="entries"><p class="hint">読み込み中…</p></div>
+<p class="hint">kintone の記録を読み取り専用で参照して回答します（回答の生成には
+1〜2 分かかることがあります）。回答は参考情報であり確定ではありません。</p>
 <script src="/app/app.js"></script>
 <script src="/app/shell.js"></script>
 <script>
+const chat = document.getElementById("chat");
+const composer = document.getElementById("composer");
+const qbox = composer.querySelector("textarea");
+const sendBtn = composer.querySelector("button");
+
 function el(tag, cls, text) {
   const node = document.createElement(tag);
   if (cls) { node.className = cls; }
@@ -54,68 +82,120 @@ function link(url, label) {
   a.rel = "noopener noreferrer";
   return a;
 }
-function renderEntry(rec, highlight) {
-  const box = el("div", highlight ? "entry latest" : "entry");
-  box.appendChild(el("div", "q", "Q. " + rec.question));
-  if (rec.status !== "ok") {
-    box.appendChild(el("div", "status-bad",
-      rec.status === "no_source" ? "出典なし（fail-closed 応答）" : "エラー応答"));
-  }
-  box.appendChild(el("div", "answer", rec.answer));
+function row(kind) {
+  const r = el("div", "row " + kind);
+  chat.appendChild(r);
+  return r;
+}
+function sysMessage(text, isErr) {
+  const wrap = el("div", "sysrow");
+  wrap.appendChild(el("div", isErr ? "sys err" : "sys", text));
+  chat.appendChild(wrap);
+}
+function scrollBottom() {
+  chat.scrollTop = chat.scrollHeight;
+}
+function fmtTime(iso) {
+  // ISO（UTC）→ 端末ローカル時刻の短い表記（文字列整形のみ・失敗時は原文）
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) { return String(iso || ""); }
+  const p = (n) => (n < 10 ? "0" + n : "" + n);
+  return d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate()) +
+    " " + p(d.getHours()) + ":" + p(d.getMinutes());
+}
+function renderRecord(rec) {
+  // 質問=右（LINE の自分側）
+  const qr = row("me");
+  qr.appendChild(el("div", "bubble", rec.question));
+  // 回答=左。status で吹き出しの色分け（本文はサーバ保存の固定文言込み）
+  const ar = row("bot");
+  const cls = rec.status === "ok" ? "bubble"
+    : (rec.status === "error" ? "bubble errb" : "bubble bad");
+  ar.appendChild(el("div", cls, rec.answer));
   for (const note of rec.notes || []) {
-    box.appendChild(el("div", "notice", "注記: " + note));
+    ar.appendChild(el("div", "notice", "注記: " + note));
   }
   const srcs = rec.sources || [];
   if (srcs.length) {
-    box.appendChild(el("div", "meta", "出典（サーバ実測記録）:"));
+    const box = el("div", "src", "出典: ");
     for (const s of srcs) {
-      const line = el("div", "src", s.app + " No." + s.record_id + " ");
+      const line = el("span", "", s.app + " No." + s.record_id + " ");
       const k = link(s.url, "kintone");
       if (k) { line.appendChild(k); }
-      const p = link(s.pdf_url, " PDF");
-      if (p) { line.appendChild(document.createTextNode(" / ")); line.appendChild(p); }
+      const p = link(s.pdf_url, "PDF");
+      if (p) { line.appendChild(document.createTextNode(" / "));
+               line.appendChild(p); }
+      line.appendChild(document.createTextNode("　"));
       box.appendChild(line);
     }
+    ar.appendChild(box);
   }
-  box.appendChild(el("div", "meta",
-    `${rec.created_at}｜model: ${rec.model}｜tokens in/out: ` +
-    `${rec.input_tokens}/${rec.output_tokens}｜概算 $${rec.cost_usd}｜` +
-    `${rec.elapsed_ms}ms`));
-  return box;
+  ar.appendChild(el("div", "meta",
+    fmtTime(rec.created_at) + "｜概算 $" + rec.cost_usd + "｜" +
+    rec.elapsed_ms + "ms｜" + rec.model));
+}
+function renderFlash(params) {
+  const e = params.get("e");
+  if (e === "rate") {
+    const retry = parseInt(params.get("retry") || "", 10);
+    let hint = "しばらくして再試行してください。";
+    if (retry > 0) {
+      hint = "約" + Math.max(1, Math.ceil(retry / 60)) +
+        "分後に再試行できます。";
+    }
+    sysMessage("質問が多すぎます（10分あたり10問まで）。" + hint, true);
+  } else if (e === "busy") {
+    sysMessage("前の質問の回答を作成中です。完了までお待ちください" +
+      "（この送信は実行されていません）。", true);
+  } else if (e === "input") {
+    sysMessage("質問を入力してください（2000文字まで）。", true);
+  } else if (e === "save") {
+    sysMessage("回答の保存に失敗しました（DB に接続できません）。" +
+      "管理者に確認してください。", true);
+  }
 }
 async function load() {
   const params = new URLSearchParams(location.search);
-  const flash = document.getElementById("flash");
-  const e = params.get("e");
-  if (e === "rate") {
-    flash.appendChild(el("div", "err",
-      "質問が多すぎます（10分あたり10問まで）。しばらくして再試行してください。"));
-  } else if (e === "input") {
-    flash.appendChild(el("div", "err", "質問を入力してください（2000文字まで）。"));
-  } else if (e === "save") {
-    flash.appendChild(el("div", "err",
-      "回答の保存に失敗しました（DB に接続できません）。管理者に確認してください。"));
-  }
-  const resp = await app_fetch("/app/api/q/history?limit=20");
+  const resp = await app_fetch("/app/api/q/history?limit=30");
   if (resp.redirected || !resp.headers.get("content-type")?.includes("json")) {
     location.href = "/app/login"; return;
   }
   const data = await resp.json();
-  const wrap = document.getElementById("entries");
-  wrap.replaceChildren();
+  chat.replaceChildren();
   if (!data.available) {
-    wrap.appendChild(el("p", "err", "Q&A 台帳（DB）に接続できません。"));
+    sysMessage("Q&A 台帳（DB）に接続できません。", true);
     return;
   }
   if (!data.records.length) {
-    wrap.appendChild(el("p", "hint", "まだ質問はありません。"));
-    return;
+    sysMessage("まだ質問はありません。下の入力欄からどうぞ。", false);
   }
-  const done = params.get("done");
-  for (const rec of data.records) {
-    wrap.appendChild(renderEntry(rec, done !== null && String(rec.id) === done));
-  }
+  // API は新しい順 → チャットは時系列（古い→新しい・最新が下）
+  const records = data.records.slice().reverse();
+  for (const rec of records) { renderRecord(rec); }
+  renderFlash(params);
+  scrollBottom();
 }
+// Q-UX-1(B): 二重送信のクライアント側遮断。native form POST はそのまま進め、
+// 送信中の画面には自分の吹き出し＋「回答を作成中…」を即時表示する。
+// textarea は readOnly（disabled だと POST body から落ちるため不可）・
+// ボタンは disabled。2 回目以降の submit は preventDefault で遮断
+let sending = false;
+composer.addEventListener("submit", (ev) => {
+  const text = qbox.value.trim();
+  if (sending || !text) { ev.preventDefault(); return; }
+  sending = true;
+  qbox.readOnly = true;
+  sendBtn.disabled = true;
+  sendBtn.textContent = "送信中…";
+  const qr = row("me");
+  qr.appendChild(el("div", "bubble", text));
+  const ar = row("bot");
+  const t = el("div", "bubble typing", "回答を作成中");
+  t.appendChild(el("span", "dots", "…"));
+  ar.appendChild(t);
+  ar.appendChild(el("div", "meta", "最大 5 分ほどかかることがあります"));
+  scrollBottom();
+});
 load();
 </script>
 </body>
