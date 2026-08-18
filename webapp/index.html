@@ -53,7 +53,16 @@ h1{font-size:1.25rem;margin:.4rem 0 .1rem}
 <script src="/app/shell.js"></script>
 <script>
 // 件数サマリー: 取得できないときは「−」（画面は落とさない）。
-// app_fetch の第1引数は各呼出しでリテラル固定（ラッパー規律の流儀）
+// app_fetch の第1引数は各呼出しでリテラル固定（ラッパー規律の流儀）。
+// UI-POLISH-1-fix1（UI-POLISH-01）: HTTP エラー（!resp.ok）も取得不能として
+// 「−」へ縮退（4xx/5xx の JSON が「0件」に化けない）。判定は純関数
+// countText に集約（テストが同一アルゴリズムで挙動 pin）。各呼出しは独立の
+// try/catch＝1 API の失敗が他の表示を妨げない
+function countText(ok, records, cap) {
+  if (!ok || !Array.isArray(records)) { return "−"; }
+  var n = records.length;
+  return n >= cap ? cap + "+" : "" + n;
+}
 async function fillCount(respPromise, elId, cap) {
   const node = document.getElementById(elId);
   try {
@@ -62,9 +71,8 @@ async function fillCount(respPromise, elId, cap) {
         !resp.headers.get("content-type")?.includes("json")) {
       location.href = "/app/login"; return;
     }
-    const data = await resp.json();
-    const n = (data.records || []).length;
-    node.textContent = n >= cap ? cap + "+" : "" + n;
+    const data = resp.ok ? await resp.json() : null;
+    node.textContent = countText(resp.ok, data && data.records, cap);
   } catch (e) {
     node.textContent = "−";
   }

@@ -50,25 +50,34 @@ function el(tag, cls, text) {
 function disp(text) {
   return text ? document.createTextNode(text) : el("span", "muted", "未登録");
 }
+// UI-POLISH-1-fix1（UI-POLISH-02）: 日時表示の単一の正（全画面で逐語同一・
+// テストが verbatim pin）。JST は UTC+9 固定（DST なし＝Asia/Tokyo と恒等）を
+// UTC 演算のみで適用し、端末タイムゾーンに依存しない（非 UTC getter 不使用を
+// 構造 pin）。「今日」判定も JST の日付境界で行う
+function jstParts(d) {
+  var t = new Date(d.getTime() + 9 * 3600 * 1000);
+  var h = t.getUTCHours();
+  var mi = t.getUTCMinutes();
+  return {y: t.getUTCFullYear(), mo: t.getUTCMonth() + 1, da: t.getUTCDate(),
+          hm: (h < 10 ? "0" + h : "" + h) + ":" +
+              (mi < 10 ? "0" + mi : "" + mi)};
+}
 function fmtDate(value) {
-  const s = String(value || "");
+  var s = String(value || "");
   if (!s) { return ""; }
-  const dOnly = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s);
+  var dOnly = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s);
   if (dOnly) {
     return dOnly[1] + "/" + dOnly[2].replace(/^0/, "") + "/" +
       dOnly[3].replace(/^0/, "");
   }
-  const d = new Date(s);
+  var d = new Date(s);
   if (isNaN(d.getTime())) { return s; }
-  const now = new Date();
-  const p = (n) => (n < 10 ? "0" + n : "" + n);
-  const hm = p(d.getHours()) + ":" + p(d.getMinutes());
-  if (d.getFullYear() === now.getFullYear() &&
-      d.getMonth() === now.getMonth() && d.getDate() === now.getDate()) {
-    return "今日 " + hm;
+  var p = jstParts(d);
+  var n = jstParts(new Date());
+  if (p.y === n.y && p.mo === n.mo && p.da === n.da) {
+    return "今日 " + p.hm;
   }
-  return d.getFullYear() + "/" + (d.getMonth() + 1) + "/" + d.getDate() +
-    " " + hm;
+  return p.y + "/" + p.mo + "/" + p.da + " " + p.hm;
 }
 const ISO_DT = /^\d{4}-\d{2}-\d{2}(T|\s)\d{2}:/;
 function smart(value) {
