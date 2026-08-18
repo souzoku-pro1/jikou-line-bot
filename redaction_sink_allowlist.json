@@ -1,5 +1,5 @@
 {
-  "baseline_count": 211,
+  "baseline_count": 80,
   "generated_by": "P1-112-frozen-prints",
   "note": "sink 直書き債務台帳。baseline_count=211(上限・単調減少)。P1-107b(PR-4b)で sink:print 134件を emit/logger へ移送(daily_healthcheck/scheduler 分は PR-4c へ凍結・据置)。例外print→logger は type(e).__name__ 可視(fix2裁定準拠)＋emit(vendor_raw)抑止で sink:logger 25件が計上。logger.exception/logging.exceptionは引数不問でlogger_exception違反(L01)。信頼emitは from hub.redact import emit(1形式)。",
   "entries": [
@@ -34,6 +34,11 @@
     "hub/scheduler.py:65:sink:logger",
     "hub/scheduler.py:92:logger_exception",
     "hub/service_auth.py:608:sink:httpexception",
+    "koseki_backfill.py:116:sink:print",
+    "koseki_backfill.py:140:sink:print",
+    "koseki_backfill.py:145:sink:print",
+    "koseki_backfill.py:149:sink:print",
+    "koseki_backfill.py:90:sink:print",
     "koseki_ingest.py:142:sink:httpexception",
     "koseki_ingest.py:150:sink:httpexception",
     "koseki_ingest.py:175:sink:httpexception",
@@ -42,12 +47,12 @@
     "koseki_ingest.py:76:sink:logger",
     "koseki_ingest.py:85:sink:logger",
     "koseki_person_sync.py:292:sink:logger",
-    "koseki_reader.py:397:sink:logger",
+    "koseki_reader.py:533:sink:logger",
     "koseki_second_opinion.py:309:sink:logger",
+    "main.py:1000:sink:logger",
     "main.py:1297:sink:logger",
     "main.py:569:sink:logger",
     "main.py:591:sink:logger",
-    "main.py:1000:sink:logger",
     "person_confirm.py:147:sink:logger",
     "person_restore_cli.py:192:sink:print",
     "person_restore_cli.py:193:sink:print",
@@ -111,7 +116,8 @@
     "hub/service_auth.py:sink:httpexception": "RV-04b dual-accept ゲートの署名経路拒否。status は §6.1（401/403/400/409）・detail は固定文字列で reason 素通しなし（分岐情報を攻撃者に与えない）。機微値は出さない",
     "valuation_ingest.py:sink:httpexception": "RV-10 移行前の ingest ルータ httpexception debt（別PRで回収）",
     "valuation_ingest.py:sink:logger": "P1-107b print→logger 転換・type(e).__name__ 可視の受容債務（fix2 裁定・本文はemit抑止）",
-    "dispatch_bot/heir_derive_task.py:sink:logger": "P3-003-CMD §6 の [HEIR-CMD] 2軸構造化ログ。値は閉集合 enum（RUN_RESULTS/ENVELOPE_RESULTS・build_heir_cmd_log が合法組合せ表と照合し表外は ValueError）＋emit(record_id) 済み case と run/封筒 の数値 ID のみ。enum は emit の kind 語彙に無く（record_id/count は値域外＝抑止される）、PII 経路なしの理由付き恒久エントリ（hub/service_auth と同型）。非露出は test_p3_003_cmd_impl の sentinel 検査で担保"
+    "dispatch_bot/heir_derive_task.py:sink:logger": "P3-003-CMD §6 の [HEIR-CMD] 2軸構造化ログ。値は閉集合 enum（RUN_RESULTS/ENVELOPE_RESULTS・build_heir_cmd_log が合法組合せ表と照合し表外は ValueError）＋emit(record_id) 済み case と run/封筒 の数値 ID のみ。enum は emit の kind 語彙に無く（record_id/count は値域外＝抑止される）、PII 経路なしの理由付き恒久エントリ（hub/service_auth と同型）。非露出は test_p3_003_cmd_impl の sentinel 検査で担保",
+    "koseki_backfill.py:sink:print": "KOSEKI-DATA-1 移行スクリプト（[人]が railway run で手動実行・cron/サーバ経路なし）。出力は $id・案件番号・日付・様式・キー名のみで氏名/本籍等の値を出さない設計（test_koseki_data1 で移行 payload を pin）"
   },
   "manifest_note": "新規(file,rule)の台帳追加は manifest への明示登録（理由付き）を必須とする（RP1107B-M01）。既存3検査(no_new/stale/monotonic)は維持。"
 }

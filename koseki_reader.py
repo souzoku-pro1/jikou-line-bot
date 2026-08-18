@@ -30,7 +30,10 @@
 import json
 import logging
 import os
+import re
 import statistics
+import unicodedata
+from datetime import date
 
 import anthropic
 
@@ -208,6 +211,130 @@ def to_japanese_reading(raw: dict) -> dict:
     return mapped
 
 
+# ── KOSEKI-DATA-1: 和暦→西暦の決定的正規化 ──────────────────────────────────
+# 目的: 連続性判定（戸籍不足チェック・第2段票）の入力充足。モデル申告の
+# *_西暦 に依存せず、和暦原文から機械変換で埋める。変換規律は fail-closed
+# ——grammar 不成立・元号範囲外・暦として不存在の日付は null（誤変換より欠落）
+
+_ERA_BASE = {"明治": 1867, "大正": 1911, "昭和": 1925, "平成": 1988,
+             "令和": 2018}
+# 各元号の最終年（明治45=1912・大正15=1926・昭和64=1989・平成31=2019。
+# 令和は進行中のため上限 98=西暦 2116 を形式上限とする）
+_ERA_MAX = {"明治": 45, "大正": 15, "昭和": 64, "平成": 31, "令和": 98}
+_WAREKI_RE = re.compile(
+    r"^(明治|大正|昭和|平成|令和)(元|\d{1,2})年(\d{1,2})月(\d{1,2})日$")
+_ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def parse_wareki(text) -> str | None:
+    """和暦日付（例: 昭和32年4月1日）を西暦 ISO（YYYY-MM-DD）へ決定的に変換。
+
+    - 全角数字・空白は NFKC/除去で吸収。それ以外の余計な文字が付く場合は
+      変換しない（「昭和32年4月1日編製」等は None＝切り出しは読解側の責務）
+    - 元号年の範囲外（昭和99年等）・暦に無い日付（2月30日等）は None
+    """
+    s = unicodedata.normalize("NFKC", str(text or ""))
+    s = s.replace(" ", "").replace("　", "").strip()
+    m = _WAREKI_RE.fullmatch(s)
+    if not m:
+        return None
+    era, y, month, day = m.group(1), m.group(2), int(m.group(3)), int(m.group(4))
+    year_n = 1 if y == "元" else int(y)
+    if not (1 <= year_n <= _ERA_MAX[era]):
+        return None
+    year = _ERA_BASE[era] + year_n
+    try:
+        date(year, month, day)
+    except ValueError:
+        return None
+    return f"{year:04d}-{month:02d}-{day:02d}"
+
+
+def _valid_iso(value) -> str | None:
+    s = str(value or "")
+    if not _ISO_DATE_RE.fullmatch(s):
+        return None
+    y, m, d = (int(x) for x in s.split("-"))
+    try:
+        date(y, m, d)
+    except ValueError:
+        return None
+    return s
+
+
+def _normalized_date(wareki, model_seireki):
+    """機械変換を優先。不成立ならモデル申告の妥当な ISO のみ許容・それも
+    無ければ None（誤変換より欠落）。"""
+    det = parse_wareki(wareki)
+    if det is not None:
+        return det
+    return _valid_iso(model_seireki)
+
+
+def _apply_dates(container: dict, pairs: tuple) -> None:
+    """指定ペアの西暦キーを充足し、原文があるのに変換不能だったキーを
+    「西暦変換不能」に列挙する（毎回作り直し＝冪等）。confidence マップには
+    一切触れない——0.0 を混ぜると全体確信度が汚染され、既存の要再読解判定
+    （overall < threshold）を誤爆させるため、fail-closed の明示は独立キーで
+    行う（誤変換より欠落・欠落は可視化）。"""
+    marks = []
+    for src_key, dst_key in pairs:
+        normalized = _normalized_date(container.get(src_key),
+                                      container.get(dst_key))
+        container[dst_key] = normalized
+        if normalized is None and str(container.get(src_key) or "").strip():
+            marks.append(dst_key)
+    if marks:
+        container["西暦変換不能"] = marks
+    else:
+        container.pop("西暦変換不能", None)
+
+
+def normalize_reading(reading: dict) -> dict:
+    """KOSEKI-DATA-1(1): 読解結果の決定的正規化（in-place・冪等）。
+
+    - 戸籍.編製日_西暦／消除日_西暦: 和暦原文からの機械変換で充足
+    - 人物[].生年月日_西暦: 新設キー（同上）
+    - 原文ありで変換不能は null＋「西暦変換不能」キーで明示（confidence／
+      全体確信度・読解状態の判定には影響させない）
+    - 既存キー（ocr_text・人物・confidence 等）は上記以外変更しない
+      （後方互換）。dict 以外・欠落構造は素通し
+    """
+    if not isinstance(reading, dict):
+        return reading
+    koseki = reading.get("戸籍")
+    if isinstance(koseki, dict):
+        _apply_dates(koseki, (("編製日", "編製日_西暦"),
+                              ("消除日", "消除日_西暦")))
+    persons = reading.get("人物")
+    if isinstance(persons, list):
+        for person in persons:
+            if isinstance(person, dict):
+                _apply_dates(person, (("生年月日", "生年月日_西暦"),))
+    return reading
+
+
+def structured_fields(saved_json: dict) -> dict:
+    """KOSEKI-DATA-1(2): App33 の kintone 構造化 field への書き戻し値。
+
+    厳密検証済みの値のみ含める（kintone 側で拒否され得る値を送らない）:
+    - 戸籍種別: 様式（FORMS 閉集合＝App33 の選択肢と一致）のみ
+    - 編製日／消除日: 正規化済み ISO（YYYY-MM-DD）のみ
+    値が無い field はキー自体を含めない（既存値を消さない）。"""
+    out: dict = {}
+    if not isinstance(saved_json, dict):
+        return out
+    if saved_json.get("様式") in FORMS:
+        out["戸籍種別"] = saved_json["様式"]
+    koseki = saved_json.get("戸籍")
+    if isinstance(koseki, dict):
+        for src, dst in (("編製日_西暦", "編製日"), ("消除日_西暦", "消除日")):
+            value = _valid_iso(koseki.get(src))
+            if value is not None:
+                out[dst] = value
+    return out
+
+
 class KosekiReaderError(Exception):
     """読解が実行できなかった（Claude 応答不正等・レコードは未読解のまま）"""
 
@@ -309,12 +436,17 @@ def _overall_confidence(reading: dict) -> float:
 
 async def _save(record_id: str, saved_json: dict, status: str,
                 form_conf: float, overall_conf: float) -> None:
-    await kintone.update_record(APP_KOSEKI_BOOK, record_id, {
+    # KOSEKI-DATA-1(2): 構造化 field（戸籍種別・編製日・消除日）を同一 update に
+    # 同梱（新規読解分は自動で充足）。値は structured_fields が厳密検証済みの
+    # もののみ＝kintone 拒否による保存失敗を持ち込まない
+    fields = {
         "読解JSON": json.dumps(saved_json, ensure_ascii=False),
         "読解状態": status,
         "様式確信度": str(round(form_conf, 3)),
         "全体確信度": str(round(overall_conf, 3)),
-    })
+    }
+    fields.update(structured_fields(saved_json))
+    await kintone.update_record(APP_KOSEKI_BOOK, record_id, fields)
 
 
 async def process_record(record_id: str) -> dict:
@@ -352,6 +484,10 @@ async def process_record(record_id: str) -> dict:
     # 失敗は縮退（一次読解のまま）——読解の成立を壊さない
     from koseki_second_opinion import maybe_second_opinion  # 遅延 import（循環回避）
     reading = await maybe_second_opinion(record, reading)
+
+    # KOSEKI-DATA-1(1): 決定的正規化（和暦→西暦・fail-closed）。読解の既存
+    # キーには触れない（後方互換）ため validate/確信度計算の契約は不変
+    reading = normalize_reading(reading)
 
     errors = validate_reading(reading)
     form_conf = float(reading.get("様式confidence")) \
