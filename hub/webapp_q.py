@@ -537,6 +537,59 @@ async def _dispatch(name: str, args: dict, ctx: dict) -> tuple:
     return payload, False
 
 
+async def _run_tools(blocks: list, ctx: dict) -> list:
+    """Q-SPEED-1(b): 同一 turn 内の複数 tool 呼び出しを並列実行する。
+
+    - tool_result の並び・出典（_merge_source）・flag の統合は **block 順**で
+      行う（完了順に依存しない＝決定的。_MAX_SOURCES の切捨ても block 順）。
+    - 各呼び出しは自前の local ctx で実行し、失敗は _dispatch 内で is_error の
+      固定文言に落ちる（1 本の失敗が他を巻き込まない）。
+    - 単一呼び出しは従来どおり直列（挙動同一・オーバーヘッドなし）。
+    消費量上限（turn 内 5 本・合計 20 本）は呼出し前に検査済みの前提。"""
+    if len(blocks) == 1:
+        block = blocks[0]
+        content, is_error = await _dispatch(block.name, block.input, ctx)
+        return [{"type": "tool_result", "tool_use_id": block.id,
+                 "content": content, "is_error": is_error}]
+    buf: list = [None] * len(blocks)
+
+    async def _one(i: int, block) -> None:
+        local = {"sources": [], "source_keys": set(), "flags": set()}
+        content, is_error = await _dispatch(block.name, block.input, local)
+        buf[i] = (content, is_error, local)
+
+    async with anyio.create_task_group() as tg:
+        for i, block in enumerate(blocks):
+            tg.start_soon(_one, i, block)
+    results = []
+    for block, item in zip(blocks, buf):
+        content, is_error, local = item
+        for entry in local["sources"]:
+            _merge_source(ctx, entry)
+        ctx["flags"] |= local["flags"]
+        results.append({"type": "tool_result", "tool_use_id": block.id,
+                        "content": content, "is_error": is_error})
+    return results
+
+
+def _set_message_cache_marker(messages: list) -> None:
+    """Q-SPEED-1(a): 会話 prefix の incremental cache。message 側の既存 marker
+    を外してから、最後の message の最後の dict block（tool_result）へ付け直す。
+    breakpoint は常に system 1 個＋message 1 個の計 2 個（API 上限 4 内）。
+    SDK オブジェクト（assistant content）と文字列 content には触れない。"""
+    for msg in messages:
+        content = msg.get("content") if isinstance(msg, dict) else None
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict):
+                    block.pop("cache_control", None)
+    last = messages[-1]
+    if isinstance(last, dict) and isinstance(last.get("content"), list):
+        dict_blocks = [b for b in last["content"] if isinstance(b, dict)]
+        if dict_blocks:
+            dict_blocks[-1]["cache_control"] = {"type": "ephemeral"}
+
+
 # ── コスト概算（Decimal・float 非経由） ──────────────────────────────────────
 
 def _estimate_cost(model: str, input_tokens: int, output_tokens: int,
@@ -699,15 +752,11 @@ async def _answer_question(question: str, history: list | None = None) -> dict:
                         return _finish(ERROR_ANSWER, "error")
                     messages.append({"role": "assistant",
                                      "content": resp.content})
-                    results = []
-                    for block in blocks:
-                        content, is_error = await _dispatch(
-                            block.name, block.input, ctx)
-                        results.append({"type": "tool_result",
-                                        "tool_use_id": block.id,
-                                        "content": content,
-                                        "is_error": is_error})
+                    # Q-SPEED-1(b): 同一 turn の複数 tool は並列実行（統合は
+                    # block 順で決定的）。(a): 会話 prefix の incremental cache
+                    results = await _run_tools(blocks, ctx)
                     messages.append({"role": "user", "content": results})
+                    _set_message_cache_marker(messages)
                     continue
                 if resp.stop_reason in ("end_turn", "max_tokens"):
                     # Q-02: submit_answer を経ない本文回答は採用しない
