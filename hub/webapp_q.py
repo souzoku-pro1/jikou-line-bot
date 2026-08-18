@@ -188,7 +188,16 @@ def _file(name: str) -> Response:
 def _record_source(ctx: dict, app_label: str, app_id: str, record_id: str,
                    pdf_url=None) -> None:
     """Q-02(i): grammar 成立（app_id=数字列・record_id=数字列）のときのみ
-    有効出典として記録する。空・不正値は出典に数えない（fail-closed）。"""
+    有効出典として記録する。空・不正値は出典に数えない（fail-closed）。
+
+    Q-QUALITY-1-fix1（Q-QUALITY-01）: app_label は SOURCE_APP_LABELS の閉集合を
+    **実行時に必須検証**——閉集合外は即時例外。呼出し方（alias・wrapper・動的
+    組立て）に依存しない保証で、閉集合外ラベルが ctx["sources"]/_citation_keys
+    へ入り enum 不在で提出不能になる系統欠陥の再発を防ぐ（AST 三者一致 pin は
+    多層防御として併存）。例外は _dispatch の except で is_error の固定文言に
+    落ちる＝当該 tool 結果は採用されず fail-closed のまま。"""
+    if app_label not in SOURCE_APP_LABELS:
+        raise ValueError("source app label outside closed set")
     app_id_s = str(app_id or "")
     rid_s = str(record_id or "")
     if not app_id_s.isdigit() or not _RECORD_ID_RE.fullmatch(rid_s):

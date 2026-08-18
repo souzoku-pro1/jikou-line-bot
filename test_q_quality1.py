@@ -184,6 +184,56 @@ class TestStrictnessUnchanged(unittest.TestCase):
                 {"app": "App36(相続人)", "record_id": "999"}]}, ctx))
 
 
+# ── Q-QUALITY-1-fix1（Q-QUALITY-01 HIGH）: 実行時防壁 ────────────────────────
+class TestRuntimeLabelGuard(unittest.TestCase):
+    """_record_source は app_label の閉集合を実行時に必須検証する——AST 走査が
+    見えない呼出し方（alias・wrapper・動的組立て）でも閉集合外は即時例外。"""
+
+    def test_direct_call_with_unknown_label_raises(self):
+        with self.assertRaises(ValueError):
+            wq._record_source(_ctx(), "App99(存在しない)", "99", "1")
+
+    def test_alias_call_raises(self):
+        # Codex 失敗例1: alias 代入経由は ast.Name 走査に映らないが、
+        # 実行時防壁は値で検証するため例外になる
+        alias = wq._record_source
+        with self.assertRaises(ValueError):
+            alias(_ctx(), "相続案件（相談カード）", "26", "3")
+
+    def test_wrapper_call_raises(self):
+        # Codex 失敗例2: wrapper 関数経由
+        def wrapper(ctx, label):
+            return wq._record_source(ctx, label, "36", "201")
+        with self.assertRaises(ValueError):
+            wrapper(_ctx(), "App36（相続人）")     # 全角括弧の表記ゆれ
+
+    def test_dynamically_built_unknown_label_raises(self):
+        # Codex 失敗例3: 動的組立てラベル（リテラル pin に映らない）
+        label = "App" + "34" + "（人物）"           # 全角括弧＝閉集合外
+        with self.assertRaises(ValueError):
+            wq._record_source(_ctx(), label, "34", "5")
+
+    def test_dynamically_built_known_label_passes(self):
+        # 対照: 防壁は値基準——動的組立てでも閉集合の値と一致すれば通る
+        ctx = _ctx()
+        wq._record_source(ctx, "App34" + "(人物)", "34", "5")
+        self.assertEqual(len(ctx["sources"]), 1)
+
+    def test_all_eight_labels_pass(self):
+        ctx = _ctx()
+        for i, label in enumerate(wq.SOURCE_APP_LABELS, start=1):
+            wq._record_source(ctx, label, str(20 + i), str(i))
+        self.assertEqual(len(ctx["sources"]), len(wq.SOURCE_APP_LABELS))
+        self.assertEqual({s["app"] for s in ctx["sources"]},
+                         set(wq.SOURCE_APP_LABELS))
+
+    def test_guard_precedes_grammar_check(self):
+        # 閉集合外なら id が不正（黙って無視される形）でも例外が優先＝
+        # 「静かな取り零し」に化けない
+        with self.assertRaises(ValueError):
+            wq._record_source(_ctx(), "App99(存在しない)", "", "")
+
+
 # ── system prompt の追記（案A 指示＋表記ゆれ・候補提示） ─────────────────────
 class TestSystemPromptDirectives(unittest.TestCase):
     def test_citation_key_directive(self):
