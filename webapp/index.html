@@ -7,21 +7,71 @@
 <link rel="manifest" href="/app/manifest.json">
 <link rel="apple-touch-icon" href="/app/icons/icon-192.png">
 <style>
-body{font-family:sans-serif;max-width:720px;margin:2rem auto;padding:0 1rem}
-.card{border:1px solid #ccc;border-radius:8px;padding:1rem;margin:.5rem 0;color:#666}
+/* UI-POLISH-1: 質問画面と統一の配色・カード型ダッシュボード */
+body{font-family:sans-serif;max-width:720px;margin:0 auto;
+  padding:.6rem 1rem 2rem;box-sizing:border-box;background:#eef1f5;color:#222}
+h1{font-size:1.25rem;margin:.4rem 0 .1rem}
+.sub{color:#667;font-size:.85rem;margin:0 0 .9rem}
+.stats{display:flex;gap:.6rem;flex-wrap:wrap;margin-bottom:.4rem}
+.stat{flex:1;min-width:8.5rem;background:#fff;border:1px solid #d8dde5;
+  border-radius:14px;padding:.7rem .9rem;text-align:center}
+.stat .num{font-size:1.6rem;font-weight:bold;color:#1a3c6e;display:block}
+.stat .num.attn{color:#a04000}
+.stat .lbl{color:#667;font-size:.8rem}
+.navcard{display:block;background:#fff;border:1px solid #d8dde5;
+  border-radius:14px;padding:.9rem 1rem;margin:.6rem 0;text-decoration:none;
+  color:#1a3c6e;font-size:1.05rem;font-weight:bold}
+.navcard .desc{display:block;color:#8a8f98;font-size:.8rem;font-weight:normal;
+  margin-top:.15rem}
+.navcard.disabled{color:#98a0ab;font-weight:normal}
 </style>
 </head>
 <body>
-<h1>案件管理（仮）ダッシュボード</h1>
-<!-- P4-001 shell → P4-002 で案件画面を結線（read-only）→ PWA-BATCH-1 で
-     相続案件ダッシュボード・共通画面枠を追加（read-only のまま） -->
-<div class="card"><a href="/app/souzoku">相続案件ダッシュボード</a></div>
-<div class="card"><a href="/app/q">質問（案件参照）</a></div>
-<div class="card"><a href="/app/cases">案件一覧</a></div>
-<div class="card">書類到着状況（P4-003・scan 到着ゲート後）</div>
-<div class="card"><a href="/app/approvals">承認キュー参照</a></div>
-<div class="card"><a href="/app/kinship">相続人関係図</a></div>
+<h1>案件管理（仮）</h1>
+<p class="sub">事務所ダッシュボード</p>
+<div class="stats">
+  <div class="stat"><span class="num" id="n-souzoku">…</span>
+    <span class="lbl">相続案件</span></div>
+  <div class="stat"><span class="num" id="n-jikou">…</span>
+    <span class="lbl">時効案件</span></div>
+  <div class="stat"><span class="num attn" id="n-approvals">…</span>
+    <span class="lbl">返信の承認待ち</span></div>
+</div>
+<a class="navcard" href="/app/souzoku">相続案件
+  <span class="desc">案件ごとの相続人・財産・書類・進行状況</span></a>
+<a class="navcard" href="/app/q">質問（チャット）
+  <span class="desc">記録を調べて答えます——「◯◯さんの相続人は？」など</span></a>
+<a class="navcard" href="/app/approvals">返信の承認
+  <span class="desc">お客様への返信下書きの確認（承認の操作は LINE から）</span></a>
+<a class="navcard" href="/app/cases">時効案件
+  <span class="desc">時効援用の案件一覧・発送状況</span></a>
+<a class="navcard" href="/app/kinship">相続人関係図
+  <span class="desc">家系図の形で相続関係を確認</span></a>
+<div class="navcard disabled">書類の到着確認
+  <span class="desc">準備中</span></div>
 <script src="/app/app.js"></script>
 <script src="/app/shell.js"></script>
+<script>
+// 件数サマリー: 取得できないときは「−」（画面は落とさない）。
+// app_fetch の第1引数は各呼出しでリテラル固定（ラッパー規律の流儀）
+async function fillCount(respPromise, elId, cap) {
+  const node = document.getElementById(elId);
+  try {
+    const resp = await respPromise;
+    if (resp.redirected ||
+        !resp.headers.get("content-type")?.includes("json")) {
+      location.href = "/app/login"; return;
+    }
+    const data = await resp.json();
+    const n = (data.records || []).length;
+    node.textContent = n >= cap ? cap + "+" : "" + n;
+  } catch (e) {
+    node.textContent = "−";
+  }
+}
+fillCount(app_fetch("/app/api/souzoku/cases?limit=50"), "n-souzoku", 50);
+fillCount(app_fetch("/app/api/cases?limit=20"), "n-jikou", 20);
+fillCount(app_fetch("/app/api/approvals?limit=20"), "n-approvals", 20);
+</script>
 </body>
 </html>

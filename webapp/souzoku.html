@@ -5,26 +5,45 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>相続案件 - 案件管理（仮）</title>
 <style>
-body{font-family:sans-serif;max-width:960px;margin:1.5rem auto;padding:0 1rem}
-table{border-collapse:collapse;width:100%}
-th,td{border:1px solid #ccc;padding:.4rem .6rem;font-size:.95rem;text-align:left}
-input,button{font-size:1rem;padding:.3rem .6rem;margin:0 .3rem .8rem 0}
+/* UI-POLISH-1: カード型一覧（質問画面と統一の配色） */
+body{font-family:sans-serif;max-width:720px;margin:0 auto;
+  padding:.6rem 1rem 2rem;box-sizing:border-box;background:#eef1f5;color:#222}
+h1{font-size:1.25rem;margin:.4rem 0 .1rem}
+.sub{color:#667;font-size:.85rem;margin:0 0 .8rem}
 a{color:#1a3c6e}
+.toolbar{display:flex;gap:.5rem;align-items:center;flex-wrap:wrap;
+  margin:.4rem 0 .6rem}
+input[type="search"]{flex:1;min-width:12rem;font-size:1rem;
+  padding:.5rem .7rem;border-radius:10px;border:1px solid #c8cdd5;
+  min-height:44px;box-sizing:border-box}
+button{font-size:.95rem;padding:.5rem 1rem;border-radius:10px;
+  border:1px solid #c8cdd5;background:#fff;min-height:44px}
+button:disabled{color:#aab;background:#f2f4f7}
+.pageinfo{color:#667;font-size:.85rem}
+.case-card{display:block;background:#fff;border:1px solid #d8dde5;
+  border-radius:14px;padding:.75rem 1rem;margin:.55rem 0;
+  text-decoration:none;color:#222}
+.case-card .name{font-size:1.05rem;font-weight:bold}
+.case-card .line2{display:flex;gap:.6rem;align-items:center;flex-wrap:wrap;
+  margin-top:.3rem;font-size:.9rem;color:#334}
+.badge{display:inline-block;border-radius:999px;padding:.12rem .6rem;
+  font-size:.78rem;background:#e8f0fb;color:#1a5cb0}
+.meta{color:#8a8f98;font-size:.78rem;margin-top:.25rem}
+.muted{color:#98a0ab}
+.empty{color:#667;text-align:center;margin:1.2rem 0}
 </style>
 </head>
 <body>
 <h1>相続案件</h1>
+<p class="sub">タップで案件の詳細（相続人・財産・書類）を開きます</p>
 <!-- PWA-BATCH-1 B(i): 案件選択（read-only）。氏名検索は取得済みページの
      クライアント側絞込のみ（自由文字列を kintone query へ埋めない既存規律） -->
-<div>
-  <input id="q" type="search" placeholder="氏名・被相続人名で絞込（表示中のページ内）">
+<div class="toolbar">
+  <input id="q" type="search" placeholder="氏名・被相続人名でしぼり込み">
   <button id="prev">前へ</button><button id="next">次へ</button>
-  <span id="page"></span>
 </div>
-<table>
-  <thead><tr><th>ID</th><th>氏名</th><th>被相続人名</th><th>書類ステータス</th><th>登録日時</th><th>更新日時</th></tr></thead>
-  <tbody id="rows"></tbody>
-</table>
+<p class="pageinfo" id="page"></p>
+<div id="rows"></div>
 <script src="/app/app.js"></script>
 <script src="/app/shell.js"></script>
 <script>
@@ -32,6 +51,30 @@ let offset = 0;
 const limit = 50;
 let loaded = [];
 function v(rec, name) { return (rec[name] && rec[name].value) || ""; }
+function el(tag, cls, text) {
+  const node = document.createElement(tag);
+  if (cls) { node.className = cls; }
+  if (text !== undefined) { node.textContent = text; }
+  return node;
+}
+function disp(text) {
+  return text ? document.createTextNode(text) : el("span", "muted", "未登録");
+}
+function fmtDate(value) {
+  const s = String(value || "");
+  if (!s) { return ""; }
+  const d = new Date(s);
+  if (isNaN(d.getTime())) { return s; }
+  const now = new Date();
+  const p = (n) => (n < 10 ? "0" + n : "" + n);
+  const hm = p(d.getHours()) + ":" + p(d.getMinutes());
+  if (d.getFullYear() === now.getFullYear() &&
+      d.getMonth() === now.getMonth() && d.getDate() === now.getDate()) {
+    return "今日 " + hm;
+  }
+  return d.getFullYear() + "/" + (d.getMonth() + 1) + "/" + d.getDate() +
+    " " + hm;
+}
 function render() {
   const q = document.getElementById("q").value.trim();
   const rows = document.getElementById("rows");
@@ -42,23 +85,29 @@ function render() {
       continue;
     }
     shown += 1;
-    const tr = document.createElement("tr");
     const id = v(rec, "$id");
-    const link = document.createElement("a");
-    link.href = "/app/souzoku/case?id=" + encodeURIComponent(id);
-    link.textContent = id;
-    const cells = [link, v(rec, "氏名"), v(rec, "被相続人名"),
-                   v(rec, "書類ステータス"), v(rec, "登録日時"),
-                   v(rec, "更新日時")];
-    for (const c of cells) {
-      const td = document.createElement("td");
-      if (c instanceof Node) { td.appendChild(c); } else { td.textContent = c; }
-      tr.appendChild(td);
-    }
-    rows.appendChild(tr);
+    const card = el("a", "case-card");
+    card.href = "/app/souzoku/case?id=" + encodeURIComponent(id);
+    const name = el("div", "name");
+    name.appendChild(disp(v(rec, "氏名")));
+    card.appendChild(name);
+    const line2 = el("div", "line2");
+    const hisouzoku = el("span", "");
+    hisouzoku.appendChild(document.createTextNode("被相続人: "));
+    hisouzoku.appendChild(disp(v(rec, "被相続人名")));
+    line2.appendChild(hisouzoku);
+    line2.appendChild(el("span", "badge",
+      v(rec, "書類ステータス") || "書類状況未設定"));
+    card.appendChild(line2);
+    card.appendChild(el("div", "meta",
+      "No." + id + "｜更新 " + fmtDate(v(rec, "更新日時"))));
+    rows.appendChild(card);
+  }
+  if (!shown) {
+    rows.appendChild(el("p", "empty", "該当する案件はありません"));
   }
   document.getElementById("page").textContent =
-    `offset ${offset}（${shown}/${loaded.length}件表示）`;
+    `${shown} 件を表示（読み込み ${loaded.length} 件）`;
   document.getElementById("prev").disabled = offset === 0;
   document.getElementById("next").disabled = loaded.length < limit;
 }
