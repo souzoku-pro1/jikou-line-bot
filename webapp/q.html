@@ -43,6 +43,12 @@ a{color:#1a3c6e}
   border:1px solid #1a3c6e;background:#1a3c6e;color:#fff}
 #composer button:disabled{background:#9aa7bd;border-color:#9aa7bd}
 .hint{color:#555;font-size:.82rem;margin:.15rem 0 0}
+.toolbar{display:flex;justify-content:flex-end;padding:.25rem 0 0}
+.toolbar button{font-size:.82rem;padding:.25rem .7rem;border-radius:8px;
+  border:1px solid #9aa7bd;background:#fff;color:#3a4a63}
+.divider{display:flex;align-items:center;gap:.6rem;color:#7a8494;
+  font-size:.8rem;margin:.3rem 0}
+.divider::before,.divider::after{content:"";flex:1;border-top:1px solid #c3cad6}
 </style>
 </head>
 <body>
@@ -52,6 +58,12 @@ a{color:#1a3c6e}
      送信中は submit ハンドラが吹き出し＋「回答を作成中…」を即時表示し、
      二重送信をクライアント側でも遮断（サーバ側 single-flight と二段） -->
 <div id="chat"><div class="sysrow"><div class="sys">読み込み中…</div></div></div>
+<!-- Q-CHAT-1(B): 話題リセット。native form POST（PRG）・実行以降の質問は
+     過去履歴を一切参照しない（境界は qa_topic_reset に永続化） -->
+<form id="resetform" class="toolbar" method="post" action="/app/q/reset">
+  <button type="submit"
+    title="これ以降の質問は、ここまでのやり取りを参照しません">新しい話題</button>
+</form>
 <form id="composer" method="post" action="/app/q/ask">
   <textarea name="question" maxlength="2000"
     placeholder="質問を入力（例: 案件 No.9 の相続人のうち戸籍確認が終わっていないのは誰？）"></textarea>
@@ -171,7 +183,22 @@ async function load() {
   }
   // API は新しい順 → チャットは時系列（古い→新しい・最新が下）
   const records = data.records.slice().reverse();
-  for (const rec of records) { renderRecord(rec); }
+  // Q-CHAT-1(B): リセット境界の区切り線。表示中に境界前の行があるときは
+  // 最初の after_reset 行の直前へ。境界後の行がまだ無い（リセット直後）は
+  // 末尾へ（＝次の質問から新しい話題）
+  const anyPre = records.some((r) => !r.after_reset);
+  const anyPost = records.some((r) => r.after_reset);
+  let divided = false;
+  for (const rec of records) {
+    if (!divided && anyPre && rec.after_reset) {
+      chat.appendChild(el("div", "divider", "ここから新しい話題"));
+      divided = true;
+    }
+    renderRecord(rec);
+  }
+  if (data.has_reset && !anyPost) {
+    chat.appendChild(el("div", "divider", "ここから新しい話題"));
+  }
   renderFlash(params);
   scrollBottom();
 }
@@ -195,6 +222,10 @@ composer.addEventListener("submit", (ev) => {
   ar.appendChild(t);
   ar.appendChild(el("div", "meta", "最大 5 分ほどかかることがあります"));
   scrollBottom();
+});
+// 送信中の話題リセットは抑止（サーバ側 busy ガードの二段目）
+document.getElementById("resetform").addEventListener("submit", (ev) => {
+  if (sending) { ev.preventDefault(); }
 });
 load();
 </script>

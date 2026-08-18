@@ -160,11 +160,12 @@ class TestAuthBoundary(unittest.TestCase):
                         f"{method} {route.path} に認証関所（_gate）がない")
 
     def test_only_post_route_is_ask(self):
-        # 「機械は確定しない」: 書き込み系 route は質問受付（Q&A 台帳への
-        # 追記のみ・業務正本に触れない）の 1 本だけ
+        # 「機械は確定しない」: 書き込み系 route は質問受付と話題リセット
+        # （Q-CHAT-1 票で追加）の閉集合のみ。いずれも app-state（qa_record/
+        # qa_topic_reset）への追記だけで業務正本には触れない
         posts = {r.path for r in wq.router.routes
                  if hasattr(r, "methods") and "POST" in r.methods}
-        self.assertEqual(posts, {"/app/q/ask"})
+        self.assertEqual(posts, {"/app/q/ask", "/app/q/reset"})
 
 
 # ── tool 閉集合と read-only 構造 pin ─────────────────────────────────────────

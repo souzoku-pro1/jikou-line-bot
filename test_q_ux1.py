@@ -330,8 +330,9 @@ class TestChatPage(unittest.TestCase):
         self.assertIn("質問を入力してください", src)      # e=input
         self.assertIn("回答の保存に失敗しました", src)    # e=save
 
-    def test_no_new_routes_added(self):
-        # (B) は既存 POST /app/q/ask の中で実現（経路の追加なし＝関所の不変）
+    def test_route_closed_set(self):
+        # route の閉集合 pin（Q-UX-1 時点の 3 本＋Q-CHAT-1 票で追加された
+        # 話題リセット POST のみ。これ以外の経路は存在しない）
         paths = sorted({(r.path, m) for r in wq.router.routes
                         if hasattr(r, "endpoint")
                         for m in r.methods if m != "HEAD"})
@@ -339,6 +340,7 @@ class TestChatPage(unittest.TestCase):
             ("/app/api/q/history", "GET"),
             ("/app/q", "GET"),
             ("/app/q/ask", "POST"),
+            ("/app/q/reset", "POST"),
         ])
 
 
