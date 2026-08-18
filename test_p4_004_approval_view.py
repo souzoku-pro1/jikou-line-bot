@@ -187,7 +187,11 @@ class TestPage(unittest.TestCase):
             r = _client.get("/app/approvals", headers=_auth_headers(),
                             follow_redirects=False)
             self.assertEqual(r.status_code, 200)
-            self.assertIn("承認キュー参照", r.text)
+            # UI-POLISH-1 票由来: 画面名を内部用語「承認キュー参照」から
+            # 「返信の承認」へ改称（確認専用の明示を追加 pin・操作不在 assert
+            # は不変）
+            self.assertIn("返信の承認", r.text)
+            self.assertIn("確認専用", r.text)
             # 参照のみ: 操作系の UI 要素・送信 API 呼出しが存在しない
             self.assertNotIn("承認する", r.text)
             self.assertNotIn("method=\"post\"", r.text.lower())
