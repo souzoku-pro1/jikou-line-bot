@@ -121,6 +121,21 @@ FLAG_NOTES = {
     "sources_truncated": "出典が多数のため一部のみ記録しています",
 }
 
+# Q-QUALITY-1(D): 出典 app ラベルの閉集合——サーバ実測記録（_record_source の
+# 呼出しラベル）と submit_answer schema の enum の**共通の正**。乖離はテストで
+# pin（AST 走査で _record_source の全ラベルと突合）。モデルは strict schema の
+# enum からしか選べないため、ラベル表記ゆれによる照合不一致が構造的にゼロになる
+SOURCE_APP_LABELS = (
+    "相談カード(相続)",
+    "App34(人物)",
+    "App36(相続人)",
+    "App35(財産)",
+    "App30(発送管理)",
+    "App33(戸籍読解)",
+    "App21(案件)",
+    "App28(チャットログ)",
+)
+
 # コスト概算（USD/MTok・Decimal 文字列。cache read=0.1×・cache write=1.25×）
 _MODEL_PRICES = {
     "claude-sonnet-4-6": (Decimal("3"), Decimal("15")),
@@ -144,6 +159,15 @@ _SYSTEM = (
     "- 回答を終えるときは必ず submit_answer ツールを 1 回呼ぶ。source_refs "
     "には、回答で実際に使用した出典（この会話で読み取りツールが返した "
     "app と record_id）だけを列挙する。読んでいない記録は挙げない。\n"
+    "- 出典の書き方: 各ツール結果末尾の _citation_keys にある app ラベルと "
+    "record_id を**そのまま**使う（app は submit_answer の選択肢からのみ"
+    "選べる）。自分でラベルを言い換えない。\n"
+    "- 人名・名称が完全一致で見つからないときは、旧字/新字（例: 澤/沢・"
+    "邊/辺・齋/斉）やかな表記のゆれを考慮して、一覧の実データから探し直す。\n"
+    "- 完全一致が無くても近い実在レコードがあれば、断定せず"
+    "「◯◯さんの案件（No.X）がありますが、こちらのことですか？」の形で候補と"
+    "して提示する（候補も必ず出典つき・ツールが返した実在レコードのみ。"
+    "記録に無い名前や番号を作らない）。\n"
     "- 回答は要点先行で簡潔に。表形式の羅列より短い文章を優先する。")
 
 
@@ -440,7 +464,11 @@ _SUBMIT_TOOL = {
                 "items": {
                     "type": "object",
                     "properties": {
-                        "app": {"type": "string"},
+                        # Q-QUALITY-1(D): app はサーバ既知ラベルの enum 閉集合。
+                        # strict schema のためモデルはここからしか選べない
+                        # （ラベル表記ゆれによる subset 照合不一致の構造的排除）
+                        "app": {"type": "string",
+                                "enum": list(SOURCE_APP_LABELS)},
                         "record_id": {"type": "string"},
                     },
                     "required": ["app", "record_id"],
@@ -484,6 +512,13 @@ async def _dispatch(name: str, args: dict, ctx: dict) -> tuple:
         return "取得に失敗しました（対象アプリに到達できないか一時的なエラー）", True
     if result is None:
         return "引数が不正です（案件レコード番号は数字のみ）", True
+    # Q-QUALITY-1(A): この呼び出しで実測記録した引用キー（app ラベル+
+    # record_id）を結果に明示して返す——モデルは submit の source_refs に
+    # これを**そのまま**使う（照合キーの非開示による不一致を解消）。
+    # TOO_LARGE 破棄時は下の上限検査で結果ごと破棄される＝開示もされない
+    result["_citation_keys"] = [
+        {"app": s["app"], "record_id": s["record_id"]}
+        for s in sub["sources"]]
     payload = json.dumps(result, ensure_ascii=False, default=str)
     if len(payload.encode("utf-8")) > _MAX_TOOL_RESULT_BYTES:
         return TOO_LARGE_RESULT, True
