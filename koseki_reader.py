@@ -221,6 +221,21 @@ _ERA_BASE = {"明治": 1867, "大正": 1911, "昭和": 1925, "平成": 1988,
 # 各元号の最終年（明治45=1912・大正15=1926・昭和64=1989・平成31=2019。
 # 令和は進行中のため上限 98=西暦 2116 を形式上限とする）
 _ERA_MAX = {"明治": 45, "大正": 15, "昭和": 64, "平成": 31, "令和": 98}
+# KOSEKI-DATA-1-fix1（01）: 元号の実在期間（グレゴリオ暦・閉区間・日単位）。
+# 「暦にはあるがその元号には無い日」（明治45年7月30日・大正15年12月25日・
+# 昭和64年1月8日・平成31年5月1日 等）を null へ倒す。
+# 採用値: 明治の開始は明治元年1月1日の遡及適用（慶応4年1月1日=1868-01-25 の
+# グレゴリオ換算）。既知の限界（明記）: 明治5年以前は旧暦のため naive な
+# 年月日変換はグレゴリオ暦と最大数週間ずれ得る——本区間検査は元号帰属の
+# 検証であり、旧暦期の日単位の暦換算までは保証しない（最終確定は R4 人手
+# 確認の責務）。令和の上限は形式値（_ERA_MAX=98 と整合）
+_ERA_RANGE = {
+    "明治": (date(1868, 1, 25), date(1912, 7, 29)),
+    "大正": (date(1912, 7, 30), date(1926, 12, 24)),
+    "昭和": (date(1926, 12, 25), date(1989, 1, 7)),
+    "平成": (date(1989, 1, 8), date(2019, 4, 30)),
+    "令和": (date(2019, 5, 1), date(2116, 12, 31)),
+}
 _WAREKI_RE = re.compile(
     r"^(明治|大正|昭和|平成|令和)(元|\d{1,2})年(\d{1,2})月(\d{1,2})日$")
 _ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -232,6 +247,9 @@ def parse_wareki(text) -> str | None:
     - 全角数字・空白は NFKC/除去で吸収。それ以外の余計な文字が付く場合は
       変換しない（「昭和32年4月1日編製」等は None＝切り出しは読解側の責務）
     - 元号年の範囲外（昭和99年等）・暦に無い日付（2月30日等）は None
+    - fix1（01）: 元号の実在期間（_ERA_RANGE・日単位の閉区間）外は None
+      （明治45年7月30日・昭和64年1月8日・平成31年5月1日 等の「暦にはあるが
+      その元号には無い日」を採用しない）
     """
     s = unicodedata.normalize("NFKC", str(text or ""))
     s = s.replace(" ", "").replace("　", "").strip()
@@ -244,8 +262,11 @@ def parse_wareki(text) -> str | None:
         return None
     year = _ERA_BASE[era] + year_n
     try:
-        date(year, month, day)
+        d = date(year, month, day)
     except ValueError:
+        return None
+    lo, hi = _ERA_RANGE[era]
+    if not (lo <= d <= hi):
         return None
     return f"{year:04d}-{month:02d}-{day:02d}"
 
@@ -263,11 +284,13 @@ def _valid_iso(value) -> str | None:
 
 
 def _normalized_date(wareki, model_seireki):
-    """機械変換を優先。不成立ならモデル申告の妥当な ISO のみ許容・それも
-    無ければ None（誤変換より欠落）。"""
-    det = parse_wareki(wareki)
-    if det is not None:
-        return det
+    """KOSEKI-DATA-1-fix1（02・裁定）: モデル申告 ISO の採用は**和暦原文が
+    空の場合のみ**。原文が存在して機械変換に失敗した場合（grammar 不成立・
+    元号範囲外・実在期間外）は None＝「西暦変換不能」へ固定する——原文と
+    矛盾し得るモデル申告で救済しない（誤変換より欠落の徹底）。"""
+    src = str(wareki or "").strip()
+    if src:
+        return parse_wareki(src)
     return _valid_iso(model_seireki)
 
 

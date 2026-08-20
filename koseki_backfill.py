@@ -40,7 +40,7 @@ from hub import kintone
 from hub import webapp_souzoku_dashboard as souzoku_dash
 from koseki_reader import APP_KOSEKI_BOOK, normalize_reading, structured_fields
 
-_FIELDS = ["$id", "案件レコードID", "読解状態", "読解JSON",
+_FIELDS = ["$id", "$revision", "案件レコードID", "読解状態", "読解JSON",
            "戸籍種別", "編製日", "消除日"]
 
 
@@ -109,6 +109,22 @@ async def run(apply: bool) -> int:
         normalized = normalize_reading(json.loads(before))
         after = json.dumps(normalized, ensure_ascii=False, sort_keys=True)
         struct = structured_fields(normalized)
+        # fix1（03）: 人手値保護の三値化——既存値が空=充足する／生成値と一致=
+        # write 0（スキップ）／不一致=write 0＋手作業送り（上書き禁止）。
+        # 値は 種別ラベル・ISO 日付のみ（PII 非該当・表示可）
+        to_write = {}
+        matched = []
+        for field, generated in sorted(struct.items()):
+            current = _v(record, field)
+            if not current:
+                to_write[field] = generated
+            elif current == generated:
+                matched.append(field)
+            else:
+                manual.append(
+                    f"$id={rid}: {field} の既存値と生成値が不一致"
+                    f"（人手修正の可能性）。上書きせず現状維持"
+                    f"（既存={current} / 生成={generated}）")
         koseki = normalized.get("戸籍") or {}
         persons = normalized.get("人物") or []
         births = sum(1 for p in persons if isinstance(p, dict)
@@ -119,24 +135,34 @@ async def run(apply: bool) -> int:
               f"消除日_西暦={koseki.get('消除日_西暦')} "
               f"生年月日_西暦={births}/{len(persons)}人 "
               f"JSON更新={'あり' if after != before else 'なし'} "
-              f"kintone書込予定={sorted(struct.keys())}")
+              f"kintone書込予定={sorted(to_write)}"
+              + (f" 一致スキップ={matched}" if matched else ""))
         if not case:
             candidates = await _case_candidates(normalized)
             manual.append(
                 f"$id={rid}: 案件レコードID が空。kintone で設定要"
                 f"（人物名一致からの候補案件: "
                 f"{candidates if candidates else '機械推定不能'}）")
-        fields = dict(struct)
+        fields = dict(to_write)
         if after != before:
             fields["読解JSON"] = json.dumps(normalized, ensure_ascii=False)
         if not fields:
             continue
         planned += 1
         if apply:
+            # fix1（03）: revision 照合つき update——並行編集は kintone 側が
+            # 409 で拒否し、当該レコードのみエラー扱いで継続する。
+            # fix1（04）: 失敗出力は閉集合（例外分類名・HTTP status・固定 code）
+            # のみ＝例外本文（PII を含み得る）を stdout へ出さない
             try:
-                await kintone.update_record(APP_KOSEKI_BOOK, rid, fields)
+                await kintone.update_record(
+                    APP_KOSEKI_BOOK, rid, fields,
+                    revision=_v(record, "$revision") or None)
+            except kintone.KintoneError as e:
+                failures.append(f"$id={rid}: KintoneError "
+                                f"status={e.status} code={e.code or 'nocode'}")
             except Exception as e:                     # 1 件の失敗は他を止めない
-                failures.append(f"$id={rid}: {type(e).__name__}: {str(e)[:120]}")
+                failures.append(f"$id={rid}: {type(e).__name__}")
     print(f"書込み対象 {planned} 件"
           + ("（適用済み）" if apply else "（dry-run のため書込みゼロ）"))
     if manual:

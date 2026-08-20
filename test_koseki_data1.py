@@ -2,10 +2,12 @@
 
 固定する仕様:
 - parse_wareki: 和暦→西暦の決定的変換。grammar 不成立・元号範囲外・暦に無い
-  日付・余計な文字付きは None（誤変換より欠落＝fail-closed）。全角数字吸収。
-- normalize_reading: 機械変換優先で 編製日_西暦/消除日_西暦 を充足・
-  人物[].生年月日_西暦 を新設。原文ありで変換不能は null＋confidence 0.0。
-  既存キーは不変（後方互換）・冪等。
+  日付・余計な文字付き・**元号の実在期間（日単位閉区間）外**（fix1 01）は
+  None（誤変換より欠落＝fail-closed）。全角数字吸収。
+- normalize_reading: 機械変換で 編製日_西暦/消除日_西暦 を充足・
+  人物[].生年月日_西暦 を新設。**モデル申告 ISO の採用は和暦原文が空の場合
+  のみ**（fix1 02 裁定）——原文ありで変換不能は null＋「西暦変換不能」キー。
+  既存キーは不変（後方互換）・冪等。confidence 判定系は完全不変。
 - structured_fields: 厳密検証済みの値のみ（様式∈FORMS・ISO 日付のみ）。
   値の無い field はキーを含めない。
 - process_record: 保存 JSON が正規化済み・構造化 field が同一 update に同梱
@@ -49,6 +51,38 @@ class TestParseWareki(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertEqual(parse_wareki(text), expected)
 
+    def test_era_boundaries_day_level(self):
+        # KOSEKI-DATA-1-fix1（01）: 各改元境界の直前・当日・直後（「暦には
+        # あるがその元号には無い日」を null へ）
+        positives = {
+            "明治元年1月25日": "1868-01-25",     # 明治開始（遡及適用の初日）
+            "明治45年7月29日": "1912-07-29",     # 明治最終日
+            "大正元年7月30日": "1912-07-30",     # 大正初日
+            "大正15年12月24日": "1926-12-24",    # 大正最終日
+            "昭和元年12月25日": "1926-12-25",    # 昭和初日
+            "昭和64年1月7日": "1989-01-07",      # 昭和最終日
+            "平成元年1月8日": "1989-01-08",      # 平成初日
+            "平成31年4月30日": "2019-04-30",     # 平成最終日
+            "令和元年5月1日": "2019-05-01",      # 令和初日
+        }
+        for text, expected in positives.items():
+            with self.subTest(text=text):
+                self.assertEqual(parse_wareki(text), expected)
+        negatives = (
+            "明治元年1月24日",     # 明治開始前日相当
+            "明治45年7月30日",     # 明治には無い日（大正元年7月30日）
+            "大正元年7月29日",     # 大正開始前日相当
+            "大正15年12月25日",    # 大正には無い日（昭和元年12月25日）
+            "昭和元年12月24日",    # 昭和開始前日相当
+            "昭和64年1月8日",      # 昭和には無い日（平成元年1月8日）
+            "平成元年1月7日",      # 平成開始前日相当
+            "平成31年5月1日",      # 平成には無い日（令和元年5月1日）
+            "令和元年4月30日",     # 令和開始前日相当
+        )
+        for text in negatives:
+            with self.subTest(text=text):
+                self.assertIsNone(parse_wareki(text))
+
     def test_fail_closed_returns_none(self):
         for text in ("昭和99年1月1日",           # 元号範囲外
                      "平成32年1月1日",           # 平成31まで
@@ -75,12 +109,25 @@ class TestNormalizeReading(unittest.TestCase):
         self.assertEqual(reading["戸籍"]["編製日_西暦"], "1957-04-01")
         self.assertIsNone(reading["戸籍"]["消除日_西暦"])
 
-    def test_model_iso_kept_when_wareki_unparseable(self):
-        # 和暦が崩れていてもモデル申告が妥当な ISO ならそれを残す
+    def test_model_iso_rejected_when_wareki_present_but_unparseable(self):
+        # KOSEKI-DATA-1-fix1（02 裁定・仕様変更＝厳格化）: 原文が存在して機械
+        # 変換に失敗した場合はモデル申告 ISO で救済せず null＋「西暦変換不能」
+        # （旧仕様「モデル ISO を残す」は本裁定で廃止・緩和ではなく厳格化）
         reading = {"戸籍": {"編製日": "昭和32年4月1日編製",
                             "編製日_西暦": "1957-04-01", "confidence": {}}}
         normalize_reading(reading)
+        self.assertIsNone(reading["戸籍"]["編製日_西暦"])
+        self.assertEqual(reading["戸籍"]["西暦変換不能"], ["編製日_西暦"])
+
+    def test_model_iso_adopted_only_when_source_empty(self):
+        # fix1（02 裁定）: 原文空のときのみモデル申告 ISO を採用・不正 ISO は null
+        reading = {"戸籍": {"編製日": "", "編製日_西暦": "1957-04-01",
+                            "消除日": "", "消除日_西暦": "not-a-date",
+                            "confidence": {}}}
+        normalize_reading(reading)
         self.assertEqual(reading["戸籍"]["編製日_西暦"], "1957-04-01")
+        self.assertIsNone(reading["戸籍"]["消除日_西暦"])
+        self.assertNotIn("西暦変換不能", reading["戸籍"])   # 原文空=マークなし
 
     def test_unconvertible_with_source_is_null_and_marked(self):
         reading = {"戸籍": {"編製日": "昭和参拾弐年卯月朔日",   # 変換不能な原文
@@ -171,12 +218,14 @@ class TestBackfill(unittest.TestCase):
         reading = valid_reading()
         reading["ocr_text"] = "OCR原文"
         return [
-            {"$id": {"value": "1"}, "案件レコードID": {"value": "3"},
+            {"$id": {"value": "1"}, "$revision": {"value": "3"},
+             "案件レコードID": {"value": "3"},
              "読解状態": {"value": "AI読解済"},
              "読解JSON": {"value": json.dumps(reading, ensure_ascii=False)},
              "戸籍種別": {"value": ""}, "編製日": {"value": ""},
              "消除日": {"value": ""}},
-            {"$id": {"value": "9"}, "案件レコードID": {"value": ""},
+            {"$id": {"value": "9"}, "$revision": {"value": "3"},
+             "案件レコードID": {"value": ""},
              "読解状態": {"value": "AI読解済"},
              "読解JSON": {"value": json.dumps(reading, ensure_ascii=False)},
              "戸籍種別": {"value": ""}, "編製日": {"value": ""},
@@ -188,41 +237,57 @@ class TestBackfill(unittest.TestCase):
              "消除日": {"value": ""}},
         ]
 
-    def _run(self, apply):
+    def _run(self, apply, records=None, update_error=None):
+        import contextlib
+        import io
         updates = []
 
         async def search(app, query, fields=None):
             if app.app_id_env == "APP_KOSEKI_BOOK":
-                return self._records()
+                return records if records is not None else self._records()
             return [{"$id": {"value": "3"}}]          # App26 案件一覧
 
         async def update(app, rid, fields, revision=None):
-            updates.append((rid, fields))
+            if update_error is not None:
+                raise update_error
+            updates.append((rid, fields, revision))
 
         load_persons = AsyncMock(return_value={
             "records": [{"$id": {"value": "1"},
                          "氏名": {"value": "山田太郎"}}],
             "excluded_merged_count": 0})
+        out = io.StringIO()
         with patch.dict(os.environ, {"APP_KOSEKI_BOOK": "33",
                                      "TOKEN_KOSEKI_BOOK": "t"}), \
              patch("hub.kintone.search_records", new=search), \
              patch("hub.kintone.update_record", new=update), \
              patch("hub.webapp_souzoku_dashboard._load_persons",
-                   new=load_persons):
+                   new=load_persons), \
+             contextlib.redirect_stdout(out):
             rc = asyncio.run(koseki_backfill.run(apply=apply))
-        return rc, updates
+        return rc, updates, out.getvalue()
+
+    def _record(self, rid, *, case="4", shubetsu="", hensei="", rev="7"):
+        reading = valid_reading()
+        reading["ocr_text"] = "OCR原文"
+        return {"$id": {"value": rid}, "$revision": {"value": rev},
+                "案件レコードID": {"value": case},
+                "読解状態": {"value": "AI読解済"},
+                "読解JSON": {"value": json.dumps(reading, ensure_ascii=False)},
+                "戸籍種別": {"value": shubetsu}, "編製日": {"value": hensei},
+                "消除日": {"value": ""}}
 
     def test_dry_run_writes_nothing(self):
-        rc, updates = self._run(apply=False)
+        rc, updates, _out = self._run(apply=False)
         self.assertEqual(rc, 0)
         self.assertEqual(updates, [])
 
     def test_apply_writes_normalized_payload_without_status(self):
-        rc, updates = self._run(apply=True)
+        rc, updates, _out = self._run(apply=True)
         self.assertEqual(rc, 0)
         # 壊れ JSON（$id=10）は書込み対象外・他 2 件が書かれる
-        self.assertEqual([rid for rid, _ in updates], ["1", "9"])
-        for _, fields in updates:
+        self.assertEqual([rid for rid, _, _r in updates], ["1", "9"])
+        for _, fields, _rev in updates:
             self.assertNotIn("読解状態", fields)       # R4 専権に触れない
             self.assertEqual(fields["戸籍種別"], "改製原（昭和）")
             self.assertEqual(fields["編製日"], "1957-04-01")
@@ -230,6 +295,47 @@ class TestBackfill(unittest.TestCase):
             saved = json.loads(fields["読解JSON"])
             self.assertEqual(saved["人物"][0]["生年月日_西暦"], "1907-01-05")
             self.assertEqual(saved["ocr_text"], "OCR原文")   # 既存キー温存
+
+    def test_manual_values_never_overwritten(self):
+        # fix1（03）: 既存値と生成値の不一致（人手修正の可能性）は --apply でも
+        # 上書きされず、手作業送り一覧に載る。一致は write 0（スキップ）
+        records = [
+            self._record("21", shubetsu="現行"),          # 生成=改製原（昭和）と不一致
+            self._record("22", shubetsu="改製原（昭和）",   # 全 field 一致
+                         hensei="1957-04-01"),
+        ]
+        rc, updates, out = self._run(apply=True, records=records)
+        self.assertEqual(rc, 0)
+        by_rid = {rid: fields for rid, fields, _r in updates}
+        # 不一致 field（戸籍種別）は書かれない（編製日は空→充足）
+        self.assertNotIn("戸籍種別", by_rid["21"])
+        self.assertEqual(by_rid["21"]["編製日"], "1957-04-01")
+        self.assertIn("$id=21: 戸籍種別 の既存値と生成値が不一致", out)
+        self.assertIn("上書きせず現状維持", out)
+        # 一致は write 0: $id=22 は構造化 field を一切書かない（JSON 更新のみ）
+        self.assertEqual(set(by_rid["22"]) - {"読解JSON"}, set())
+
+    def test_revision_passed_and_conflict_continues(self):
+        # fix1（03）: revision 照合つき update。競合（KintoneError）は当該
+        # レコードのみエラー扱いで継続・rc=1
+        from hub.kintone import KintoneError
+        rc, updates, out = self._run(apply=True)
+        self.assertEqual([rev for _, _f, rev in updates], ["3", "3"])
+        rc, updates, out = self._run(
+            apply=True, update_error=KintoneError(409, "GAIA_CO02", "競合"))
+        self.assertEqual(rc, 1)
+        self.assertIn("KintoneError status=409 code=GAIA_CO02", out)
+
+    def test_failure_output_is_pii_safe(self):
+        # fix1（04）: 例外本文（PII を含み得る）を stdout へ出さない——
+        # 分類名のみの閉集合
+        rc, _updates, out = self._run(
+            apply=True,
+            update_error=RuntimeError("SENTINEL-氏名-XY が含まれる例外本文"))
+        self.assertEqual(rc, 1)
+        self.assertIn("RuntimeError", out)
+        self.assertNotIn("SENTINEL", out)
+        self.assertNotIn("氏名-XY", out)
 
     def test_backfill_never_writes_reading_state_statically(self):
         # 静的 pin: 読解状態 は文字として fields へ入り得る箇所が無い
