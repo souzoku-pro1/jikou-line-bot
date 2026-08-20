@@ -17,9 +17,16 @@
 import ast
 import asyncio
 import os
+import re
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
+
+from ast_policy_helpers import (
+    _FORBIDDEN_IMPORTS,
+    _binding_violations,
+    _readonly_violations,
+)
 
 _ENV = {
     "ANTHROPIC_API_KEY": "dummy", "LINE_CHANNEL_SECRET": "dummy_secret",
@@ -206,6 +213,70 @@ class TestInboundWiring(_ResetMixin):
         checker.assert_not_awaited()
 
 
+# ── STOPLIST-fix1（STOPLIST-01）: durable 反転窓の event_id 引き継ぎ ─────────
+class TestDurableEventIdCarryover(_ResetMixin):
+    def test_inner_flip_keeps_event_id_and_retry_is_idempotent(self):
+        """外側判定 False →（App39 登録の反転窓）→ 内側判定 True でも、
+        ContextVar 経由の event_id で冪等キー stoplist:{event_id} が成立し、
+        通知失敗 → durable failed → retry で App28 増分 0・最終該当行 1 件。"""
+        rows = []
+
+        async def fake_create(app, fields):
+            rows.append(dict(fields))
+
+        async def fake_search(app, query, fields=None):
+            # _paused_chatlog_already_saved の完全一致検索を再現
+            m = re.match(r'category = "([^"]*)"', query)
+            key = m.group(1) if m else None
+            return ([{"$id": {"value": "1"}}]
+                    if any(r.get("category") == key for r in rows) else [])
+
+        notify = AsyncMock(side_effect=[RuntimeError("line down"), True])
+        failed = AsyncMock()
+        completed = AsyncMock()
+        env = {**_ENV, **_STOP_ENV, "AUTOREPLY_PAUSED": "",
+               "APP_CHATLOG": "28", "TOKEN_CHATLOG": "t28"}
+        with patch.dict(os.environ, env), \
+             patch.object(main, "ATTORNEY_LINE_USER_ID", "U" + "a" * 32), \
+             patch.object(main.autoreply_stoplist, "is_suppressed",
+                          AsyncMock(side_effect=[False, True, True])), \
+             patch.object(main, "get_app21_record",
+                          AsyncMock(return_value=None)), \
+             patch.object(main.hub_kintone, "create_record", fake_create), \
+             patch.object(main.hub_kintone, "search_records", fake_search), \
+             patch("hub.notify.notify_business", notify), \
+             patch("hub.durable_inbound.mark_line_processing",
+                   AsyncMock(return_value=True)), \
+             patch("hub.durable_inbound.mark_line_completed", completed), \
+             patch("hub.durable_inbound.mark_line_failed", failed):
+            # 1回目: 外側 False → 内側 True（反転窓）。保存成功・通知失敗
+            _run(main._process_line_event_durable("rt", UID, "相談です",
+                                                  "evt-1"))
+            failed.assert_awaited_once()              # durable failed へ
+            completed.assert_not_awaited()
+            self.assertEqual(len(rows), 1)            # App28 保存は成立
+            self.assertEqual(rows[0]["category"], "stoplist:evt-1")  # 完全一致
+            # retry（外側 True・already_claimed）: 冪等確認が既存行を発見
+            _run(main._process_line_event_durable("rt", UID, "相談です",
+                                                  "evt-1",
+                                                  already_claimed=True))
+            completed.assert_awaited_once()           # 今回は成功
+            self.assertEqual(len(rows), 1)            # App28 増分 0・最終 1 件
+            self.assertEqual(
+                [r["category"] for r in rows], ["stoplist:evt-1"])
+
+    def test_non_durable_context_stays_none(self):
+        # 非 durable 文脈では ContextVar は既定 None（従来どおり冪等キーなし）
+        handled = AsyncMock()
+        with patch.dict(os.environ, {**_ENV, **_STOP_ENV,
+                                     "AUTOREPLY_PAUSED": ""}), \
+             patch.object(main.autoreply_stoplist, "is_suppressed",
+                          AsyncMock(return_value=True)), \
+             patch.object(main, "_handle_suppressed_inbound", handled):
+            _run(main._process_line_event("rt", UID, "x"))
+        handled.assert_awaited_once_with(UID, "x", None)
+
+
 # ── 承認キュー経路の抑止 ─────────────────────────────────────────────────────
 class TestApprovalSuppression(unittest.TestCase):
     def _post(self, *, suppressed, record):
@@ -264,16 +335,64 @@ class TestStructuralPins(unittest.TestCase):
             "登録日": {"type": "DATE"},
         })
 
-    def test_stoplist_module_is_read_only(self):
-        # 書込み経路なし: kintone の write API（create/update/delete）を呼ばない
-        src = Path("hub/autoreply_stoplist.py").read_text(encoding="utf-8")
-        called = {node.func.attr for node in ast.walk(ast.parse(src))
-                  if isinstance(node, ast.Call)
-                  and isinstance(node.func, ast.Attribute)}
-        for banned in ("create_record", "update_record", "delete_record",
-                       "get_record"):
-            self.assertNotIn(banned, called)
-        self.assertIn("search_records", called)
+    @staticmethod
+    def _imports(tree):
+        out = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                out |= {a.name.split(".")[0] for a in node.names}
+            elif isinstance(node, ast.ImportFrom):
+                out.add((node.module or "").split(".")[0])
+        return out
+
+    def test_stoplist_module_passes_p4_readonly_checker(self):
+        # STOPLIST-fix1（STOPLIST-02）: P4 系 read-only checker（許可文脈の
+        # 閉集合方式=未知の kintone 属性・private _write・alias/属性直 import・
+        # 動的アクセスはすべて fail-closed）＋HTTP/プロセス系 import 禁止を共用
+        tree = ast.parse(
+            Path("hub/autoreply_stoplist.py").read_text(encoding="utf-8"))
+        self.assertEqual(_readonly_violations(tree), [])
+        self.assertEqual(_binding_violations(tree), [])
+        self.assertFalse(self._imports(tree) & _FORBIDDEN_IMPORTS)
+        # 使用する kintone 属性は read の 2 種のみ（許可集合のさらに部分集合）
+        attrs = {node.attr for node in ast.walk(tree)
+                 if isinstance(node, ast.Attribute)
+                 and isinstance(node.value, ast.Name)
+                 and node.value.id == "kintone"}
+        self.assertEqual(attrs, {"KintoneApp", "search_records"})
+
+    def test_checker_detects_write_and_bypass_forms(self):
+        # checker 単体の negative 対照（STOPLIST-02 指定水準）: 既存 write API・
+        # private _write・未知 attr（fail-closed）・import alias・属性直 import・
+        # HTTP client 直呼び・動的アクセスの各形が違反として検出される
+        cases = {
+            "既存 write API": 'from hub import kintone\n'
+                              'async def f(a):\n'
+                              '    await kintone.create_records(a, [])\n',
+            "update_record": 'from hub import kintone\n'
+                             'async def f(a):\n'
+                             '    await kintone.update_record(a, "1", {})\n',
+            "private _write": 'from hub import kintone\n'
+                              'async def f(a):\n'
+                              '    await kintone._write("POST", a, {})\n',
+            "未知 attr=fail-closed": 'from hub import kintone\n'
+                                     'async def f(a):\n'
+                                     '    await kintone.bulk_delete(a)\n',
+            "import alias": 'from hub import kintone as kt\n'
+                            'async def f(a):\n'
+                            '    await kt.create_record(a, {})\n',
+            "属性直 import": 'from hub.kintone import create_record\n',
+            "HTTP 直呼び": 'from hub import kintone\nimport httpx\n',
+            "動的アクセス": 'from hub import kintone\n'
+                            'g = getattr(kintone, "create_record")\n',
+        }
+        for label, src in cases.items():
+            with self.subTest(case=label):
+                tree = ast.parse(src)
+                violations = (_readonly_violations(tree)
+                              + _binding_violations(tree))
+                forbidden = self._imports(tree) & _FORBIDDEN_IMPORTS
+                self.assertTrue(violations or forbidden, label)
 
     def test_approval_check_precedes_sending_marker(self):
         # 承認経路: 停止判定は sending marker より前（marker を汚さない）

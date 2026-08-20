@@ -1,3 +1,4 @@
+import contextvars
 import os
 import stripe
 import re
@@ -612,6 +613,16 @@ async def _handle_paused_inbound(user_id: str, user_text: str,
             f"save={save_error or 'ok'} notify={notify_error or 'ok'}")
 
 
+# STOPLIST-fix1（STOPLIST-01）: durable 文脈の webhook_event_id を内側の停止
+# 再確認へ引き継ぐ ContextVar。_process_line_event の 3 引数契約（durable
+# テストの patch 契約）を変えずに、外側判定 False→（App39 登録）→内側判定
+# True の反転窓でも同じ event id で冪等キー stoplist:{event_id} が成立する
+# （None のままだと category 空で保存され、retry の冪等確認が既存行を発見
+# できず受信記録が重複した）。await 連鎖に伝播し task 境界では既定 None。
+_durable_event_id: contextvars.ContextVar = contextvars.ContextVar(
+    "durable_event_id", default=None)
+
+
 async def _handle_suppressed_inbound(user_id: str, user_text: str,
                                      webhook_event_id: str | None = None) -> None:
     """AUTOREPLY-STOPLIST-1: 個人別停止（停止リスト該当 userId）の受信処理。
@@ -645,7 +656,10 @@ async def _process_line_event(reply_token: str, user_id: str, user_text: str) ->
     #    _process_line_event の 3 引数シグネチャは durable テストの patch 契約
     #    のため変えない）。pause 同様 try の外＝記録/通知失敗は上位へ伝播 ──────
     if await autoreply_stoplist.is_suppressed(user_id):
-        await _handle_suppressed_inbound(user_id, user_text, None)
+        # STOPLIST-fix1: durable 文脈なら ContextVar の event id で冪等キーが
+        # 成立（非 durable 文脈は既定 None＝従来どおり）
+        await _handle_suppressed_inbound(user_id, user_text,
+                                         _durable_event_id.get())
         return
     try:
         # ── ルーティング判定 ──────────────────────────────────────────────
@@ -791,6 +805,9 @@ async def _process_line_event_durable(reply_token: str, user_id: str, user_text:
       （already_claimed=True・webhook 側が outcome で判別して渡す）"""
     from hub.durable_inbound import (mark_line_processing, mark_line_completed,
                                      mark_line_failed)
+    # STOPLIST-fix1（STOPLIST-01）: durable 文脈の event id を内側の停止再確認へ
+    # 引き継ぐ（finally で必ず reset＝文脈漏れなし）
+    _ctx_token = _durable_event_id.set(webhook_event_id)
     try:
         if not already_claimed and not await mark_line_processing(webhook_event_id):
             logger.info("[DURABLE] ownership not acquired (claimed by "
@@ -813,6 +830,8 @@ async def _process_line_event_durable(reply_token: str, user_id: str, user_text:
             await mark_line_failed(webhook_event_id, type(e).__name__)
         except Exception:
             pass
+    finally:
+        _durable_event_id.reset(_ctx_token)
 
 
 @app.post("/webhook")
