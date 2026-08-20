@@ -631,6 +631,22 @@ EXPECTED_KINTONE_SCHEMA = {
             "実行日時": {"type": "DATETIME"},
         },
     },
+    # ── AUTOREPLY-STOPLIST-1: 自動返信の個人別停止リスト（方針(C)専用アプリ）。
+    # LINE userId 基準＝App21 未登録の問い合わせ段階でも特定できる。照会は
+    # hub/autoreply_stoplist.is_suppressed（fail-open・裁定済み）のみ・書込みは
+    # 大野の kintone 手動操作のみ（コードからの書込み経路なし）
+    "App 39 (自動返信停止リスト)": {
+        "app_id_env": "APP_AUTOREPLY_STOP",
+        "token_env": "TOKEN_AUTOREPLY_STOP",
+        # env 未設定の環境では監視をスキップ（設定されたら自動的に監視対象になる）
+        "optional": True,
+        "fields": {
+            "LINE_userId": {"type": "SINGLE_LINE_TEXT"},
+            "表示名": {"type": "SINGLE_LINE_TEXT"},
+            "停止理由": {"type": "MULTI_LINE_TEXT"},
+            "登録日": {"type": "DATE"},
+        },
+    },
 }
 
 

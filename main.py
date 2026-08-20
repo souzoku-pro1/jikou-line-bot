@@ -55,6 +55,7 @@ from claude_gateway import (
     extract_text,
 )
 from daily_healthcheck import start_healthcheck_scheduler
+from hub import autoreply_stoplist
 from hub import kintone as hub_kintone
 from hub import notify as hub_notify
 from hub.webhook_auth import extract_record_id, verify_token
@@ -509,7 +510,8 @@ async def _paused_chatlog_already_saved(idem_key: str) -> bool:
 
 
 async def _handle_paused_inbound(user_id: str, user_text: str,
-                                 webhook_event_id: str | None = None) -> None:
+                                 webhook_event_id: str | None = None,
+                                 idem_prefix: str = "paused") -> None:
     """AUTOREPLY_PAUSED=1 の受信処理（既存「人対応」経路と同型・返信 0 件）:
 
     - 顧客へは一切送信しない（自動応答・定型文・承認キュー投入とも発生しない。
@@ -554,7 +556,9 @@ async def _handle_paused_inbound(user_id: str, user_text: str,
         display_name = f"新規/未紐付け(匿名ID:{anon})"
 
     # ── (b) 受信記録（独立試行・durable 時は冪等キーつき） ──────────────────
-    idem_key = f"paused:{webhook_event_id}" if webhook_event_id else ""
+    # AUTOREPLY-STOPLIST-1: 個人別停止経路は prefix="stoplist"（App28 の
+    # category で全体停止と区別＝どの機構で抑止したかを恒久的に追跡できる）
+    idem_key = f"{idem_prefix}:{webhook_event_id}" if webhook_event_id else ""
     save_error = ""
     if idem_key and await _paused_chatlog_already_saved(idem_key):
         logger.info("[AUTOREPLY_PAUSED] chatlog already saved (idempotent "
@@ -608,6 +612,18 @@ async def _handle_paused_inbound(user_id: str, user_text: str,
             f"save={save_error or 'ok'} notify={notify_error or 'ok'}")
 
 
+async def _handle_suppressed_inbound(user_id: str, user_text: str,
+                                     webhook_event_id: str | None = None) -> None:
+    """AUTOREPLY-STOPLIST-1: 個人別停止（停止リスト該当 userId）の受信処理。
+
+    返信 0 件・受信記録（App28）＋管理者通知は pause 経路の実装を共用
+    （挙動同一・AUTOREPLY-01/02 の strict writer と失敗伝播も継承）。
+    異なるのは計数（count_suppressed）と冪等キー prefix（stoplist:）のみ。"""
+    autoreply_stoplist.count_suppressed(user_id)
+    await _handle_paused_inbound(user_id, user_text, webhook_event_id,
+                                 idem_prefix="stoplist")
+
+
 async def _process_line_event(reply_token: str, user_id: str, user_text: str) -> None:
     """LINEイベントの重い処理（BackgroundTasksで非同期実行）"""
     logger.info("[PROCESS] start user_id=%s text=%s",
@@ -620,6 +636,16 @@ async def _process_line_event(reply_token: str, user_id: str, user_text: str) ->
     #    durable 経路は wrapper 側の pause 分岐が event id つきで処理する）──────
     if _autoreply_paused():
         await _handle_paused_inbound(user_id, user_text, None)
+        return
+    # ── ②個人別停止（AUTOREPLY-STOPLIST-1・全体停止に次いで、他の外部作用
+    #    〔App21 参照・Claude・LINE 送信・承認キュー投入〕より前に判定）。
+    #    照会は fail-open（失敗＝止めない・警報は module 側）。durable 経路は
+    #    wrapper 側で event id つきの判定・処理が先に行われ、ここへ来るのは
+    #    非該当時のみ＝本判定は再確認（kintone 1 照会の許容コスト。
+    #    _process_line_event の 3 引数シグネチャは durable テストの patch 契約
+    #    のため変えない）。pause 同様 try の外＝記録/通知失敗は上位へ伝播 ──────
+    if await autoreply_stoplist.is_suppressed(user_id):
+        await _handle_suppressed_inbound(user_id, user_text, None)
         return
     try:
         # ── ルーティング判定 ──────────────────────────────────────────────
@@ -773,6 +799,10 @@ async def _process_line_event_durable(reply_token: str, user_id: str, user_text:
             return
         if _autoreply_paused():
             await _handle_paused_inbound(user_id, user_text, webhook_event_id)
+        elif await autoreply_stoplist.is_suppressed(user_id):
+            # AUTOREPLY-STOPLIST-1: durable 経路は event id つきで冪等記録
+            await _handle_suppressed_inbound(user_id, user_text,
+                                             webhook_event_id)
         else:
             await _process_line_event(reply_token, user_id, user_text)
         await mark_line_completed(webhook_event_id)
@@ -965,6 +995,19 @@ async def kintone_approval_webhook(request: Request):
         if _ev:
             await mark_noop_done(_ev, "skip_missing_user_or_draft")
         return {"ok": True, "skip": "missing_user_or_draft"}
+
+    # ── AUTOREPLY-STOPLIST-1(B): 停止中 userId への承認キュー経由の自動送信を
+    #    抑止。送信済み=no のまま・sending marker も取得しない＝停止解除後に
+    #    再承認（ステータス2 を一度他値→承認済）すれば送れる。大野が LINE
+    #    アプリから直接送る手動送信は本サーバを経由しないため妨げない。
+    #    照会失敗は fail-open（送信継続・裁定済み）─────────────────────────────
+    if await autoreply_stoplist.is_suppressed(user_id):
+        logger.info("[KINTONE] approval push suppressed (autoreply stoplist) "
+                    "record_id=%s",
+                    emit(record_id, "record_id", "log", "operator"))
+        if _ev:
+            await mark_noop_done(_ev, "skip_autoreply_stopped")
+        return {"ok": True, "skip": "autoreply_stopped"}
 
     # RV-04c §4.2 D3-H01: 送信着手 marker（received→sending）成功が LINE 送信の前提条件。
     if _ev:
