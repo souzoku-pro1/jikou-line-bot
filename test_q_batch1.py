@@ -174,6 +174,9 @@ _EXPECTED_TOOLS = [
     "list_case_heirs", "list_case_assets", "list_case_documents",
     "list_case_kosekis", "list_jikou_cases", "get_jikou_case",
     "list_case_chats",
+    # KOSEKI-CHECK-1 票由来: 11 本目（戸籍不足チェック・read-only の決定的
+    # 検査。閉集合の拡張であり read-only 構造 pin 群は不変で green）
+    "check_koseki_coverage",
 ]
 
 
