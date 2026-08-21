@@ -55,7 +55,7 @@ class TestParseWareki(unittest.TestCase):
         # KOSEKI-DATA-1-fix1（01）: 各改元境界の直前・当日・直後（「暦には
         # あるがその元号には無い日」を null へ）
         positives = {
-            "明治元年1月25日": "1868-01-25",     # 明治開始（遡及適用の初日）
+            "明治6年1月1日": "1873-01-01",       # 新暦施行日=自動変換の開始
             "明治45年7月29日": "1912-07-29",     # 明治最終日
             "大正元年7月30日": "1912-07-30",     # 大正初日
             "大正15年12月24日": "1926-12-24",    # 大正最終日
@@ -69,7 +69,12 @@ class TestParseWareki(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertEqual(parse_wareki(text), expected)
         negatives = (
-            "明治元年1月24日",     # 明治開始前日相当
+            # fix2（06・裁定=安全側初版・仕様変更として明記）: 明治5年以前
+            # （旧暦期）は自動変換の対象外。fix1 で正常系だった
+            # 「明治元年1月25日→1868-01-25」は本裁定により negative へ変更
+            # （旧暦→新暦の正式変換は実装しない・naive 変換の不正確さを排除）
+            "明治元年1月25日",     # 旧暦期（明治元年）
+            "明治5年12月2日",      # 旧暦期の最終盤（新暦施行の直前）
             "明治45年7月30日",     # 明治には無い日（大正元年7月30日）
             "大正元年7月29日",     # 大正開始前日相当
             "大正15年12月25日",    # 大正には無い日（昭和元年12月25日）
@@ -325,6 +330,24 @@ class TestBackfill(unittest.TestCase):
             apply=True, update_error=KintoneError(409, "GAIA_CO02", "競合"))
         self.assertEqual(rc, 1)
         self.assertIn("KintoneError status=409 code=GAIA_CO02", out)
+
+    def test_vendor_code_is_grammar_gated(self):
+        # fix2（07）: 外部由来 code は厳格 grammar（^[A-Z]{2}[0-9A-Z_-]{1,30}$）
+        # を通らない限り unknown_code へ正規化＝無検証出力の遮断
+        from hub.kintone import KintoneError
+        rc, _updates, out = self._run(
+            apply=True,
+            update_error=KintoneError(409, "SENTINEL-氏名", "本文"))
+        self.assertEqual(rc, 1)
+        self.assertIn("code=unknown_code", out)
+        self.assertNotIn("SENTINEL", out)
+        self.assertNotIn("SENTINEL-氏名", out)
+        # 正規 code（固定語彙形）は素通し・空は nocode
+        self.assertEqual(koseki_backfill._safe_code("GAIA_RE01"), "GAIA_RE01")
+        self.assertEqual(koseki_backfill._safe_code(""), "nocode")
+        self.assertEqual(koseki_backfill._safe_code(None), "nocode")
+        self.assertEqual(koseki_backfill._safe_code("lower_case"),
+                         "unknown_code")
 
     def test_failure_output_is_pii_safe(self):
         # fix1（04）: 例外本文（PII を含み得る）を stdout へ出さない——

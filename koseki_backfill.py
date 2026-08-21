@@ -21,6 +21,7 @@
 import argparse
 import asyncio
 import json
+import re
 import sys
 import unicodedata
 
@@ -46,6 +47,18 @@ _FIELDS = ["$id", "$revision", "案件レコードID", "読解状態", "読解JS
 
 def _v(record: dict, code: str) -> str:
     return str((record.get(code) or {}).get("value") or "")
+
+
+# KOSEKI-DATA-1-fix2（07）: 外部由来 code の閉集合化——厳格 grammar を通らない
+# code は unknown_code へ正規化（vendor 由来文字列の無検証出力を遮断）
+_ERROR_CODE_RE = re.compile(r"^[A-Z]{2}[0-9A-Z_-]{1,30}$")
+
+
+def _safe_code(code) -> str:
+    s = str(code or "")
+    if not s:
+        return "nocode"
+    return s if _ERROR_CODE_RE.fullmatch(s) else "unknown_code"
 
 
 def _norm_name(s) -> str:
@@ -159,8 +172,9 @@ async def run(apply: bool) -> int:
                     APP_KOSEKI_BOOK, rid, fields,
                     revision=_v(record, "$revision") or None)
             except kintone.KintoneError as e:
+                status = e.status if isinstance(e.status, int) else 0
                 failures.append(f"$id={rid}: KintoneError "
-                                f"status={e.status} code={e.code or 'nocode'}")
+                                f"status={status} code={_safe_code(e.code)}")
             except Exception as e:                     # 1 件の失敗は他を止めない
                 failures.append(f"$id={rid}: {type(e).__name__}")
     print(f"書込み対象 {planned} 件"
