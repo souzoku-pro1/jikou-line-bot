@@ -3,34 +3,104 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>承認キュー参照 - 案件管理（仮）</title>
+<title>返信の承認 - 案件管理（仮）</title>
 <style>
-body{font-family:sans-serif;max-width:960px;margin:1.5rem auto;padding:0 1rem}
-.item{border:1px solid #ccc;border-radius:8px;padding:.8rem;margin:.6rem 0}
-.meta{color:#555;font-size:.9rem;margin-bottom:.4rem}
-pre{white-space:pre-wrap;background:#f7f7f7;padding:.5rem;border-radius:4px;margin:.3rem 0}
-label,button{font-size:1rem;margin-right:.6rem}
+/* UI-POLISH-1: カード＋バッジ型（質問画面と統一の配色）。参照専用は不変 */
+body{font-family:sans-serif;max-width:720px;margin:0 auto;
+  padding:.6rem 1rem 2rem;box-sizing:border-box;background:#eef1f5;color:#222}
+h1{font-size:1.25rem;margin:.4rem 0 .1rem}
+.sub{color:#667;font-size:.85rem;margin:0 0 .8rem}
 a{color:#1a3c6e}
-.badge{display:inline-block;border:1px solid #888;border-radius:4px;padding:0 .4rem;font-size:.85rem;margin-left:.4rem}
+.toolbar{display:flex;gap:.6rem;align-items:center;flex-wrap:wrap;
+  margin:.4rem 0 .6rem}
+label{font-size:.9rem;color:#334}
+button{font-size:.95rem;padding:.5rem 1rem;border-radius:10px;
+  border:1px solid #c8cdd5;background:#fff;min-height:44px}
+button:disabled{color:#aab;background:#f2f4f7}
+.pageinfo{color:#667;font-size:.85rem}
+.item{background:#fff;border:1px solid #d8dde5;border-radius:14px;
+  padding:.75rem 1rem;margin:.6rem 0}
+.name{font-size:1.05rem;font-weight:bold}
+.badges{margin:.3rem 0}
+.badge{display:inline-block;border-radius:999px;padding:.12rem .6rem;
+  font-size:.78rem;background:#e3e7ee;color:#445;margin-right:.35rem}
+.badge.ok{background:#e5f4e6;color:#256d2a}
+.badge.warn{background:#fff3d6;color:#8a6d00}
+.badge.info{background:#e8f0fb;color:#1a5cb0}
+pre{white-space:pre-wrap;word-break:break-word;font-family:inherit;
+  font-size:.93rem;border-radius:12px;padding:.55rem .8rem;margin:.4rem 0}
+pre.cust{background:#f2f4f7;border:1px solid #e2e6ec}
+pre.draft{background:#eef7e8;border:1px solid #cfe6c2}
+.lbl{color:#667;font-size:.78rem;margin-top:.4rem}
+.meta{color:#8a8f98;font-size:.78rem;margin-top:.3rem}
+.empty{color:#667;text-align:center;margin:1.2rem 0}
 </style>
 </head>
 <body>
-<h1>承認キュー参照</h1>
-<p><a href="/app">← ダッシュボード</a></p>
+<h1>返信の承認</h1>
+<p class="sub">お客様への返信下書きの確認（この画面は確認専用です。承認・送信の
+操作は従来どおり LINE から行います）</p>
 <!-- P4-004: 参照のみ——承認・送信の操作 UI はこの画面に存在しない（承認経路は
      既存 webhook が単一の正）。裁定: AI 下書き本文（顧客往復含む）の表示可・
      既定は送信済み=no のみ（全件切替あり） -->
-<div>
-  <label><input type="checkbox" id="all"> 全件表示（既定: 未送信のみ）</label>
+<div class="toolbar">
+  <label><input type="checkbox" id="all"> 送信済みも表示する</label>
   <button id="prev">前へ</button><button id="next">次へ</button>
-  <span id="page"></span>
+  <span class="pageinfo" id="page"></span>
 </div>
 <div id="items"></div>
 <script src="/app/app.js"></script>
+<script src="/app/shell.js"></script>
 <script>
 let offset = 0;
 const limit = 20;
 function v(rec, name) { return (rec[name] && rec[name].value) || ""; }
+function el(tag, cls, text) {
+  const node = document.createElement(tag);
+  if (cls) { node.className = cls; }
+  if (text !== undefined) { node.textContent = text; }
+  return node;
+}
+// UI-POLISH-1-fix1（UI-POLISH-02）: 日時表示の単一の正（全画面で逐語同一・
+// テストが verbatim pin）。JST は UTC+9 固定（DST なし＝Asia/Tokyo と恒等）を
+// UTC 演算のみで適用し、端末タイムゾーンに依存しない（非 UTC getter 不使用を
+// 構造 pin）。「今日」判定も JST の日付境界で行う
+function jstParts(d) {
+  var t = new Date(d.getTime() + 9 * 3600 * 1000);
+  var h = t.getUTCHours();
+  var mi = t.getUTCMinutes();
+  return {y: t.getUTCFullYear(), mo: t.getUTCMonth() + 1, da: t.getUTCDate(),
+          hm: (h < 10 ? "0" + h : "" + h) + ":" +
+              (mi < 10 ? "0" + mi : "" + mi)};
+}
+function fmtDate(value) {
+  var s = String(value || "");
+  if (!s) { return ""; }
+  var dOnly = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s);
+  if (dOnly) {
+    return dOnly[1] + "/" + dOnly[2].replace(/^0/, "") + "/" +
+      dOnly[3].replace(/^0/, "");
+  }
+  var d = new Date(s);
+  if (isNaN(d.getTime())) { return s; }
+  var p = jstParts(d);
+  var n = jstParts(new Date());
+  if (p.y === n.y && p.mo === n.mo && p.da === n.da) {
+    return "今日 " + p.hm;
+  }
+  return p.y + "/" + p.mo + "/" + p.da + " " + p.hm;
+}
+function stateBadge(s) {
+  if (s === "承認済" || s === "承認済み") { return el("span", "badge ok", s); }
+  if (s === "承認待ち" || s === "未承認" || s === "要確認") {
+    return el("span", "badge warn", s);
+  }
+  return el("span", "badge", s || "状態未設定");
+}
+function sentBadge(s) {
+  return s === "yes" ? el("span", "badge info", "送信済み")
+                     : el("span", "badge warn", "未送信");
+}
 async function load() {
   const q = new URLSearchParams({limit: limit, offset: offset});
   if (document.getElementById("all").checked) q.set("all", "1");
@@ -41,31 +111,36 @@ async function load() {
   const data = await resp.json();
   const items = document.getElementById("items");
   items.replaceChildren();
+  if (!data.records.length) {
+    items.appendChild(el("p", "empty", "確認待ちの返信はありません"));
+  }
   for (const rec of data.records) {
-    const div = document.createElement("div");
-    div.className = "item";
-    const meta = document.createElement("div");
-    meta.className = "meta";
-    meta.textContent = `#${v(rec, "$id")} ${v(rec, "顧客名")}` +
-      `｜${v(rec, "カテゴリ")}｜${v(rec, "ステータス2")}` +
-      `｜送信済み: ${v(rec, "送信済み")}｜${v(rec, "更新日時")}`;
-    div.appendChild(meta);
-    const msg = document.createElement("pre");
-    msg.textContent = "顧客: " + v(rec, "顧客メッセージ");
+    const div = el("div", "item");
+    div.appendChild(el("div", "name", v(rec, "顧客名") || "（お名前未登録）"));
+    const badges = el("div", "badges");
+    badges.appendChild(stateBadge(v(rec, "ステータス2")));
+    badges.appendChild(sentBadge(v(rec, "送信済み")));
+    if (v(rec, "カテゴリ")) {
+      badges.appendChild(el("span", "badge", v(rec, "カテゴリ")));
+    }
+    div.appendChild(badges);
+    div.appendChild(el("div", "lbl", "お客様からのメッセージ"));
+    const msg = el("pre", "cust", v(rec, "顧客メッセージ"));
     div.appendChild(msg);
-    const draft = document.createElement("pre");
-    draft.textContent = "AI下書き: " + v(rec, "AI下書き");
+    div.appendChild(el("div", "lbl", "返信の下書き（AI 作成）"));
+    const draft = el("pre", "draft", v(rec, "AI下書き"));
     div.appendChild(draft);
     if (v(rec, "判断理由")) {
-      const reason = document.createElement("div");
-      reason.className = "meta";
-      reason.textContent = "判断理由: " + v(rec, "判断理由");
-      div.appendChild(reason);
+      div.appendChild(el("div", "meta", "判断メモ: " + v(rec, "判断理由")));
     }
+    div.appendChild(el("div", "meta",
+      "No." + v(rec, "$id") + "｜更新 " + fmtDate(v(rec, "更新日時"))));
     items.appendChild(div);
   }
-  document.getElementById("page").textContent =
-    `offset ${offset}（${data.records.length}件表示）`;
+  const from = offset + 1;
+  document.getElementById("page").textContent = data.records.length
+    ? `${from}〜${offset + data.records.length} 件目を表示`
+    : "";
   document.getElementById("prev").disabled = offset === 0;
   document.getElementById("next").disabled = data.records.length < limit;
 }

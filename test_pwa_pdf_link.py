@@ -159,7 +159,9 @@ class TestPagePins(unittest.TestCase):
         self.assertIn('startsWith("https://drive.google.com/file/d/")', page)
         self.assertIn('rel = "noopener noreferrer"', page)
         self.assertIn("pdfLink(rec._pdf_url)", page)
-        self.assertIn("<th>PDF</th>", page)
+        # UI-POLISH-1 票由来: テーブル列（<th>PDF</th>）→ カード内リンク
+        # 「原本PDF」表記へ（リンク化条件・rel/target・pdfLink 経由は不変）
+        self.assertIn('a.textContent = "原本PDF";', page)
         self.assertIn("recLink(", page)          # kintone 原本リンクは併存
 
     def test_kinship_page_renders_pdf_link_guarded(self):

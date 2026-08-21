@@ -5,32 +5,86 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>案件一覧 - 案件管理（仮）</title>
 <style>
-body{font-family:sans-serif;max-width:960px;margin:1.5rem auto;padding:0 1rem}
-table{border-collapse:collapse;width:100%}
-th,td{border:1px solid #ccc;padding:.4rem .6rem;font-size:.95rem;text-align:left}
-select,button{font-size:1rem;padding:.3rem .6rem;margin:0 .3rem .8rem 0}
+/* UI-POLISH-1: カード型一覧（質問画面と統一の配色） */
+body{font-family:sans-serif;max-width:720px;margin:0 auto;
+  padding:.6rem 1rem 2rem;box-sizing:border-box;background:#eef1f5;color:#222}
+h1{font-size:1.25rem;margin:.4rem 0 .1rem}
+.sub{color:#667;font-size:.85rem;margin:0 0 .8rem}
 a{color:#1a3c6e}
+.toolbar{display:flex;gap:.5rem;align-items:center;flex-wrap:wrap;
+  margin:.4rem 0 .6rem}
+select{font-size:1rem;padding:.5rem .6rem;border-radius:10px;
+  border:1px solid #c8cdd5;background:#fff;min-height:44px}
+button{font-size:.95rem;padding:.5rem 1rem;border-radius:10px;
+  border:1px solid #c8cdd5;background:#fff;min-height:44px}
+button:disabled{color:#aab;background:#f2f4f7}
+.pageinfo{color:#667;font-size:.85rem}
+.case-card{display:block;background:#fff;border:1px solid #d8dde5;
+  border-radius:14px;padding:.75rem 1rem;margin:.55rem 0;
+  text-decoration:none;color:#222}
+.case-card .name{font-size:1.05rem;font-weight:bold}
+.case-card .line2{display:flex;gap:.6rem;align-items:center;flex-wrap:wrap;
+  margin-top:.3rem}
+.badge{display:inline-block;border-radius:999px;padding:.12rem .6rem;
+  font-size:.78rem;background:#e8f0fb;color:#1a5cb0}
+.meta{color:#8a8f98;font-size:.78rem;margin-top:.25rem}
+.muted{color:#98a0ab}
+.empty{color:#667;text-align:center;margin:1.2rem 0}
 </style>
 </head>
 <body>
-<h1>案件一覧</h1>
-<p><a href="/app">← ダッシュボード</a></p>
-<!-- P4-002: read-only（表示のみ・操作なし）。status 選択肢はサーバ応答の
-     status_options（EXPECTED_KINTONE_SCHEMA 由来）から構成し、画面で発明しない -->
-<div>
-  <select id="status"><option value="">（すべて）</option></select>
+<h1>時効案件</h1>
+<p class="sub">案件一覧（時効援用・表示のみ）</p>
+<div class="toolbar">
+  <select id="status"><option value="">すべての状態</option></select>
   <button id="prev">前へ</button><button id="next">次へ</button>
-  <span id="page"></span>
+  <span class="pageinfo" id="page"></span>
 </div>
-<table>
-  <thead><tr><th>ID</th><th>顧客名</th><th>status</th><th>問い合わせ業者名</th><th>更新日時</th></tr></thead>
-  <tbody id="rows"></tbody>
-</table>
+<div id="rows"></div>
 <script src="/app/app.js"></script>
+<script src="/app/shell.js"></script>
 <script>
 let offset = 0;
 const limit = 20;
 function v(rec, name) { return (rec[name] && rec[name].value) || ""; }
+function el(tag, cls, text) {
+  const node = document.createElement(tag);
+  if (cls) { node.className = cls; }
+  if (text !== undefined) { node.textContent = text; }
+  return node;
+}
+function disp(text) {
+  return text ? document.createTextNode(text) : el("span", "muted", "未登録");
+}
+// UI-POLISH-1-fix1（UI-POLISH-02）: 日時表示の単一の正（全画面で逐語同一・
+// テストが verbatim pin）。JST は UTC+9 固定（DST なし＝Asia/Tokyo と恒等）を
+// UTC 演算のみで適用し、端末タイムゾーンに依存しない（非 UTC getter 不使用を
+// 構造 pin）。「今日」判定も JST の日付境界で行う
+function jstParts(d) {
+  var t = new Date(d.getTime() + 9 * 3600 * 1000);
+  var h = t.getUTCHours();
+  var mi = t.getUTCMinutes();
+  return {y: t.getUTCFullYear(), mo: t.getUTCMonth() + 1, da: t.getUTCDate(),
+          hm: (h < 10 ? "0" + h : "" + h) + ":" +
+              (mi < 10 ? "0" + mi : "" + mi)};
+}
+function fmtDate(value) {
+  var s = String(value || "");
+  if (!s) { return ""; }
+  var dOnly = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s);
+  if (dOnly) {
+    return dOnly[1] + "/" + dOnly[2].replace(/^0/, "") + "/" +
+      dOnly[3].replace(/^0/, "");
+  }
+  var d = new Date(s);
+  if (isNaN(d.getTime())) { return s; }
+  var p = jstParts(d);
+  var n = jstParts(new Date());
+  if (p.y === n.y && p.mo === n.mo && p.da === n.da) {
+    return "今日 " + p.hm;
+  }
+  return p.y + "/" + p.mo + "/" + p.da + " " + p.hm;
+}
 async function load() {
   const st = document.getElementById("status").value;
   const q = new URLSearchParams({limit: limit, offset: offset});
@@ -54,23 +108,30 @@ async function load() {
   }
   const rows = document.getElementById("rows");
   rows.replaceChildren();
-  for (const rec of data.records) {
-    const tr = document.createElement("tr");
-    const id = v(rec, "$id");
-    const link = document.createElement("a");
-    link.href = "/app/case?id=" + encodeURIComponent(id);
-    link.textContent = id;
-    const cells = [link, v(rec, "顧客名"), v(rec, "status"),
-                   v(rec, "問い合わせ業者名"), v(rec, "更新日時")];
-    for (const c of cells) {
-      const td = document.createElement("td");
-      if (c instanceof Node) { td.appendChild(c); } else { td.textContent = c; }
-      tr.appendChild(td);
-    }
-    rows.appendChild(tr);
+  if (!data.records.length) {
+    rows.appendChild(el("p", "empty", "該当する案件はありません"));
   }
-  document.getElementById("page").textContent =
-    `offset ${offset}（${data.records.length}件表示）`;
+  for (const rec of data.records) {
+    const id = v(rec, "$id");
+    const card = el("a", "case-card");
+    card.href = "/app/case?id=" + encodeURIComponent(id);
+    const name = el("div", "name");
+    name.appendChild(disp(v(rec, "顧客名")));
+    card.appendChild(name);
+    const line2 = el("div", "line2");
+    line2.appendChild(el("span", "badge", v(rec, "status") || "状態未設定"));
+    const gyosha = el("span", "");
+    gyosha.appendChild(disp(v(rec, "問い合わせ業者名")));
+    line2.appendChild(gyosha);
+    card.appendChild(line2);
+    card.appendChild(el("div", "meta",
+      "No." + id + "｜更新 " + fmtDate(v(rec, "更新日時"))));
+    rows.appendChild(card);
+  }
+  const from = offset + 1;
+  document.getElementById("page").textContent = data.records.length
+    ? `${from}〜${offset + data.records.length} 件目を表示`
+    : "";
   document.getElementById("prev").disabled = offset === 0;
   document.getElementById("next").disabled = data.records.length < limit;
 }
