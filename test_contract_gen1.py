@@ -241,6 +241,52 @@ class TestStateMachine(_WebhookBase):
         notify.assert_awaited_once()
         self.assertIn("自動では上書きせず", notify.await_args.args[0])
 
+    def test_claim_failures_not_silenced(self):
+        # fix2（CONTRACT-GEN-04）: 409 競合のみ cas_lost（200/作用0）。
+        # 5xx・transport_error・401/403 は HTTP 500 で kintone 再配送へ
+        # （cas_lost に変換して沈黙させない）
+        cases = {
+            "conflict_409": (KintoneError(409, "GAIA_CO02", "競合"),
+                             200, "cas_lost"),
+            "server_500": (KintoneError(500, "GAIA_XX01", "x"), 500, None),
+            "transport": (KintoneError(0, "transport_error", "x"), 500, None),
+            "auth_401": (KintoneError(401, "CB_AU01", "x"), 500, None),
+            "auth_403": (KintoneError(403, "GAIA_AP15", "x"), 500, None),
+        }
+        for label, (err, want_status, want_skip) in cases.items():
+            with self.subTest(case=label):
+                update = AsyncMock(side_effect=err)
+                r, upload, _u, _n, _g = self._post(
+                    record=_full_record(), update=update)
+                self.assertEqual(r.status_code, want_status)
+                if want_skip:
+                    self.assertEqual(r.json().get("skip"), want_skip)
+                upload.assert_not_awaited()      # いずれも生成/upload 0
+
+    def test_review_transition_only_conflict_is_cas_lost(self):
+        # fix2: 要確認への CAS でも 409 のみ cas_lost・障害系は 500
+        record = _full_record(契約書ステータス="契約書作成中")
+        record["委任契約書"] = {"value": [{"fileKey": "old-file"}]}
+        for err, want in ((KintoneError(409, "GAIA_CO02", "x"), 200),
+                          (KintoneError(500, "GAIA_XX01", "x"), 500),
+                          (KintoneError(0, "transport_error", "x"), 500)):
+            with self.subTest(status=err.status):
+                update = AsyncMock(side_effect=err)
+                r, upload, _u, notify, _g = self._post(
+                    record=record, update=update)
+                self.assertEqual(r.status_code, want)
+                upload.assert_not_awaited()
+                notify.assert_not_awaited()      # 遷移未成立時は通知しない
+
+    def test_recovery_claim_failure_not_silenced(self):
+        # fix2: 回収の再claim も同規則（500 系は HTTP 500）
+        record = _full_record(契約書ステータス="契約書作成中")
+        record["$revision"] = {"value": "7"}
+        update = AsyncMock(side_effect=KintoneError(503, "GAIA_XX02", "x"))
+        r, upload, _u, _n, _g = self._post(record=record, update=update)
+        self.assertEqual(r.status_code, 500)
+        upload.assert_not_awaited()
+
     def test_review_transition_cas_lost_no_notify(self):
         record = _full_record(契約書ステータス="契約書作成中")
         record["委任契約書"] = {"value": [{"fileKey": "old-file"}]}

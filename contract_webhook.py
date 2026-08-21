@@ -168,12 +168,21 @@ async def _generate_and_attach(record_id: str, record: dict,
 
 async def _claim(record_id: str, revision: str, to_status: str) -> str | None:
     """CAS: $revision 一致時のみステータス遷移。勝者は次 revision（claim+1）を
-    返す・敗者（競合 409 等）は None。"""
+    返す。
+
+    fix2（CONTRACT-GEN-04）: cas_lost（None・HTTP 200）に落とすのは
+    **revision 競合（409）のみ**。通信障害（transport_error）・認証障害
+    （401/403）・5xx 等それ以外の KintoneError は再送出し、外側の except が
+    HTTP 500 へ落として kintone Webhook の再配送に委ねる（沈黙させない）。
+    本関数は「作成→作成中」claim・「作成中」再claim・「要確認」遷移の
+    3 箇所すべてで共用される単一の正。"""
     try:
         await hub_kintone.update_record(
             _APP, record_id, {FIELD_STATUS: to_status}, revision=revision)
-    except hub_kintone.KintoneError:
-        return None
+    except hub_kintone.KintoneError as e:
+        if getattr(e, "status", None) == 409:
+            return None                  # CAS 敗者（競合）のみ 200/作用 0
+        raise                            # 障害系は外側で 500 → 再配送へ
     return str(int(revision) + 1)
 
 
