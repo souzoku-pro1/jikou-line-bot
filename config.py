@@ -77,6 +77,17 @@ EXPECTED_KINTONE_SCHEMA = {
             "電話番号": {"type": "SINGLE_LINE_TEXT"},
             "メールアドレス": {"type": "SINGLE_LINE_TEXT"},
             "cloudsign_document_id": {"type": "SINGLE_LINE_TEXT"},
+            # ── CONTRACT-GEN-1: 委任契約書生成（contract_webhook.py が読む/書く）
+            # CU（大野）でのフィールド追加が前提——追加までは daily_healthcheck
+            # が App21 の不足として日次警告する（[人]手順を参照）
+            "対象債権者2": {"type": "SINGLE_LINE_TEXT"},
+            "対象債権者3": {"type": "SINGLE_LINE_TEXT"},
+            "契約書ステータス": {
+                "type": "DROP_DOWN",
+                # 書き: contract_webhook（作成済へ）／トリガ読み: 契約書作成
+                "required_options": ["契約書作成", "契約書作成済"],
+            },
+            "委任契約書": {"type": "FILE"},
         },
     },
     "App 28 (チャットログ)": {
@@ -683,6 +694,13 @@ EXPECTED_DOCX_TEMPLATES = {
     # document_webhook.py（送付状生成）が差し込む4キー（2026-07-03 実テンプレートで確認）
     "docx_templates/送付状_委任契約書.docx": [
         "{{日付}}", "{{依頼者住所}}", "{{依頼者氏名}}", "{{被相続人名}}",
+    ],
+    # contract_webhook.py（CONTRACT-GEN-1 委任契約書生成）が差し込む7キー
+    # （2026-08-22 実テンプレートで確認。{{依頼者氏名}} は本文中 2 箇所）
+    "docx_templates/jikou/委任契約書.docx": [
+        "{{依頼者氏名}}", "{{依頼者住所}}",
+        "{{対象債権者1}}", "{{対象債権者2}}", "{{対象債権者3}}",
+        "{{契約年}}", "{{契約月}}", "{{契約日}}",
     ],
     # channels/soufu_annai.py（M4 送付案内）が差し込むキー（事務所正式書式・2026-07-03 差替）
     "docx_templates/jikou/送付案内.docx": [
