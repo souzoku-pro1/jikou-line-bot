@@ -84,8 +84,10 @@ EXPECTED_KINTONE_SCHEMA = {
             "対象債権者3": {"type": "SINGLE_LINE_TEXT"},
             "契約書ステータス": {
                 "type": "DROP_DOWN",
-                # 書き: contract_webhook（作成済へ）／トリガ読み: 契約書作成
-                "required_options": ["契約書作成", "契約書作成済"],
+                # fix1[02] CAS 状態機械の閉集合 4 値。トリガ読み: 契約書作成／
+                # 書き: contract_webhook（作成中・作成済・要確認）
+                "required_options": ["契約書作成", "契約書作成中",
+                                     "契約書作成済", "要確認"],
             },
             "委任契約書": {"type": "FILE"},
         },
@@ -695,8 +697,9 @@ EXPECTED_DOCX_TEMPLATES = {
     "docx_templates/送付状_委任契約書.docx": [
         "{{日付}}", "{{依頼者住所}}", "{{依頼者氏名}}", "{{被相続人名}}",
     ],
-    # contract_webhook.py（CONTRACT-GEN-1 委任契約書生成）が差し込む7キー
-    # （2026-08-22 実テンプレートで確認。{{依頼者氏名}} は本文中 2 箇所）
+    # contract_webhook.py（CONTRACT-GEN-1 委任契約書生成）が差し込む8キー
+    # （一意プレースホルダ数・2026-08-22 実テンプレートで確認。
+    # {{依頼者氏名}} は本文中 2 箇所）
     "docx_templates/jikou/委任契約書.docx": [
         "{{依頼者氏名}}", "{{依頼者住所}}",
         "{{対象債権者1}}", "{{対象債権者2}}", "{{対象債権者3}}",
