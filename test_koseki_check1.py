@@ -58,9 +58,23 @@ def _heir(rid, name):
     return {"$id": {"value": rid}, "氏名": {"value": name}}
 
 
-def _check(kosekis, persons, heirs, case="3"):
+def _paged_search(kosekis):
+    """fix1(05) の $id カーソル取得を再現する App33 検索 mock。"""
+    import re as _re
+
+    async def search(app, query, fields=None):
+        m = _re.search(r"\$id > (\d+)", query)
+        cursor = int(m.group(1)) if m else 0
+        rows = [r for r in kosekis
+                if str((r.get("$id") or {}).get("value") or "").isdigit()
+                and int(r["$id"]["value"]) > cursor]
+        return rows[:koseki_coverage._PAGE_LIMIT]
+    return search
+
+
+def _check(kosekis, persons, heirs, case="3", raw_search=None):
     with patch.object(koseki_coverage.kintone, "search_records",
-                      AsyncMock(return_value=kosekis)), \
+                      new=(raw_search or _paged_search(kosekis))), \
          patch.object(koseki_coverage.souzoku_dash, "_load_persons",
                       AsyncMock(return_value={"records": persons,
                                               "excluded_merged_count": 0})), \
@@ -132,7 +146,8 @@ class TestInsufficiency(unittest.TestCase):
         self.assertFalse(result["decedent"]["registered"])
 
     def test_undated_koseki_listed_not_asserted_as_gap(self):
-        # 西暦変換不能（編製日空）は「不足」と断定せず判定不能として列挙
+        # 西暦変換不能（編製日空）は「不足」と断定せず判定不能として列挙。
+        # fix1(01) 裁定由来: status も insufficient へ固定（gaps 非返却）
         result = _check(
             [_koseki("31", "改製原（昭和）", "", "", ["熊澤太郎"]),
              _koseki("32", "現行", "1975-01-01", "", ["熊澤太郎"])],
@@ -141,6 +156,7 @@ class TestInsufficiency(unittest.TestCase):
                       result["chain"]["insufficient_reasons"])
         self.assertEqual(result["chain"]["undated_koseki_ids"], ["31"])
         self.assertEqual(result["chain"]["gaps"], [])
+        self.assertEqual(result["chain"]["status"], "insufficient")
 
     def test_no_kosekis_for_decedent(self):
         result = _check(
@@ -182,6 +198,118 @@ class TestHeirs(unittest.TestCase):
         self.assertEqual(result["heirs"]["status"], "insufficient")
         self.assertEqual(result["heirs"]["insufficient_reasons"],
                          ["heirs_unregistered"])
+
+
+# ── KOSEKI-CHECK-1-fix1: fail-closed の完成（Codex 指定 negative） ───────────
+class TestFailClosedFix1(unittest.TestCase):
+    def test_undated_koseki_could_fill_known_gap(self):
+        # (1) 編製日不明の戸籍が既知 gap（1960〜1980）を埋め得る形——gap を
+        # 断定せず chain 全体を insufficient に（fix1(01)）
+        result = _check(
+            [_koseki("31", "除籍", "1950-01-01", "1960-01-01", ["熊澤太郎"]),
+             _koseki("32", "現行", "1980-01-01", "", ["熊澤太郎"]),
+             _koseki("33", "改製原（昭和）", "", "", ["熊澤太郎"])],
+            DEC, [_heir("201", "熊澤花子")])
+        self.assertEqual(result["chain"]["status"], "insufficient")
+        self.assertEqual(result["chain"]["gaps"], [])   # 1960-1980 を断定しない
+        self.assertIn("unparseable_dates",
+                      result["chain"]["insufficient_reasons"])
+
+    def test_invalid_nonempty_shojo_blocks_judgment(self):
+        # (2)(3) fix1(02): 非空だが解釈不能な消除日=判定不能（後続 gap を隠す
+        # 形でも断定しない）
+        result = _check(
+            [_koseki("31", "除籍", "1950-01-01", "9999-99-99", ["熊澤太郎"]),
+             _koseki("32", "現行", "1980-01-01", "", ["熊澤太郎"])],
+            DEC, [_heir("201", "熊澤花子")])
+        self.assertEqual(result["chain"]["status"], "insufficient")
+        self.assertIn("unparseable_dates",
+                      result["chain"]["insufficient_reasons"])
+        self.assertEqual(result["chain"]["undated_koseki_ids"], ["31"])
+        self.assertEqual(result["chain"]["gaps"], [])
+
+    def test_inverted_interval_blocks_judgment(self):
+        # (4) fix1(02): 消除日<編製日 の逆転区間=判定不能
+        result = _check(
+            [_koseki("31", "除籍", "1970-01-01", "1950-01-01", ["熊澤太郎"]),
+             _koseki("32", "現行", "1980-01-01", "", ["熊澤太郎"])],
+            DEC, [_heir("201", "熊澤花子")])
+        self.assertEqual(result["chain"]["status"], "insufficient")
+        self.assertIn("inverted_interval",
+                      result["chain"]["insufficient_reasons"])
+        self.assertEqual(result["chain"]["gaps"], [])
+
+    def test_shubetsu_unset_makes_heirs_insufficient_not_missing(self):
+        # (5) fix1(01): 種別未設定行があるとき「現在戸籍なし」と断定しない
+        result = _check(
+            [_koseki("31", "", "1999-01-01", "", ["熊澤花子"])],
+            DEC, [_heir("201", "熊澤花子")])
+        self.assertEqual(result["heirs"]["status"], "insufficient")
+        self.assertIn("shubetsu_unset",
+                      result["heirs"]["insufficient_reasons"])
+        self.assertIsNone(result["heirs"]["rows"][0]["has_current_koseki"])
+
+    def test_multiple_decedent_flags_ambiguous(self):
+        # (6) fix1(04): フラグ=yes が 2 件以上 → decedent_ambiguous（先頭採用
+        # の廃止）
+        result = _check(
+            [_koseki("31", "除籍", "1950-01-01", "1970-01-01", ["熊澤太郎"])],
+            [_person("1", "熊澤太郎", decedent=True),
+             _person("2", "熊澤次郎", decedent=True)],
+            [_heir("201", "熊澤花子")])
+        self.assertEqual(result["chain"]["status"], "insufficient")
+        self.assertIn("decedent_ambiguous",
+                      result["chain"]["insufficient_reasons"])
+        self.assertFalse(result["decedent"]["registered"])
+
+    def test_normalized_name_collision_ambiguous(self):
+        # (7) fix1(04): 正規化後同名の別 App34 人物がいる場合も名寄せ不能
+        result = _check(
+            [_koseki("31", "除籍", "1950-01-01", "1970-01-01", ["熊澤太郎"])],
+            [_person("1", "熊澤太郎", decedent=True),
+             _person("2", "熊澤　太郎", decedent=False)],   # 空白差=正規化後同名
+            [_heir("201", "熊澤花子")])
+        self.assertEqual(result["chain"]["status"], "insufficient")
+        self.assertIn("decedent_ambiguous",
+                      result["chain"]["insufficient_reasons"])
+
+    def test_pagination_over_100_fetches_all(self):
+        # (9) fix1(05): 101 件以上でも $id カーソルで全件取得（正常系）
+        kosekis = [_koseki(str(i), "除籍", "1950-01-01", "1960-01-01",
+                           ["熊澤太郎"]) for i in range(1, 121)]
+        kosekis[-1] = _koseki("120", "現行", "1960-01-02", "", ["熊澤太郎"])
+        result = _check(kosekis, DEC, [_heir("201", "熊澤花子")])
+        self.assertEqual(len(result["chain"]["kosekis"]), 120)
+        self.assertNotIn("fetch_incomplete",
+                         result["chain"]["insufficient_reasons"])
+
+    def test_page_cap_fails_closed(self):
+        # (9) fix1(05): ページ上限到達=完全性保証なし → 両判定面 insufficient
+        kosekis = [_koseki(str(i), "除籍", "1950-01-01", "1960-01-01",
+                           ["熊澤太郎"]) for i in range(1, 121)]
+        with patch.object(koseki_coverage, "_MAX_PAGES", 1):
+            result = _check(kosekis, DEC, [_heir("201", "熊澤花子")])
+        self.assertEqual(result["chain"]["status"], "insufficient")
+        self.assertEqual(result["heirs"]["status"], "insufficient")
+        self.assertIn("fetch_incomplete",
+                      result["chain"]["insufficient_reasons"])
+        self.assertIn("fetch_incomplete",
+                      result["heirs"]["insufficient_reasons"])
+        self.assertEqual(result["chain"]["gaps"], [])
+        self.assertIsNone(result["heirs"]["rows"][0]["has_current_koseki"])
+
+    def test_cursor_violation_fails_closed(self):
+        # (9) fix1(05): 重複/逆行 $id は fail-closed（部分データで判定しない）
+        async def broken_search(app, query, fields=None):
+            return [_koseki("5", "現行", "1999-01-01", "", ["熊澤花子"]),
+                    _koseki("5", "現行", "1999-01-01", "", ["熊澤花子"])]
+
+        result = _check([], DEC, [_heir("201", "熊澤花子")],
+                        raw_search=broken_search)
+        self.assertIn("fetch_incomplete",
+                      result["chain"]["insufficient_reasons"])
+        self.assertEqual(result["chain"]["status"], "insufficient")
+        self.assertEqual(result["heirs"]["status"], "insufficient")
 
 
 class TestOutputGrammar(unittest.TestCase):
@@ -227,6 +355,7 @@ class TestQIntegration(unittest.TestCase):
         return {
             "case_record_id": "3", "estimate": True,
             "decedent": {"registered": True, "birth_seireki": None},
+            "persons_consulted": ["1"],
             "chain": {"status": "ok",
                       "kosekis": [{"record_id": "31", "shubetsu": "現行",
                                    "hensei": "2002-01-01", "shojo": None,
@@ -235,7 +364,7 @@ class TestQIntegration(unittest.TestCase):
                                        "1AbC-dEfG_hIjKlMnOpQrStUv"}],
                       "gaps": [], "undated_koseki_ids": [],
                       "insufficient_reasons": ["decedent_birth_unknown"]},
-            "heirs": {"status": "insufficient", "rows": [
+            "heirs": {"status": "missing_found", "rows": [
                 {"record_id": "201", "name": "熊澤花子",
                  "has_current_koseki": False}],
                 "insufficient_reasons": []},
@@ -257,7 +386,9 @@ class TestQIntegration(unittest.TestCase):
                 "check_koseki_coverage", {"case_record_id": "3"}, ctx))
         self.assertFalse(is_error)
         keys = [(s["app"], s["record_id"]) for s in ctx["sources"]]
+        # fix1(03): 被相続人同定に読んだ App34 行も出典に記録
         self.assertEqual(keys, [("App33(戸籍読解)", "31"),
+                                ("App34(人物)", "1"),
                                 ("App36(相続人)", "201")])
         # App33 出典は原本 PDF リンクつき（grammar 検証済み Drive id のみ）
         self.assertEqual(
@@ -304,7 +435,8 @@ class TestQIntegration(unittest.TestCase):
                       result["notes"])
         self.assertIn(wq.FLAG_NOTES["koseki_reading"], result["notes"])
         apps = {s["app"] for s in result["sources"]}
-        self.assertEqual(apps, {"App33(戸籍読解)", "App36(相続人)"})
+        self.assertEqual(apps, {"App33(戸籍読解)", "App34(人物)",
+                                "App36(相続人)"})
 
 
 if __name__ == "__main__":

@@ -414,6 +414,10 @@ async def _t_check_koseki_coverage(args: dict, ctx: dict):
                        row["record_id"],
                        pdf_url=config.drive_pdf_view_url(
                            row.get("drive_file_id") or ""))
+    # KOSEKI-CHECK-1-fix1(03): 被相続人同定に読んだ App34 行も出典に記録
+    for pid in result.get("persons_consulted") or []:
+        _record_source(ctx, "App34(人物)",
+                       souzoku_dash.APP_KOSEKI_PERSON.app_id(), pid)
     for h in result["heirs"]["rows"]:
         _record_source(ctx, "App36(相続人)",
                        souzoku_dash.APP_SOUZOKUNIN.app_id(), h["record_id"])
