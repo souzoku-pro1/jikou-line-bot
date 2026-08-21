@@ -312,6 +312,77 @@ class TestFailClosedFix1(unittest.TestCase):
         self.assertEqual(result["heirs"]["status"], "insufficient")
 
 
+# ── KOSEKI-CHECK-1-fix2: 残所見 3 件（同定の数え方・破損行・氏名欠損） ───────
+class TestFailClosedFix2(unittest.TestCase):
+    def test_two_flags_one_nameless_still_ambiguous(self):
+        # fix2(06): 氏名の有無で絞る前に数える——フラグ yes 2 行（片方氏名空）
+        # は「1 件」に化けず ambiguous
+        result = _check(
+            [_koseki("31", "除籍", "1950-01-01", "1970-01-01", ["熊澤太郎"])],
+            [_person("1", "熊澤太郎", decedent=True),
+             _person("2", "", decedent=True)],
+            [_heir("201", "熊澤花子")])
+        self.assertEqual(result["chain"]["status"], "insufficient")
+        self.assertIn("decedent_ambiguous",
+                      result["chain"]["insufficient_reasons"])
+
+    def test_single_flag_whitespace_name_insufficient(self):
+        # fix2(06): フラグ yes 1 行で氏名が全角空白のみ → decedent_unknown
+        result = _check(
+            [_koseki("31", "除籍", "1950-01-01", "1970-01-01", ["熊澤太郎"])],
+            [_person("1", "　　", decedent=True)],
+            [_heir("201", "熊澤花子")])
+        self.assertEqual(result["chain"]["status"], "insufficient")
+        self.assertIn("decedent_unknown",
+                      result["chain"]["insufficient_reasons"])
+        self.assertFalse(result["decedent"]["registered"])
+
+    def _broken_row(self, rid, raw):
+        return {"$id": {"value": rid}, "戸籍種別": {"value": "除籍"},
+                "編製日": {"value": "1965-01-01"},
+                "消除日": {"value": "1975-01-01"},
+                "読解JSON": {"value": raw}, "Drive_fileId": {"value": ""}}
+
+    def test_broken_reading_blocks_both_faces(self):
+        # fix2(07): 既知の 2 区間（1950-1960 / 1980-）の間を覆い得る破損行が
+        # あるとき gap を断定しない・heirs も insufficient（現在戸籍を含み得る）
+        for raw in ("{{broken", "[1, 2]",
+                    '{"人物": "壊れ"}', '{"人物": [1]}', '{"戸籍": []}'):
+            with self.subTest(raw=raw):
+                result = _check(
+                    [_koseki("31", "除籍", "1950-01-01", "1960-01-01",
+                             ["熊澤太郎"]),
+                     _koseki("32", "現行", "1980-01-01", "", ["熊澤太郎"]),
+                     self._broken_row("33", raw)],
+                    DEC, [_heir("201", "熊澤花子")])
+                self.assertEqual(result["chain"]["status"], "insufficient")
+                self.assertEqual(result["chain"]["gaps"], [])
+                self.assertIn("reading_unparseable",
+                              result["chain"]["insufficient_reasons"])
+                self.assertEqual(result["unparseable_reading_ids"], ["33"])
+                self.assertEqual(result["heirs"]["status"], "insufficient")
+                self.assertIn("reading_unparseable",
+                              result["heirs"]["insufficient_reasons"])
+                self.assertIsNone(
+                    result["heirs"]["rows"][0]["has_current_koseki"])
+                # OCR 本文・破損 raw を出力に含めない
+                self.assertNotIn("壊れ", json.dumps(result,
+                                                    ensure_ascii=False))
+
+    def test_heir_name_empty_not_converted_to_missing(self):
+        # fix2(08): 対象人物名が空の有効行 → missing_found に変換せず
+        # insufficient・has_current_koseki=null
+        result = _check(
+            [_koseki("33", "現行", "1999-01-01", "", ["熊澤花子"])],
+            DEC, [_heir("201", "熊澤花子"), _heir("202", "")])
+        self.assertEqual(result["heirs"]["status"], "insufficient")
+        self.assertIn("heir_name_unparseable",
+                      result["heirs"]["insufficient_reasons"])
+        for row in result["heirs"]["rows"]:
+            self.assertIsNone(row["has_current_koseki"])
+        self.assertNotEqual(result["heirs"]["status"], "missing_found")
+
+
 class TestOutputGrammar(unittest.TestCase):
     def test_closed_sets_and_no_ocr_text(self):
         result = _check(

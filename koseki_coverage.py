@@ -51,6 +51,11 @@ has_current_koseki=null）。例外（裁定）: decedent_birth_unknown **のみ
 - heirs_unregistered:      App36 相続人行がない
 - fetch_incomplete:        fix1(05) App33 の全件取得が完了しなかった
                            （cap 到達・カーソル異常＝部分データで判定しない）
+- reading_unparseable:     fix2(07) 読解JSON が破損（parse 不能・構造不正）の
+                           行がある（unparseable_reading_ids に列挙・破損行は
+                           切れ目を埋め得る/現在戸籍を含み得るため両面 blocking）
+- heir_name_unparseable:   fix2(08) 有効な App36 行の対象人物名が空/正規化後空
+                           （判定不能を「不足」に変換しない）
 
 fix1(05) App33 取得: $id 厳密単調増加カーソルで全件取得（PWA-02 の確立
 パターン踏襲）。重複/逆行/非数字・ページ上限到達は fail-closed。
@@ -71,7 +76,10 @@ INSUFFICIENT_REASONS = ("no_kosekis", "decedent_unknown",
                         "decedent_ambiguous", "decedent_birth_unknown",
                         "unparseable_dates", "inverted_interval",
                         "shubetsu_unset", "heirs_unregistered",
-                        "fetch_incomplete")
+                        "fetch_incomplete",
+                        # fix2 で追加（閉集合の拡張）
+                        "reading_unparseable",     # fix2(07) 読解JSON 破損行あり
+                        "heir_name_unparseable")   # fix2(08) App36 氏名が空/空白
 CHAIN_STATUSES = ("ok", "gaps_found", "insufficient")
 HEIRS_STATUSES = ("ok", "missing_found", "insufficient")
 # fix1(01): birth 不明**のみ**は between 判定を続行できる（裁定）。それ以外は
@@ -128,6 +136,29 @@ async def _fetch_all_kosekis(rid: str):
     return out, False                        # ページ上限到達 = 完全性保証なし
 
 
+def _parse_reading(raw: str):
+    """fix2(07): 読解JSON の構造検証つき parse。Returns (reading, ok)。
+    parse 不能・dict 以外・人物が list 以外/非 dict 要素あり・戸籍が dict 以外
+    は ok=False（破損行＝切れ目を埋め得る・現在戸籍を含み得るため、呼び出し側
+    が reading_unparseable として両判定面を insufficient に倒す）。
+    OCR 本文は返さない（呼び出し側は名前・日付の抽出にのみ使う）。"""
+    try:
+        parsed = json.loads(raw or "{}")
+    except json.JSONDecodeError:
+        return {}, False
+    if not isinstance(parsed, dict):
+        return {}, False
+    jinbutsu = parsed.get("人物")
+    if jinbutsu is not None and (
+            not isinstance(jinbutsu, list)
+            or any(not isinstance(p, dict) for p in jinbutsu)):
+        return {}, False
+    koseki = parsed.get("戸籍")
+    if koseki is not None and not isinstance(koseki, dict):
+        return {}, False
+    return parsed, True
+
+
 def _names_in_reading(reading: dict) -> set:
     names = set()
     if not isinstance(reading, dict):
@@ -154,20 +185,26 @@ def _birth_of(reading: dict, name_norm: str):
 
 
 def _identify_decedent(person_rows: list):
-    """fix1(04): 被相続人同定の fail-closed。
+    """fix1(04)→fix2(06): 被相続人同定の fail-closed。
     Returns (decedent_norm, reason|None)。
-    - フラグ=yes（氏名あり）0 件 → ("", "decedent_unknown")
-    - 2 件以上 → ("", "decedent_ambiguous")
-    - 1 件でも、正規化後同名の**別の**App34 人物が存在すれば名寄せ不能
-      → ("", "decedent_ambiguous")（先頭採用はしない）"""
-    candidates = [p for p in person_rows
-                  if _v(p, "被相続人フラグ") == "yes" and _v(p, "氏名")]
-    if not candidates:
+    - フラグ=yes の**全行**（氏名の有無で絞らない）が 0 件 → decedent_unknown
+      ／2 件以上 → decedent_ambiguous
+    - 1 件のみのとき、正規化後の氏名が空 → decedent_unknown
+    - 正規化後同名の**別の**App34 人物が存在すれば decedent_ambiguous
+      （先頭採用はしない）"""
+    # fix2(06): **氏名の有無で絞る前に**フラグ=yes の全行を数える——
+    # 0 件=decedent_unknown／2 件以上=decedent_ambiguous を確定。1 件の場合に
+    # 限り、正規化（NFKC・空白除去）後の氏名が空なら decedent_unknown
+    # （名前で戸籍と照合できない＝同定不能・閉集合の既存理由を使用）
+    flagged = [p for p in person_rows if _v(p, "被相続人フラグ") == "yes"]
+    if not flagged:
         return "", "decedent_unknown"
-    if len(candidates) > 1:
+    if len(flagged) > 1:
         return "", "decedent_ambiguous"
-    decedent = candidates[0]
+    decedent = flagged[0]
     dec_norm = _norm(_v(decedent, "氏名"))
+    if not dec_norm:
+        return "", "decedent_unknown"
     dec_id = _v(decedent, "$id")
     for p in person_rows:
         if _v(p, "$id") != dec_id and _norm(_v(p, "氏名")) == dec_norm:
@@ -187,15 +224,17 @@ async def check_coverage(case_record_id: str) -> dict:
 
     rows = []
     undated_decedent_ids = []
+    unparseable_reading_ids = []
     inverted = False
     shubetsu_unset = False
     decedent_birth = None
     intervals = []
     for rec in kosekis:
-        try:
-            reading = json.loads(_v(rec, "読解JSON") or "{}")
-        except json.JSONDecodeError:
-            reading = {}
+        # fix2(07): 破損行は reading_unparseable として記録（$id 列挙）——
+        # 破損行が切れ目を埋め得る・現在戸籍を含み得るため両判定面を塞ぐ
+        reading, reading_ok = _parse_reading(_v(rec, "読解JSON"))
+        if not reading_ok:
+            unparseable_reading_ids.append(_v(rec, "$id"))
         names = _names_in_reading(reading)
         belongs = bool(decedent_norm) and decedent_norm in names
         shubetsu = _v(rec, "戸籍種別")
@@ -235,6 +274,8 @@ async def check_coverage(case_record_id: str) -> dict:
         chain_reasons.append("no_kosekis")
     if undated_decedent_ids:
         chain_reasons.append("unparseable_dates")
+    if unparseable_reading_ids:
+        chain_reasons.append("reading_unparseable")     # fix2(07)
     if inverted:
         chain_reasons.append("inverted_interval")
     if shubetsu_unset:
@@ -275,11 +316,18 @@ async def check_coverage(case_record_id: str) -> dict:
         heirs_reasons.append("fetch_incomplete")
     if shubetsu_unset:
         heirs_reasons.append("shubetsu_unset")
+    if unparseable_reading_ids:
+        heirs_reasons.append("reading_unparseable")     # fix2(07) 現在戸籍を含み得る
     heirs_data = await souzoku_dash._load_heirs(rid)
+    heir_records = heirs_data.get("records") or []
+    # fix2(08): 有効行の対象人物名が空/正規化後空なら判定不能（「不足」に
+    # 変換しない）——face 全体を insufficient・has_current_koseki=null
+    if any(not _norm(_v(h, "氏名")) for h in heir_records):
+        heirs_reasons.append("heir_name_unparseable")
     heirs_blocked = bool(heirs_reasons)
     heir_rows = []
     missing = False
-    for h in heirs_data.get("records") or []:
+    for h in heir_records:
         name_norm = _norm(_v(h, "氏名"))
         if heirs_blocked:
             has_current = None               # 断定しない（判定不能）
@@ -311,6 +359,7 @@ async def check_coverage(case_record_id: str) -> dict:
                      "birth_seireki": (decedent_birth.isoformat()
                                        if decedent_birth else None)},
         "persons_consulted": persons_consulted,
+        "unparseable_reading_ids": unparseable_reading_ids,   # fix2(07)
         "chain": {"status": chain_status, "kosekis": rows, "gaps": gaps,
                   "undated_koseki_ids": undated_decedent_ids,
                   "insufficient_reasons": chain_reasons},
