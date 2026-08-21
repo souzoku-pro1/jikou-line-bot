@@ -369,6 +369,46 @@ class TestFailClosedFix2(unittest.TestCase):
                 self.assertNotIn("壊れ", json.dumps(result,
                                                     ensure_ascii=False))
 
+    def test_nameless_reading_blocks_both_faces(self):
+        # fix3(09): 名前情報の無い読解JSON 6 形（型は正しくても帰属不能）を
+        # 既知の 2 区間の間を覆い得る行として配置——「無関係な戸籍」として
+        # 黙って除外されず reading_unparseable で両判定面を塞ぐ
+        raws = ("", "{}", '{"戸籍": {}}', '{"人物": []}', '{"人物": [{}]}',
+                '{"人物": [{"氏名": "　"}]}')
+        for raw in raws:
+            with self.subTest(raw=raw):
+                result = _check(
+                    [_koseki("31", "除籍", "1950-01-01", "1960-01-01",
+                             ["熊澤太郎"]),
+                     _koseki("32", "現行", "1980-01-01", "", ["熊澤太郎"]),
+                     self._broken_row("33", raw)],
+                    DEC, [_heir("201", "熊澤花子")])
+                self.assertIn("reading_unparseable",
+                              result["chain"]["insufficient_reasons"])
+                self.assertEqual(result["unparseable_reading_ids"], ["33"])
+                self.assertEqual(result["chain"]["status"], "insufficient")
+                self.assertEqual(result["chain"]["gaps"], [])
+                self.assertEqual(result["heirs"]["status"], "insufficient")
+                self.assertIsNone(
+                    result["heirs"]["rows"][0]["has_current_koseki"])
+                dumped = json.dumps(result, ensure_ascii=False)
+                self.assertNotIn("ocr_text", dumped)      # OCR 本文非出力
+                if len(raw) > 4:
+                    self.assertNotIn(raw, dumped)          # raw 非出力
+
+    def test_hittousha_only_reading_still_valid(self):
+        # fix3 回帰なし: 人物キーが無くても筆頭者があれば帰属有効（既存仕様）
+        rec = {"$id": {"value": "31"}, "戸籍種別": {"value": "除籍"},
+               "編製日": {"value": "1950-01-01"},
+               "消除日": {"value": "1970-01-01"},
+               "読解JSON": {"value": '{"戸籍": {"筆頭者": "熊澤太郎"}}'},
+               "Drive_fileId": {"value": ""}}
+        result = _check([rec], DEC, [_heir("201", "熊澤花子")])
+        self.assertNotIn("reading_unparseable",
+                         result["chain"]["insufficient_reasons"])
+        self.assertTrue(
+            result["chain"]["kosekis"][0]["belongs_to_decedent"])
+
     def test_heir_name_empty_not_converted_to_missing(self):
         # fix2(08): 対象人物名が空の有効行 → missing_found に変換せず
         # insufficient・has_current_koseki=null

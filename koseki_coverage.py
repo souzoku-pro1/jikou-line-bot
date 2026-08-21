@@ -156,6 +156,16 @@ def _parse_reading(raw: str):
     koseki = parsed.get("戸籍")
     if koseki is not None and not isinstance(koseki, dict):
         return {}, False
+    # fix3(09): 帰属判定に利用できる名前情報の必須化——戸籍.筆頭者が正規化後
+    # 非空、または 氏名が正規化後非空の人物 dict が 1 件以上。どちらも無い行
+    # （raw=""/{}/{"戸籍":{}}/{"人物":[]}/{"人物":[{}]}/氏名が空白のみ等）は
+    # 帰属不能＝「無関係な戸籍」として黙って除外される経路を塞ぐ
+    # （人物キーは必須としない＝筆頭者のみでの帰属は既存仕様どおり有効）
+    hitto = _norm(koseki.get("筆頭者")) if isinstance(koseki, dict) else ""
+    person_named = any(isinstance(p, dict) and _norm(p.get("氏名"))
+                      for p in (jinbutsu or []))
+    if not hitto and not person_named:
+        return {}, False
     return parsed, True
 
 
