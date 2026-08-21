@@ -119,6 +119,7 @@ FLAG_NOTES = {
     "ocr_numbers": "OCR（印字読取）由来の数値を含みます——正確な数値は原本の確認を推奨します",
     "koseki_reading": "戸籍読解（手書き・旧字を含み得る）由来の情報です——低確信度のため原本 PDF の確認が必須です",
     "sources_truncated": "出典が多数のため一部のみ記録しています",
+    "koseki_coverage_estimate": "戸籍不足チェックは機械的な参考見立てです——不足の確定は原本・戸籍全体のご確認によります（機械は確定しません）",
 }
 
 # Q-QUALITY-1(D): 出典 app ラベルの閉集合——サーバ実測記録（_record_source の
@@ -397,6 +398,31 @@ async def _t_list_case_chats(args: dict, ctx: dict):
     return {"records": chats}
 
 
+async def _t_check_koseki_coverage(args: dict, ctx: dict):
+    """KOSEKI-CHECK-1: 戸籍不足チェック（決定的検査は koseki_coverage が実施・
+    本 handler は出典の実測記録と注記 flag のみ）。出典=検査に使った実レコード
+    （App33 全行＋App36 相続人行）。モデルの役割は結果の平易な説明のみで、
+    不足の確定はしない（koseki_coverage_estimate の定型注記が必ず付く）。"""
+    rid = str(args.get("case_record_id") or "")
+    if not _RECORD_ID_RE.fullmatch(rid):
+        return None
+    import koseki_coverage
+    from kinship_graph import APP_KOSEKI_BOOK
+    result = await koseki_coverage.check_coverage(rid)
+    for row in result["chain"]["kosekis"]:
+        _record_source(ctx, "App33(戸籍読解)", APP_KOSEKI_BOOK.app_id(),
+                       row["record_id"],
+                       pdf_url=config.drive_pdf_view_url(
+                           row.get("drive_file_id") or ""))
+    for h in result["heirs"]["rows"]:
+        _record_source(ctx, "App36(相続人)",
+                       souzoku_dash.APP_SOUZOKUNIN.app_id(), h["record_id"])
+    if result["chain"]["kosekis"]:
+        ctx["flags"].add("koseki_reading")
+    ctx["flags"].add("koseki_coverage_estimate")
+    return result
+
+
 def _case_id_schema(field: str = "case_record_id") -> dict:
     return {"type": "object",
             "properties": {field: {
@@ -449,6 +475,12 @@ _TOOLS = [
      "description": "時効援用案件の LINE 会話ログ（App28）を新しい順に最大30件"
                     "返す。",
      "input_schema": _case_id_schema("jikou_case_record_id")},
+    {"name": "check_koseki_coverage",
+     "description": "戸籍不足チェック（参考見立て・KOSEKI-CHECK-1）: 被相続人の"
+                    "出生〜死亡の戸籍連続性の切れ目と、相続人ごとの現在戸籍の"
+                    "有無を機械判定して返す。判定不能は理由つきで区別される"
+                    "（不足の確定はしない）。",
+     "input_schema": _case_id_schema()},
 ]
 
 # Q-02(ii): 最終回答は submit_answer の構造化出力のみで受け付ける（本文 text
@@ -500,6 +532,7 @@ _DISPATCH = {
     "list_jikou_cases": _t_list_jikou_cases,
     "get_jikou_case": _t_get_jikou_case,
     "list_case_chats": _t_list_case_chats,
+    "check_koseki_coverage": _t_check_koseki_coverage,
 }
 
 
