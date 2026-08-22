@@ -333,6 +333,19 @@ LINEで承っております。
 }
 [/KINTONE_UPDATE]"""
 
+# fix1[01]（R-AUTOREPLY-GEN2）: 長さ免除の対象=SYSTEM_PROMPT 内の確定定型
+# ブロック（罫線で区切られた逐語ブロック）。SYSTEM_PROMPT そのものから
+# 決定的に抽出してサーバ側で保持し（単一の正・二重管理なし）、免除は
+# reply_sanitizer.structure_violations の exempt_blocks（逐語一致した
+# ブロックを除いた自由文にのみ通常上限を適用）でだけ効く——罫線を混ぜた
+# だけの自由文は免除されない
+def _extract_template_blocks(prompt: str) -> tuple[str, ...]:
+    return tuple(re.findall("━{5,}\n.*?\n━{5,}", prompt, re.DOTALL))
+
+
+HEARING_TEMPLATE_BLOCKS = _extract_template_blocks(SYSTEM_PROMPT)
+
+
 # ユーザーIDごとの会話履歴を保持
 conversation_histories: dict[str, list] = {}
 
@@ -840,7 +853,8 @@ async def _process_line_event(reply_token: str, user_id: str, user_text: str) ->
         cleaned, _issues, _fatal = reply_sanitizer.sanitize_reply(
             claude_reply, allowed_emoji=ALLOWED_CANONICAL_EMOJI)
         violations = ((["プレースホルダ/内部マーカー残存"] if _fatal else [])
-                      + reply_sanitizer.structure_violations(cleaned))
+                      + reply_sanitizer.structure_violations(
+                          cleaned, exempt_blocks=HEARING_TEMPLATE_BLOCKS))
         history = conversation_histories.get(user_id, [])
         if violations:
             await save_to_approval_queue(
@@ -876,37 +890,130 @@ async def _process_line_event(reply_token: str, user_id: str, user_text: str) ->
                      emit(traceback.format_exc(), "vendor_raw", "log", "operator"))
 
 
-async def _process_line_image_event(reply_token: str, user_id: str) -> None:
-    """AUTOREPLY-GEN2 要件4: 画像メッセージへの固定受領応答。
+class ImageChatlogConfigError(RuntimeError):
+    """fix1[03]: 画像経路 strict writer の env 未設定（保存を確約できない
+    場合は顧客へ返信しない=fail-closed）。"""
 
-    AI に画像内容の判断はさせない（読解は別票）。応答は弁護士確定を経た
-    固定文言のみ+弁護士へ受領通知。pause → 停止リスト → 人対応 のゲート
-    順はテキストイベントと同一。画像バイナリは保存しない（App28 には
-    受信マーカーのみ）。"""
+
+_IMAGE_IDEM_PREFIX = "画像受領"
+
+
+def _image_idem_key(event_id: str) -> str:
+    return f"{_IMAGE_IDEM_PREFIX}:{event_id}"
+
+
+async def _image_already_handled(idem_key: str) -> bool:
+    """fix1[03]: 順次再配送の冪等 pre-check（App28 category 完全一致・
+    _paused_chatlog_already_saved と同型）。確認失敗は False（=続行）へ
+    倒してよい——返信の二重送出は下の strict 保存が防ぐ（保存できない
+    状況では返信しない）。"""
+    if not (_APP_CHATLOG_KT.app_id() and _APP_CHATLOG_KT.token()):
+        return False
+    try:
+        rows = await hub_kintone.search_records(
+            _APP_CHATLOG_KT,
+            f'category = "{idem_key}" order by $id asc limit 1',
+            fields=["$id"])
+    except Exception:
+        logger.info("[IMAGE] idempotency pre-check failed "
+                    "(strict save still guards)")
+        return False
+    return bool(rows)
+
+
+async def _save_image_inbound(user_id: str, idem_key: str) -> str:
+    """fix1[03]: 受信マーカーの strict 保存（冪等キー=category）。
+    失敗＝例外（返信・通知は行わない）。レコード ID を返す。"""
+    if not (_APP_CHATLOG_KT.app_id() and _APP_CHATLOG_KT.token()):
+        raise ImageChatlogConfigError(
+            f"{_APP_CHATLOG_KT.app_id_env}/{_APP_CHATLOG_KT.token_env} not set")
+    return await hub_kintone.create_record(_APP_CHATLOG_KT, {
+        "line_user_id": user_id,
+        "role": "user",
+        "message": IMAGE_INBOUND_MARKER,
+        "category": idem_key,
+        "auto_sent": "no",
+    })
+
+
+async def _image_claim_winner(idem_key: str, my_id: str) -> bool:
+    """fix1[03]: 並行 2 配送の勝者決定（同一冪等キー行の最小 $id が勝者）。
+    kintone に一意制約が無いため保存後の再照会で決定的に絞る。照会失敗は
+    True（単独配送が通常のため・報告済みの残余）。"""
+    try:
+        rows = await hub_kintone.search_records(
+            _APP_CHATLOG_KT,
+            f'category = "{idem_key}" order by $id asc limit 1',
+            fields=["$id"])
+    except Exception:
+        return True
+    if not rows:
+        return True
+    return str((rows[0].get("$id") or {}).get("value") or "") == str(my_id)
+
+
+async def _notify_image_failure() -> None:
+    """fix1[03]: 画像処理失敗の回収ハンドル（best-effort・固定文言のみ）。
+    LINE へは 200 応答済みで自動再配送が無いため、人の確認へ倒す。"""
+    try:
+        if ATTORNEY_LINE_USER_ID:
+            from hub.notify import notify_business
+            await notify_business(
+                ATTORNEY_LINE_USER_ID,
+                "【要確認】書類写真の受領処理に失敗しました。LINE アプリで"
+                "受信を確認し、必要なら手動でご返信ください")
+    except Exception:
+        logger.error("[IMAGE] failure notify also failed (fixed text)")
+
+
+async def _process_line_image_event(reply_token: str, user_id: str,
+                                    event_id: str) -> None:
+    """AUTOREPLY-GEN2 要件4+fix1[03]: 画像メッセージへの固定受領応答
+    （決定的 event ID による冪等化・採用方式=画像専用の回収可能な状態管理）。
+
+    冪等設計（App28 マーカー方式・durable lane はテキスト契約のまま不変）:
+      1. pre-check: category="画像受領:{event_id}" の既存行があれば作用 0
+         （返信・記録・通知いずれも重複させない）
+      2. 受信マーカーを strict 保存（失敗＝返信せず例外→失敗通知で人回収）
+      3. 並行 2 配送は保存後の再照会で勝者決定（最小 $id のみ返信・通知。
+         敗者は作用 0——受信行は最大 2 件残り得るが効果は 1 回）
+      4. 返信成功後の assistant 記録・通知は best-effort（再配送重複は
+         マーカーが防ぐ）
+    失敗時の各状態は fix1 完了報告に列挙（marker 保存後の返信失敗は
+    再配送でも skip されるため、失敗通知→人の手動応答で回収する）。
+    AI に画像内容の判断はさせない（読解は別票）。pause → 停止リスト →
+    人対応のゲート順はテキストイベントと同一。画像バイナリは保存しない。"""
+    idem_key = _image_idem_key(event_id)
     if _autoreply_paused():
-        await _handle_paused_inbound(user_id, IMAGE_INBOUND_MARKER, None)
+        await _handle_paused_inbound(user_id, IMAGE_INBOUND_MARKER, event_id)
         return
     if await autoreply_stoplist.is_suppressed(user_id):
         await _handle_suppressed_inbound(user_id, IMAGE_INBOUND_MARKER,
-                                         _durable_event_id.get())
+                                         event_id)
         return
     try:
+        if await _image_already_handled(idem_key):
+            logger.info("[IMAGE] duplicate delivery skipped user_id=%s",
+                        emit(user_id, "external_ref", "log", "operator"))
+            return
         record = await get_app21_record(user_id)
-        if record is not None:
-            response_mode = (record.get("response_mode", {})
-                             .get("value", "") or "自動")
-            if response_mode == "人対応":
-                await save_to_chatlog(user_id, "user", IMAGE_INBOUND_MARKER,
-                                      "", "no")
-                if ATTORNEY_LINE_USER_ID:
-                    from hub.notify import notify_business
-                    await notify_business(
-                        ATTORNEY_LINE_USER_ID,
-                        "【人対応中】お客様から書類のお写真が届きました。"
-                        "LINE アプリでご確認ください")
-                return
-        await save_to_chatlog(user_id, "user", IMAGE_INBOUND_MARKER,
-                              "画像受領", "no")
+        human = record is not None and (
+            (record.get("response_mode", {}).get("value", "") or "自動")
+            == "人対応")
+        my_id = await _save_image_inbound(user_id, idem_key)
+        if not await _image_claim_winner(idem_key, my_id):
+            logger.info("[IMAGE] concurrent duplicate lost user_id=%s",
+                        emit(user_id, "external_ref", "log", "operator"))
+            return
+        if human:
+            # 人対応: 顧客へは完全無言・弁護士通知のみ（受信行は保存済み）
+            if ATTORNEY_LINE_USER_ID:
+                from hub.notify import notify_business
+                await notify_business(
+                    ATTORNEY_LINE_USER_ID,
+                    "【人対応中】お客様から書類のお写真が届きました。"
+                    "LINE アプリでご確認ください")
+            return
         await _line_reply_with_fallback(reply_token, user_id,
                                         IMAGE_RECEIPT_REPLY)
         await save_to_chatlog(user_id, "assistant", IMAGE_RECEIPT_REPLY,
@@ -927,9 +1034,13 @@ async def _process_line_image_event(reply_token: str, user_id: str) -> None:
         logger.info("[IMAGE] receipt sent user_id=%s",
                     emit(user_id, "external_ref", "log", "operator"))
     except Exception as e:
+        # fix1[03]: 握りつぶし廃止——分類のみログ+失敗通知（best-effort）の
+        # うえ再送出（BackgroundTasks の未処理例外として可視化）
         logger.error("[IMAGE] handling failed user_id=%s cls=%s",
                      emit(user_id, "external_ref", "log", "operator"),
                      type(e).__name__)
+        await _notify_image_failure()
+        raise
 
 
 async def _process_line_event_durable(reply_token: str, user_id: str, user_text: str,
@@ -1001,10 +1112,18 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
         if event["message"].get("type") == "image":
             # AUTOREPLY-GEN2 要件4: 画像は固定受領応答+弁護士通知のみ
             # （AI に画像内容の判断はさせない・画像読解は別票。durable lane
-            # はテキスト契約のまま=画像は非 durable の背景処理）
+            # はテキスト契約のまま=画像は専用の冪等状態管理・fix1[03]）。
+            # event ID はテキスト durable lane と同じ導出（webhookEventId
+            # 優先・無ければ event 全体の決定的ハッシュ）
+            image_event_id = event.get("webhookEventId") or (
+                "evt-" + hashlib.sha256(
+                    json.dumps(event, sort_keys=True,
+                               ensure_ascii=False).encode()
+                ).hexdigest()[:32])
             background_tasks.add_task(
                 _process_line_image_event,
-                event["replyToken"], event["source"]["userId"])
+                event["replyToken"], event["source"]["userId"],
+                image_event_id)
             logger.info("[WEBHOOK] queued image user_id=%s",
                         emit(event["source"]["userId"], "external_ref",
                              "log", "operator"))

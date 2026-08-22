@@ -19,6 +19,7 @@ Claude API (tool use) で返信案を作成し、自動送信または承認キ�
 import logging
 import os
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
@@ -196,6 +197,17 @@ HOTERASU_STANDARD_REPLY = (
 # 承認降格時の即時定型として登録し、二度送り防止のマーカーも持たせる
 IMMEDIATE_NOTICE_TEXTS["hoterasu"] = HOTERASU_STANDARD_REPLY
 _TEMPLATE_DEDUP_MARKERS["hoterasu"] = "法テラス（民事法律扶助）"
+
+# fix1[04]: 法テラス検知の語彙閉集合（本裁定で確定・返信文言は既存の
+# 弁護士確定文のまま不変）。NFKC 正規化+空白除去のうえ部分一致で判定し、
+# 検知後は安全側で標準回答へ倒す
+_HOTERASU_VOCAB = ("法テラス", "ほうてらす", "民事法律扶助", "法律扶助")
+
+
+def _mentions_hoterasu(text: str) -> bool:
+    t = unicodedata.normalize("NFKC", text or "")
+    t = re.sub(r"\s+", "", t)   # 空白除去（全角空白は NFKC で半角化済み）
+    return any(v in t for v in _HOTERASU_VOCAB)
 
 # ── 画像メッセージへの固定受領応答（AUTOREPLY-GEN2 要件4・票由来文言） ─────────
 # AI に画像内容の判断はさせない（画像読解は別票）。受領応答+弁護士通知のみ。
@@ -836,7 +848,7 @@ def apply_server_guards(
         # a1) AUTOREPLY-GEN2 要件6: 法テラス質問には標準回答（弁護士確定）を
         #     決定的に到達させる——標準回答を逐語で含まない返信は承認降格し、
         #     即時定型（hoterasu）で標準回答を顧客へ送る
-        if "法テラス" in user_message \
+        if _mentions_hoterasu(user_message) \
                 and HOTERASU_STANDARD_REPLY not in reply:
             can_auto_send = False
             reasons.append("法テラス標準回答の不使用")
@@ -876,7 +888,7 @@ def apply_server_guards(
         if notice_key == "none" and looks_like_court_doc_report(user_message):
             notice_key = "court_doc_request"
         # AUTOREPLY-GEN2 要件6: 法テラス質問の承認降格時は標準回答を即時送信
-        if notice_key == "none" and "法テラス" in user_message:
+        if notice_key == "none" and _mentions_hoterasu(user_message):
             notice_key = "hoterasu"
         # 同じ定型文の二度送りは通常の定型文に戻す
         if notice_key != "none" and _template_already_sent(notice_key, history):

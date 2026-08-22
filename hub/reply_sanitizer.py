@@ -13,8 +13,8 @@
 要件2（長さ・構成の強制）:
   - 上限文字数（既定 300・env AUTOREPLY_MAX_CHARS で大野調整可）と
     質問数上限（2）の検査。超過は呼び出し側が自動送信せず承認降格
-    （切り詰めはしない）。ヒアリング定型テンプレブロック（━━━━ 罫線）を
-    含む返信は定型そのものが上限超のため長さ検査を免除する
+    （切り詰めはしない）。免除はサーバ側保持の確定定型ブロックとの逐語
+    一致のみ（fix1[01]・一致部分を除いた自由文へ上限適用）
 """
 
 import os
@@ -22,8 +22,9 @@ import re
 import unicodedata
 
 # 内部マーカー/プレースホルダの残存（送信禁止＝承認降格）
-_PLACEHOLDER_RE = re.compile(
-    r"<<[^<>]{1,60}>>|\{\{[^{}]{1,60}\}\}|\[/?KINTONE_[A-Z_]+\]")
+# fix1[02]: 内容長上限（{1,60}）を撤廃し、開始/終了記号の**存在そのもの**を
+# 安全側で検知する（閉じていない開始記号・61 字超・改行入りも漏らさない）
+_PLACEHOLDER_RE = re.compile(r"<<|>>|\{\{|\}\}|\[/?KINTONE_")
 
 _BOLD_RE = re.compile(r"\*\*(.+?)\*\*", re.DOTALL)
 _CODE_RE = re.compile(r"`([^`]*)`")
@@ -33,8 +34,6 @@ _HR_LINE_RE = re.compile(r"^[ \t]*(?:-{3,}|\*{3,}|_{3,})[ \t]*$\n?",
 _BULLET_RE = re.compile(r"^[ \t]*[-*+•][ \t]+", re.MULTILINE)
 _QUESTION_RE = re.compile(r"[?？]")
 
-# ヒアリング定型テンプレブロックの罫線（含む返信は長さ検査を免除）
-TEMPLATE_BLOCK_MARKER = "━━━━"
 
 _DEFAULT_MAX_CHARS = 300
 MAX_QUESTIONS = 2
@@ -106,14 +105,27 @@ def sanitize_reply(text: str,
 
 
 def structure_violations(text: str, *, max_chars: int | None = None,
-                         max_questions: int = MAX_QUESTIONS) -> list[str]:
+                         max_questions: int = MAX_QUESTIONS,
+                         exempt_blocks: tuple[str, ...] = ()) -> list[str]:
     """長さ・構成の検査（要件2）。違反分類のリストを返す（空=適合）。
-    ヒアリング定型テンプレブロックを含む文は長さ検査を免除する。"""
+
+    fix1[01]: 「罫線（━━━━）を含めば長さ免除」を廃止。免除は
+    **サーバ側が保持する確定定型ブロック（exempt_blocks）との逐語一致**のみ
+    ——一致したブロックを本文から除いた**自由文部分**に通常上限（文字数・
+    質問数とも）を適用する。罫線だけ混ぜた自由文は免除されない。
+    exempt_blocks を渡さない経路（顧客対応 Bot）は全文に上限適用（従来
+    どおり）。"""
     limit = max_chars if max_chars is not None else max_auto_chars()
+    remainder = text
+    for block in exempt_blocks:
+        if block and block in remainder:
+            remainder = remainder.replace(block, "")
     violations = []
-    if TEMPLATE_BLOCK_MARKER not in text and len(text) > limit:
-        violations.append(f"文字数超過（{len(text)}字 > 上限{limit}字）")
-    questions = len(_QUESTION_RE.findall(text))
+    free_len = len(remainder.strip())   # ブロック除去痕の前後空白は数えない
+    if free_len > limit:
+        violations.append(
+            f"文字数超過（自由文{free_len}字 > 上限{limit}字）")
+    questions = len(_QUESTION_RE.findall(remainder))
     if questions > max_questions:
         violations.append(f"質問数超過（{questions} > 上限{max_questions}）")
     return violations

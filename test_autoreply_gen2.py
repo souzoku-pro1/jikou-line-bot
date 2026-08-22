@@ -93,12 +93,42 @@ class TestSanitizer(unittest.TestCase):
         self.assertEqual(rs.structure_violations("あ" * 300), [])
         v = rs.structure_violations("あ" * 301)
         self.assertTrue(v and "文字数超過" in v[0])
-        # ヒアリング定型テンプレブロックは長さ免除
-        self.assertEqual(
-            rs.structure_violations("━━━━━━━\n" + "あ" * 400), [])
         v = rs.structure_violations("A？B？C？")
         self.assertTrue(any("質問数超過" in x for x in v))
         self.assertEqual(rs.structure_violations("A？B？"), [])
+
+    def test_placeholder_unbounded_detection(self):
+        # fix1[02]: 内容長上限なし・閉じていない開始記号・改行入りも fatal
+        cases = {
+            "60字": "<<" + "あ" * 60 + ">>",
+            "61字": "<<" + "あ" * 61 + ">>",
+            "300字": "{{" + "あ" * 300 + "}}",
+            "開始記号のみ": "こちらです<<",
+            "波括弧開始のみ": "{{顧客名",
+            "終了記号のみ": "顧客名}}です",
+            "改行入り": "<<複数行の" + chr(10) + "プレースホルダ>>",
+        }
+        for label, text in cases.items():
+            with self.subTest(case=label):
+                _o, _i, fatal = rs.sanitize_reply(text)
+                self.assertTrue(fatal)
+
+    def test_exemption_only_for_verbatim_blocks(self):
+        # fix1[01]: 免除は確定定型ブロックとの逐語一致のみ（票由来＝旧
+        # 「━━━━を含めば免除」の廃止）。罫線だけ混ぜた 301 字超の自由文は
+        # 承認降格される
+        block = "━━━━━━━" + chr(10) + "①定型の項目" + chr(10) + "━━━━━━━"
+        free_300 = "あ" * 300
+        self.assertEqual(rs.structure_violations(
+            block + chr(10) + free_300, exempt_blocks=(block,)), [])
+        v = rs.structure_violations(
+            block + chr(10) + free_300 + "あ", exempt_blocks=(block,))
+        self.assertTrue(v and "文字数超過" in v[0])   # 自由文 301 字
+        v = rs.structure_violations("━━━━━━━" + chr(10) + "あ" * 301,
+                                    exempt_blocks=(block,))
+        self.assertTrue(v and "文字数超過" in v[0])
+        v = rs.structure_violations("━━━━" + "あ" * 301)
+        self.assertTrue(v and "文字数超過" in v[0])
 
     def test_max_chars_env_adjustable(self):
         with patch.dict(os.environ, {"AUTOREPLY_MAX_CHARS": "100"}):
@@ -161,6 +191,23 @@ class TestGuardsGen2(unittest.TestCase):
     def test_hoterasu_verbatim_passes(self):
         g = cr.apply_server_guards(
             _result(cr.HOTERASU_STANDARD_REPLY), [], "法テラス使えますか？")
+        self.assertTrue(g.can_auto_send)
+
+    def test_hoterasu_vocab_closure(self):
+        # fix1[04]: NFKC 正規化+空白除去のうえ語彙閉集合で検知（裁定確定）。
+        # 返信文言は既存の弁護士確定文のまま
+        for msg in ("民事法律扶助は使えますか", "ほうてらすは？",
+                    "法 テラス使えますか", "法　テラスは？",
+                    "法律扶助の制度はありますか", "法ﾃﾗｽは？"):
+            with self.subTest(msg=msg):
+                g = cr.apply_server_guards(
+                    _result("はい、ご利用いただけます"), [], msg)
+                self.assertFalse(g.can_auto_send)
+                self.assertIn("法テラス標準回答の不使用", g.demotion_reasons)
+                self.assertEqual(g.immediate_notice, "hoterasu")
+        # 非該当は発動しない
+        g = cr.apply_server_guards(_result("ご案内します"), [],
+                                   "費用はいくらですか")
         self.assertTrue(g.can_auto_send)
 
     def test_hoterasu_dedup_marker(self):
@@ -246,7 +293,33 @@ class _AsyncBase(unittest.TestCase):
         main.conversation_histories.pop(self.user, None)
 
 
+class _FakeChatlog:
+    """fix1[03] 用の in-memory App28（create/search の実ロジックで冪等検査）。"""
+
+    def __init__(self):
+        self.rows = []
+        self._id = 0
+
+    async def create(self, app, fields):
+        self._id += 1
+        self.rows.append({"$id": str(self._id), **fields})
+        return str(self._id)
+
+    async def search(self, app, query, fields=None):
+        import re as _re
+        m = _re.search('category = "([^"]+)"', query)
+        rows = [r for r in self.rows if r.get("category") == m.group(1)]
+        rows.sort(key=lambda r: int(r["$id"]))
+        return [{"$id": {"value": r["$id"]}} for r in rows[:1]]
+
+
 class TestImageEvent(_AsyncBase):
+    """要件4+fix1[03]: 画像イベントの固定受領応答と冪等化。"""
+
+    def setUp(self):
+        super().setUp()
+        self.store = _FakeChatlog()
+
     def _patches(self, record=None):
         return (
             patch.object(main.autoreply_stoplist, "is_suppressed",
@@ -257,62 +330,113 @@ class TestImageEvent(_AsyncBase):
             patch.object(main, "save_to_chatlog", AsyncMock()),
             patch("hub.notify.notify_business", AsyncMock(return_value=True)),
             patch.object(main, "ATTORNEY_LINE_USER_ID", "Uattorney"),
+            patch.object(main.hub_kintone, "create_record",
+                         self.store.create),
+            patch.object(main.hub_kintone, "search_records",
+                         self.store.search),
+            patch.dict(os.environ, {"APP_CHATLOG": "28",
+                                    "TOKEN_CHATLOG": "d"}),
         )
 
-    def test_receipt_reply_and_notify(self):
-        p = self._patches()
-        with p[0], p[1], p[2] as reply, p[3] as log, p[4] as notify, p[5]:
-            _run(main._process_line_image_event("tok", self.user))
+    def _run_image(self, patches, event_id="evt-1"):
+        with patches[0], patches[1], patches[2] as reply,              patches[3] as log, patches[4] as notify, patches[5],              patches[6], patches[7], patches[8]:
+            _run(main._process_line_image_event("tok", self.user, event_id))
+        return reply, log, notify
+
+    def test_receipt_reply_marker_and_notify(self):
+        reply, log, notify = self._run_image(self._patches())
         reply.assert_awaited_once()
         self.assertEqual(reply.await_args.args[2], cr.IMAGE_RECEIPT_REPLY)
-        self.assertEqual(log.await_count, 2)      # 受信マーカー+受領応答
-        self.assertEqual(log.await_args_list[0].args[2],
+        # 受信マーカーは strict 保存（category=画像受領:{event_id}）
+        self.assertEqual(len(self.store.rows), 1)
+        self.assertEqual(self.store.rows[0]["category"], "画像受領:evt-1")
+        self.assertEqual(self.store.rows[0]["message"],
                          cr.IMAGE_INBOUND_MARKER)
+        # assistant 記録は fail-open writer 経由
+        log.assert_awaited_once()
+        self.assertEqual(log.await_args.args[2], cr.IMAGE_RECEIPT_REPLY)
         notify.assert_awaited_once()
         self.assertIn("書類写真受領", notify.await_args.args[1])
+
+    def test_sequential_redelivery_idempotent(self):
+        # fix1[03] negative: 同一 event ID の順次 2 配送 → 返信合計 1 回・
+        # 記録冪等（行 1 件のまま）・通知も 1 回
+        r1, _l1, n1 = self._run_image(self._patches())
+        r2, l2, n2 = self._run_image(self._patches())
+        r1.assert_awaited_once()
+        r2.assert_not_awaited()
+        l2.assert_not_awaited()
+        n2.assert_not_awaited()
+        self.assertEqual(len(self.store.rows), 1)
+
+    def test_concurrent_race_single_effect(self):
+        # fix1[03] negative: pre-check をすり抜けた並行 2 配送でも、保存後の
+        # 勝者決定（最小 $id）で返信・通知は合計 1 回（行は最大 2 件）
+        with patch.object(main, "_image_already_handled",
+                          AsyncMock(return_value=False)):
+            r1, _l, n1 = self._run_image(self._patches())
+            r2, _l2, n2 = self._run_image(self._patches())
+        r1.assert_awaited_once()
+        r2.assert_not_awaited()          # 敗者は作用 0
+        n2.assert_not_awaited()
+        self.assertEqual(len(self.store.rows), 2)
+
+    def test_marker_save_failure_no_reply_and_raises(self):
+        # fix1[03] 部分失敗: 保存失敗＝返信・通知なしで例外（握りつぶし廃止）
+        # +失敗通知（人の回収ハンドル）
+        async def broken_create(app, fields):
+            raise RuntimeError("kintone down")
+        p = self._patches()
+        with p[0], p[1], p[2] as reply, p[3], p[4] as notify, p[5],              patch.object(main.hub_kintone, "create_record", broken_create),              p[7], p[8]:
+            with self.assertRaises(RuntimeError):
+                _run(main._process_line_image_event("tok", self.user,
+                                                    "evt-f"))
+        reply.assert_not_awaited()
+        notify.assert_awaited_once()     # 失敗通知のみ
+        self.assertIn("失敗", notify.await_args.args[1])
 
     def test_hearing_history_gets_receipt_marker(self):
         main.conversation_histories[self.user] = [
             {"role": "user", "content": "こんにちは"},
             {"role": "assistant", "content": "テンプレ"}]
-        p = self._patches()
-        with p[0], p[1], p[2], p[3], p[4], p[5]:
-            _run(main._process_line_image_event("tok", self.user))
+        self._run_image(self._patches())
         history = main.conversation_histories[self.user]
         self.assertEqual(history[-1]["content"], cr.IMAGE_RECEIPT_REPLY)
         items = cr.build_known_items(None, history)
         self.assertEqual(items.get("書類写真"), "受領済み")
 
-    def test_human_mode_silent(self):
+    def test_human_mode_silent_and_idempotent(self):
         record = {"response_mode": {"value": "人対応"},
                   "顧客名": {"value": "試験太郎"}}
-        p = self._patches(record)
-        with p[0], p[1], p[2] as reply, p[3] as log, p[4] as notify, p[5]:
-            _run(main._process_line_image_event("tok", self.user))
+        reply, _l, notify = self._run_image(self._patches(record))
         reply.assert_not_awaited()               # 顧客へは完全無言
-        self.assertEqual(log.await_count, 1)
+        self.assertEqual(len(self.store.rows), 1)
         notify.assert_awaited_once()
+        self.assertIn("人対応中", notify.await_args.args[1])
+        # 再配送は作用 0
+        r2, _l2, n2 = self._run_image(self._patches(record))
+        r2.assert_not_awaited()
+        n2.assert_not_awaited()
+        self.assertEqual(len(self.store.rows), 1)
 
-    def test_pause_gate(self):
-        with patch.object(main, "_autoreply_paused", lambda: True), \
-             patch.object(main, "_handle_paused_inbound",
-                          AsyncMock()) as paused, \
-             patch.object(main, "_line_reply_with_fallback",
+    def test_pause_gate_with_event_id(self):
+        with patch.object(main, "_autoreply_paused", lambda: True),              patch.object(main, "_handle_paused_inbound",
+                          AsyncMock()) as paused,              patch.object(main, "_line_reply_with_fallback",
                           AsyncMock()) as reply:
-            _run(main._process_line_image_event("tok", self.user))
+            _run(main._process_line_image_event("tok", self.user, "evt-p"))
         paused.assert_awaited_once()
         self.assertEqual(paused.await_args.args[1], cr.IMAGE_INBOUND_MARKER)
+        self.assertEqual(paused.await_args.args[2], "evt-p")  # 冪等キー引継ぎ
         reply.assert_not_awaited()
 
-    def test_stoplist_gate(self):
+    def test_stoplist_gate_with_event_id(self):
         with patch.object(main.autoreply_stoplist, "is_suppressed",
-                          AsyncMock(return_value=True)), \
-             patch.object(main, "_handle_suppressed_inbound",
-                          AsyncMock()) as sup, \
-             patch.object(main, "_line_reply_with_fallback",
+                          AsyncMock(return_value=True)),              patch.object(main, "_handle_suppressed_inbound",
+                          AsyncMock()) as sup,              patch.object(main, "_line_reply_with_fallback",
                           AsyncMock()) as reply:
-            _run(main._process_line_image_event("tok", self.user))
+            _run(main._process_line_image_event("tok", self.user, "evt-s"))
         sup.assert_awaited_once()
+        self.assertEqual(sup.await_args.args[2], "evt-s")
         reply.assert_not_awaited()
 
 
@@ -352,13 +476,21 @@ class TestHearingSendGate(_AsyncBase):
                       queue.await_args.kwargs["reason"])
 
     def test_canonical_template_block_passes(self):
-        template = ("━━━━━━━\n①債権者名\n②おおよその借入時期\n"
-                    "（2）過去5年以内に返済しましたか？\n"
-                    "④10年以内に裁判所から書類は届きましたか？\n"
-                    "━━━━━━━\n" + "説明" * 120)
+        # fix1[01]: 免除はサーバ側保持の確定定型ブロック（SYSTEM_PROMPT から
+        # 決定的抽出した逐語）との一致のみ。実ブロック+300 字以内の自由文は
+        # 通過する
+        template = (main.HEARING_TEMPLATE_BLOCKS[0] + chr(10)
+                    + "ご不明な点はお気軽にお送りください。")
         reply, _log, queue = self._run_event(template)
         self.assertEqual(reply.await_args.args[2], template)
         queue.assert_not_awaited()
+
+    def test_ruled_line_in_free_text_still_demoted(self):
+        # fix1[01] negative: 罫線だけ混ぜた 301 字超の自由文は承認降格
+        reply, _log, queue = self._run_event("━━━━━━━" + chr(10) + "あ" * 301)
+        self.assertEqual(reply.await_args.args[2], cr.PENDING_REPLY)
+        queue.assert_awaited_once()
+        self.assertIn("文字数超過", queue.await_args.kwargs["reason"])
 
     def test_placeholder_residue_demoted(self):
         reply, _log, queue = self._run_event("こちらです<<SEIZURE_SCOPE>>")
