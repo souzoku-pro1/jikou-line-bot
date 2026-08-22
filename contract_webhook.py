@@ -36,6 +36,11 @@
   CloudSign 途中失敗 → 下書き削除（部分状態を残さない）＋掃除成功時のみ
       ステータス巻き戻し（登録中→登録）→ 500 で kintone 再配送=自動再試行。
       掃除失敗時は巻き戻さず 500 → 再配送は下記 reconcile で「要確認」へ
+  書類作成 POST の結果不明（fix1[01] ACK 喪失窓: POST 開始後の transport
+      例外・5xx・id 欠落）→ 下書きが存在し得るため巻き戻し・再作成とも
+      禁止（CloudSignResultUnknown）。「登録中」維持 → reconcile で
+      「要確認」。「POST 到達前の失敗（token 取得等）」のみ従来のクリーン
+      巻き戻しを許可（_cs_request の unknown_window が実装上の区別）
   クラウドサイン登録中（reconcile） → CloudSign 側に下書きが残り得る（外部
       状態）ため自動再実行はせず常に CAS で「要確認」+管理者通知（fail-closed・
       v1 の添付有無分岐と異なる点は二重下書き防止のため）
@@ -124,6 +129,16 @@ class ContractIntegrityError(RuntimeError):
     """fix1[03]: テンプレート/生成物の凍結文言検証に失敗（添付しない）。"""
 
 
+class CloudSignResultUnknown(RuntimeError):
+    """CONTRACT-GEN-2-fix1[01]: 書類作成 POST の結果不明（ACK 喪失窓）。
+
+    POST 開始後に doc id を得られなかった場合（transport 例外・5xx 応答・
+    2xx だが id 欠落）は、CloudSign 側に下書きが作成済みの可能性があり id も
+    不明。「未作成」と同一視した自動巻き戻し・自動再作成は二重下書きを作る
+    ため禁止し、「登録中」維持 → 再配送の reconcile が「要確認」+通知へ倒す
+    （人が CloudSign 画面で下書きの有無を確認して整理する運用）。"""
+
+
 def _fv(record: dict, code: str) -> str:
     return str((record.get(code) or {}).get("value") or "").strip()
 
@@ -192,6 +207,21 @@ def verify_frozen_pdf(pdf_bytes: bytes) -> None:
         raise ContractIntegrityError("unfilled key in pdf")
 
 
+def verify_pdf_full_text(docx_bytes: bytes, pdf_bytes: bytes) -> None:
+    """fix1[02]: PDF 抽出全文と docx 正規化全文の完全一致 pin（第2条限定の
+    verify_frozen_pdf を包含する全文保証）。
+
+    正規化は改行・空白（全角空白含む）の除去のみ＝文字列内容そのものは
+    docx と PDF で 1 文字も違わないことを要求する。表は docx 側・PDF 側の
+    どちらの走査にも乗らず本 pin では欠落を検知できないため、contract_pdf
+    が入口で拒否する（PdfUnsupportedStructure・表は非対応）。"""
+    doc = Document(io.BytesIO(docx_bytes))
+    doc_flat = "".join("".join(p.text.split()) for p in doc.paragraphs)
+    pdf_flat = "".join(contract_pdf.pdf_text(pdf_bytes).split())
+    if doc_flat != pdf_flat:
+        raise ContractIntegrityError("pdf full text mismatch")
+
+
 async def _notify(text: str) -> None:
     """管理者 LINE 通知（best-effort・固定文言+レコード番号のみ）。"""
     try:
@@ -227,31 +257,61 @@ async def _generate_and_attach(record_id: str, record: dict,
 # 呼ばない＝送信操作は大野が CloudSign 画面で行う（テストが source pin）。
 
 
-def _cs_request(method: str, path: str, **kwargs):
+def _cs_request(method: str, path: str, *, unknown_window: bool = False,
+                **kwargs):
     """CloudSign API 呼び出し。token 管理は cloudsign_webhook._token（本番
-    稼働中の単一の正）を共用し、401 は取り直して 1 回だけ再試行。"""
+    稼働中の単一の正）を共用し、401 は取り直して 1 回だけ再試行。
+
+    fix1[01]: unknown_window=True（書類作成 POST 専用）は「POST 到達前の
+    失敗」と「POST 開始後の結果不明」を実装上区別する。
+      - token 取得の失敗＝POST 未実行（下書き未作成が確定）→ 通常伝播
+        （呼び出し側のクリーン巻き戻しを許可）
+      - request 実行中の transport 例外・5xx 応答＝結果不明 →
+        CloudSignResultUnknown（巻き戻し・再作成禁止の経路へ）
+      - 4xx 応答＝CloudSign が拒否を応答済み（未作成確定）→ 通常の
+        HTTPError。401 も未作成確定なので token を取り直して再試行し、
+        再試行の POST は再び結果不明窓に入る。"""
     import requests
 
     import cloudsign_webhook as cs
     url = f"{cs.CLOUDSIGN_API_BASE}{path}"
-    headers = {"Authorization": f"Bearer {cs._token.get()}"}
-    resp = requests.request(method, url, headers=headers, timeout=30, **kwargs)
+
+    def _attempt(token: str):
+        try:
+            return requests.request(
+                method, url, headers={"Authorization": f"Bearer {token}"},
+                timeout=30, **kwargs)
+        except Exception as e:
+            if unknown_window:
+                raise CloudSignResultUnknown(
+                    "cloudsign request outcome unknown") from e
+            raise
+
+    resp = _attempt(cs._token.get())
     if resp.status_code == 401:
         cs._token.invalidate()
-        headers = {"Authorization": f"Bearer {cs._token.get()}"}
-        resp = requests.request(method, url, headers=headers, timeout=30,
-                                **kwargs)
+        resp = _attempt(cs._token.get())
+    if unknown_window and resp.status_code >= 500:
+        raise CloudSignResultUnknown("cloudsign request outcome unknown (5xx)")
     resp.raise_for_status()
     return resp
 
 
 def _cs_create_document(record_id: str) -> str:
-    """書類作成（下書き）。タイトルは案件 No のみ（氏名等の PII は載せない）。"""
-    resp = _cs_request("POST", "/documents",
+    """書類作成（下書き）。タイトルは案件 No のみ（氏名等の PII は載せない）。
+
+    fix1[01]: 唯一の unknown_window 呼出し。2xx 応答から id を取り出せない
+    場合（本文不正・id 欠落）も「作成された可能性があるが特定できない」＝
+    結果不明として扱う（ContractIntegrityError から変更・票 [01] 由来）。"""
+    resp = _cs_request("POST", "/documents", unknown_window=True,
                        data={"title": f"委任契約書_案件No.{record_id}"})
-    doc_id = str((resp.json() or {}).get("id") or "")
+    try:
+        doc_id = str((resp.json() or {}).get("id") or "")
+    except Exception as e:
+        raise CloudSignResultUnknown(
+            "cloudsign create response unreadable") from e
     if not doc_id:
-        raise ContractIntegrityError("cloudsign document id missing")
+        raise CloudSignResultUnknown("cloudsign document id missing")
     return doc_id
 
 
@@ -368,6 +428,7 @@ async def _cloudsign_flow(record_id: str, record: dict, revision: str):
     verify_frozen_clause(docx_bytes)
     pdf_bytes = contract_pdf.docx_to_pdf_bytes(docx_bytes)
     verify_frozen_pdf(pdf_bytes)
+    verify_pdf_full_text(docx_bytes, pdf_bytes)   # fix1[02] 全文 pin
     logger.info("[CONTRACT] pdf generated record_id=%s bytes=%d",
                 emit(record_id, "record_id", "log", "operator"),
                 len(pdf_bytes))
@@ -380,6 +441,14 @@ async def _cloudsign_flow(record_id: str, record: dict, revision: str):
         doc_id = _cs_create_document(record_id)
         _cs_attach_pdf(doc_id, pdf_bytes)
         _cs_add_participant(doc_id, email, _fv(record, _REQUIRED_NAME))
+    except CloudSignResultUnknown:
+        # fix1[01]: 作成結果不明＝下書きが存在し得るが id 不明。掃除も巻き
+        # 戻しもせず「登録中」維持で 500 → 再配送は reconcile が「要確認」
+        # +通知へ倒す（自動再作成の禁止＝二重下書き防止）
+        logger.error("[CONTRACT] cloudsign create outcome unknown "
+                     "record_id=%s",
+                     emit(record_id, "record_id", "log", "operator"))
+        raise
     except Exception:
         cleaned = _cs_delete_draft(doc_id) if doc_id else True
         if cleaned:

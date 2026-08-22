@@ -24,6 +24,12 @@ from reportlab.pdfgen import canvas
 
 FONT_NAME = "HeiseiMin-W3"
 
+
+class PdfUnsupportedStructure(ValueError):
+    """fix1[02]: 表など段落以外の本文構造は非対応（黙って本文を落とさない
+    ための構造 pin。doc.paragraphs にも docx_to_pdf_bytes の描画にも表セル
+    は含まれず、全文一致 pin では欠落を検知できないため入口で拒否する）。"""
+
 _PAGE_W, _PAGE_H = A4
 _MARGIN_L = 22 * mm
 _MARGIN_R = 22 * mm
@@ -62,6 +68,9 @@ def docx_to_pdf_bytes(docx_bytes: bytes) -> bytes:
     （中央/右寄せ）を反映し、その他は左寄せ。改ページは行単位。"""
     _ensure_font()
     doc = Document(io.BytesIO(docx_bytes))
+    if doc.tables:
+        raise PdfUnsupportedStructure(
+            "docx contains tables (paragraphs only)")
     buf = io.BytesIO()
     pdf = canvas.Canvas(buf, pagesize=A4)
     y = _PAGE_H - _MARGIN_TOP

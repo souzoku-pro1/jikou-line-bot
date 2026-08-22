@@ -17,8 +17,23 @@
 - 途中失敗: 下書き削除成功→「クラウドサイン登録」へ巻き戻し→500（再配送で
   自動再試行）。削除失敗→巻き戻さず 500（reconcile が「要確認」へ）。
   書き戻し PUT 失敗→下書きは削除しない（完成下書きを人が回収）。
+
+fix1（R-CONTRACT-GEN-2）:
+- [01] 書類作成 POST の ACK 喪失窓: 「到達前の失敗」（token 取得等）のみ
+  クリーン巻き戻し可。「POST 開始後の結果不明」（transport 例外・5xx・
+  id 欠落）は CloudSignResultUnknown＝巻き戻し・自動再作成とも禁止し
+  「登録中」維持 → reconcile で「要確認」（再配送を跨いでも create は
+  合計 1 回・二重下書きを作らない）。
+- [02] 全文 pin: fill_template 済み docx の正規化全文と PDF 抽出全文の
+  完全一致（空白・改行差のみ正規化）+ テンプレに表が無い構造 pin
+  （表は非対応・contract_pdf が入口拒否）。
+- [03] CloudSign 外部作用の閉集合化: AST checker で method×path 形 4 種に
+  固定。HTTP クライアント直接呼出しは _cs_request 内部（requests.request）
+  のみ。動的 method/path・未知 endpoint・wrapper 迂回・別名参照は FAIL。
 """
 
+import ast
+import io
 import os
 import re
 import unittest
@@ -38,6 +53,8 @@ _ENV = {
 for _k, _v in _ENV.items():
     os.environ.setdefault(_k, _v)
 
+import requests  # noqa: E402
+from docx import Document as DocxDocument  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
 import cloudsign_webhook  # noqa: E402
@@ -74,6 +91,120 @@ def _filled_pdf() -> bytes:
     docx = cw.fill_template(cw.TEMPLATE_PATH,
                             cw.build_fill_data(_cs_record()))
     return contract_pdf.docx_to_pdf_bytes(docx)
+
+
+# ══════════════════════════════════════════════════════════════
+# fix1[03]: CloudSign 外部作用の閉集合 checker（P4 系流儀・本 checker は
+# contract_webhook 専用のため当面ここに置く。汎用化は AST-CONSOL 同様
+# merge 後の移設票で ast_policy_helpers へ）
+# ══════════════════════════════════════════════════════════════
+
+# 許可される CloudSign 外部作用の閉集合（method × path 形・4 種のみ）。
+# PUT（送信）はここに無い＝checker 段でも封じる
+_CS_ALLOWED_EFFECTS = {
+    ("POST", "/documents"),
+    ("POST", "/documents/{}/files"),
+    ("POST", "/documents/{}/participants"),
+    ("DELETE", "/documents/{}"),
+}
+_HTTP_CLIENT_NAMES = {"requests", "httpx", "urllib", "aiohttp", "http"}
+
+
+def _normalize_cs_path(node):
+    """_cs_request の path 引数を形に正規化。文字列リテラルはそのまま、
+    f-string は素の置換（conversion/format_spec なし）を {} に置換。
+    それ以外（動的 path）は None。"""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.JoinedStr):
+        parts = []
+        for v in node.values:
+            if isinstance(v, ast.Constant) and isinstance(v.value, str):
+                parts.append(v.value)
+            elif isinstance(v, ast.FormattedValue):
+                if v.conversion != -1 or v.format_spec is not None:
+                    return None
+                parts.append("{}")
+            else:
+                return None
+        return "".join(parts)
+    return None
+
+
+def cloudsign_effect_violations(tree) -> list[str]:
+    """fix1[03]: CloudSign への外部作用を閉集合 4 種に固定する機械検査。
+
+    規則:
+      1. `_cs_request(...)` は method が文字列リテラル・path が正規化可能で、
+         (method, path形) が _CS_ALLOWED_EFFECTS に含まれること。動的
+         method/path・未知 endpoint は違反。
+      2. `_cs_request` の別名参照・再束縛（呼出し以外の Name 出現）は違反
+         （wrapper 迂回・間接呼出しの封殺）。
+      3. HTTP クライアント（requests/httpx/urllib/aiohttp/http）の属性
+         呼出しは `_cs_request` 関数本体の内側のみ、かつ requests.request
+         のみ許可。from-import・alias import は場所を問わず違反。"""
+    violations = []
+    cs_req_nodes = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) \
+                and node.name == "_cs_request":
+            for sub in ast.walk(node):
+                cs_req_nodes.add(id(sub))
+    call_func_ids = {id(n.func) for n in ast.walk(tree)
+                     if isinstance(n, ast.Call)}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            f = node.func
+            if isinstance(f, ast.Name) and f.id == "_cs_request":
+                args = node.args
+                if len(args) < 2 or not (
+                        isinstance(args[0], ast.Constant)
+                        and isinstance(args[0].value, str)):
+                    violations.append(
+                        f"L{node.lineno}: _cs_request の method が文字列"
+                        "リテラルでない（動的 method）")
+                    continue
+                path = _normalize_cs_path(args[1])
+                if path is None:
+                    violations.append(
+                        f"L{node.lineno}: _cs_request の path が動的")
+                    continue
+                if (args[0].value, path) not in _CS_ALLOWED_EFFECTS:
+                    violations.append(
+                        f"L{node.lineno}: 閉集合外の CloudSign 作用 "
+                        f"{args[0].value} {path}")
+            if isinstance(f, ast.Attribute):
+                root = f.value
+                while isinstance(root, ast.Attribute):
+                    root = root.value
+                if isinstance(root, ast.Name) \
+                        and root.id in _HTTP_CLIENT_NAMES:
+                    if id(node) not in cs_req_nodes:
+                        violations.append(
+                            f"L{node.lineno}: _cs_request 外の HTTP "
+                            f"クライアント直接呼出し {root.id}.{f.attr}")
+                    elif not (root.id == "requests"
+                              and f.attr == "request"):
+                        violations.append(
+                            f"L{node.lineno}: _cs_request 内で許可外の "
+                            f"HTTP 呼出し {root.id}.{f.attr}")
+        elif isinstance(node, ast.Name) and node.id == "_cs_request" \
+                and id(node) not in call_func_ids:
+            violations.append(
+                f"L{node.lineno}: _cs_request の別名参照/再束縛"
+                "（間接呼出し・wrapper 迂回の疑い）")
+        elif isinstance(node, ast.ImportFrom):
+            if (node.module or "").split(".")[0] in _HTTP_CLIENT_NAMES:
+                violations.append(
+                    f"L{node.lineno}: HTTP クライアントの from-import"
+                    "（別名迂回）")
+        elif isinstance(node, ast.Import):
+            for a in node.names:
+                if a.name.split(".")[0] in _HTTP_CLIENT_NAMES \
+                        and a.asname is not None:
+                    violations.append(
+                        f"L{node.lineno}: HTTP クライアントの alias import")
+    return violations
 
 
 class _CsBase(unittest.TestCase):
@@ -354,11 +485,14 @@ class TestCloudSignHttp(unittest.TestCase):
         self.assertIn("12", title)
         self.assertNotIn("熊澤", title)          # タイトルは案件 No のみ
 
-    def test_create_document_missing_id_rejected(self):
+    def test_create_document_missing_id_is_unknown(self):
+        # fix1[01]（票由来の仕様変更）: 2xx だが id 欠落は「作成された可能性
+        # があるが特定できない」＝ContractIntegrityError から
+        # CloudSignResultUnknown へ変更（巻き戻し・再作成禁止の経路）
         resp = MagicMock()
         resp.json.return_value = {}
         with patch.object(cw, "_cs_request", MagicMock(return_value=resp)):
-            with self.assertRaises(cw.ContractIntegrityError):
+            with self.assertRaises(cw.CloudSignResultUnknown):
                 cw._cs_create_document("12")
 
     def test_attach_pdf_multipart_shape(self):
@@ -403,6 +537,214 @@ class TestCloudSignHttp(unittest.TestCase):
         headers = [c.kwargs["headers"]["Authorization"]
                    for c in req.call_args_list]
         self.assertEqual(headers, ["Bearer t1", "Bearer t2"])
+
+
+class _FakeToken:
+    def __init__(self, fail=False):
+        self.fail = fail
+        self.invalidated = False
+
+    def get(self):
+        if self.fail:
+            raise RuntimeError("token backend down")
+        return "t"
+
+    def invalidate(self):
+        self.invalidated = True
+
+
+class TestAckLossWindow(_CsBase):
+    """fix1[01]: 書類作成 POST の ACK 喪失窓（到達前と結果不明の区別）。"""
+
+    def test_transport_error_in_window_is_unknown(self):
+        with patch("requests.request",
+                   MagicMock(side_effect=requests.ConnectionError("x"))), \
+             patch.object(cloudsign_webhook, "_token", _FakeToken()):
+            with self.assertRaises(cw.CloudSignResultUnknown):
+                cw._cs_request("POST", "/documents", unknown_window=True)
+
+    def test_transport_error_outside_window_propagates(self):
+        # 添付/宛先/削除は doc_id 既知＝従来の掃除+巻き戻し経路のまま
+        with patch("requests.request",
+                   MagicMock(side_effect=requests.ConnectionError("x"))), \
+             patch.object(cloudsign_webhook, "_token", _FakeToken()):
+            with self.assertRaises(requests.ConnectionError):
+                cw._cs_request("DELETE", "/documents/d-1")
+
+    def test_5xx_in_window_unknown_4xx_definite(self):
+        # 5xx=処理有無不明→unknown・4xx=拒否応答済み（未作成確定）→通常
+        # HTTPError（クリーン巻き戻し許可）
+        r5 = MagicMock(status_code=502)
+        with patch("requests.request", MagicMock(return_value=r5)), \
+             patch.object(cloudsign_webhook, "_token", _FakeToken()):
+            with self.assertRaises(cw.CloudSignResultUnknown):
+                cw._cs_request("POST", "/documents", unknown_window=True)
+        r4 = MagicMock(status_code=404)
+        r4.raise_for_status.side_effect = requests.HTTPError("404")
+        with patch("requests.request", MagicMock(return_value=r4)), \
+             patch.object(cloudsign_webhook, "_token", _FakeToken()):
+            with self.assertRaises(requests.HTTPError):
+                cw._cs_request("POST", "/documents", unknown_window=True)
+
+    def test_token_failure_before_post_is_clean(self):
+        # 到達前（POST 未実行が確定）はそのまま伝播＝クリーン巻き戻し可
+        req = MagicMock()
+        with patch("requests.request", req), \
+             patch.object(cloudsign_webhook, "_token", _FakeToken(fail=True)):
+            with self.assertRaises(RuntimeError):
+                cw._cs_request("POST", "/documents", unknown_window=True)
+        req.assert_not_called()
+
+    def test_unknown_keeps_working_no_rollback_no_cleanup(self):
+        # flow: 結果不明は掃除も巻き戻しもしない（登録中維持で 500）
+        create = MagicMock(side_effect=cw.CloudSignResultUnknown("x"))
+        r, _c, _a, _p, delete, update, _n, _g = self._post(
+            record=_cs_record(), create=create)
+        self.assertEqual(r.status_code, 500)
+        delete.assert_not_called()
+        self.assertEqual(update.await_count, 1)  # CAS のみ・巻き戻しなし
+        self.assertEqual(update.await_args.args[2],
+                         {"契約書ステータス": "クラウドサイン登録中"})
+
+    def test_ack_loss_no_duplicate_create_across_redelivery(self):
+        # 票指定 negative: 「POST は CloudSign 側で成功したが応答喪失」を
+        # transport 層で模擬（_cs_request/_cs_create_document は実物）。
+        # 1 配送目=500・自動巻き戻しなし。再配送=reconcile で要確認。
+        # create の POST 実行は再配送を跨いで合計 1 回（2 にならない）
+        http = MagicMock(side_effect=requests.ConnectionError("ack lost"))
+        notify = AsyncMock(return_value=True)
+        update1 = AsyncMock()
+        with patch.dict(os.environ, _ENV), \
+             patch.object(cw.hub_kintone, "get_record",
+                          AsyncMock(return_value=_cs_record())), \
+             patch.object(cw.hub_kintone, "update_record", update1), \
+             patch.object(cloudsign_webhook, "_token", _FakeToken()), \
+             patch("requests.request", http), \
+             patch("hub.notify.notify_admin_line", notify):
+            r1 = _client.post(_URL, json=_body())
+        self.assertEqual(r1.status_code, 500)
+        self.assertEqual(http.call_count, 1)      # 作成 POST 1 回のみ
+        self.assertEqual(update1.await_count, 1)  # CAS のみ・巻き戻しなし
+        self.assertEqual(update1.await_args.args[2],
+                         {"契約書ステータス": "クラウドサイン登録中"})
+
+        record2 = _cs_record(契約書ステータス="クラウドサイン登録中")
+        update2 = AsyncMock()
+        with patch.dict(os.environ, _ENV), \
+             patch.object(cw.hub_kintone, "get_record",
+                          AsyncMock(return_value=record2)), \
+             patch.object(cw.hub_kintone, "update_record", update2), \
+             patch.object(cloudsign_webhook, "_token", _FakeToken()), \
+             patch("requests.request", http), \
+             patch("hub.notify.notify_admin_line", notify):
+            r2 = _client.post(_URL, json=_body())
+        self.assertEqual(r2.json().get("skip"), "cs_needs_review")
+        self.assertEqual(http.call_count, 1)      # 増分 0＝合計 2 にならない
+        self.assertEqual(update2.await_args.args[2],
+                         {"契約書ステータス": "要確認"})
+        notify.assert_awaited_once()
+
+
+class TestPdfFullTextPin(_CsBase):
+    """fix1[02]: PDF 全文の完全一致 pin+表の構造 pin（表は非対応）。"""
+
+    def test_full_text_exact_match(self):
+        docx = cw.fill_template(cw.TEMPLATE_PATH,
+                                cw.build_fill_data(_cs_record()))
+        pdf = contract_pdf.docx_to_pdf_bytes(docx)
+        cw.verify_pdf_full_text(docx, pdf)       # 実行時 pin と同判定
+        doc_flat = "".join(
+            "".join(p.text.split())
+            for p in DocxDocument(io.BytesIO(docx)).paragraphs)
+        pdf_flat = "".join(contract_pdf.pdf_text(pdf).split())
+        self.assertEqual(doc_flat, pdf_flat)     # 1 文字も違わない
+
+    def test_mismatched_pdf_rejected(self):
+        # 第2条は無傷でも本文が別内容（債権者違い）の PDF は全文 pin で拒否
+        docx_a = cw.fill_template(cw.TEMPLATE_PATH,
+                                  cw.build_fill_data(_cs_record()))
+        record_b = _cs_record(問い合わせ業者名="株式会社Bローン")
+        pdf_b = contract_pdf.docx_to_pdf_bytes(
+            cw.fill_template(cw.TEMPLATE_PATH, cw.build_fill_data(record_b)))
+        cw.verify_frozen_pdf(pdf_b)              # 第2条 pin は通る＝差分検査
+        with self.assertRaises(cw.ContractIntegrityError):
+            cw.verify_pdf_full_text(docx_a, pdf_b)
+
+    def test_template_has_no_tables(self):
+        # 構造 pin: 表は docx.paragraphs にも描画にも乗らず全文 pin で欠落を
+        # 検知できないため、テンプレに表が無いことを固定
+        self.assertEqual(len(DocxDocument(cw.TEMPLATE_PATH).tables), 0)
+
+    def test_table_docx_rejected(self):
+        d = DocxDocument()
+        d.add_paragraph("表つき文書")
+        d.add_table(rows=1, cols=1)
+        buf = io.BytesIO()
+        d.save(buf)
+        with self.assertRaises(contract_pdf.PdfUnsupportedStructure):
+            contract_pdf.docx_to_pdf_bytes(buf.getvalue())
+
+    def test_flow_blocks_on_full_text_mismatch(self):
+        # 描画側の欠落/差替えの模擬: 別内容 PDF を返す変換 → CloudSign 不触
+        record_b = _cs_record(問い合わせ業者名="株式会社Bローン")
+        other_pdf = contract_pdf.docx_to_pdf_bytes(
+            cw.fill_template(cw.TEMPLATE_PATH, cw.build_fill_data(record_b)))
+        with patch.object(contract_pdf, "docx_to_pdf_bytes",
+                          lambda _b: other_pdf):
+            r, create, _a, _p, _d, update, _n, _g = self._post(
+                record=_cs_record())
+        self.assertEqual(r.status_code, 500)
+        create.assert_not_called()
+        self.assertEqual(update.await_count, 1)
+
+
+class TestCloudSignEffectClosure(unittest.TestCase):
+    """fix1[03]: CloudSign 外部作用の閉集合 checker（P4 系流儀）。"""
+
+    def _v(self, src):
+        return cloudsign_effect_violations(ast.parse(src))
+
+    def test_production_source_clean(self):
+        src = open("contract_webhook.py", encoding="utf-8").read()
+        self.assertEqual(self._v(src), [])
+
+    def test_checker_negatives(self):
+        cases = {
+            "PUT（送信 API）": '_cs_request("PUT", "/documents")',
+            "動的 method": 'm = "POST"\n_cs_request(m, "/documents")',
+            "動的 path": '_cs_request("POST", p)',
+            "未知 endpoint":
+                '_cs_request("POST", f"/documents/{d}/attachments")',
+            "conversion つき置換":
+                '_cs_request("POST", f"/documents/{d!r}/files")',
+            "format_spec つき置換":
+                '_cs_request("POST", f"/documents/{d:>8}/files")',
+            "wrapper 迂回の直接 HTTP":
+                'def send():\n    import requests\n    requests.post(u)',
+            "urllib 迂回":
+                'def send():\n    import urllib.request\n'
+                '    urllib.request.urlopen(u)',
+            "from-import": "from requests import post",
+            "alias import": "import requests as rq",
+            "_cs_request の別名参照": "x = _cs_request",
+            "_cs_request 内の許可外呼出し":
+                'def _cs_request(m, p):\n    import requests\n'
+                '    return requests.post(u)',
+        }
+        for label, src in cases.items():
+            with self.subTest(case=label):
+                self.assertTrue(self._v(src), label)
+
+    def test_checker_allows_canonical_forms(self):
+        src = (
+            'def _cs_request(method, path, **kw):\n'
+            '    import requests\n'
+            '    return requests.request(method, u, **kw)\n'
+            '_cs_request("POST", "/documents")\n'
+            '_cs_request("POST", f"/documents/{d}/files")\n'
+            '_cs_request("POST", f"/documents/{d}/participants")\n'
+            '_cs_request("DELETE", f"/documents/{d}")\n')
+        self.assertEqual(self._v(src), [])
 
 
 class TestSchemaPin(unittest.TestCase):
