@@ -18,9 +18,13 @@ CONTRACT-GEN で確立した構造の同型（App26=相談カード（相続）�
 
 fail-closed（前提未充足＝状態不変・値は通知に載せない）:
   - App 財産に有効な財産行が 0 件 → 生成拒否・明示
-  - 評価確定=yes でない行あり → 既存ガード（確定は弁護士・不変）どおり拒否
   - 生成 xlsx はサーバ側検証（verify_zaisan_xlsx: 金額セル int・小計/総合計
-    再計算一致・行数整合・セル式不在）を通してから添付
+    再計算一致・行数整合・セル式不在・下書き表示の閉集合照合）を通してから
+    添付
+
+ZAISAN-GEN-2（大野裁定）: 評価確定=yes の全件要求は生成条件から外し、
+未確定行があれば「下書き」（バナー+行注記+暫定表示つき）として生成する。
+生成通知に「下書き（未確定 N 件）」か「完成版」かを明記する。
 """
 
 import logging
@@ -31,11 +35,10 @@ from fastapi.responses import JSONResponse
 from hub import kintone as hub_kintone
 from hub.redact import emit
 from hub.webhook_auth import extract_record_id, verify_token
-from units.souzoku.guards import (
-    ValuationNotConfirmed, ensure_valuations_confirmed)
 from units.souzoku.zaisan_mokuroku import (
     ZaisanMokurokuError, fetch_zaisan_records)
-from units.souzoku.zaisan_xlsx import build_zaisan_xlsx, verify_zaisan_xlsx
+from units.souzoku.zaisan_xlsx import (
+    build_zaisan_xlsx, count_unconfirmed, verify_zaisan_xlsx)
 
 logger = logging.getLogger("zaisan")
 
@@ -87,6 +90,18 @@ async def _generate_and_attach(record_id: str, record: dict,
     }, revision=final_revision)
     logger.info("[ZAISAN] attached record_id=%s",
                 emit(record_id, "record_id", "log", "operator"))
+    # ZAISAN-GEN-2: 下書き/完成版の別を明記して通知（件数のみ・PII 非搭載）
+    unconfirmed = count_unconfirmed(records)
+    if unconfirmed:
+        await _notify(
+            f"【財産目録】案件 No.{record_id} の財産目録を下書き"
+            f"（評価未確定 {unconfirmed} 件）として生成・添付しました。"
+            "評価確定の入力後、添付を削除してステータスを"
+            f"「{STATUS_TRIGGER}」に設定し直すと完成版を再生成できます")
+    else:
+        await _notify(
+            f"【財産目録】案件 No.{record_id} の財産目録を完成版として"
+            "生成・添付しました")
 
 
 async def _claim(record_id: str, revision: str, to_status: str) -> str | None:
@@ -178,7 +193,8 @@ async def zaisan_webhook(secret: str, request: Request):
             return JSONResponse(status_code=200,
                                 content={"ok": True, "skip": "stale_status"})
 
-        # fail-closed: 財産行 0 件／評価未確定は生成しない（状態も動かさない）。
+        # fail-closed: 財産行 0 件は生成しない（状態も動かさない）。
+        # ZAISAN-GEN-2 裁定: 評価未確定は拒否せず下書きとして生成する。
         # ガード文言はレコード番号・件数のみ（PII 非搭載）。生成そのものは
         # CAS 勝者のみが行う（下の _generate_and_attach）
         try:
@@ -188,8 +204,7 @@ async def zaisan_webhook(secret: str, request: Request):
                 raise ZaisanMokurokuError(
                     "財産行が0件です（App 財産に案件の財産が登録されて"
                     "いません）。")
-            ensure_valuations_confirmed(records)
-        except (ZaisanMokurokuError, ValuationNotConfirmed) as e:
+        except ZaisanMokurokuError as e:
             logger.info("[ZAISAN] not ready record_id=%s cls=%s",
                         emit(record_id, "record_id", "log", "operator"),
                         type(e).__name__)

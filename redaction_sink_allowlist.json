@@ -93,9 +93,9 @@
     "valuation_ingest.py:142:sink:logger",
     "valuation_ingest.py:275:sink:httpexception",
     "valuation_ingest.py:280:sink:httpexception",
-    "zaisan_webhook.py:193:sink:logger",
-    "zaisan_webhook.py:211:sink:logger",
-    "zaisan_webhook.py:79:sink:logger"
+    "zaisan_webhook.py:208:sink:logger",
+    "zaisan_webhook.py:226:sink:logger",
+    "zaisan_webhook.py:82:sink:logger"
   ],
   "manifest": {
     "bank_ingest.py:sink:httpexception": "RV-10 移行前の ingest ルータ httpexception debt（別PRで回収）",
