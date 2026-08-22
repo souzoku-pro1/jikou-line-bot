@@ -891,12 +891,15 @@ class TestCloudSignEffectClosure(unittest.TestCase):
 
 class TestSchemaPin(unittest.TestCase):
     def test_status_options_closed_seven(self):
+        # JIKOU-NOTICE-1 票由来の時点追随: 時効援用通知の 3 値追加で
+        # 閉集合 7→10（同一 DROP_DOWN を notice_webhook と共用する裁定）
         opts = (EXPECTED_KINTONE_SCHEMA["App 21 (案件)"]["fields"]
                 ["契約書ステータス"]["required_options"])
         self.assertEqual(opts, [
             "契約書作成", "契約書作成中", "契約書作成済",
             "クラウドサイン登録", "クラウドサイン登録中",
-            "クラウドサイン登録済", "要確認"])
+            "クラウドサイン登録済", "時効援用通知作成",
+            "時効援用通知作成中", "時効援用通知作成済", "要確認"])
 
 
 if __name__ == "__main__":

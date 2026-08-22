@@ -1,7 +1,7 @@
 {
-  "baseline_count": 93,
+  "baseline_count": 99,
   "generated_by": "P1-112-frozen-prints",
-  "note": "sink 直書き債務台帳。baseline_count=93（現行値・entries 数へ追随。沿革: 初回 211=上限・単調減少方針 → 移送・整理で 75 → 2026-08-19 KOSEKI-DATA-1 で 80 → #219 AUTOREPLY-STOPLIST-1 の logger 2 件統合で 82 → CONTRACT-GEN-1 の webhook logger 追加で 85 → CONTRACT-GEN-2（PDF+CloudSign 登録）の logger 増分+行再計測で 87 → ZAISAN-GEN-1（財産目録 xlsx）の webhook logger 3+収載スクリプト print 2 で 92 → AUTOREPLY-GEN2（画像受領ハンドラの logger.error 追加=固定分類+emit のみ）+行再計測で 93）。P1-107b(PR-4b)で sink:print 134件を emit/logger へ移送(daily_healthcheck/scheduler 分は PR-4c へ凍結・据置)。例外print→logger は type(e).__name__ 可視(fix2裁定準拠)＋emit(vendor_raw)抑止で sink:logger 25件が計上。logger.exception/logging.exceptionは引数不問でlogger_exception違反(L01)。信頼emitは from hub.redact import emit(1形式)。baseline_count は entries 数へ追随して更新する運用（削除漏れ検査は test_no_stale_entries が担保）。2026-08-19 KOSEKI-DATA-1: [人]手動実行の移行スクリプト koseki_backfill.py の sink:print 5 件を理由つきで追加し 75→80（値を出さない設計・理由は manifest の koseki_backfill.py:sink:print を参照）",
+  "note": "sink 直書き債務台帳。baseline_count=99（現行値・entries 数へ追随。沿革: 初回 211=上限・単調減少方針 → 移送・整理で 75 → 2026-08-19 KOSEKI-DATA-1 で 80 → #219 AUTOREPLY-STOPLIST-1 の logger 2 件統合で 82 → CONTRACT-GEN-1 の webhook logger 追加で 85 → CONTRACT-GEN-2（PDF+CloudSign 登録）の logger 増分+行再計測で 87 → ZAISAN-GEN-1（財産目録 xlsx）の webhook logger 3+収載スクリプト print 2 で 92 → AUTOREPLY-GEN2（画像受領ハンドラの logger.error 追加=固定分類+emit のみ）+行再計測で 93 → JIKOU-NOTICE-1（時効援用通知書）の webhook logger 4+収載スクリプト print 2 で 99）。P1-107b(PR-4b)で sink:print 134件を emit/logger へ移送(daily_healthcheck/scheduler 分は PR-4c へ凍結・据置)。例外print→logger は type(e).__name__ 可視(fix2裁定準拠)＋emit(vendor_raw)抑止で sink:logger 25件が計上。logger.exception/logging.exceptionは引数不問でlogger_exception違反(L01)。信頼emitは from hub.redact import emit(1形式)。baseline_count は entries 数へ追随して更新する運用（削除漏れ検査は test_no_stale_entries が担保）。2026-08-19 KOSEKI-DATA-1: [人]手動実行の移行スクリプト koseki_backfill.py の sink:print 5 件を理由つきで追加し 75→80（値を出さない設計・理由は manifest の koseki_backfill.py:sink:print を参照）",
   "entries": [
     "bank_ingest.py:243:sink:httpexception",
     "bank_ingest.py:248:sink:httpexception",
@@ -56,13 +56,19 @@
     "koseki_person_sync.py:292:sink:logger",
     "koseki_reader.py:558:sink:logger",
     "koseki_second_opinion.py:309:sink:logger",
-    "main.py:1048:sink:logger",
-    "main.py:1347:sink:logger",
-    "main.py:1644:sink:logger",
-    "main.py:627:sink:logger",
-    "main.py:649:sink:logger",
+    "main.py:1050:sink:logger",
+    "main.py:1349:sink:logger",
+    "main.py:1646:sink:logger",
+    "main.py:629:sink:logger",
+    "main.py:651:sink:logger",
+    "make_notice_template.py:115:sink:print",
+    "make_notice_template.py:116:sink:print",
     "make_zaisan_xlsx_template.py:100:sink:print",
     "make_zaisan_xlsx_template.py:99:sink:print",
+    "notice_webhook.py:192:sink:logger",
+    "notice_webhook.py:205:sink:logger",
+    "notice_webhook.py:305:sink:logger",
+    "notice_webhook.py:325:sink:logger",
     "person_confirm.py:147:sink:logger",
     "person_restore_cli.py:192:sink:print",
     "person_restore_cli.py:193:sink:print",
@@ -134,7 +140,9 @@
     "koseki_backfill.py:sink:print": "KOSEKI-DATA-1 移行スクリプト（[人]が railway run で手動実行・cron/サーバ経路なし）。出力は $id・案件番号・日付・様式・キー名のみで氏名/本籍等の値を出さない設計（test_koseki_data1 で移行 payload を pin）",
     "contract_webhook.py:sink:logger": "CONTRACT-GEN-1/2: 送付状（document_webhook）と同型の webhook ログ。record_id は emit 経由・例外は固定分類+emit(vendor_raw) 抑止・logger.exception 不使用・PII（氏名/住所/債権者値/メールアドレス値）はログ非搭載（test_contract_gen1/test_contract_gen2 で pin）。GEN-2 追加分は PDF 生成・CloudSign 前提未充足・登録完了・巻き戻し失敗のrecord_id 付きログ",
     "make_zaisan_xlsx_template.py:sink:print": "ZAISAN-GEN-1: [人]手動実行のテンプレ収載スクリプト（koseki_backfill と同区分）。出力はテンプレの保存先パス・行数・SHA-256 のみで業務データ値を出さない設計",
-    "zaisan_webhook.py:sink:logger": "ZAISAN-GEN-1: contract_webhook と同型の webhook ログ。record_id は emit 経由・例外は固定分類+emit(vendor_raw) 抑止・logger.exception 不使用・PII（被相続人名/財産の値）はログ非搭載（test_zaisan_gen1 で pin）"
+    "zaisan_webhook.py:sink:logger": "ZAISAN-GEN-1: contract_webhook と同型の webhook ログ。record_id は emit 経由・例外は固定分類+emit(vendor_raw) 抑止・logger.exception 不使用・PII（被相続人名/財産の値）はログ非搭載（test_zaisan_gen1 で pin）",
+    "make_notice_template.py:sink:print": "JIKOU-NOTICE-1: [人]手動実行のテンプレ収載スクリプト（koseki_backfill/make_zaisan_xlsx_template と同区分）。出力は保存先パス・段落数・SHA-256 のみで個人情報値を出さない設計（残存検査つき）",
+    "notice_webhook.py:sink:logger": "JIKOU-NOTICE-1: contract_webhook と同型の webhook ログ。record_id は emit 経由・例外は固定分類+emit(vendor_raw) 抑止・logger.exception 不使用・PII（氏名/ふりがな/住所/生年月日/債権者値）はログ非搭載（test_jikou_notice1 で pin）"
   },
   "manifest_note": "新規(file,rule)の台帳追加は manifest への明示登録（理由付き）を必須とする（RP1107B-M01）。既存3検査(no_new/stale/monotonic)は維持。"
 }
