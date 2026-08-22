@@ -37,10 +37,12 @@
       ステータス巻き戻し（登録中→登録）→ 500 で kintone 再配送=自動再試行。
       掃除失敗時は巻き戻さず 500 → 再配送は下記 reconcile で「要確認」へ
   書類作成 POST の結果不明（fix1[01] ACK 喪失窓: POST 開始後の transport
-      例外・5xx・id 欠落）→ 下書きが存在し得るため巻き戻し・再作成とも
-      禁止（CloudSignResultUnknown）。「登録中」維持 → reconcile で
-      「要確認」。「POST 到達前の失敗（token 取得等）」のみ従来のクリーン
-      巻き戻しを許可（_cs_request の unknown_window が実装上の区別）
+      例外・5xx・確定拒否 allowlist 外の 4xx〔408/429 等・fix2[04]〕・
+      id 欠落）→ 下書きが存在し得るため巻き戻し・再作成とも禁止
+      （CloudSignResultUnknown）。「登録中」維持 → reconcile で「要確認」。
+      「POST 到達前の失敗（token 取得等）」と「確定拒否 status
+      （_CS_DEFINITE_REJECTION）」のみ従来のクリーン巻き戻しを許可
+      （_cs_request の unknown_window が実装上の区別）
   クラウドサイン登録中（reconcile） → CloudSign 側に下書きが残り得る（外部
       状態）ため自動再実行はせず常に CAS で「要確認」+管理者通知（fail-closed・
       v1 の添付有無分岐と異なる点は二重下書き防止のため）
@@ -256,6 +258,15 @@ async def _generate_and_attach(record_id: str, record: dict,
 # 呼ぶのは POST（作成/添付/宛先）と DELETE（掃除）のみ。送信 API（PUT）は
 # 呼ばない＝送信操作は大野が CloudSign 画面で行う（テストが source pin）。
 
+# fix2[04]: unknown_window で「書類が作成されないまま拒否された」と確定判定
+# してよい status の明示 allowlist（閉集合）。HTTP 意味論上、要求を受理せず
+# 拒否を応答したことが確定するもののみ:
+#   400（要求不正）/ 401（認証拒否・token 再取得の対象）/ 403（権限拒否）/
+#   404（endpoint/資源なし）/ 409（競合拒否）/ 422（検証拒否）
+# allowlist 外の 4xx は結果不明へ倒す——特に 408（タイムアウト応答＝処理有無
+# 不明）・429（レート制限＝処理有無をこの応答からは断定できない）。
+_CS_DEFINITE_REJECTION = frozenset({400, 401, 403, 404, 409, 422})
+
 
 def _cs_request(method: str, path: str, *, unknown_window: bool = False,
                 **kwargs):
@@ -266,11 +277,12 @@ def _cs_request(method: str, path: str, *, unknown_window: bool = False,
     失敗」と「POST 開始後の結果不明」を実装上区別する。
       - token 取得の失敗＝POST 未実行（下書き未作成が確定）→ 通常伝播
         （呼び出し側のクリーン巻き戻しを許可）
-      - request 実行中の transport 例外・5xx 応答＝結果不明 →
+      - request 実行中の transport 例外・5xx 応答・確定拒否 allowlist
+        （_CS_DEFINITE_REJECTION）外の 4xx（408/429 等）＝結果不明 →
         CloudSignResultUnknown（巻き戻し・再作成禁止の経路へ）
-      - 4xx 応答＝CloudSign が拒否を応答済み（未作成確定）→ 通常の
-        HTTPError。401 も未作成確定なので token を取り直して再試行し、
-        再試行の POST は再び結果不明窓に入る。"""
+      - allowlist 内の 4xx 応答＝CloudSign が作成しないまま拒否を応答済み
+        （未作成確定）→ 通常の HTTPError。401 も未作成確定なので token を
+        取り直して 1 回再試行し、再試行の POST は再び結果不明窓に入る。"""
     import requests
 
     import cloudsign_webhook as cs
@@ -291,8 +303,10 @@ def _cs_request(method: str, path: str, *, unknown_window: bool = False,
     if resp.status_code == 401:
         cs._token.invalidate()
         resp = _attempt(cs._token.get())
-    if unknown_window and resp.status_code >= 500:
-        raise CloudSignResultUnknown("cloudsign request outcome unknown (5xx)")
+    if unknown_window and resp.status_code >= 400 \
+            and resp.status_code not in _CS_DEFINITE_REJECTION:
+        raise CloudSignResultUnknown(
+            "cloudsign request outcome unknown (non-definite status)")
     resp.raise_for_status()
     return resp
 

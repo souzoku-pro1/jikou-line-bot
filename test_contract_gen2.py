@@ -30,6 +30,15 @@ fix1（R-CONTRACT-GEN-2）:
 - [03] CloudSign 外部作用の閉集合化: AST checker で method×path 形 4 種に
   固定。HTTP クライアント直接呼出しは _cs_request 内部（requests.request）
   のみ。動的 method/path・未知 endpoint・wrapper 迂回・別名参照は FAIL。
+
+fix2（R-CONTRACT-GEN-2-2）:
+- [04] unknown_window の 4xx 分類: 「未作成が確定」と判定してよい status を
+  明示 allowlist（_CS_DEFINITE_REJECTION={400,401,403,404,409,422}・401 は
+  token 再取得 1 回→再試行は再び unknown 窓）に閉じ、allowlist 外の 4xx
+  （408/429 含む）は CloudSignResultUnknown へ倒す。
+- [05] checker の値参照迂回封殺: HTTP クライアント（またはその属性）の
+  値参照・別名束縛（sender = requests.request 等）・getattr 迂回・裸参照を
+  禁止。requests.request の出現は _cs_request 内の Call.func のみ。
 """
 
 import ast
@@ -142,7 +151,12 @@ def cloudsign_effect_violations(tree) -> list[str]:
          （wrapper 迂回・間接呼出しの封殺）。
       3. HTTP クライアント（requests/httpx/urllib/aiohttp/http）の属性
          呼出しは `_cs_request` 関数本体の内側のみ、かつ requests.request
-         のみ許可。from-import・alias import は場所を問わず違反。"""
+         のみ許可。from-import・alias import は場所を問わず違反。
+      4. fix2[05] 値参照の封殺: HTTP クライアント（またはその属性）の
+         Attribute 出現は Call.func としての使用のみ許可（`sender =
+         requests.request` 等の値束縛は違反）。HTTP クライアントの Name
+         出現は Attribute の根としてのみ許可（`r = requests`・
+         `getattr(requests, ...)` 等の裸参照・getattr 迂回は違反）。"""
     violations = []
     cs_req_nodes = set()
     for node in ast.walk(tree):
@@ -152,6 +166,18 @@ def cloudsign_effect_violations(tree) -> list[str]:
                 cs_req_nodes.add(id(sub))
     call_func_ids = {id(n.func) for n in ast.walk(tree)
                      if isinstance(n, ast.Call)}
+    # fix2[05] 用の補助集合: Attribute 連鎖の内側 node／Attribute の根 Name
+    inner_attrs = set()
+    attr_root_names = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute):
+            if isinstance(node.value, ast.Attribute):
+                inner_attrs.add(id(node.value))
+            root = node.value
+            while isinstance(root, ast.Attribute):
+                root = root.value
+            if isinstance(root, ast.Name):
+                attr_root_names.add(id(root))
     for node in ast.walk(tree):
         if isinstance(node, ast.Call):
             f = node.func
@@ -188,6 +214,24 @@ def cloudsign_effect_violations(tree) -> list[str]:
                         violations.append(
                             f"L{node.lineno}: _cs_request 内で許可外の "
                             f"HTTP 呼出し {root.id}.{f.attr}")
+        elif isinstance(node, ast.Attribute) and id(node) not in inner_attrs \
+                and id(node) not in call_func_ids:
+            # fix2[05]: Call.func 以外での HTTP クライアント属性の出現＝
+            # 値参照・別名束縛（sender = requests.request 等）を封殺
+            root = node.value
+            while isinstance(root, ast.Attribute):
+                root = root.value
+            if isinstance(root, ast.Name) and root.id in _HTTP_CLIENT_NAMES:
+                violations.append(
+                    f"L{node.lineno}: HTTP クライアント属性の値参照/"
+                    f"別名束縛 {root.id}.{node.attr}")
+        elif isinstance(node, ast.Name) and node.id in _HTTP_CLIENT_NAMES \
+                and id(node) not in attr_root_names:
+            # fix2[05]: Attribute の根以外での HTTP クライアント Name 出現
+            # ＝裸参照（r = requests）・getattr(requests, ...) 迂回を封殺
+            violations.append(
+                f"L{node.lineno}: HTTP クライアントの裸参照/getattr 迂回 "
+                f"{node.id}")
         elif isinstance(node, ast.Name) and node.id == "_cs_request" \
                 and id(node) not in call_func_ids:
             violations.append(
@@ -586,6 +630,93 @@ class TestAckLossWindow(_CsBase):
             with self.assertRaises(requests.HTTPError):
                 cw._cs_request("POST", "/documents", unknown_window=True)
 
+    def test_4xx_allowlist_definite_vs_unknown(self):
+        # fix2[04]: 確定拒否 allowlist（400/403/404/409/422・401 は token
+        # 再試行経路）のみ通常 HTTPError＝クリーン経路。allowlist 外の 4xx
+        # （408/429 を含む）は結果不明へ倒す
+        for code in (408, 429, 402, 418, 451):
+            with self.subTest(code=code, kind="unknown"):
+                resp = MagicMock(status_code=code)
+                with patch("requests.request",
+                           MagicMock(return_value=resp)), \
+                     patch.object(cloudsign_webhook, "_token",
+                                  _FakeToken()):
+                    with self.assertRaises(cw.CloudSignResultUnknown):
+                        cw._cs_request("POST", "/documents",
+                                       unknown_window=True)
+        for code in (400, 403, 404, 409, 422):
+            with self.subTest(code=code, kind="definite"):
+                resp = MagicMock(status_code=code)
+                resp.raise_for_status.side_effect = requests.HTTPError(
+                    str(code))
+                with patch("requests.request",
+                           MagicMock(return_value=resp)), \
+                     patch.object(cloudsign_webhook, "_token",
+                                  _FakeToken()):
+                    with self.assertRaises(requests.HTTPError):
+                        cw._cs_request("POST", "/documents",
+                                       unknown_window=True)
+
+    def test_408_no_cleanup_no_rollback_no_repost(self):
+        # fix2[04] Codex 指定 negative: 408 → CloudSignResultUnknown＝
+        # 削除・巻き戻しなし。再配送は reconcile → 要確認で POST 増分 0
+        r408 = MagicMock(status_code=408)
+        http = MagicMock(return_value=r408)
+        notify = AsyncMock(return_value=True)
+        update1 = AsyncMock()
+        with patch.dict(os.environ, _ENV), \
+             patch.object(cw.hub_kintone, "get_record",
+                          AsyncMock(return_value=_cs_record())), \
+             patch.object(cw.hub_kintone, "update_record", update1), \
+             patch.object(cloudsign_webhook, "_token", _FakeToken()), \
+             patch("requests.request", http), \
+             patch("hub.notify.notify_admin_line", notify):
+            r1 = _client.post(_URL, json=_body())
+        self.assertEqual(r1.status_code, 500)
+        self.assertEqual(http.call_count, 1)      # 削除 DELETE も出ていない
+        self.assertEqual(update1.await_count, 1)  # CAS のみ・巻き戻しなし
+        self.assertEqual(update1.await_args.args[2],
+                         {"契約書ステータス": "クラウドサイン登録中"})
+
+        record2 = _cs_record(契約書ステータス="クラウドサイン登録中")
+        update2 = AsyncMock()
+        with patch.dict(os.environ, _ENV), \
+             patch.object(cw.hub_kintone, "get_record",
+                          AsyncMock(return_value=record2)), \
+             patch.object(cw.hub_kintone, "update_record", update2), \
+             patch.object(cloudsign_webhook, "_token", _FakeToken()), \
+             patch("requests.request", http), \
+             patch("hub.notify.notify_admin_line", notify):
+            r2 = _client.post(_URL, json=_body())
+        self.assertEqual(r2.json().get("skip"), "cs_needs_review")
+        self.assertEqual(http.call_count, 1)      # POST 増分 0
+        self.assertEqual(update2.await_args.args[2],
+                         {"契約書ステータス": "要確認"})
+
+    def test_definite_rejection_400_clean_rollback(self):
+        # fix2[04] Codex 指定 negative: 確定拒否 status（400 等）のみ
+        # 従来のクリーン巻き戻し（登録へ）＝再配送で自動再試行できる
+        r400 = MagicMock(status_code=400)
+        r400.raise_for_status.side_effect = requests.HTTPError("400")
+        http = MagicMock(return_value=r400)
+        update = AsyncMock()
+        with patch.dict(os.environ, _ENV), \
+             patch.object(cw.hub_kintone, "get_record",
+                          AsyncMock(return_value=_cs_record())), \
+             patch.object(cw.hub_kintone, "update_record", update), \
+             patch.object(cloudsign_webhook, "_token", _FakeToken()), \
+             patch("requests.request", http), \
+             patch("hub.notify.notify_admin_line",
+                   AsyncMock(return_value=True)):
+            r = _client.post(_URL, json=_body())
+        self.assertEqual(r.status_code, 500)
+        self.assertEqual(http.call_count, 1)      # 未作成確定＝掃除不要
+        self.assertEqual(update.await_count, 2)   # CAS+クリーン巻き戻し
+        rollback = update.await_args_list[1]
+        self.assertEqual(rollback.args[2],
+                         {"契約書ステータス": "クラウドサイン登録"})
+        self.assertEqual(rollback.kwargs.get("revision"), "6")
+
     def test_token_failure_before_post_is_clean(self):
         # 到達前（POST 未実行が確定）はそのまま伝播＝クリーン巻き戻し可
         req = MagicMock()
@@ -730,6 +861,17 @@ class TestCloudSignEffectClosure(unittest.TestCase):
             "_cs_request 内の許可外呼出し":
                 'def _cs_request(m, p):\n    import requests\n'
                 '    return requests.post(u)',
+            # fix2[05]: 値参照・別名束縛（_cs_request 内でも Call.func 以外
+            # の requests.request 出現は違反）
+            "値束縛（sender = requests.request）":
+                'def _cs_request(m, p):\n    import requests\n'
+                '    sender = requests.request\n    return sender(m, u)',
+            "モジュール階層の値束縛":
+                'import requests\nsender = requests.request',
+            "getattr 迂回":
+                'def f():\n    import requests\n'
+                '    g = getattr(requests, "post")\n    return g(u)',
+            "裸参照（r = requests）": "import requests\nr = requests",
         }
         for label, src in cases.items():
             with self.subTest(case=label):
