@@ -12,6 +12,17 @@
   端数切捨て）。grammar 外は空欄+備考に明示（field は設けない）
 - 小計 4+総合計（= A+B+C−D・原本の式と同じ構成）はサーバ側 Python int
   集計。セル式は持たせない（verify が式の不在も検査）
+
+ZAISAN-GEN-2（大野裁定・下書き生成）:
+- 生成条件は「有効な財産レコード 1 件以上」のみ（評価確定=yes の全件要求を
+  生成条件から外す）。ただし「機械は確定しない」は維持——評価確定≠yes の
+  行は備考へ「※評価未確定」を自動追記し、未確定行が 1 つでもあれば
+  ①表題直上の空き行（B1:K1 結合・原本の余白行）へ下書きバナーを表示
+  ②算定できた小計・総合計の隣（J 列=注記欄）へ「（暫定）」を表示。
+  金額セルは int のまま（暫定表示は注記欄に置き、検証水準を落とさない）。
+- 全件確定+全金額入力なら従来どおり注記なしの完成版（現行検証水準のまま）。
+- verify は下書きモードも対レコード照合（未確定注記・バナー・暫定表示を
+  閉集合として照合）。
 """
 
 import hashlib
@@ -24,7 +35,6 @@ from openpyxl import load_workbook
 
 from config import get_office_info
 from hub.docx_builder import to_wareki
-from units.souzoku.guards import ensure_valuations_confirmed
 from units.souzoku.zaisan_mokuroku import (
     ZaisanMokurokuError, _classify, _fudousan_row, _val, _yokin_row)
 
@@ -49,6 +59,27 @@ NOTE_B = "相続開始時残高が未入力の行があるため小計は算定�
 NOTE_CD = "金額が未入力の行があるため小計は算定していません"
 NOTE_TOTAL = "小計に算定不能があるため総合計は算定していません"
 NOTE_MOCHIBUN = "持分評価格は自動算定できません（持分の書式外）"
+# ZAISAN-GEN-2: 下書きモードの明示（弁護士確定は人の行為のまま＝機械は
+# 確定しない。確定版と紛れない見た目を注記欄・余白行で実現し体裁は不変）
+NOTE_UNCONFIRMED = "※評価未確定"
+DRAFT_BANNER = "【下書き・評価未確定の項目があります】"
+PROVISIONAL_MARK = "（暫定）"
+
+
+def _is_unconfirmed(record: dict) -> bool:
+    return _val(record, "評価確定") != "yes"
+
+
+def count_unconfirmed(records: list[dict]) -> int:
+    """評価確定≠yes の行数（webhook の生成通知が下書き/完成版の明記に使う）。"""
+    return sum(1 for r in records if _is_unconfirmed(r))
+
+
+def _note_with_flags(record: dict, note: str) -> str:
+    """行の備考へ未確定注記を自動追記（GEN-2・既存注記とは「／」連結）。"""
+    if _is_unconfirmed(record):
+        note = f"{note}／{NOTE_UNCONFIRMED}" if note else NOTE_UNCONFIRMED
+    return note
 
 _MOCHIBUN_KANJI = re.compile(r"(\d+)分の(\d+)")
 _MOCHIBUN_SLASH = re.compile(r"(\d+)/(\d+)")
@@ -122,7 +153,8 @@ def _a_row(record: dict) -> tuple[dict, int | None]:
         effective = hyoka
     cells = {3: base["所在"], 4: base["地番家屋番号"], 5: base["地目種別"],
              6: base["地積床面積"], 7: base["持分"], 8: hyoka, 9: share,
-             10: note, 11: _val(record, "資料番号")}
+             10: _note_with_flags(record, note),
+             11: _val(record, "資料番号")}
     return cells, effective
 
 
@@ -135,7 +167,8 @@ def _b_row(record: dict) -> tuple[dict, int | None]:
     start = _int_or_none(record, "相続開始時残高")
     now = _int_or_none(record, "現在残高")
     cells = {3: bank, 4: base["種別"], 5: base["口座番号"], 8: start, 9: now,
-             10: _val(record, "備考"), 11: _val(record, "資料番号")}
+             10: _note_with_flags(record, _val(record, "備考")),
+             11: _val(record, "資料番号")}
     return cells, start
 
 
@@ -145,7 +178,8 @@ def _cd_row(record: dict, company_col: int) -> tuple[dict, int | None]:
     amount = _int_or_none(record, "評価額")
     cells = {3: _val(record, "財産種別"),
              company_col: _val(record, "特定情報") or None,
-             9: amount, 10: _val(record, "備考"),
+             9: amount,
+             10: _note_with_flags(record, _val(record, "備考")),
              11: _val(record, "資料番号")}
     return cells, amount
 
@@ -228,7 +262,8 @@ def build_zaisan_xlsx(records: list[dict], *,
     if not records:
         raise ZaisanMokurokuError(
             "財産行が0件です（App 財産に案件の財産が登録されていません）")
-    ensure_valuations_confirmed(records)
+    # ZAISAN-GEN-2 裁定: 生成条件は「有効な財産行 1 件以上」のみ
+    # （評価確定の全件要求は生成条件から外し、下書きモードで明示する）
     verify_template_integrity()
 
     fud, yok, son, sai = _classify(records)
@@ -258,6 +293,12 @@ def build_zaisan_xlsx(records: list[dict], *,
     _write_section(ws, ROW_C + oa + ob, [x[0] for x in c])
     _write_section(ws, ROW_D + oa + ob + oc, [x[0] for x in d])
 
+    # ZAISAN-GEN-2: 未確定行が 1 つでもあれば下書きモード——表題直上の
+    # 余白行（B1:K1 結合・原本の空行）へバナー、算定できた小計・総合計の
+    # 注記欄（J 列）へ「（暫定）」。金額セルは int のまま（検証水準不変）
+    draft = any(_is_unconfirmed(r) for r in records)
+    if draft:
+        ws.cell(row=1, column=2).value = DRAFT_BANNER
     subs = {}
     for key, rows, sub_row, note in (
             ("A", a, SUB_A + oa, NOTE_A),
@@ -270,12 +311,16 @@ def build_zaisan_xlsx(records: list[dict], *,
             ws.cell(row=sub_row, column=_COL_NOTE).value = note
         else:
             ws.cell(row=sub_row, column=_COL_SUB).value = sub
+            if draft:
+                ws.cell(row=sub_row, column=_COL_NOTE).value =                     PROVISIONAL_MARK
     total_row = ROW_TOTAL + oa + ob + oc + od
     if any(v is None for v in subs.values()):
         ws.cell(row=total_row, column=_COL_NOTE).value = NOTE_TOTAL
     else:
         ws.cell(row=total_row, column=_COL_SUB).value = (
             subs["A"] + subs["B"] + subs["C"] - subs["D"])
+        if draft:
+            ws.cell(row=total_row, column=_COL_NOTE).value = PROVISIONAL_MARK
 
     # 見出し差し込み（テンプレの {{...}} を置換）
     name = decedent_name or next(
@@ -322,6 +367,9 @@ def verify_zaisan_xlsx(xlsx_bytes: bytes, records: list[dict]) -> None:
       元データとの不一致として拒否される
     - fix1[04] レイアウト: 可変行数から決定的に算出した最終結合レンジ集合
       （_merge_ranges・builder と単一の正）と merged_cells の完全一致
+    - GEN-2 下書きモード: 未確定注記（備考・行投影に含む）・下書きバナー
+      （B1）・暫定表示（小計/総合計の J 列）も閉集合として照合——完成版に
+      バナー/暫定が付くこと・下書きに欠けることの両方向を拒否
     """
     fud, yok, son, sai = _classify(records)
     a = [_a_row(r) for r in fud]
@@ -341,6 +389,10 @@ def verify_zaisan_xlsx(xlsx_bytes: bytes, records: list[dict]) -> None:
     got_merges = {str(r) for r in ws.merged_cells.ranges}
     if got_merges != set(_merge_ranges(na, nb, nc, nd)):
         raise ZaisanXlsxIntegrityError("merge ranges mismatch")
+    draft = any(_is_unconfirmed(r) for r in records)
+    banner = ws.cell(row=1, column=2).value
+    if banner != (DRAFT_BANNER if draft else None):
+        raise ZaisanXlsxIntegrityError("draft banner mismatch")
 
     sections = (
         ("A", ROW_A, a, (8, 9)),
@@ -383,13 +435,21 @@ def verify_zaisan_xlsx(xlsx_bytes: bytes, records: list[dict]) -> None:
             if got is not None or not note:
                 raise ZaisanXlsxIntegrityError(
                     f"subtotal {key}: expected uncomputable note")
-        elif got != subs[key]:
-            raise ZaisanXlsxIntegrityError(f"subtotal {key} mismatch")
+        else:
+            if got != subs[key]:
+                raise ZaisanXlsxIntegrityError(f"subtotal {key} mismatch")
+            # GEN-2: 暫定表示の閉集合照合（下書き=（暫定）・完成版=空）
+            if note != (PROVISIONAL_MARK if draft else None):
+                raise ZaisanXlsxIntegrityError(
+                    f"subtotal {key}: provisional mark mismatch")
     total_row = ROW_TOTAL + oa + ob + oc + od
     got_total = ws.cell(row=total_row, column=_COL_SUB).value
+    total_note = ws.cell(row=total_row, column=_COL_NOTE).value
     if any(v is None for v in subs.values()):
-        if got_total is not None or not ws.cell(row=total_row,
-                                                column=_COL_NOTE).value:
+        if got_total is not None or not total_note:
             raise ZaisanXlsxIntegrityError("total: expected uncomputable note")
-    elif got_total != subs["A"] + subs["B"] + subs["C"] - subs["D"]:
-        raise ZaisanXlsxIntegrityError("total mismatch")
+    else:
+        if got_total != subs["A"] + subs["B"] + subs["C"] - subs["D"]:
+            raise ZaisanXlsxIntegrityError("total mismatch")
+        if total_note != (PROVISIONAL_MARK if draft else None):
+            raise ZaisanXlsxIntegrityError("total: provisional mark mismatch")

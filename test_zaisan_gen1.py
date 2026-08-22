@@ -59,7 +59,6 @@ from config import EXPECTED_KINTONE_SCHEMA  # noqa: E402
 from hub.kintone import KintoneError  # noqa: E402
 from make_zaisan_xlsx_template import CANON_MERGES  # noqa: E402
 from units.souzoku import zaisan_xlsx as zx  # noqa: E402
-from units.souzoku.guards import ValuationNotConfirmed  # noqa: E402
 from units.souzoku.zaisan_mokuroku import ZaisanMokurokuError  # noqa: E402
 
 _client = TestClient(main.app)
@@ -300,11 +299,17 @@ class TestFailClosed(unittest.TestCase):
         with self.assertRaises(ZaisanMokurokuError):
             zx.build_zaisan_xlsx([])
 
-    def test_unconfirmed_valuation_rejected(self):
+    def test_unconfirmed_valuation_builds_draft(self):
+        # ZAISAN-GEN-2 裁定由来の期待値変更: 評価確定の全件要求は生成条件から
+        # 外れ、未確定行があっても「下書き」（バナー+行注記+暫定表示）として
+        # 生成される（拒否しない）。詳細検証は test_zaisan_gen2.py
         records = _sample_records()
         records[2]["評価確定"] = {"value": "no"}
-        with self.assertRaises(ValuationNotConfirmed):
-            zx.build_zaisan_xlsx(records)
+        with patch.dict(os.environ, _ENV):
+            data = zx.build_zaisan_xlsx(records)
+        ws = load_workbook(io.BytesIO(data)).active
+        self.assertEqual(ws["B1"].value, zx.DRAFT_BANNER)
+        zx.verify_zaisan_xlsx(data, records)
 
     def test_template_hash_mismatch_rejected(self):
         with patch.object(zx, "TEMPLATE_SHA256", "0" * 64):
@@ -521,7 +526,9 @@ class TestWebhookStateMachine(_WebhookBase):
         zx.verify_zaisan_xlsx(data, _sample_records())
         ws = load_workbook(io.BytesIO(data)).active
         self.assertEqual(ws["C3"].value, "被相続人　試験太郎")
-        notify.assert_not_awaited()
+        # ZAISAN-GEN-2 裁定由来: 生成通知（完成版の明記）が 1 回入る
+        notify.assert_awaited_once()
+        self.assertIn("完成版として生成", notify.await_args.args[0])
 
     def test_cas_loser_zero_effects(self):
         loser = AsyncMock(side_effect=KintoneError(409, "GAIA_CO02"))
@@ -549,7 +556,9 @@ class TestWebhookStateMachine(_WebhookBase):
         self.assertEqual(upload.await_count, 1)
         self.assertEqual(update.await_args_list[1].kwargs.get("revision"),
                          "8")
-        notify.assert_not_awaited()
+        # ZAISAN-GEN-2 裁定由来: 回収成功時も生成通知（完成版）が入る
+        notify.assert_awaited_once()
+        self.assertIn("完成版として生成", notify.await_args.args[0])
 
     def test_working_with_attachment_goes_review(self):
         record = _case_record(財産目録ステータス="財産目録作成中")
@@ -582,16 +591,21 @@ class TestWebhookFailClosed(_WebhookBase):
         self.assertIn("財産行が0件", sent)
         self.assertNotIn("試験", sent)           # PII 非搭載
 
-    def test_unconfirmed_valuation_rejected(self):
+    def test_unconfirmed_generates_draft_with_notice(self):
+        # ZAISAN-GEN-2 裁定由来の期待値変更: 評価未確定は拒否せず下書きとして
+        # 生成し、通知に「下書き（評価未確定 N 件）」を明記する
         records = _sample_records()
         records[0]["評価確定"] = {"value": "no"}
         r, upload, update, notify, _g = self._post(
             record=_case_record(), zaisan=records)
-        self.assertEqual(r.json().get("skip"), "not_ready")
-        upload.assert_not_awaited()
-        update.assert_not_awaited()
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json().get("record_id"), "7")
+        upload.assert_awaited_once()
+        zx.verify_zaisan_xlsx(upload.await_args.args[2], records)
         notify.assert_awaited_once()
-        self.assertIn("評価確定", notify.await_args.args[0])
+        sent = notify.await_args.args[0]
+        self.assertIn("下書き（評価未確定 1 件）", sent)
+        self.assertNotIn("試験", sent)           # PII 非搭載
 
 
 class TestSchemaPin(unittest.TestCase):
