@@ -370,6 +370,9 @@ def verify_zaisan_xlsx(xlsx_bytes: bytes, records: list[dict]) -> None:
     - GEN-2 下書きモード: 未確定注記（備考・行投影に含む）・下書きバナー
       （B1）・暫定表示（小計/総合計の J 列）も閉集合として照合——完成版に
       バナー/暫定が付くこと・下書きに欠けることの両方向を拒否
+    - GEN2-fix1: 集計不能時の注記欄は部ごとの期待注記（A=NOTE_A/B=NOTE_B/
+      C・D=NOTE_CD/総合計=NOTE_TOTAL）と完全一致（draft/final とも不変＝
+      集計不能注記が暫定表示に優先。PROVISIONAL_MARK や任意文字列は拒否）
     """
     fud, yok, son, sai = _classify(records)
     a = [_a_row(r) for r in fud]
@@ -426,15 +429,19 @@ def verify_zaisan_xlsx(xlsx_bytes: bytes, records: list[dict]) -> None:
                             f"unexpected value in empty section {key}")
         subs[key] = _subtotal([x[1] for x in rows])
 
+    # GEN2-fix1（ZAISAN-GEN2-01）: 集計不能注記は部ごとの期待注記との
+    # **完全一致**で照合（非空存在検査を廃止）。期待値は draft/final で
+    # 不変＝集計不能注記が PROVISIONAL_MARK に優先する
+    expected_notes = {"A": NOTE_A, "B": NOTE_B, "C": NOTE_CD, "D": NOTE_CD}
     for key, sub_row in (("A", SUB_A + oa), ("B", SUB_B + oa + ob),
                          ("C", SUB_C + oa + ob + oc),
                          ("D", SUB_D + oa + ob + oc + od)):
         got = ws.cell(row=sub_row, column=_COL_SUB).value
         note = ws.cell(row=sub_row, column=_COL_NOTE).value
         if subs[key] is None:
-            if got is not None or not note:
+            if got is not None or note != expected_notes[key]:
                 raise ZaisanXlsxIntegrityError(
-                    f"subtotal {key}: expected uncomputable note")
+                    f"subtotal {key}: uncomputable note mismatch")
         else:
             if got != subs[key]:
                 raise ZaisanXlsxIntegrityError(f"subtotal {key} mismatch")
@@ -446,8 +453,9 @@ def verify_zaisan_xlsx(xlsx_bytes: bytes, records: list[dict]) -> None:
     got_total = ws.cell(row=total_row, column=_COL_SUB).value
     total_note = ws.cell(row=total_row, column=_COL_NOTE).value
     if any(v is None for v in subs.values()):
-        if got_total is not None or not total_note:
-            raise ZaisanXlsxIntegrityError("total: expected uncomputable note")
+        if got_total is not None or total_note != NOTE_TOTAL:
+            raise ZaisanXlsxIntegrityError(
+                "total: uncomputable note mismatch")
     else:
         if got_total != subs["A"] + subs["B"] + subs["C"] - subs["D"]:
             raise ZaisanXlsxIntegrityError("total mismatch")

@@ -149,6 +149,65 @@ class TestDraftVerifyNegatives(unittest.TestCase):
             zx.verify_zaisan_xlsx(data, _sample_records())
 
 
+class TestUncomputableNoteExactMatch(unittest.TestCase):
+    """GEN2-fix1（ZAISAN-GEN2-01）: 集計不能注記の完全一致照合。
+    期待注記は draft/final で不変＝集計不能が暫定表示に優先。"""
+
+    def _b_uncomputable(self, draft: bool):
+        records = _draft_records() if draft else _sample_records()
+        records[3]["相続開始時残高"] = {"value": ""}   # B 部を集計不能に
+        return records
+
+    def _tampered(self, records, mutate):
+        with patch.dict(os.environ, _ENV):
+            data = zx.build_zaisan_xlsx(records)
+        wb = load_workbook(io.BytesIO(data))
+        mutate(wb.active)
+        buf = io.BytesIO()
+        wb.save(buf)
+        return buf.getvalue()
+
+    def test_note_cells_rejected_unless_exact(self):
+        # Codex 指定形: draft/final × B 小計注記（暫定/任意文字列）・
+        # draft/final × 総合計注記（暫定）→ すべて拒否
+        cases = [
+            ("draft_B_provisional", True, "J13", zx.PROVISIONAL_MARK),
+            ("draft_B_arbitrary", True, "J13", "確認中です"),
+            ("final_B_provisional", False, "J13", zx.PROVISIONAL_MARK),
+            ("final_B_arbitrary", False, "J13", "確認中です"),
+            ("draft_total_provisional", True, "J25", zx.PROVISIONAL_MARK),
+            ("final_total_provisional", False, "J25", zx.PROVISIONAL_MARK),
+        ]
+        for label, draft, cell, value in cases:
+            with self.subTest(case=label):
+                records = self._b_uncomputable(draft)
+                data = self._tampered(
+                    records, lambda ws: ws.__setitem__(cell, value))
+                with self.assertRaises(zx.ZaisanXlsxIntegrityError):
+                    zx.verify_zaisan_xlsx(data, records)
+
+    def test_canonical_notes_pass(self):
+        # 対照: 所定の NOTE_B・NOTE_TOTAL（builder 出力そのまま）は
+        # draft/final とも通過
+        for draft in (True, False):
+            with self.subTest(draft=draft):
+                records = self._b_uncomputable(draft)
+                with patch.dict(os.environ, _ENV):
+                    data = zx.build_zaisan_xlsx(records)
+                ws = load_workbook(io.BytesIO(data)).active
+                self.assertEqual(ws["J13"].value, zx.NOTE_B)
+                self.assertEqual(ws["J25"].value, zx.NOTE_TOTAL)
+                zx.verify_zaisan_xlsx(data, records)
+
+    def test_note_removed_rejected(self):
+        # 注記の消去（非空→空）も完全一致で拒否
+        records = self._b_uncomputable(True)
+        data = self._tampered(records,
+                              lambda ws: ws.__setitem__("J13", None))
+        with self.assertRaises(zx.ZaisanXlsxIntegrityError):
+            zx.verify_zaisan_xlsx(data, records)
+
+
 class TestWebhookDraftNotice(_WebhookBase):
     def test_draft_notice_counts(self):
         records = _draft_records()
