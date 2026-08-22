@@ -936,19 +936,26 @@ async def _save_image_inbound(user_id: str, idem_key: str) -> str:
     })
 
 
+class ImageWinnerUnknownError(RuntimeError):
+    """fix2[03]: 勝者照会の失敗＝勝者を確定できない。fail-closed——顧客へは
+    送信せず例外化し、失敗通知（要確認・人回収）へ倒す（二重送信の可能性を
+    残すより無応答+人回収を選ぶ）。"""
+
+
 async def _image_claim_winner(idem_key: str, my_id: str) -> bool:
-    """fix1[03]: 並行 2 配送の勝者決定（同一冪等キー行の最小 $id が勝者）。
-    kintone に一意制約が無いため保存後の再照会で決定的に絞る。照会失敗は
-    True（単独配送が通常のため・報告済みの残余）。"""
+    """fix1[03]+fix2[03]: 並行 2 配送の勝者決定（同一冪等キー行の最小 $id が
+    勝者）。kintone に一意制約が無いため保存後の再照会で決定的に絞る。
+    照会失敗・自行不可視（保存直後に行が見えない不整合）は勝者を確定
+    できない＝ImageWinnerUnknownError（送信 0・失敗通知）。"""
     try:
         rows = await hub_kintone.search_records(
             _APP_CHATLOG_KT,
             f'category = "{idem_key}" order by $id asc limit 1',
             fields=["$id"])
-    except Exception:
-        return True
+    except Exception as e:
+        raise ImageWinnerUnknownError("winner query failed") from e
     if not rows:
-        return True
+        raise ImageWinnerUnknownError("winner row missing after save")
     return str((rows[0].get("$id") or {}).get("value") or "") == str(my_id)
 
 
@@ -976,7 +983,9 @@ async def _process_line_image_event(reply_token: str, user_id: str,
          （返信・記録・通知いずれも重複させない）
       2. 受信マーカーを strict 保存（失敗＝返信せず例外→失敗通知で人回収）
       3. 並行 2 配送は保存後の再照会で勝者決定（最小 $id のみ返信・通知。
-         敗者は作用 0——受信行は最大 2 件残り得るが効果は 1 回）
+         敗者は作用 0——受信行は最大 2 件残り得るが効果は 1 回）。
+         fix2[03]: 勝者照会の失敗＝勝者不明は fail-closed（送信 0・例外→
+         失敗通知=要確認・人回収）
       4. 返信成功後の assistant 記録・通知は best-effort（再配送重複は
          マーカーが防ぐ）
     失敗時の各状態は fix1 完了報告に列挙（marker 保存後の返信失敗は

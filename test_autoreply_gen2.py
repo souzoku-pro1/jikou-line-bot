@@ -46,6 +46,9 @@ import main  # noqa: E402
 from hub import reply_sanitizer as rs  # noqa: E402
 
 
+NL_ = chr(10)
+
+
 def _run(coro):
     return asyncio.run(coro)
 
@@ -128,6 +131,24 @@ class TestSanitizer(unittest.TestCase):
                                     exempt_blocks=(block,))
         self.assertTrue(v and "文字数超過" in v[0])
         v = rs.structure_violations("━━━━" + "あ" * 301)
+        self.assertTrue(v and "文字数超過" in v[0])
+
+    def test_block_exemption_capped_at_once(self):
+        # fix2[01]: 各確定ブロックの免除は最大 1 回。同一ブロックの 2 回目
+        # 以降は自由文として検査（実ブロック=320 字なので 2 回目で上限超）。
+        # 2 種類の正規ブロックを各 1 回使う組合せは許可
+        b0, b1 = main.HEARING_TEMPLATE_BLOCKS[:2]
+        blocks = main.HEARING_TEMPLATE_BLOCKS
+        v = rs.structure_violations(b0 + NL_ + b0, exempt_blocks=blocks)
+        self.assertTrue(v and "文字数超過" in v[0])       # 同一 2 回 → 降格
+        v = rs.structure_violations(b0 + b0 + b0, exempt_blocks=blocks)
+        self.assertTrue(v and "文字数超過" in v[0])       # 同一 3 回 → 降格
+        self.assertEqual(rs.structure_violations(
+            b0 + NL_ + b1, exempt_blocks=blocks), [])     # 2 種各 1 回は許可
+        self.assertEqual(rs.structure_violations(
+            b0 + NL_ + "あ" * 300, exempt_blocks=blocks), [])
+        v = rs.structure_violations(b0 + NL_ + "あ" * 301,
+                                    exempt_blocks=blocks)
         self.assertTrue(v and "文字数超過" in v[0])
 
     def test_max_chars_env_adjustable(self):
@@ -299,6 +320,8 @@ class _FakeChatlog:
     def __init__(self):
         self.rows = []
         self._id = 0
+        self.search_fail_times = 0      # 次の n 回の search を失敗させる
+        self.search_always_fail = False
 
     async def create(self, app, fields):
         self._id += 1
@@ -306,6 +329,11 @@ class _FakeChatlog:
         return str(self._id)
 
     async def search(self, app, query, fields=None):
+        if self.search_always_fail:
+            raise RuntimeError("search down")
+        if self.search_fail_times:
+            self.search_fail_times -= 1
+            raise RuntimeError("search down")
         import re as _re
         m = _re.search('category = "([^"]+)"', query)
         rows = [r for r in self.rows if r.get("category") == m.group(1)]
@@ -417,6 +445,88 @@ class TestImageEvent(_AsyncBase):
         r2, _l2, n2 = self._run_image(self._patches(record))
         r2.assert_not_awaited()
         n2.assert_not_awaited()
+        self.assertEqual(len(self.store.rows), 1)
+
+    def _stack(self, record=None):
+        from contextlib import ExitStack
+        st = ExitStack()
+        mocks = [st.enter_context(x) for x in self._patches(record)]
+        return st, mocks   # mocks[2]=reply, mocks[4]=notify
+
+    def test_true_concurrent_double_delivery_barrier(self):
+        # fix2[03] 実並行: 両タスクが pre-check 通過後に保存へ進む barrier 形。
+        # 勝者（最小 $id）のみ返信・通知＝合計 1 回・受信行 2 件
+        import asyncio as aio
+
+        async def scenario():
+            st, mocks = self._stack()
+            with st:
+                barrier = aio.Barrier(2)
+                real_already = main._image_already_handled
+
+                async def gated(idem_key):
+                    res = await real_already(idem_key)
+                    await barrier.wait()   # 両者の pre-check 通過を同期
+                    return res
+
+                from unittest.mock import patch as _patch
+                with _patch.object(main, "_image_already_handled", gated):
+                    await aio.gather(
+                        main._process_line_image_event(
+                            "tok1", self.user, "evt-cc"),
+                        main._process_line_image_event(
+                            "tok2", self.user, "evt-cc"))
+                return mocks[2].await_count, mocks[4].await_count
+
+        replies, notifies = _run(scenario())
+        self.assertEqual(replies, 1)
+        self.assertEqual(notifies, 1)
+        self.assertEqual(len(self.store.rows), 2)
+
+    def test_winner_query_one_side_failure(self):
+        # fix2[03] negative: 勝者照会の片側失敗→その側は送信 0+要確認通知・
+        # もう片側（勝者）は送信 1 回=合計 1 回
+        with patch.object(main, "_image_already_handled",
+                          AsyncMock(return_value=False)):
+            r1, _l1, n1 = self._run_image(self._patches(),
+                                          event_id="evt-w1")
+            r1.assert_awaited_once()
+            self.store.search_fail_times = 1
+            st, mocks = self._stack()
+            with st:
+                with self.assertRaises(main.ImageWinnerUnknownError):
+                    _run(main._process_line_image_event(
+                        "tok2", self.user, "evt-w1"))
+                mocks[2].assert_not_awaited()          # 送信 0
+                mocks[4].assert_awaited_once()         # 要確認通知
+                self.assertIn("要確認", mocks[4].await_args.args[1])
+
+    def test_winner_query_both_sides_failure(self):
+        # fix2[03] negative: 両側失敗→送信 0 回+要確認通知（fail-closed）
+        with patch.object(main, "_image_already_handled",
+                          AsyncMock(return_value=False)):
+            for token in ("tok1", "tok2"):
+                self.store.search_fail_times = 1
+                st, mocks = self._stack()
+                with st:
+                    with self.assertRaises(main.ImageWinnerUnknownError):
+                        _run(main._process_line_image_event(
+                            token, self.user, "evt-w2"))
+                    mocks[2].assert_not_awaited()
+                    mocks[4].assert_awaited_once()
+        self.assertEqual(len(self.store.rows), 2)      # 行は残る=回収可能
+
+    def test_precheck_fail_plus_winner_fail(self):
+        # fix2[03] negative: pre-check 失敗（False へ縮退）+勝者照会失敗→
+        # 保存は成功・送信 0+要確認通知
+        self.store.search_always_fail = True
+        st, mocks = self._stack()
+        with st:
+            with self.assertRaises(main.ImageWinnerUnknownError):
+                _run(main._process_line_image_event(
+                    "tok", self.user, "evt-w3"))
+            mocks[2].assert_not_awaited()
+            mocks[4].assert_awaited_once()
         self.assertEqual(len(self.store.rows), 1)
 
     def test_pause_gate_with_event_id(self):

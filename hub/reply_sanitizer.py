@@ -109,7 +109,7 @@ def structure_violations(text: str, *, max_chars: int | None = None,
                          exempt_blocks: tuple[str, ...] = ()) -> list[str]:
     """長さ・構成の検査（要件2）。違反分類のリストを返す（空=適合）。
 
-    fix1[01]: 「罫線（━━━━）を含めば長さ免除」を廃止。免除は
+    fix1[01]+fix2[01]: 「罫線（━━━━）を含めば長さ免除」を廃止。免除は
     **サーバ側が保持する確定定型ブロック（exempt_blocks）との逐語一致**のみ
     ——一致したブロックを本文から除いた**自由文部分**に通常上限（文字数・
     質問数とも）を適用する。罫線だけ混ぜた自由文は免除されない。
@@ -118,8 +118,11 @@ def structure_violations(text: str, *, max_chars: int | None = None,
     limit = max_chars if max_chars is not None else max_auto_chars()
     remainder = text
     for block in exempt_blocks:
-        if block and block in remainder:
-            remainder = remainder.replace(block, "")
+        if block:
+            # fix2[01]: 各確定ブロックの免除は**最大 1 回**。同一ブロックの
+            # 2 回目以降は自由文として検査対象に残す（=実質承認降格）。
+            # 2 種類の正規ブロックを各 1 回使う組合せは許可
+            remainder = remainder.replace(block, "", 1)
     violations = []
     free_len = len(remainder.strip())   # ブロック除去痕の前後空白は数えない
     if free_len > limit:
