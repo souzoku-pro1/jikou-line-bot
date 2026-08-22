@@ -8,6 +8,9 @@ requests
 stripe
 reportlab
 pymupdf
+# ── ZAISAN-GEN-1 財産目録 xlsx 生成（大野書式テンプレの行差し込み。セル式を
+#    持たせずサーバ側 int 集計で描画するため openpyxl を直接依存化）──
+openpyxl
 # ── P5-001 条項ライブラリ（裁定 2026-07-27: repo 内 YAML 正式採用・直接依存化）──
 pyyaml
 # ── DB基盤（P1-004・O-01 PostgreSQL）。追加分のみ==固定（既存行の固定化は別タスク）──

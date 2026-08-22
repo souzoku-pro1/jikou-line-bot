@@ -232,7 +232,10 @@ class TestApp35Schema(unittest.TestCase):
         self.assertEqual(self.app35["token_env"], "TOKEN_ZAISAN")
 
     def test_field_count_is_19(self):
-        self.assertEqual(len(self.app35["fields"]), 19)
+        # ZAISAN-GEN-1（CU 適用前 merge・App36 P3-003b と同型の順序）:
+        # 資料番号／相続開始時残高／現在残高 の 3 field 追加で 19→22
+        # （時点ピンの追随は正当・財産目録 xlsx の列充足用）
+        self.assertEqual(len(self.app35["fields"]), 22)
 
     def test_is_optional(self):
         self.assertIs(self.app35.get("optional"), True)

@@ -30,6 +30,7 @@ from registry_ingest import router as registry_ingest_router
 from bank_ingest import router as bank_ingest_router
 from sortation_ingest import router as sortation_ingest_router
 from valuation_ingest import router as valuation_ingest_router
+from zaisan_webhook import router as zaisan_router
 app.include_router(cloudsign_router)
 app.include_router(contract_router)
 app.include_router(document_router)
@@ -40,6 +41,7 @@ app.include_router(registry_ingest_router)
 app.include_router(bank_ingest_router)
 app.include_router(sortation_ingest_router)
 app.include_router(valuation_ingest_router)
+app.include_router(zaisan_router)
 
 from chat_responder import (
     get_app21_record,
