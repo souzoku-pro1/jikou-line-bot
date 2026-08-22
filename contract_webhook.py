@@ -27,17 +27,54 @@
   - {{対象債権者1}}=問い合わせ業者名・{{対象債権者2}}/{{対象債権者3}}=新設 field
   - 空き枠・契約年月日は全角空白（原本の体裁維持・契約日は締結時確定が既定）
 
-スコープ外: CloudSign 送信 API 結線（第2版・P5）・PDF 自動変換。
+第2版（CONTRACT-GEN-2・PDF 化+CloudSign 自動登録）:
+  クラウドサイン登録 --（CAS: 登録→登録中）--> クラウドサイン登録中
+    --（PDF 生成+凍結検証 → CloudSign 書類作成+PDF 添付+宛先追加
+        → doc id 書き戻し PUT〔revision=claim+1〕）--> クラウドサイン登録済
+  前提未充足（docx 未添付/メールアドレス欠落・形式不正/v1 必須欠落）
+      → 変更なし（不足フィールド名のみ通知・値は非搭載）
+  CloudSign 途中失敗 → 下書き削除（部分状態を残さない）＋掃除成功時のみ
+      ステータス巻き戻し（登録中→登録）→ 500 で kintone 再配送=自動再試行。
+      掃除失敗時は巻き戻さず 500 → 再配送は下記 reconcile で「要確認」へ
+  書類作成 POST の結果不明（fix1[01] ACK 喪失窓: POST 開始後の transport
+      例外・5xx・確定拒否 allowlist 外の 4xx〔408/429 等・fix2[04]〕・
+      id 欠落）→ 下書きが存在し得るため巻き戻し・再作成とも禁止
+      （CloudSignResultUnknown）。「登録中」維持 → reconcile で「要確認」。
+      「POST 到達前の失敗（token 取得等）」と「確定拒否 status
+      （_CS_DEFINITE_REJECTION）」のみ従来のクリーン巻き戻しを許可
+      （_cs_request の unknown_window が実装上の区別）
+  クラウドサイン登録中（reconcile） → CloudSign 側に下書きが残り得る（外部
+      状態）ため自動再実行はせず常に CAS で「要確認」+管理者通知（fail-closed・
+      v1 の添付有無分岐と異なる点は二重下書き防止のため）
+  クラウドサイン登録済 → already_done skip（冪等化）
+
+CloudSign 連携の一線（裁定済み方針）:
+  - 呼ぶのは 書類作成（POST /documents）・PDF 添付（POST .../files）・
+    宛先追加（POST .../participants）・下書き削除（DELETE、掃除時のみ）。
+  - 送信 API（PUT /documents/{id}）は呼ばない。送信操作は大野が CloudSign
+    画面で行う（対外効果の一線）。テストが source 走査で PUT 不在を pin。
+
+PDF 化の設計（CONTRACT-GEN-2 条件）:
+  - テンプレ docx を単一の正とし、fill_template 済み docx の段落を
+    contract_pdf が描画（本文をコードに二重管理しない）。
+  - 生成 PDF の抽出テキストに対し第1版同水準の凍結検証を実行時に行う
+    （verify_frozen_pdf: 第2条逐語一致〔全空白除去後の連続部分列〕+
+    差し込みキー残存なし。不一致は登録せず 500）。
+
+スコープ外: CloudSign 送信 API の呼び出し・締結後処理（既存
+cloudsign_webhook が cloudsign_document_id で照合して担う）。
 """
 
 import hashlib
 import io
 import logging
+import re
 
 from docx import Document
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
+import contract_pdf
 from hub import kintone as hub_kintone
 from hub.docx_builder import fill_template
 from hub.redact import emit
@@ -58,6 +95,17 @@ FIELD_ATTACHMENT = "委任契約書"
 TEMPLATE_PATH    = "docx_templates/jikou/委任契約書.docx"
 OUTPUT_FILENAME  = "委任契約書_時効援用.docx"
 _BLANK           = "　"
+
+# ── 第2版（CONTRACT-GEN-2）: CloudSign 登録の状態 3 値+フィールド ──────────
+STATUS_CS_TRIGGER = "クラウドサイン登録"
+STATUS_CS_WORKING = "クラウドサイン登録中"
+STATUS_CS_DONE    = "クラウドサイン登録済"
+FIELD_EMAIL       = "メールアドレス"
+FIELD_CS_DOC_ID   = "cloudsign_document_id"   # cloudsign_webhook の照合キー
+OUTPUT_PDF_NAME   = "委任契約書_時効援用.pdf"
+# 簡易 grammar（fail-closed）: ASCII のローカル部@ドメイン.TLD のみ許可。
+# 全角・空白・@ 二重などは形式不正として登録しない
+_EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 
 # fix1[03]: 人承認済み現物テンプレートの SHA-256（2026-08-22 収載時実測）
 TEMPLATE_SHA256 = (
@@ -81,6 +129,16 @@ router = APIRouter()
 
 class ContractIntegrityError(RuntimeError):
     """fix1[03]: テンプレート/生成物の凍結文言検証に失敗（添付しない）。"""
+
+
+class CloudSignResultUnknown(RuntimeError):
+    """CONTRACT-GEN-2-fix1[01]: 書類作成 POST の結果不明（ACK 喪失窓）。
+
+    POST 開始後に doc id を得られなかった場合（transport 例外・5xx 応答・
+    2xx だが id 欠落）は、CloudSign 側に下書きが作成済みの可能性があり id も
+    不明。「未作成」と同一視した自動巻き戻し・自動再作成は二重下書きを作る
+    ため禁止し、「登録中」維持 → 再配送の reconcile が「要確認」+通知へ倒す
+    （人が CloudSign 画面で下書きの有無を確認して整理する運用）。"""
 
 
 def _fv(record: dict, code: str) -> str:
@@ -136,6 +194,36 @@ def verify_frozen_clause(docx_bytes: bytes) -> None:
         raise ContractIntegrityError("frozen clause mismatch")
 
 
+def verify_frozen_pdf(pdf_bytes: bytes) -> None:
+    """CONTRACT-GEN-2: 生成 PDF の抽出テキストへの凍結検証（第1版同水準）。
+
+    PDF は折返しで改行位置が変わるため、全空白（全角空白含む）除去後の
+    連結文字列に対して第2条（見出し+3 項）が連続部分列として文字単位で
+    逐語一致すること、および差し込みキー（{{ / }}）が残存しないことを検証。
+    不一致は CloudSign へ登録しない（500）。"""
+    flat = "".join(contract_pdf.pdf_text(pdf_bytes).split())
+    frozen = "".join("".join(part.split()) for part in FROZEN_CLAUSE)
+    if frozen not in flat:
+        raise ContractIntegrityError("frozen clause missing in pdf")
+    if "{{" in flat or "}}" in flat:
+        raise ContractIntegrityError("unfilled key in pdf")
+
+
+def verify_pdf_full_text(docx_bytes: bytes, pdf_bytes: bytes) -> None:
+    """fix1[02]: PDF 抽出全文と docx 正規化全文の完全一致 pin（第2条限定の
+    verify_frozen_pdf を包含する全文保証）。
+
+    正規化は改行・空白（全角空白含む）の除去のみ＝文字列内容そのものは
+    docx と PDF で 1 文字も違わないことを要求する。表は docx 側・PDF 側の
+    どちらの走査にも乗らず本 pin では欠落を検知できないため、contract_pdf
+    が入口で拒否する（PdfUnsupportedStructure・表は非対応）。"""
+    doc = Document(io.BytesIO(docx_bytes))
+    doc_flat = "".join("".join(p.text.split()) for p in doc.paragraphs)
+    pdf_flat = "".join(contract_pdf.pdf_text(pdf_bytes).split())
+    if doc_flat != pdf_flat:
+        raise ContractIntegrityError("pdf full text mismatch")
+
+
 async def _notify(text: str) -> None:
     """管理者 LINE 通知（best-effort・固定文言+レコード番号のみ）。"""
     try:
@@ -164,6 +252,104 @@ async def _generate_and_attach(record_id: str, record: dict,
     }, revision=final_revision)
     logger.info("[CONTRACT] attached record_id=%s",
                 emit(record_id, "record_id", "log", "operator"))
+
+
+# ── CloudSign API（CONTRACT-GEN-2）───────────────────────────────────────────
+# 呼ぶのは POST（作成/添付/宛先）と DELETE（掃除）のみ。送信 API（PUT）は
+# 呼ばない＝送信操作は大野が CloudSign 画面で行う（テストが source pin）。
+
+# fix2[04]: unknown_window で「書類が作成されないまま拒否された」と確定判定
+# してよい status の明示 allowlist（閉集合）。HTTP 意味論上、要求を受理せず
+# 拒否を応答したことが確定するもののみ:
+#   400（要求不正）/ 401（認証拒否・token 再取得の対象）/ 403（権限拒否）/
+#   404（endpoint/資源なし）/ 409（競合拒否）/ 422（検証拒否）
+# allowlist 外の 4xx は結果不明へ倒す——特に 408（タイムアウト応答＝処理有無
+# 不明）・429（レート制限＝処理有無をこの応答からは断定できない）。
+_CS_DEFINITE_REJECTION = frozenset({400, 401, 403, 404, 409, 422})
+
+
+def _cs_request(method: str, path: str, *, unknown_window: bool = False,
+                **kwargs):
+    """CloudSign API 呼び出し。token 管理は cloudsign_webhook._token（本番
+    稼働中の単一の正）を共用し、401 は取り直して 1 回だけ再試行。
+
+    fix1[01]: unknown_window=True（書類作成 POST 専用）は「POST 到達前の
+    失敗」と「POST 開始後の結果不明」を実装上区別する。
+      - token 取得の失敗＝POST 未実行（下書き未作成が確定）→ 通常伝播
+        （呼び出し側のクリーン巻き戻しを許可）
+      - request 実行中の transport 例外・5xx 応答・確定拒否 allowlist
+        （_CS_DEFINITE_REJECTION）外の 4xx（408/429 等）＝結果不明 →
+        CloudSignResultUnknown（巻き戻し・再作成禁止の経路へ）
+      - allowlist 内の 4xx 応答＝CloudSign が作成しないまま拒否を応答済み
+        （未作成確定）→ 通常の HTTPError。401 も未作成確定なので token を
+        取り直して 1 回再試行し、再試行の POST は再び結果不明窓に入る。"""
+    import requests
+
+    import cloudsign_webhook as cs
+    url = f"{cs.CLOUDSIGN_API_BASE}{path}"
+
+    def _attempt(token: str):
+        try:
+            return requests.request(
+                method, url, headers={"Authorization": f"Bearer {token}"},
+                timeout=30, **kwargs)
+        except Exception as e:
+            if unknown_window:
+                raise CloudSignResultUnknown(
+                    "cloudsign request outcome unknown") from e
+            raise
+
+    resp = _attempt(cs._token.get())
+    if resp.status_code == 401:
+        cs._token.invalidate()
+        resp = _attempt(cs._token.get())
+    if unknown_window and resp.status_code >= 400 \
+            and resp.status_code not in _CS_DEFINITE_REJECTION:
+        raise CloudSignResultUnknown(
+            "cloudsign request outcome unknown (non-definite status)")
+    resp.raise_for_status()
+    return resp
+
+
+def _cs_create_document(record_id: str) -> str:
+    """書類作成（下書き）。タイトルは案件 No のみ（氏名等の PII は載せない）。
+
+    fix1[01]: 唯一の unknown_window 呼出し。2xx 応答から id を取り出せない
+    場合（本文不正・id 欠落）も「作成された可能性があるが特定できない」＝
+    結果不明として扱う（ContractIntegrityError から変更・票 [01] 由来）。"""
+    resp = _cs_request("POST", "/documents", unknown_window=True,
+                       data={"title": f"委任契約書_案件No.{record_id}"})
+    try:
+        doc_id = str((resp.json() or {}).get("id") or "")
+    except Exception as e:
+        raise CloudSignResultUnknown(
+            "cloudsign create response unreadable") from e
+    if not doc_id:
+        raise CloudSignResultUnknown("cloudsign document id missing")
+    return doc_id
+
+
+def _cs_attach_pdf(doc_id: str, pdf_bytes: bytes) -> None:
+    _cs_request("POST", f"/documents/{doc_id}/files",
+                files={"uploadfile":
+                       (OUTPUT_PDF_NAME, pdf_bytes, "application/pdf")},
+                data={"name": OUTPUT_PDF_NAME})
+
+
+def _cs_add_participant(doc_id: str, email: str, name: str) -> None:
+    _cs_request("POST", f"/documents/{doc_id}/participants",
+                data={"email": email, "name": name})
+
+
+def _cs_delete_draft(doc_id: str) -> bool:
+    """途中失敗時の下書き掃除（部分状態を残さない）。成功=True。失敗しても
+    例外は伝播させない（元の失敗を 500 で報告するのが主）。"""
+    try:
+        _cs_request("DELETE", f"/documents/{doc_id}")
+        return True
+    except Exception:
+        logger.error("[CONTRACT] cloudsign draft cleanup failed")
+        return False
 
 
 async def _claim(record_id: str, revision: str, to_status: str) -> str | None:
@@ -215,6 +401,110 @@ async def _reconcile_working(record_id: str, record: dict,
         "ok": True, "record_id": record_id, "recovered": True})
 
 
+async def _cloudsign_flow(record_id: str, record: dict, revision: str):
+    """CONTRACT-GEN-2: PDF 生成 → CloudSign 書類作成+PDF 添付+宛先追加 →
+    doc id 書き戻し（登録済）。送信 API は呼ばない（対外効果の一線）。"""
+    # fail-closed: 前提未充足は登録しない（状態も動かさない・値は非搭載）
+    problems = _missing_fields(record)
+    if not (record.get(FIELD_ATTACHMENT) or {}).get("value"):
+        problems.append(f"{FIELD_ATTACHMENT}（docx 未添付＝先に"
+                        f"「{STATUS_TRIGGER}」を実行してください）")
+    email = _fv(record, FIELD_EMAIL)
+    if not email:
+        problems.append(FIELD_EMAIL)
+    elif not _EMAIL_RE.fullmatch(email):
+        problems.append(f"{FIELD_EMAIL}（形式不正）")
+    if problems:
+        logger.info("[CONTRACT] cloudsign preconditions unmet record_id=%s "
+                    "count=%d",
+                    emit(record_id, "record_id", "log", "operator"),
+                    len(problems))
+        await _notify(
+            f"【委任契約書】案件 No.{record_id} はクラウドサイン登録の前提を"
+            f"満たしていないため登録しませんでした。不足: "
+            f"{'・'.join(problems)}。kintone で解消後、契約書ステータスを"
+            f"「{STATUS_CS_TRIGGER}」に設定し直してください")
+        return JSONResponse(status_code=200, content={
+            "ok": True, "skip": "cs_preconditions", "missing": problems})
+
+    # CAS（登録→登録中）勝者のみ実行（並行 2 本でも CloudSign 作成は 1 回）
+    next_rev = await _claim(record_id, revision, STATUS_CS_WORKING)
+    if next_rev is None:
+        logger.info("[CONTRACT] cs cas lost record_id=%s",
+                    emit(record_id, "record_id", "log", "operator"))
+        return JSONResponse(status_code=200,
+                            content={"ok": True, "skip": "cas_lost"})
+
+    # PDF 生成（テンプレ=単一の正）+ 凍結検証（docx 段・PDF 段の二層）。
+    # 検証失敗はここで 500（系統的エラー→再配送が reconcile で「要確認」へ）
+    verify_template_integrity()
+    docx_bytes = fill_template(TEMPLATE_PATH, build_fill_data(record))
+    verify_frozen_clause(docx_bytes)
+    pdf_bytes = contract_pdf.docx_to_pdf_bytes(docx_bytes)
+    verify_frozen_pdf(pdf_bytes)
+    verify_pdf_full_text(docx_bytes, pdf_bytes)   # fix1[02] 全文 pin
+    logger.info("[CONTRACT] pdf generated record_id=%s bytes=%d",
+                emit(record_id, "record_id", "log", "operator"),
+                len(pdf_bytes))
+
+    # CloudSign 作成→添付→宛先。途中失敗は下書き削除（部分状態を残さない）
+    # ＋掃除成功時のみ巻き戻し（登録中→登録）→ raise → 500 → 再配送で
+    # 自動再試行。掃除失敗時は巻き戻さない（reconcile が「要確認」へ倒す）
+    doc_id = None
+    try:
+        doc_id = _cs_create_document(record_id)
+        _cs_attach_pdf(doc_id, pdf_bytes)
+        _cs_add_participant(doc_id, email, _fv(record, _REQUIRED_NAME))
+    except CloudSignResultUnknown:
+        # fix1[01]: 作成結果不明＝下書きが存在し得るが id 不明。掃除も巻き
+        # 戻しもせず「登録中」維持で 500 → 再配送は reconcile が「要確認」
+        # +通知へ倒す（自動再作成の禁止＝二重下書き防止）
+        logger.error("[CONTRACT] cloudsign create outcome unknown "
+                     "record_id=%s",
+                     emit(record_id, "record_id", "log", "operator"))
+        raise
+    except Exception:
+        cleaned = _cs_delete_draft(doc_id) if doc_id else True
+        if cleaned:
+            try:
+                await hub_kintone.update_record(
+                    _APP, record_id, {FIELD_STATUS: STATUS_CS_TRIGGER},
+                    revision=next_rev)
+            except Exception:
+                logger.error("[CONTRACT] cs status rollback failed "
+                             "record_id=%s",
+                             emit(record_id, "record_id", "log", "operator"))
+        raise
+
+    await hub_kintone.update_record(_APP, record_id, {
+        FIELD_CS_DOC_ID: doc_id,
+        FIELD_STATUS: STATUS_CS_DONE,
+    }, revision=next_rev)
+    logger.info("[CONTRACT] cloudsign registered record_id=%s",
+                emit(record_id, "record_id", "log", "operator"))
+    return JSONResponse(status_code=200, content={
+        "ok": True, "record_id": record_id, "cloudsign": True})
+
+
+async def _reconcile_cs_working(record_id: str, revision: str):
+    """CONTRACT-GEN-2 reconcile: 「クラウドサイン登録中」で停止した行の回収。
+
+    CloudSign 側に下書きが残っている可能性がある（外部状態・kintone からは
+    機械確認できない）ため、v1 の回収と異なり自動再実行はせず、常に CAS で
+    「要確認」へ倒して管理者通知（二重下書き防止の fail-closed）。"""
+    next_rev = await _claim(record_id, revision, STATUS_REVIEW)
+    if next_rev is None:
+        return JSONResponse(status_code=200,
+                            content={"ok": True, "skip": "cas_lost"})
+    await _notify(
+        f"【委任契約書】案件 No.{record_id} はクラウドサイン登録が中断した"
+        "状態のため「要確認」にしました。CloudSign 画面で下書きの有無を確認し"
+        "（重複下書きがあれば削除）、再実行する場合は契約書ステータスを"
+        f"「{STATUS_CS_TRIGGER}」に設定し直してください")
+    return JSONResponse(status_code=200,
+                        content={"ok": True, "skip": "cs_needs_review"})
+
+
 @router.post("/contract/{secret}")
 async def contract_webhook(secret: str, request: Request):
     if not verify_token(secret or "", "DOCUMENT_WEBHOOK_SECRET"):
@@ -240,12 +530,13 @@ async def contract_webhook(secret: str, request: Request):
         return JSONResponse(status_code=200,
                             content={"ok": True, "skip": "no_record_id"})
 
-    # 本文ステータス gate（自 update の echo=作成中/作成済 もここで落ちる）
+    # 本文ステータス gate（自 update の echo=作成中/作成済/登録中/登録済 も
+    # ここで落ちる）。通過はトリガ 2 値（契約書作成/クラウドサイン登録）のみ
     try:
         status_in_webhook = body["record"][FIELD_STATUS]["value"]
     except (KeyError, TypeError):
         status_in_webhook = None
-    if status_in_webhook != STATUS_TRIGGER:
+    if status_in_webhook not in (STATUS_TRIGGER, STATUS_CS_TRIGGER):
         logger.info("[CONTRACT] not triggered record_id=%s",
                     emit(record_id, "record_id", "log", "operator"))
         return JSONResponse(status_code=200,
@@ -256,15 +547,25 @@ async def contract_webhook(secret: str, request: Request):
         current = _fv(record, FIELD_STATUS)
         revision = _fv(record, "$revision")
 
-        # fix1[01]: 正本の完全一致検証（stale 本文は作用 0 で skip）
-        if current == STATUS_DONE:
+        # fix1[01]: 正本の完全一致検証（stale 本文は作用 0 で skip）。
+        # dispatch は本文でなく正本ステータスに対して行う
+        if current in (STATUS_DONE, STATUS_CS_DONE):
             logger.info("[CONTRACT] already done record_id=%s",
                         emit(record_id, "record_id", "log", "operator"))
             return JSONResponse(status_code=200,
                                 content={"ok": True, "skip": "already_done"})
+        if not revision.isdigit():
+            logger.info("[CONTRACT] stale status record_id=%s",
+                        emit(record_id, "record_id", "log", "operator"))
+            return JSONResponse(status_code=200,
+                                content={"ok": True, "skip": "stale_status"})
         if current == STATUS_WORKING:
             return await _reconcile_working(record_id, record, revision)
-        if current != STATUS_TRIGGER or not revision.isdigit():
+        if current == STATUS_CS_WORKING:
+            return await _reconcile_cs_working(record_id, revision)
+        if current == STATUS_CS_TRIGGER:
+            return await _cloudsign_flow(record_id, record, revision)
+        if current != STATUS_TRIGGER:
             logger.info("[CONTRACT] stale status record_id=%s",
                         emit(record_id, "record_id", "log", "operator"))
             return JSONResponse(status_code=200,
