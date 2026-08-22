@@ -65,7 +65,11 @@ def verify_template_integrity() -> None:
 
 
 def _mochibun_fraction(text: str) -> tuple[int, int] | None:
-    """持分文字列 →（分子, 分母）。「2分の1」=1/2・「1/2」のみ。他は None。"""
+    """持分文字列 →（分子, 分母）。「2分の1」=1/2・「1/2」のみ。
+
+    fix1[03]: 範囲固定 0 < 分子 <= 分母 を必須化。範囲外（1分の2・3分の4
+    等）・0 分母・0 分子は None（空欄+固定注記 NOTE_MOCHIBUN の経路）。
+    持分評価格の端数は**切捨て**（builder の // 演算・テストで固定）。"""
     t = text.replace("　", "").replace(" ", "")
     m = _MOCHIBUN_KANJI.fullmatch(t)
     if m:
@@ -75,19 +79,27 @@ def _mochibun_fraction(text: str) -> tuple[int, int] | None:
         if not m:
             return None
         num, den = int(m.group(1)), int(m.group(2))
-    if den == 0:
+    if not 0 < num <= den:
         return None
     return num, den
 
 
+_AMOUNT_INT_RE = re.compile(r"[0-9]+")
+
+
 def _int_or_none(record: dict, code: str) -> int | None:
+    """fix1[01]: 金額の受理を閉集合化——bool を除く実 int、または 10 進整数
+    文字列（^[0-9]+$・既存金額 grammar と同基準）のみ。小数・指数表記・
+    bool・桁区切り・符号は不受理=None（当該行は集計不能の既存流儀へ）。
+    int(float(...)) 経由の精度喪失（2^53 超）も本閉集合で排除される。"""
     raw = (record.get(code) or {}).get("value")
-    if raw in (None, ""):
+    if isinstance(raw, bool):
         return None
-    try:
-        return int(float(raw))
-    except (TypeError, ValueError):
-        return None
+    if isinstance(raw, int):
+        return raw
+    if isinstance(raw, str) and _AMOUNT_INT_RE.fullmatch(raw):
+        return int(raw)
+    return None
 
 
 def _a_row(record: dict) -> tuple[dict, int | None]:
@@ -162,9 +174,11 @@ def _expand(ws, proto_row: int, n: int) -> None:
                 ws.cell(row=proto_row, column=c)._style)
 
 
-def _apply_merges(ws, na: int, nb: int, nc: int, nd: int) -> None:
-    """最終座標で結合を一括再構築（テンプレの正準 17 レンジ+データ行の
-    3 結合パターン: B=口座番号 E:G・C/D=種別/会社名等 D:E と F:H）。"""
+def _merge_ranges(na: int, nb: int, nc: int, nd: int) -> list[str]:
+    """可変行数（各部の描画行数・0 件の部は 1）から最終結合レンジを決定的に
+    算出する（テンプレの正準レンジ+データ行の 3 結合パターン: B=口座番号
+    E:G・C/D=種別/会社名等 D:E と F:H）。builder の再構築と fix1[04] の
+    生成物検証（完全一致検査）が共用する単一の正。"""
     oa, ob, oc, od = na - 1, nb - 1, nc - 1, nd - 1
     merges = ["B1:K1", "B2:I2", "B4:K4"]
     row_b_label = 8 + oa
@@ -189,7 +203,11 @@ def _apply_merges(ws, na: int, nb: int, nc: int, nd: int) -> None:
         merges += [f"D{r}:E{r}", f"F{r}:H{r}"]
     total_row = ROW_TOTAL + oa + ob + oc + od
     merges.append(f"J{total_row}:K{total_row}")
-    for rng in merges:
+    return merges
+
+
+def _apply_merges(ws, na: int, nb: int, nc: int, nd: int) -> None:
+    for rng in _merge_ranges(na, nb, nc, nd):
         ws.merge_cells(rng)
 
 
@@ -292,17 +310,27 @@ def _amount_cell_ok(v) -> bool:
 
 
 def verify_zaisan_xlsx(xlsx_bytes: bytes, records: list[dict]) -> None:
-    """生成物の実測検証（ZAISAN-GEN-1 要件 3・添付前に必ず通す）。
+    """生成物の添付前検証（ZAISAN-GEN-1 要件 3+fix1[02][04]）。
 
     - 行数整合: 各部の描画行数 = レコード数（0 件の部は空 1 行）・総行数一致
     - 金額セルは int のみ（float/str/bool を拒否）・セル式（"=..."）の不在
-    - 小計はシート上のデータセルからの再計算と一致（集計不能の部は小計空欄
-      +注記の存在を要求）・総合計 = A+B+C−D の再計算と一致
-    - 番号列は 1..n の連番
+    - fix1[02] 対レコード照合: 元 records から期待する閉集合投影
+      （部区分・番号・名称/特定情報・金額・持分/持分評価格・備考・資料番号）
+      を再構成し、明細行ごとにセル単位で完全一致を検査。小計/総合計も投影
+      からの再計算と照合（集計不能の部は小計空欄+注記の存在を要求・
+      総合計 = A+B+C−D）。明細と集計を整合的に同時改変した生成物も、
+      元データとの不一致として拒否される
+    - fix1[04] レイアウト: 可変行数から決定的に算出した最終結合レンジ集合
+      （_merge_ranges・builder と単一の正）と merged_cells の完全一致
     """
     fud, yok, son, sai = _classify(records)
-    na, nb, nc, nd = (max(len(x), 1) for x in (fud, yok, son, sai))
-    oa, ob, oc, od = na - 1, nb - 1, nc - 1, nd - 1
+    a = [_a_row(r) for r in fud]
+    b = [_b_row(r) for r in yok]
+    c = [_cd_row(r, 6) for r in son]
+    d = [_cd_row(r, 4) for r in sai]
+    na, nb, nc, nd = (max(len(x), 1) for x in (a, b, c, d))
+    oa, ob, oc = na - 1, nb - 1, nc - 1
+    od = nd - 1
     ws = load_workbook(io.BytesIO(xlsx_bytes)).active
     if ws.max_row != ROW_TOTAL + oa + ob + oc + od:
         raise ZaisanXlsxIntegrityError("row count mismatch")
@@ -310,62 +338,58 @@ def verify_zaisan_xlsx(xlsx_bytes: bytes, records: list[dict]) -> None:
         for cell in row:
             if isinstance(cell.value, str) and cell.value.startswith("="):
                 raise ZaisanXlsxIntegrityError("formula found")
+    got_merges = {str(r) for r in ws.merged_cells.ranges}
+    if got_merges != set(_merge_ranges(na, nb, nc, nd)):
+        raise ZaisanXlsxIntegrityError("merge ranges mismatch")
 
-    def _check_section(start: int, count: int, real: int,
-                       amount_cols: tuple, effective) -> int | None:
-        vals = []
-        for i in range(count):
+    sections = (
+        ("A", ROW_A, a, (8, 9)),
+        ("B", ROW_B + oa, b, (8, 9)),
+        ("C", ROW_C + oa + ob, c, (9,)),
+        ("D", ROW_D + oa + ob + oc, d, (9,)),
+    )
+    subs = {}
+    for key, start, rows, amount_cols in sections:
+        for i in range(max(len(rows), 1)):
             r = start + i
-            num = ws.cell(row=r, column=2).value
-            if real and num != i + 1:
-                raise ZaisanXlsxIntegrityError("番号 sequence mismatch")
-            for c in amount_cols:
-                if not _amount_cell_ok(ws.cell(row=r, column=c).value):
+            for col in amount_cols:
+                if not _amount_cell_ok(ws.cell(row=r, column=col).value):
                     raise ZaisanXlsxIntegrityError("non-int amount cell")
-            vals.append(effective(r))
-        if not real:
-            return 0
-        if any(v is None for v in vals):
-            return None
-        return sum(vals)
+            if i < len(rows):
+                if ws.cell(row=r, column=2).value != i + 1:
+                    raise ZaisanXlsxIntegrityError("番号 sequence mismatch")
+                cells = rows[i][0]
+                for col in range(3, 12):
+                    want = cells.get(col)
+                    if want in (None, ""):
+                        want = None
+                    if ws.cell(row=r, column=col).value != want:
+                        raise ZaisanXlsxIntegrityError(
+                            f"cell mismatch section={key} "
+                            f"row={i + 1} col={col}")
+            else:  # 空セクションのプレースホルダ行は完全空欄
+                for col in range(2, 12):
+                    if ws.cell(row=r, column=col).value is not None:
+                        raise ZaisanXlsxIntegrityError(
+                            f"unexpected value in empty section {key}")
+        subs[key] = _subtotal([x[1] for x in rows])
 
-    def _a_effective(r: int) -> int | None:
-        share = ws.cell(row=r, column=9).value
-        if isinstance(share, int) and not isinstance(share, bool):
-            return share
-        if str(ws.cell(row=r, column=7).value or "") == "":
-            v = ws.cell(row=r, column=8).value
-            return v if isinstance(v, int) and not isinstance(v, bool) \
-                else None
-        return None
-
-    exp = {
-        "A": _check_section(ROW_A, na, len(fud), (8, 9), _a_effective),
-        "B": _check_section(ROW_B + oa, nb, len(yok), (8, 9),
-                            lambda r: ws.cell(row=r, column=8).value
-                            if _amount_cell_ok(ws.cell(row=r, column=8).value)
-                            else None),
-        "C": _check_section(ROW_C + oa + ob, nc, len(son), (9,),
-                            lambda r: ws.cell(row=r, column=9).value),
-        "D": _check_section(ROW_D + oa + ob + oc, nd, len(sai), (9,),
-                            lambda r: ws.cell(row=r, column=9).value),
-    }
     for key, sub_row in (("A", SUB_A + oa), ("B", SUB_B + oa + ob),
                          ("C", SUB_C + oa + ob + oc),
                          ("D", SUB_D + oa + ob + oc + od)):
         got = ws.cell(row=sub_row, column=_COL_SUB).value
-        if exp[key] is None:
-            if got is not None or not ws.cell(row=sub_row,
-                                              column=_COL_NOTE).value:
+        note = ws.cell(row=sub_row, column=_COL_NOTE).value
+        if subs[key] is None:
+            if got is not None or not note:
                 raise ZaisanXlsxIntegrityError(
                     f"subtotal {key}: expected uncomputable note")
-        elif got != exp[key]:
+        elif got != subs[key]:
             raise ZaisanXlsxIntegrityError(f"subtotal {key} mismatch")
     total_row = ROW_TOTAL + oa + ob + oc + od
     got_total = ws.cell(row=total_row, column=_COL_SUB).value
-    if any(v is None for v in exp.values()):
+    if any(v is None for v in subs.values()):
         if got_total is not None or not ws.cell(row=total_row,
                                                 column=_COL_NOTE).value:
             raise ZaisanXlsxIntegrityError("total: expected uncomputable note")
-    elif got_total != exp["A"] + exp["B"] + exp["C"] - exp["D"]:
+    elif got_total != subs["A"] + subs["B"] + subs["C"] - subs["D"]:
         raise ZaisanXlsxIntegrityError("total mismatch")

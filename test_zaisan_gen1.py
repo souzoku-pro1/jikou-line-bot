@@ -15,6 +15,17 @@
   セル式不在・番号連番（verify_zaisan_xlsx）
 - webhook は CONTRACT-GEN 確立構造の同型（App26・入口ガード・CAS 4 値・
   409 のみ cas_lost・fail-closed=財産行 0 件/評価未確定は状態不変+通知）
+
+fix1（R-ZAISAN-GEN-1）:
+- [01] 金額受理の閉集合化: bool を除く実 int と 10 進整数文字列（^[0-9]+$）
+  のみ。小数・指数・bool・桁区切り・符号・全角は不受理=当該行を集計不能
+  扱い（int(float(...)) の精度喪失も排除・"9007199254740993" が正確値）
+- [02] 添付前検証の対レコード照合: 元 records の閉集合投影と明細セル単位で
+  完全一致（明細+小計+総合計の整合的同時改変も拒否）
+- [03] 持分 grammar の範囲固定: 0 < 分子 <= 分母 必須（1分の2・3分の4 等は
+  空欄+固定注記）・端数切捨てを pin
+- [04] レイアウト検証: 可変行数から決定的算出した結合レンジ集合と
+  merged_cells の完全一致（0 件/1 件/複数/多数行の各配置・書式保持）
 """
 
 import hashlib
@@ -124,10 +135,72 @@ class TestMochibunGrammar(unittest.TestCase):
             "2分の1": (1, 2), "3分の2": (2, 3), "1/2": (1, 2),
             "10分の3": (3, 10), "２分の１くらい": None, "持分不明": None,
             "0分の1": None, "": None, "2分の1くらい": None,
+            # fix1[03]: 範囲固定 0 < 分子 <= 分母（範囲外・0 分子は不受理）
+            "1分の2": None, "3分の4": None, "2/1": None, "0/2": None,
+            "1分の0": None, "2分の2": (2, 2),
         }
         for text, want in cases.items():
             with self.subTest(text=text):
                 self.assertEqual(zx._mochibun_fraction(text), want)
+
+    def test_floor_division_pinned(self):
+        # fix1[03]: 端数は切捨て（100×1/3 = 33・仕様固定）
+        records = _sample_records()
+        records[0]["特定情報"] = {"value":
+                                  "所在 川口市青木1丁目 / 持分 3分の1"}
+        records[0]["評価額"] = {"value": "100"}
+        with patch.dict(os.environ, _ENV):
+            data = zx.build_zaisan_xlsx(records)
+        ws = load_workbook(io.BytesIO(data)).active
+        self.assertEqual(ws["I6"].value, 33)
+        zx.verify_zaisan_xlsx(data, records)
+
+    def test_out_of_range_mochibun_blank_plus_note(self):
+        # fix1[03]: 範囲外（1分の2）は空欄+固定注記
+        records = _sample_records()
+        records[0]["特定情報"] = {"value":
+                                  "所在 川口市青木1丁目 / 持分 1分の2"}
+        with patch.dict(os.environ, _ENV):
+            data = zx.build_zaisan_xlsx(records)
+        ws = load_workbook(io.BytesIO(data)).active
+        self.assertIsNone(ws["I6"].value)
+        self.assertIn(zx.NOTE_MOCHIBUN, ws["J6"].value)
+        self.assertEqual(ws["J8"].value, zx.NOTE_A)
+        zx.verify_zaisan_xlsx(data, records)
+
+
+class TestAmountGrammar(unittest.TestCase):
+    """fix1[01]: 金額受理の閉集合（既存金額 grammar と同基準）。"""
+
+    def _v(self, raw):
+        return zx._int_or_none({"金額": {"value": raw}}, "金額")
+
+    def test_accepted_forms(self):
+        self.assertEqual(self._v("100"), 100)
+        self.assertEqual(self._v(100), 100)
+        self.assertEqual(self._v("0"), 0)
+        # 精度喪失検知: 2^53+1 が正確値のまま（int(float()) だと ...992 に化ける）
+        self.assertEqual(self._v("9007199254740993"), 9007199254740993)
+        self.assertNotEqual(self._v("9007199254740993"), 9007199254740992)
+
+    def test_rejected_forms(self):
+        for raw in ("100.9", 1.9, True, False, "1e6", "1E6", "1,000",
+                    "-5", "+5", " 100", "100 ", "", None, "１００"):
+            with self.subTest(raw=repr(raw)):
+                self.assertIsNone(self._v(raw))
+
+    def test_decimal_amount_uncomputable_flow(self):
+        # 小数の評価額は正常値へ変換せず当該部を集計不能（注記連鎖）へ
+        records = _sample_records()
+        records[4]["評価額"] = {"value": "100.9"}
+        with patch.dict(os.environ, _ENV):
+            data = zx.build_zaisan_xlsx(records)
+        ws = load_workbook(io.BytesIO(data)).active
+        self.assertIsNone(ws["I16"].value)        # C 明細は空欄
+        self.assertIsNone(ws["I17"].value)        # C 小計は出さない
+        self.assertEqual(ws["J17"].value, zx.NOTE_CD)
+        self.assertIsNone(ws["I25"].value)        # 総合計も出さない
+        zx.verify_zaisan_xlsx(data, records)
 
 
 class TestBuilder(unittest.TestCase):
@@ -274,6 +347,85 @@ class TestVerifyNegatives(unittest.TestCase):
             data = zx.build_zaisan_xlsx(_sample_records())
         with self.assertRaises(zx.ZaisanXlsxIntegrityError):
             zx.verify_zaisan_xlsx(data, _sample_records()[:-1])
+
+    def test_consistent_simultaneous_tamper_rejected(self):
+        # fix1[02]: 明細+小計+総合計を整合的に同時改変（内部整合は保たれる）
+        # しても、元 records の閉集合投影との照合で拒否される
+        def mutate(ws):
+            ws["I16"] = 400001
+            ws["I17"] = 400001
+            ws["I25"] = 3050002
+        data = self._tampered(mutate)
+        with self.assertRaises(zx.ZaisanXlsxIntegrityError):
+            zx.verify_zaisan_xlsx(data, _sample_records())
+
+    def test_text_cell_tamper_rejected(self):
+        # fix1[02]: 金額以外（所在等）の改変も対レコード照合で拒否
+        data = self._tampered(lambda ws: ws.__setitem__("C6", "別の所在"))
+        with self.assertRaises(zx.ZaisanXlsxIntegrityError):
+            zx.verify_zaisan_xlsx(data, _sample_records())
+
+    def test_merge_tamper_rejected(self):
+        # fix1[04]: 結合レンジの欠落は完全一致検査で拒否
+        data = self._tampered(lambda ws: ws.unmerge_cells("E11:G11"))
+        with self.assertRaises(zx.ZaisanXlsxIntegrityError):
+            zx.verify_zaisan_xlsx(data, _sample_records())
+
+
+class TestLayoutVariants(unittest.TestCase):
+    """fix1[04]: 可変行数の各配置で結合レンジ完全一致+書式保持。"""
+
+    def _build(self, records):
+        with patch.dict(os.environ, _ENV):
+            return zx.build_zaisan_xlsx(records)
+
+    def test_merges_exact_on_happy(self):
+        ws = load_workbook(io.BytesIO(self._build(_sample_records()))).active
+        self.assertEqual({str(r) for r in ws.merged_cells.ranges},
+                         set(zx._merge_ranges(2, 2, 1, 1)))
+
+    def test_empty_sections_single_row_layout(self):
+        # B 部 1 件のみ（A/C/D は 0 件=空 1 行・小計 0・総合計=B）
+        records = [_zrec("1", 財産種別="預貯金",
+                         特定情報="テスト銀行 青木支店 普通預金 "
+                                  "口座番号1234567",
+                         相続開始時残高="300000")]
+        data = self._build(records)
+        zx.verify_zaisan_xlsx(data, records)
+        ws = load_workbook(io.BytesIO(data)).active
+        self.assertEqual(ws.max_row, 23)
+        self.assertEqual({str(r) for r in ws.merged_cells.ranges},
+                         set(zx._merge_ranges(1, 1, 1, 1)))
+        self.assertEqual(ws["I7"].value, 0)       # A 小計（0 件）
+        self.assertEqual(ws["I11"].value, 300000)
+        self.assertEqual(ws["I15"].value, 0)
+        self.assertEqual(ws["I20"].value, 0)
+        self.assertEqual(ws["I23"].value, 300000)
+        for col in range(2, 12):                  # 空 A プロト行は完全空欄
+            self.assertIsNone(ws.cell(row=6, column=col).value)
+
+    def test_many_rows_layout_and_style(self):
+        records = (
+            [_zrec(str(i), 財産種別="預貯金",
+                   特定情報=f"テスト銀行 支店{i} 普通貯金 口座番号{1000+i}",
+                   相続開始時残高="1000") for i in range(12)]
+            + [_zrec(str(20 + i), 財産種別="葬儀費用",
+                     特定情報="テスト葬祭", 評価額="500") for i in range(4)])
+        data = self._build(records)
+        zx.verify_zaisan_xlsx(data, records)
+        ws = load_workbook(io.BytesIO(data)).active
+        self.assertEqual(ws.max_row, 23 + 11 + 3)  # B+11・D+3
+        self.assertEqual({str(r) for r in ws.merged_cells.ranges},
+                         set(zx._merge_ranges(1, 12, 1, 4)))
+        self.assertEqual(ws["I22"].value, 12000)   # B 小計（11+11）
+        self.assertEqual(ws["I25"].value, None)    # C 小計行ではない位置検査
+        self.assertEqual(ws.cell(row=22, column=9).value, 12000)
+        self.assertEqual(ws["I37"].value, 0 + 12000 + 0 - 2000)  # 総合計
+        # 挿入行の書式保持: 金額書式・行高がプロト行と同一
+        proto_h = ws.row_dimensions[10].height
+        for r in (11, 15, 21):
+            self.assertIn("#,##0", ws.cell(row=r, column=8).number_format)
+            self.assertEqual(ws.row_dimensions[r].height, proto_h)
 
 
 class _WebhookBase(unittest.TestCase):
