@@ -97,6 +97,10 @@ class _Base(unittest.TestCase):
             patch.object(main, "_save_paused_chatlog", new=self.chatlog),
             patch.object(main, "handle_customer_message", new=self.customer),
             patch.object(main, "get_app21_record", new=self.app21),
+            # AUTOREPLY-GEN2 要件3: ヒアリング履歴の App28 復元（fail-open）は
+            # 本ハーネスでは空で固定（ネットワーク不使用）
+            patch.object(main, "get_recent_chat_history",
+                         new=AsyncMock(return_value=[])),
             patch.object(main, "_paused_chatlog_already_saved",
                          new=self.idem_check),
             patch.object(main, "ATTORNEY_LINE_USER_ID", "U-attorney"),
@@ -635,7 +639,11 @@ class TestPausedOff(_Base):
         self.claude.assert_awaited_once()
         self.reply.assert_awaited_once()
         self.notify.assert_not_awaited()
-        self.chatlog.assert_not_awaited()
+        # AUTOREPLY-GEN2 要件3（票由来の仕様変更）: ヒアリング会話は App28 へ
+        # 永続化されるようになった（user/assistant の 2 件・category=ヒアリング）
+        self.assertEqual(self.chatlog.await_count, 2)
+        self.assertEqual([c.args[3] for c in self.chatlog.await_args_list],
+                         ["ヒアリング", "ヒアリング"])
 
     def test_unset_behaves_as_before(self):
         """OFF（未設定）: 従来どおりヒアリングフロー（Claude→返信）へ進む"""
