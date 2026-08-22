@@ -21,6 +21,7 @@ from hub.service_auth import BodyCachingRoute, optional_signature_guard
 signed_optin_router = APIRouter(route_class=BodyCachingRoute)
 
 from cloudsign_webhook import router as cloudsign_router
+from contract_webhook import router as contract_router
 from document_webhook import router as document_router
 from hub.dispatch import router as hub_dispatch_router
 from dispatch_bot.router import router as dispatch_bot_router
@@ -30,6 +31,7 @@ from bank_ingest import router as bank_ingest_router
 from sortation_ingest import router as sortation_ingest_router
 from valuation_ingest import router as valuation_ingest_router
 app.include_router(cloudsign_router)
+app.include_router(contract_router)
 app.include_router(document_router)
 app.include_router(hub_dispatch_router)
 app.include_router(dispatch_bot_router)
