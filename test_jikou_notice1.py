@@ -282,6 +282,56 @@ class TestWebhookStateMachine(_WebhookBase):
         self.assertTrue(any("旧　住　所" in t and "旧町2-2-2" in t
                             for t in texts))
 
+    def test_sparse_slots_keep_original_numbers(self):
+        # fix1[01]（Codex 指定 3 形）: 空欄除去後も元の枠番号を保持——
+        # ファイル名の N は常に App21 の入力枠（監査対応）。生成・添付順は
+        # 枠番号昇順で決定的
+        cases = {
+            "枠2のみ": ({"問い合わせ業者名": "", "対象債権者2": "株式会社B",
+                         "対象債権者3": ""},
+                        ["時効援用通知書_対象債権者2.docx"]),
+            "枠1と3": ({"問い合わせ業者名": "株式会社A", "対象債権者2": "",
+                        "対象債権者3": "C債権回収株式会社"},
+                       ["時効援用通知書_対象債権者1.docx",
+                        "時効援用通知書_対象債権者3.docx"]),
+            "枠3のみ": ({"問い合わせ業者名": "", "対象債権者2": "",
+                         "対象債権者3": "C債権回収株式会社"},
+                        ["時効援用通知書_対象債権者3.docx"]),
+        }
+        for label, (fields, want_names) in cases.items():
+            with self.subTest(case=label):
+                r, upload, update, _n, _g = self._post(
+                    record=_full_record(**fields))
+                self.assertEqual(r.status_code, 200)
+                names = [c.args[1] for c in upload.await_args_list]
+                self.assertEqual(names, want_names)
+                self.assertNotIn("時効援用通知書_対象債権者2.docx",
+                                 names if label == "枠1と3" else [])
+                final_call = update.await_args_list[1]
+                self.assertEqual(
+                    final_call.args[2]["notice_file"],
+                    [{"fileKey": f"fk-{i + 1}"}
+                     for i in range(len(want_names))])
+
+    def test_partial_upload_failure_orphan_filekeys_by_spec(self):
+        """fix1[02]（採用方式 (a)）: 3 通中 2 通目の upload 失敗 → 500・
+        最終 PUT なし（CAS のみ=作成中維持→reconcile 回収）。成功済み
+        fileKey は未添付のまま残るが、kintone 公式仕様「一時保管領域に
+        保存されたファイルは、レコードやスペースなどに添付されない場合、
+        3日間で削除されます」（cybozu developer network
+        「ファイルをアップロードする」制限事項・
+        https://cybozu.dev/ja/kintone/docs/rest-api/files/upload-file/ ・
+        2026-08-23 確認）により孤立 fileKey は自動回収されるため、
+        再実行が最初から再 upload しても蓄積しない。"""
+        record = _full_record(対象債権者2="株式会社B",
+                              対象債権者3="C債権回収株式会社")
+        upload = AsyncMock(side_effect=["fk-1", RuntimeError("kintone down")])
+        r, _u, update, _n, _g = self._post(record=record, upload=upload)
+        self.assertEqual(r.status_code, 500)
+        self.assertEqual(update.await_count, 1)          # CAS のみ・PUT なし
+        self.assertEqual(update.await_args.args[2],
+                         {"契約書ステータス": "時効援用通知作成中"})
+
     def test_zero_creditors_fails_closed(self):
         record = _full_record(問い合わせ業者名="", 対象債権者2="",
                               対象債権者3="")

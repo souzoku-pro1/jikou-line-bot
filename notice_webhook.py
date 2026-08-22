@@ -79,8 +79,17 @@ def _fv(record: dict, code: str) -> str:
     return str((record.get(code) or {}).get("value") or "").strip()
 
 
-def _creditors(record: dict) -> list[str]:
-    return [v for v in (_fv(record, c) for c in _CREDITOR_FIELDS) if v]
+def _creditors(record: dict) -> list[tuple[int, str]]:
+    """fix1[01]: （元の枠番号, 値）の組で返す——枠1=問い合わせ業者名/
+    枠2=対象債権者2/枠3=対象債権者3。空欄は除くが**枠番号は保持**し、
+    ファイル命名「時効援用通知書_対象債権者N.docx」の N は常に元の枠番号
+    （App21 の入力枠との監査対応）。枠番号昇順=生成・添付順も決定的。"""
+    out = []
+    for slot, code in enumerate(_CREDITOR_FIELDS, start=1):
+        v = _fv(record, code)
+        if v:
+            out.append((slot, v))
+    return out
 
 
 def _missing_fields(record: dict) -> list[str]:
@@ -194,10 +203,18 @@ async def _generate_and_attach(record_id: str, record: dict,
                 len(docx_bytes), len(creditors))
     mime = ("application/vnd.openxmlformats-officedocument"
             ".wordprocessingml.document")
+    # fix1[02]（採用方式 (a)）: upload を全通成功させてから単一 PUT へ進む。
+    # 途中 upload/最終 PUT の失敗で未添付の fileKey が残っても、kintone
+    # 公式仕様により一時保管領域のファイルは「レコードやスペースなどに
+    # 添付されない場合、3 日間で削除される」ため孤立 fileKey は自動回収
+    # される（cybozu developer network「ファイルをアップロードする」
+    # https://cybozu.dev/ja/kintone/docs/rest-api/files/upload-file/
+    # 制限事項・2026-08-23 確認）。再実行（reconcile 回収）は最初から
+    # 再 upload してよい
     file_keys = []
-    for i in range(1, len(creditors) + 1):
+    for slot, _name in creditors:
         file_keys.append(await hub_kintone.upload_file(
-            _APP, f"時効援用通知書_対象債権者{i}.docx", docx_bytes, mime))
+            _APP, f"時効援用通知書_対象債権者{slot}.docx", docx_bytes, mime))
     await hub_kintone.update_record(_APP, record_id, {
         FIELD_ATTACHMENT: [{"fileKey": k} for k in file_keys],
         FIELD_STATUS: STATUS_DONE,
