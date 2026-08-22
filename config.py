@@ -151,6 +151,15 @@ EXPECTED_KINTONE_SCHEMA = {
                 "required_options": ["送付状作成", "送付状作成済"],
             },
             "送付状": {"type": "FILE"},
+            # ── ZAISAN-GEN-1: 財産目録生成（zaisan_webhook.py が読む/書く）。
+            # CAS 状態機械の閉集合 4 値。CU（大野）でのフィールド追加が前提——
+            # 追加までは daily_healthcheck が App26 の不足として日次警告する
+            "財産目録ステータス": {
+                "type": "DROP_DOWN",
+                "required_options": ["財産目録作成", "財産目録作成中",
+                                     "財産目録作成済", "要確認"],
+            },
+            "財産目録": {"type": "FILE"},
         },
     },
     "戸籍謄本 (相続)": {
@@ -501,6 +510,13 @@ EXPECTED_KINTONE_SCHEMA = {
                 "required_options": ["no", "yes"],
             },
             "備考": {"type": "MULTI_LINE_TEXT"},
+            # ── ZAISAN-GEN-1: 財産目録 xlsx の列充足（zaisan_xlsx.py が読む）。
+            # CU（大野）でのフィールド追加が前提——追加までは daily_healthcheck
+            # が App35 の不足として日次警告する。B 部の集計は相続開始時残高で
+            # 統一（大野裁定・現在残高は表示のみ）
+            "資料番号": {"type": "SINGLE_LINE_TEXT"},
+            "相続開始時残高": {"type": "NUMBER"},
+            "現在残高": {"type": "NUMBER"},
             # データ源・トレーサビリティ（OCR経路の確信度・原本必須）
             "データ源": {
                 "type": "DROP_DOWN",
