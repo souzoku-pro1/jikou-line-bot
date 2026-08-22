@@ -52,8 +52,16 @@ from chat_responder import (
     mark_approval_sent,
     send_line_push,
     save_to_chatlog,
+    save_to_approval_queue,
+    get_recent_chat_history,
+    build_known_items,
+    ALLOWED_CANONICAL_EMOJI,
+    IMAGE_RECEIPT_REPLY,
+    IMAGE_INBOUND_MARKER,
+    PENDING_REPLY,
     ATTORNEY_LINE_USER_ID,
 )
+from hub import reply_sanitizer
 from claude_gateway import (
     ClaudeUnavailableError,
     create_message_with_fallback,
@@ -417,15 +425,43 @@ def extract_marker(text: str, tag: str) -> tuple[str, dict | None]:
         return clean_text, None
 
 
-async def ask_claude(user_id: str, user_message: str) -> str:
+def _normalize_history(rows: list[dict]) -> list[dict]:
+    """App28 復元履歴を Claude messages 契約（user 先頭・交互）へ整形する
+    （AUTOREPLY-GEN2 要件3・ヒアリング履歴の永続化復元用）。"""
+    out: list[dict] = []
+    for m in rows:
+        role = m.get("role")
+        content = m.get("content") or ""
+        if role not in ("user", "assistant") or not content:
+            continue
+        if out and out[-1]["role"] == role:
+            out[-1]["content"] += "\n" + content
+        else:
+            out.append({"role": role, "content": content})
+    while out and out[0]["role"] != "user":
+        out.pop(0)
+    return out
+
+
+async def ask_claude(user_id: str, user_message: str,
+                     known_items: dict | None = None) -> str:
     history = conversation_histories.setdefault(user_id, [])
     history.append({"role": "user", "content": user_message})
+
+    # AUTOREPLY-GEN2 要件3: 収集済み項目台帳を既知項目一覧として注入し
+    # 再質問を禁止（SYSTEM_PROMPT 本体の固定文言には触れない=追記のみ）
+    system = SYSTEM_PROMPT
+    if known_items:
+        lines = "\n".join(f"- {k}: {v}" for k, v in known_items.items())
+        system += ("\n\n【収集済み項目（既知・再質問禁止）】\n" + lines
+                   + "\n上記は既に回答済み・受領済みの項目です。同じ内容を"
+                     "再度質問・依頼しないでください。")
 
     response = await create_message_with_fallback(
         claude_client,
         context="ヒアリングフロー ask_claude",
         max_tokens=1024,
-        system=SYSTEM_PROMPT,
+        system=system,
         messages=history,
     )
 
@@ -738,8 +774,26 @@ async def _process_line_event(reply_token: str, user_id: str, user_text: str) ->
                         emit(user_id, "external_ref", "log", "operator"))
 
         # ── 既存ヒアリングフロー ──────────────────────────────────────────
+        # AUTOREPLY-GEN2 要件3: デプロイ等でメモリ履歴が消えた場合は App28 の
+        # 直近履歴から復元（Q-CHAT-1 と同方式・fail-open）
+        if user_id not in conversation_histories:
+            try:
+                _seeded = _normalize_history(
+                    await get_recent_chat_history(user_id))
+            except Exception:
+                _seeded = []
+            if _seeded:
+                conversation_histories[user_id] = _seeded
+        # 収集済み項目台帳（App21 の正+画像受領マーカー・fail-open）
         try:
-            claude_reply = await ask_claude(user_id, user_text)
+            _known_rec = await get_app21_record(user_id)
+        except Exception:
+            _known_rec = None
+        known_items = build_known_items(
+            _known_rec, conversation_histories.get(user_id, []))
+        try:
+            claude_reply = await ask_claude(user_id, user_text,
+                                            known_items=known_items)
         except ClaudeUnavailableError as e:
             # PRIMARY / FALLBACK 両方失敗 → 確認中応答 + 承認キューに要対応レコード
             async def _reply_func(token: str, text: str) -> None:
@@ -780,7 +834,39 @@ async def _process_line_event(reply_token: str, user_id: str, user_text: str) ->
             claude_reply = clean_reply2
             hearing_completed.add(user_id)
 
-        await _line_reply_with_fallback(reply_token, user_id, claude_reply)
+        # AUTOREPLY-GEN2 要件1/2: ヒアリング返信もサニタイズ+構成検証して
+        # から送信。fatal（マーカー残存）・上限超過（定型テンプレブロックは
+        # 免除）は自動送信せず承認キュー+現行定型で応答（切り詰めはしない）
+        cleaned, _issues, _fatal = reply_sanitizer.sanitize_reply(
+            claude_reply, allowed_emoji=ALLOWED_CANONICAL_EMOJI)
+        violations = ((["プレースホルダ/内部マーカー残存"] if _fatal else [])
+                      + reply_sanitizer.structure_violations(cleaned))
+        history = conversation_histories.get(user_id, [])
+        if violations:
+            await save_to_approval_queue(
+                user_id=user_id,
+                customer_name="（ヒアリング中）",
+                customer_message=user_text,
+                ai_draft=cleaned,
+                category="その他判断系",
+                reason="[ヒアリング送信ゲートで降格] " + " / ".join(violations),
+            )
+            if history and history[-1].get("role") == "assistant":
+                history[-1]["content"] = PENDING_REPLY
+            await _line_reply_with_fallback(reply_token, user_id,
+                                            PENDING_REPLY)
+            await save_to_chatlog(user_id, "user", user_text,
+                                  "ヒアリング", "no")
+            await save_to_chatlog(user_id, "assistant", PENDING_REPLY,
+                                  "ヒアリング", "yes")
+            return
+        if cleaned != claude_reply and history                 and history[-1].get("role") == "assistant":
+            history[-1]["content"] = cleaned
+        await _line_reply_with_fallback(reply_token, user_id, cleaned)
+        # 要件3: ヒアリング会話も App28 へ永続化（fail-open writer）
+        await save_to_chatlog(user_id, "user", user_text, "ヒアリング", "no")
+        await save_to_chatlog(user_id, "assistant", cleaned,
+                              "ヒアリング", "yes")
 
     except Exception:
         import traceback
@@ -788,6 +874,62 @@ async def _process_line_event(reply_token: str, user_id: str, user_text: str) ->
                      emit(user_id, "external_ref", "log", "operator"))
         logger.error("[ERROR] traceback: %s",
                      emit(traceback.format_exc(), "vendor_raw", "log", "operator"))
+
+
+async def _process_line_image_event(reply_token: str, user_id: str) -> None:
+    """AUTOREPLY-GEN2 要件4: 画像メッセージへの固定受領応答。
+
+    AI に画像内容の判断はさせない（読解は別票）。応答は弁護士確定を経た
+    固定文言のみ+弁護士へ受領通知。pause → 停止リスト → 人対応 のゲート
+    順はテキストイベントと同一。画像バイナリは保存しない（App28 には
+    受信マーカーのみ）。"""
+    if _autoreply_paused():
+        await _handle_paused_inbound(user_id, IMAGE_INBOUND_MARKER, None)
+        return
+    if await autoreply_stoplist.is_suppressed(user_id):
+        await _handle_suppressed_inbound(user_id, IMAGE_INBOUND_MARKER,
+                                         _durable_event_id.get())
+        return
+    try:
+        record = await get_app21_record(user_id)
+        if record is not None:
+            response_mode = (record.get("response_mode", {})
+                             .get("value", "") or "自動")
+            if response_mode == "人対応":
+                await save_to_chatlog(user_id, "user", IMAGE_INBOUND_MARKER,
+                                      "", "no")
+                if ATTORNEY_LINE_USER_ID:
+                    from hub.notify import notify_business
+                    await notify_business(
+                        ATTORNEY_LINE_USER_ID,
+                        "【人対応中】お客様から書類のお写真が届きました。"
+                        "LINE アプリでご確認ください")
+                return
+        await save_to_chatlog(user_id, "user", IMAGE_INBOUND_MARKER,
+                              "画像受領", "no")
+        await _line_reply_with_fallback(reply_token, user_id,
+                                        IMAGE_RECEIPT_REPLY)
+        await save_to_chatlog(user_id, "assistant", IMAGE_RECEIPT_REPLY,
+                              "画像受領", "yes")
+        # ヒアリング中のメモリ履歴にも受領を残す（既知項目台帳の
+        # 「書類写真: 受領済み」の源になる）
+        history = conversation_histories.get(user_id)
+        if history is not None:
+            history.append({"role": "user", "content": IMAGE_INBOUND_MARKER})
+            history.append({"role": "assistant",
+                            "content": IMAGE_RECEIPT_REPLY})
+        if ATTORNEY_LINE_USER_ID:
+            from hub.notify import notify_business
+            await notify_business(
+                ATTORNEY_LINE_USER_ID,
+                "【書類写真受領】お客様から書類のお写真が届きました。"
+                "LINE アプリでご確認ください")
+        logger.info("[IMAGE] receipt sent user_id=%s",
+                    emit(user_id, "external_ref", "log", "operator"))
+    except Exception as e:
+        logger.error("[IMAGE] handling failed user_id=%s cls=%s",
+                     emit(user_id, "external_ref", "log", "operator"),
+                     type(e).__name__)
 
 
 async def _process_line_event_durable(reply_token: str, user_id: str, user_text: str,
@@ -855,6 +997,17 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
 
     for event in data.get("events", []):
         if event.get("type") != "message":
+            continue
+        if event["message"].get("type") == "image":
+            # AUTOREPLY-GEN2 要件4: 画像は固定受領応答+弁護士通知のみ
+            # （AI に画像内容の判断はさせない・画像読解は別票。durable lane
+            # はテキスト契約のまま=画像は非 durable の背景処理）
+            background_tasks.add_task(
+                _process_line_image_event,
+                event["replyToken"], event["source"]["userId"])
+            logger.info("[WEBHOOK] queued image user_id=%s",
+                        emit(event["source"]["userId"], "external_ref",
+                             "log", "operator"))
             continue
         if event["message"].get("type") != "text":
             continue

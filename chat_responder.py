@@ -30,6 +30,7 @@ from claude_gateway import (
     create_message_with_fallback,
 )
 from config import HEARING_STATUSES, POST_ENGAGEMENT_STATUSES
+from hub import reply_sanitizer
 from hub.redact import emit
 
 logger = logging.getLogger("chat_responder")
@@ -104,6 +105,8 @@ URGENT_SEIZURE_PANIC_REPLY = (
 )
 
 # 承認キュー行き時に PENDING_REPLY の代わりに即時送信できる定型文
+# （hoterasu は定義順の都合で HOTERASU_STANDARD_REPLY 定義直後に登録——
+# AUTOREPLY-GEN2 要件6: 法テラス標準回答のサーバー側決定的到達）
 IMMEDIATE_NOTICE_TEXTS = {
     "court_doc_request": COURT_DOC_REQUEST_REPLY,
     "churn_neutral": CHURN_NEUTRAL_REPLY,
@@ -188,6 +191,99 @@ HOTERASU_STANDARD_REPLY = (
     "ご利用には対応しておりません。"
     "費用は1社あたり44,000円（税込）の前払いとなります。"
 )
+# AUTOREPLY-GEN2 要件6: 法テラス質問に本標準回答をサーバー側で決定的に
+# 到達させる（従来はプロンプト内 FAQ 指示のみ＝モデル依存で不達だった）。
+# 承認降格時の即時定型として登録し、二度送り防止のマーカーも持たせる
+IMMEDIATE_NOTICE_TEXTS["hoterasu"] = HOTERASU_STANDARD_REPLY
+_TEMPLATE_DEDUP_MARKERS["hoterasu"] = "法テラス（民事法律扶助）"
+
+# ── 画像メッセージへの固定受領応答（AUTOREPLY-GEN2 要件4・票由来文言） ─────────
+# AI に画像内容の判断はさせない（画像読解は別票）。受領応答+弁護士通知のみ。
+# 本文言は merge 前に大野確定を経る
+IMAGE_RECEIPT_REPLY = (
+    "書類のお写真を受領いたしました。弁護士が確認のうえご連絡いたします。"
+)
+# App28 に記録する受信側マーカー（画像バイナリは保存しない）
+IMAGE_INBOUND_MARKER = "（画像メッセージを受信）"
+
+# ── PENDING_REPLY の文脈化（AUTOREPLY-GEN2 要件5・文言案） ──────────────────────
+# カテゴリ名ベースの閉集合文言。**大野の文言確定まで無効**（既定=現行
+# PENDING_REPLY）。確定後に env PENDING_CONTEXT_ENABLED=1 で有効化する。
+# 所要時間の目安を入れる場合は大野裁定の文言へ差し替える（時間の約束は
+# 現案では入れていない）
+PENDING_BY_CATEGORY = {
+    "費用の定型案内": ("費用についてのご質問ありがとうございます。"
+                       "担当弁護士に確認のうえ、改めてご連絡いたします。"),
+    "費用交渉・減額相談": ("お支払い方法についてのご相談ありがとうございます。"
+                           "担当弁護士が内容を確認のうえ、改めてご連絡いたします。"),
+    "法的判断・見通し": ("ご質問ありがとうございます。個別のご事情に関わる"
+                         "内容のため、担当弁護士が確認のうえ、改めてご連絡"
+                         "いたします。"),
+    "手続きの一般的な流れ": ("お手続きについてのご質問ありがとうございます。"
+                             "確認のうえ、改めてご連絡いたします。"),
+    "必要書類の案内": ("書類についてのご質問ありがとうございます。"
+                       "確認のうえ、改めてご連絡いたします。"),
+    "進捗の事実回答": ("進捗についてのお問い合わせありがとうございます。"
+                       "現在の状況を確認のうえ、改めてご連絡いたします。"),
+    "営業案内・アクセス": ("お問い合わせありがとうございます。"
+                           "ご案内内容を確認のうえ、改めてご連絡いたします。"),
+    "クレーム・不満": ("ご指摘ありがとうございます。責任者が内容を確認の"
+                       "うえ、改めてご連絡いたします。"),
+    "解約・辞任関係": ("ご連絡ありがとうございます。担当弁護士が内容を"
+                       "確認のうえ、改めてご連絡いたします。"),
+    "本人確認不能・第三者": ("恐れ入りますが、ご本人さま確認が必要な内容の"
+                             "ため、確認のうえ改めてご連絡いたします。"),
+    "その他判断系": ("ご質問ありがとうございます。担当者が内容を確認の"
+                     "うえ、改めてご連絡いたします。"),
+}
+
+
+def pending_reply_for(category: str) -> str:
+    """承認送り時の即時応答（要件5）。大野の文言確定（env
+    PENDING_CONTEXT_ENABLED=1）までは現行 PENDING_REPLY を返す。"""
+    if os.environ.get("PENDING_CONTEXT_ENABLED") == "1":
+        return PENDING_BY_CATEGORY.get(category, PENDING_REPLY)
+    return PENDING_REPLY
+
+
+# ── 許可絵文字（弁護士確定定型に含まれるもののみ・要件1） ───────────────────────
+def _collect_allowed_emoji() -> frozenset:
+    from hub.reply_sanitizer import _is_emoji
+    sources = FAQ3_CANONICAL_TEXTS + [
+        FEE_GUIDE_TEXT, HOTERASU_STANDARD_REPLY, PENDING_REPLY,
+        IMAGE_RECEIPT_REPLY, COURT_DOC_REQUEST_REPLY,
+    ] + list(PENDING_BY_CATEGORY.values())
+    return frozenset(ch for t in sources for ch in t if _is_emoji(ch))
+
+
+ALLOWED_CANONICAL_EMOJI = _collect_allowed_emoji()
+
+
+def build_known_items(app21_record: Optional[dict],
+                      history: list[dict]) -> dict:
+    """AUTOREPLY-GEN2 要件3: 収集済み項目台帳。
+
+    App21 の正（既存ヒアリングフローが機械抽出済み）+会話履歴の画像受領
+    マーカーから決定的に構成する。fail-open=取れない項目は載せない
+    （未知扱い・抽出失敗で会話を止めない）。"""
+    items: dict[str, str] = {}
+    try:
+        if app21_record:
+            for label, code in (("債権者名", "問い合わせ業者名"),
+                                ("借入時期", "借入時期_テキスト"),
+                                ("最終返済日", "最終返済日_テキスト"),
+                                ("裁判所書類の有無", "裁判所書類"),
+                                ("信用情報で知ったか", "信用情報確認")):
+                v = str((app21_record.get(code) or {}).get("value")
+                        or "").strip()
+                if v:
+                    items[label] = v
+        if any(IMAGE_RECEIPT_REPLY in (m.get("content") or "")
+               for m in history if m.get("role") == "assistant"):
+            items["書類写真"] = "受領済み"
+    except Exception:
+        return items
+    return items
 
 # ── 時効見立て_条件付きの留保文言 ─────────────────────────────────────────────
 # 一般論（A型）のただし書き / 個別見立て（B型）の条件+確定留保。
@@ -221,10 +317,22 @@ BRANCHING_GUIDANCE_EXAMPLE = (
 )
 
 # 禁止語照合の前に返信文から除去する許可済みフレーズ
+# AUTOREPLY-GEN2 要件4: ヒアリング初回テンプレの写真案内（SYSTEM_PROMPT 内の
+# 固定文言）のみ許可。それ以外の自由文での写真依頼は禁止語
+# （AI は画像を見られないため、見えないものを求める文面を出させない）
+HEARING_PHOTO_GUIDE_PHRASE = "写真を送っていただくと\nより正確に確認できます"
+# 写真依頼の許可定型（弁護士確定の資料収集文言のみ。これ以外の自由な
+# 言い回しでの写真依頼は「写真依頼」禁止語で承認制に降格される）
+APPROVED_PHOTO_REQUEST_PHRASES = [
+    "全ページの写真をこのLINEにお送りください",         # 差押え切迫の定型内
+    "差押えに関する書類の写真をこのLINEにお送りいただけますか",  # FAQ 指示の定型
+]
 ALLOWLISTED_PHRASES = [
     APPROVED_PHONE_INSTRUCTION,
     APPROVED_DUNNING_INSTRUCTION,
     "お電話に出ないでください",
+    HEARING_PHOTO_GUIDE_PHRASE,
+    *APPROVED_PHOTO_REQUEST_PHRASES,
 ]
 
 # 禁止語（検出したら自動送信を承認制に降格）
@@ -256,6 +364,11 @@ _FORBIDDEN_PATTERNS: list[tuple[str, re.Pattern]] = [
     # 「時効間近」は全応答で使用禁止（減額通知等からの安易な示唆を防ぐ。
     # 顧客が使った場合も復唱しない。2026-07-03 FAQ第2弾で弁護士指示）
     ("禁止表現", re.compile(r"時効間近")),
+    # AUTOREPLY-GEN2 要件4: AI は画像を見られないため、自由文での写真依頼は
+    # 禁止（ヒアリング初回テンプレの固定文言のみ ALLOWLISTED_PHRASES で許可。
+    # 画像の受領応答・弁護士確認は _process_line_image_event が担う）
+    ("写真依頼",
+     re.compile(r"(?:お?写真|画像)を(?:お送り|送っ|撮っ|添付し)")),
 ]
 
 # ── 裁判所書類の第一報検知（サーバー側バックストップ） ─────────────────────────
@@ -292,6 +405,7 @@ _SYSTEM_PROMPT_BASE = """\
 - 敬体（です・ます調）、1メッセージ400字以内を目安とする
 - 用語:「時効の更新」を使用（「時効の延長」は禁止）
 - 記録にない進捗・日付・金額の創作は禁止
+- 書類の写真をお願いするときは定型文言（「お手元の書類の全ページを写真に撮って、このLINEに送っていただけますか。」または「差押えに関する書類の写真をこのLINEにお送りいただけますか」）をそのまま使う。自由な言い回しでの写真依頼はサーバー側で承認制に降格される。収集済み項目に「書類写真: 受領済み」がある場合は再依頼しない
 - 断定語（確実に/絶対に/間違いなく/必ず 等）・行動指示語（払わないで/無視して/連絡しないで/放置して 等）は使用禁止。例外は2つのみ: (1)【FAQ】記載の受任後顧客への定型指示（電話対応・督促状対応）をそのまま使う場合 (2)「絶対に大丈夫とは言えません」のような否定の形
 
 【カテゴリ選択肢】
@@ -591,11 +705,15 @@ def build_system_prompt(
     last_payment: str = "（未登録）",
     court_docs: str = "（未登録）",
     credit_check: str = "（未登録）",
+    known_items: Optional[dict] = None,
 ) -> str:
-    """顧客対応Claudeのシステムプロンプトを組み立てる"""
+    """顧客対応Claudeのシステムプロンプトを組み立てる。
+
+    AUTOREPLY-GEN2 要件3: known_items（収集済み項目台帳・build_known_items）
+    を渡すと「既知項目一覧+再質問禁止」の節を追記する。"""
     routing = classify_routing(status)
     phase = "受任後" if routing == "post_engagement" else "受任前"
-    return _SYSTEM_PROMPT_TMPL.format(
+    prompt = _SYSTEM_PROMPT_TMPL.format(
         phase=phase,
         customer_name=customer_name,
         status=status,
@@ -605,6 +723,14 @@ def build_system_prompt(
         court_docs=court_docs,
         credit_check=credit_check,
     )
+    if known_items:
+        lines = "\n".join(f"- {k}: {v}" for k, v in known_items.items())
+        prompt += (
+            "\n\n【収集済み項目（既知・再質問禁止）】\n" + lines +
+            "\n上記は既に回答済み・受領済みの項目です。同じ内容を再度"
+            "質問・依頼しないでください。"
+        )
+    return prompt
 
 
 # ── サーバー側ガード（自動送信前の二重チェック） ─────────────────────────────────
@@ -670,7 +796,8 @@ def _template_already_sent(notice_key: str, history: list[dict]) -> bool:
 
 
 def apply_server_guards(
-    result: dict, history: list[dict], user_message: str
+    result: dict, history: list[dict], user_message: str,
+    *, sanitize_fatal: bool = False
 ) -> GuardResult:
     """
     compose_reply の結果にサーバー側の二重チェックを適用する。
@@ -697,6 +824,22 @@ def apply_server_guards(
     can_auto_send = auto_send and (category in AUTO_SEND_CATEGORIES)
 
     if can_auto_send:
+        # a0) AUTOREPLY-GEN2 要件1/2: プレースホルダ残存は送信禁止・
+        #     長さ/質問数の超過は自動送信せず承認降格（切り詰めはしない）
+        if sanitize_fatal:
+            can_auto_send = False
+            reasons.append("プレースホルダ/内部マーカー残存")
+        structural = reply_sanitizer.structure_violations(reply)
+        if structural:
+            can_auto_send = False
+            reasons.extend(structural)
+        # a1) AUTOREPLY-GEN2 要件6: 法テラス質問には標準回答（弁護士確定）を
+        #     決定的に到達させる——標準回答を逐語で含まない返信は承認降格し、
+        #     即時定型（hoterasu）で標準回答を顧客へ送る
+        if "法テラス" in user_message \
+                and HOTERASU_STANDARD_REPLY not in reply:
+            can_auto_send = False
+            reasons.append("法テラス標準回答の不使用")
         # a) 禁止語照合
         hits = find_forbidden_words(reply)
         if hits:
@@ -732,6 +875,9 @@ def apply_server_guards(
         # サーバー側バックストップ: 裁判所書類の第一報を検知したら資料収集文面を送る
         if notice_key == "none" and looks_like_court_doc_report(user_message):
             notice_key = "court_doc_request"
+        # AUTOREPLY-GEN2 要件6: 法テラス質問の承認降格時は標準回答を即時送信
+        if notice_key == "none" and "法テラス" in user_message:
+            notice_key = "hoterasu"
         # 同じ定型文の二度送りは通常の定型文に戻す
         if notice_key != "none" and _template_already_sent(notice_key, history):
             notice_key = "none"
@@ -1130,6 +1276,14 @@ async def handle_customer_message(
     def _field(code: str) -> str:
         return app21_record.get(code, {}).get("value", "") or "（未登録）"
 
+    # チャット履歴（直近10往復）を取得してメッセージに追加
+    history = await get_recent_chat_history(user_id)
+    messages = history + [{"role": "user", "content": user_message}]
+
+    # AUTOREPLY-GEN2 要件3: 収集済み項目台帳（App21 の正+画像受領マーカー・
+    # fail-open）を既知項目一覧としてプロンプトへ注入し再質問を禁止
+    known_items = build_known_items(app21_record, history)
+
     system_prompt = build_system_prompt(
         status=status,
         customer_name=customer_name,
@@ -1138,11 +1292,8 @@ async def handle_customer_message(
         last_payment=_field("最終返済日_テキスト"),
         court_docs=_field("裁判所書類"),
         credit_check=_field("信用情報確認"),
+        known_items=known_items,
     )
-
-    # チャット履歴（直近10往復）を取得してメッセージに追加
-    history = await get_recent_chat_history(user_id)
-    messages = history + [{"role": "user", "content": user_message}]
 
     # Claude で返信案を作成
     try:
@@ -1165,7 +1316,17 @@ async def handle_customer_message(
         await reply_func(reply_token, PENDING_REPLY)
         return
 
-    reply_text = result["reply"]
+    # AUTOREPLY-GEN2 要件1: 送信直前サニタイズ（markdown 平文化・許可外
+    # 絵文字除去）。fatal（プレースホルダ/内部マーカー残存）はガードで
+    # 承認降格＝その文面は送信しない
+    reply_text, sanitize_issues, sanitize_fatal = \
+        reply_sanitizer.sanitize_reply(
+            result["reply"], allowed_emoji=ALLOWED_CANONICAL_EMOJI)
+    if sanitize_issues:
+        logger.info("[SANITIZE] user_id=%s issues=%s",
+                    emit(user_id, "external_ref", "log", "operator"),
+                    emit(sanitize_issues, "freetext", "log", "operator"))
+    result = dict(result, reply=reply_text)
     category   = result["category"]
     auto_send  = result["auto_send"]
     reason     = result.get("reason", "")
@@ -1173,8 +1334,10 @@ async def handle_customer_message(
                 emit(user_id, "external_ref", "log", "operator"),
                 emit(reason, "freetext", "log", "operator"))
 
-    # サーバー側二重チェック（カテゴリ許可リスト＋禁止語・必須文言・留保文言）
-    guard = apply_server_guards(result, history, user_message)
+    # サーバー側二重チェック（カテゴリ許可リスト＋禁止語・必須文言・留保文言
+    # ＋GEN2: プレースホルダ/長さ/質問数/法テラス標準回答）
+    guard = apply_server_guards(result, history, user_message,
+                                sanitize_fatal=sanitize_fatal)
     if guard.demotion_reasons:
         logger.info("[GUARD] demoted user_id=%s reasons=%s",
                     emit(user_id, "external_ref", "log", "operator"),
@@ -1202,8 +1365,10 @@ async def handle_customer_message(
             category=category,
             reason=queue_reason,
         )
-        # 顧客への定型文を返信（裁判所書類の第一報・離脱兆候・対象外債権は専用文面）
-        ack_text = guard.immediate_notice_text or PENDING_REPLY
+        # 顧客への定型文を返信（裁判所書類の第一報・離脱兆候・対象外債権・
+        # 法テラスは専用文面。GEN2 要件5: それ以外はカテゴリ別の文脈化定型
+        # ——大野の文言確定=PENDING_CONTEXT_ENABLED までは現行文言）
+        ack_text = guard.immediate_notice_text or pending_reply_for(category)
         await reply_func(reply_token, ack_text)
         await save_to_chatlog(user_id, "assistant", ack_text, category, "yes")
         # 弁護士へ承認依頼通知（希死念慮・差押え切迫は【緊急・要即時対応】）
