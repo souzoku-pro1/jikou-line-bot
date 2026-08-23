@@ -84,16 +84,26 @@ EXPECTED_KINTONE_SCHEMA = {
             "対象債権者3": {"type": "SINGLE_LINE_TEXT"},
             "契約書ステータス": {
                 "type": "DROP_DOWN",
-                # CAS 状態機械の閉集合 7 値。トリガ読み: 契約書作成（v1）・
-                # クラウドサイン登録（CONTRACT-GEN-2）／書き: contract_webhook
-                # （作成中・作成済・登録中・登録済・要確認）。3 値追加は
+                # CAS 状態機械の閉集合 10 値。トリガ読み: 契約書作成（v1）・
+                # クラウドサイン登録（CONTRACT-GEN-2）・時効援用通知作成
+                # （JIKOU-NOTICE-1・notice_webhook）／書き: contract_webhook
+                # （作成中・作成済・登録中・登録済・要確認）+notice_webhook
+                # （通知作成中・通知作成済・要確認）。追加分の選択肢は
                 # CU（大野）が前提——追加までは daily_healthcheck が日次警告
                 "required_options": ["契約書作成", "契約書作成中",
                                      "契約書作成済", "クラウドサイン登録",
                                      "クラウドサイン登録中",
-                                     "クラウドサイン登録済", "要確認"],
+                                     "クラウドサイン登録済",
+                                     "時効援用通知作成", "時効援用通知作成中",
+                                     "時効援用通知作成済", "要確認"],
             },
             "委任契約書": {"type": "FILE"},
+            # ── JIKOU-NOTICE-1: 時効援用通知書生成（notice_webhook.py が
+            # 読む/書く）。CU（大野）でのフィールド追加が前提——追加までは
+            # daily_healthcheck が App21 の不足として日次警告する
+            "furigana": {"type": "SINGLE_LINE_TEXT"},      # ラベル: ふりがな
+            "old_address": {"type": "SINGLE_LINE_TEXT"},   # ラベル: 旧住所
+            "notice_file": {"type": "FILE"},               # ラベル: 時効援用通知書
         },
     },
     "App 28 (チャットログ)": {
