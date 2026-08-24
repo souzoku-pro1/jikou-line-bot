@@ -25,6 +25,7 @@ from contract_webhook import router as contract_router
 from document_webhook import router as document_router
 from hub.dispatch import router as hub_dispatch_router
 from dispatch_bot.router import router as dispatch_bot_router
+from houki_bot.router import router as houki_bot_router
 from koseki_ingest import router as koseki_ingest_router
 from registry_ingest import router as registry_ingest_router
 from bank_ingest import router as bank_ingest_router
@@ -37,6 +38,7 @@ app.include_router(contract_router)
 app.include_router(document_router)
 app.include_router(hub_dispatch_router)
 app.include_router(dispatch_bot_router)
+app.include_router(houki_bot_router)
 app.include_router(koseki_ingest_router)
 app.include_router(registry_ingest_router)
 app.include_router(bank_ingest_router)
@@ -184,8 +186,11 @@ async def health():
     return {"status": "ok", "deps": status}
 
 
+# 必須 env の import 時 fail-fast は従来どおり維持（値の実使用は
+# hub/line_channel.JIKOU_CHANNEL が呼び出し時に env から解決する・H1）
 LINE_CHANNEL_SECRET = os.environ["LINE_CHANNEL_SECRET"]
 LINE_CHANNEL_ACCESS_TOKEN = os.environ["LINE_CHANNEL_ACCESS_TOKEN"]
+from hub import line_channel as hub_line_channel  # noqa: E402
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 KINTONE_SUBDOMAIN = os.environ["KINTONE_SUBDOMAIN"]
 KINTONE_APP_ID = os.environ["KINTONE_APP_ID"]
@@ -196,31 +201,12 @@ PUSH_URL  = "https://api.line.me/v2/bot/message/push"
 
 
 async def _line_reply_with_fallback(reply_token: str, user_id: str, text: str) -> None:
-    """LINE Reply APIを試み、失敗（400等）したらPush APIにフォールバック"""
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(
-            REPLY_URL,
-            headers={"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"},
-            json={"replyToken": reply_token, "messages": [{"type": "text", "text": text}]},
-        )
-    if resp.is_success:
-        logger.info("[LINE] reply OK user_id=%s",
-                    emit(user_id, "external_ref", "log", "operator"))
-        return
-    logger.warning("[LINE] reply failed %s %s, trying push",
-                   emit(resp.status_code, "count", "log", "operator"),
-                   emit(resp.text[:200], "vendor_raw", "log", "operator"))
-    async with httpx.AsyncClient() as client:
-        push_resp = await client.post(
-            PUSH_URL,
-            headers={"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"},
-            json={"to": user_id, "messages": [{"type": "text", "text": text}]},
-        )
-    logger.info("[LINE] push fallback status=%s",
-                emit(push_resp.status_code, "count", "log", "operator"))
-    if not push_resp.is_success:
-        logger.error("[LINE] push fallback error: %s",
-                     emit(push_resp.text[:200], "vendor_raw", "log", "operator"))
+    """LINE Reply APIを試み、失敗（400等）したらPush APIにフォールバック。
+
+    SOUZOKU-HOUKI-H1: 実装は hub/line_channel.reply_with_push_fallback へ
+    逐語移設（時効チャネル JIKOU_CHANNEL=従来 env・ログ文言・順序とも不変）。"""
+    await hub_line_channel.reply_with_push_fallback(
+        hub_line_channel.JIKOU_CHANNEL, reply_token, user_id, text)
 
 # OCR固定資産エンドポイント用の環境変数（起動時ではなくリクエスト時にチェック）
 GOOGLE_VISION_API_KEY        = os.environ.get("GOOGLE_VISION_API_KEY")

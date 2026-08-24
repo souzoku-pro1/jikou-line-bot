@@ -31,6 +31,7 @@ from claude_gateway import (
     create_message_with_fallback,
 )
 from config import HEARING_STATUSES, POST_ENGAGEMENT_STATUSES
+from hub import line_channel
 from hub import reply_sanitizer
 from hub.redact import emit
 
@@ -1315,22 +1316,11 @@ async def mark_approval_sent(record_id: str) -> None:
 # ── LINE 送信 ──────────────────────────────────────────────────────────────────
 
 async def send_line_push(to: str, text: str) -> None:
-    """LINE Push API でメッセージを送信する"""
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(
-            "https://api.line.me/v2/bot/message/push",
-            headers={
-                "Authorization": f"Bearer {_LINE_TOKEN}",
-                "Content-Type": "application/json",
-            },
-            json={"to": to, "messages": [{"type": "text", "text": text}]},
-        )
-    logger.info("[LINE_PUSH] to=%s status=%s",
-                emit(to, "external_ref", "log", "operator"),
-                emit(resp.status_code, "count", "log", "operator"))
-    if not resp.is_success:
-        logger.error("[LINE_PUSH] ERROR: %s",
-                     emit(resp.text, "vendor_raw", "log", "operator"))
+    """LINE Push API でメッセージを送信する。
+
+    SOUZOKU-HOUKI-H1: 実装は hub/line_channel.push_text へ逐語移設
+    （時効チャネル JIKOU_CHANNEL=従来 env・ログ文言不変）。"""
+    await line_channel.push_text(line_channel.JIKOU_CHANNEL, to, text)
 
 
 def build_attorney_notification(
