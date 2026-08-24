@@ -62,7 +62,7 @@ from chat_responder import (
     IMAGE_INBOUND_MARKER,
     PENDING_REPLY,
     ATTORNEY_LINE_USER_ID,
-    STYLE_SECTION,
+    HEARING_STYLE_SECTION_BASE,
     style_guard_violations,
 )
 from hub import reply_sanitizer
@@ -342,9 +342,11 @@ LINEで承っております。
 [/KINTONE_UPDATE]"""
 
 # ヒアリング経路の補足: 定型ブロック（罫線で区切られた項目一覧）と内部出力
-# （KINTONE_RECORD / KINTONE_UPDATE）は原文のまま。文体規範は自由文にのみ適用
+# （KINTONE_RECORD / KINTONE_UPDATE）は原文のまま。文体規範は自由文にのみ適用。
+# fix3 [A]: 見本集合はヒアリング用の無内容見本（HEARING_STYLE_SECTION_BASE・
+# 規範と注記は顧客対応経路と同一の正）
 HEARING_STYLE_SECTION = (
-    STYLE_SECTION
+    HEARING_STYLE_SECTION_BASE
     + "\n※ ヒアリング経路の補足: 上記の罫線で区切られた定型ブロックと、"
       "下記の kintone 登録の節で指示する内部出力（KINTONE_RECORD / "
       "KINTONE_UPDATE）は原文のまま出力する（文体規範の対象外）。"
@@ -881,7 +883,7 @@ async def _process_line_event(reply_token: str, user_id: str, user_text: str) ->
         violations = ((["プレースホルダ/内部マーカー残存"] if _fatal else [])
                       + reply_sanitizer.structure_violations(
                           cleaned, exempt_blocks=HEARING_TEMPLATE_BLOCKS)
-                      + style_guard_violations(cleaned))
+                      + style_guard_violations(cleaned, route="hearing"))
         history = conversation_histories.get(user_id, [])
         if violations:
             await save_to_approval_queue(

@@ -397,14 +397,55 @@ STYLE_EXEMPLARS_NOTE = (
     "回答のとおり）。"
 )
 
-STYLE_EXEMPLARS_TEXT = STYLE_EXEMPLARS_NOTE + "\n" + "\n".join(
-    f"見本{i}（{label}）:\n{text}"
-    for i, (label, text) in enumerate(STYLE_EXEMPLARS, start=1)
+# fix3 [A]（R-AUTOREPLY-STYLE-1-2 STYLE-02 HIGH・経路ごとの根拠集合の一致）:
+# ヒアリング prompt（_HEARING_PROMPT_FROZEN）には FAQ が無く、顧客対応の見本
+# 1〜3 が持つ具体値（5年程度・住宅ローン）の根拠が経路内に存在しない。そのため
+# ヒアリング経路は**無内容見本**（文体のみ: 結論先出し・引き取り・正直な開示・
+# 敬語水準・宛名/結び）で構成する。見本4 は法的内容を含まないため両経路共通。
+# 見本 B・C は fix1 [A] で設計した無内容版（fix2 で顧客対応側のみ大野確定の
+# 内容付きへ差し替えられたもの）を再利用。
+HEARING_STYLE_EXEMPLARS: tuple[tuple[str, str], ...] = (
+    ("引き取りと流れの案内",
+     "○○様 お問合せありがとうございます。ご回答内容を確認いたしました。"
+     "△△については○○様のおっしゃられるように、まずその点から確認する流れと"
+     "なりますね。そうすると、残りの項目を順にお伺いし、確認の結果をご案内する"
+     "こととなりそうです。当事務所でもお手伝いさせていただくことはできますので、"
+     "ご検討のほどよろしくお願いいたします。"),
+    ("不利益の正直な開示",
+     "△△については、お手続きにより解消される部分はあるものの、"
+     "すぐには解消されない場合もございますので、"
+     "あらかじめご了承いただきたく存じます。"),
+    ("質問への具体的回答",
+     "ご質問の点につきましては、当事務所で対応しております。"
+     "もっとも、その結果がいつの時点で反映されるかは相手方にも分かりません。"
+     "そのため、当面は反映されないものとしてご認識いただけると"
+     "間違いございません。"),
+    STYLE_EXEMPLARS[3],     # 進捗報告（両経路共通・法的内容なし）
 )
 
-# 両経路（ヒアリング=main.SYSTEM_PROMPT・顧客対応=_SYSTEM_PROMPT_BASE）へ
-# 同一の節を収載する（単一の正・二重管理なし）
+HEARING_STYLE_EXEMPLARS_NOTE = (
+    "※ ヒアリング経路の補足: 本プロンプトには FAQ・確定定型の根拠がないため、"
+    "金額・期間などの具体値（○年程度・○ヶ月程度・ローン等）は返信に入れない"
+    "（入れればサーバ側で承認降格）。"
+)
+
+
+def _exemplars_text(exemplars: tuple[tuple[str, str], ...]) -> str:
+    return STYLE_EXEMPLARS_NOTE + "\n" + "\n".join(
+        f"見本{i}（{label}）:\n{text}"
+        for i, (label, text) in enumerate(exemplars, start=1))
+
+
+STYLE_EXEMPLARS_TEXT = _exemplars_text(STYLE_EXEMPLARS)
+HEARING_STYLE_EXEMPLARS_TEXT = (
+    _exemplars_text(HEARING_STYLE_EXEMPLARS) + "\n" + HEARING_STYLE_EXEMPLARS_NOTE)
+
+# 規範（STYLE_RULES_TEXT）と見本注記は両経路で同一の正。見本集合のみ経路別:
+#   顧客対応（_SYSTEM_PROMPT_BASE）= STYLE_SECTION（FAQ 根拠つき見本 1〜4）
+#   ヒアリング（main.SYSTEM_PROMPT）= HEARING_STYLE_SECTION_BASE（無内容見本）
 STYLE_SECTION = STYLE_RULES_TEXT + "\n\n" + STYLE_EXEMPLARS_TEXT
+HEARING_STYLE_SECTION_BASE = (
+    STYLE_RULES_TEXT + "\n\n" + HEARING_STYLE_EXEMPLARS_TEXT)
 
 # 禁止語照合の前に返信文から除去する許可済みフレーズ
 # AUTOREPLY-GEN2 要件4: ヒアリング初回テンプレの写真案内（SYSTEM_PROMPT 内の
@@ -893,6 +934,21 @@ LEGACY_EXEMPLAR_NO_BASIS_PHRASES: tuple[str, ...] = (
     "ご連絡要求",       # 旧見本3: 信用情報機関への「連絡要求」（FAQ は「報告するよう伝える」）
 )
 
+# (4) fix3 [B]（STYLE-02）: 経路ごとの根拠集合。「FAQ 根拠あり・許容」は FAQ が
+#     prompt に収載される**顧客対応経路に限定**する。ヒアリング prompt
+#     （_HEARING_PROMPT_FROZEN）には FAQ が無いため、同語を含む出力は根拠なし＝
+#     承認降格（PENDING+承認キュー）。値は顧客対応 prompt の FAQ 文言と対照
+#     （test_autoreply_style1 で経路別根拠集合を pin）
+FAQ_BACKED_PHRASES: tuple[str, ...] = (
+    "5年程度",          # FAQ: 信用情報の削除まで長いと 5 年程度／完了後 5 年程度はローン不可
+    "住宅ローン",       # FAQ: カード作成やローンは組めない前提（住宅ローンを含む）
+    "1ヶ月程度",        # FAQ: 受任後の督促（ご依頼から 1 ヶ月程度経過後）
+)
+ROUTE_BASIS: dict[str, frozenset[str]] = {
+    "customer": frozenset(FAQ_BACKED_PHRASES),   # FAQ 収載＝根拠あり
+    "hearing": frozenset(),                      # FAQ 非収載＝根拠なし
+}
+
 
 def _normalize_for_self_intro(text: str) -> str:
     t = unicodedata.normalize("NFKC", text or "")
@@ -909,10 +965,20 @@ def find_attorney_self_intro(reply: str) -> list[str]:
     return hits
 
 
-def style_guard_violations(reply: str) -> list[str]:
+def style_guard_violations(reply: str, *, route: str) -> list[str]:
     """fix1 [B] の降格理由（空=適合）。両経路（顧客対応 apply_server_guards・
-    ヒアリング送信ゲート）から同一関数で適用する。"""
+    ヒアリング送信ゲート）から同一関数で適用する。
+
+    fix3 [B]: route（"customer" | "hearing"・必須）で根拠集合を切り替える。
+    名乗り・記号残存・無根拠語は両経路共通。FAQ 根拠語は route の根拠集合に
+    含まれる場合のみ許容（未知の route は fail-closed=根拠なし扱い）。"""
     violations: list[str] = []
+    basis = ROUTE_BASIS.get(route, frozenset())
+    unbacked = [p for p in FAQ_BACKED_PHRASES
+                if p in (reply or "") and p not in basis]
+    if unbacked:
+        violations.append(
+            f"経路（{route}）に根拠のない具体値: " + "、".join(unbacked))
     intro = find_attorney_self_intro(reply)
     if intro:
         violations.append("弁護士本人の名乗り検出: " + "、".join(intro))
@@ -1007,7 +1073,7 @@ def apply_server_guards(
             reasons.append("禁止語検出: " + "、".join(hits))
         # a2) AUTOREPLY-STYLE-1-fix1 [B]: 弁護士本人の名乗り・見本の匿名化
         #     記号の残存・旧見本由来の無根拠表現は承認降格
-        style_hits = style_guard_violations(reply)
+        style_hits = style_guard_violations(reply, route="customer")
         if style_hits:
             can_auto_send = False
             reasons.extend(style_hits)

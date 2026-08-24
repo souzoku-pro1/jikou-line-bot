@@ -1,11 +1,12 @@
 """AUTOREPLY-STYLE-1: 自動返信への「大野文体」の移植（文体規範+few-shot 見本）。
 
 固定する仕様:
-- 文体規範（7 項目）と見本 4 件を**両経路**（ヒアリング=main.SYSTEM_PROMPT・
-  顧客対応=chat_responder.build_system_prompt）の prompt に収載する。単一の正
-  （chat_responder.STYLE_SECTION）を両経路が共有する。
-- 真似るのは文体のみ。見本の匿名化記号・事案内容を Bot が引用しない旨と、
-  弁護士本人として名乗らない旨を prompt に明記する。
+- 文体規範（7 項目）と見本を**両経路**（ヒアリング=main.SYSTEM_PROMPT・
+  顧客対応=chat_responder.build_system_prompt）の prompt に収載する。規範と
+  見本注記は単一の正（chat_responder.STYLE_RULES_TEXT / STYLE_EXEMPLARS_NOTE）
+  を両経路が共有する。
+- 真似るのは文体のみ。見本の匿名化記号・事案内容を Bot が根拠なく引用しない
+  旨と、弁護士本人として名乗らない旨を prompt に明記する。
 - 凍結文言（法テラス・PENDING 11 種・画像受領文言・ヒアリング定型ブロック・
   費用定型・即時定型・FAQ3 確定文言・承認済み定型指示）と、従来の prompt
   本文（ヒアリング=_HEARING_PROMPT_FROZEN・顧客対応=_SYSTEM_PROMPT_BASE から
@@ -17,18 +18,28 @@ fix1（R-AUTOREPLY-STYLE-1 STYLE-01 HIGH・見本の無害化+サーバ側防壁
 - [B] サーバ側防壁（両経路・style_guard_violations）: 弁護士本人の名乗り
   （NFKC+空白除去のうえ閉集合）・見本の匿名化記号の残存・旧見本由来の
   無根拠表現（確定定型/FAQ に根拠のない旧見本固有の言い回し）を承認降格。
-  FAQ に根拠のある語（5年程度・1ヶ月程度・ローン等）は従来どおり許容。
 - [C] テストの向き: 修正後見本=**形式検査**（サニタイズ・300 字・質問数・
   禁止語）に適合し、匿名化記号を実名に埋めた形は全ガード通過。見本逐語
   （記号残存）・旧見本の引用・名乗り各形=**拒否**の negative。
 
-fix2（大野確定による見本文言の差し替え・見本1〜3・見本4 は fix1 のまま）:
+fix2（大野確定による見本文言の差し替え・顧客対応の見本1〜3・見本4 は fix1 のまま）:
 - 見本2・3 に戻した具体値（5年程度・住宅ローン）は FAQ 確定文言に根拠がある
-  語＝fix1 防壁の「FAQ 根拠あり・許容」分類と整合（見本逐語は形式検査と
-  [B] 防壁の双方を通る）。見本注記は「根拠なき引用の禁止」の趣旨へ微調整。
-- 無根拠語の降格閉集合・名乗り検知 4 形・記号残存検知は不変。
-- 本票由来の期待値更新: EXEMPLARS_FROZEN（見本1〜3）・見本に無い語の集合・
-  NO_QUOTE_PHRASES（注記の調整分）。
+  語＝fix1 防壁の「FAQ 根拠あり・許容」分類と整合。見本注記は「根拠なき引用
+  の禁止」の趣旨へ微調整。
+
+fix3（R-AUTOREPLY-STYLE-1-2 STYLE-02 HIGH・経路ごとの根拠集合の一致）:
+- [A] ヒアリング prompt には FAQ が無いため、ヒアリング経路の見本集合は
+  無内容見本（HEARING_STYLE_EXEMPLARS・見本4 は両経路共通）で構成。顧客対応
+  経路は現行（FAQ 根拠つき見本 1〜4）のまま。
+- [B] style_guard_violations(reply, route=...) で経路別の根拠集合
+  （ROUTE_BASIS）を適用: FAQ 根拠語（FAQ_BACKED_PHRASES）の許容は顧客対応
+  経路に限定。ヒアリング経路では同語を含む出力を承認降格。名乗り・記号残存・
+  無根拠語は両経路共通のまま。
+- [C] negative（Codex 指定）: ヒアリング経路で顧客対応の見本2・3 を逐語返却→
+  PENDING_REPLY・承認キュー 1 件・LINE への見本文送信 0。顧客対応経路では
+  既存 FAQ 根拠により通過。両経路の根拠集合を prompt 本文と明示的に対照。
+  旧 test_faq_backed_exemplars_pass_verbatim のヒアリング側 positive は
+  本票由来で negative へ書き換え。
 """
 
 import hashlib
@@ -65,7 +76,7 @@ def _run(coro):
     return asyncio.run(coro)
 
 
-# ── fix2（大野確定）後の見本（テスト側の凍結コピー・逐語対照） ──────────────────
+# ── 顧客対応経路の見本（fix2・大野確定・テスト側の凍結コピー） ──────────────────
 EXEMPLARS_FROZEN = {
     "見立てと提案": (
         "○○様 お問合せありがとうございます。"
@@ -87,6 +98,26 @@ EXEMPLARS_FROZEN = {
         "お世話になっております。本日△△に対して、時効援用通知を送付致します。"
         "今後は結果の確認までお時間をいただき、手続きを進めさせていただきます。"
         "少々お時間をいただきますが、引き続きよろしくお願い致します。"),
+}
+
+# ── ヒアリング経路の無内容見本（fix3 [A]・テスト側の凍結コピー） ────────────────
+HEARING_EXEMPLARS_FROZEN = {
+    "引き取りと流れの案内": (
+        "○○様 お問合せありがとうございます。ご回答内容を確認いたしました。"
+        "△△については○○様のおっしゃられるように、まずその点から確認する流れと"
+        "なりますね。そうすると、残りの項目を順にお伺いし、確認の結果をご案内する"
+        "こととなりそうです。当事務所でもお手伝いさせていただくことはできますので、"
+        "ご検討のほどよろしくお願いいたします。"),
+    "不利益の正直な開示": (
+        "△△については、お手続きにより解消される部分はあるものの、"
+        "すぐには解消されない場合もございますので、"
+        "あらかじめご了承いただきたく存じます。"),
+    "質問への具体的回答": (
+        "ご質問の点につきましては、当事務所で対応しております。"
+        "もっとも、その結果がいつの時点で反映されるかは相手方にも分かりません。"
+        "そのため、当面は反映されないものとしてご認識いただけると"
+        "間違いございません。"),
+    "進捗報告": EXEMPLARS_FROZEN["進捗報告"],
 }
 
 # ── 旧見本（AUTOREPLY-STYLE-1 e595ae6 時点・fix1 で prompt から除去済み） ─────────
@@ -113,7 +144,7 @@ OLD_EXEMPLARS = {
         "今後は1ヶ月程度のお時間をいただき手続きを進めさせていただきます。"
         "少々お時間をいただきますが、引き続きよろしくお願い致します。"),
 }
-# 旧見本ごとに期待する降格理由の分類（[B] 3 種の閉集合）
+# 旧見本ごとに期待する降格理由の分類（[B] 閉集合・両経路共通の 3 種）
 OLD_EXEMPLAR_EXPECTED_REASON = {
     "旧1_名乗り": "弁護士本人の名乗り検出",
     "旧2_住宅ローン": "旧見本由来の無根拠表現",
@@ -159,7 +190,7 @@ STYLE_RULE_PHRASES = (
 )
 
 # 「文体のみ」裁定の明記（fix1: 匿名化記号の不残存・事案内容の不引用・
-# 弁護士本人として名乗らない・内容ルールの優先）
+# 弁護士本人として名乗らない・内容ルールの優先。fix2: 根拠なき引用の禁止）
 NO_QUOTE_PHRASES = (
     "匿名化の空欄であり",
     "○○・△△の記号を残さない",
@@ -169,6 +200,13 @@ NO_QUOTE_PHRASES = (
     "サーバ側で承認降格",
     "文体規範が内容のルールに優先することはない",
 )
+
+# fix3: FAQ 根拠語 → 顧客対応 prompt 本文（FAQ）側の根拠要語（対照用）
+FAQ_BASIS_EVIDENCE = {
+    "5年程度": "5年程度",
+    "住宅ローン": "ローンは組めない",
+    "1ヶ月程度": "1ヶ月程度",
+}
 
 # ── main 時点（4b61b41）の凍結文言 sha256 ────────────────────────────────────
 FROZEN_SHA = {
@@ -204,6 +242,12 @@ FROZEN_SHA = {
 
 _CUSTOMER_STYLE_MARKER = "<<STYLE_SECTION>>"
 _HEARING_KINTONE_HEADING = "【kintone登録について】"
+
+# 経路 → (見本集合, 凍結コピー)
+ROUTE_EXEMPLARS = {
+    "customer": (cr.STYLE_EXEMPLARS, EXEMPLARS_FROZEN),
+    "hearing": (cr.HEARING_STYLE_EXEMPLARS, HEARING_EXEMPLARS_FROZEN),
+}
 
 
 def _concretize(text: str) -> str:
@@ -265,132 +309,183 @@ def _hearing_gate(text: str, tag: str):
     return reply, queue
 
 
+def _assert_hearing_passes(tc, text, tag):
+    reply, queue = _hearing_gate(text, tag)
+    reply.assert_awaited_once()
+    tc.assertEqual(reply.await_args.args[2], text)
+    queue.assert_not_awaited()
+
+
+def _assert_hearing_demoted(tc, text, tag, expected_reason):
+    """PENDING_REPLY を 1 回だけ送信・承認キュー 1 件・見本文の LINE 送信 0。"""
+    reply, queue = _hearing_gate(text, tag)
+    reply.assert_awaited_once()
+    tc.assertEqual(reply.await_args.args[2], cr.PENDING_REPLY)
+    tc.assertNotEqual(reply.await_args.args[2], text)
+    queue.assert_awaited_once()
+    tc.assertIn(expected_reason, queue.await_args.kwargs["reason"])
+    tc.assertIn("ヒアリング送信ゲートで降格", queue.await_args.kwargs["reason"])
+
+
 class TestExemplarsVerbatim(unittest.TestCase):
-    """見本 4 件は fix1 [A] 後の逐語（改変禁止）。"""
+    """見本は経路別の凍結コピーと逐語一致（改変禁止）。"""
 
     def test_exemplars_match_frozen_copy(self):
-        self.assertEqual([lbl for lbl, _t in cr.STYLE_EXEMPLARS],
-                         list(EXEMPLARS_FROZEN))
-        for label, text in cr.STYLE_EXEMPLARS:
-            with self.subTest(label=label):
-                self.assertEqual(text, EXEMPLARS_FROZEN[label])
+        for route, (exemplars, frozen) in ROUTE_EXEMPLARS.items():
+            with self.subTest(route=route):
+                self.assertEqual([lbl for lbl, _t in exemplars], list(frozen))
+            for label, text in exemplars:
+                with self.subTest(route=route, label=label):
+                    self.assertEqual(text, frozen[label])
+        # 見本4（進捗報告）は両経路共通の同一文
+        self.assertEqual(cr.HEARING_STYLE_EXEMPLARS[3], cr.STYLE_EXEMPLARS[3])
 
     def test_exemplars_are_sanitized_of_case_content(self):
         # fix1 [A]: 名乗り・無根拠の案件固有表現・旧記号「◯社」は見本に残って
-        # いない（見本本文でも同様）。fix2: 大野確定で戻した 5年程度・住宅ローン
-        # は FAQ 根拠あり＝禁止集合から外す（1ヶ月程度・信用情報機関は不使用のまま）
+        # いない。fix2: 顧客対応側の 5年程度・住宅ローンは FAQ 根拠あり＝禁止集合
+        # から外す（1ヶ月程度・信用情報機関は不使用のまま）
         banned = ("大野と申します", "弁護士の大野", "1ヶ月",
                   "延滞の文字", "完全に抹消", "ご連絡要求", "信用情報機関", "◯社")
-        for label, text in cr.STYLE_EXEMPLARS:
-            for token in banned:
-                with self.subTest(label=label, token=token):
-                    self.assertNotIn(token, text)
+        for route, (exemplars, _f) in ROUTE_EXEMPLARS.items():
+            for label, text in exemplars:
+                for token in banned:
+                    with self.subTest(route=route, label=label, token=token):
+                        self.assertNotIn(token, text)
+                with self.subTest(route=route, label=label):
+                    self.assertFalse(set("◯□") & set(text))   # 記号は ○○/△△ のみ
         for token in banned:
             with self.subTest(section=True, token=token):
                 self.assertNotIn(token, cr.STYLE_EXEMPLARS_TEXT.replace(
                     cr.STYLE_EXEMPLARS_NOTE, ""))
-        # 匿名化記号は ○○/△△ の 2 種のみ
-        for label, text in cr.STYLE_EXEMPLARS:
-            with self.subTest(label=label):
-                self.assertFalse(set("◯□") & set(text))
+
+    def test_hearing_exemplars_are_content_free(self):
+        # fix3 [A]: ヒアリング見本は FAQ 根拠語も案件固有の法的内容も含まない
+        # （経路内に根拠が無いため）。顧客対応の見本1〜3 とは別文
+        legal = ("譲渡", "原債権者", "信用情報", "債権者", "5年", "ローン",
+                 "ヶ月", "延滞", "抹消")
+        for label, text in cr.HEARING_STYLE_EXEMPLARS:
+            for token in cr.FAQ_BACKED_PHRASES + legal:
+                with self.subTest(label=label, token=token):
+                    self.assertNotIn(token, text)
+        hearing_texts = [t for _l, t in cr.HEARING_STYLE_EXEMPLARS]
+        for label in ("見立てと提案", "不利益の正直な開示", "質問への具体的回答"):
+            self.assertNotIn(EXEMPLARS_FROZEN[label], hearing_texts)
 
     def test_exemplars_contain_no_template_markers(self):
         # 置換マーカー（<<...>>）・format プレースホルダ（{}）・内部マーカーを
         # 含まない＝差し込み順序に依存せず、送信時 fatal にも該当しない
-        for label, text in cr.STYLE_EXEMPLARS:
-            with self.subTest(label=label):
-                for bad in ("<<", ">>", "{", "}", "[KINTONE_", "━"):
-                    self.assertNotIn(bad, text)
-        for bad in ("<<", ">>", "{", "}", "[KINTONE_", "━"):
-            self.assertNotIn(bad, cr.STYLE_SECTION)
+        for route, (exemplars, _f) in ROUTE_EXEMPLARS.items():
+            for label, text in exemplars:
+                with self.subTest(route=route, label=label):
+                    for bad in ("<<", ">>", "{", "}", "[KINTONE_", "━"):
+                        self.assertNotIn(bad, text)
+        for section in (cr.STYLE_SECTION, cr.HEARING_STYLE_SECTION_BASE):
+            for bad in ("<<", ">>", "{", "}", "[KINTONE_", "━"):
+                self.assertNotIn(bad, section)
 
 
 class TestExemplarsFormalChecks(unittest.TestCase):
-    """[C] 修正後見本=形式検査（サニタイズ・300 字・質問数・禁止語）に適合。"""
+    """[C] 見本=形式検査（サニタイズ・300 字・質問数・禁止語）に適合（両経路）。"""
 
     def test_sanitizer_leaves_exemplars_untouched(self):
-        for label, text in cr.STYLE_EXEMPLARS:
-            with self.subTest(label=label):
-                for allowed in (frozenset(), cr.ALLOWED_CANONICAL_EMOJI):
-                    out, issues, fatal = rs.sanitize_reply(text, allowed)
-                    self.assertEqual(out, text)
-                    self.assertEqual(issues, [])
-                    self.assertFalse(fatal)
+        for route, (exemplars, _f) in ROUTE_EXEMPLARS.items():
+            for label, text in exemplars:
+                with self.subTest(route=route, label=label):
+                    for allowed in (frozenset(), cr.ALLOWED_CANONICAL_EMOJI):
+                        out, issues, fatal = rs.sanitize_reply(text, allowed)
+                        self.assertEqual(out, text)
+                        self.assertEqual(issues, [])
+                        self.assertFalse(fatal)
 
     def test_length_and_question_limits(self):
         # 既定 300 字・質問数 2（env による調整なしの既定値で検査）
         with patch.dict(os.environ, {"AUTOREPLY_MAX_CHARS": ""}):
-            for label, text in cr.STYLE_EXEMPLARS:
-                with self.subTest(label=label):
-                    self.assertLessEqual(len(text), 300)
-                    self.assertEqual(rs.structure_violations(text), [])
-                    self.assertEqual(rs.structure_violations(
-                        text, exempt_blocks=main.HEARING_TEMPLATE_BLOCKS), [])
-                    self.assertEqual(len(rs._QUESTION_RE.findall(text)), 0)
+            for route, (exemplars, _f) in ROUTE_EXEMPLARS.items():
+                for label, text in exemplars:
+                    with self.subTest(route=route, label=label):
+                        self.assertLessEqual(len(text), 300)
+                        self.assertEqual(rs.structure_violations(text), [])
+                        self.assertEqual(rs.structure_violations(
+                            text, exempt_blocks=main.HEARING_TEMPLATE_BLOCKS),
+                            [])
+                        self.assertEqual(len(rs._QUESTION_RE.findall(text)), 0)
 
     def test_no_forbidden_words_and_no_self_intro(self):
-        for label, text in cr.STYLE_EXEMPLARS:
-            with self.subTest(label=label):
-                self.assertEqual(cr.find_forbidden_words(text), [])
-                self.assertEqual(cr.find_attorney_self_intro(text), [])
-                # 匿名化記号の残存以外の [B] 違反はない
-                other = [v for v in cr.style_guard_violations(text)
-                         if not v.startswith("見本の匿名化記号の残存")]
-                self.assertEqual(other, [])
+        # 各経路の見本は、その経路の [B] 防壁で「匿名化記号の残存」以外の違反
+        # を持たない（fix3: 経路別判定で評価）
+        for route, (exemplars, _f) in ROUTE_EXEMPLARS.items():
+            for label, text in exemplars:
+                with self.subTest(route=route, label=label):
+                    self.assertEqual(cr.find_forbidden_words(text), [])
+                    self.assertEqual(cr.find_attorney_self_intro(text), [])
+                    other = [v for v in cr.style_guard_violations(
+                                 text, route=route)
+                             if not v.startswith("見本の匿名化記号の残存")]
+                    self.assertEqual(other, [])
 
-    def test_concretized_exemplars_pass_all_guards(self):
-        # 記号を実名に埋めた形（正しい穴埋め）は両経路の全ガードを通過する
-        # ＝見本の文体そのものはガードと整合している
+    def test_concretized_exemplars_pass_own_route(self):
+        # 記号を実名に埋めた形（正しい穴埋め）は**その経路の**全ガードを通過する
+        # ＝見本の文体そのものは経路のガードと整合している（fix3: 経路別）
         for label, text in cr.STYLE_EXEMPLARS:
             filled = _concretize(text)
             with self.subTest(route="顧客対応", label=label):
                 g = _customer_guards(filled)
                 self.assertTrue(g.can_auto_send, g.demotion_reasons)
                 self.assertEqual(g.demotion_reasons, [])
+        for label, text in cr.HEARING_STYLE_EXEMPLARS:
+            filled = _concretize(text)
             with self.subTest(route="ヒアリング", label=label):
-                reply, queue = _hearing_gate(filled, "filled-" + label)
-                reply.assert_awaited_once()
-                self.assertEqual(reply.await_args.args[2], filled)
-                queue.assert_not_awaited()
+                _assert_hearing_passes(self, filled, "filled-h-" + label)
+            with self.subTest(route="顧客対応(ヒアリング見本)", label=label):
+                # 無内容見本は根拠を要しないため顧客対応経路でも通過する
+                self.assertTrue(_customer_guards(filled).can_auto_send)
 
 
 class TestExemplarVerbatimRejected(unittest.TestCase):
     """[C] 見本の丸写し（匿名化記号の残存）=拒否。旧見本の引用=拒否。"""
 
-    def test_faq_backed_exemplars_pass_verbatim(self):
-        # fix2: 見本2・3（記号なし・FAQ 根拠語 5年程度/住宅ローンを含む）は
-        # 逐語でも [B] 防壁にかからず両経路で通過する（根拠あり=許容の整合）
+    def test_faq_backed_exemplars_customer_pass_hearing_reject(self):
+        # fix3 [C]（Codex 指定・旧 test_faq_backed_exemplars_pass_verbatim を
+        # 本票由来で書き換え）: 顧客対応の見本2・3（記号なし・FAQ 根拠語
+        # 5年程度/住宅ローンを含む）は
+        #   顧客対応経路 → 既存 FAQ 根拠により通過（現行の維持）
+        #   ヒアリング経路 → PENDING_REPLY・承認キュー 1 件・見本文の LINE 送信 0
         for label in ("不利益の正直な開示", "質問への具体的回答"):
             text = EXEMPLARS_FROZEN[label]
             self.assertIn("5年程度", text)
-            with self.subTest(label=label):
-                self.assertEqual(cr.style_guard_violations(text), [])
+            with self.subTest(route="顧客対応", label=label):
+                self.assertEqual(
+                    cr.style_guard_violations(text, route="customer"), [])
                 self.assertTrue(_customer_guards(text).can_auto_send)
-                reply, queue = _hearing_gate(text, "faqbacked-" + label)
-                self.assertEqual(reply.await_args.args[2], text)
-                queue.assert_not_awaited()
+            with self.subTest(route="ヒアリング", label=label):
+                v = cr.style_guard_violations(text, route="hearing")
+                self.assertEqual(len(v), 1)
+                self.assertTrue(v[0].startswith("経路（hearing）に根拠のない具体値"))
+                self.assertIn("5年程度", v[0])
+                _assert_hearing_demoted(self, text, "faq-h-" + label,
+                                        "経路（hearing）に根拠のない具体値")
 
     def test_placeholder_residue_demoted_both_routes(self):
-        for label, text in cr.STYLE_EXEMPLARS:
-            if not cr._EXEMPLAR_PLACEHOLDER_RE.search(text):
-                continue    # 見本2・3 は記号を含まない（形式検査のみの対象）
-            with self.subTest(route="顧客対応", label=label):
-                g = _customer_guards(text)
-                self.assertFalse(g.can_auto_send)
-                self.assertTrue(any(r.startswith("見本の匿名化記号の残存")
-                                    for r in g.demotion_reasons))
-            with self.subTest(route="ヒアリング", label=label):
-                reply, queue = _hearing_gate(text, "verbatim-" + label)
-                self.assertEqual(reply.await_args.args[2], cr.PENDING_REPLY)
-                queue.assert_awaited_once()
-                self.assertIn("見本の匿名化記号の残存",
-                              queue.await_args.kwargs["reason"])
-        self.assertTrue(cr._EXEMPLAR_PLACEHOLDER_RE.search(
-            EXEMPLARS_FROZEN["見立てと提案"]))    # 少なくとも 1 件は検査対象
+        for route, (exemplars, _f) in ROUTE_EXEMPLARS.items():
+            for label, text in exemplars:
+                if not cr._EXEMPLAR_PLACEHOLDER_RE.search(text):
+                    continue    # 記号を含まない見本は形式検査のみの対象
+                with self.subTest(route="顧客対応", origin=route, label=label):
+                    g = _customer_guards(text)
+                    self.assertFalse(g.can_auto_send)
+                    self.assertTrue(any(
+                        r.startswith("見本の匿名化記号の残存")
+                        for r in g.demotion_reasons))
+                with self.subTest(route="ヒアリング", origin=route, label=label):
+                    _assert_hearing_demoted(self, text, f"verbatim-{route}-{label}",
+                                            "見本の匿名化記号の残存")
+        for frozen in (EXEMPLARS_FROZEN, HEARING_EXEMPLARS_FROZEN):
+            self.assertTrue(cr._EXEMPLAR_PLACEHOLDER_RE.search(
+                list(frozen.values())[0]))    # 各経路で少なくとも 1 件は検査対象
 
     def test_old_exemplars_rejected_both_routes(self):
         # Codex 指定 negative: 旧見本1 の逐語全文（名乗り入り）をモデル出力
-        # として返しても自動送信されない。旧2〜4 も各分類で降格
+        # として返しても自動送信されない。旧2〜4 も各分類で降格（両経路共通）
         for label, text in OLD_EXEMPLARS.items():
             expected = OLD_EXEMPLAR_EXPECTED_REASON[label]
             with self.subTest(route="顧客対応", label=label):
@@ -400,13 +495,7 @@ class TestExemplarVerbatimRejected(unittest.TestCase):
                                     for r in g.demotion_reasons),
                                 g.demotion_reasons)
             with self.subTest(route="ヒアリング", label=label):
-                reply, queue = _hearing_gate(text, "old-" + label)
-                reply.assert_awaited_once()
-                self.assertEqual(reply.await_args.args[2], cr.PENDING_REPLY)
-                queue.assert_awaited_once()
-                self.assertIn(expected, queue.await_args.kwargs["reason"])
-                self.assertIn("ヒアリング送信ゲートで降格",
-                              queue.await_args.kwargs["reason"])
+                _assert_hearing_demoted(self, text, "old-" + label, expected)
 
     def test_old_exemplar1_self_intro_is_the_trigger(self):
         # 旧見本1 は名乗りだけで降格される（記号を埋めても名乗りが残れば拒否）
@@ -439,30 +528,33 @@ class TestAttorneySelfIntroGuard(unittest.TestCase):
                 self.assertTrue(any(r.startswith("弁護士本人の名乗り検出")
                                     for r in g.demotion_reasons))
             with self.subTest(route="ヒアリング", form=form):
-                reply, queue = _hearing_gate(text, "intro-" + form)
-                self.assertEqual(reply.await_args.args[2], cr.PENDING_REPLY)
-                queue.assert_awaited_once()
-                self.assertIn("弁護士本人の名乗り検出",
-                              queue.await_args.kwargs["reason"])
+                _assert_hearing_demoted(self, text, "intro-" + form,
+                                        "弁護士本人の名乗り検出")
 
     def test_office_name_and_third_person_not_detected(self):
         for form in NOT_SELF_INTRO_FORMS:
             with self.subTest(form=form):
                 self.assertEqual(cr.find_attorney_self_intro(form), [])
-                self.assertEqual(cr.style_guard_violations(form), [])
+                for route in ROUTE_EXEMPLARS:
+                    self.assertEqual(
+                        cr.style_guard_violations(form, route=route), [])
                 self.assertTrue(_customer_guards(form).can_auto_send)
 
     def test_frozen_texts_and_template_blocks_pass(self):
         # 凍結文言（事務所名を含むヒアリング定型ブロックを含む）は [B] 防壁に
-        # 一切かからない（false positive なし）
+        # 一切かからない（false positive なし・両経路）
         for key, text in _frozen_texts().items():
-            with self.subTest(key=key):
-                self.assertEqual(cr.style_guard_violations(text), [])
+            for route in ROUTE_EXEMPLARS:
+                with self.subTest(key=key, route=route):
+                    self.assertEqual(
+                        cr.style_guard_violations(text, route=route), [])
         for i, block in enumerate(main.HEARING_TEMPLATE_BLOCKS):
             with self.subTest(block=i):
-                self.assertEqual(cr.style_guard_violations(block), [])
+                self.assertEqual(
+                    cr.style_guard_violations(block, route="hearing"), [])
         self.assertEqual(cr.style_guard_violations(
-            "はじめまして。\n大野法律事務所　時効援用専門窓口です。"), [])
+            "はじめまして。\n大野法律事務所　時効援用専門窓口です。",
+            route="hearing"), [])
 
     def test_vocabulary_closed_set_pinned(self):
         # 検知語彙の閉集合（設計の可視化・追加は票由来で行う）
@@ -473,44 +565,81 @@ class TestAttorneySelfIntroGuard(unittest.TestCase):
                          "○○|◯◯|△△|□□|◯社")
         self.assertEqual(cr.LEGACY_EXEMPLAR_NO_BASIS_PHRASES,
                          ("延滞の文字", "完全に抹消", "ご連絡要求"))
+        self.assertEqual(cr.FAQ_BACKED_PHRASES,
+                         ("5年程度", "住宅ローン", "1ヶ月程度"))
 
 
-class TestLegacyTokenPolicy(unittest.TestCase):
-    """[B] 旧見本トークンの線引き: FAQ に根拠のある語は許容・根拠なしは降格。"""
+class TestRouteBasisPolicy(unittest.TestCase):
+    """[B] fix3: 経路ごとの根拠集合。FAQ 根拠語は顧客対応のみ許容・ヒアリングは降格。
+    無根拠語の降格は両経路共通。"""
 
-    def test_faq_backed_tokens_allowed(self):
-        # FAQ（信用情報 5年程度・ローン・督促の 1ヶ月程度・信用情報機関への
-        # 報告）に同内容の根拠がある語は新ガードで降格しない
-        texts = (
-            "山田様のおっしゃるように、信用情報の削除まで長いと5年程度かかる"
-            "ことがございます。よろしくお願い致します。",
-            "手続きから5年程度はカード作成やローンは組めない前提でいた方が"
-            "よいです。住宅ローンも同様となります。",
-            "ご依頼から1ヶ月程度経過後に届いた場合は必ずご連絡ください。",
-            "信用情報機関へ早急に報告するよう業者には伝えます。",
-        )
-        for text in texts:
-            with self.subTest(text=text[:16]):
-                self.assertEqual(cr.style_guard_violations(text), [])
+    FAQ_BACKED_TEXTS = (
+        "山田様のおっしゃるように、信用情報の削除まで長いと5年程度かかる"
+        "ことがございます。よろしくお願い致します。",
+        "手続きから5年程度はカード作成やローンは組めない前提でいた方が"
+        "よいです。住宅ローンも同様となります。",
+        "ご依頼から1ヶ月程度経過後に届いた場合は必ずご連絡ください。",
+    )
+
+    def test_route_basis_closed_set(self):
+        self.assertEqual(set(cr.ROUTE_BASIS), {"customer", "hearing"})
+        self.assertEqual(cr.ROUTE_BASIS["customer"],
+                         frozenset(cr.FAQ_BACKED_PHRASES))
+        self.assertEqual(cr.ROUTE_BASIS["hearing"], frozenset())
+
+    def test_route_argument_required_and_unknown_is_fail_closed(self):
+        with self.assertRaises(TypeError):
+            cr.style_guard_violations("5年程度です")      # route 省略不可
+        v = cr.style_guard_violations("5年程度です", route="unknown")
+        self.assertEqual(len(v), 1)
+        self.assertIn("根拠のない具体値", v[0])
+
+    def test_basis_sets_contrast_with_prompt_bodies(self):
+        # 両経路の根拠集合を prompt 本文と明示的に対照: 顧客対応の根拠語には
+        # 顧客対応 prompt 本文（見本節を除く FAQ 部分）に根拠要語が実在し、
+        # ヒアリング prompt 本文（_HEARING_PROMPT_FROZEN）には存在しない
+        # ＝ヒアリング側に該当 FAQ がない限り許容しない
+        customer_body = cr._SYSTEM_PROMPT_TMPL.replace(cr.STYLE_SECTION, "")
+        self.assertEqual(set(FAQ_BASIS_EVIDENCE), set(cr.FAQ_BACKED_PHRASES))
+        for phrase, evidence in FAQ_BASIS_EVIDENCE.items():
+            with self.subTest(phrase=phrase):
+                self.assertIn(evidence, customer_body)
+                self.assertIn(phrase, cr.ROUTE_BASIS["customer"])
+                self.assertNotIn(evidence, main._HEARING_PROMPT_FROZEN)
+                self.assertNotIn(phrase, main._HEARING_PROMPT_FROZEN)
+                self.assertNotIn(phrase, cr.ROUTE_BASIS["hearing"])
+        # 組み立て済みヒアリング prompt 全体にも FAQ 根拠語は現れない
+        for phrase in cr.FAQ_BACKED_PHRASES:
+            self.assertNotIn(phrase, main.SYSTEM_PROMPT)
+
+    def test_faq_backed_tokens_allowed_customer_only(self):
+        for text in self.FAQ_BACKED_TEXTS:
+            with self.subTest(route="顧客対応", text=text[:16]):
+                self.assertEqual(
+                    cr.style_guard_violations(text, route="customer"), [])
                 self.assertTrue(_customer_guards(text).can_auto_send)
+            with self.subTest(route="ヒアリング", text=text[:16]):
+                v = cr.style_guard_violations(text, route="hearing")
+                self.assertEqual(len(v), 1)
+                self.assertTrue(v[0].startswith("経路（hearing）に根拠のない具体値"))
+                _assert_hearing_demoted(self, text, "faqtok-" + text[:8],
+                                        "経路（hearing）に根拠のない具体値")
 
-    def test_no_basis_phrases_demoted(self):
+    def test_no_basis_phrases_demoted_both_routes(self):
         for phrase in cr.LEGACY_EXEMPLAR_NO_BASIS_PHRASES:
             text = f"山田様、{phrase}について申し上げます。"
             with self.subTest(phrase=phrase):
-                v = cr.style_guard_violations(text)
-                self.assertEqual(
-                    v, [f"旧見本由来の無根拠表現: {phrase}"])
-                g = _customer_guards(text)
-                self.assertFalse(g.can_auto_send)
-                reply, queue = _hearing_gate(text, "legacy-" + phrase)
-                self.assertEqual(reply.await_args.args[2], cr.PENDING_REPLY)
-                self.assertIn("旧見本由来の無根拠表現",
-                              queue.await_args.kwargs["reason"])
+                for route in ROUTE_EXEMPLARS:
+                    self.assertEqual(
+                        cr.style_guard_violations(text, route=route),
+                        [f"旧見本由来の無根拠表現: {phrase}"])
+                self.assertFalse(_customer_guards(text).can_auto_send)
+                _assert_hearing_demoted(self, text, "legacy-" + phrase,
+                                        "旧見本由来の無根拠表現")
 
 
 class TestStyleInBothPrompts(unittest.TestCase):
-    """文体規範+見本が両経路の prompt に収載され、同一の正を共有する。"""
+    """文体規範+見本が両経路の prompt に収載され、規範/注記は同一の正を共有する。"""
 
     def _all_prompts(self) -> dict[str, str]:
         return {"ヒアリング": main.SYSTEM_PROMPT, **_customer_prompts()}
@@ -518,9 +647,19 @@ class TestStyleInBothPrompts(unittest.TestCase):
     def test_style_section_present_once_in_each_route(self):
         for route, prompt in self._all_prompts().items():
             with self.subTest(route=route):
-                self.assertEqual(prompt.count(cr.STYLE_SECTION), 1)
+                self.assertEqual(prompt.count(cr.STYLE_RULES_TEXT), 1)
+                self.assertEqual(prompt.count(cr.STYLE_EXEMPLARS_NOTE), 1)
                 self.assertEqual(prompt.count("【文体規範"), 1)
                 self.assertEqual(prompt.count("【文体見本"), 1)
+        # fix3: 見本節は経路別（顧客対応=STYLE_SECTION・ヒアリング=
+        # HEARING_STYLE_SECTION_BASE）で、互いの節を含まない
+        self.assertEqual(main.SYSTEM_PROMPT.count(cr.HEARING_STYLE_SECTION_BASE), 1)
+        self.assertNotIn(cr.STYLE_SECTION, main.SYSTEM_PROMPT)
+        for route, prompt in _customer_prompts().items():
+            with self.subTest(route=route):
+                self.assertEqual(prompt.count(cr.STYLE_SECTION), 1)
+                self.assertNotIn(cr.HEARING_STYLE_SECTION_BASE, prompt)
+                self.assertNotIn(cr.HEARING_STYLE_EXEMPLARS_NOTE, prompt)
 
     def test_all_seven_rules_present(self):
         for route, prompt in self._all_prompts().items():
@@ -528,14 +667,22 @@ class TestStyleInBothPrompts(unittest.TestCase):
                 with self.subTest(route=route, phrase=phrase):
                     self.assertIn(phrase, prompt)
 
-    def test_all_four_exemplars_present_verbatim(self):
-        for route, prompt in self._all_prompts().items():
+    def test_route_exemplars_present_verbatim(self):
+        # 顧客対応=FAQ 根拠つき見本 1〜4／ヒアリング=無内容見本 1〜4（見本4 共通）。
+        # 内容付きの顧客対応見本 1〜3 はヒアリング prompt に現れない
+        for route, prompt in _customer_prompts().items():
             for i, (label, text) in enumerate(cr.STYLE_EXEMPLARS, start=1):
                 with self.subTest(route=route, label=label):
                     self.assertIn(f"見本{i}（{label}）:\n{text}", prompt)
+        for i, (label, text) in enumerate(cr.HEARING_STYLE_EXEMPLARS, start=1):
+            with self.subTest(route="ヒアリング", label=label):
+                self.assertIn(f"見本{i}（{label}）:\n{text}", main.SYSTEM_PROMPT)
+        for label in ("見立てと提案", "不利益の正直な開示", "質問への具体的回答"):
+            self.assertNotIn(EXEMPLARS_FROZEN[label], main.SYSTEM_PROMPT)
+        self.assertIn(cr.HEARING_STYLE_EXEMPLARS_NOTE, main.SYSTEM_PROMPT)
 
     def test_style_only_ruling_is_explicit(self):
-        # 裁定: 真似るのは文体のみ。記号の不残存・事案内容の不引用・名乗り
+        # 裁定: 真似るのは文体のみ。記号の不残存・根拠なき引用の禁止・名乗り
         # 禁止（サーバ側降格の明記）・内容ルール（定型・承認制）の優先を両経路で明記
         for route, prompt in self._all_prompts().items():
             for phrase in NO_QUOTE_PHRASES:
@@ -551,6 +698,7 @@ class TestStyleInBothPrompts(unittest.TestCase):
         self.assertIn(main.HEARING_STYLE_SECTION, p)
         self.assertIn("文体規範は自由文の部分にのみ適用する", p)
         self.assertIn("顧客名が未回答の間は宛名を省略する", p)
+        self.assertIn("具体値（○年程度・○ヶ月程度・ローン等）は返信に入れない", p)
         # 既存契約: 既知項目追記は SYSTEM_PROMPT の後ろに付く（gen2 と同じ）
         self.assertTrue(p.startswith("【友達追加・最初のメッセージへの自動返信】"))
 
@@ -583,7 +731,8 @@ class TestStyleInBothPrompts(unittest.TestCase):
                                  known_items={"債権者名": "アコム"}))
         main.conversation_histories.pop("Ustyle1-ask", None)
         self.assertTrue(captured["system"].startswith(main.SYSTEM_PROMPT))
-        self.assertIn(cr.STYLE_SECTION, captured["system"])
+        self.assertIn(cr.HEARING_STYLE_SECTION_BASE, captured["system"])
+        self.assertNotIn(cr.STYLE_SECTION, captured["system"])
 
 
 class TestFrozenTextsUnchanged(unittest.TestCase):
