@@ -63,6 +63,7 @@ from chat_responder import (
     PENDING_REPLY,
     ATTORNEY_LINE_USER_ID,
     STYLE_SECTION,
+    style_guard_violations,
 )
 from hub import reply_sanitizer
 from claude_gateway import (
@@ -875,9 +876,12 @@ async def _process_line_event(reply_token: str, user_id: str, user_text: str) ->
         # 免除）は自動送信せず承認キュー+現行定型で応答（切り詰めはしない）
         cleaned, _issues, _fatal = reply_sanitizer.sanitize_reply(
             claude_reply, allowed_emoji=ALLOWED_CANONICAL_EMOJI)
+        # AUTOREPLY-STYLE-1-fix1 [B]: 弁護士本人の名乗り・見本の匿名化記号・
+        # 旧見本由来の無根拠表現もヒアリング経路で承認降格（顧客対応と同一関数）
         violations = ((["プレースホルダ/内部マーカー残存"] if _fatal else [])
                       + reply_sanitizer.structure_violations(
-                          cleaned, exempt_blocks=HEARING_TEMPLATE_BLOCKS))
+                          cleaned, exempt_blocks=HEARING_TEMPLATE_BLOCKS)
+                      + style_guard_violations(cleaned))
         history = conversation_histories.get(user_id, [])
         if violations:
             await save_to_approval_queue(
