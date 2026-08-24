@@ -329,6 +329,125 @@ BRANCHING_GUIDANCE_EXAMPLE = (
     "どちらに当たるか確認したいので、最後に返済されたのはいつ頃か教えていただけますか。"
 )
 
+# ── 大野文体（AUTOREPLY-STYLE-1・両経路共通の文体規範+few-shot 見本） ─────────────
+# 真似るのは**文体のみ**。金額・期間・法的見立ての中身は従来どおり弁護士確定
+# 定型と承認制に従う（見本中の数値・固有名詞を Bot が引用しない旨を prompt に
+# 明記）。見本は大野の実返信を匿名化した弁護士確定の文体見本。
+# 見本はサニタイズ・300 字・質問数・禁止語の第 2 世代ガードに適合する
+# （test_autoreply_style1.py で pin）。凍結文言（法テラス・PENDING・画像受領
+# 文言・定型ブロック等）には触れない（同テストで hash pin）。
+STYLE_RULES_TEXT = """\
+【文体規範（大野文体・弁護士確定）】
+返信文の自由文部分は次の文体で書く。これは文体の規範であり、金額・期間・法的見立ての中身は本プロンプトの弁護士確定定型・FAQ・承認制ルールに従う（文体規範が内容のルールに優先することはない）。
+- 結論を最初の1〜2文で言い切り、補足は後に置く（言い切るのは構成の話。断定語の禁止と留保文言の必須は従来どおり）
+- 金額・期間・次の行動を具体的に示す。「確認します」で終わる文を避ける（示す金額・期間は弁護士確定定型・FAQ・顧客情報にあるものに限る。記録にない数値の創作は禁止）
+- 不利な情報も先回りで正直に開示する姿勢で書く（開示できるのは定型・FAQの範囲。承認必須のカテゴリは従来どおり承認制）
+- 記号・箇条書き・罫線・絵文字なしのプレーン文で書く（弁護士確定定型・定型ブロックは原文のまま使い、この規範の対象外）
+- 敬語水準は「〜となります」「〜いただけますと」「よろしくお願い致します」
+- 相手の言葉を引き取ってから答える（「○○様のおっしゃるように」）
+- 宛名で始め「よろしくお願い致します」で結ぶ（顧客名が判明している場合のみ「○○様」で始める。不明・未登録の場合は宛名を省略する。宛名と結びを含めて上限文字数内に収める）\
+"""
+
+# 見本（票由来・匿名化済み）。ラベルはプロンプト表示用。
+# fix1 [A]（R-AUTOREPLY-STYLE-1 STYLE-01 HIGH）: 見本側の無害化——
+#   見本1: 名乗り文「弁護士の大野と申します。」を除去（文体見本に名乗りを置かない）
+#   見本2〜4: 案件固有の数値・期間・法的内容（5年程度/1ヶ月程度/住宅ローン/
+#   延滞の文字/信用情報機関へのご連絡要求/完全に抹消 等）を、文体（結論先出し・
+#   引き取り・正直な開示・敬語水準・「もっとも/そのため」の運び）が保たれる
+#   範囲で内容を持たない言い回しへ置換。匿名化記号は ○○=顧客名・△△=相手方/
+#   対象 の 2 種に統一（旧「◯社」は廃止）。
+# 旧見本の逐語は test_autoreply_style1 に凍結コピーとして保持し、モデル出力が
+# 旧見本を引用しても自動送信されないこと（[B] 防壁）を negative で固定する。
+# fix2: 見本1〜3 を大野確定の最終文言へ差し替え（逐語・改変禁止）。見本2・3 の
+# 具体値（5年程度・住宅ローン）は FAQ 確定文言（信用情報の削除まで 5 年程度／
+# 完了後 5 年程度はローンを組めない前提）に根拠がある語＝fix1 防壁の
+# 「FAQ 根拠あり・許容」分類と整合する。見本4 は fix1 のまま
+STYLE_EXEMPLARS: tuple[tuple[str, str], ...] = (
+    ("見立てと提案",
+     "○○様 お問合せありがとうございます。"
+     "信用情報等ご確認いたしました。△△については○○様のおっしゃられるように"
+     "譲渡済となっておりますね。そうすると、当事務所から原債権者に譲渡先を"
+     "確認し、その譲渡先に対して時効援用通知をご送付する流れとなりそうです。"
+     "当事務所でもお手伝いさせていただくことはできますので、"
+     "ご検討のほどよろしくお願いいたします。"),
+    ("不利益の正直な開示",
+     "信用情報については、お手続きにより解消される部分はあるものの、"
+     "時効援用通知の送付から5年程度は住宅ローンを組むことができない"
+     "場合もございますので、あらかじめご了承いただきたく存じます。"),
+    ("質問への具体的回答",
+     "ご質問の点につきましては、当事務所で対応しております。"
+     "もっとも、その結果がいつの時点で反映されるかは債権者にも分かりません。"
+     "そのため、送付から5年程度は反映されないものとしてご認識いただけると"
+     "間違いございません。"),
+    ("進捗報告",
+     "お世話になっております。本日△△に対して、時効援用通知を送付致します。"
+     "今後は結果の確認までお時間をいただき、手続きを進めさせていただきます。"
+     "少々お時間をいただきますが、引き続きよろしくお願い致します。"),
+)
+
+STYLE_EXEMPLARS_NOTE = (
+    "【文体見本（弁護士確定・文体の参照のみ）】\n"
+    "以下は文体の見本である。文の運び・語尾・敬語水準・結論先行の構成を真似る。"
+    "見本の○○（顧客名）・△△（相手方・対象）は匿名化の空欄であり、返信に"
+    "○○・△△の記号を残さない（残せばサーバ側で承認降格。顧客名が不明なら"
+    "宛名を省略する）。見本の中の事案の内容・見立ては、本プロンプトの弁護士"
+    "確定定型・FAQ・顧客情報に根拠がない限り引用しない（根拠なき引用の禁止）。"
+    "回答に金額・期間・見立てを入れるときは、必ず本プロンプトの弁護士確定定型・"
+    "FAQ・顧客情報を出典とする。弁護士本人として名乗らない（「大野と申します」"
+    "「弁護士の大野」等の名乗りはサーバ側で承認降格。対応者についてはFAQの"
+    "回答のとおり）。"
+)
+
+# fix3 [A]（R-AUTOREPLY-STYLE-1-2 STYLE-02 HIGH・経路ごとの根拠集合の一致）:
+# ヒアリング prompt（_HEARING_PROMPT_FROZEN）には FAQ が無く、顧客対応の見本
+# 1〜3 が持つ具体値（5年程度・住宅ローン）の根拠が経路内に存在しない。そのため
+# ヒアリング経路は**無内容見本**（文体のみ: 結論先出し・引き取り・正直な開示・
+# 敬語水準・宛名/結び）で構成する。見本4 は法的内容を含まないため両経路共通。
+# 見本 B・C は fix1 [A] で設計した無内容版（fix2 で顧客対応側のみ大野確定の
+# 内容付きへ差し替えられたもの）を再利用。
+HEARING_STYLE_EXEMPLARS: tuple[tuple[str, str], ...] = (
+    ("引き取りと流れの案内",
+     "○○様 お問合せありがとうございます。ご回答内容を確認いたしました。"
+     "△△については○○様のおっしゃられるように、まずその点から確認する流れと"
+     "なりますね。そうすると、残りの項目を順にお伺いし、確認の結果をご案内する"
+     "こととなりそうです。当事務所でもお手伝いさせていただくことはできますので、"
+     "ご検討のほどよろしくお願いいたします。"),
+    ("不利益の正直な開示",
+     "△△については、お手続きにより解消される部分はあるものの、"
+     "すぐには解消されない場合もございますので、"
+     "あらかじめご了承いただきたく存じます。"),
+    ("質問への具体的回答",
+     "ご質問の点につきましては、当事務所で対応しております。"
+     "もっとも、その結果がいつの時点で反映されるかは相手方にも分かりません。"
+     "そのため、当面は反映されないものとしてご認識いただけると"
+     "間違いございません。"),
+    STYLE_EXEMPLARS[3],     # 進捗報告（両経路共通・法的内容なし）
+)
+
+HEARING_STYLE_EXEMPLARS_NOTE = (
+    "※ ヒアリング経路の補足: 本プロンプトには FAQ・確定定型の根拠がないため、"
+    "金額・期間などの具体値（○年程度・○ヶ月程度・ローン等）は返信に入れない"
+    "（入れればサーバ側で承認降格）。"
+)
+
+
+def _exemplars_text(exemplars: tuple[tuple[str, str], ...]) -> str:
+    return STYLE_EXEMPLARS_NOTE + "\n" + "\n".join(
+        f"見本{i}（{label}）:\n{text}"
+        for i, (label, text) in enumerate(exemplars, start=1))
+
+
+STYLE_EXEMPLARS_TEXT = _exemplars_text(STYLE_EXEMPLARS)
+HEARING_STYLE_EXEMPLARS_TEXT = (
+    _exemplars_text(HEARING_STYLE_EXEMPLARS) + "\n" + HEARING_STYLE_EXEMPLARS_NOTE)
+
+# 規範（STYLE_RULES_TEXT）と見本注記は両経路で同一の正。見本集合のみ経路別:
+#   顧客対応（_SYSTEM_PROMPT_BASE）= STYLE_SECTION（FAQ 根拠つき見本 1〜4）
+#   ヒアリング（main.SYSTEM_PROMPT）= HEARING_STYLE_SECTION_BASE（無内容見本）
+STYLE_SECTION = STYLE_RULES_TEXT + "\n\n" + STYLE_EXEMPLARS_TEXT
+HEARING_STYLE_SECTION_BASE = (
+    STYLE_RULES_TEXT + "\n\n" + HEARING_STYLE_EXEMPLARS_TEXT)
+
 # 禁止語照合の前に返信文から除去する許可済みフレーズ
 # AUTOREPLY-GEN2 要件4: ヒアリング初回テンプレの写真案内（SYSTEM_PROMPT 内の
 # 固定文言）のみ許可。それ以外の自由文での写真依頼は禁止語
@@ -420,6 +539,8 @@ _SYSTEM_PROMPT_BASE = """\
 - 記録にない進捗・日付・金額の創作は禁止
 - 書類の写真をお願いするときは定型文言（「お手元の書類の全ページを写真に撮って、このLINEに送っていただけますか。」または「差押えに関する書類の写真をこのLINEにお送りいただけますか」）をそのまま使う。自由な言い回しでの写真依頼はサーバー側で承認制に降格される。収集済み項目に「書類写真: 受領済み」がある場合は再依頼しない
 - 断定語（確実に/絶対に/間違いなく/必ず 等）・行動指示語（払わないで/無視して/連絡しないで/放置して 等）は使用禁止。例外は2つのみ: (1)【FAQ】記載の受任後顧客への定型指示（電話対応・督促状対応）をそのまま使う場合 (2)「絶対に大丈夫とは言えません」のような否定の形
+
+<<STYLE_SECTION>>
 
 【カテゴリ選択肢】
 自動送信可（auto_send=true にできる）:
@@ -612,6 +733,9 @@ _SYSTEM_PROMPT_TMPL = (
     .replace("<<HOME_VISIT>>", HOME_VISIT_TEXT)
     .replace("<<SEIZURE_SCOPE>>", SEIZURE_SCOPE_TEXT)
     .replace("<<MAIL_ADDRESS>>", MAIL_ADDRESS_TEXT)
+    # AUTOREPLY-STYLE-1: 文体規範+見本（他の置換より後段=見本文中に置換対象
+    # マーカーが無いことは test_autoreply_style1 で pin）
+    .replace("<<STYLE_SECTION>>", STYLE_SECTION)
 )
 
 # ── tool 定義 ─────────────────────────────────────────────────────────────────
@@ -778,6 +902,96 @@ def find_forbidden_words(reply: str) -> list[str]:
     return hits
 
 
+# ── AUTOREPLY-STYLE-1-fix1 [B]: 文体見本まわりのサーバ側防壁（両経路共通） ────────
+# (1) 弁護士本人の名乗り検知: NFKC 正規化+空白除去のうえ、Bot が弁護士本人を
+#     自称する形を閉集合で検知→承認降格。「大野法律事務所」（事務所名・凍結
+#     テンプレに実在）は名乗りではないため各形で除外される（逐語 pin）。
+_SELF_INTRO_PATTERNS: list[tuple[str, re.Pattern]] = [
+    # 「弁護士の大野」（直後が「法律事務所」なら事務所名）
+    ("弁護士の大野", re.compile(r"弁護士の大野(?!法律事務所)")),
+    # 「大野と申します」「大野です」「大野でございます」「大野弁護士です」等
+    ("大野と申します/です",
+     re.compile(r"大野(?:弁護士)?(?:と申します|と申し上げます|です|でございます)")),
+    # 「私は大野」「わたくし、弁護士の大野」「当職大野」等
+    ("私は大野",
+     re.compile(r"(?:私|わたくし|わたし|当職|小職)(?:は|が|、|,)?(?:弁護士の)?大野")),
+    # 「弁護士本人です」「大野本人として」等
+    ("弁護士本人です",
+     re.compile(r"(?:弁護士|大野)本人(?:です|でございます|として)")),
+]
+
+# (2) 見本の匿名化記号の残存: ○○（顧客名）・△△（相手方）・旧「◯社」・□□ が
+#     返信に残る＝見本の丸写し/穴埋め失敗。送信せず承認降格
+_EXEMPLAR_PLACEHOLDER_RE = re.compile(r"○○|◯◯|△△|□□|◯社")
+
+# (3) 旧見本由来トークンの線引き（fix1 設計）:
+#     確定定型・FAQ に同内容の根拠がある語（5年程度・1ヶ月程度・ローン/住宅
+#     ローン・信用情報機関への報告）は FAQ ルールの範囲で許容＝新ガードを設けず
+#     従来どおり prompt の FAQ 指示に従う。根拠のない旧見本固有の言い回しだけを
+#     閉集合で降格する（案件固有の法的内容の無断引用を塞ぐ）
+LEGACY_EXEMPLAR_NO_BASIS_PHRASES: tuple[str, ...] = (
+    "延滞の文字",       # 旧見本2: 信用情報の「延滞」表記の消去（FAQ は「削除」まで）
+    "完全に抹消",       # 旧見本3: 抹消時期の言い切り（FAQ に無い）
+    "ご連絡要求",       # 旧見本3: 信用情報機関への「連絡要求」（FAQ は「報告するよう伝える」）
+)
+
+# (4) fix3 [B]（STYLE-02）: 経路ごとの根拠集合。「FAQ 根拠あり・許容」は FAQ が
+#     prompt に収載される**顧客対応経路に限定**する。ヒアリング prompt
+#     （_HEARING_PROMPT_FROZEN）には FAQ が無いため、同語を含む出力は根拠なし＝
+#     承認降格（PENDING+承認キュー）。値は顧客対応 prompt の FAQ 文言と対照
+#     （test_autoreply_style1 で経路別根拠集合を pin）
+FAQ_BACKED_PHRASES: tuple[str, ...] = (
+    "5年程度",          # FAQ: 信用情報の削除まで長いと 5 年程度／完了後 5 年程度はローン不可
+    "住宅ローン",       # FAQ: カード作成やローンは組めない前提（住宅ローンを含む）
+    "1ヶ月程度",        # FAQ: 受任後の督促（ご依頼から 1 ヶ月程度経過後）
+)
+ROUTE_BASIS: dict[str, frozenset[str]] = {
+    "customer": frozenset(FAQ_BACKED_PHRASES),   # FAQ 収載＝根拠あり
+    "hearing": frozenset(),                      # FAQ 非収載＝根拠なし
+}
+
+
+def _normalize_for_self_intro(text: str) -> str:
+    t = unicodedata.normalize("NFKC", text or "")
+    return re.sub(r"\s+", "", t)   # 全角空白は NFKC で半角化済み→除去
+
+
+def find_attorney_self_intro(reply: str) -> list[str]:
+    """弁護士本人の名乗りを検出して返す（空=なし）。"""
+    t = _normalize_for_self_intro(reply)
+    hits = []
+    for label, pattern in _SELF_INTRO_PATTERNS:
+        for m in pattern.finditer(t):
+            hits.append(f"{label}「{m.group(0)}」")
+    return hits
+
+
+def style_guard_violations(reply: str, *, route: str) -> list[str]:
+    """fix1 [B] の降格理由（空=適合）。両経路（顧客対応 apply_server_guards・
+    ヒアリング送信ゲート）から同一関数で適用する。
+
+    fix3 [B]: route（"customer" | "hearing"・必須）で根拠集合を切り替える。
+    名乗り・記号残存・無根拠語は両経路共通。FAQ 根拠語は route の根拠集合に
+    含まれる場合のみ許容（未知の route は fail-closed=根拠なし扱い）。"""
+    violations: list[str] = []
+    basis = ROUTE_BASIS.get(route, frozenset())
+    unbacked = [p for p in FAQ_BACKED_PHRASES
+                if p in (reply or "") and p not in basis]
+    if unbacked:
+        violations.append(
+            f"経路（{route}）に根拠のない具体値: " + "、".join(unbacked))
+    intro = find_attorney_self_intro(reply)
+    if intro:
+        violations.append("弁護士本人の名乗り検出: " + "、".join(intro))
+    residue = sorted(set(_EXEMPLAR_PLACEHOLDER_RE.findall(reply or "")))
+    if residue:
+        violations.append("見本の匿名化記号の残存: " + "、".join(residue))
+    legacy = [p for p in LEGACY_EXEMPLAR_NO_BASIS_PHRASES if p in (reply or "")]
+    if legacy:
+        violations.append("旧見本由来の無根拠表現: " + "、".join(legacy))
+    return violations
+
+
 def looks_like_court_doc_report(message: str) -> bool:
     """「裁判所から書類が来た」系の申告かどうか（否定の回答は除外）"""
     return bool(
@@ -858,6 +1072,12 @@ def apply_server_guards(
         if hits:
             can_auto_send = False
             reasons.append("禁止語検出: " + "、".join(hits))
+        # a2) AUTOREPLY-STYLE-1-fix1 [B]: 弁護士本人の名乗り・見本の匿名化
+        #     記号の残存・旧見本由来の無根拠表現は承認降格
+        style_hits = style_guard_violations(reply, route="customer")
+        if style_hits:
+            can_auto_send = False
+            reasons.extend(style_hits)
         # b) 費用の定型案内の必須文言（会話単位: 固定文を送付済みの顧客への
         #    続き質問には簡潔な回答を許容する。2026-07-03 弁護士承認済みの緩和）
         if category == "費用の定型案内":

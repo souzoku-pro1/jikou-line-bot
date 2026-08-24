@@ -64,6 +64,8 @@ from chat_responder import (
     IMAGE_INBOUND_MARKER,
     PENDING_REPLY,
     ATTORNEY_LINE_USER_ID,
+    HEARING_STYLE_SECTION_BASE,
+    style_guard_violations,
 )
 from hub import reply_sanitizer
 from claude_gateway import (
@@ -215,7 +217,11 @@ LINE_USER_ID                 = os.environ.get("LINE_USER_ID", "")
 
 claude_client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
 
-SYSTEM_PROMPT = """【友達追加・最初のメッセージへの自動返信】
+# AUTOREPLY-STYLE-1: 従来の SYSTEM_PROMPT 本文は _HEARING_PROMPT_FROZEN として
+# 逐語不変（test_autoreply_style1 で hash pin）。SYSTEM_PROMPT は本文の
+# 【kintone登録について】の直前に文体規範+見本（chat_responder.STYLE_SECTION・
+# 顧客対応経路と同一の正）を差し込んで組み立てる
+_HEARING_PROMPT_FROZEN = """【友達追加・最初のメッセージへの自動返信】
 はじめまして。
 大野法律事務所　時効援用専門窓口です。
 
@@ -320,6 +326,24 @@ LINEで承っております。
   "メールアドレス": "（メールアドレスの値）"
 }
 [/KINTONE_UPDATE]"""
+
+# ヒアリング経路の補足: 定型ブロック（罫線で区切られた項目一覧）と内部出力
+# （KINTONE_RECORD / KINTONE_UPDATE）は原文のまま。文体規範は自由文にのみ適用。
+# fix3 [A]: 見本集合はヒアリング用の無内容見本（HEARING_STYLE_SECTION_BASE・
+# 規範と注記は顧客対応経路と同一の正）
+HEARING_STYLE_SECTION = (
+    HEARING_STYLE_SECTION_BASE
+    + "\n※ ヒアリング経路の補足: 上記の罫線で区切られた定型ブロックと、"
+      "下記の kintone 登録の節で指示する内部出力（KINTONE_RECORD / "
+      "KINTONE_UPDATE）は原文のまま出力する（文体規範の対象外）。"
+      "文体規範は自由文の部分にのみ適用する。ヒアリング中で顧客名が"
+      "未回答の間は宛名を省略する。"
+)
+
+_HEARING_KINTONE_HEADING = "【kintone登録について】"   # 本文中に 1 回（test pin）
+SYSTEM_PROMPT = _HEARING_PROMPT_FROZEN.replace(
+    _HEARING_KINTONE_HEADING,
+    HEARING_STYLE_SECTION + "\n\n" + _HEARING_KINTONE_HEADING, 1)
 
 # fix1[01]（R-AUTOREPLY-GEN2）: 長さ免除の対象=SYSTEM_PROMPT 内の確定定型
 # ブロック（罫線で区切られた逐語ブロック）。SYSTEM_PROMPT そのものから
@@ -840,9 +864,12 @@ async def _process_line_event(reply_token: str, user_id: str, user_text: str) ->
         # 免除）は自動送信せず承認キュー+現行定型で応答（切り詰めはしない）
         cleaned, _issues, _fatal = reply_sanitizer.sanitize_reply(
             claude_reply, allowed_emoji=ALLOWED_CANONICAL_EMOJI)
+        # AUTOREPLY-STYLE-1-fix1 [B]: 弁護士本人の名乗り・見本の匿名化記号・
+        # 旧見本由来の無根拠表現もヒアリング経路で承認降格（顧客対応と同一関数）
         violations = ((["プレースホルダ/内部マーカー残存"] if _fatal else [])
                       + reply_sanitizer.structure_violations(
-                          cleaned, exempt_blocks=HEARING_TEMPLATE_BLOCKS))
+                          cleaned, exempt_blocks=HEARING_TEMPLATE_BLOCKS)
+                      + style_guard_violations(cleaned, route="hearing"))
         history = conversation_histories.get(user_id, [])
         if violations:
             await save_to_approval_queue(
