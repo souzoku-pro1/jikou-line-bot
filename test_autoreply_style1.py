@@ -21,6 +21,14 @@ fix1（R-AUTOREPLY-STYLE-1 STYLE-01 HIGH・見本の無害化+サーバ側防壁
 - [C] テストの向き: 修正後見本=**形式検査**（サニタイズ・300 字・質問数・
   禁止語）に適合し、匿名化記号を実名に埋めた形は全ガード通過。見本逐語
   （記号残存）・旧見本の引用・名乗り各形=**拒否**の negative。
+
+fix2（大野確定による見本文言の差し替え・見本1〜3・見本4 は fix1 のまま）:
+- 見本2・3 に戻した具体値（5年程度・住宅ローン）は FAQ 確定文言に根拠がある
+  語＝fix1 防壁の「FAQ 根拠あり・許容」分類と整合（見本逐語は形式検査と
+  [B] 防壁の双方を通る）。見本注記は「根拠なき引用の禁止」の趣旨へ微調整。
+- 無根拠語の降格閉集合・名乗り検知 4 形・記号残存検知は不変。
+- 本票由来の期待値更新: EXEMPLARS_FROZEN（見本1〜3）・見本に無い語の集合・
+  NO_QUOTE_PHRASES（注記の調整分）。
 """
 
 import hashlib
@@ -57,23 +65,23 @@ def _run(coro):
     return asyncio.run(coro)
 
 
-# ── fix1 [A] 後の見本（テスト側の凍結コピー・逐語対照） ───────────────────────────
+# ── fix2（大野確定）後の見本（テスト側の凍結コピー・逐語対照） ──────────────────
 EXEMPLARS_FROZEN = {
     "見立てと提案": (
         "○○様 お問合せありがとうございます。"
         "信用情報等ご確認いたしました。△△については○○様のおっしゃられるように"
-        "譲渡済となっておりますね。そうすると譲渡先を開示していただき、"
-        "その譲渡先に対して時効援用通知をご送付する流れとなりそうです。"
+        "譲渡済となっておりますね。そうすると、当事務所から原債権者に譲渡先を"
+        "確認し、その譲渡先に対して時効援用通知をご送付する流れとなりそうです。"
         "当事務所でもお手伝いさせていただくことはできますので、"
         "ご検討のほどよろしくお願いいたします。"),
     "不利益の正直な開示": (
-        "△△については、お手続きにより解消される部分はあるものの、"
-        "すぐには解消されない場合もございますので、"
-        "あらかじめご了承いただきたく存じます。"),
+        "信用情報については、お手続きにより解消される部分はあるものの、"
+        "時効援用通知の送付から5年程度は住宅ローンを組むことができない"
+        "場合もございますので、あらかじめご了承いただきたく存じます。"),
     "質問への具体的回答": (
         "ご質問の点につきましては、当事務所で対応しております。"
-        "もっとも、その結果がいつの時点で反映されるかは相手方にも分かりません。"
-        "そのため、当面は反映されないものとしてご認識いただけると"
+        "もっとも、その結果がいつの時点で反映されるかは債権者にも分かりません。"
+        "そのため、送付から5年程度は反映されないものとしてご認識いただけると"
         "間違いございません。"),
     "進捗報告": (
         "お世話になっております。本日△△に対して、時効援用通知を送付致します。"
@@ -155,7 +163,7 @@ STYLE_RULE_PHRASES = (
 NO_QUOTE_PHRASES = (
     "匿名化の空欄であり",
     "○○・△△の記号を残さない",
-    "事案の内容・見立ては見本から引用しない",
+    "根拠がない限り引用しない（根拠なき引用の禁止）",
     "弁護士確定定型・FAQ・顧客情報を出典とする",
     "弁護士本人として名乗らない",
     "サーバ側で承認降格",
@@ -268,9 +276,10 @@ class TestExemplarsVerbatim(unittest.TestCase):
                 self.assertEqual(text, EXEMPLARS_FROZEN[label])
 
     def test_exemplars_are_sanitized_of_case_content(self):
-        # fix1 [A]: 名乗り・案件固有の数値/期間/法的内容・旧記号「◯社」は
-        # 見本に残っていない（prompt 全体=STYLE_SECTION でも同様）
-        banned = ("大野と申します", "弁護士の大野", "5年", "1ヶ月", "住宅ローン",
+        # fix1 [A]: 名乗り・無根拠の案件固有表現・旧記号「◯社」は見本に残って
+        # いない（見本本文でも同様）。fix2: 大野確定で戻した 5年程度・住宅ローン
+        # は FAQ 根拠あり＝禁止集合から外す（1ヶ月程度・信用情報機関は不使用のまま）
+        banned = ("大野と申します", "弁護士の大野", "1ヶ月",
                   "延滞の文字", "完全に抹消", "ご連絡要求", "信用情報機関", "◯社")
         for label, text in cr.STYLE_EXEMPLARS:
             for token in banned:
@@ -348,10 +357,23 @@ class TestExemplarsFormalChecks(unittest.TestCase):
 class TestExemplarVerbatimRejected(unittest.TestCase):
     """[C] 見本の丸写し（匿名化記号の残存）=拒否。旧見本の引用=拒否。"""
 
+    def test_faq_backed_exemplars_pass_verbatim(self):
+        # fix2: 見本2・3（記号なし・FAQ 根拠語 5年程度/住宅ローンを含む）は
+        # 逐語でも [B] 防壁にかからず両経路で通過する（根拠あり=許容の整合）
+        for label in ("不利益の正直な開示", "質問への具体的回答"):
+            text = EXEMPLARS_FROZEN[label]
+            self.assertIn("5年程度", text)
+            with self.subTest(label=label):
+                self.assertEqual(cr.style_guard_violations(text), [])
+                self.assertTrue(_customer_guards(text).can_auto_send)
+                reply, queue = _hearing_gate(text, "faqbacked-" + label)
+                self.assertEqual(reply.await_args.args[2], text)
+                queue.assert_not_awaited()
+
     def test_placeholder_residue_demoted_both_routes(self):
         for label, text in cr.STYLE_EXEMPLARS:
             if not cr._EXEMPLAR_PLACEHOLDER_RE.search(text):
-                continue    # 見本3 は記号を含まない（形式検査のみの対象）
+                continue    # 見本2・3 は記号を含まない（形式検査のみの対象）
             with self.subTest(route="顧客対応", label=label):
                 g = _customer_guards(text)
                 self.assertFalse(g.can_auto_send)
