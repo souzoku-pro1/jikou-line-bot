@@ -149,6 +149,8 @@ def _log_throttled(throttle_key: str) -> None:
         logger.info("admin LINE notify throttled kind=prepare_deferred")
     elif head == "dispatchbot_unauthorized":
         logger.info("admin LINE notify throttled kind=dispatchbot_unauthorized")
+    elif head == "houki_inbound":
+        logger.info("admin LINE notify throttled kind=houki_inbound")
     elif head == "dispatchbot_filing_error":
         logger.info("admin LINE notify throttled kind=dispatchbot_filing_error")
     elif head == "invalid_transition":
