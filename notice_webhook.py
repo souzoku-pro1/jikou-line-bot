@@ -40,6 +40,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
 from hub import kintone as hub_kintone
+from hub.docx_builder import fill_runs as docx_fill_runs
 from hub.docx_builder import to_wareki
 from hub.redact import emit
 from hub.webhook_auth import extract_record_id, verify_token
@@ -121,21 +122,15 @@ def verify_template_integrity() -> None:
         raise NoticeIntegrityError("template hash mismatch")
 
 
-def _fill_runs(p, mapping: dict) -> None:
-    """run 単位でプレースホルダを差し込む（fix2）。
-
-    段落全体を先頭 run へ潰すと、ラベル run の書式（ふりがな・生年月日行の
-    均等割り付け w:fitText）が行全体へ及び小さな崩れた字になる（実機で
-    発見）。各 run の rPr を保ったまま、プレースホルダを含む run の中だけで
-    置換する。テンプレはプレースホルダを単一 run に収める（収載時に検査・
-    test で pin）ため run 跨ぎは生じず、万一残れば verify の残存検査で拒否。
-    """
-    for r in p.runs:
-        if "{{" in r.text:
-            text = r.text
-            for k, v in mapping.items():
-                text = text.replace(k, v)
-            r.text = text
+# run 単位でプレースホルダを差し込む（fix2 で確立→SOUZOKU-HOUKI-H7A で
+# hub/docx_builder.fill_runs へ逐語昇格・挙動変更ゼロ）。
+#
+# 段落全体を先頭 run へ潰すと、ラベル run の書式（ふりがな・生年月日行の
+# 均等割り付け w:fitText）が行全体へ及び小さな崩れた字になる（実機で発見）。
+# 各 run の rPr を保ったまま、プレースホルダを含む run の中だけで置換する。
+# テンプレはプレースホルダを単一 run に収める（収載時に検査・test で pin）
+# ため run 跨ぎは生じず、万一残れば verify の残存検査で拒否。
+_fill_runs = docx_fill_runs
 
 
 def build_notice_docx(fill: dict, old_address: str) -> bytes:
