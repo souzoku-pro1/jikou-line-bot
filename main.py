@@ -62,6 +62,7 @@ from chat_responder import (
     IMAGE_INBOUND_MARKER,
     PENDING_REPLY,
     ATTORNEY_LINE_USER_ID,
+    STYLE_SECTION,
 )
 from hub import reply_sanitizer
 from claude_gateway import (
@@ -229,7 +230,11 @@ LINE_USER_ID                 = os.environ.get("LINE_USER_ID", "")
 
 claude_client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
 
-SYSTEM_PROMPT = """【友達追加・最初のメッセージへの自動返信】
+# AUTOREPLY-STYLE-1: 従来の SYSTEM_PROMPT 本文は _HEARING_PROMPT_FROZEN として
+# 逐語不変（test_autoreply_style1 で hash pin）。SYSTEM_PROMPT は本文の
+# 【kintone登録について】の直前に文体規範+見本（chat_responder.STYLE_SECTION・
+# 顧客対応経路と同一の正）を差し込んで組み立てる
+_HEARING_PROMPT_FROZEN = """【友達追加・最初のメッセージへの自動返信】
 はじめまして。
 大野法律事務所　時効援用専門窓口です。
 
@@ -334,6 +339,22 @@ LINEで承っております。
   "メールアドレス": "（メールアドレスの値）"
 }
 [/KINTONE_UPDATE]"""
+
+# ヒアリング経路の補足: 定型ブロック（罫線で区切られた項目一覧）と内部出力
+# （KINTONE_RECORD / KINTONE_UPDATE）は原文のまま。文体規範は自由文にのみ適用
+HEARING_STYLE_SECTION = (
+    STYLE_SECTION
+    + "\n※ ヒアリング経路の補足: 上記の罫線で区切られた定型ブロックと、"
+      "下記の kintone 登録の節で指示する内部出力（KINTONE_RECORD / "
+      "KINTONE_UPDATE）は原文のまま出力する（文体規範の対象外）。"
+      "文体規範は自由文の部分にのみ適用する。ヒアリング中で顧客名が"
+      "未回答の間は宛名を省略する。"
+)
+
+_HEARING_KINTONE_HEADING = "【kintone登録について】"   # 本文中に 1 回（test pin）
+SYSTEM_PROMPT = _HEARING_PROMPT_FROZEN.replace(
+    _HEARING_KINTONE_HEADING,
+    HEARING_STYLE_SECTION + "\n\n" + _HEARING_KINTONE_HEADING, 1)
 
 # fix1[01]（R-AUTOREPLY-GEN2）: 長さ免除の対象=SYSTEM_PROMPT 内の確定定型
 # ブロック（罫線で区切られた逐語ブロック）。SYSTEM_PROMPT そのものから
