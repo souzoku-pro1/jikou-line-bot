@@ -22,8 +22,14 @@
     TEL/FAX＝p03〜p08）
   - 表題・本文全段落（信用情報機関への削除依頼・債務承認非該当の付言含む）
 
-プレースホルダ段落は run を単一化（fill_template 互換）。凍結段落の run は
-触らない。
+run 書式の保持（fix2・実機で発見）:
+  元票の「ふりがな」「生年月日」ラベルは 5 文字幅の均等割り付け
+  （w:fitText val=1050）が run 単位で付いている。初版は段落全体を先頭 run
+  へ潰していたため、この 2 行だけ行全体が 1050 twips に圧縮され小さな崩れた
+  字になった。本版は**値の run だけ**をプレースホルダへ置換し、ラベル run
+  （fitText 含む）と各 run の rPr をそのまま残す。プレースホルダは必ず単一
+  run 内に収まる（notice_webhook 側も run 単位で差し込む）。凍結段落の run は
+  触らない。
 
 実行: python make_notice_template.py
 """
@@ -47,14 +53,39 @@ _LABELED = {
 }
 
 
-def _set_text(p, text: str) -> None:
-    """段落テキストを差し替え（先頭 run の書式を維持・run を単一化）。"""
-    if not p.runs:
-        p.add_run(text)
+def _replace_span(p, old: str, new: str) -> None:
+    """段落内の部分文字列 old（唯一）を new へ置換し、run 書式を保持する。
+
+    old にかかる最初の run へ「前置き+new」を置き（その run の rPr を継承）、
+    末尾 run には後置きだけを残し、中間 run は削除する。old が 1 run に
+    収まる場合はその run 内で置換。結果として new は必ず単一 run 内。
+    """
+    runs = p.runs
+    full = "".join(r.text for r in runs)
+    if full.count(old) != 1:
+        raise SystemExit(f"置換対象が一意でありません: {old!r} in {full!r}")
+    start = full.index(old)
+    end = start + len(old)
+    pos = 0
+    first = last = None
+    for i, r in enumerate(runs):
+        r_start, r_end = pos, pos + len(r.text)
+        pos = r_end
+        if first is None and r_end > start:
+            first = i
+            prefix = r.text[:start - r_start]
+        if first is not None and r_end >= end:
+            last = i
+            suffix = r.text[end - r_start:]
+            break
+    if first == last:
+        runs[first].text = prefix + new + suffix
         return
-    p.runs[0].text = text
-    for r in p.runs[1:]:
-        r.text = ""
+    runs[first].text = prefix + new
+    runs[last].text = suffix
+    for r in runs[first + 1:last + 1]:        # 中間 run と空になった末尾 run
+        if r is not runs[last] or not suffix:
+            r._r.getparent().remove(r._r)
 
 
 def _label_split(text: str, label: str) -> tuple[str, str]:
@@ -80,10 +111,10 @@ def main() -> None:
         values[key] = value
     name = values["{{通知人氏名}}"]
 
-    # 記載ブロック 4 行をプレースホルダ化（ラベル+元の空白は維持）
+    # 記載ブロック 4 行: 値の run だけをプレースホルダ化（ラベル run と
+    # 元の空白 run は書式ごとそのまま）
     for idx, (label, key) in _LABELED.items():
-        prefix, _value = _label_split(paras[idx].text, label)
-        _set_text(paras[idx], prefix + key)
+        _replace_span(paras[idx], values[key], key)
 
     # 旧住所行を住所行の直後に同書式で追加（{{旧住所}}・空なら生成時に削除）
     addr_p = paras[22]
@@ -91,16 +122,25 @@ def main() -> None:
     addr_p._element.addnext(new_el)
     doc2_paras = doc.paragraphs  # 挿入後に取り直し
     old_addr_p = doc2_paras[23]
-    prefix, _ = _label_split(addr_p.text, "住　　　所")
-    _set_text(old_addr_p, prefix.replace("住　　　所", "旧　住　所") + "{{旧住所}}")
+    _replace_span(old_addr_p, "住　　　所", "旧　住　所")
+    _replace_span(old_addr_p, "{{通知人住所}}", "{{旧住所}}")
 
     # 日付行（全体）と通知人氏名（冒頭・本文）
-    _set_text(doc2_paras[0], "{{通知日付}}")
+    _replace_span(doc2_paras[0], doc2_paras[0].text, "{{通知日付}}")
     for idx in (2, 11):
-        t = doc2_paras[idx].text
-        if name not in t:
+        if name not in doc2_paras[idx].text:
             raise SystemExit(f"p{idx:02d} に氏名が見つかりません")
-        _set_text(doc2_paras[idx], t.replace(name, "{{通知人氏名}}"))
+        _replace_span(doc2_paras[idx], name, "{{通知人氏名}}")
+
+    # プレースホルダは単一 run 内・記載ブロックの値 run に fitText がない
+    for p in doc.paragraphs:
+        if "{{" in p.text:
+            holders = [r for r in p.runs if "{{" in r.text and "}}" in r.text]
+            if len(holders) != 1 or holders[0].text.count("{{") != 1:
+                raise SystemExit(f"プレースホルダが単一 run に収まっていません: {p.text}")
+            rpr = holders[0]._r.rPr
+            if rpr is not None and any(c.tag.endswith("}fitText") for c in rpr):
+                raise SystemExit(f"値 run に fitText が混入しています: {p.text}")
 
     # 残存個人情報の機械検査（氏名・ふりがな・生年月日・記載住所の値）
     all_text = "\n".join(p.text for p in doc.paragraphs)

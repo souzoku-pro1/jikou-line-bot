@@ -11,6 +11,9 @@
   へ複数添付（単一レコード 1 PUT・宛先固定のため各通の本文は同一）。
 - 本文凍結検証: 生成物の全段落がテンプレ由来の期待列と完全一致（差し込み
   箇所以外はテンプレ逐語）・プレースホルダ残存なし。不一致は添付せず 500。
+- 書式 pin（fix2）: 記載ブロックの値 run の rPr が債務者氏名行と同一・
+  ラベルの均等割り付け（fitText）は値へ及ばない（凍結一致検証はテキストの
+  検査で run 書式の崩れを検出しないため、テンプレと生成物の両方で pin）。
 - webhook は CONTRACT-GEN 確立構造の同型（/notice/・DOCUMENT_WEBHOOK_SECRET
   共用・契約書ステータス DROP_DOWN 共用で新 3 値・CAS $revision・409 のみ
   cas_lost・reconcile 添付あり=要確認・fail-closed=必須欠落/債権者 0 件は
@@ -85,6 +88,34 @@ def _texts(data: bytes) -> list[str]:
     return [p.text for p in Document(io.BytesIO(data)).paragraphs]
 
 
+# fix2: 記載ブロックの書式 pin（凍結一致検証は段落テキストの検査＝run 書式の
+# 崩れを検出しないため、この穴を塞ぐ）。
+_LABEL_ROWS = ("ふりがな", "債務者氏名", "生年月日", "住　　　所", "旧　住　所")
+
+
+def _rpr_sig(run) -> tuple:
+    """run の rPr を (要素名, 属性) の列に正規化（フォント名・サイズ・
+    fitText・spacing 等の明示書式をすべて含む）。"""
+    rpr = run._r.rPr
+    if rpr is None:
+        return ()
+    return tuple(sorted(
+        (c.tag.split("}")[1],
+         tuple(sorted((k.split("}")[1], v) for k, v in c.attrib.items())))
+        for c in rpr))
+
+
+def _row(doc, label):
+    return next(p for p in doc.paragraphs if p.text.startswith(label))
+
+
+def _value_run(p, value):
+    """差し込み値（またはプレースホルダ）を含む run（単一 run であること）。"""
+    runs = [r for r in p.runs if value in r.text]
+    assert len(runs) == 1, (p.text, [r.text for r in p.runs])
+    return runs[0]
+
+
 class TestTemplatePin(unittest.TestCase):
     def test_sha256_pinned(self):
         data = open(nw.TEMPLATE_PATH, "rb").read()
@@ -123,6 +154,31 @@ class TestTemplatePin(unittest.TestCase):
                 self.assertTrue(any("{{" in r.text and "}}" in r.text
                                     for r in p.runs), p.text)
 
+    def test_label_rows_run_format_preserved(self):
+        # fix2: 元票の「ふりがな」「生年月日」ラベルは 5 文字幅の均等割り付け
+        # （w:fitText val=1050）。収載時に行全体を fitText 付き run へ潰すと
+        # 行全体が 1050 twips に圧縮され小さな崩れた字になる（実機事象）。
+        # ラベル run の fitText は元票どおり残し、プレースホルダ run は
+        # 債務者氏名行の値 run と同一書式（fitText なし）であること。
+        doc = Document(nw.TEMPLATE_PATH)
+        ref = _rpr_sig(_value_run(_row(doc, "債務者氏名"), "{{通知人氏名}}"))
+        self.assertFalse(any(tag == "fitText" for tag, _ in ref))
+        for label, ph in (("ふりがな", "{{ふりがな}}"),
+                          ("生年月日", "{{生年月日}}"),
+                          ("住　　　所", "{{通知人住所}}"),
+                          ("旧　住　所", "{{旧住所}}")):
+            with self.subTest(label=label):
+                p = _row(doc, label)
+                self.assertEqual(_rpr_sig(_value_run(p, ph)), ref)
+        for label in ("ふりがな", "生年月日"):
+            with self.subTest(label=label):
+                p = _row(doc, label)
+                first = p.runs[0]
+                self.assertTrue(first.text and label.startswith(first.text))
+                fit = [dict(attrs) for tag, attrs in _rpr_sig(first)
+                       if tag == "fitText"]
+                self.assertEqual([f.get("val") for f in fit], ["1050"])
+
 
 class TestBuildAndFreeze(unittest.TestCase):
     _FILL = {"{{通知日付}}": "令和8年8月23日", "{{通知人氏名}}": "試験太郎",
@@ -155,6 +211,28 @@ class TestBuildAndFreeze(unittest.TestCase):
         self.assertIn("債権者各位", texts)
         self.assertEqual(sum(t.count("試験太郎") for t in texts), 3)
         self.assertNotIn("{{", "\n".join(texts))
+
+    def test_filled_rows_font_consistent(self):
+        # fix2: 生成物の記載ブロック 5 行で、差し込み値を持つ run の書式
+        # （フォント名・サイズ・fitText 等の明示 rPr）が債務者氏名行と同一。
+        # 差し込み時に段落全体を先頭 run へ潰すと、ふりがな・生年月日行だけ
+        # ラベルの fitText(1050) に行全体が圧縮される（実機で発見）。
+        old = "東京都台東区旧町2-2-2"
+        doc = Document(io.BytesIO(nw.build_notice_docx(self._FILL, old)))
+        ref_run = _value_run(_row(doc, "債務者氏名"), "試験太郎")
+        ref = _rpr_sig(ref_run)
+        self.assertFalse(any(tag == "fitText" for tag, _ in ref))
+        for label, value in (("ふりがな", "しけんたろう"),
+                             ("生年月日", "昭和55年1月1日"),
+                             ("住　　　所", "埼玉県川口市青木1-1-1"),
+                             ("旧　住　所", old)):
+            with self.subTest(label=label):
+                run = _value_run(_row(doc, label), value)
+                self.assertEqual(_rpr_sig(run), ref)
+                self.assertEqual(run.font.name, ref_run.font.name)
+                self.assertEqual(run.font.size, ref_run.font.size)
+                # ラベルは値と別 run（ラベル書式が値へ及ばない）
+                self.assertFalse(run.text.startswith(label), run.text)
 
     def test_tampered_body_rejected(self):
         # 凍結本文の 1 字改変（44,000 と違い本文なので任意の語）を検知
