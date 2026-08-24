@@ -58,9 +58,11 @@ FIELD_ATTACHMENT = "notice_file"           # ラベル「時効援用通知書�
 FIELD_FURIGANA   = "furigana"              # ラベル「ふりがな」（CU 新設）
 FIELD_OLD_ADDR   = "old_address"           # ラベル「旧住所」（CU 新設）
 TEMPLATE_PATH    = "docx_templates/jikou/時効援用通知書.docx"
-# 収載現物（make_notice_template.py 生成・コミット済み artifact）の pin
+# 収載現物（make_notice_template.py 生成・コミット済み artifact）の pin。
+# fix2: 大野修正版の本票から run 書式保持形で再収載（本文文言は不変・
+# 記載ブロックのラベル fitText を値 run へ及ぼさない）
 TEMPLATE_SHA256 = (
-    "828fcee68bbee193e3b5f6946f294fce6a10a481d02bd834016dfc7f243fa725")
+    "900049054703c433bf5f955a784aaf66597cd862cec0ea14eaa1de3b8c6191d8")
 
 _REQUIRED_NAME   = "顧客名"
 _REQUIRED_ADDR   = "住所"
@@ -119,13 +121,21 @@ def verify_template_integrity() -> None:
         raise NoticeIntegrityError("template hash mismatch")
 
 
-def _set_paragraph_text(p, text: str) -> None:
-    if not p.runs:
-        p.add_run(text)
-        return
-    p.runs[0].text = text
-    for r in p.runs[1:]:
-        r.text = ""
+def _fill_runs(p, mapping: dict) -> None:
+    """run 単位でプレースホルダを差し込む（fix2）。
+
+    段落全体を先頭 run へ潰すと、ラベル run の書式（ふりがな・生年月日行の
+    均等割り付け w:fitText）が行全体へ及び小さな崩れた字になる（実機で
+    発見）。各 run の rPr を保ったまま、プレースホルダを含む run の中だけで
+    置換する。テンプレはプレースホルダを単一 run に収める（収載時に検査・
+    test で pin）ため run 跨ぎは生じず、万一残れば verify の残存検査で拒否。
+    """
+    for r in p.runs:
+        if "{{" in r.text:
+            text = r.text
+            for k, v in mapping.items():
+                text = text.replace(k, v)
+            r.text = text
 
 
 def build_notice_docx(fill: dict, old_address: str) -> bytes:
@@ -135,15 +145,12 @@ def build_notice_docx(fill: dict, old_address: str) -> bytes:
         text = p.text
         if _OLD_ADDR_KEY in text:
             if old_address:
-                _set_paragraph_text(p, text.replace(_OLD_ADDR_KEY,
-                                                    old_address))
+                _fill_runs(p, {_OLD_ADDR_KEY: old_address})
             else:
                 p._element.getparent().remove(p._element)
             continue
         if "{{" in text:
-            for k, v in fill.items():
-                text = text.replace(k, v)
-            _set_paragraph_text(p, text)
+            _fill_runs(p, fill)
     buf = io.BytesIO()
     doc.save(buf)
     return buf.getvalue()
