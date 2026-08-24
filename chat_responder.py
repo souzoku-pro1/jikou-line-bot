@@ -1523,6 +1523,7 @@ async def handle_claude_outage(
     reply_func: Callable,
     customer_name: str = "",
     error: str = "",
+    profile: BusinessProfile | None = None,
 ) -> None:
     """
     PRIMARY / FALLBACK の両方で Claude 応答が得られなかったときの共通処理。
@@ -1530,8 +1531,14 @@ async def handle_claude_outage(
     1. ユーザーには定型の「確認中」応答を返す
     2. 承認キュー（App 29）に要対応レコードを作成する
     3. 弁護士に承認依頼を LINE Push で通知する
+
+    H2-fix1 [01]: 障害時応答は profile.pending_reply を流用（独立フィールドは
+    持たない裁定・hub/business_profile docstring と一致）。送信文言と App28 の
+    assistant 保存文言は同一値。profile 省略（None→JIKOU）は従来の
+    PENDING_REPLY と逐語一致（test_business_profile で pin）。
     """
-    await reply_func(reply_token, PENDING_REPLY)
+    p = profile or JIKOU_PROFILE
+    await reply_func(reply_token, p.pending_reply)
     approval_id = await save_to_approval_queue(
         user_id=user_id,
         customer_name=customer_name,
@@ -1541,7 +1548,8 @@ async def handle_claude_outage(
         reason=f"Claude応答不能（要手動対応）: {error[:200]}",
     )
     await save_to_chatlog(user_id, "user", user_message, OUTAGE_CATEGORY, "no")
-    await save_to_chatlog(user_id, "assistant", PENDING_REPLY, OUTAGE_CATEGORY, "yes")
+    await save_to_chatlog(user_id, "assistant", p.pending_reply,
+                          OUTAGE_CATEGORY, "yes")
     await _notify_attorney(user_id, customer_name, approval_id, OUTAGE_CATEGORY)
     logger.info("[OUTAGE] queued user_id=%s approval_id=%s",
                 emit(user_id, "external_ref", "log", "operator"),
@@ -1620,12 +1628,14 @@ async def handle_customer_message(
             reply_func=reply_func,
             customer_name=customer_name,
             error=str(e),
+            profile=p,
         )
         return
     except Exception:
         logger.exception("compose_reply failed for user_id=%s", user_id)
         # 一時的なエラー（レート制限等）は定型文を返して終了
-        await reply_func(reply_token, PENDING_REPLY)
+        # （H2-fix1 [01]: 障害系の両経路とも profile の pending_reply を使う）
+        await reply_func(reply_token, p.pending_reply)
         return
 
     # AUTOREPLY-GEN2 要件1: 送信直前サニタイズ（markdown 平文化・許可外

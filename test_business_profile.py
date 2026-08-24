@@ -12,6 +12,16 @@
 - ガード関数は profile=None（既定）で従来挙動と完全一致し、profile 注入で
   実際に定義が差し替わる（注入機構の実効性）。相続放棄プロファイルの実体は
   本票では作らない（本テストのダミーは注入機構の検証専用の架空値）。
+
+H2-fix1（R-SOUZOKU-HOUKI-H2 H2-01 HIGH・Claude 障害経路の profile 化）:
+- 障害時応答は profile.pending_reply を**流用**（独立フィールドなしの裁定・
+  hub/business_profile docstring と一致）。ClaudeUnavailableError／一般例外の
+  両経路で module 定数 PENDING_REPLY の直接使用を廃止。App28 の assistant
+  保存文言も送信と同一値。
+- profile 省略（None→JIKOU）は従来 PENDING_REPLY と逐語一致を pin。
+  alternate profile では両障害形とも時効文言が送信・保存されない negative。
+- フィールド数の確定値=30 を pin（[02]: H2 完了報告の「31」は誤記・実体の
+  増減なし）。
 """
 
 import hashlib
@@ -341,6 +351,96 @@ class TestInjectionTakesEffect(unittest.TestCase):
         with patch.object(cr, "create_message_with_fallback", fake_create):
             asyncio.run(cr._call_compose_reply("sys", []))
         self.assertIs(captured["tools"][0], cr._COMPOSE_REPLY_TOOL)
+
+
+class TestOutagePathProfile(unittest.TestCase):
+    """H2-fix1 [01]: Claude 障害経路（ClaudeUnavailableError/一般例外）の
+    profile 化——送信文言と App28 保存文言の両方を assert。"""
+
+    def _run_outage(self, exc, profile=None):
+        """handle_customer_message を compose 例外で走らせ
+        (reply_mock, chatlog_mock, queue_mock) を返す。"""
+        import asyncio
+        reply, log = AsyncMock(), AsyncMock()
+        queue = AsyncMock(return_value="q-1")
+        kwargs = dict(
+            user_id="Uoutage", user_message="質問です", reply_token="tok",
+            app21_record={"status": {"value": "決済完了"}}, reply_func=reply)
+        if profile is not None:
+            kwargs["profile"] = profile
+        with patch.object(cr, "_call_compose_reply",
+                          AsyncMock(side_effect=exc)), \
+             patch.object(cr, "get_recent_chat_history",
+                          AsyncMock(return_value=[])), \
+             patch.object(cr, "save_to_chatlog", log), \
+             patch.object(cr, "save_to_approval_queue", queue), \
+             patch.object(cr, "_notify_attorney", AsyncMock()):
+            asyncio.run(cr.handle_customer_message(**kwargs))
+        return reply, log, queue
+
+    def _assistant_saves(self, log):
+        return [c.args[2] for c in log.await_args_list
+                if c.args[1] == "assistant"]
+
+    def test_default_profile_matches_legacy_pending_reply(self):
+        # profile 省略（None→JIKOU）: 従来 PENDING_REPLY と逐語一致
+        # （送信・App28 保存の両方）
+        from claude_gateway import ClaudeUnavailableError
+        reply, log, queue = self._run_outage(ClaudeUnavailableError("down"))
+        reply.assert_awaited_once()
+        self.assertEqual(reply.await_args.args[1], cr.PENDING_REPLY)
+        self.assertEqual(self._assistant_saves(log), [cr.PENDING_REPLY])
+        queue.assert_awaited_once()
+        self.assertEqual(queue.await_args.kwargs["ai_draft"],
+                         cr.OUTAGE_DRAFT_PLACEHOLDER)   # 下書き雛形は機構側
+        # 一般例外経路（従来: 返信のみ・chatlog/queue なし）
+        reply2, log2, queue2 = self._run_outage(RuntimeError("rate"))
+        reply2.assert_awaited_once()
+        self.assertEqual(reply2.await_args.args[1], cr.PENDING_REPLY)
+        self.assertEqual(self._assistant_saves(log2), [])
+        queue2.assert_not_awaited()
+
+    def test_alternate_profile_claude_unavailable_no_jikou_text(self):
+        from claude_gateway import ClaudeUnavailableError
+        d = _dummy_profile()
+        reply, log, _q = self._run_outage(ClaudeUnavailableError("down"),
+                                          profile=d)
+        reply.assert_awaited_once()
+        self.assertEqual(reply.await_args.args[1], "D確認中です。")
+        self.assertNotEqual(reply.await_args.args[1], cr.PENDING_REPLY)
+        self.assertEqual(self._assistant_saves(log), ["D確認中です。"])
+        # 時効文言はどの保存にも現れない（送信と保存の一致・混入ゼロ）
+        for c in log.await_args_list:
+            self.assertNotIn(cr.PENDING_REPLY, c.args[2])
+
+    def test_alternate_profile_generic_exception_no_jikou_text(self):
+        d = _dummy_profile()
+        reply, log, queue = self._run_outage(RuntimeError("rate"), profile=d)
+        reply.assert_awaited_once()
+        self.assertEqual(reply.await_args.args[1], "D確認中です。")
+        self.assertNotEqual(reply.await_args.args[1], cr.PENDING_REPLY)
+        self.assertEqual(self._assistant_saves(log), [])   # 従来どおり保存なし
+        queue.assert_not_awaited()
+
+    def test_handle_claude_outage_direct_call_with_profile(self):
+        import asyncio
+        d = _dummy_profile()
+        reply, log = AsyncMock(), AsyncMock()
+        with patch.object(cr, "save_to_chatlog", log), \
+             patch.object(cr, "save_to_approval_queue",
+                          AsyncMock(return_value="q-1")), \
+             patch.object(cr, "_notify_attorney", AsyncMock()):
+            asyncio.run(cr.handle_claude_outage(
+                user_id="Uo", user_message="m", reply_token="t",
+                reply_func=reply, profile=d))
+        self.assertEqual(reply.await_args.args[1], "D確認中です。")
+        self.assertEqual(self._assistant_saves(log), ["D確認中です。"])
+
+    def test_field_count_pinned_30(self):
+        # [02]: BusinessProfile のフィールド数=30（H2 報告の 31 は誤記・
+        # 実体の増減なし）。増減は票由来でのみ行う
+        import dataclasses
+        self.assertEqual(len(dataclasses.fields(BusinessProfile)), 30)
 
 
 class TestHandleCustomerMessagePlumbing(unittest.TestCase):

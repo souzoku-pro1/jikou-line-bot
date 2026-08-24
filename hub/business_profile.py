@@ -18,6 +18,9 @@
   （サニタイズ・300 字/質問数・名乗り検知・記号残存・無根拠語・承認線引きの
   骨格・承認キュー/チャットログ/通知の配管・PENDING_CONTEXT_ENABLED 等の env
   フラグ解釈）。
+  Claude 障害時応答（ClaudeUnavailableError／一般例外の両経路）は
+  **pending_reply を流用**する（独立フィールドは持たない・H2-fix1 [01] 裁定。
+  送信文言と App28 の assistant 保存文言は同一値）。
 """
 
 from dataclasses import dataclass
@@ -69,7 +72,7 @@ class BusinessProfile:
     mandatory_reply_notice_key: str
     mandatory_reply_label: str
 
-    # ── 承認送り時の即時応答 ─────────────────────────────────────────────
+    # ── 承認送り時の即時応答（Claude 障害時応答にも流用・H2-fix1） ────────
     pending_reply: str
     pending_by_category: Mapping
     immediate_notice_texts: Mapping
