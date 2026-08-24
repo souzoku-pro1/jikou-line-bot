@@ -60,6 +60,30 @@ HOUKI_CHANNEL = LineChannelConfig(
     "HOUKI_LINE_CHANNEL_ACCESS_TOKEN")
 
 
+def houki_channel_disabled_reason() -> str | None:
+    """HOUKI 受け口の有効化判定（H1-fix1 [02]・fail-closed）。
+
+    無効なら固定語彙の理由・有効なら None を返す（毎リクエスト判定。
+    起動時 fail-fast は併用しない: 単一サービス同居のため誤設定 env で
+    時効側まで起動不能にしない・dispatch_bot と同じ受け口判定方式）:
+      - "secret_unset"        : HOUKI_LINE_CHANNEL_SECRET 未設定（点火前の既定状態）
+      - "secret_equals_jikou" : 時効側 LINE_CHANNEL_SECRET と同値
+                                （チャネル取り違えの誤設定＝分離が成立しない）
+      - "token_equals_jikou"  : access token が**設定済みかつ**時効側と同値
+                                （送信が時効チャネル名義になる誤設定。
+                                token 空は v1（H-1）では正当のため対象外）
+    """
+    secret = HOUKI_CHANNEL.secret()
+    if not secret:
+        return "secret_unset"
+    if secret == JIKOU_CHANNEL.secret():
+        return "secret_equals_jikou"
+    token = HOUKI_CHANNEL.token()
+    if token and token == JIKOU_CHANNEL.token():
+        return "token_equals_jikou"
+    return None
+
+
 def verify_line_signature(channel: LineChannelConfig,
                           body: bytes, signature: str) -> bool:
     """X-Line-Signature の HMAC-SHA256 検証（チャネル別 secret）。

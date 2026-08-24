@@ -8,6 +8,9 @@
   **secret 未設定は受け口自体を無効＝404**（存在しないフリ・fail-closed。
   /hub/dispatch の「token 無しは 404」と同じ防御思想。大野が env を投入する
   まで endpoint は外形上存在しない）
+- fix1 [02]: secret が時効側と同値・access token が設定済みかつ時効側と
+  同値の誤設定も受け口無効＝404（hub/line_channel.houki_channel_disabled_reason
+  の固定語彙閉集合・時効側は通常動作継続）
 - v1（H-1）の挙動は **deny-all 既定**: 受信イベントの検証・記録（Railway
   ログ・PII は emit 抑止）と管理者 LINE 通知のみ。**顧客への reply/push は
   一切行わない**（ヒアリング Bot は H-3 で載せる。それまで受信は人対応＝
@@ -16,8 +19,9 @@
   （記録の永続化は H-3 の設計に含める）
 - 即 200 + BackgroundTasks（LINE 2 秒タイムアウト対策・既存流儀）
 - 時効チャネルの資格情報（顧客 Bot の secret / access token env）は参照
-  しない（test_houki_bot_entry が source pin。禁止文字列そのものを本
-  ファイルに書けないため env 名は列挙しない）
+  しない。deny-all（送信・HTTP・kintone/DB 書込の不在）は fix1 [01] で
+  AST checker（test_houki_bot_policy.py: import 閉集合・notify 許可属性
+  =notify_admin_line のみ・動的アクセス遮断）が構造的に固定する
 """
 
 import json
@@ -26,7 +30,8 @@ import logging
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 
 from hub import notify
-from hub.line_channel import HOUKI_CHANNEL, verify_line_signature
+from hub.line_channel import (HOUKI_CHANNEL, houki_channel_disabled_reason,
+                              verify_line_signature)
 from hub.redact import emit
 
 logger = logging.getLogger("houki_bot.router")
@@ -60,9 +65,20 @@ async def _record_inbound(user_id: str, kind: str) -> None:
 
     通知本文は固定文言+種別+userId 先頭 10 文字（顧客メッセージ本文は
     載せない＝dispatch_bot の警報より狭い。相続放棄の顧客本文は PII のため）。"""
-    logger.info("[HOUKI] inbound kind=%s userId=%s...",
-                kind,
-                emit(user_id[:10], "record_id", "log", "operator"))
+    # sink 規律: kind は固定語彙のため分岐で**固定文言**として出し、
+    # 可変値は emit の直接呼び出しのみを logger 引数に渡す
+    if kind == _KIND_TEXT:
+        logger.info("[HOUKI] inbound kind=text userId=%s...",
+                    emit(user_id[:10], "record_id", "log", "operator"))
+    elif kind == _KIND_IMAGE:
+        logger.info("[HOUKI] inbound kind=image userId=%s...",
+                    emit(user_id[:10], "record_id", "log", "operator"))
+    elif kind == _KIND_FOLLOW:
+        logger.info("[HOUKI] inbound kind=follow userId=%s...",
+                    emit(user_id[:10], "record_id", "log", "operator"))
+    else:
+        logger.info("[HOUKI] inbound kind=other_message userId=%s...",
+                    emit(user_id[:10], "record_id", "log", "operator"))
     await notify.notify_admin_line(
         "【相続放棄LINE】新チャネルで受信がありました\n"
         f"種別: {kind}\n"
@@ -75,8 +91,15 @@ async def _record_inbound(user_id: str, kind: str) -> None:
 
 @router.post("/webhook/souzoku-houki")
 async def houki_webhook(request: Request, background_tasks: BackgroundTasks):
-    # fail-closed: secret 未設定＝受け口自体を無効（404・存在しないフリ）
-    if not HOUKI_CHANNEL.secret():
+    # fail-closed: secret 未設定・時効側資格情報との同値（fix1 [02]）＝
+    # 受け口自体を無効（404・存在しないフリ）。理由の閉集合は
+    # hub/line_channel.houki_channel_disabled_reason が単一の正
+    reason = houki_channel_disabled_reason()
+    if reason is not None:
+        if reason != "secret_unset":
+            # 誤設定のみ固定文言で警告（未設定=点火前の既定状態は無音）
+            logger.warning(
+                "[HOUKI] endpoint disabled (channel credential misconfig)")
         raise HTTPException(status_code=404, detail="not found")
 
     body = await request.body()

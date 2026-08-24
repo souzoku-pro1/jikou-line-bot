@@ -5,8 +5,11 @@
   **secret 未設定は 404**（受け口自体を無効＝存在しないフリ・fail-closed）。
   署名不正・欠落は 400。時効 secret で署名しても通らない（チャネル分離）。
 - v1 は deny-all 既定: 受信の検証・記録+管理者通知（userId 単位 throttle）のみ。
-  顧客への reply/push は行わない（source pin: houki_bot は送信ヘルパ・
-  api.line.me・時効/HOUKI の access token に一切触れない）。kintone 書込なし。
+  顧客への reply/push・kintone 書込は行わない。deny-all の構造的担保は
+  fix1 [01] で AST checker（test_houki_bot_policy.py）へ格上げ（旧 source
+  pin は本票由来で置換・削除）。
+- fix1 [02]: HOUKI secret が時効側 secret と同値／HOUKI token が設定済みかつ
+  時効側 token と同値の誤設定は受け口無効（404）・時効側は通常動作継続。
 - LINE 送信のチャネル資格情報一般化（hub/line_channel）: 時効側
   （main._line_reply_with_fallback / chat_responder.send_line_push）は
   JIKOU_CHANNEL=従来 env への委譲となり、HTTP 呼び出し・fallback 順序・
@@ -195,6 +198,101 @@ class TestFailClosedAndSignature(unittest.TestCase):
         self.assertEqual(resp.json(), {"status": "ok"})
 
 
+class TestCredentialEqualityFailClosed(unittest.TestCase):
+    """fix1 [02]: 時効側資格情報との同値=誤設定は受け口無効（404）。"""
+
+    def _with_houki_env(self, secret=None, token=None):
+        saved = {k: os.environ.get(k) for k in
+                 ("HOUKI_LINE_CHANNEL_SECRET", "HOUKI_LINE_CHANNEL_ACCESS_TOKEN")}
+        if secret is not None:
+            os.environ["HOUKI_LINE_CHANNEL_SECRET"] = secret
+        if token is not None:
+            os.environ["HOUKI_LINE_CHANNEL_ACCESS_TOKEN"] = token
+        return saved
+
+    def _restore(self, saved):
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def test_same_secret_disables_endpoint(self):
+        body = _event_body()
+        saved = self._with_houki_env(secret=_jikou_secret())
+        try:
+            # 同値 secret による正しい署名でも 404（受け口自体が無効）
+            resp, alert, reply, push = _post(
+                body, signature=_sign(body, _jikou_secret()))
+        finally:
+            self._restore(saved)
+        self.assertEqual(resp.status_code, 404)
+        alert.assert_not_awaited()
+        reply.assert_not_awaited()
+        push.assert_not_awaited()
+
+    def test_same_token_disables_endpoint(self):
+        body = _event_body()
+        saved = self._with_houki_env(
+            token=os.environ["LINE_CHANNEL_ACCESS_TOKEN"])
+        try:
+            resp, alert, _r, _p = _post(body)   # secret は正規・token のみ同値
+        finally:
+            self._restore(saved)
+        self.assertEqual(resp.status_code, 404)
+        alert.assert_not_awaited()
+
+    def test_empty_token_stays_enabled(self):
+        # v1 では token 未設定は正当（H-3 まで送信に使わない）＝有効のまま
+        body = _event_body()
+        saved = self._with_houki_env(token="")
+        try:
+            resp, alert, _r, _p = _post(body)
+        finally:
+            self._restore(saved)
+        self.assertEqual(resp.status_code, 200)
+        alert.assert_awaited_once()
+
+    def test_jikou_webhook_unaffected_by_same_secret_misconfig(self):
+        # 誤設定中も時効側 /webhook は通常動作を継続する
+        saved = self._with_houki_env(secret=_jikou_secret())
+        try:
+            body = json.dumps({"events": []}).encode()
+            digest = hmac.new(main.LINE_CHANNEL_SECRET.encode(), body,
+                              hashlib.sha256).digest()
+            resp = client.post(
+                "/webhook", content=body,
+                headers={"X-Line-Signature":
+                         base64.b64encode(digest).decode()})
+        finally:
+            self._restore(saved)
+        self.assertEqual(resp.status_code, 200)
+
+    def test_disabled_reason_closed_set(self):
+        self.assertIsNone(line_channel.houki_channel_disabled_reason())
+        saved = self._with_houki_env(secret=_jikou_secret())
+        try:
+            self.assertEqual(line_channel.houki_channel_disabled_reason(),
+                             "secret_equals_jikou")
+        finally:
+            self._restore(saved)
+        saved = self._with_houki_env(
+            token=os.environ["LINE_CHANNEL_ACCESS_TOKEN"])
+        try:
+            self.assertEqual(line_channel.houki_channel_disabled_reason(),
+                             "token_equals_jikou")
+        finally:
+            self._restore(saved)
+        saved = dict(os.environ)
+        os.environ.pop("HOUKI_LINE_CHANNEL_SECRET", None)
+        try:
+            self.assertEqual(line_channel.houki_channel_disabled_reason(),
+                             "secret_unset")
+        finally:
+            os.environ["HOUKI_LINE_CHANNEL_SECRET"] = \
+                saved["HOUKI_LINE_CHANNEL_SECRET"]
+
+
 class TestDenyAllV1(unittest.TestCase):
     """v1: 検証・記録・管理者通知のみ。顧客への送信は一切ない。"""
 
@@ -245,23 +343,10 @@ class TestDenyAllV1(unittest.TestCase):
         self.assertEqual(resp.status_code, 200)
         alert.assert_not_awaited()
 
-    def test_source_pins_no_send_no_jikou_creds_no_kintone(self):
-        """source pin: houki_bot は送信・時効資格情報・kintone 書込に触れない
-        （dispatch_bot の source pin と同型）"""
-        import pathlib
-        pkg = pathlib.Path(houki.__file__).parent
-        for py in pkg.glob("*.py"):
-            src = py.read_text(encoding="utf-8")
-            for banned in ("api.line.me",
-                           "reply_with_push_fallback", "push_text",
-                           "LINE_CHANNEL_ACCESS_TOKEN",   # HOUKI_… も含め token 不使用
-                           'environ.get("LINE_CHANNEL_SECRET',
-                           'environ["LINE_CHANNEL_SECRET',
-                           "import chat_responder", "from chat_responder",
-                           "APP_CHATLOG", "save_to_chatlog", "KintoneApp",
-                           "create_record", "update_record"):
-                self.assertNotIn(banned, src,
-                                 f"{py.name} に {banned} が含まれている")
+    # 旧 test_source_pins_no_send_no_jikou_creds_no_kintone（文字列包含の
+    # source pin）は fix1 [01]（R-SOUZOKU-HOUKI-H1）で AST checker
+    # （test_houki_bot_policy.py: import 閉集合・notify 許可属性閉集合・
+    # 動的アクセス遮断+checker negative）へ格上げ・置換した（本票由来）。
 
     def test_throttle_kind_registered(self):
         """houki_inbound は notify の throttle 種別語彙に登録済み（ID 非露出）"""
