@@ -20,6 +20,19 @@ read-only checker と同様の「許可文脈の閉集合」方式へ格上げ�
 
 checker 自体の negative（Codex 指定: notify.push_line_message(...) 追加形が
 red になることを直接固定）を fixture で併置する。
+
+SOUZOKU-HOUKI-H3（票由来の閉集合更新）: ヒアリング実装で必要になった分だけ
+許可を拡張する——
+- from-import に hub{houki_case_store, reply_sanitizer}・
+  hub.autoreply_stoplist{is_suppressed}・hub.houki_profile{名前閉集合 11}・
+  hub.line_channel へ reply_with_push_fallback・houki_bot.hearing
+  {handle_houki_hearing} を追加
+- BANNED から reply_with_push_fallback / save_to_chatlog /
+  save_to_approval_queue を外す（import 閉集合+新規則で統制へ移行）
+- 新規則: reply_with_push_fallback の呼び出しは**第1引数が HOUKI_CHANNEL の
+  Name である場合のみ許可**（時効チャネルでの送信は構造的に不可能のまま）
+- push_text・push_line_message・kintone/DB 直接アクセス・chat_responder
+  import・動的アクセスの禁止は不変
 """
 
 import ast
@@ -34,24 +47,43 @@ ALLOWED_PLAIN_IMPORTS = frozenset({"json", "logging"})
 ALLOWED_FROM_IMPORTS = {
     "fastapi": frozenset({"APIRouter", "BackgroundTasks", "HTTPException",
                           "Request"}),
-    "hub": frozenset({"notify"}),
+    # H3: houki_case_store（App 40 アクセス層・高位関数のみ）・reply_sanitizer
+    # （第 2 世代ガード機構）を追加
+    "hub": frozenset({"notify", "houki_case_store", "reply_sanitizer"}),
+    # H3: 送信は reply_with_push_fallback のみ解禁（呼び出し規則で
+    # HOUKI_CHANNEL 限定・push_text は禁止のまま）
     "hub.line_channel": frozenset({"HOUKI_CHANNEL", "verify_line_signature",
-                                   "houki_channel_disabled_reason"}),
+                                   "houki_channel_disabled_reason",
+                                   "reply_with_push_fallback"}),
     "hub.redact": frozenset({"emit"}),
+    # H3: 停止リスト共用（照会のみ）
+    "hub.autoreply_stoplist": frozenset({"is_suppressed"}),
+    # H3: 相続放棄プロファイル/ヒアリング定義+機構 re-export の名前閉集合
+    "hub.houki_profile": frozenset({
+        "HEARING_TEMPLATE_BLOCKS_HOUKI", "HOUKI_HEARING_CATEGORY",
+        "HOUKI_HEARING_PROMPT", "HOUKI_PROFILE", "ClaudeUnavailableError",
+        "autoreply_paused", "call_hearing_model", "get_recent_chat_history",
+        "save_to_approval_queue", "save_to_chatlog",
+        "style_guard_violations"}),
+    # H3: パッケージ内（router → hearing）
+    "houki_bot.hearing": frozenset({"handle_houki_hearing"}),
 }
 
 # ── 2. notify の許可属性（閉集合・これ以外の属性アクセスは違反） ─────────────────
 NOTIFY_ALLOWED_ATTRS = frozenset({"notify_admin_line"})
 
 # ── 3. 送信・書込系の禁止識別子（Name / Attribute.attr の両文脈で許可文脈ゼロ） ──
+# H3: reply_with_push_fallback / save_to_chatlog / save_to_approval_queue は
+# import 閉集合+呼び出し規則（HOUKI_CHANNEL 限定）での統制へ移行し本集合から
+# 除外（票由来）。それ以外は不変
 BANNED_EFFECT_NAMES = frozenset({
     # LINE 送信（hub/line_channel・hub/notify・chat_responder・raw HTTP）
-    "push_text", "reply_with_push_fallback", "push_line_message",
+    "push_text", "push_line_message",
     "notify_business", "notify_attorney_approval", "send_line_push",
     "httpx", "requests", "urllib", "aiohttp", "socket",
     # kintone / DB 書込
     "KintoneApp", "create_record", "update_record", "update_record_cas",
-    "upload_file", "save_to_chatlog", "save_to_approval_queue",
+    "upload_file",
     "get_engine", "get_session", "execute", "commit",
 })
 
@@ -104,6 +136,18 @@ def policy_violations(src: str, filename: str = "<src>") -> list[str]:
                 viol(node, f"禁止識別子: {node.id}")
             if node.id in BANNED_DYNAMIC_NAMES:
                 viol(node, f"禁止動的識別子: {node.id}")
+        elif isinstance(node, ast.Call):
+            # H3 新規則: 送信は HOUKI チャネル限定（第1引数が Name
+            # "HOUKI_CHANNEL" のときだけ許可。式・別名・時効チャネルは違反）
+            func = node.func
+            fname = func.id if isinstance(func, ast.Name) else (
+                func.attr if isinstance(func, ast.Attribute) else "")
+            if fname == "reply_with_push_fallback":
+                first = node.args[0] if node.args else None
+                if not (isinstance(first, ast.Name)
+                        and first.id == "HOUKI_CHANNEL"):
+                    viol(node, "reply_with_push_fallback の第1引数は "
+                               "HOUKI_CHANNEL の Name に限る")
 
     return violations
 
@@ -157,15 +201,37 @@ class TestCheckerNegatives(unittest.TestCase):
                 self.assertTrue(v, stmt)
 
     def test_line_channel_sender_import_is_red(self):
+        # H3: reply_with_push_fallback の**名前 import は許可**へ移行（呼び出し
+        # 規則で HOUKI_CHANNEL 限定）。push_text・module import・alias は禁止のまま
         for stmt in ("from hub.line_channel import push_text",
                      "from hub.line_channel import push_text as pt",
-                     "from hub.line_channel import reply_with_push_fallback",
+                     "from hub.line_channel import reply_with_push_fallback as r",
                      "from hub import line_channel",
                      "import hub.line_channel",
                      "import hub.line_channel as lc"):
             with self.subTest(stmt=stmt):
                 v = self._router_plus(stmt + "\n")
                 self.assertTrue(v, stmt)
+
+    def test_jikou_channel_send_is_red(self):
+        # H3 新規則の negative: 時効チャネルでの送信は構造的に不可能
+        # （JIKOU_CHANNEL の import 自体が名前閉集合外・呼び出し第1引数も検査）
+        v = self._router_plus("from hub.line_channel import JIKOU_CHANNEL\n")
+        self.assertTrue(any("JIKOU_CHANNEL" in x for x in v), v)
+        v = self._router_plus(
+            "async def _bad(rt, uid, t):\n"
+            "    await reply_with_push_fallback(JIKOU_CHANNEL, rt, uid, t)\n")
+        self.assertTrue(any("第1引数は" in x for x in v), v)
+        v = self._router_plus(
+            "async def _bad(rt, uid, t):\n"
+            "    ch = HOUKI_CHANNEL\n"
+            "    await reply_with_push_fallback(ch, rt, uid, t)\n")
+        self.assertTrue(any("第1引数は" in x for x in v), v)   # 別名経由も red
+        # 正形（HOUKI_CHANNEL の Name 直渡し）は green
+        v = self._router_plus(
+            "async def _ok(rt, uid, t):\n"
+            "    await reply_with_push_fallback(HOUKI_CHANNEL, rt, uid, t)\n")
+        self.assertEqual([x for x in v if "第1引数" in x], [])
 
     def test_chat_responder_and_kintone_are_red(self):
         for stmt in ("from chat_responder import send_line_push",
@@ -204,23 +270,37 @@ class TestClosedSetsPinned(unittest.TestCase):
     """閉集合そのものを pin（拡張は票由来で行う・無断の緩和を検知）。"""
 
     def test_allowlists_pinned(self):
+        # H3 で更新した閉集合の pin（拡張は票由来のみ）
         self.assertEqual(ALLOWED_PLAIN_IMPORTS, frozenset({"json", "logging"}))
         self.assertEqual(set(ALLOWED_FROM_IMPORTS),
-                         {"fastapi", "hub", "hub.line_channel", "hub.redact"})
-        self.assertEqual(ALLOWED_FROM_IMPORTS["hub"], frozenset({"notify"}))
+                         {"fastapi", "hub", "hub.line_channel", "hub.redact",
+                          "hub.autoreply_stoplist", "hub.houki_profile",
+                          "houki_bot.hearing"})
+        self.assertEqual(ALLOWED_FROM_IMPORTS["hub"],
+                         frozenset({"notify", "houki_case_store",
+                                    "reply_sanitizer"}))
         self.assertEqual(ALLOWED_FROM_IMPORTS["hub.line_channel"],
                          frozenset({"HOUKI_CHANNEL", "verify_line_signature",
-                                    "houki_channel_disabled_reason"}))
+                                    "houki_channel_disabled_reason",
+                                    "reply_with_push_fallback"}))
+        self.assertEqual(ALLOWED_FROM_IMPORTS["hub.autoreply_stoplist"],
+                         frozenset({"is_suppressed"}))
+        self.assertEqual(len(ALLOWED_FROM_IMPORTS["hub.houki_profile"]), 11)
+        self.assertEqual(ALLOWED_FROM_IMPORTS["houki_bot.hearing"],
+                         frozenset({"handle_houki_hearing"}))
         self.assertEqual(NOTIFY_ALLOWED_ATTRS, frozenset({"notify_admin_line"}))
 
     def test_banned_sets_contain_review_targets(self):
         # レビュー指摘の対象（送信・HTTP・kintone/DB・動的アクセス）が
-        # 禁止集合に実在することを個別に固定
-        for name in ("push_text", "reply_with_push_fallback",
+        # 禁止集合に実在することを個別に固定。H3 で統制方式を移行した 3 名は
+        # **意図的に除外**（import 閉集合+HOUKI_CHANNEL 限定規則で統制）
+        for name in ("push_text",
                      "push_line_message", "send_line_push", "httpx",
-                     "KintoneApp", "create_record", "update_record",
-                     "save_to_chatlog", "save_to_approval_queue"):
+                     "KintoneApp", "create_record", "update_record"):
             self.assertIn(name, BANNED_EFFECT_NAMES)
+        for name in ("reply_with_push_fallback", "save_to_chatlog",
+                     "save_to_approval_queue"):
+            self.assertNotIn(name, BANNED_EFFECT_NAMES)   # H3 移行（票由来）
         for name in ("getattr", "eval", "exec", "__import__", "importlib"):
             self.assertIn(name, BANNED_DYNAMIC_NAMES)
 

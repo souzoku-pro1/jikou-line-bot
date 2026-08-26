@@ -975,6 +975,9 @@ FAQ_BACKED_PHRASES: tuple[str, ...] = (
 ROUTE_BASIS: dict[str, frozenset[str]] = {
     "customer": frozenset(FAQ_BACKED_PHRASES),   # FAQ 収載＝根拠あり
     "hearing": frozenset(),                      # FAQ 非収載＝根拠なし
+    # SOUZOKU-HOUKI-H3: 相続放棄ヒアリング経路（FAQ 非収載＝根拠なし。
+    # 顧客対応 route〔houki_customer〕の登録は H-5）
+    "houki_hearing": frozenset(),
 }
 
 

@@ -97,7 +97,9 @@ def _event_body(user_id="U_houki_customer_1", text="相談です",
 
 def _post(body: bytes, signature: str | None = None, alert=None):
     """署名付き POST。管理者通知と送信ヘルパをモックし
-    (response, alert, reply_helper, push_helper) を返す。"""
+    (response, alert, reply_helper, push_helper) を返す。
+    H3: テキストのヒアリング回送先も遮断する（実 kintone/モデルに触れない。
+    回送そのものの検証は test_text_message_dispatches_hearing が行う）。"""
     alert = alert or AsyncMock(return_value=True)
     reply_helper, push_helper = AsyncMock(), AsyncMock()
     headers = {"X-Line-Signature":
@@ -105,7 +107,8 @@ def _post(body: bytes, signature: str | None = None, alert=None):
     with patch("hub.notify.notify_admin_line", new=alert), \
          patch.object(line_channel, "reply_with_push_fallback",
                       new=reply_helper), \
-         patch.object(line_channel, "push_text", new=push_helper):
+         patch.object(line_channel, "push_text", new=push_helper), \
+         patch("houki_bot.router.handle_houki_hearing", new=AsyncMock()):
         resp = client.post(URL, content=body, headers=headers)
     return resp, alert, reply_helper, push_helper
 
@@ -243,8 +246,9 @@ class TestCredentialEqualityFailClosed(unittest.TestCase):
         alert.assert_not_awaited()
 
     def test_empty_token_stays_enabled(self):
-        # v1 では token 未設定は正当（H-3 まで送信に使わない）＝有効のまま
-        body = _event_body()
+        # token 未設定でも受け口は有効のまま（H3 票由来の書き換え: テキストは
+        # ヒアリング回送になったため、通知経路が残る follow イベントで検証）
+        body = _event_body(event_type="follow")
         saved = self._with_houki_env(token="")
         try:
             resp, alert, _r, _p = _post(body)
@@ -306,16 +310,20 @@ class TestDenyAllV1(unittest.TestCase):
         self.assertEqual(alert.await_args.kwargs["throttle_key"],
                          f"houki_inbound:{user_id}")
 
-    def test_text_message_notifies_without_customer_send(self):
+    def test_text_message_dispatches_hearing(self):
+        # SOUZOKU-HOUKI-H3（票由来の書き換え）: テキストは deny-all 通知でなく
+        # ヒアリング会話へ回送される（管理者通知なし・回送引数の逐語）
         uid = "U_houki_customer_1"
-        resp, alert, reply, push = _post(_event_body(user_id=uid,
-                                                     text="秘密の相談内容"))
+        hearing = AsyncMock()
+        body = _event_body(user_id=uid, text="相談です")
+        alert = AsyncMock(return_value=True)
+        with patch("houki_bot.router.handle_houki_hearing", new=hearing), \
+             patch("hub.notify.notify_admin_line", new=alert):
+            resp = client.post(URL, content=body,
+                               headers={"X-Line-Signature": _sign(body)})
         self.assertEqual(resp.status_code, 200)
-        self._assert_notified(alert, "テキスト", uid)
-        self.assertNotIn("秘密の相談内容",
-                         alert.await_args.args[0])   # 本文は通知に載せない
-        reply.assert_not_awaited()
-        push.assert_not_awaited()
+        hearing.assert_awaited_once_with("rt1", uid, "相談です")
+        alert.assert_not_awaited()
 
     def test_image_message_notifies(self):
         uid = "U_houki_customer_2"
