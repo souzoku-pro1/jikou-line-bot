@@ -33,6 +33,7 @@ from claude_gateway import (
 from config import HEARING_STATUSES, POST_ENGAGEMENT_STATUSES
 from hub import line_channel
 from hub import reply_sanitizer
+from hub.business_profile import BusinessProfile
 from hub.redact import emit
 
 logger = logging.getLogger("chat_responder")
@@ -205,10 +206,15 @@ _TEMPLATE_DEDUP_MARKERS["hoterasu"] = "法テラス（民事法律扶助）"
 _HOTERASU_VOCAB = ("法テラス", "ほうてらす", "民事法律扶助", "法律扶助")
 
 
-def _mentions_hoterasu(text: str) -> bool:
+def _mentions_hoterasu(text: str,
+                       profile: BusinessProfile | None = None) -> bool:
+    """必須標準回答の検知語彙（NFKC+空白除去・部分一致）。H2: 語彙は
+    プロファイル側（時効=法テラス閉集合）・正規化照合は機構側。vocab 空の
+    プロファイルでは常に False（ガード無効）。"""
+    p = profile or JIKOU_PROFILE
     t = unicodedata.normalize("NFKC", text or "")
     t = re.sub(r"\s+", "", t)   # 空白除去（全角空白は NFKC で半角化済み）
-    return any(v in t for v in _HOTERASU_VOCAB)
+    return any(v in t for v in p.mandatory_reply_vocab)
 
 # ── 画像メッセージへの固定受領応答（AUTOREPLY-GEN2 要件4・票由来文言） ─────────
 # AI に画像内容の判断はさせない（画像読解は別票）。受領応答+弁護士通知のみ。
@@ -251,12 +257,15 @@ PENDING_BY_CATEGORY = {
 }
 
 
-def pending_reply_for(category: str) -> str:
+def pending_reply_for(category: str,
+                      profile: BusinessProfile | None = None) -> str:
     """承認送り時の即時応答（要件5）。大野の文言確定（env
-    PENDING_CONTEXT_ENABLED=1）までは現行 PENDING_REPLY を返す。"""
+    PENDING_CONTEXT_ENABLED=1）までは現行 PENDING_REPLY を返す。
+    H2: 文言はプロファイル側・env フラグの解釈は機構側。"""
+    p = profile or JIKOU_PROFILE
     if os.environ.get("PENDING_CONTEXT_ENABLED") == "1":
-        return PENDING_BY_CATEGORY.get(category, PENDING_REPLY)
-    return PENDING_REPLY
+        return p.pending_by_category.get(category, p.pending_reply)
+    return p.pending_reply
 
 
 # ── 許可絵文字（弁護士確定定型に含まれるもののみ・要件1） ───────────────────────
@@ -818,17 +827,20 @@ def _kintone_base() -> str:
 
 # ── ルーティング判定 ────────────────────────────────────────────────────────────
 
-def classify_routing(status: str) -> str:
+def classify_routing(status: str,
+                     profile: BusinessProfile | None = None) -> str:
     """
-    App 21 の status 値からルーティング先を返す。
+    案件 status 値からルーティング先を返す（H2: status 語彙はプロファイル側・
+    3 値分類は機構側）。
       "hearing"        : ヒアリング未完了 → 既存フロー
       "post_engagement": 受任後 → 顧客対応Claude（受任後）
       "pre_engagement" : 受任前 → 顧客対応Claude（受任前）
                          ※ 想定外の値は安全側フォールバックで pre_engagement
     """
-    if status in HEARING_STATUSES:
+    p = profile or JIKOU_PROFILE
+    if status in p.hearing_statuses:
         return "hearing"
-    if status in POST_ENGAGEMENT_STATUSES:
+    if status in p.post_engagement_statuses:
         return "post_engagement"
     return "pre_engagement"
 
@@ -843,14 +855,19 @@ def build_system_prompt(
     court_docs: str = "（未登録）",
     credit_check: str = "（未登録）",
     known_items: Optional[dict] = None,
+    profile: BusinessProfile | None = None,
 ) -> str:
     """顧客対応Claudeのシステムプロンプトを組み立てる。
 
     AUTOREPLY-GEN2 要件3: known_items（収集済み項目台帳・build_known_items）
-    を渡すと「既知項目一覧+再質問禁止」の節を追記する。"""
-    routing = classify_routing(status)
+    を渡すと「既知項目一覧+再質問禁止」の節を追記する。
+    H2: テンプレ本文はプロファイル側・phase 分類と既知項目節は機構側。
+    ※ 顧客情報 placeholder 集合（business_name 等）は時効テンプレ固有の
+    署名のまま（相続放棄の prompt 組み立ては H-3 で設計）。"""
+    p = profile or JIKOU_PROFILE
+    routing = classify_routing(status, profile=p)
     phase = "受任後" if routing == "post_engagement" else "受任前"
-    prompt = _SYSTEM_PROMPT_TMPL.format(
+    prompt = p.system_prompt_template.format(
         phase=phase,
         customer_name=customer_name,
         status=status,
@@ -877,26 +894,36 @@ class GuardResult:
     """apply_server_guards() の判定結果"""
     can_auto_send: bool
     demotion_reasons: list[str] = field(default_factory=list)
-    immediate_notice: str = "none"  # IMMEDIATE_NOTICE_TEXTS のキー or "none"
+    immediate_notice: str = "none"  # notice_texts のキー or "none"
+    # H2: プロファイルの即時定型集合（None=時効の IMMEDIATE_NOTICE_TEXTS。
+    # 既存の生成箇所・テストは省略のままで挙動不変）
+    notice_texts: Optional[dict] = None
 
     @property
     def immediate_notice_text(self) -> Optional[str]:
         """承認キュー行き時に即時送信する定型文（なければ None）"""
-        return IMMEDIATE_NOTICE_TEXTS.get(self.immediate_notice)
+        texts = self.notice_texts if self.notice_texts is not None \
+            else IMMEDIATE_NOTICE_TEXTS
+        return texts.get(self.immediate_notice)
 
 
-def _strip_allowlisted(text: str) -> str:
+def _strip_allowlisted(text: str,
+                       profile: BusinessProfile | None = None) -> str:
     """禁止語照合の前に、弁護士確認済みの許可フレーズを除去する"""
-    for phrase in ALLOWLISTED_PHRASES:
+    p = profile or JIKOU_PROFILE
+    for phrase in p.allowlisted_phrases:
         text = text.replace(phrase, "")
     return text
 
 
-def find_forbidden_words(reply: str) -> list[str]:
-    """返信文中の禁止語を検出して返す（許可リスト適用後）"""
-    stripped = _strip_allowlisted(reply)
+def find_forbidden_words(reply: str,
+                         profile: BusinessProfile | None = None) -> list[str]:
+    """返信文中の禁止語を検出して返す（許可リスト適用後）。
+    H2: 禁止語・許可リストはプロファイル側・照合は機構側。"""
+    p = profile or JIKOU_PROFILE
+    stripped = _strip_allowlisted(reply, profile=p)
     hits = []
-    for label, pattern in _FORBIDDEN_PATTERNS:
+    for label, pattern in p.forbidden_patterns:
         for m in pattern.finditer(stripped):
             hits.append(f"{label}「{m.group(0)}」")
     return hits
@@ -1001,18 +1028,61 @@ def looks_like_court_doc_report(message: str) -> bool:
     )
 
 
-def _fee_guide_already_sent(history: list[dict]) -> bool:
+# ── 時効プロファイル（SOUZOKU-HOUKI-H2・G1）───────────────────────────────────
+# 既存 module 定数（弁護士確定・hash pin 凍結済み）への**参照の束**。値の複製は
+# しない（単一の正・二重管理なし）。ガード関数は profile=None をこの束に解決
+# するため、既存呼び出し・既存テストは無変更で従来挙動と完全一致する。
+# 相続放棄プロファイルの実体は H-3/H-5 票で作る（本票は枠のみ）。
+JIKOU_PROFILE = BusinessProfile(
+    name="jikou",
+    hearing_statuses=frozenset(HEARING_STATUSES),
+    post_engagement_statuses=frozenset(POST_ENGAGEMENT_STATUSES),
+    system_prompt_template=_SYSTEM_PROMPT_TMPL,
+    compose_tool=_COMPOSE_REPLY_TOOL,
+    update_flag_key="jikou_update_flag",
+    auto_send_categories=frozenset(AUTO_SEND_CATEGORIES),
+    forbidden_patterns=tuple(_FORBIDDEN_PATTERNS),
+    allowlisted_phrases=tuple(ALLOWLISTED_PHRASES),
+    allowed_emoji=ALLOWED_CANONICAL_EMOJI,
+    customer_style_route="customer",
+    hearing_style_route="hearing",
+    style_section=STYLE_SECTION,
+    fee_category="費用の定型案内",
+    fee_required_phrases=tuple(FEE_REQUIRED_PHRASES),
+    fee_guide_marker=FEE_GUIDE_MARKER,
+    conditional_category="時効見立て_条件付き",
+    reservation_general_marker=RESERVATION_GENERAL_MARKER,
+    reservation_individual_markers=tuple(RESERVATION_INDIVIDUAL_MARKERS),
+    mandatory_reply_vocab=tuple(_HOTERASU_VOCAB),
+    mandatory_reply_text=HOTERASU_STANDARD_REPLY,
+    mandatory_reply_notice_key="hoterasu",
+    mandatory_reply_label="法テラス標準回答の不使用",
+    pending_reply=PENDING_REPLY,
+    pending_by_category=PENDING_BY_CATEGORY,
+    immediate_notice_texts=IMMEDIATE_NOTICE_TEXTS,
+    template_dedup_markers=_TEMPLATE_DEDUP_MARKERS,
+    urgent_notice_kinds=URGENT_NOTICE_KINDS,
+    first_report_detector=looks_like_court_doc_report,
+    first_report_notice_key="court_doc_request",
+)
+
+
+def _fee_guide_already_sent(history: list[dict],
+                            profile: BusinessProfile | None = None) -> bool:
     """費用の固定文を過去の会話で送付済みか（assistant 発言のマーカー照合）"""
+    p = profile or JIKOU_PROFILE
     return any(
-        FEE_GUIDE_MARKER in m.get("content", "")
+        p.fee_guide_marker in m.get("content", "")
         for m in history
         if m.get("role") == "assistant"
     )
 
 
-def _template_already_sent(notice_key: str, history: list[dict]) -> bool:
+def _template_already_sent(notice_key: str, history: list[dict],
+                           profile: BusinessProfile | None = None) -> bool:
     """同じ定型文を過去に送信済みか（会話履歴の assistant 発言と照合）"""
-    marker = _TEMPLATE_DEDUP_MARKERS.get(notice_key, "")
+    p = profile or JIKOU_PROFILE
+    marker = p.template_dedup_markers.get(notice_key, "")
     if not marker:
         return False
     return any(
@@ -1024,7 +1094,8 @@ def _template_already_sent(notice_key: str, history: list[dict]) -> bool:
 
 def apply_server_guards(
     result: dict, history: list[dict], user_message: str,
-    *, sanitize_fatal: bool = False
+    *, sanitize_fatal: bool = False,
+    profile: BusinessProfile | None = None,
 ) -> GuardResult:
     """
     compose_reply の結果にサーバー側の二重チェックを適用する。
@@ -1042,13 +1113,16 @@ def apply_server_guards(
         サーバー側の検知でも補完する
       - 同じ定型文を過去に送信済みなら通常の定型文（PENDING_REPLY）に戻す
     """
+    # H2: 閉集合・文言・フラグ名はプロファイル側（None=時効・挙動不変）。
+    # 検査の骨格（線引きの順序・降格の合成）は機構側
+    p = profile or JIKOU_PROFILE
     reply = result.get("reply", "") or ""
     category = result.get("category", "")
     auto_send = bool(result.get("auto_send"))
-    update_flag = bool(result.get("jikou_update_flag"))
+    update_flag = bool(result.get(p.update_flag_key))
 
     reasons: list[str] = []
-    can_auto_send = auto_send and (category in AUTO_SEND_CATEGORIES)
+    can_auto_send = auto_send and (category in p.auto_send_categories)
 
     if can_auto_send:
         # a0) AUTOREPLY-GEN2 要件1/2: プレースホルダ残存は送信禁止・
@@ -1063,33 +1137,36 @@ def apply_server_guards(
         # a1) AUTOREPLY-GEN2 要件6: 法テラス質問には標準回答（弁護士確定）を
         #     決定的に到達させる——標準回答を逐語で含まない返信は承認降格し、
         #     即時定型（hoterasu）で標準回答を顧客へ送る
-        if _mentions_hoterasu(user_message) \
-                and HOTERASU_STANDARD_REPLY not in reply:
+        if p.mandatory_reply_vocab \
+                and _mentions_hoterasu(user_message, profile=p) \
+                and p.mandatory_reply_text not in reply:
             can_auto_send = False
-            reasons.append("法テラス標準回答の不使用")
+            reasons.append(p.mandatory_reply_label)
         # a) 禁止語照合
-        hits = find_forbidden_words(reply)
+        hits = find_forbidden_words(reply, profile=p)
         if hits:
             can_auto_send = False
             reasons.append("禁止語検出: " + "、".join(hits))
         # a2) AUTOREPLY-STYLE-1-fix1 [B]: 弁護士本人の名乗り・見本の匿名化
         #     記号の残存・旧見本由来の無根拠表現は承認降格
-        style_hits = style_guard_violations(reply, route="customer")
+        style_hits = style_guard_violations(reply,
+                                            route=p.customer_style_route)
         if style_hits:
             can_auto_send = False
             reasons.extend(style_hits)
-        # b) 費用の定型案内の必須文言（会話単位: 固定文を送付済みの顧客への
+        # b) 費用定型の必須文言（会話単位: 固定文を送付済みの顧客への
         #    続き質問には簡潔な回答を許容する。2026-07-03 弁護士承認済みの緩和）
-        if category == "費用の定型案内":
-            missing = [p for p in FEE_REQUIRED_PHRASES if p not in reply]
-            if missing and not _fee_guide_already_sent(history):
+        if category == p.fee_category:
+            missing = [ph for ph in p.fee_required_phrases if ph not in reply]
+            if missing and not _fee_guide_already_sent(history, profile=p):
                 can_auto_send = False
                 reasons.append("費用定型の必須文言欠落: " + "、".join(missing))
-        # c) 時効見立て_条件付きの留保文言・更新事由フラグ
-        if category == "時効見立て_条件付き":
+        # c) 条件付き見立てカテゴリの留保文言・更新事由フラグ
+        if category == p.conditional_category:
             has_reservation = (
-                RESERVATION_GENERAL_MARKER in reply
-                or all(m in reply for m in RESERVATION_INDIVIDUAL_MARKERS)
+                p.reservation_general_marker in reply
+                or all(m in reply
+                       for m in p.reservation_individual_markers)
             )
             if not has_reservation:
                 can_auto_send = False
@@ -1100,25 +1177,30 @@ def apply_server_guards(
 
     # 承認キュー行き時の即時定型文を解決
     notice_key = result.get("immediate_notice") or "none"
-    if notice_key not in IMMEDIATE_NOTICE_TEXTS:
+    if notice_key not in p.immediate_notice_texts:
         notice_key = "none"
     if can_auto_send:
         notice_key = "none"
     else:
-        # サーバー側バックストップ: 裁判所書類の第一報を検知したら資料収集文面を送る
-        if notice_key == "none" and looks_like_court_doc_report(user_message):
-            notice_key = "court_doc_request"
-        # AUTOREPLY-GEN2 要件6: 法テラス質問の承認降格時は標準回答を即時送信
-        if notice_key == "none" and _mentions_hoterasu(user_message):
-            notice_key = "hoterasu"
+        # サーバー側バックストップ: 第一報検知（時効=裁判所書類）で資料収集文面
+        if notice_key == "none" and p.first_report_detector is not None \
+                and p.first_report_detector(user_message):
+            notice_key = p.first_report_notice_key
+        # AUTOREPLY-GEN2 要件6: 必須標準回答（時効=法テラス）の承認降格時は
+        # 標準回答を即時送信
+        if notice_key == "none" and p.mandatory_reply_vocab \
+                and _mentions_hoterasu(user_message, profile=p):
+            notice_key = p.mandatory_reply_notice_key
         # 同じ定型文の二度送りは通常の定型文に戻す
-        if notice_key != "none" and _template_already_sent(notice_key, history):
+        if notice_key != "none" \
+                and _template_already_sent(notice_key, history, profile=p):
             notice_key = "none"
 
     return GuardResult(
         can_auto_send=can_auto_send,
         demotion_reasons=reasons,
         immediate_notice=notice_key,
+        notice_texts=dict(p.immediate_notice_texts),
     )
 
 
@@ -1391,7 +1473,8 @@ async def _notify_attorney(
 
 # ── Claude 呼び出し ────────────────────────────────────────────────────────────
 
-async def _call_compose_reply(system_prompt: str, messages: list[dict]) -> dict:
+async def _call_compose_reply(system_prompt: str, messages: list[dict],
+                              tool: dict | None = None) -> dict:
     """Claude API (tool use / compose_reply 強制) を呼び出し結果 dict を返す
 
     モデル名は config.py（PRIMARY_MODEL / FALLBACK_MODEL）で管理。
@@ -1414,7 +1497,7 @@ async def _call_compose_reply(system_prompt: str, messages: list[dict]) -> dict:
                 "cache_control": {"type": "ephemeral"},
             }
         ],
-        tools=[_COMPOSE_REPLY_TOOL],
+        tools=[tool if tool is not None else _COMPOSE_REPLY_TOOL],
         tool_choice={"type": "tool", "name": "compose_reply"},
         messages=messages,
     )
@@ -1440,6 +1523,7 @@ async def handle_claude_outage(
     reply_func: Callable,
     customer_name: str = "",
     error: str = "",
+    profile: BusinessProfile | None = None,
 ) -> None:
     """
     PRIMARY / FALLBACK の両方で Claude 応答が得られなかったときの共通処理。
@@ -1447,8 +1531,14 @@ async def handle_claude_outage(
     1. ユーザーには定型の「確認中」応答を返す
     2. 承認キュー（App 29）に要対応レコードを作成する
     3. 弁護士に承認依頼を LINE Push で通知する
+
+    H2-fix1 [01]: 障害時応答は profile.pending_reply を流用（独立フィールドは
+    持たない裁定・hub/business_profile docstring と一致）。送信文言と App28 の
+    assistant 保存文言は同一値。profile 省略（None→JIKOU）は従来の
+    PENDING_REPLY と逐語一致（test_business_profile で pin）。
     """
-    await reply_func(reply_token, PENDING_REPLY)
+    p = profile or JIKOU_PROFILE
+    await reply_func(reply_token, p.pending_reply)
     approval_id = await save_to_approval_queue(
         user_id=user_id,
         customer_name=customer_name,
@@ -1458,7 +1548,8 @@ async def handle_claude_outage(
         reason=f"Claude応答不能（要手動対応）: {error[:200]}",
     )
     await save_to_chatlog(user_id, "user", user_message, OUTAGE_CATEGORY, "no")
-    await save_to_chatlog(user_id, "assistant", PENDING_REPLY, OUTAGE_CATEGORY, "yes")
+    await save_to_chatlog(user_id, "assistant", p.pending_reply,
+                          OUTAGE_CATEGORY, "yes")
     await _notify_attorney(user_id, customer_name, approval_id, OUTAGE_CATEGORY)
     logger.info("[OUTAGE] queued user_id=%s approval_id=%s",
                 emit(user_id, "external_ref", "log", "operator"),
@@ -1473,6 +1564,7 @@ async def handle_customer_message(
     reply_token: str,
     app21_record: dict,
     reply_func: Callable,
+    profile: BusinessProfile | None = None,
 ) -> None:
     """
     顧客対応 Claude のメインエントリーポイント。
@@ -1485,7 +1577,11 @@ async def handle_customer_message(
     app21_record  : get_app21_record() で取得した kintone App21 レコード dict
     reply_func    : async (reply_token: str, text: str) -> None
                     LINE に返信するための呼び出し元提供の非同期関数
+    profile       : 業務プロファイル（H2。None=時効・従来挙動と完全一致）。
+                    ※ 直下の案件フィールド抽出（顧客名・借入時期 等）は
+                    App21=時効スキーマ固有のまま（相続放棄の entry は H-3）
     """
+    p = profile or JIKOU_PROFILE
     # App21 レコードから案件情報を取り出す
     status        = app21_record.get("status", {}).get("value", "")
     customer_name = app21_record.get("顧客名", {}).get("value", "") or "（未登録）"
@@ -1515,11 +1611,13 @@ async def handle_customer_message(
         court_docs=_field("裁判所書類"),
         credit_check=_field("信用情報確認"),
         known_items=known_items,
+        profile=p,
     )
 
     # Claude で返信案を作成
     try:
-        result = await _call_compose_reply(system_prompt, messages)
+        result = await _call_compose_reply(system_prompt, messages,
+                                           tool=p.compose_tool)
     except ClaudeUnavailableError as e:
         # PRIMARY / FALLBACK 両方失敗 → 確認中応答 + 承認キューに要対応レコード
         logger.exception("compose_reply unavailable for user_id=%s", user_id)
@@ -1530,12 +1628,14 @@ async def handle_customer_message(
             reply_func=reply_func,
             customer_name=customer_name,
             error=str(e),
+            profile=p,
         )
         return
     except Exception:
         logger.exception("compose_reply failed for user_id=%s", user_id)
         # 一時的なエラー（レート制限等）は定型文を返して終了
-        await reply_func(reply_token, PENDING_REPLY)
+        # （H2-fix1 [01]: 障害系の両経路とも profile の pending_reply を使う）
+        await reply_func(reply_token, p.pending_reply)
         return
 
     # AUTOREPLY-GEN2 要件1: 送信直前サニタイズ（markdown 平文化・許可外
@@ -1543,7 +1643,7 @@ async def handle_customer_message(
     # 承認降格＝その文面は送信しない
     reply_text, sanitize_issues, sanitize_fatal = \
         reply_sanitizer.sanitize_reply(
-            result["reply"], allowed_emoji=ALLOWED_CANONICAL_EMOJI)
+            result["reply"], allowed_emoji=p.allowed_emoji)
     if sanitize_issues:
         logger.info("[SANITIZE] user_id=%s issues=%s",
                     emit(user_id, "external_ref", "log", "operator"),
@@ -1559,7 +1659,7 @@ async def handle_customer_message(
     # サーバー側二重チェック（カテゴリ許可リスト＋禁止語・必須文言・留保文言
     # ＋GEN2: プレースホルダ/長さ/質問数/法テラス標準回答）
     guard = apply_server_guards(result, history, user_message,
-                                sanitize_fatal=sanitize_fatal)
+                                sanitize_fatal=sanitize_fatal, profile=p)
     if guard.demotion_reasons:
         logger.info("[GUARD] demoted user_id=%s reasons=%s",
                     emit(user_id, "external_ref", "log", "operator"),
@@ -1590,13 +1690,14 @@ async def handle_customer_message(
         # 顧客への定型文を返信（裁判所書類の第一報・離脱兆候・対象外債権・
         # 法テラスは専用文面。GEN2 要件5: それ以外はカテゴリ別の文脈化定型
         # ——大野の文言確定=PENDING_CONTEXT_ENABLED までは現行文言）
-        ack_text = guard.immediate_notice_text or pending_reply_for(category)
+        ack_text = guard.immediate_notice_text \
+            or pending_reply_for(category, profile=p)
         await reply_func(reply_token, ack_text)
         await save_to_chatlog(user_id, "assistant", ack_text, category, "yes")
         # 弁護士へ承認依頼通知（希死念慮・差押え切迫は【緊急・要即時対応】）
         await _notify_attorney(
             user_id, customer_name, approval_id, category,
-            urgent_kind=URGENT_NOTICE_KINDS.get(guard.immediate_notice, ""),
+            urgent_kind=p.urgent_notice_kinds.get(guard.immediate_notice, ""),
             customer_message=user_message,
         )
         logger.info(
