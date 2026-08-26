@@ -232,6 +232,23 @@ async def apply_hearing_fields(user_id: str, raw_fields: dict,
                 return _v(existing or {}, "$id"), problems
             existing = latest
             fields, problems = split_valid_fields(raw_fields, latest)
+        except kintone.KintoneError:
+            # fix3[H3-06]: 新規作成の二重 create 防止（方式(a)）。App 40 の
+            # LINEユーザーID 欄は「値の重複を禁止する」を有効化する（大野の
+            # 点火作業）——並行 2 タスクが双方 existing=None でも create は
+            # 1 件しか成立しない。敗者の create 失敗は再検索し、既存レコードが
+            # 見つかれば**そのレコードへの update に収束**（再検証込み）。
+            # 見つからなければ重複起因でない障害＝従来どおり送出
+            if existing is not None:
+                raise
+            latest = await fetch_case(user_id)
+            if latest is None:
+                raise
+            logger.info("[HOUKI_CASE] duplicate create converged record_id=%s",
+                        emit(_v(latest, "$id"), "record_id", "log",
+                             "operator"))
+            existing = latest
+            fields, problems = split_valid_fields(raw_fields, latest)
     logger.warning("[HOUKI_CASE] upsert cas exhausted (write 0) record_id=%s",
                    emit(_v(existing or {}, "$id"), "record_id", "log",
                         "operator"))
@@ -241,29 +258,46 @@ async def apply_hearing_fields(user_id: str, raw_fields: dict,
 async def append_creditors(record_id: str, existing: dict | None,
                            names: list[str]) -> int:
     """債権者一覧 SUBTABLE へ債権者名を追記（既存行保持・同名スキップ・
-    新規行は 通知要否=未確認）。追加行数を返す。"""
+    新規行は 通知要否=未確認）。追加行数を返す。
+
+    fix3[H3-07]: fix2 のマーカー/フラグと同型の $revision CAS 収束ループ——
+    最新取得→既存行との併合（既存行保持+同名スキップの契約を維持）→CAS 更新。
+    409 は再取得・再併合（≤_CAS_RETRIES）。収束不能=既存表を上書きせず
+    要確認通知+0（write 0）。"""
     clean = [str(n or "").strip() for n in (names or [])]
     clean = [n for n in clean if n]
     if not clean:
         return 0
-    rows = list(((existing or {}).get(CREDITOR_TABLE) or {}).get("value") or [])
-    known = {str(((r.get("value") or {}).get("債権者名") or {})
-                 .get("value") or "").strip() for r in rows}
-    added = 0
-    for name in clean:
-        if name in known:
-            continue
-        rows.append({"value": {"債権者名": {"value": name},
-                               "通知要否": {"value": "未確認"}}})
-        known.add(name)
-        added += 1
-    if added:
-        await kintone.update_record(APP_HOUKI_CASE, record_id,
-                                    {CREDITOR_TABLE: {"value": rows}})
-        logger.info("[HOUKI_CASE] creditors appended record_id=%s rows=%s",
-                    emit(record_id, "record_id", "log", "operator"),
-                    emit(added, "count", "log", "operator"))
-    return added
+    for _attempt in range(_CAS_RETRIES):
+        rows = list(((existing or {}).get(CREDITOR_TABLE) or {})
+                    .get("value") or [])
+        known = {str(((r.get("value") or {}).get("債権者名") or {})
+                     .get("value") or "").strip() for r in rows}
+        added = 0
+        for name in clean:
+            if name in known:
+                continue
+            rows.append({"value": {"債権者名": {"value": name},
+                                   "通知要否": {"value": "未確認"}}})
+            known.add(name)
+            added += 1
+        if not added:
+            return 0
+        try:
+            await kintone.update_record(
+                APP_HOUKI_CASE, record_id, {CREDITOR_TABLE: {"value": rows}},
+                revision=_v(existing or {}, "$revision") or None)
+            logger.info("[HOUKI_CASE] creditors appended record_id=%s rows=%s",
+                        emit(record_id, "record_id", "log", "operator"),
+                        emit(added, "count", "log", "operator"))
+            return added
+        except kintone.KintoneConflict:
+            latest = await _refetch_by_id(record_id)
+            if latest is None:
+                break
+            existing = latest
+    await _cas_unresolved_alert(record_id, "債権者一覧の追記")
+    return 0
 
 
 # ── fix1[03]: 日付整合失敗の永続正本（in-memory カウンタ廃止） ──────────────────

@@ -35,6 +35,14 @@ fix2（R-SOUZOKU-HOUKI-H3-2・H3-04/H3-05 HIGH）: App 40 書込の全面 CAS �
 - [H3-05] メモ/フラグの read-modify-write=$revision CAS。409 収束: 既存在=
   write 0／未存在=最新値（人の追記・人の別フラグ）を保持して追加／収束不能=
   上書きせず要確認通知（notify_admin_line・固定文言）。
+
+fix3（R-SOUZOKU-HOUKI-H3-3・H3-06/H3-07 HIGH）:
+- [H3-06] 二重 create 防止=方式(a): App 40 の LINEユーザーID 欄に kintone の
+  「値の重複を禁止する」を有効化（大野の点火作業・fake は一意制約を模す）。
+  create 失敗（KintoneConflict 以外の KintoneError）→ 再検索 → 既存レコードへ
+  収束（split 再検証込み）。既存なし=重複起因でない障害=従来どおり送出。
+- [H3-07] append_creditors=fix2 同型の $revision CAS 収束（再取得・再併合≤3・
+  既存行保持+同名スキップ維持・収束不能=上書きせず要確認+0）。
 """
 
 import asyncio
@@ -87,6 +95,13 @@ class _FakeApp40:
         return found[:1]
 
     async def create_record(self, app, fields):
+        # fix3[H3-06]: App 40 の LINEユーザーID 欄は「値の重複を禁止する」
+        # 設定（方式(a)・大野の点火作業）＝一意制約違反を模す
+        uid = (fields.get("LINEユーザーID") or {}).get("value")
+        if uid and any(r.get("LINEユーザーID", {}).get("value") == uid
+                       for r in self.rows.values()):
+            raise store.kintone.KintoneError(400, "CB_VA01",
+                                             "unique constraint")
         self._id += 1
         rid = str(self._id)
         rec = dict(fields)
@@ -380,6 +395,99 @@ class TestFix2CASConvergence(_StoreBase):
             self.assertFalse(_run(store.mark_date_mismatch_flag(rid, stale)))
         alert2.assert_awaited_once()
         self.assertEqual(self.fake.field(rid, "危険類型フラグ") or [], [])
+
+
+class TestFix3DoubleCreateAndCreditors(_StoreBase):
+    """fix3[H3-06/07]: 二重 create の収束・債権者一覧 SUBTABLE の CAS 収束。"""
+
+    def test_h3_06_concurrent_creates_converge_to_one_record(self):
+        # Codex 指定形: 並行 2 タスクが双方 existing=None を取得した状態から、
+        # create 合計 1 件・両タスクの入力が同一レコードへ収束
+        rid_a, prob_a = _run(store.apply_hearing_fields(
+            "U_dc1", {"顧客名": "山田"}, None))
+        rid_b, prob_b = _run(store.apply_hearing_fields(
+            "U_dc1", {"電話番号": "090"}, None))     # B も existing=None
+        self.assertEqual(len(self.fake.rows), 1)     # create は合計 1 件
+        self.assertEqual(rid_a, rid_b)
+        self.assertEqual(prob_a, [])
+        self.assertEqual(prob_b, [])
+        self.assertEqual(self.fake.field(rid_a, "顧客名"), "山田")
+        self.assertEqual(self.fake.field(rid_a, "電話番号"), "090")
+        self.assertEqual(self.fake.field(rid_a, "status"), "問い合わせ")
+
+    def test_h3_06_converged_write_is_revalidated(self):
+        # 収束後の書込にも cross-turn 検証が効く（勝者の死亡日と矛盾する
+        # 敗者の日付は write 0+problems）
+        _run(store.apply_hearing_fields(
+            "U_dc2", {"死亡日_申告": "2026-05-02"}, None))
+        rid_b, prob_b = _run(store.apply_hearing_fields(
+            "U_dc2", {"死亡を知った日_申告": "2026-05-01"}, None))
+        self.assertEqual(len(self.fake.rows), 1)
+        self.assertTrue(any("死亡を知った日_申告が死亡日_申告より前" in x
+                            for x in prob_b), prob_b)
+        self.assertIsNone(self.fake.field(rid_b, "死亡を知った日_申告"))
+
+    def test_h3_06_non_duplicate_create_error_reraised(self):
+        # 再検索しても既存なし=重複起因でない create 障害は従来どおり送出
+        async def broken_create(app, fields):
+            raise store.kintone.KintoneError(500, "GAIA_XX", "down")
+
+        with patch.object(store.kintone, "create_record", broken_create):
+            with self.assertRaises(store.kintone.KintoneError):
+                _run(store.apply_hearing_fields("U_dc3", {"顧客名": "x"},
+                                                None))
+        self.assertEqual(len(self.fake.rows), 0)
+
+    def test_h3_07_concurrent_appends_no_lost_update(self):
+        # Codex 指定形: 並行 2 処理が別々の債権者 X・Y を追加→最終表に
+        # X・Y が各 1 回ずつ残る（lost update なし）
+        import copy
+        rid = _run(store.upsert_case_fields("U_cr1", {}, None))
+        snap_a = copy.deepcopy(self.fake.rows[rid])
+        snap_b = copy.deepcopy(self.fake.rows[rid])
+        self.assertEqual(_run(store.append_creditors(rid, snap_a, ["X社"])), 1)
+        self.assertEqual(_run(store.append_creditors(rid, snap_b, ["Y社"])), 1)
+        names = [r["value"]["債権者名"]["value"]
+                 for r in self.fake.field(rid, "債権者一覧")]
+        self.assertEqual(sorted(names), ["X社", "Y社"])
+        self.assertEqual(len(names), 2)     # 各 1 回・重複なし
+
+    def test_h3_07_same_name_after_conflict_write_zero(self):
+        # 競合再取得後に同名が既に存在=同名スキップ（write 0・revision 不変）
+        import copy
+        rid = _run(store.upsert_case_fields("U_cr2", {}, None))
+        stale = copy.deepcopy(self.fake.rows[rid])
+        _run(store.append_creditors(rid, self.fake.rows[rid], ["X社"]))
+        rev_after = self.fake.rows[rid]["$revision"]["value"]
+        self.assertEqual(_run(store.append_creditors(rid, stale, ["X社"])), 0)
+        self.assertEqual(self.fake.rows[rid]["$revision"]["value"], rev_after)
+        names = [r["value"]["債権者名"]["value"]
+                 for r in self.fake.field(rid, "債権者一覧")]
+        self.assertEqual(names, ["X社"])
+
+    def test_h3_07_unresolvable_alerts_without_write(self):
+        # 収束不能=既存表を上書きせず要確認通知+0
+        rid = _run(store.upsert_case_fields("U_cr3", {}, None))
+        _run(store.append_creditors(rid, self.fake.rows[rid], ["X社"]))
+        stale = dict(self.fake.rows[rid])
+        alert = AsyncMock(return_value=True)
+
+        async def always_conflict(app, record_id, fields, revision=None):
+            raise store.kintone.KintoneConflict(409, "GAIA_CO02", "conflict")
+
+        async def refetch_fail(app, record_id):
+            raise store.kintone.KintoneError(520, "X", "down")
+
+        with patch.object(store.kintone, "update_record", always_conflict), \
+             patch.object(store.kintone, "get_record", refetch_fail), \
+             patch.object(store.notify, "notify_admin_line", alert):
+            self.assertEqual(_run(store.append_creditors(rid, stale,
+                                                         ["Y社"])), 0)
+        alert.assert_awaited_once()
+        self.assertIn("債権者一覧", alert.await_args.args[0])
+        names = [r["value"]["債権者名"]["value"]
+                 for r in self.fake.field(rid, "債権者一覧")]
+        self.assertEqual(names, ["X社"])    # 既存表は上書きされていない
 
 
 class TestCrossTurnDateRules(_StoreBase):
