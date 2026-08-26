@@ -40,9 +40,38 @@ def to_wareki(d: date) -> str:
     return f"{era}{y}年{d.month}月{d.day}日"
 
 
+def fill_runs(para, mapping: dict) -> None:
+    """run 単位でプレースホルダを差し込む（段落の run 構成・各 run の rPr を
+    保持する。SOUZOKU-HOUKI-H7A で notice_webhook._fill_runs〔JIKOU-NOTICE-1-
+    fix2 で確立〕から逐語昇格・実装不変）。
+
+    段落全体を先頭 run へ潰す方式（fill_template）は、ラベル run の書式
+    （均等割り付け w:fitText 等）が行全体へ及び崩れる（時効援用通知書の
+    ふりがな・生年月日行で実機発見）。本関数は各 run の rPr を保ったまま、
+    プレースホルダを含む run の中だけで置換する。
+
+    契約: テンプレートはプレースホルダを**単一 run に収める**こと（収載時に
+    検査する・run 跨ぎのプレースホルダは置換されず残るため、呼び出し側の
+    残存検査〔fail-closed〕で拒否される）。新規テンプレ（相続放棄 H-7(b)(c)
+    以降）は本関数を使う。
+    """
+    for r in para.runs:
+        if "{{" in r.text:
+            text = r.text
+            for k, v in mapping.items():
+                text = text.replace(k, v)
+            r.text = text
+
+
 def fill_template(template_path: str, data: dict) -> bytes:
     """テンプレートを差し込み置換して docx の bytes を返す
-    （document_webhook から移設・実装不変。run 分割されたプレースホルダにも対応）"""
+    （document_webhook から移設・実装不変。run 分割されたプレースホルダにも対応）
+
+    既知問題（JIKOU-NOTICE-1-fix2 で実機発見・H7A で明文化）: 段落の全 run を
+    先頭 run へ潰すため、run 単位の書式（均等割り付け w:fitText・font 差等）が
+    行全体へ波及して崩れる。既存利用者（契約書・送付状等＝この挙動で SHA/凍結
+    pin 済み）の互換のため実装は変更しない。**新規テンプレートは run 保持形の
+    fill_runs を使うこと**（プレースホルダは単一 run に収める契約）。"""
     doc = Document(template_path)
 
     def replace_in_paragraph(para):
