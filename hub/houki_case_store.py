@@ -129,17 +129,36 @@ def validate_hearing_dates(fields: dict,
     return problems
 
 
-def split_valid_fields(fields: dict,
+def split_valid_fields(fields: dict, existing: dict | None = None,
                        today: datetime.date | None = None
                        ) -> tuple[dict, list[str]]:
     """tool の fields を（書き込み可能な適合分, 矛盾理由）へ分ける。
 
     - 許可集合外のフィールド名は黙って落とす（弁護士専権・サーバ計算欄の防壁）
     - 空値は落とす（非空を空で上書きしない）
-    - 日付矛盾があれば**日付 3 欄をすべて**書き込み対象から外す（部分書込で
-      矛盾ペアの片側だけ残る事故を防ぐ）。他フィールドは書く
+    - fix1[01]: 日付整合は「**既存レコードの日付 3 欄+今回入力を合成した
+      postimage 候補**」に対して検証する（一方が既存値・他方が今回値の
+      cross-turn の組合せにも 3 順序規則を適用）。今回入力に日付が 1 つも
+      無ければ検証しない（保存済みの確定値は書込時に検証済み）
+    - 矛盾があれば**今回の日付 3 欄をすべて**書き込み対象から外す（write 0。
+      部分書込で矛盾ペアの片側だけ残る事故を防ぐ）。他フィールドは書く
     """
-    problems = validate_hearing_dates(fields, today=today)
+    incoming_dates = [c for c in _DATE_FIELDS
+                     if str((fields or {}).get(c) or "").strip()]
+    if incoming_dates:
+        merged: dict = {}
+        for code in _DATE_FIELDS:
+            raw_in = str((fields or {}).get(code) or "").strip()
+            if raw_in:
+                merged[code] = raw_in       # 形式不正は validate 側で検知
+                continue
+            raw_ex = str(((existing or {}).get(code) or {})
+                         .get("value") or "").strip()
+            if raw_ex and _DATE_RE.fullmatch(raw_ex):
+                merged[code] = raw_ex       # 既存確定値（postimage 候補）
+        problems = validate_hearing_dates(merged, today=today)
+    else:
+        problems = []
     out: dict = {}
     for code, value in (fields or {}).items():
         if code not in HEARING_WRITABLE_FIELDS:
@@ -208,6 +227,36 @@ async def append_creditors(record_id: str, existing: dict | None,
     return added
 
 
+# ── fix1[03]: 日付整合失敗の永続正本（in-memory カウンタ廃止） ──────────────────
+# 1 回目=日付申告メモへ固定マーカー追記（App 40 が正本＝再起動を跨いで持続）。
+# 発火済み=危険類型フラグ「申告内容の矛盾」。判定はすべてレコード実値から導出
+MEMO_FIELD = "日付申告メモ"
+MISMATCH_MARKER = "【日付整合エラー検知】"
+
+
+def has_mismatch_marker(record: dict | None) -> bool:
+    return MISMATCH_MARKER in _v(record or {}, MEMO_FIELD)
+
+
+def has_mismatch_flag(record: dict | None) -> bool:
+    current = list((((record or {}).get(KIKEN_FLAG_FIELD) or {})
+                    .get("value")) or [])
+    return KIKEN_FLAG_DATE_MISMATCH in current
+
+
+async def add_mismatch_marker(record_id: str, existing: dict) -> bool:
+    """1 回目の失敗マーカーを 日付申告メモ へ追記（冪等・固定文言・PII なし）。"""
+    memo = _v(existing, MEMO_FIELD)
+    if MISMATCH_MARKER in memo:
+        return False
+    new_memo = (memo + "\n" if memo else "") + MISMATCH_MARKER
+    await kintone.update_record(APP_HOUKI_CASE, record_id,
+                                {MEMO_FIELD: {"value": new_memo}})
+    logger.info("[HOUKI_CASE] mismatch marker set record_id=%s",
+                emit(record_id, "record_id", "log", "operator"))
+    return True
+
+
 async def mark_date_mismatch_flag(record_id: str, existing: dict) -> bool:
     """日付整合の 2 回失敗（正本 §2.1）: 危険類型フラグへ
     「申告内容の矛盾」を追記する（既存チェックは保持・冪等）。"""
@@ -233,13 +282,24 @@ def hearing_required_satisfied(record: dict, pending: dict) -> bool:
 async def promote_status_to_phone_triage(record_id: str,
                                          existing: dict) -> bool:
     """status を 問い合わせ（または空）→ 電話判断待ち へ一方向遷移させる。
-    それ以外の現値（受任 等）からは**絶対に動かさない**。遷移したら True。"""
+    それ以外の現値（受任 等）からは**絶対に動かさない**。遷移したら True。
+
+    fix1[02]: $revision の CAS 更新（contract/notice 金型と同流儀）。
+    409（KintoneConflict）＝読取後に人（弁護士）が変更した＝**作用 0**。
+    最新を取り直しての自動再遷移はしない（人の変更を尊重して停止）。"""
     current = _v(existing, STATUS_FIELD)
     if current not in ("", STATUS_INQUIRY):
         return False
-    await kintone.update_record(
-        APP_HOUKI_CASE, record_id,
-        {STATUS_FIELD: {"value": STATUS_PHONE_TRIAGE}})
+    revision = _v(existing, "$revision")
+    try:
+        await kintone.update_record(
+            APP_HOUKI_CASE, record_id,
+            {STATUS_FIELD: {"value": STATUS_PHONE_TRIAGE}},
+            revision=revision or None)
+    except kintone.KintoneConflict:
+        logger.info("[HOUKI_CASE] status promote cas_lost record_id=%s",
+                    emit(record_id, "record_id", "log", "operator"))
+        return False
     logger.info("[HOUKI_CASE] status -> phone triage record_id=%s",
                 emit(record_id, "record_id", "log", "operator"))
     return True

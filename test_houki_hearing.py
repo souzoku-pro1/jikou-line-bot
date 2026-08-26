@@ -16,6 +16,17 @@
 - 停止リスト（App 39 共用）・全業務ブレーキ（AUTOREPLY_PAUSED 共用）。
 - HOUKI_PROFILE: ヒアリング部分のみ実値・顧客対応部分は fail-closed
   プレースホルダ（auto_send_categories=空集合）。
+
+fix1（R-SOUZOKU-HOUKI-H3・3 件 HIGH）:
+- [01] 日付整合の cross-turn 化: 検証は「App 40 既存レコードの日付 3 欄+
+  今回入力の postimage 候補」に対して行い、既存×今回の全組合せに 3 順序規則を
+  適用。矛盾時は今回の日付 3 欄を write 0。
+- [02] status 遷移の CAS 化: $revision 楽観ロック。409=作用 0・自動再遷移
+  しない（TOCTOU: 読取後の弁護士変更「受任」を上書きしない）。
+- [03] 失敗状態の永続化+承認キュー冪等化: in-memory カウンタ廃止。
+  1 回目=日付申告メモの固定マーカー【日付整合エラー検知】（App 40 正本・
+  再起動を跨いで持続）／2 回目=承認キュー→危険類型フラグ（queue 先行の
+  at-least-once）／フラグ済み=増分 0。
 """
 
 import asyncio
@@ -72,11 +83,17 @@ class _FakeApp40:
         rid = str(self._id)
         rec = dict(fields)
         rec["$id"] = {"value": rid}
+        rec["$revision"] = {"value": "1"}
         self.rows[rid] = rec
         return rid
 
-    async def update_record(self, app, record_id, fields):
-        self.rows[str(record_id)].update(fields)
+    async def update_record(self, app, record_id, fields, revision=None):
+        rec = self.rows[str(record_id)]
+        cur = int(rec["$revision"]["value"])
+        if revision is not None and int(revision) != cur:
+            raise store.kintone.KintoneConflict(409, "GAIA_CO02", "conflict")
+        rec.update(fields)
+        rec["$revision"] = {"value": str(cur + 1)}
 
     def field(self, rid, code):
         return (self.rows[str(rid)].get(code) or {}).get("value")
@@ -215,6 +232,86 @@ class TestUpsert(_StoreBase):
             rid, self.fake.rows[rid])))
         self.assertEqual(self.fake.field(rid, "status"), "受任")
 
+    def test_status_promotion_cas_toctou(self):
+        # fix1[02]（Codex 指定）: 「問い合わせ」取得後に弁護士が「受任」へ変更
+        # → Bot の昇格は 409=作用 0・自動再遷移なし・最終 status は「受任」のまま
+        import copy
+        rid = _run(store.upsert_case_fields("U_h6", {}, None))
+        stale = copy.deepcopy(self.fake.rows[rid])   # Bot が読んだ時点の姿
+        self.assertEqual(stale["status"]["value"], "問い合わせ")
+        # 弁護士が先に変更（revision が進む）
+        _run(self.fake.update_record(None, rid, {"status": {"value": "受任"}}))
+        # Bot の昇格試行（stale で CAS）→ 敗北・作用 0
+        self.assertFalse(_run(store.promote_status_to_phone_triage(rid, stale)))
+        self.assertEqual(self.fake.field(rid, "status"), "受任")
+        # 最新を取り直しても自動で再遷移しない（受任は遷移元でない）
+        self.assertFalse(_run(store.promote_status_to_phone_triage(
+            rid, self.fake.rows[rid])))
+        self.assertEqual(self.fake.field(rid, "status"), "受任")
+
+    def test_mismatch_marker_idempotent(self):
+        rid = _run(store.upsert_case_fields("U_h7", {"日付申告メモ": "5月頃"},
+                                            None))
+        self.assertTrue(_run(store.add_mismatch_marker(
+            rid, self.fake.rows[rid])))
+        self.assertFalse(_run(store.add_mismatch_marker(
+            rid, self.fake.rows[rid])))
+        memo = self.fake.field(rid, "日付申告メモ")
+        self.assertEqual(memo, "5月頃\n" + store.MISMATCH_MARKER)
+        self.assertTrue(store.has_mismatch_marker(self.fake.rows[rid]))
+
+
+class TestCrossTurnDateRules(_StoreBase):
+    """fix1[01]: 既存レコード×今回入力の cross-turn 矛盾（3 順序規則+逆方向）。"""
+
+    def _existing_with(self, **dates):
+        rid = _run(store.upsert_case_fields(
+            "U_ct", {k: v for k, v in dates.items()}, None))
+        return self.fake.rows[rid]
+
+    def test_rule1_existing_death_incoming_knew_death(self):
+        existing = self._existing_with(死亡日_申告="2026-05-02")
+        out, problems = store.split_valid_fields(
+            {"死亡を知った日_申告": "2026-05-01"}, existing,
+            today=datetime.date(2026, 8, 26))
+        self.assertTrue(any("死亡を知った日_申告が死亡日_申告より前" in x
+                            for x in problems))
+        self.assertEqual(out, {})
+
+    def test_rule2_existing_death_incoming_knew_heir(self):
+        existing = self._existing_with(死亡日_申告="2026-05-02")
+        out, problems = store.split_valid_fields(
+            {"相続人と知った日_申告": "2026-05-01"}, existing,
+            today=datetime.date(2026, 8, 26))
+        self.assertTrue(any("相続人と知った日_申告が死亡日_申告より前" in x
+                            for x in problems))
+        self.assertEqual(out, {})
+
+    def test_rule3_existing_knew_death_incoming_knew_heir(self):
+        existing = self._existing_with(死亡を知った日_申告="2026-06-01")
+        out, problems = store.split_valid_fields(
+            {"相続人と知った日_申告": "2026-05-20"}, existing,
+            today=datetime.date(2026, 8, 26))
+        self.assertTrue(any("死亡を知った日_申告より前" in x
+                            for x in problems))
+        self.assertEqual(out, {})
+
+    def test_reverse_direction_incoming_death_vs_existing_knew(self):
+        # 逆方向: 既存=知った日・今回=死亡日 の組合せも検知（write 0）
+        existing = self._existing_with(死亡を知った日_申告="2026-05-01")
+        out, problems = store.split_valid_fields(
+            {"死亡日_申告": "2026-05-02", "顧客名": "山田"}, existing,
+            today=datetime.date(2026, 8, 26))
+        self.assertTrue(problems)
+        self.assertEqual(out, {"顧客名": "山田"})   # 日付は write 0・他は書く
+
+    def test_no_incoming_dates_no_validation(self):
+        existing = self._existing_with(死亡日_申告="2026-05-02")
+        out, problems = store.split_valid_fields(
+            {"顧客名": "山田"}, existing, today=datetime.date(2026, 8, 26))
+        self.assertEqual(problems, [])
+        self.assertEqual(out, {"顧客名": "山田"})
+
 
 # ── モデル応答のフェイク ────────────────────────────────────────────────────────
 def _text_response(text):
@@ -235,7 +332,7 @@ class _HearingBase(_StoreBase):
         super().setUp()
         self.uid = f"U_houki_{self.id().rsplit('.', 1)[-1][:20]}"
         hearing.conversation_histories.pop(self.uid, None)
-        hearing._date_mismatch_counts.pop(self.uid, None)
+        # fix1[03]: 日付整合の失敗状態は App 40 正本＝in-memory カウンタなし
 
     def run_turn(self, responses, text="こんにちは", paused=False,
                  suppressed=False):
@@ -291,12 +388,16 @@ class TestHearingFlow(_HearingBase):
                "fields": {"死亡日_申告": "2026-05-02",
                           "死亡を知った日_申告": "2026-05-01"},
                "phase_done": False, "hearing_done": False}
-        # 1 回目: 日付は書かれない・queue なし
+        # 1 回目: 日付は書かれない・queue なし・**メモに永続マーカー**（fix1[03]）
         _s, queue, _c = self.run_turn(
             [_tool_response(dict(bad)), _text_response("確認させてください。")])
         rid = list(self.fake.rows)[0]
         self.assertIsNone(self.fake.field(rid, "死亡日_申告"))
         queue.assert_not_awaited()
+        self.assertIn(store.MISMATCH_MARKER,
+                      self.fake.field(rid, "日付申告メモ") or "")
+        # 「再起動」相当: in-memory の会話履歴を消しても状態は App 40 が正本
+        hearing.conversation_histories.pop(self.uid, None)
         # 2 回目: 危険類型フラグ「申告内容の矛盾」+承認キュー
         _s, queue2, _c = self.run_turn(
             [_tool_response(dict(bad)), _text_response("再度確認します。")],
@@ -306,6 +407,70 @@ class TestHearingFlow(_HearingBase):
         queue2.assert_awaited_once()
         self.assertIn("日付整合検証の2回失敗",
                       queue2.await_args.kwargs["reason"])
+        # 3 回目（フラグ済み）: 承認キュー増分 0・フラグ不変（fix1[03] 冪等）
+        _s, queue3, _c = self.run_turn(
+            [_tool_response(dict(bad)), _text_response("承知しました。")],
+            text="同じ日付です")
+        queue3.assert_not_awaited()
+        self.assertEqual(self.fake.field(rid, "危険類型フラグ"),
+                         ["申告内容の矛盾"])
+        memo = self.fake.field(rid, "日付申告メモ") or ""
+        self.assertEqual(memo.count(store.MISMATCH_MARKER), 1)   # 追記も 1 回
+
+    def test_partial_failure_queue_lost_then_refires(self):
+        # fix1[03] 部分失敗: 2 回目でキュー作成が失敗（ACK 喪失）→ フラグは
+        # **書かれない**（queue 先行）→ 次回の矛盾で再発火してキュー+フラグ完了
+        bad = {"phase": "2_dates",
+               "fields": {"死亡日_申告": "2026-05-02",
+                          "死亡を知った日_申告": "2026-05-01"},
+               "phase_done": False, "hearing_done": False}
+        self.run_turn([_tool_response(dict(bad)), _text_response("確認します。")])
+        rid = list(self.fake.rows)[0]
+        # 2 回目: queue が例外 → 全体は確認中定型で縮退・フラグ未書込
+        send, queue, chatlog = AsyncMock(), \
+            AsyncMock(side_effect=RuntimeError("app29 down")), AsyncMock()
+        model = AsyncMock(side_effect=[_tool_response(dict(bad))])
+        with patch.object(hearing, "call_hearing_model", model), \
+             patch.object(hearing, "reply_with_push_fallback", send), \
+             patch.object(hearing, "save_to_approval_queue", queue), \
+             patch.object(hearing, "save_to_chatlog", chatlog), \
+             patch.object(hearing, "get_recent_chat_history",
+                          AsyncMock(return_value=[])), \
+             patch.object(hearing, "is_suppressed",
+                          AsyncMock(return_value=False)), \
+             patch.object(hearing, "autoreply_paused", lambda: False):
+            _run(hearing.handle_houki_hearing("rtok", self.uid, "同じです"))
+        queue.assert_awaited_once()
+        self.assertEqual(self.fake.field(rid, "危険類型フラグ") or [], [])
+        send.assert_awaited_once()   # 縮退の確認中定型
+        self.assertEqual(send.await_args.args[3],
+                         hp.HOUKI_PROFILE.pending_reply)
+        # 3 回目（queue 正常）: 再発火してキュー+フラグ完了（at-least-once）
+        _s, queue3, _c = self.run_turn(
+            [_tool_response(dict(bad)), _text_response("承知しました。")],
+            text="やはり同じです")
+        queue3.assert_awaited_once()
+        self.assertEqual(self.fake.field(rid, "危険類型フラグ"),
+                         ["申告内容の矛盾"])
+
+    def test_cross_turn_date_mismatch_not_saved(self):
+        # fix1[01]（Codex 指定形）: 第 1 ターンで死亡日保存 → 第 2 ターンで
+        # それより前の「死亡を知った日」→ 保存されない
+        self.run_turn(
+            [_tool_response({"phase": "2_dates",
+                             "fields": {"死亡日_申告": "2026-05-02"},
+                             "phase_done": False, "hearing_done": False}),
+             _text_response("記録しました。")])
+        rid = list(self.fake.rows)[0]
+        self.assertEqual(self.fake.field(rid, "死亡日_申告"), "2026-05-02")
+        self.run_turn(
+            [_tool_response({"phase": "2_dates",
+                             "fields": {"死亡を知った日_申告": "2026-05-01"},
+                             "phase_done": False, "hearing_done": False}),
+             _text_response("確認します。")],
+            text="知ったのは5月1日です")
+        self.assertIsNone(self.fake.field(rid, "死亡を知った日_申告"))
+        self.assertEqual(self.fake.field(rid, "死亡日_申告"), "2026-05-02")
 
     def test_hearing_done_promotes_status(self):
         filled = {c: "x" for c in store.HEARING_REQUIRED_FIELDS}

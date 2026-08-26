@@ -45,10 +45,10 @@ from hub.redact import emit
 
 logger = logging.getLogger("houki_bot.hearing")
 
-# ユーザーごとの会話履歴・日付整合の連続失敗回数（in-memory・単一 worker 前提。
-# 履歴は App 28 から復元できるため消失しても会話は継続する）
+# ユーザーごとの会話履歴（in-memory・単一 worker 前提。履歴は App 28 から
+# 復元できるため消失しても会話は継続する）。日付整合の失敗状態は fix1[03] で
+# App 40 が正本（メモの固定マーカー+危険類型フラグ）＝in-memory を持たない
 conversation_histories: dict[str, list] = {}
-_date_mismatch_counts: dict[str, int] = {}
 
 _MAX_HISTORY_TURNS = 10
 
@@ -88,8 +88,10 @@ async def _apply_record_hearing(user_id: str, record: dict | None,
                                 tool_input: dict) -> tuple[str, dict | None]:
     """record_hearing の入力を検証・upsert し、(tool_result 文字列,
     最新レコード) を返す。矛盾は固定語彙で返す（モデルが聞き直す）。"""
+    # fix1[01]: 既存レコードとの合成（postimage 候補）で cross-turn の
+    # 日付矛盾も検証する
     fields, problems = houki_case_store.split_valid_fields(
-        tool_input.get("fields") or {})
+        tool_input.get("fields") or {}, record)
     record_id = await houki_case_store.upsert_case_fields(user_id, fields, record)
     creditors = tool_input.get("creditor_names") or []
     if creditors:
@@ -97,16 +99,19 @@ async def _apply_record_hearing(user_id: str, record: dict | None,
         await houki_case_store.append_creditors(record_id, latest, creditors)
 
     if problems:
-        count = _date_mismatch_counts.get(user_id, 0) + 1
-        _date_mismatch_counts[user_id] = count
-        logger.info("[HOUKI_HEARING] date mismatch count=%s userId=%s...",
-                    emit(count, "count", "log", "operator"),
-                    emit(user_id[:10], "record_id", "log", "operator"))
-        if count >= 2:
-            latest = await houki_case_store.fetch_case(user_id)
-            if latest:
-                await houki_case_store.mark_date_mismatch_flag(
-                    str((latest.get("$id") or {}).get("value") or ""), latest)
+        # fix1[03]: 失敗状態は App 40 が正本（再起動を跨いで持続）。
+        #   1 回目=メモへ固定マーカー / 2 回目=承認キュー→危険類型フラグ
+        #   （queue 先行の at-least-once: queue 喪失時はフラグ未書込のまま
+        #   次回再発火＝未通知の沈黙を作らない。重複起票は人が閉じる） /
+        #   フラグ済み=増分 0（承認キューの再作成を抑止）
+        latest = await houki_case_store.fetch_case(user_id)
+        rid = str(((latest or {}).get("$id") or {}).get("value") or record_id)
+        if latest is not None and not houki_case_store.has_mismatch_marker(latest):
+            await houki_case_store.add_mismatch_marker(rid, latest)
+            logger.info("[HOUKI_HEARING] date mismatch first userId=%s...",
+                        emit(user_id[:10], "record_id", "log", "operator"))
+        elif latest is not None \
+                and not houki_case_store.has_mismatch_flag(latest):
             await save_to_approval_queue(
                 user_id=user_id,
                 customer_name="（相続放棄ヒアリング中）",
@@ -117,11 +122,11 @@ async def _apply_record_hearing(user_id: str, record: dict | None,
                 reason="[相続放棄ヒアリング] 日付整合検証の2回失敗: "
                        + " / ".join(problems),
             )
+            await houki_case_store.mark_date_mismatch_flag(rid, latest)
         result = ("記録しましたが、日付に矛盾があるため日付欄は保存して"
                   "いません: " + " / ".join(problems)
                   + "。丁寧に確認し直してください。")
     else:
-        _date_mismatch_counts.pop(user_id, None)
         result = "記録しました。"
 
     latest = await houki_case_store.fetch_case(user_id)
