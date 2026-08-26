@@ -89,10 +89,10 @@ async def _apply_record_hearing(user_id: str, record: dict | None,
     """record_hearing の入力を検証・upsert し、(tool_result 文字列,
     最新レコード) を返す。矛盾は固定語彙で返す（モデルが聞き直す）。"""
     # fix1[01]: 既存レコードとの合成（postimage 候補）で cross-turn の
-    # 日付矛盾も検証する
-    fields, problems = houki_case_store.split_valid_fields(
-        tool_input.get("fields") or {}, record)
-    record_id = await houki_case_store.upsert_case_fields(user_id, fields, record)
+    # 日付矛盾も検証。fix2[H3-04]: 書込は $revision CAS+409 収束
+    # （最新再取得→再検証→再試行）を apply_hearing_fields が担う
+    record_id, problems = await houki_case_store.apply_hearing_fields(
+        user_id, tool_input.get("fields") or {}, record)
     creditors = tool_input.get("creditor_names") or []
     if creditors:
         latest = await houki_case_store.fetch_case(user_id)

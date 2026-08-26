@@ -24,9 +24,13 @@ import logging
 import re
 
 from hub import kintone
+from hub import notify
 from hub.redact import emit
 
 logger = logging.getLogger("hub.houki_case_store")
+
+# fix2: read-modify-write の CAS 収束再試行の上限（超過=収束不能・上書きしない）
+_CAS_RETRIES = 3
 
 APP_HOUKI_CASE = kintone.KintoneApp(
     "App 40 (相続放棄案件)", "APP_HOUKI", "TOKEN_HOUKI")
@@ -178,6 +182,9 @@ async def upsert_case_fields(user_id: str, fields: dict,
 
     - 新規: 受付チャネル=LINE・status=問い合わせ で作成
     - 既存: **空でない現値は上書きしない**（record_hearing は追記専用）
+    - fix2[H3-04]: 更新は existing の $revision で CAS。409（KintoneConflict）
+      は**送出**する（収束＝再取得・再検証・再試行は apply_hearing_fields が
+      担う。単発の低レベル書込としては作用 0）
     """
     if existing is None:
         payload = {code: {"value": v} for code, v in fields.items()}
@@ -192,11 +199,43 @@ async def upsert_case_fields(user_id: str, fields: dict,
     update = {code: {"value": v} for code, v in fields.items()
               if not _v(existing, code)}
     if update:
-        await kintone.update_record(APP_HOUKI_CASE, rid, update)
+        await kintone.update_record(APP_HOUKI_CASE, rid, update,
+                                    revision=_v(existing, "$revision") or None)
         logger.info("[HOUKI_CASE] updated record_id=%s fields=%s",
                     emit(rid, "record_id", "log", "operator"),
                     emit(len(update), "count", "log", "operator"))
     return rid
+
+
+async def apply_hearing_fields(user_id: str, raw_fields: dict,
+                               existing: dict | None
+                               ) -> tuple[str, list[str]]:
+    """record_hearing の生 fields を（検証→CAS upsert→409 収束）まで行う
+    （fix2[H3-04]）。(レコード ID, 矛盾理由一覧) を返す。
+
+    収束: CAS 敗北（409）ごとに最新レコードを再取得し、
+    split_valid_fields(raw_fields, 最新) を**再実行**——最新値との合成で
+    矛盾が出れば日付 3 欄は write 0（矛盾理由を返し、不一致処理は呼び出し側）。
+    再試行は _CAS_RETRIES 回まで。尽きたら書込を諦める（write 0・今ターンの
+    データは次の発話で再収集される＝会話は継続。矛盾 postimage は成立しない）。
+    """
+    fields, problems = split_valid_fields(raw_fields, existing)
+    for _attempt in range(_CAS_RETRIES):
+        try:
+            rid = await upsert_case_fields(user_id, fields, existing)
+            return rid, problems
+        except kintone.KintoneConflict:
+            latest = await fetch_case(user_id)
+            if latest is None:
+                logger.warning(
+                    "[HOUKI_CASE] upsert cas refetch missing (write 0)")
+                return _v(existing or {}, "$id"), problems
+            existing = latest
+            fields, problems = split_valid_fields(raw_fields, latest)
+    logger.warning("[HOUKI_CASE] upsert cas exhausted (write 0) record_id=%s",
+                   emit(_v(existing or {}, "$id"), "record_id", "log",
+                        "operator"))
+    return _v(existing or {}, "$id"), problems
 
 
 async def append_creditors(record_id: str, existing: dict | None,
@@ -244,31 +283,82 @@ def has_mismatch_flag(record: dict | None) -> bool:
     return KIKEN_FLAG_DATE_MISMATCH in current
 
 
+async def _cas_unresolved_alert(record_id: str, what: str) -> None:
+    """fix2[H3-05]: 再取得・再照合不能（CAS 収束の再試行超過/最新取得失敗）＝
+    **上書きせず**管理者へ要確認通知（固定文言+レコード番号のみ）。"""
+    logger.warning("[HOUKI_CASE] cas unresolved (no write) record_id=%s",
+                   emit(record_id, "record_id", "log", "operator"))
+    await notify.notify_admin_line(
+        "【相続放棄・要確認】案件レコードの更新が競合し収束できませんでした"
+        f"（{what}・上書きはしていません）。\n"
+        f"相続放棄案件レコードNo: {record_id}\n"
+        "kintone で内容を確認してください。",
+        throttle_key=f"houki_cas_unresolved:{record_id}",
+    )
+
+
+async def _refetch_by_id(record_id: str) -> dict | None:
+    try:
+        return await kintone.get_record(APP_HOUKI_CASE, record_id)
+    except kintone.KintoneError:
+        return None
+
+
 async def add_mismatch_marker(record_id: str, existing: dict) -> bool:
-    """1 回目の失敗マーカーを 日付申告メモ へ追記（冪等・固定文言・PII なし）。"""
-    memo = _v(existing, MEMO_FIELD)
-    if MISMATCH_MARKER in memo:
-        return False
-    new_memo = (memo + "\n" if memo else "") + MISMATCH_MARKER
-    await kintone.update_record(APP_HOUKI_CASE, record_id,
-                                {MEMO_FIELD: {"value": new_memo}})
-    logger.info("[HOUKI_CASE] mismatch marker set record_id=%s",
-                emit(record_id, "record_id", "log", "operator"))
-    return True
+    """1 回目の失敗マーカーを 日付申告メモ へ追記（冪等・固定文言・PII なし）。
+
+    fix2[H3-05]: $revision CAS の read-modify-write。409 は最新を再取得して
+    収束——マーカー既存=write 0／未存在=**最新メモ本文を保持したまま**追記。
+    収束不能（再試行超過・再取得失敗）=上書きせず要確認通知。"""
+    for _attempt in range(_CAS_RETRIES):
+        memo = _v(existing, MEMO_FIELD)
+        if MISMATCH_MARKER in memo:
+            return False
+        new_memo = (memo + "\n" if memo else "") + MISMATCH_MARKER
+        try:
+            await kintone.update_record(
+                APP_HOUKI_CASE, record_id, {MEMO_FIELD: {"value": new_memo}},
+                revision=_v(existing, "$revision") or None)
+            logger.info("[HOUKI_CASE] mismatch marker set record_id=%s",
+                        emit(record_id, "record_id", "log", "operator"))
+            return True
+        except kintone.KintoneConflict:
+            latest = await _refetch_by_id(record_id)
+            if latest is None:
+                break
+            existing = latest
+    await _cas_unresolved_alert(record_id, "日付申告メモのマーカー追記")
+    return False
 
 
 async def mark_date_mismatch_flag(record_id: str, existing: dict) -> bool:
     """日付整合の 2 回失敗（正本 §2.1）: 危険類型フラグへ
-    「申告内容の矛盾」を追記する（既存チェックは保持・冪等）。"""
-    current = list(((existing.get(KIKEN_FLAG_FIELD) or {}).get("value")) or [])
-    if KIKEN_FLAG_DATE_MISMATCH in current:
-        return False
-    current.append(KIKEN_FLAG_DATE_MISMATCH)
-    await kintone.update_record(APP_HOUKI_CASE, record_id,
-                                {KIKEN_FLAG_FIELD: {"value": current}})
-    logger.info("[HOUKI_CASE] kiken flag set record_id=%s",
-                emit(record_id, "record_id", "log", "operator"))
-    return True
+    「申告内容の矛盾」を追記する（既存チェックは保持・冪等）。
+
+    fix2[H3-05]: $revision CAS の read-modify-write。409 は最新を再取得して
+    収束——フラグ既存=write 0／未存在=**人が追加した別フラグを保持したまま**
+    追加。収束不能=上書きせず要確認通知。"""
+    for _attempt in range(_CAS_RETRIES):
+        current = list(((existing.get(KIKEN_FLAG_FIELD) or {})
+                        .get("value")) or [])
+        if KIKEN_FLAG_DATE_MISMATCH in current:
+            return False
+        try:
+            await kintone.update_record(
+                APP_HOUKI_CASE, record_id,
+                {KIKEN_FLAG_FIELD:
+                 {"value": current + [KIKEN_FLAG_DATE_MISMATCH]}},
+                revision=_v(existing, "$revision") or None)
+            logger.info("[HOUKI_CASE] kiken flag set record_id=%s",
+                        emit(record_id, "record_id", "log", "operator"))
+            return True
+        except kintone.KintoneConflict:
+            latest = await _refetch_by_id(record_id)
+            if latest is None:
+                break
+            existing = latest
+    await _cas_unresolved_alert(record_id, "危険類型フラグの追加")
+    return False
 
 
 def hearing_required_satisfied(record: dict, pending: dict) -> bool:

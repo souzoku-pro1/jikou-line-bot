@@ -27,6 +27,14 @@ fix1（R-SOUZOKU-HOUKI-H3・3 件 HIGH）:
   1 回目=日付申告メモの固定マーカー【日付整合エラー検知】（App 40 正本・
   再起動を跨いで持続）／2 回目=承認キュー→危険類型フラグ（queue 先行の
   at-least-once）／フラグ済み=増分 0。
+
+fix2（R-SOUZOKU-HOUKI-H3-2・H3-04/H3-05 HIGH）: App 40 書込の全面 CAS 化。
+- [H3-04] upsert=$revision CAS+apply_hearing_fields の 409 収束（最新再取得→
+  split_valid_fields(最新) 再実行→再試行≤3。最新合成で矛盾=日付 write 0+
+  不一致処理。矛盾 postimage は成立しない）。
+- [H3-05] メモ/フラグの read-modify-write=$revision CAS。409 収束: 既存在=
+  write 0／未存在=最新値（人の追記・人の別フラグ）を保持して追加／収束不能=
+  上書きせず要確認通知（notify_admin_line・固定文言）。
 """
 
 import asyncio
@@ -95,6 +103,12 @@ class _FakeApp40:
         rec.update(fields)
         rec["$revision"] = {"value": str(cur + 1)}
 
+    async def get_record(self, app, record_id):
+        rec = self.rows.get(str(record_id))
+        if rec is None:
+            raise store.kintone.KintoneError(404, "GAIA_RE01", "not found")
+        return rec
+
     def field(self, rid, code):
         return (self.rows[str(rid)].get(code) or {}).get("value")
 
@@ -102,7 +116,8 @@ class _FakeApp40:
 def _patch_store(fake):
     return (patch.object(store.kintone, "search_records", fake.search_records),
             patch.object(store.kintone, "create_record", fake.create_record),
-            patch.object(store.kintone, "update_record", fake.update_record))
+            patch.object(store.kintone, "update_record", fake.update_record),
+            patch.object(store.kintone, "get_record", fake.get_record))
 
 
 class _StoreBase(unittest.TestCase):
@@ -259,6 +274,112 @@ class TestUpsert(_StoreBase):
         memo = self.fake.field(rid, "日付申告メモ")
         self.assertEqual(memo, "5月頃\n" + store.MISMATCH_MARKER)
         self.assertTrue(store.has_mismatch_marker(self.fake.rows[rid]))
+
+
+class TestFix2CASConvergence(_StoreBase):
+    """fix2[H3-04/05]: App 40 書込の CAS 化と 409 収束の各分岐。"""
+
+    def test_h3_04_concurrent_dates_no_contradictory_postimage(self):
+        # Codex 指定形: 両者が日付 3 欄空の同一 revision snapshot を取得
+        import copy
+        rid = _run(store.upsert_case_fields("U_cas1", {}, None))
+        snap_a = copy.deepcopy(self.fake.rows[rid])
+        snap_b = copy.deepcopy(self.fake.rows[rid])
+        # A: 死亡日を書込（rev が進む）
+        rid_a, prob_a = _run(store.apply_hearing_fields(
+            "U_cas1", {"死亡日_申告": "2026-05-02"}, snap_a))
+        self.assertEqual(prob_a, [])
+        self.assertEqual(self.fake.field(rid, "死亡日_申告"), "2026-05-02")
+        # B: 旧 snapshot 前提で「それより前の死亡を知った日」→ CAS 敗北→
+        #    再取得・再検証で矛盾検出→日付 write 0+不一致処理（problems 返却）
+        rid_b, prob_b = _run(store.apply_hearing_fields(
+            "U_cas1", {"死亡を知った日_申告": "2026-05-01"}, snap_b))
+        self.assertTrue(any("死亡を知った日_申告が死亡日_申告より前" in x
+                            for x in prob_b), prob_b)
+        self.assertIsNone(self.fake.field(rid, "死亡を知った日_申告"))
+        self.assertEqual(self.fake.field(rid, "死亡日_申告"), "2026-05-02")
+        # 最終状態に矛盾 postimage は成立しない
+
+    def test_h3_04_benign_conflict_converges(self):
+        # 競合はあるが矛盾しない書込は収束して両方残る
+        import copy
+        rid = _run(store.upsert_case_fields("U_cas2", {}, None))
+        snap_b = copy.deepcopy(self.fake.rows[rid])
+        _run(store.apply_hearing_fields(
+            "U_cas2", {"死亡日_申告": "2026-05-02"}, self.fake.rows[rid]))
+        _rid, prob = _run(store.apply_hearing_fields(
+            "U_cas2", {"顧客名": "山田"}, snap_b))
+        self.assertEqual(prob, [])
+        self.assertEqual(self.fake.field(rid, "死亡日_申告"), "2026-05-02")
+        self.assertEqual(self.fake.field(rid, "顧客名"), "山田")
+
+    def test_h3_05_marker_preserves_human_memo(self):
+        # Codex 指定: 取得後に人がメモ追記→旧 snapshot 書き戻しで消えない
+        import copy
+        rid = _run(store.upsert_case_fields(
+            "U_cas3", {"日付申告メモ": "5月頃"}, None))
+        stale = copy.deepcopy(self.fake.rows[rid])
+        _run(self.fake.update_record(None, rid,
+                                     {"日付申告メモ": {"value":
+                                                       "5月頃\n人の追記"}}))
+        self.assertTrue(_run(store.add_mismatch_marker(rid, stale)))
+        memo = self.fake.field(rid, "日付申告メモ")
+        self.assertEqual(memo, "5月頃\n人の追記\n" + store.MISMATCH_MARKER)
+
+    def test_h3_05_flag_preserves_human_flags(self):
+        # Codex 指定: 人が別フラグ追加→保持したうえで「申告内容の矛盾」が加わる
+        import copy
+        rid = _run(store.upsert_case_fields("U_cas4", {}, None))
+        stale = copy.deepcopy(self.fake.rows[rid])
+        _run(self.fake.update_record(
+            None, rid, {"危険類型フラグ": {"value": ["訴訟・督促あり"]}}))
+        self.assertTrue(_run(store.mark_date_mismatch_flag(rid, stale)))
+        self.assertEqual(self.fake.field(rid, "危険類型フラグ"),
+                         ["訴訟・督促あり", "申告内容の矛盾"])
+
+    def test_h3_05_already_present_after_conflict_write_zero(self):
+        # Codex 指定: 再取得したらマーカー/フラグ既存在= write 0（False）
+        import copy
+        rid = _run(store.upsert_case_fields("U_cas5", {}, None))
+        stale = copy.deepcopy(self.fake.rows[rid])
+        _run(self.fake.update_record(
+            None, rid,
+            {"日付申告メモ": {"value": store.MISMATCH_MARKER},
+             "危険類型フラグ": {"value": ["申告内容の矛盾"]}}))
+        rev_after = self.fake.rows[rid]["$revision"]["value"]
+        self.assertFalse(_run(store.add_mismatch_marker(rid, stale)))
+        self.assertFalse(_run(store.mark_date_mismatch_flag(rid, stale)))
+        # write 0（revision が進んでいない）
+        self.assertEqual(self.fake.rows[rid]["$revision"]["value"], rev_after)
+
+    def test_h3_05_unresolvable_alerts_without_write(self):
+        # Codex 指定: 再取得・再照合不能=上書きせず要確認通知
+        rid = _run(store.upsert_case_fields("U_cas6", {}, None))
+        stale = dict(self.fake.rows[rid])
+        alert = AsyncMock(return_value=True)
+
+        async def always_conflict(app, record_id, fields, revision=None):
+            raise store.kintone.KintoneConflict(409, "GAIA_CO02", "conflict")
+
+        async def refetch_fail(app, record_id):
+            raise store.kintone.KintoneError(520, "X", "down")
+
+        with patch.object(store.kintone, "update_record", always_conflict), \
+             patch.object(store.kintone, "get_record", refetch_fail), \
+             patch.object(store.notify, "notify_admin_line", alert):
+            self.assertFalse(_run(store.add_mismatch_marker(rid, stale)))
+        alert.assert_awaited_once()
+        self.assertIn("要確認", alert.await_args.args[0])
+        self.assertIn(rid, alert.await_args.args[0])
+        self.assertIsNone(self.fake.field(rid, "日付申告メモ"))   # 上書きなし
+        # フラグ側も同様（収束不能=通知+write 0）
+        alert2 = AsyncMock(return_value=True)
+        with patch.object(store.kintone, "update_record", always_conflict), \
+             patch.object(store.kintone, "get_record", refetch_fail), \
+             patch.object(store.notify, "notify_admin_line", alert2):
+            self.assertFalse(_run(store.mark_date_mismatch_flag(rid, stale)))
+        alert2.assert_awaited_once()
+        self.assertEqual(self.fake.field(rid, "危険類型フラグ") or [], [])
 
 
 class TestCrossTurnDateRules(_StoreBase):
