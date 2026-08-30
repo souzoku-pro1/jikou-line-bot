@@ -395,6 +395,75 @@ async def mark_date_mismatch_flag(record_id: str, existing: dict) -> bool:
     return False
 
 
+# ── H-4: 電話推奨度判定の書込面（危険類型フラグの複数追記+推奨度/根拠） ──────────
+# 電話要否・受任判断・電話予定日時・起算日_確定 等の弁護士専権欄への書込関数は
+# 本 module に存在しない（書込閉集合の維持・test_houki_phone_triage が payload を pin）
+PHONE_RECO_FIELD = "電話推奨度"
+PHONE_RECO_RATIONALE_FIELD = "電話推奨根拠"
+
+
+async def add_kiken_flags(record_id: str, existing: dict,
+                          labels: list[str]) -> int:
+    """危険類型フラグへ複数値を追記する（mark_date_mismatch_flag の複数値
+    一般形・H-4）。既存チェック（人の編集含む）は保持・既存在分は追加しない
+    （冪等）。$revision CAS の read-modify-write・409 は最新再取得で収束
+    （≤_CAS_RETRIES）・収束不能=上書きせず要確認通知。追加した件数を返す。"""
+    want = [str(v or "").strip() for v in (labels or [])]
+    want = [v for v in want if v]
+    if not want:
+        return 0
+    for _attempt in range(_CAS_RETRIES):
+        current = list(((existing.get(KIKEN_FLAG_FIELD) or {})
+                        .get("value")) or [])
+        add = [v for v in want if v not in current]
+        if not add:
+            return 0
+        try:
+            await kintone.update_record(
+                APP_HOUKI_CASE, record_id,
+                {KIKEN_FLAG_FIELD: {"value": current + add}},
+                revision=_v(existing, "$revision") or None)
+            logger.info("[HOUKI_CASE] kiken flags added record_id=%s count=%s",
+                        emit(record_id, "record_id", "log", "operator"),
+                        emit(len(add), "count", "log", "operator"))
+            return len(add)
+        except kintone.KintoneConflict:
+            latest = await _refetch_by_id(record_id)
+            if latest is None:
+                break
+            existing = latest
+    await _cas_unresolved_alert(record_id, "危険類型フラグの追加")
+    return 0
+
+
+async def set_phone_recommendation(record_id: str, existing: dict,
+                                   recommendation: str,
+                                   rationale: str) -> bool:
+    """電話推奨度+電話推奨根拠を書く（H-4 の冪等キー: **推奨度が空のとき
+    だけ**書く。非空=判定済み=write 0。フラグの解除・推奨度の再判定は
+    弁護士のみ〔正本 §3.1〕）。$revision CAS・409 は最新再取得で収束
+    （最新で推奨度が非空なら他の勝者に譲り write 0）・収束不能=要確認通知。"""
+    for _attempt in range(_CAS_RETRIES):
+        if _v(existing, PHONE_RECO_FIELD):
+            return False
+        try:
+            await kintone.update_record(
+                APP_HOUKI_CASE, record_id,
+                {PHONE_RECO_FIELD: {"value": recommendation},
+                 PHONE_RECO_RATIONALE_FIELD: {"value": rationale}},
+                revision=_v(existing, "$revision") or None)
+            logger.info("[HOUKI_CASE] phone recommendation set record_id=%s",
+                        emit(record_id, "record_id", "log", "operator"))
+            return True
+        except kintone.KintoneConflict:
+            latest = await _refetch_by_id(record_id)
+            if latest is None:
+                break
+            existing = latest
+    await _cas_unresolved_alert(record_id, "電話推奨度の書き込み")
+    return False
+
+
 def hearing_required_satisfied(record: dict, pending: dict) -> bool:
     """必須項目（HEARING_REQUIRED_FIELDS）が record+今回書込分で全て非空か。"""
     for code in HEARING_REQUIRED_FIELDS:
