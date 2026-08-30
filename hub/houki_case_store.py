@@ -403,11 +403,16 @@ PHONE_RECO_RATIONALE_FIELD = "電話推奨根拠"
 
 
 async def add_kiken_flags(record_id: str, existing: dict,
-                          labels: list[str]) -> int:
+                          labels: list[str]) -> int | None:
     """危険類型フラグへ複数値を追記する（mark_date_mismatch_flag の複数値
     一般形・H-4）。既存チェック（人の編集含む）は保持・既存在分は追加しない
     （冪等）。$revision CAS の read-modify-write・409 は最新再取得で収束
-    （≤_CAS_RETRIES）・収束不能=上書きせず要確認通知。追加した件数を返す。"""
+    （≤_CAS_RETRIES）・収束不能=上書きせず要確認通知。
+
+    戻り値（fix1[H4-02]: 「write 0 正常」と保存失敗を区別）:
+      int  = 追加した件数（0 = 追加対象なし＝正常）
+      None = CAS 収束不能（再試行超過・再取得失敗）＝保存失敗。要確認通知は
+             送信済み。呼び出し側は後段（通知・推奨度書込）に進まないこと"""
     want = [str(v or "").strip() for v in (labels or [])]
     want = [v for v in want if v]
     if not want:
@@ -433,7 +438,7 @@ async def add_kiken_flags(record_id: str, existing: dict,
                 break
             existing = latest
     await _cas_unresolved_alert(record_id, "危険類型フラグの追加")
-    return 0
+    return None
 
 
 async def set_phone_recommendation(record_id: str, existing: dict,

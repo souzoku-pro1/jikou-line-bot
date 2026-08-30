@@ -6,9 +6,12 @@
   （通知前クラッシュ等）は次のヒアリング受信時の**自己修復発火**
   （status=電話判断待ち かつ 電話推奨度が空）で拾う。
 - 冪等: App 40 `電話推奨度` の非空を冪等キーとする（永続正本から導出・
-  in-memory を持たない）。通知→書込の順（H-3 fix1[03] の queue 先行
-  at-least-once と同型: 書込失敗時は次回再発火＝未通知の沈黙を作らない。
-  重複通知は再発火時のみ・人が閉じる）。
+  in-memory を持たない）。fix1[H4-01/H4-02]: フラグ保存→通知→推奨度書込の
+  直列化・前段失敗で後段に進まない。冪等キーを閉じるのは**通知が実際に
+  届いた（notify=True）とき**だけ（管理者未設定・HTTP 失敗・スロットル拒否は
+  キー開放のまま自己修復発火で再試行）。通知成功→書込失敗→再発火→再通知の
+  at-least-once（H-3 fix1[03] の queue 先行と同型・未通知の沈黙を作らない・
+  重複通知は再発火時のみ・人が閉じる）は不変。
 - 判定（正本 §3.1 の 10 類型・ルール一次+Claude補助）:
   決定的ルールで判定できるものはレコード実値から、会話の文脈を要するもの
   （紛争気配・グレー記述等）は Claude 補助（tool use set_phone_recommendation・
@@ -387,7 +390,9 @@ async def run_phone_triage(user_id: str) -> bool:
 
     - 最新レコードを取り直してから判定（発火時点の据置レコードを使わない）
     - status=電話判断待ち 以外は作用 0（弁護士が先へ進めた案件を再判定しない）
-    - 冪等キー: 電話推奨度の非空（永続正本）。通知→書込の順の at-least-once
+    - 冪等キー: 電話推奨度の非空（永続正本）。fix1: フラグ保存→通知→
+      推奨度書込の直列化・前段失敗（フラグ収束不能/通知 False）で後段に
+      進まずキー開放のまま False＝自己修復発火で再試行
     - 例外は内部で握って False（ヒアリング応答を道連れにしない。書込前に
       落ちれば冪等キーが空のまま＝自己修復発火が拾う）
     """
@@ -411,15 +416,36 @@ async def run_phone_triage(user_id: str) -> bool:
             rationale.append("該当する危険類型はありませんでした"
                              "（機械的ルール+Claude補助）")
 
-        # 通知先行（fix1[03] と同型の at-least-once。冪等キーは書込側）
-        await notify.notify_admin_line(
-            _notification_text(recommendation, record_id, assist_failed),
-            throttle_key=f"houki_phone_triage:{record_id}",
-        )
-
+        # fix1[H4-02]: フラグ保存→通知→推奨度書込の直列化。前段失敗で後段に
+        # 進まない（冪等キー=推奨度が空のまま＝自己修復発火で再試行可能）。
+        # フラグ追記は冪等（既存在=正常 0）なので再発火で安全に再走する
         ordered = [f for f in FLAG_ORDER if f in flags]
         if ordered:
-            await houki_case_store.add_kiken_flags(record_id, record, ordered)
+            added = await houki_case_store.add_kiken_flags(
+                record_id, record, ordered)
+            if added is None:
+                # CAS 収束不能=保存失敗（要確認通知は store 側で送信済み）。
+                # 「追加対象なし=0」は正常で後段へ進む
+                logger.warning("[HOUKI_PHONE_TRIAGE] flag save unresolved "
+                               "(no notify, key left open)")
+                return False
+
+        # fix1[H4-01]: 冪等キー（電話推奨度）を閉じるのは通知が実際に届いた
+        # （True）ときだけ。False（管理者未設定・HTTP 失敗・スロットル拒否）は
+        # 推奨度を空のまま残し自己修復発火で再試行する。スロットル刻印は
+        # 成功時のみ（throttle_on_success_only・共用先の既定挙動は不変）＝
+        # 失敗が interval を占有しない。通知成功→書込失敗→再発火→再通知の
+        # at-least-once（重複通知は許容・人が閉じる）は従来どおり
+        sent = await notify.notify_admin_line(
+            _notification_text(recommendation, record_id, assist_failed),
+            throttle_key=f"houki_phone_triage:{record_id}",
+            throttle_on_success_only=True,
+        )
+        if not sent:
+            logger.info("[HOUKI_PHONE_TRIAGE] notify not delivered "
+                        "(key left open)")
+            return False
+
         await houki_case_store.set_phone_recommendation(
             record_id, record, recommendation, "\n".join(rationale))
         logger.info("[HOUKI_PHONE_TRIAGE] done record_id=%s flags=%s",

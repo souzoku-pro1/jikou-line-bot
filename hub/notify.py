@@ -173,7 +173,8 @@ def _log_throttled(throttle_key: str) -> None:
         logger.info("admin LINE notify throttled kind=unknown_kind")
 
 
-async def notify_admin_line(text: str, throttle_key: str = "") -> bool:
+async def notify_admin_line(text: str, throttle_key: str = "",
+                            throttle_on_success_only: bool = False) -> bool:
     """管理者に LINE Push で通知する。失敗しても本処理には影響させない。
     送信できたら True・スキップ/失敗/スロットルは False（P1-102 dead-man 検証用）。
 
@@ -181,6 +182,12 @@ async def notify_admin_line(text: str, throttle_key: str = "") -> bool:
       - 管理者 ID 未設定ならスキップ（警告ログのみ）
       - throttle_key 指定時は同一キーの通知を _NOTIFY_MIN_INTERVAL_SEC 秒に1回へ抑制
       - 本文は 4900 文字で切り詰め
+
+    throttle_on_success_only（SOUZOKU-HOUKI-H4-fix1[H4-01]・opt-in）:
+      True のときスロットル刻印を**送信成功時のみ**行う——送信失敗が interval
+      を占有して直後の再試行を機械的に拒否し続けない（通知成功を冪等キー
+      書込の条件にする houki 電話推奨度通知向け）。既定 False は従来どおり
+      試行時に刻印＝**共用先（時効側 caller）の挙動は不変**。
     """
     admin_id = get_admin_line_user_id()
     if not admin_id:
@@ -193,10 +200,15 @@ async def notify_admin_line(text: str, throttle_key: str = "") -> bool:
         if now - last < _NOTIFY_MIN_INTERVAL_SEC:
             _log_throttled(throttle_key)   # 種別のみ可視（key 内の ID は出さない）
             return False
-        _last_notify_at[throttle_key] = now
+        if not throttle_on_success_only:
+            _last_notify_at[throttle_key] = now
 
     # 業務通知は指示Botチャネルから（fail-closed・P1-102）
-    return await push_line_message(admin_id, text, token_env=business_token_env())
+    sent = await push_line_message(admin_id, text,
+                                   token_env=business_token_env())
+    if sent and throttle_key and throttle_on_success_only:
+        _last_notify_at[throttle_key] = time.monotonic()
+    return sent
 
 
 async def notify_attorney_approval(record: dict) -> None:

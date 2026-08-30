@@ -20,6 +20,7 @@
 
 import asyncio
 import datetime
+import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -30,6 +31,7 @@ from test_houki_hearing import (_FakeApp40, _HearingBase, _StoreBase,
 from houki_bot import hearing  # noqa: E402
 from hub import houki_case_store as store  # noqa: E402
 from hub import houki_phone_triage as tri  # noqa: E402
+from hub import notify as notify_mod  # noqa: E402
 
 TODAY = datetime.date(2026, 8, 30)
 
@@ -286,13 +288,16 @@ class TestClaudeAssist(unittest.TestCase):
 # ── run_phone_triage（発火・冪等・通知・書込） ───────────────────────────────────
 class _TriageBase(_StoreBase):
     UID = "U_houki_triage"
+    PATCH_NOTIFY = True     # fix1: 実 notify を使う派生クラスは False にする
 
     def setUp(self):
         super().setUp()
-        self.notify = AsyncMock(return_value=True)
-        self._np = patch.object(tri.notify, "notify_admin_line", self.notify)
-        self._np.start()
-        self.addCleanup(self._np.stop)
+        if self.PATCH_NOTIFY:
+            self.notify = AsyncMock(return_value=True)
+            self._np = patch.object(tri.notify, "notify_admin_line",
+                                    self.notify)
+            self._np.start()
+            self.addCleanup(self._np.stop)
         self.assist = AsyncMock(return_value=_assist_response([]))
         self._ap = patch.object(tri, "_call_assist_model", self.assist)
         self._ap.start()
@@ -428,6 +433,138 @@ class TestCasConvergence(_TriageBase):
             rid, stale, "強推奨", "後発")))
         self.assertEqual(self.fake.field(rid, "電話推奨度"), "推奨")
         self.assertEqual(self.fake.field(rid, "電話推奨根拠"), "先勝ち")
+
+
+# ── fix1[H4-01]: 通知失敗時に冪等キーを閉じない（通知 True のときだけ書込） ────────
+class TestH4Fix1NotifyGate(_TriageBase):
+    def test_notify_false_leaves_key_open_then_refire_completes(self):
+        rid = self.make_case()
+        self.notify.return_value = False
+        self.assertFalse(_run(tri.run_phone_triage(self.UID)))
+        self.assertIsNone(self.fake.field(rid, "電話推奨度"))
+        self.assertTrue(tri.triage_pending(_run(store.fetch_case(self.UID))))
+        # 復旧後の再発火（自己修復経路と同じ入口）で通知→書込まで完遂
+        self.notify.return_value = True
+        self.assertTrue(_run(tri.run_phone_triage(self.UID)))
+        self.assertEqual(self.notify.await_count, 2)
+        self.assertEqual(self.fake.field(rid, "電話推奨度"), "不要寄り")
+
+
+class TestH4Fix1RealNotifyPaths(_TriageBase):
+    """実 notify_admin_line を通す negative（管理者未設定/HTTP失敗/スロットル）。"""
+    PATCH_NOTIFY = False
+    UID = "U_houki_triage_rn"
+
+    def setUp(self):
+        super().setUp()
+        notify_mod._last_notify_at.clear()
+        self.addCleanup(notify_mod._last_notify_at.clear)
+
+    def test_no_admin_id_leaves_key_open(self):
+        rid = self.make_case()
+        with patch.object(notify_mod, "get_admin_line_user_id", lambda: ""):
+            self.assertFalse(_run(tri.run_phone_triage(self.UID)))
+        self.assertIsNone(self.fake.field(rid, "電話推奨度"))
+        self.assertTrue(tri.triage_pending(_run(store.fetch_case(self.UID))))
+
+    def test_push_failure_no_stamp_immediate_retry_succeeds(self):
+        # HTTP 失敗はスロットル刻印されない（成功時のみ刻印の opt-in）＝
+        # 直後の再発火が機械的 False にならず、そのまま成功→書込に到達
+        rid = self.make_case()
+        with patch.object(notify_mod, "get_admin_line_user_id",
+                          lambda: "U_admin"):
+            with patch.object(notify_mod, "push_line_message",
+                              AsyncMock(return_value=False)):
+                self.assertFalse(_run(tri.run_phone_triage(self.UID)))
+            self.assertIsNone(self.fake.field(rid, "電話推奨度"))
+            push = AsyncMock(return_value=True)
+            with patch.object(notify_mod, "push_line_message", push):
+                self.assertTrue(_run(tri.run_phone_triage(self.UID)))
+            push.assert_awaited_once()      # スロットルに阻まれていない
+        self.assertEqual(self.fake.field(rid, "電話推奨度"), "不要寄り")
+
+    def test_throttled_rejection_then_clears_and_completes(self):
+        rid = self.make_case()
+        key = f"houki_phone_triage:{rid}"
+        notify_mod._last_notify_at[key] = time.monotonic()   # 直前成功相当
+        with patch.object(notify_mod, "get_admin_line_user_id",
+                          lambda: "U_admin"), \
+             patch.object(notify_mod, "push_line_message",
+                          AsyncMock(return_value=True)):
+            self.assertFalse(_run(tri.run_phone_triage(self.UID)))
+            self.assertIsNone(self.fake.field(rid, "電話推奨度"))
+            self.assertTrue(
+                tri.triage_pending(_run(store.fetch_case(self.UID))))
+            # スロットル解消後の再発火で通知成功→書込まで到達
+            notify_mod._last_notify_at[key] = (
+                time.monotonic() - notify_mod._NOTIFY_MIN_INTERVAL_SEC - 1)
+            self.assertTrue(_run(tri.run_phone_triage(self.UID)))
+        self.assertEqual(self.fake.field(rid, "電話推奨度"), "不要寄り")
+
+    def test_default_throttle_behavior_unchanged_for_shared_callers(self):
+        # 共用先挙動の pin: 既定（opt-in なし）は従来どおり**試行時に刻印**＝
+        # 失敗直後の同一キーはスロットルされる（時効側 caller の挙動不変）
+        push = AsyncMock(return_value=False)
+        with patch.object(notify_mod, "get_admin_line_user_id",
+                          lambda: "U_admin"), \
+             patch.object(notify_mod, "push_line_message", push):
+            self.assertFalse(_run(notify_mod.notify_admin_line(
+                "x", throttle_key="shared_k")))
+            self.assertFalse(_run(notify_mod.notify_admin_line(
+                "x", throttle_key="shared_k")))
+        push.assert_awaited_once()          # 2 回目は throttle で送信試行なし
+
+
+# ── fix1[H4-02]: フラグ保存失敗と「write 0 正常」の区別・直列化 ───────────────────
+class TestH4Fix1FlagGate(_TriageBase):
+    def test_flag_unresolved_blocks_notify_and_write(self):
+        rid = self.make_case(財産処分有無="不明")
+        with patch.object(store, "add_kiken_flags",
+                          AsyncMock(return_value=None)):
+            self.assertFalse(_run(tri.run_phone_triage(self.UID)))
+        self.notify.assert_not_awaited()        # 通知 0 回
+        self.assertIsNone(self.fake.field(rid, "電話推奨度"))
+        self.assertTrue(tri.triage_pending(_run(store.fetch_case(self.UID))))
+        # 復旧後の再発火で保存→通知→書込まで完遂
+        self.assertTrue(_run(tri.run_phone_triage(self.UID)))
+        self.notify.assert_awaited_once()
+        self.assertEqual(self.fake.field(rid, "電話推奨度"), "強推奨")
+
+    def test_zero_add_normal_proceeds_to_notify_and_write(self):
+        # 追加対象なし（既に全フラグが立っている）＝正常 0 → 通知・書込に進む
+        rid = self.make_case()
+        self.fake.rows[rid]["危険類型フラグ"] = {"value": ["申告内容の矛盾"]}
+        self.assertTrue(_run(tri.run_phone_triage(self.UID)))
+        self.notify.assert_awaited_once()
+        self.assertEqual(self.fake.field(rid, "電話推奨度"), "強推奨")
+        self.assertEqual(self.fake.field(rid, "危険類型フラグ"),
+                         ["申告内容の矛盾"])
+
+
+class TestH4Fix1AddFlagsReturn(_TriageBase):
+    def test_add_kiken_flags_unresolved_returns_none(self):
+        # CAS 収束不能（409 が _CAS_RETRIES 回続く）→ None（要確認通知は維持）
+        rid = self.make_case()
+        existing = _run(store.fetch_case(self.UID))
+
+        async def _always_conflict(*a, **k):
+            raise store.kintone.KintoneConflict(409, "GAIA_CO02", "conflict")
+        with patch.object(store.kintone, "update_record", _always_conflict):
+            result = _run(store.add_kiken_flags(
+                rid, existing, [tri.FLAG_ASSET_CONTACT]))
+        self.assertIsNone(result)
+        self.notify.assert_awaited_once()       # H-3 確立の要確認通知は不変
+        self.assertIn("要確認", self.notify.await_args.args[0])
+
+    def test_add_kiken_flags_nothing_to_add_returns_zero(self):
+        rid = self.make_case()
+        self.fake.rows[rid]["危険類型フラグ"] = \
+            {"value": [tri.FLAG_ASSET_CONTACT]}
+        existing = _run(store.fetch_case(self.UID))
+        self.assertEqual(
+            _run(store.add_kiken_flags(rid, existing,
+                                       [tri.FLAG_ASSET_CONTACT])), 0)
+        self.notify.assert_not_awaited()
 
 
 # ── 発火点（hearing 配線） ─────────────────────────────────────────────────────
