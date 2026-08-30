@@ -582,10 +582,14 @@ class TestRouteBasisPolicy(unittest.TestCase):
     )
 
     def test_route_basis_closed_set(self):
-        self.assertEqual(set(cr.ROUTE_BASIS), {"customer", "hearing"})
+        # SOUZOKU-HOUKI-H3（票由来の pin 追随）: 相続放棄ヒアリング route
+        # houki_hearing（根拠集合=空）を閉集合へ追加。時効側 2 route は不変
+        self.assertEqual(set(cr.ROUTE_BASIS),
+                         {"customer", "hearing", "houki_hearing"})
         self.assertEqual(cr.ROUTE_BASIS["customer"],
                          frozenset(cr.FAQ_BACKED_PHRASES))
         self.assertEqual(cr.ROUTE_BASIS["hearing"], frozenset())
+        self.assertEqual(cr.ROUTE_BASIS["houki_hearing"], frozenset())
 
     def test_route_argument_required_and_unknown_is_fail_closed(self):
         with self.assertRaises(TypeError):
