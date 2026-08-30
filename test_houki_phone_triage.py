@@ -515,6 +515,88 @@ class TestH4Fix1RealNotifyPaths(_TriageBase):
         push.assert_awaited_once()          # 2 回目は throttle で送信試行なし
 
 
+# ── fix2[H4-fix1-01]: opt-in 経路の送信中予約（同一プロセス内排他） ────────────────
+class TestH4Fix2InFlightReservation(unittest.TestCase):
+    """throttle_on_success_only=True の並行二重送信防止（送信中予約）。"""
+    KEY = "houki_phone_triage:fx2"
+
+    def setUp(self):
+        notify_mod._last_notify_at.clear()
+        getattr(notify_mod, "_notify_in_flight", set()).clear()
+        self.addCleanup(notify_mod._last_notify_at.clear)
+        self.addCleanup(
+            lambda: getattr(notify_mod, "_notify_in_flight", set()).clear())
+        self._admin = patch.object(notify_mod, "get_admin_line_user_id",
+                                   lambda: "U_admin")
+        self._admin.start()
+        self.addCleanup(self._admin.stop)
+
+    def _notify(self, text="x"):
+        return notify_mod.notify_admin_line(
+            text, throttle_key=self.KEY, throttle_on_success_only=True)
+
+    def test_parallel_same_key_sends_once(self):
+        # 未刻印から 2 処理が interleave → push は 1 回だけ・後発は False
+        calls = []
+        gate = asyncio.Event()
+
+        async def _push(to, text, token_env=None):
+            calls.append(text)
+            await gate.wait()
+            return True
+
+        async def scenario():
+            with patch.object(notify_mod, "push_line_message", _push):
+                t1 = asyncio.ensure_future(self._notify("first"))
+                await asyncio.sleep(0)      # t1 が予約して送信待ちに入る
+                t2 = asyncio.ensure_future(self._notify("second"))
+                await asyncio.sleep(0)      # t2 に進入を試みさせる（予約済み
+                                            # なら送信せず即 False で完了する）
+                gate.set()
+                return await t1, await t2
+        r1, r2 = _run(scenario())
+        self.assertTrue(r1)
+        self.assertFalse(r2)
+        self.assertEqual(calls, ["first"])              # 二重送信なし
+        self.assertNotIn(self.KEY, notify_mod._notify_in_flight)
+        self.assertIn(self.KEY, notify_mod._last_notify_at)   # 成功刻印は確定
+
+    def test_failure_releases_reservation_then_retry_sends(self):
+        # 送信失敗 → 自予約を解除・直後の再試行が送信できる（interval 非占有）
+        push = AsyncMock(return_value=False)
+        with patch.object(notify_mod, "push_line_message", push):
+            self.assertFalse(_run(self._notify()))
+        self.assertNotIn(self.KEY, notify_mod._notify_in_flight)
+        push2 = AsyncMock(return_value=True)
+        with patch.object(notify_mod, "push_line_message", push2):
+            self.assertTrue(_run(self._notify()))
+        push2.assert_awaited_once()
+
+    def test_success_stamps_then_normal_throttle(self):
+        push = AsyncMock(return_value=True)
+        with patch.object(notify_mod, "push_line_message", push):
+            self.assertTrue(_run(self._notify()))
+            self.assertFalse(_run(self._notify()))      # 以後は通常スロットル
+        push.assert_awaited_once()
+        self.assertNotIn(self.KEY, notify_mod._notify_in_flight)
+
+    def test_failure_release_preserves_success_stamp(self):
+        # 解除の安全性: 失敗処理の予約解除は成功刻印（_last_notify_at）に
+        # 触れない——interval 経過済みの旧刻印がそのまま残る
+        old = time.monotonic() - notify_mod._NOTIFY_MIN_INTERVAL_SEC - 10
+        notify_mod._last_notify_at[self.KEY] = old
+        with patch.object(notify_mod, "push_line_message",
+                          AsyncMock(return_value=False)):
+            self.assertFalse(_run(self._notify()))
+        self.assertEqual(notify_mod._last_notify_at.get(self.KEY), old)
+        self.assertNotIn(self.KEY, notify_mod._notify_in_flight)
+        # その後の成功で刻印が更新される（別処理の成功を妨げない）
+        with patch.object(notify_mod, "push_line_message",
+                          AsyncMock(return_value=True)):
+            self.assertTrue(_run(self._notify()))
+        self.assertGreater(notify_mod._last_notify_at[self.KEY], old)
+
+
 # ── fix1[H4-02]: フラグ保存失敗と「write 0 正常」の区別・直列化 ───────────────────
 class TestH4Fix1FlagGate(_TriageBase):
     def test_flag_unresolved_blocks_notify_and_write(self):

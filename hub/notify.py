@@ -25,6 +25,13 @@ logger = logging.getLogger("hub.notify")
 # 管理者通知のスロットル（同種の連続障害で LINE を埋めないため・claude_gateway から移設）
 _NOTIFY_MIN_INTERVAL_SEC = 300
 _last_notify_at: dict[str, float] = {}
+# fix2[H4-fix1-01]: throttle_on_success_only 経路の**送信中予約**。従来の既定
+# 経路は送信前刻印が排他を兼ねるが、成功時のみ刻印の opt-in 経路は
+# 「未刻印確認→両方送信」の interleave で並行二重送信し得るため、送信中の
+# key を予約して後発を遮断する。本 module は lock を持たない単一イベント
+# ループ前提（実測: threading/asyncio.Lock 不使用）——予約の確認と設定は
+# await を挟まない同期区間で行う＝check-then-act は割り込まれない
+_notify_in_flight: set[str] = set()
 
 _PUSH_URL = "https://api.line.me/v2/bot/message/push"
 
@@ -194,20 +201,36 @@ async def notify_admin_line(text: str, throttle_key: str = "",
         logger.warning("admin LINE notify skipped (no admin id)")
         return False
 
+    reserved = False
     if throttle_key:
         now = time.monotonic()
         last = _last_notify_at.get(throttle_key, 0.0)
         if now - last < _NOTIFY_MIN_INTERVAL_SEC:
             _log_throttled(throttle_key)   # 種別のみ可視（key 内の ID は出さない）
             return False
-        if not throttle_on_success_only:
+        if throttle_on_success_only:
+            # fix2[H4-fix1-01]: スロットル確認と予約設定を同一同期区間で
+            # 行う（await なし=原子的）。予約済み key への後発は送信しない
+            if throttle_key in _notify_in_flight:
+                logger.info("admin LINE notify suppressed (same key in flight)")
+                return False
+            _notify_in_flight.add(throttle_key)
+            reserved = True
+        else:
             _last_notify_at[throttle_key] = now
 
     # 業務通知は指示Botチャネルから（fail-closed・P1-102）
-    sent = await push_line_message(admin_id, text,
-                                   token_env=business_token_env())
-    if sent and throttle_key and throttle_on_success_only:
-        _last_notify_at[throttle_key] = time.monotonic()
+    try:
+        sent = await push_line_message(admin_id, text,
+                                       token_env=business_token_env())
+        if sent and throttle_key and throttle_on_success_only:
+            # 成功=予約を成功時刻の刻印へ確定（以後は通常スロットルが効く）
+            _last_notify_at[throttle_key] = time.monotonic()
+    finally:
+        if reserved:
+            # 自処理が設定した予約のみ解除（予約は単一保持者＝他処理の予約は
+            # 共存し得ない。成功刻印 _last_notify_at には触れない）
+            _notify_in_flight.discard(throttle_key)
     return sent
 
 
