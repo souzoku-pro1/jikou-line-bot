@@ -347,6 +347,13 @@ class TestImageEvent(_AsyncBase):
     def setUp(self):
         super().setUp()
         self.store = _FakeChatlog()
+        # IMAGE-INTAKE-1: 束ね待ちの短縮+予約の初期化（挙動検査は不変）
+        from hub import image_intake as _ii
+        _ii._pending.clear()
+        self.addCleanup(_ii._pending.clear)
+        _p = patch.object(_ii, "DEBOUNCE_SEC", 0)
+        _p.start()
+        self.addCleanup(_p.stop)
 
     def _patches(self, record=None):
         return (
@@ -354,7 +361,7 @@ class TestImageEvent(_AsyncBase):
                          AsyncMock(return_value=False)),
             patch.object(main, "get_app21_record",
                          AsyncMock(return_value=record)),
-            patch.object(main, "_line_reply_with_fallback", AsyncMock()),
+            patch.object(main.hub_line_channel, "push_text", AsyncMock()),
             patch.object(main, "save_to_chatlog", AsyncMock()),
             patch("hub.notify.notify_business", AsyncMock(return_value=True)),
             patch.object(main, "ATTORNEY_LINE_USER_ID", "Uattorney"),

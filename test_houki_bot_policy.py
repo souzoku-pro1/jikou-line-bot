@@ -52,8 +52,11 @@ ALLOWED_FROM_IMPORTS = {
     # H4（票由来）: houki_phone_triage（電話推奨度判定の高位入口
     # run_phone_triage / triage_pending のみ使用。kintone/LINE への作用は
     # hub 側 module 内に閉じる）を追加
+    # IMAGE-INTAKE-1（票由来）: image_intake（画像受領の束ね返信。送信は
+    # hub 側 module 内の push_text に閉じる——houki_bot 内には httpx/送信名を
+    # 置かない）を追加
     "hub": frozenset({"notify", "houki_case_store", "reply_sanitizer",
-                      "houki_phone_triage"}),
+                      "houki_phone_triage", "image_intake"}),
     # H3: 送信は reply_with_push_fallback のみ解禁（呼び出し規則で
     # HOUKI_CHANNEL 限定・push_text は禁止のまま）
     "hub.line_channel": frozenset({"HOUKI_CHANNEL", "verify_line_signature",
@@ -247,6 +250,15 @@ class TestCheckerNegatives(unittest.TestCase):
                 v = self._router_plus(stmt + "\n")
                 self.assertTrue(v, stmt)
 
+    def test_image_intake_bypass_forms_are_red(self):
+        # IMAGE-INTAKE-1 の閉集合更新の negative: module 属性経由のみ許可
+        for stmt in ("from hub.image_intake import handle_houki_image",
+                     "from hub import image_intake as im",
+                     "import hub.image_intake"):
+            with self.subTest(stmt=stmt):
+                v = self._router_plus(stmt + "\n")
+                self.assertTrue(v, stmt)
+
     def test_chat_responder_and_kintone_are_red(self):
         for stmt in ("from chat_responder import send_line_push",
                      "from hub import kintone",
@@ -292,8 +304,8 @@ class TestClosedSetsPinned(unittest.TestCase):
                           "houki_bot.hearing"})
         self.assertEqual(ALLOWED_FROM_IMPORTS["hub"],
                          frozenset({"notify", "houki_case_store",
-                                    "reply_sanitizer",
-                                    "houki_phone_triage"}))   # H4 票由来
+                                    "reply_sanitizer", "houki_phone_triage",
+                                    "image_intake"}))   # H4/IMAGE-INTAKE-1 票由来
         self.assertEqual(ALLOWED_FROM_IMPORTS["hub.line_channel"],
                          frozenset({"HOUKI_CHANNEL", "verify_line_signature",
                                     "houki_channel_disabled_reason",

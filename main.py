@@ -193,6 +193,7 @@ async def health():
 LINE_CHANNEL_SECRET = os.environ["LINE_CHANNEL_SECRET"]
 LINE_CHANNEL_ACCESS_TOKEN = os.environ["LINE_CHANNEL_ACCESS_TOKEN"]
 from hub import line_channel as hub_line_channel  # noqa: E402
+from hub import image_intake  # noqa: E402
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 KINTONE_SUBDOMAIN = os.environ["KINTONE_SUBDOMAIN"]
 KINTONE_APP_ID = os.environ["KINTONE_APP_ID"]
@@ -1040,8 +1041,18 @@ async def _process_line_image_event(reply_token: str, user_id: str,
                     "【人対応中】お客様から書類のお写真が届きました。"
                     "LINE アプリでご確認ください")
             return
-        await _line_reply_with_fallback(reply_token, user_id,
-                                        IMAGE_RECEIPT_REPLY)
+        # IMAGE-INTAKE-1: 複数枚まとめ受領返信——デバウンス待ち+App 28 照会で
+        # 代表 1 タスクだけが push する（reply token は待ち合わせで失効する
+        # ため不使用。縮退時=個別返信で無返信は作らない）。譲った側は
+        # 記録済み（マーカー）のまま無言
+        if not await image_intake.debounce_and_elect(
+                "jikou", user_id, my_id,
+                lambda: image_intake.latest_marker_row_id(user_id)):
+            logger.info("[IMAGE] bundled (superseded) user_id=%s",
+                        emit(user_id, "external_ref", "log", "operator"))
+            return
+        await hub_line_channel.push_text(hub_line_channel.JIKOU_CHANNEL,
+                                         user_id, IMAGE_RECEIPT_REPLY)
         await save_to_chatlog(user_id, "assistant", IMAGE_RECEIPT_REPLY,
                               "画像受領", "yes")
         # ヒアリング中のメモリ履歴にも受領を残す（既知項目台帳の

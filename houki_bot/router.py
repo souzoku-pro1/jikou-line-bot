@@ -29,6 +29,7 @@ import logging
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 
+from hub import image_intake
 from hub import notify
 from hub.line_channel import (HOUKI_CHANNEL, houki_channel_disabled_reason,
                               verify_line_signature)
@@ -125,4 +126,12 @@ async def houki_webhook(request: Request, background_tasks: BackgroundTasks):
                 (event.get("message") or {}).get("text", ""))
             continue
         background_tasks.add_task(_record_inbound, user_id, kind)
+        if kind == _KIND_IMAGE:
+            # IMAGE-INTAKE-1: 受領返信（束ね方式）を追加。既存の管理者通知
+            # （_record_inbound・300 秒スロットル）は維持。event id 不明は
+            # 冪等キーが作れないため受領返信なし（通知のみ）
+            image_event_id = event.get("webhookEventId") or (
+                (event.get("message") or {}).get("id", ""))
+            background_tasks.add_task(
+                image_intake.handle_houki_image, user_id, image_event_id)
     return {"status": "ok"}
