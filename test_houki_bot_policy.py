@@ -49,7 +49,11 @@ ALLOWED_FROM_IMPORTS = {
                           "Request"}),
     # H3: houki_case_store（App 40 アクセス層・高位関数のみ）・reply_sanitizer
     # （第 2 世代ガード機構）を追加
-    "hub": frozenset({"notify", "houki_case_store", "reply_sanitizer"}),
+    # H4（票由来）: houki_phone_triage（電話推奨度判定の高位入口
+    # run_phone_triage / triage_pending のみ使用。kintone/LINE への作用は
+    # hub 側 module 内に閉じる）を追加
+    "hub": frozenset({"notify", "houki_case_store", "reply_sanitizer",
+                      "houki_phone_triage"}),
     # H3: 送信は reply_with_push_fallback のみ解禁（呼び出し規則で
     # HOUKI_CHANNEL 限定・push_text は禁止のまま）
     "hub.line_channel": frozenset({"HOUKI_CHANNEL", "verify_line_signature",
@@ -233,6 +237,16 @@ class TestCheckerNegatives(unittest.TestCase):
             "    await reply_with_push_fallback(HOUKI_CHANNEL, rt, uid, t)\n")
         self.assertEqual([x for x in v if "第1引数" in x], [])
 
+    def test_houki_phone_triage_bypass_forms_are_red(self):
+        # H4 の閉集合更新の negative: 許可は `from hub import
+        # houki_phone_triage`（module 属性経由）のみ。名前 import・alias は red
+        for stmt in ("from hub.houki_phone_triage import run_phone_triage",
+                     "from hub import houki_phone_triage as t",
+                     "import hub.houki_phone_triage"):
+            with self.subTest(stmt=stmt):
+                v = self._router_plus(stmt + "\n")
+                self.assertTrue(v, stmt)
+
     def test_chat_responder_and_kintone_are_red(self):
         for stmt in ("from chat_responder import send_line_push",
                      "from hub import kintone",
@@ -278,7 +292,8 @@ class TestClosedSetsPinned(unittest.TestCase):
                           "houki_bot.hearing"})
         self.assertEqual(ALLOWED_FROM_IMPORTS["hub"],
                          frozenset({"notify", "houki_case_store",
-                                    "reply_sanitizer"}))
+                                    "reply_sanitizer",
+                                    "houki_phone_triage"}))   # H4 票由来
         self.assertEqual(ALLOWED_FROM_IMPORTS["hub.line_channel"],
                          frozenset({"HOUKI_CHANNEL", "verify_line_signature",
                                     "houki_channel_disabled_reason",

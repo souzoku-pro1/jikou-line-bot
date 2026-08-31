@@ -25,6 +25,7 @@ Claude 全断（ClaudeUnavailableError）は確認中定型+承認キュー+ロ�
 import logging
 
 from hub import houki_case_store
+from hub import houki_phone_triage
 from hub import reply_sanitizer
 from hub.houki_profile import (
     HEARING_TEMPLATE_BLOCKS_HOUKI,
@@ -136,6 +137,10 @@ async def _apply_record_hearing(user_id: str, record: dict | None,
         promoted = await houki_case_store.promote_status_to_phone_triage(
             str((latest.get("$id") or {}).get("value") or ""), latest)
         if promoted:
+            # H-4: 電話推奨度判定は**遷移 CAS 勝者のみ**が実行（発火の一意性。
+            # 判定内部は 電話推奨度の非空 を冪等キーに再発火安全・例外は
+            # 内部で握る=顧客応答を道連れにしない）
+            await houki_phone_triage.run_phone_triage(user_id)
             result += " 必須項目が揃ったため案件を弁護士の判断待ちに進めました。"
     return result, latest
 
@@ -186,6 +191,12 @@ async def handle_houki_hearing(reply_token: str, user_id: str,
     del history[:-_MAX_HISTORY_TURNS * 2]
 
     record = await houki_case_store.fetch_case(user_id)
+
+    # H-4 自己修復発火: 遷移済み（電話判断待ち）なのに判定未了（電話推奨度が
+    # 空）＝通知前クラッシュ等の取りこぼしを次の受信で拾う（冪等キーは判定側）
+    if record is not None and houki_phone_triage.triage_pending(record):
+        await houki_phone_triage.run_phone_triage(user_id)
+        record = await houki_case_store.fetch_case(user_id)
 
     try:
         reply_text = await _converse(user_id, record, history)
