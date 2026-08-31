@@ -180,8 +180,7 @@ class TestCanonicalPin(unittest.TestCase):
         return tmp.name, hashlib.sha256(data).hexdigest()
 
     def test_canary_committed_template_matches_canonical(self):
-        doc = Document(hs.TEMPLATE_PATH)
-        self.assertEqual(hs.canonical_sha256(doc),
+        self.assertEqual(hs.canonical_sha256(hs.TEMPLATE_PATH),
                          hs.TEMPLATE_CANONICAL_SHA256)
 
     def test_canonical_is_zip_timestamp_independent(self):
@@ -191,8 +190,7 @@ class TestCanonicalPin(unittest.TestCase):
         doc = Document(hs.TEMPLATE_PATH)
         buf = _io.BytesIO()
         doc.save(buf)
-        again = Document(_io.BytesIO(buf.getvalue()))
-        self.assertEqual(hs.canonical_sha256(again),
+        self.assertEqual(hs.canonical_sha256(buf.getvalue()),
                          hs.TEMPLATE_CANONICAL_SHA256)
 
     def test_fixed_text_one_char_change_detected_despite_sha_update(self):
@@ -247,6 +245,99 @@ class TestCanonicalPin(unittest.TestCase):
             fill = dict(hs.PLACEHOLDER_DEFAULTS)
             with self.assertRaises(hs.ShinjutsuIntegrityError):
                 hs.expected_paragraph_texts(fill, {})
+
+
+# ── fix2[H7C-fix1-01]: 表示書式・全パートを含む canonical（見た目改変の遮断） ──────
+class TestCanonicalDisplayAttrs(unittest.TestCase):
+    """テキスト同一のまま表示を壊す改変（白文字・vanish・フォント・罫線/
+    セル書式・styles パート）が、バイナリ SHA 追随でも canonical で拒否
+    されることの固定。"""
+
+    def _reject(self, path, sha):
+        with patch.object(hs, "TEMPLATE_PATH", path), \
+             patch.object(hs, "TEMPLATE_SHA256", sha):
+            with self.assertRaises(hs.ShinjutsuIntegrityError):
+                hs.verify_template_integrity()
+
+    def _tampered_doc(self, mutate):
+        import io as _io
+        import tempfile
+        doc = Document(hs.TEMPLATE_PATH)
+        mutate(doc)
+        buf = _io.BytesIO()
+        doc.save(buf)
+        data = buf.getvalue()
+        tmp = tempfile.NamedTemporaryFile(suffix=".docx", delete=False)
+        tmp.write(data)
+        tmp.close()
+        self.addCleanup(os.unlink, tmp.name)
+        return tmp.name, hashlib.sha256(data).hexdigest()
+
+    def _tampered_part(self, part_name, mutate_text):
+        import io as _io
+        import tempfile
+        import zipfile
+        src = zipfile.ZipFile(hs.TEMPLATE_PATH)
+        buf = _io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as out:
+            for info in src.infolist():
+                data = src.read(info.filename)
+                if info.filename == part_name:
+                    data = mutate_text(data.decode("utf-8")).encode("utf-8")
+                out.writestr(info, data)
+        data = buf.getvalue()
+        tmp = tempfile.NamedTemporaryFile(suffix=".docx", delete=False)
+        tmp.write(data)
+        tmp.close()
+        self.addCleanup(os.unlink, tmp.name)
+        return tmp.name, hashlib.sha256(data).hexdigest()
+
+    def _shushi_run(self, doc):
+        t5 = doc.tables[5]
+        run = _Cell(t5.rows[1]._tr.tc_lst[0], t5).paragraphs[1].runs[0]
+        assert "相　続　の　放　棄" in run.text
+        return run
+
+    def test_white_color_attack_rejected(self):
+        from docx.shared import RGBColor
+
+        def mutate(doc):
+            self._shushi_run(doc).font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
+        self._reject(*self._tampered_doc(mutate))
+
+    def test_vanish_attack_rejected(self):
+        def mutate(doc):
+            self._shushi_run(doc).font.hidden = True
+        self._reject(*self._tampered_doc(mutate))
+
+    def test_rfonts_change_rejected(self):
+        def mutate(doc):
+            self._shushi_run(doc).font.name = "Arial"
+        self._reject(*self._tampered_doc(mutate))
+
+    def test_cell_format_change_rejected(self):
+        from docx.oxml.ns import qn
+
+        def mutate(doc):
+            t5 = doc.tables[5]
+            tc = t5.rows[1]._tr.tc_lst[0]
+            tc_pr = tc.get_or_add_tcPr()
+            shd = tc_pr.makeelement(qn("w:shd"), {})
+            shd.set(qn("w:val"), "clear")
+            shd.set(qn("w:fill"), "000000")
+            tc_pr.append(shd)
+        self._reject(*self._tampered_doc(mutate))
+
+    def test_styles_part_tamper_rejected(self):
+        def mutate(text):
+            assert "明朝" in text
+            return text.replace("明朝", "ゴシック", 1)
+        self._reject(*self._tampered_part("word/styles.xml", mutate))
+
+    def test_theme_part_tamper_rejected(self):
+        def mutate(text):
+            return text.replace("<a:theme", "<a:theme foo=\"1\"", 1)
+        self._reject(*self._tampered_part("word/theme/theme1.xml", mutate))
 
 
 # ── 生成・凍結・丸数字 ─────────────────────────────────────────────────────────

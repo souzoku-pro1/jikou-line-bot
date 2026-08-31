@@ -304,7 +304,7 @@ def main() -> None:
 
     # fix1[H7C-01]: 生成物の canonical を pin 済み定数と照合（不一致=exit 1。
     # 意図的更新の手順は docstring 参照）
-    canon = canonical_sha256(Document(str(OUT)))
+    canon = canonical_sha256(str(OUT))
     print("CANONICAL_SHA256 =", emit(canon, "record_id", "log", "operator"))
     if canon != TEMPLATE_CANONICAL_SHA256:
         die("生成物の canonical が pin（hub/houki_shinjutsu."

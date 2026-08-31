@@ -45,15 +45,16 @@ TEMPLATE_PATH = "docx_templates/houki/相続放棄申述書.docx"
 TEMPLATE_SHA256 = (
     "a6bbc4d12da1699adff39daf0612e3b24a80ee81061a90e826b254a69d996c46")
 # fix1[H7C-01]: 正本性の防壁=正規化済み内容の pin（収載スクリプト由来の独立
-# 定数・zip タイムスタンプ非依存）。canonical manifest は全段落テキスト全量+
-# run 分割（プレースホルダの位置・個数を含む）+rPr 要点（fitText/sz/u）を
-# 決定的に直列化した SHA-256——不動文字の 1 文字改変・プレースホルダの増減・
-# 位置替え・ラベル書式の変更はいずれか（多くは複数）の行を変え、必ず検出
-# される。「テンプレ改変+TEMPLATE_SHA256 追随」の同時変更はこの定数を
-# 変えない限り通らず、この定数の変更は票由来のレビュー対象になる。
+# 定数・zip タイムスタンプ非依存）。fix2[H7C-fix1-01]: canonical は
+# 「非本質属性のみ除外した正規化 XML のパート別 SHA を列挙した JSON manifest」
+# の SHA-256——不動文字の 1 文字改変・プレースホルダの増減/位置替えに加え、
+# 表示書式（色・vanish・フォント・太字/斜体・罫線・網掛け・段落/表/セル
+# 書式）や styles/theme 等の関連パートの改変も必ず検出される。
+# 「テンプレ改変+TEMPLATE_SHA256 追随」の同時変更はこの定数を変えない限り
+# 通らず、この定数の変更は票由来のレビュー対象になる。
 # 意図的更新の手順は scripts/make_shinjutsu_template.py の docstring を参照
 TEMPLATE_CANONICAL_SHA256 = (
-    "c16dfb76e9d7e4be3bd843d3877df209a222a816258f9b04df85d9b8f9e4f88f")
+    "a2da8826e1e1b769b1ccfbd3b9b49d933560186de31dadfecb5e78d80553fc1a")
 
 _FW = "　"
 _JST = datetime.timezone(datetime.timedelta(hours=9))
@@ -354,34 +355,74 @@ def _walk_paragraphs(doc):
                 yield from _Cell(tc, tb).paragraphs
 
 
-def canonical_manifest_text(doc) -> str:
-    """テンプレ内容の決定的な直列化（fix1[H7C-01]・zip タイムスタンプ非依存）。
+# fix2[H7C-fix1-01]: canonical は「許可リスト採録」でなく「非本質属性のみ
+# 除外した正規化 XML」——表示に影響し得る属性・要素（rFonts/color/vanish/
+# b/i/bdr/shd/spacing/position/w/szCs・pPr/tblPr/tcPr/trPr・罫線 等）は
+# 除外方式により**自動的に全て**検査対象になる。
+#
+# 除外属性の閉集合（表示に影響しないことが明確なもののみ）:
+# - w:rsid*（rsidR/rsidRPr/rsidRDefault/rsidP/rsidDel/rsidTr/rsidSect）:
+#   Word の編集セッション追跡 ID（差分マージ用のメタデータ・レンダリング
+#   には一切使われない）
+# - w14:paraId / w14:textId: 段落の永続識別子（コメント・変更履歴の紐付け
+#   用 ID・表示に不使用）
+_CANONICAL_EXCLUDED_ATTR_LOCALS = frozenset({
+    "rsidR", "rsidRPr", "rsidRDefault", "rsidP", "rsidDel", "rsidTr",
+    "rsidSect", "paraId", "textId",
+})
 
-    粒度: 段落ごとに (a) 段落テキスト全量、(b) 各 run のテキスト（＝
-    プレースホルダの個数・位置・run 分割）、(c) rPr 要点（fitText の有無・
-    sz・下線）。不動文字の 1 文字改変は (a)(b) を、プレースホルダの増減・
-    位置替えは (b) を、ラベル書式（均等割り付け等）の変更は (c) を変える。"""
-    lines = []
-    for i, p in enumerate(_walk_paragraphs(doc)):
-        lines.append(f"P{i}\t{p.text}")
-        for j, r in enumerate(p.runs):
-            rpr = r._r.find(_W_NS + "rPr")
-            fit = sz = und = "-"
-            if rpr is not None:
-                if rpr.find(_W_NS + "fitText") is not None:
-                    fit = "fit"
-                sz_el = rpr.find(_W_NS + "sz")
-                if sz_el is not None:
-                    sz = sz_el.get(_W_NS + "val") or "-"
-                if rpr.find(_W_NS + "u") is not None:
-                    und = "u"
-            lines.append(f"R{i}.{j}\t{fit}\t{sz}\t{und}\t{r.text}")
-    return "\n".join(lines)
+# canonical 対象パート: zip 内の全 XML/rels（下記除外を除く）。
+# 除外パートの閉集合（外観に影響しない根拠）:
+# - docProps/core.xml: 文書メタデータ（作成者・更新日時等）。本文の
+#   レンダリングに不使用で、保存日時を含み決定性も持たない
+# - docProps/app.xml: アプリメタデータ（版・統計値）。同上
+_CANONICAL_EXCLUDED_PARTS = frozenset({
+    "docProps/core.xml", "docProps/app.xml",
+})
 
 
-def canonical_sha256(doc) -> str:
+def _normalized_part_xml(data: bytes) -> str:
+    """1 パートの正規化: 除外属性の除去 → C14N 正規化（属性順・空白等の
+    直列化差を吸収した決定形）。"""
+    import xml.etree.ElementTree as _ET
+    root = _ET.fromstring(data)
+    for el in root.iter():
+        for attr in list(el.attrib):
+            local = attr.rsplit("}", 1)[-1]
+            if local in _CANONICAL_EXCLUDED_ATTR_LOCALS:
+                del el.attrib[attr]
+    return _ET.canonicalize(_ET.tostring(root, encoding="unicode"))
+
+
+def canonical_manifest_text(source) -> str:
+    """テンプレ内容の決定的な直列化（fix2・zip タイムスタンプ非依存）。
+
+    source: docx のファイルパス（str/PathLike）または bytes。
+    形式: パート名→正規化 XML の SHA-256 を列挙した JSON（sort_keys・
+    区切り文字衝突のない衝突不能な形式。どのパートが変わったかも特定できる）。"""
+    import zipfile
+    if isinstance(source, (bytes, bytearray)):
+        zf = zipfile.ZipFile(io.BytesIO(bytes(source)))
+    else:
+        zf = zipfile.ZipFile(str(source))
+    parts = {}
+    for info in zf.infolist():
+        name = info.filename
+        if name in _CANONICAL_EXCLUDED_PARTS:
+            continue
+        if not (name.endswith(".xml") or name.endswith(".rels")):
+            continue
+        parts[name] = hashlib.sha256(
+            _normalized_part_xml(zf.read(name)).encode("utf-8")).hexdigest()
+    import json
+    return json.dumps({"version": 2, "parts": parts},
+                      ensure_ascii=False, sort_keys=True,
+                      separators=(",", ":"))
+
+
+def canonical_sha256(source) -> str:
     return hashlib.sha256(
-        canonical_manifest_text(doc).encode("utf-8")).hexdigest()
+        canonical_manifest_text(source).encode("utf-8")).hexdigest()
 
 
 def verify_template_integrity() -> None:
@@ -389,7 +430,7 @@ def verify_template_integrity() -> None:
     data = open(TEMPLATE_PATH, "rb").read()
     if hashlib.sha256(data).hexdigest() != TEMPLATE_SHA256:
         raise ShinjutsuIntegrityError("template hash mismatch")
-    if canonical_sha256(Document(TEMPLATE_PATH)) != TEMPLATE_CANONICAL_SHA256:
+    if canonical_sha256(data) != TEMPLATE_CANONICAL_SHA256:
         raise ShinjutsuIntegrityError("template canonical mismatch")
 
 
@@ -425,13 +466,13 @@ def expected_paragraph_texts(fill: dict, circles: dict) -> list[str]:
     """凍結検証の期待列: テンプレ全段落（本文+テーブルセル）へ同一の差し込み+
     sanctioned substitution（許可グループの許可数字のみ丸数字化）を適用。
     それ以外の本文はテンプレ逐語のまま＝完全一致検査で凍結を保証する。"""
-    tdoc = Document(TEMPLATE_PATH)
     # fix1[H7C-01]: 期待列の基準は canonical 定数に錨づける——テンプレが
     # canonical pin と一致することを確認してから導出する（コミット物からの
     # 自己生成に正本性を委ねない。バイナリ SHA を追随更新する同時改変は
     # ここで拒否される）
-    if canonical_sha256(tdoc) != TEMPLATE_CANONICAL_SHA256:
+    if canonical_sha256(TEMPLATE_PATH) != TEMPLATE_CANONICAL_SHA256:
         raise ShinjutsuIntegrityError("template canonical mismatch")
+    tdoc = Document(TEMPLATE_PATH)
     # 期待列は「canonical 検証済みテンプレ+承認済み変換（丸数字→差し込みの
     # 同順）」からのみ導出される（sanctioned substitution 以外の差分は
     # 完全一致検査で検出される）
