@@ -175,7 +175,11 @@ async def send_receipt_and_close(channel_name: str, channel,
       None  = 送信不要（claim を他タスクが保持中／永続再確認で返信済み・
               マーカーなし）＝呼び出し側は沈黙してよい（失敗ではない）
       False = 送信失敗（非 2xx・通信例外・受領済み行の保存失敗）＝未返信の
-              まま（heal が回収）。要確認通知は呼び出し側の責務
+              まま（heal が回収）。fix3: 要確認通知は**本関数内で発火済み**
+              （呼び出し側は通知しない=二重通知防止）。None は「閉鎖済み」と
+              「他タスクが claim 保持中」を区別しない——どちらも呼び出し側の
+              正しい動作は沈黙であり、失敗時の通知保証は保持者側の False
+              経路が担うため区別は不要
 
     fix2[fix1-01]: 送信 claim——確認→取得は await を挟まない同期区間で行い、
     push 前に単一保持者へ閉じる（代表経路と heal 経路の共有関門）。claim は
@@ -200,10 +204,12 @@ async def send_receipt_and_close(channel_name: str, channel,
         except Exception:
             logger.error("[IMAGE_INTAKE] receipt push transport error "
                          "(stays unreplied)")
+            await _notify_send_failure(channel_name, user_id)
             return False
         if sent is not True:
             logger.error("[IMAGE_INTAKE] receipt push rejected "
                          "(stays unreplied)")
+            await _notify_send_failure(channel_name, user_id)
             return False
         try:
             await kintone.create_record(_APP_CHATLOG, {
@@ -218,6 +224,7 @@ async def send_receipt_and_close(channel_name: str, channel,
             # （at-least-once・重複受領文は許容）
             logger.error("[IMAGE_INTAKE] receipt record save failed "
                          "(will re-fire)")
+            await _notify_send_failure(channel_name, user_id)
             return False
         return True
     finally:
@@ -256,6 +263,40 @@ async def heal_unreplied(channel_name: str, channel, user_id: str) -> bool:
 
 
 # ── 相続放棄チャネルの画像受信（受領返信の新設・IMAGE-INTAKE-1） ─────────────────
+async def _notify_send_failure(channel_name: str, user_id: str) -> None:
+    """fix3[fix2-01]: 受領返信の失敗通知を**関門（send_receipt_and_close）内**へ
+    一元化——保持者が代表でも heal でも、False 確定のその場で必ず 1 回発火する
+    （claim 競合で後発が None 終了しても「通知 0 回」にならない）。
+
+    重複制御（実装判断）:
+    - houki: notify_admin_line + throttle_key（userId 別・300 秒）+
+      **throttle_on_success_only=True**（H4-fix1 整合: 通知自体の送信失敗が
+      interval を占有して「1 回も出ない」状態を作らない。成功後 300 秒は
+      同一ユーザーの連続失敗を集約）
+    - jikou: notify_business（弁護士宛の既存流儀）にはスロットル機構がない
+      ため都度通知（失敗は代表 1 回/束+heal は顧客イベント時のみ=低頻度）
+    通知の失敗は握る（本体の未返信状態は App 28 に残り heal が回収）。"""
+    try:
+        if channel_name == "houki":
+            await notify.notify_admin_line(
+                "【相続放棄・要確認】書類写真の受領返信の送信に失敗しました。"
+                "LINE アプリで受信をご確認ください。\n"
+                f"userId: {user_id[:10]}...",
+                throttle_key=f"houki_image_failure:{user_id}",
+                throttle_on_success_only=True,
+            )
+        else:
+            attorney = os.environ.get("ATTORNEY_LINE_USER_ID", "")
+            if attorney:
+                await notify.notify_business(
+                    attorney,
+                    "【要確認】書類写真の受領返信の送信に失敗しました。"
+                    "LINE アプリで受信を確認し、必要なら手動でご返信"
+                    "ください")
+    except Exception:
+        logger.error("[IMAGE_INTAKE] failure notify also failed (fixed text)")
+
+
 async def _alert_houki_image_failure(user_id: str, what: str) -> None:
     """要確認通知（固定文言+userId 先頭のみ・PII 非搭載）。"""
     await notify.notify_admin_line(
@@ -341,8 +382,8 @@ async def handle_houki_image(user_id: str, event_id: str) -> None:
         logger.info("[IMAGE_INTAKE] receipt not needed (claimed or closed)")
         return
     if result is not True:
-        # fix1[03]: 未返信のまま（自己修復が回収）+代表経路の失敗は要確認通知
-        await _alert_houki_image_failure(user_id, "受領返信の送信")
+        # fix1[03]: 未返信のまま（自己修復が回収）。要確認通知は fix3 で
+        # 関門内に一元化済み（ここでは通知しない=二重通知防止）
         return
     logger.info("[IMAGE_INTAKE] houki receipt sent userId=%s...",
                 emit(user_id[:10], "record_id", "log", "operator"))

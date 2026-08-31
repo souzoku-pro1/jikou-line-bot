@@ -1068,7 +1068,8 @@ async def _process_line_image_event(reply_token: str, user_id: str,
         if _receipt_result is None:
             return
         if _receipt_result is not True:
-            await _notify_image_failure()
+            # fix3: 要確認通知は image_intake の関門内に一元化済み
+            # （二重通知防止・_notify_image_failure は他の失敗経路用に残置）
             return
         # ヒアリング中のメモリ履歴にも受領を残す（既知項目台帳の
         # 「書類写真: 受領済み」の源になる）

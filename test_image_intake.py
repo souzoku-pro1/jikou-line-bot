@@ -400,6 +400,8 @@ class TestJikouBundledFlow(_Base):
             patch.object(ii, "push_text", AsyncMock(return_value=True)),
             patch("hub.notify.notify_business", AsyncMock(return_value=True)),
             patch.object(main, "ATTORNEY_LINE_USER_ID", "Uattorney"),
+            # fix3: 関門内の jikou 失敗通知は env から弁護士 ID を読む
+            patch.dict(os.environ, {"ATTORNEY_LINE_USER_ID": "Uattorney"}),
         ]
 
     def test_three_images_one_push_three_markers(self):
@@ -412,7 +414,7 @@ class TestJikouBundledFlow(_Base):
                                                         "ev2"), 0.005),
                 _delayed(main._process_line_image_event("t3", self.USER,
                                                         "ev3"), 0.01))
-        with ps[0], ps[1], ps[2] as push_m, ps[3] as notify, ps[4]:
+        with ps[0], ps[1], ps[2] as push_m, ps[3] as notify, ps[4], ps[5]:
             _run(scenario())
         push_m.assert_awaited_once()
         self.assertEqual(push_m.await_args.args[2], cr.IMAGE_RECEIPT_REPLY)
@@ -426,7 +428,7 @@ class TestJikouBundledFlow(_Base):
         with ps[0], ps[1], \
                 patch.object(ii, "push_text",
                              AsyncMock(return_value=False)), \
-                ps[3] as notify, ps[4]:
+                ps[3] as notify, ps[4], ps[5]:
             _run(main._process_line_image_event("t1", self.USER, "ev1"))
         self.assertEqual(self.store.receipts("jikou"), [])
         notify.assert_awaited_once()
@@ -443,7 +445,7 @@ class TestJikouBundledFlow(_Base):
                           AsyncMock(return_value=True)), \
              patch.object(main, "_handle_suppressed_inbound",
                           AsyncMock()) as sup, \
-             ps[1], ps[2] as push_m, ps[3], ps[4]:
+             ps[1], ps[2] as push_m, ps[3], ps[4], ps[5]:
             _run(main._process_line_image_event("t", self.USER, "ev-s"))
         sup.assert_awaited_once()
         push_m.assert_not_awaited()
@@ -662,6 +664,116 @@ class TestSendClaim(_Base):
                 "houki", ii.HOUKI_CHANNEL, self.UID))
         self.assertIsNone(res)                               # 送信不要=None
         self.assertEqual(len(self.store.receipts("houki")), 1)
+
+
+# ── fix3[fix2-01]: 失敗通知の関門内一元化（競合時も必ず 1 回） ──────────────────
+class TestFailureNotifyUnified(_Base):
+    UID = "U_notify_unified_0123456789"   # [:10] が真部分列になる長さ
+
+    def setUp(self):
+        super().setUp()
+        self.alert = AsyncMock(return_value=True)
+        self.biz = AsyncMock(return_value=True)
+        for p in (patch.object(ii.notify, "notify_admin_line", self.alert),
+                  patch("hub.notify.notify_business", self.biz),
+                  patch.dict(os.environ,
+                             {"ATTORNEY_LINE_USER_ID": "Uattorney"})):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def _marker(self, channel="houki", evid="nf1"):
+        return _run(self.store.create(None, {
+            "line_user_id": self.UID,
+            "category": ii.marker_category(channel, evid),
+            "message": cr.IMAGE_INBOUND_MARKER}))
+
+    def _interleave(self, push_outcome):
+        """Codex 指摘の interleave: heal が claim 取得→代表進入 None 終了→
+        heal の push 失敗。(heal結果, 代表結果) を返す。"""
+        self._marker()
+        gate = asyncio.Event()
+
+        async def gated_push(channel, to, text):
+            await gate.wait()
+            if isinstance(push_outcome, Exception):
+                raise push_outcome
+            return push_outcome
+
+        async def scenario():
+            with patch.object(ii, "push_text", gated_push):
+                holder = asyncio.ensure_future(ii.heal_unreplied(
+                    "houki", ii.HOUKI_CHANNEL, self.UID))
+                await asyncio.sleep(0.01)          # heal が claim→push 待ち
+                rep = await ii.send_receipt_and_close(
+                    "houki", ii.HOUKI_CHANNEL, self.UID)   # 後発代表
+                gate.set()
+                return await holder, rep
+        return _run(scenario())
+
+    def test_interleave_holder_non2xx_notifies_exactly_once(self):
+        healed, rep = self._interleave(False)
+        self.assertFalse(healed)
+        self.assertIsNone(rep)                     # 後発は None 終了（沈黙）
+        self.alert.assert_awaited_once()           # 要確認ちょうど 1 回
+        text = self.alert.await_args.args[0]
+        self.assertIn("要確認", text)
+        self.assertIn(self.UID[:10], text)
+        self.assertNotIn(self.UID, text)
+        self.assertEqual(self.store.receipts("houki"), [])   # 未返信維持
+
+    def test_interleave_holder_transport_error_notifies_exactly_once(self):
+        healed, rep = self._interleave(RuntimeError("net"))
+        self.assertFalse(healed)
+        self.assertIsNone(rep)
+        self.alert.assert_awaited_once()
+        self.assertEqual(self.store.receipts("houki"), [])
+
+    def test_heal_only_failure_notifies(self):
+        # heal 単独の失敗も関門内で通知される（fix2 までは無通知で吸収）
+        self._marker()
+        with patch.object(ii, "push_text", AsyncMock(return_value=False)):
+            self.assertFalse(_run(ii.heal_unreplied(
+                "houki", ii.HOUKI_CHANNEL, self.UID)))
+        self.alert.assert_awaited_once()
+
+    def test_representative_single_failure_single_notice(self):
+        # 呼出側撤去後も二重通知にならない（houki 代表経路・マーカーは
+        # handle 自身が保存する）
+        with patch.object(ii, "push_text", AsyncMock(return_value=False)),                 patch.object(ii, "is_suppressed",
+                             AsyncMock(return_value=False)):
+            _run(ii.handle_houki_image(self.UID, "nf-rep"))
+        self.assertEqual(self.alert.await_count, 1)
+
+    def test_jikou_failure_notifies_business_once(self):
+        self._marker(channel="jikou")
+        with patch.object(ii, "push_text", AsyncMock(return_value=False)):
+            self.assertFalse(_run(ii.send_receipt_and_close(
+                "jikou", None, self.UID)))
+        self.biz.assert_awaited_once()
+        text = self.biz.await_args.args[1]
+        self.assertIn("要確認", text)
+        self.assertNotIn(self.UID, text)
+
+    def test_success_no_failure_notice(self):
+        self._marker()
+        with patch.object(ii, "push_text", AsyncMock(return_value=True)):
+            self.assertIs(_run(ii.send_receipt_and_close(
+                "houki", ii.HOUKI_CHANNEL, self.UID)), True)
+        self.alert.assert_not_awaited()
+        self.biz.assert_not_awaited()
+
+    def test_receipt_save_failure_also_notifies(self):
+        # 保存失敗（push は成功）も要確認 1 回（呼出側撤去の穴を作らない）
+        self._marker()
+
+        async def broken_create(app, fields):
+            if (fields.get("category") or "").startswith("画像受領済:"):
+                raise RuntimeError("kintone down")
+            return await self.store.create(app, fields)
+        with patch.object(ii, "push_text", AsyncMock(return_value=True)),                 patch.object(hub_kintone, "create_record", broken_create):
+            self.assertFalse(_run(ii.send_receipt_and_close(
+                "houki", ii.HOUKI_CHANNEL, self.UID)))
+        self.alert.assert_awaited_once()
 
 
 class TestSingleWorkerPinned(unittest.TestCase):
