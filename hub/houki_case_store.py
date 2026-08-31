@@ -29,6 +29,9 @@ from hub.redact import emit
 
 logger = logging.getLogger("hub.houki_case_store")
 
+# houki_bot（AST checker で hub.kintone 直 import 禁止）向けの例外 re-export
+KintoneError = kintone.KintoneError
+
 # fix2: read-modify-write の CAS 収束再試行の上限（超過=収束不能・上書きしない）
 _CAS_RETRIES = 3
 
@@ -38,9 +41,14 @@ APP_HOUKI_CASE = kintone.KintoneApp(
 # ── record_hearing が書き込める App 40 フィールドの閉集合 ──────────────────────
 # （H0-APP-2 の実フィールドコード。弁護士専権・サーバ計算欄は含めない）
 HEARING_WRITABLE_FIELDS: frozenset = frozenset({
-    # 申述人（正本 §2.1 phase7 + 様式必須のふりがな・職業）
+    # 申述人（正本 §2.1 phase7 + 様式必須のふりがな）
+    # HEARING-FIX1 止血: 「職業」は App 40 に実欄が存在しない（form fields
+    # API 実測 87 欄に不在）ため除外——含めたまま書くと create/update 全体が
+    # kintone に拒否され会話が全断していた。復帰条件: 大野が CU で職業欄を
+    # 追加したら小票で本集合へ復帰し、H7C 申述書の {{職業欄}} マッピングにも
+    # 接続する（H7C 完了報告の不足フィールド一覧参照）
     "顧客名", "furigana", "生年月日", "住所", "電話番号", "メールアドレス",
-    "職業", "本人区分", "未成年後見関与",
+    "本人区分", "未成年後見関与",
     # 被相続人（phase1）
     "被相続人氏名", "被相続人ふりがな", "被相続人本籍", "被相続人最後の住所",
     "続柄", "続柄その他",
@@ -54,6 +62,32 @@ HEARING_WRITABLE_FIELDS: frozenset = frozenset({
     "相続順位", "先順位相続人の状況", "他の相続人", "同時申述希望",
     "先順位者の放棄状況",
 })
+
+# ── HEARING-FIX1: DROP_DOWN 閉集合（App 40 form fields API 実測の逐語 pin） ──
+# 書込対象の選択式フィールド。選択肢外値は kintone が update/create ごと
+# 拒否する（実障害: 続柄=自由値で会話全断・2026-08-31）ため、サーバ側で
+# 事前検証し write 0+聞き直し（日付整合検証と同型・fail-open）にする
+HEARING_CHOICE_FIELDS: dict = {
+    "続柄": ("子", "孫", "配偶者", "直系尊属（父母・祖父母）", "兄弟姉妹",
+             "おいめい", "その他"),
+    "本人区分": ("本人", "親族（本人依頼予定）", "その他"),
+    "未成年後見関与": ("なし", "あり", "不明"),
+    "財産処分有無": ("なし", "あり", "不明"),
+    "訴訟督促有無": ("なし", "あり", "不明"),
+    "相続順位": ("配偶者", "子", "直系尊属", "兄弟姉妹", "甥姪（代襲）",
+                 "不明"),
+    "同時申述希望": ("なし", "あり"),
+}
+
+# 書込対象外だが App 40 実測を pin（H7C 申述書マッピングの前提値・将来
+# ヒアリング書込対象化する票はここから HEARING_CHOICE_FIELDS へ昇格させる）
+APP40_CHOICE_REFERENCE: dict = {
+    "知った日の区分": ("被相続人死亡の当日", "死亡の通知をうけた日",
+                       "先順位者の相続放棄を知った日", "その他"),
+    "放棄の理由": ("被相続人から生前に贈与を受けている。",
+                   "生活が安定している。", "遺産が少ない。",
+                   "遺産を分散させたくない。", "債務超過のため。", "その他"),
+}
 
 # 日付フィールド（YYYY-MM-DD のみ upsert・曖昧値は 日付申告メモ に残す運用）
 _DATE_FIELDS = ("死亡日_申告", "死亡を知った日_申告", "相続人と知った日_申告")
@@ -135,8 +169,9 @@ def validate_hearing_dates(fields: dict,
 
 def split_valid_fields(fields: dict, existing: dict | None = None,
                        today: datetime.date | None = None
-                       ) -> tuple[dict, list[str]]:
-    """tool の fields を（書き込み可能な適合分, 矛盾理由）へ分ける。
+                       ) -> tuple[dict, list[str], list[str]]:
+    """tool の fields を（書き込み可能な適合分, 日付矛盾理由, 選択肢外理由）へ
+    分ける。
 
     - 許可集合外のフィールド名は黙って落とす（弁護士専権・サーバ計算欄の防壁）
     - 空値は落とす（非空を空で上書きしない）
@@ -146,6 +181,12 @@ def split_valid_fields(fields: dict, existing: dict | None = None,
       無ければ検証しない（保存済みの確定値は書込時に検証済み）
     - 矛盾があれば**今回の日付 3 欄をすべて**書き込み対象から外す（write 0。
       部分書込で矛盾ペアの片側だけ残る事故を防ぐ）。他フィールドは書く
+    - HEARING-FIX1: DROP_DOWN 閉集合（HEARING_CHOICE_FIELDS）の選択肢外値は
+      当該フィールドのみ write 0 とし、固定語彙
+      「<code>=選択肢外（値1/値2/…）」を第 3 戻り値で返す（tool_result で
+      モデルに聞き直させる・日付整合と同型の fail-open。**日付矛盾の系
+      〔メモのマーカー・危険類型フラグ〕には接続しない**——申告の矛盾では
+      なく表現の言い換えが必要なだけのため）。他フィールドは書く
     """
     incoming_dates = [c for c in _DATE_FIELDS
                      if str((fields or {}).get(c) or "").strip()]
@@ -164,6 +205,7 @@ def split_valid_fields(fields: dict, existing: dict | None = None,
     else:
         problems = []
     out: dict = {}
+    choice_problems: list[str] = []
     for code, value in (fields or {}).items():
         if code not in HEARING_WRITABLE_FIELDS:
             continue
@@ -172,8 +214,13 @@ def split_valid_fields(fields: dict, existing: dict | None = None,
             continue
         if problems and code in _DATE_FIELDS:
             continue
+        allowed = HEARING_CHOICE_FIELDS.get(code)
+        if allowed is not None and sval not in allowed:
+            choice_problems.append(
+                f"{code}=選択肢外（{'/'.join(allowed)}）")
+            continue
         out[code] = sval
-    return out, problems
+    return out, problems, choice_problems
 
 
 async def upsert_case_fields(user_id: str, fields: dict,
@@ -209,9 +256,10 @@ async def upsert_case_fields(user_id: str, fields: dict,
 
 async def apply_hearing_fields(user_id: str, raw_fields: dict,
                                existing: dict | None
-                               ) -> tuple[str, list[str]]:
+                               ) -> tuple[str, list[str], list[str]]:
     """record_hearing の生 fields を（検証→CAS upsert→409 収束）まで行う
-    （fix2[H3-04]）。(レコード ID, 矛盾理由一覧) を返す。
+    （fix2[H3-04]）。(レコード ID, 日付矛盾理由一覧, 選択肢外理由一覧) を返す
+    （HEARING-FIX1: 選択肢外は日付矛盾の系と別チャネル）。
 
     収束: CAS 敗北（409）ごとに最新レコードを再取得し、
     split_valid_fields(raw_fields, 最新) を**再実行**——最新値との合成で
@@ -219,19 +267,21 @@ async def apply_hearing_fields(user_id: str, raw_fields: dict,
     再試行は _CAS_RETRIES 回まで。尽きたら書込を諦める（write 0・今ターンの
     データは次の発話で再収集される＝会話は継続。矛盾 postimage は成立しない）。
     """
-    fields, problems = split_valid_fields(raw_fields, existing)
+    fields, problems, choice_problems = split_valid_fields(
+        raw_fields, existing)
     for _attempt in range(_CAS_RETRIES):
         try:
             rid = await upsert_case_fields(user_id, fields, existing)
-            return rid, problems
+            return rid, problems, choice_problems
         except kintone.KintoneConflict:
             latest = await fetch_case(user_id)
             if latest is None:
                 logger.warning(
                     "[HOUKI_CASE] upsert cas refetch missing (write 0)")
-                return _v(existing or {}, "$id"), problems
+                return _v(existing or {}, "$id"), problems, choice_problems
             existing = latest
-            fields, problems = split_valid_fields(raw_fields, latest)
+            fields, problems, choice_problems = split_valid_fields(
+                raw_fields, latest)
         except kintone.KintoneError:
             # fix3[H3-06]: 新規作成の二重 create 防止（方式(a)）。App 40 の
             # LINEユーザーID 欄は「値の重複を禁止する」を有効化する（大野の
@@ -248,11 +298,12 @@ async def apply_hearing_fields(user_id: str, raw_fields: dict,
                         emit(_v(latest, "$id"), "record_id", "log",
                              "operator"))
             existing = latest
-            fields, problems = split_valid_fields(raw_fields, latest)
+            fields, problems, choice_problems = split_valid_fields(
+                raw_fields, latest)
     logger.warning("[HOUKI_CASE] upsert cas exhausted (write 0) record_id=%s",
                    emit(_v(existing or {}, "$id"), "record_id", "log",
                         "operator"))
-    return _v(existing or {}, "$id"), problems
+    return _v(existing or {}, "$id"), problems, choice_problems
 
 
 async def append_creditors(record_id: str, existing: dict | None,

@@ -91,9 +91,11 @@ async def _apply_record_hearing(user_id: str, record: dict | None,
     最新レコード) を返す。矛盾は固定語彙で返す（モデルが聞き直す）。"""
     # fix1[01]: 既存レコードとの合成（postimage 候補）で cross-turn の
     # 日付矛盾も検証。fix2[H3-04]: 書込は $revision CAS+409 収束
-    # （最新再取得→再検証→再試行）を apply_hearing_fields が担う
-    record_id, problems = await houki_case_store.apply_hearing_fields(
-        user_id, tool_input.get("fields") or {}, record)
+    # （最新再取得→再検証→再試行）を apply_hearing_fields が担う。
+    # HEARING-FIX1: 選択肢外（DROP_DOWN 閉集合）は日付矛盾と別チャネル
+    record_id, problems, choice_problems = \
+        await houki_case_store.apply_hearing_fields(
+            user_id, tool_input.get("fields") or {}, record)
     creditors = tool_input.get("creditor_names") or []
     if creditors:
         latest = await houki_case_store.fetch_case(user_id)
@@ -129,6 +131,15 @@ async def _apply_record_hearing(user_id: str, record: dict | None,
                   + "。丁寧に確認し直してください。")
     else:
         result = "記録しました。"
+    if choice_problems:
+        # HEARING-FIX1: 選択肢外は「申告の矛盾」ではなく表現の言い換えが
+        # 必要なだけ——聞き直し語彙に許容値を含めてモデルに再記録させる
+        # （メモのマーカー・危険類型フラグの系には入れない・fail-open）。
+        # 日付矛盾と同時のときは両方を伝える（追記形）
+        result += ("次の項目は選択肢と一致しないため保存していません: "
+                   + " / ".join(choice_problems)
+                   + "。お伺いした内容に当てはまる選択肢の値で記録し直して"
+                     "ください。")
 
     latest = await houki_case_store.fetch_case(user_id)
     # 必須充足 + hearing_done → status 遷移（問い合わせ→電話判断待ち・一方向）
@@ -220,6 +231,16 @@ async def handle_houki_hearing(reply_token: str, user_id: str,
                               HOUKI_PROFILE.pending_reply,
                               HOUKI_HEARING_CATEGORY, "yes")
         history.pop()   # 応答なしの user メッセージを履歴に残さない
+        return
+    except houki_case_store.KintoneError as e:
+        # HEARING-FIX1: kintone 起因の失敗を固定分類で可視化（DIAG で例外型が
+        # 見えず調査コストが嵩んだ穴の解消）。code は kintone の固定分類語彙
+        # （GAIA_xx 等・自由文の message は出さない）
+        logger.error("[HOUKI_HEARING] kintone write failed code=%s",
+                     emit(e.code, "record_id", "log", "operator"))
+        await reply_with_push_fallback(HOUKI_CHANNEL, reply_token, user_id,
+                                       HOUKI_PROFILE.pending_reply)
+        history.pop()
         return
     except Exception:
         logger.error("[HOUKI_HEARING] converse failed (fixed reason)")

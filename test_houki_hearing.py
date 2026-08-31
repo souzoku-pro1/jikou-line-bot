@@ -181,7 +181,7 @@ class TestDateValidation(unittest.TestCase):
 
 class TestSplitValidFields(unittest.TestCase):
     def test_closed_set_and_empty_dropped(self):
-        fields, problems = store.split_valid_fields({
+        fields, problems, _choice = store.split_valid_fields({
             "顧客名": "山田太郎",
             "住所": "  ",                       # 空→落ちる
             "起算日_確定": "2026-05-01",        # 弁護士専権→落ちる
@@ -192,7 +192,7 @@ class TestSplitValidFields(unittest.TestCase):
         self.assertEqual(fields, {"顧客名": "山田太郎"})
 
     def test_date_trio_dropped_on_problem(self):
-        fields, problems = store.split_valid_fields({
+        fields, problems, _choice = store.split_valid_fields({
             "死亡日_申告": "2026-05-02",
             "死亡を知った日_申告": "2026-05-01",
             "顧客名": "山田太郎",
@@ -207,6 +207,62 @@ class TestSplitValidFields(unittest.TestCase):
                      "提出目標日", "残日数", "熟慮期間期限", "status",
                      "単純承認事由フラグ", "本人確認ステータス"):
             self.assertNotIn(code, store.HEARING_WRITABLE_FIELDS)
+
+
+class TestChoiceClosedSets(unittest.TestCase):
+    """HEARING-FIX1: DROP_DOWN 閉集合の pin（App 40 form fields API 実測の逐語）。"""
+
+    def test_choice_sets_pinned(self):
+        self.assertEqual(store.HEARING_CHOICE_FIELDS["続柄"], (
+            "子", "孫", "配偶者", "直系尊属（父母・祖父母）", "兄弟姉妹",
+            "おいめい", "その他"))
+        self.assertEqual(store.HEARING_CHOICE_FIELDS["本人区分"],
+                         ("本人", "親族（本人依頼予定）", "その他"))
+        self.assertEqual(store.HEARING_CHOICE_FIELDS["相続順位"], (
+            "配偶者", "子", "直系尊属", "兄弟姉妹", "甥姪（代襲）", "不明"))
+        for code in ("未成年後見関与", "財産処分有無", "訴訟督促有無"):
+            self.assertEqual(store.HEARING_CHOICE_FIELDS[code],
+                             ("なし", "あり", "不明"))
+        self.assertEqual(store.HEARING_CHOICE_FIELDS["同時申述希望"],
+                         ("なし", "あり"))
+        # 書込対象外だが実測 pin（将来の書込対象化票で使う・ガードは書込面のみ）
+        self.assertEqual(store.APP40_CHOICE_REFERENCE["知った日の区分"], (
+            "被相続人死亡の当日", "死亡の通知をうけた日",
+            "先順位者の相続放棄を知った日", "その他"))
+        self.assertEqual(store.APP40_CHOICE_REFERENCE["放棄の理由"], (
+            "被相続人から生前に贈与を受けている。", "生活が安定している。",
+            "遺産が少ない。", "遺産を分散させたくない。", "債務超過のため。",
+            "その他"))
+
+    def test_shokugyou_removed_from_writable(self):
+        # 止血: App 40 に「職業」実欄が存在しない（実測）ため書込集合から除外
+        self.assertNotIn("職業", store.HEARING_WRITABLE_FIELDS)
+
+    def test_split_drops_out_of_set_choice_without_date_side_effects(self):
+        out, problems, choice = store.split_valid_fields(
+            {"続柄": "母", "被相続人氏名": "山田太郎",
+             "死亡日_申告": "2026-05-01"},
+            today=datetime.date(2026, 8, 26))
+        self.assertEqual(problems, [])                    # 日付検証は不干渉
+        self.assertIn("死亡日_申告", out)                  # 日付は落ちない
+        self.assertEqual(out.get("被相続人氏名"), "山田太郎")
+        self.assertNotIn("続柄", out)                     # 選択肢外=write 0
+        self.assertEqual(len(choice), 1)
+        self.assertIn("続柄=選択肢外", choice[0])
+        self.assertIn("子/孫/配偶者", choice[0])           # 許容値を固定語彙で提示
+
+    def test_split_keeps_in_set_choice(self):
+        out, problems, choice = store.split_valid_fields({"続柄": "子"})
+        self.assertEqual((problems, choice), ([], []))
+        self.assertEqual(out, {"続柄": "子"})
+
+    def test_tool_description_lists_choice_values(self):
+        desc = hp.RECORD_HEARING_TOOL["input_schema"]["properties"][
+            "fields"]["description"]
+        self.assertIn("続柄", desc)
+        self.assertIn("子/孫/配偶者/直系尊属（父母・祖父母）/兄弟姉妹/おいめい/その他",
+                      desc)
+        self.assertIn("本人/親族（本人依頼予定）/その他", desc)
 
 
 class TestUpsert(_StoreBase):
@@ -301,13 +357,13 @@ class TestFix2CASConvergence(_StoreBase):
         snap_a = copy.deepcopy(self.fake.rows[rid])
         snap_b = copy.deepcopy(self.fake.rows[rid])
         # A: 死亡日を書込（rev が進む）
-        rid_a, prob_a = _run(store.apply_hearing_fields(
+        rid_a, prob_a, _ca = _run(store.apply_hearing_fields(
             "U_cas1", {"死亡日_申告": "2026-05-02"}, snap_a))
         self.assertEqual(prob_a, [])
         self.assertEqual(self.fake.field(rid, "死亡日_申告"), "2026-05-02")
         # B: 旧 snapshot 前提で「それより前の死亡を知った日」→ CAS 敗北→
         #    再取得・再検証で矛盾検出→日付 write 0+不一致処理（problems 返却）
-        rid_b, prob_b = _run(store.apply_hearing_fields(
+        rid_b, prob_b, _cb = _run(store.apply_hearing_fields(
             "U_cas1", {"死亡を知った日_申告": "2026-05-01"}, snap_b))
         self.assertTrue(any("死亡を知った日_申告が死亡日_申告より前" in x
                             for x in prob_b), prob_b)
@@ -322,7 +378,7 @@ class TestFix2CASConvergence(_StoreBase):
         snap_b = copy.deepcopy(self.fake.rows[rid])
         _run(store.apply_hearing_fields(
             "U_cas2", {"死亡日_申告": "2026-05-02"}, self.fake.rows[rid]))
-        _rid, prob = _run(store.apply_hearing_fields(
+        _rid, prob, _c = _run(store.apply_hearing_fields(
             "U_cas2", {"顧客名": "山田"}, snap_b))
         self.assertEqual(prob, [])
         self.assertEqual(self.fake.field(rid, "死亡日_申告"), "2026-05-02")
@@ -403,9 +459,9 @@ class TestFix3DoubleCreateAndCreditors(_StoreBase):
     def test_h3_06_concurrent_creates_converge_to_one_record(self):
         # Codex 指定形: 並行 2 タスクが双方 existing=None を取得した状態から、
         # create 合計 1 件・両タスクの入力が同一レコードへ収束
-        rid_a, prob_a = _run(store.apply_hearing_fields(
+        rid_a, prob_a, _ca = _run(store.apply_hearing_fields(
             "U_dc1", {"顧客名": "山田"}, None))
-        rid_b, prob_b = _run(store.apply_hearing_fields(
+        rid_b, prob_b, _cb = _run(store.apply_hearing_fields(
             "U_dc1", {"電話番号": "090"}, None))     # B も existing=None
         self.assertEqual(len(self.fake.rows), 1)     # create は合計 1 件
         self.assertEqual(rid_a, rid_b)
@@ -420,7 +476,7 @@ class TestFix3DoubleCreateAndCreditors(_StoreBase):
         # 敗者の日付は write 0+problems）
         _run(store.apply_hearing_fields(
             "U_dc2", {"死亡日_申告": "2026-05-02"}, None))
-        rid_b, prob_b = _run(store.apply_hearing_fields(
+        rid_b, prob_b, _cb = _run(store.apply_hearing_fields(
             "U_dc2", {"死亡を知った日_申告": "2026-05-01"}, None))
         self.assertEqual(len(self.fake.rows), 1)
         self.assertTrue(any("死亡を知った日_申告が死亡日_申告より前" in x
@@ -500,7 +556,7 @@ class TestCrossTurnDateRules(_StoreBase):
 
     def test_rule1_existing_death_incoming_knew_death(self):
         existing = self._existing_with(死亡日_申告="2026-05-02")
-        out, problems = store.split_valid_fields(
+        out, problems, _choice = store.split_valid_fields(
             {"死亡を知った日_申告": "2026-05-01"}, existing,
             today=datetime.date(2026, 8, 26))
         self.assertTrue(any("死亡を知った日_申告が死亡日_申告より前" in x
@@ -509,7 +565,7 @@ class TestCrossTurnDateRules(_StoreBase):
 
     def test_rule2_existing_death_incoming_knew_heir(self):
         existing = self._existing_with(死亡日_申告="2026-05-02")
-        out, problems = store.split_valid_fields(
+        out, problems, _choice = store.split_valid_fields(
             {"相続人と知った日_申告": "2026-05-01"}, existing,
             today=datetime.date(2026, 8, 26))
         self.assertTrue(any("相続人と知った日_申告が死亡日_申告より前" in x
@@ -518,7 +574,7 @@ class TestCrossTurnDateRules(_StoreBase):
 
     def test_rule3_existing_knew_death_incoming_knew_heir(self):
         existing = self._existing_with(死亡を知った日_申告="2026-06-01")
-        out, problems = store.split_valid_fields(
+        out, problems, _choice = store.split_valid_fields(
             {"相続人と知った日_申告": "2026-05-20"}, existing,
             today=datetime.date(2026, 8, 26))
         self.assertTrue(any("死亡を知った日_申告より前" in x
@@ -528,7 +584,7 @@ class TestCrossTurnDateRules(_StoreBase):
     def test_reverse_direction_incoming_death_vs_existing_knew(self):
         # 逆方向: 既存=知った日・今回=死亡日 の組合せも検知（write 0）
         existing = self._existing_with(死亡を知った日_申告="2026-05-01")
-        out, problems = store.split_valid_fields(
+        out, problems, _choice = store.split_valid_fields(
             {"死亡日_申告": "2026-05-02", "顧客名": "山田"}, existing,
             today=datetime.date(2026, 8, 26))
         self.assertTrue(problems)
@@ -536,7 +592,7 @@ class TestCrossTurnDateRules(_StoreBase):
 
     def test_no_incoming_dates_no_validation(self):
         existing = self._existing_with(死亡日_申告="2026-05-02")
-        out, problems = store.split_valid_fields(
+        out, problems, _choice = store.split_valid_fields(
             {"顧客名": "山田"}, existing, today=datetime.date(2026, 8, 26))
         self.assertEqual(problems, [])
         self.assertEqual(out, {"顧客名": "山田"})
@@ -703,6 +759,8 @@ class TestHearingFlow(_HearingBase):
 
     def test_hearing_done_promotes_status(self):
         filled = {c: "x" for c in store.HEARING_REQUIRED_FIELDS}
+        filled["続柄"] = "子"          # HEARING-FIX1: 閉集合適合値で充足させる
+        filled["相続順位"] = "子"
         filled["死亡日_申告"] = "2026-05-01"
         filled["死亡を知った日_申告"] = "2026-05-01"
         filled["相続人と知った日_申告"] = "2026-05-02"
@@ -839,6 +897,96 @@ class TestHoukiProfileAndPrompt(unittest.TestCase):
              "5_others", "6_koseki", "7_applicant"])
         self.assertEqual(sorted(tool["input_schema"]["required"]),
                          ["fields", "hearing_done", "phase", "phase_done"])
+
+
+class TestChoiceFieldGuardFlow(_HearingBase):
+    """HEARING-FIX1: 会話フロー——選択肢外値でも全断せず聞き直しで継続。"""
+
+    def run_turn_with_model(self, responses, text="母が亡くなりました"):
+        send, queue, chatlog = AsyncMock(), AsyncMock(return_value="q-1"), \
+            AsyncMock()
+        model = AsyncMock(side_effect=list(responses))
+        with patch.object(hearing, "call_hearing_model", model), \
+             patch.object(hearing, "reply_with_push_fallback", send), \
+             patch.object(hearing, "save_to_approval_queue", queue), \
+             patch.object(hearing, "save_to_chatlog", chatlog), \
+             patch.object(hearing, "get_recent_chat_history",
+                          AsyncMock(return_value=[])), \
+             patch.object(hearing, "is_suppressed",
+                          AsyncMock(return_value=False)), \
+             patch.object(hearing, "autoreply_paused", lambda: False):
+            _run(hearing.handle_houki_hearing("rtok", self.uid, text))
+        return send, queue, chatlog, model
+
+    def _tool_result_text(self, model) -> str:
+        messages = model.await_args_list[1].args[1]
+        return messages[-1]["content"][0]["content"]
+
+    def test_out_of_set_choice_write0_retry_and_continue(self):
+        send, queue, _c, model = self.run_turn_with_model(
+            [_tool_response({"phase": "1_deceased",
+                             "fields": {"被相続人氏名": "山田太郎",
+                                        "続柄": "母"},
+                             "phase_done": False, "hearing_done": False}),
+             _text_response("失礼しました。亡くなられたのはお母様ですね。")])
+        rows = list(self.fake.rows.values())
+        self.assertEqual(len(rows), 1)                   # 全断せず作成される
+        rid = rows[0]["$id"]["value"]
+        self.assertEqual(self.fake.field(rid, "被相続人氏名"), "山田太郎")
+        self.assertIsNone(self.fake.field(rid, "続柄"))   # 選択肢外は write 0
+        tr = self._tool_result_text(model)
+        self.assertIn("続柄=選択肢外", tr)
+        self.assertIn("子/孫/配偶者", tr)                 # 聞き直しの許容値提示
+        send.assert_awaited_once()                        # 会話は継続（定型でない）
+        self.assertIn("お母様", send.await_args.args[3])
+        queue.assert_not_awaited()
+        # 日付矛盾の系（マーカー・危険類型フラグ）には入らない
+        self.assertIsNone(self.fake.field(rid, "危険類型フラグ"))
+        memo = self.fake.field(rid, "日付申告メモ") or ""
+        self.assertNotIn(store.MISMATCH_MARKER, memo)
+
+    def test_in_set_choice_written(self):
+        _s, _q, _c, _m = self.run_turn_with_model(
+            [_tool_response({"phase": "1_deceased",
+                             "fields": {"続柄": "子"},
+                             "phase_done": False, "hearing_done": False}),
+             _text_response("ありがとうございます。")])
+        rid = list(self.fake.rows)[0]
+        self.assertEqual(self.fake.field(rid, "続柄"), "子")
+
+    def test_shokugyou_dropped_others_written_no_crash(self):
+        send, _q, _c, model = self.run_turn_with_model(
+            [_tool_response({"phase": "7_applicant",
+                             "fields": {"顧客名": "山田花子",
+                                        "職業": "会社員"},
+                             "phase_done": False, "hearing_done": False}),
+             _text_response("記録しました。続いてご住所を伺えますか。")])
+        rid = list(self.fake.rows)[0]
+        self.assertEqual(self.fake.field(rid, "顧客名"), "山田花子")
+        self.assertIsNone(self.fake.field(rid, "職業"))
+        self.assertEqual(self._tool_result_text(model), "記録しました。")
+        send.assert_awaited_once()
+        self.assertIn("ご住所", send.await_args.args[3])
+
+    def test_kintone_failure_classified_log_and_fallback(self):
+        async def _fail(*a, **k):
+            raise store.kintone.KintoneError(400, "GAIA_IA02", "token error")
+        with patch.object(store.kintone, "create_record", _fail):
+            with self.assertLogs("houki_bot.hearing", level="ERROR") as logs:
+                send, _q, _c, _m = self.run_turn_with_model(
+                    [_tool_response({"phase": "1_deceased",
+                                     "fields": {"被相続人氏名": "山田太郎"},
+                                     "phase_done": False,
+                                     "hearing_done": False}),
+                     _text_response("（到達しない）")])
+        joined = "\n".join(logs.output)
+        self.assertIn("kintone write failed", joined)     # 固定分類
+        self.assertIn("GAIA_IA02", joined)                # 固定分類コード
+        self.assertNotIn("token error", joined)           # 自由文本文は出さない
+        self.assertNotIn("converse failed", joined)       # 汎用分類と区別
+        send.assert_awaited_once()
+        self.assertEqual(send.await_args.args[3], hp.HOUKI_PROFILE.pending_reply)
+
 
 
 if __name__ == "__main__":

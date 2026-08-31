@@ -35,7 +35,7 @@ from chat_responder import (
 )
 from claude_gateway import ClaudeUnavailableError, create_message_with_fallback
 from hub.business_profile import BusinessProfile
-from hub.houki_case_store import HEARING_WRITABLE_FIELDS
+from hub.houki_case_store import HEARING_CHOICE_FIELDS, HEARING_WRITABLE_FIELDS
 
 __all__ = [
     "HOUKI_PROFILE", "HOUKI_HEARING_PROMPT", "RECORD_HEARING_TOOL",
@@ -81,7 +81,16 @@ RECORD_HEARING_TOOL = {
                     + "、".join(sorted(HEARING_WRITABLE_FIELDS))
                     + "。日付（〜_申告）は YYYY-MM-DD 形式が確定した場合のみ"
                       "入れ、曖昧（『2026-05頃』等）は 日付申告メモ に原文の"
-                      "まま記録する"
+                      "まま記録する。"
+                    # HEARING-FIX1: 選択式フィールドの許容値を明示（App 40
+                    # DROP_DOWN の閉集合。選択肢外はサーバ側で保存されず
+                    # 聞き直しになる）。単一の正= HEARING_CHOICE_FIELDS
+                    + "次のフィールドは必ず記載の選択肢の値そのままで入れる: "
+                    + "、".join(f"{code}（{'/'.join(values)}）"
+                                for code, values
+                                in sorted(HEARING_CHOICE_FIELDS.items()))
+                    + "。会話の表現（『母です』等）は選択肢へ読み替えて記録"
+                      "する（例: 亡くなったのが母なら申述人は 子）"
                 ),
             },
             "creditor_names": {
