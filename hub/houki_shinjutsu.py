@@ -40,9 +40,20 @@ from hub.docx_builder import fill_runs
 
 TEMPLATE_PATH = "docx_templates/houki/相続放棄申述書.docx"
 # 収載現物（scripts/make_shinjutsu_template.py 生成・コミット済み artifact）の
-# pin。再収載は zip タイムスタンプで SHA が変わるため、pin はコミット現物
+# pin。再収載は zip タイムスタンプで SHA が変わるため、pin はコミット現物。
+# 役割は「コミット物の同一性」（fix1[H7C-01]: 正本性の防壁は canonical 側）
 TEMPLATE_SHA256 = (
     "a6bbc4d12da1699adff39daf0612e3b24a80ee81061a90e826b254a69d996c46")
+# fix1[H7C-01]: 正本性の防壁=正規化済み内容の pin（収載スクリプト由来の独立
+# 定数・zip タイムスタンプ非依存）。canonical manifest は全段落テキスト全量+
+# run 分割（プレースホルダの位置・個数を含む）+rPr 要点（fitText/sz/u）を
+# 決定的に直列化した SHA-256——不動文字の 1 文字改変・プレースホルダの増減・
+# 位置替え・ラベル書式の変更はいずれか（多くは複数）の行を変え、必ず検出
+# される。「テンプレ改変+TEMPLATE_SHA256 追随」の同時変更はこの定数を
+# 変えない限り通らず、この定数の変更は票由来のレビュー対象になる。
+# 意図的更新の手順は scripts/make_shinjutsu_template.py の docstring を参照
+TEMPLATE_CANONICAL_SHA256 = (
+    "c16dfb76e9d7e4be3bd843d3877df209a222a816258f9b04df85d9b8f9e4f88f")
 
 _FW = "　"
 _JST = datetime.timezone(datetime.timedelta(hours=9))
@@ -332,10 +343,7 @@ def build_fill_data(record: dict,
 
 
 # ── docx の組み立て・凍結検証 ────────────────────────────────────────────────
-def verify_template_integrity() -> None:
-    data = open(TEMPLATE_PATH, "rb").read()
-    if hashlib.sha256(data).hexdigest() != TEMPLATE_SHA256:
-        raise ShinjutsuIntegrityError("template hash mismatch")
+_W_NS = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
 
 
 def _walk_paragraphs(doc):
@@ -344,6 +352,45 @@ def _walk_paragraphs(doc):
         for row in tb.rows:
             for tc in row._tr.tc_lst:
                 yield from _Cell(tc, tb).paragraphs
+
+
+def canonical_manifest_text(doc) -> str:
+    """テンプレ内容の決定的な直列化（fix1[H7C-01]・zip タイムスタンプ非依存）。
+
+    粒度: 段落ごとに (a) 段落テキスト全量、(b) 各 run のテキスト（＝
+    プレースホルダの個数・位置・run 分割）、(c) rPr 要点（fitText の有無・
+    sz・下線）。不動文字の 1 文字改変は (a)(b) を、プレースホルダの増減・
+    位置替えは (b) を、ラベル書式（均等割り付け等）の変更は (c) を変える。"""
+    lines = []
+    for i, p in enumerate(_walk_paragraphs(doc)):
+        lines.append(f"P{i}\t{p.text}")
+        for j, r in enumerate(p.runs):
+            rpr = r._r.find(_W_NS + "rPr")
+            fit = sz = und = "-"
+            if rpr is not None:
+                if rpr.find(_W_NS + "fitText") is not None:
+                    fit = "fit"
+                sz_el = rpr.find(_W_NS + "sz")
+                if sz_el is not None:
+                    sz = sz_el.get(_W_NS + "val") or "-"
+                if rpr.find(_W_NS + "u") is not None:
+                    und = "u"
+            lines.append(f"R{i}.{j}\t{fit}\t{sz}\t{und}\t{r.text}")
+    return "\n".join(lines)
+
+
+def canonical_sha256(doc) -> str:
+    return hashlib.sha256(
+        canonical_manifest_text(doc).encode("utf-8")).hexdigest()
+
+
+def verify_template_integrity() -> None:
+    """コミット物の同一性（バイナリ SHA）+正本性（canonical pin・fix1）。"""
+    data = open(TEMPLATE_PATH, "rb").read()
+    if hashlib.sha256(data).hexdigest() != TEMPLATE_SHA256:
+        raise ShinjutsuIntegrityError("template hash mismatch")
+    if canonical_sha256(Document(TEMPLATE_PATH)) != TEMPLATE_CANONICAL_SHA256:
+        raise ShinjutsuIntegrityError("template canonical mismatch")
 
 
 def _circle_cell(doc, addr: tuple, digit: str) -> None:
@@ -379,9 +426,15 @@ def expected_paragraph_texts(fill: dict, circles: dict) -> list[str]:
     sanctioned substitution（許可グループの許可数字のみ丸数字化）を適用。
     それ以外の本文はテンプレ逐語のまま＝完全一致検査で凍結を保証する。"""
     tdoc = Document(TEMPLATE_PATH)
-    # 期待列は「pin されたテンプレ+承認済み変換（丸数字→差し込みの同順）」
-    # からのみ導出される（sanctioned substitution 以外の差分は完全一致検査で
-    # 検出される）
+    # fix1[H7C-01]: 期待列の基準は canonical 定数に錨づける——テンプレが
+    # canonical pin と一致することを確認してから導出する（コミット物からの
+    # 自己生成に正本性を委ねない。バイナリ SHA を追随更新する同時改変は
+    # ここで拒否される）
+    if canonical_sha256(tdoc) != TEMPLATE_CANONICAL_SHA256:
+        raise ShinjutsuIntegrityError("template canonical mismatch")
+    # 期待列は「canonical 検証済みテンプレ+承認済み変換（丸数字→差し込みの
+    # 同順）」からのみ導出される（sanctioned substitution 以外の差分は
+    # 完全一致検査で検出される）
     for group, digit in circles.items():
         _circle_cell(tdoc, _CIRCLE_CELLS[group], digit)
     for p in _walk_paragraphs(tdoc):

@@ -158,6 +158,97 @@ class TestTemplatePin(unittest.TestCase):
                 self.assertEqual(text.count(d), 1, (group, d))
 
 
+# ── fix1[H7C-01]: canonical pin（自己参照でない正本性の防壁） ─────────────────────
+class TestCanonicalPin(unittest.TestCase):
+    """バイナリ SHA を追随更新する攻撃（テンプレ改変+TEMPLATE_SHA256 更新）を
+    canonical 定数（収載スクリプト由来・コード固定）が検出することの固定。"""
+
+    def _tampered_template(self, mutate):
+        """コミット済みテンプレへ mutate を適用し、(一時ファイルパス,
+        改変後バイナリ SHA) を返す＝攻撃シナリオの「①改変 ②SHA 追随」。"""
+        import io as _io
+        import tempfile
+        doc = Document(hs.TEMPLATE_PATH)
+        mutate(doc)
+        buf = _io.BytesIO()
+        doc.save(buf)
+        data = buf.getvalue()
+        tmp = tempfile.NamedTemporaryFile(suffix=".docx", delete=False)
+        tmp.write(data)
+        tmp.close()
+        self.addCleanup(os.unlink, tmp.name)
+        return tmp.name, hashlib.sha256(data).hexdigest()
+
+    def test_canary_committed_template_matches_canonical(self):
+        doc = Document(hs.TEMPLATE_PATH)
+        self.assertEqual(hs.canonical_sha256(doc),
+                         hs.TEMPLATE_CANONICAL_SHA256)
+
+    def test_canonical_is_zip_timestamp_independent(self):
+        # 同一内容を保存し直す（zip タイムスタンプが変わりバイナリ SHA は
+        # 変動し得る）→ canonical は不変
+        import io as _io
+        doc = Document(hs.TEMPLATE_PATH)
+        buf = _io.BytesIO()
+        doc.save(buf)
+        again = Document(_io.BytesIO(buf.getvalue()))
+        self.assertEqual(hs.canonical_sha256(again),
+                         hs.TEMPLATE_CANONICAL_SHA256)
+
+    def test_fixed_text_one_char_change_detected_despite_sha_update(self):
+        # Codex 指摘の攻撃そのもの: 不動文字 1 文字改変+バイナリ SHA 追随でも
+        # canonical 照合で拒否される
+        def mutate(doc):
+            t5 = doc.tables[5]
+            cell = _Cell(t5.rows[1]._tr.tc_lst[0], t5)
+            run = cell.paragraphs[1].runs[0]
+            assert "相　続　の　放　棄" in run.text
+            run.text = run.text.replace("放", "抛", 1)
+        path, sha = self._tampered_template(mutate)
+        with patch.object(hs, "TEMPLATE_PATH", path), \
+             patch.object(hs, "TEMPLATE_SHA256", sha):
+            with self.assertRaises(hs.ShinjutsuIntegrityError):
+                hs.verify_template_integrity()
+            with self.assertRaises(hs.ShinjutsuIntegrityError):
+                hs.generate(_full_record(), today=TODAY)
+
+    def test_placeholder_count_change_detected_despite_sha_update(self):
+        def mutate(doc):
+            t4 = doc.tables[4]
+            cell = _Cell(t4.rows[2]._tr.tc_lst[2], t4)
+            run = cell.paragraphs[0].runs[0]
+            assert run.text == "{{申述人フリガナ}}"
+            run.text = "　"      # プレースホルダを 1 個削る（個数改変）
+        path, sha = self._tampered_template(mutate)
+        with patch.object(hs, "TEMPLATE_PATH", path), \
+             patch.object(hs, "TEMPLATE_SHA256", sha):
+            with self.assertRaises(hs.ShinjutsuIntegrityError):
+                hs.verify_template_integrity()
+
+    def test_placeholder_position_change_detected_despite_sha_update(self):
+        def mutate(doc):
+            t2 = doc.tables[2]
+            p0 = _Cell(t2.rows[0]._tr.tc_lst[0], t2).paragraphs[0]
+            runs = p0.runs
+            assert runs[0].text == "{{裁判所前}}"
+            runs[0].text, runs[3].text = runs[3].text, runs[0].text  # 位置交換
+        path, sha = self._tampered_template(mutate)
+        with patch.object(hs, "TEMPLATE_PATH", path), \
+             patch.object(hs, "TEMPLATE_SHA256", sha):
+            with self.assertRaises(hs.ShinjutsuIntegrityError):
+                hs.verify_template_integrity()
+
+    def test_canonical_constant_anchors_expected_texts(self):
+        # 期待列の基準は canonical 定数に錨づく（定数を偽値にすると凍結検証
+        # 一式が拒否される=自己生成に退行していないことの pin）
+        with patch.object(hs, "TEMPLATE_CANONICAL_SHA256", "0" * 64):
+            with self.assertRaises(hs.ShinjutsuIntegrityError):
+                hs.generate(_full_record(), today=TODAY)
+            fill = dict(hs.PLACEHOLDER_DEFAULTS)
+            with self.assertRaises(hs.ShinjutsuIntegrityError):
+                hs.expected_paragraph_texts(fill, {})
+
+
 # ── 生成・凍結・丸数字 ─────────────────────────────────────────────────────────
 class TestBuildAndFreeze(unittest.TestCase):
     def test_happy_path_contents(self):

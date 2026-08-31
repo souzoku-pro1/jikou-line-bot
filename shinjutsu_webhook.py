@@ -174,9 +174,10 @@ async def shinjutsu_webhook(secret: str, request: Request):
         return JSONResponse(status_code=500,
                             content={"error": "integrity_error"})
     except Exception as e:
-        logger.error("[SHINJUTSU] error record_id=%s cls=%s: %s",
+        # sink 規律: 例外本文・型名は出さない（固定文言+emit のみ。
+        # vendor_raw は emit 側で完全抑止される）
+        logger.error("[SHINJUTSU] error record_id=%s: %s",
                      emit(record_id, "record_id", "log", "operator"),
-                     type(e).__name__,
                      emit(str(e), "vendor_raw", "log", "operator"))
         return JSONResponse(status_code=500,
                             content={"error": "internal_error"})

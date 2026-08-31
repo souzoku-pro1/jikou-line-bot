@@ -29,6 +29,20 @@ PII なしだが、収載スクリプト+生成物 SHA pin で再現性は足り
 (e) 添付書類の □ run のプレースホルダ化（生成時に □/■ を値として差し込む。
     値なしの既定は □ ＝様式のまま）
 
+canonical pin との照合（fix1[H7C-01]）:
+  保存後、生成物の canonical manifest SHA（hub/houki_shinjutsu.
+  canonical_sha256——全段落テキスト+run 分割+rPr 要点の決定的直列化・zip
+  タイムスタンプ非依存）を hub/houki_shinjutsu.TEMPLATE_CANONICAL_SHA256 と
+  照合し、不一致なら exit 1（テンプレの不動文字・プレースホルダ構成が
+  pin 済み正本から変わっている）。
+  **意図的更新の手順（原本改訂・プレースホルダ設計変更時のみ・票由来）**:
+  1. 本 docstring 冒頭の SOURCE_SHA256 を新しい原本の実測値へ更新
+  2. 本スクリプトを実行（canonical 不一致で exit 1・新 canonical が出力される）
+  3. 出力された canonical を hub/houki_shinjutsu.TEMPLATE_CANONICAL_SHA256 へ、
+     コミット現物の SHA-256 を TEMPLATE_SHA256 へ pin し直す
+  4. 再実行して一致（exit 0）を確認・全 suite green → commit（Codex レビュー
+     対象。canonical 定数の変更は官製様式の不動文言の変更を意味する）
+
 実行: python scripts/make_shinjutsu_template.py
 """
 
@@ -42,6 +56,10 @@ from docx.table import _Cell
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
+
+from hub.houki_shinjutsu import (TEMPLATE_CANONICAL_SHA256,  # noqa: E402
+                                 canonical_sha256)
+from hub.redact import emit  # noqa: E402
 
 SOURCE = Path.home() / "Desktop" / "claude" / "相続放棄　書式.docx"
 SOURCE_SHA256 = (
@@ -280,10 +298,19 @@ def main() -> None:
     # sink 規律（test_sink_ast_policy）: print 引数は定数+emit() のみ。
     # 保存先・個数は上の検査で定数確定済み。SHA-256 hex64 は record_id の
     # 値域（[A-Za-z0-9_-]{1,64}）を満たす素通し kind で出力する
-    from hub.redact import emit
     print("saved: docx_templates/houki/相続放棄申述書.docx")
     print("placeholders: 33")
     print("TEMPLATE_SHA256 =", emit(sha, "record_id", "log", "operator"))
+
+    # fix1[H7C-01]: 生成物の canonical を pin 済み定数と照合（不一致=exit 1。
+    # 意図的更新の手順は docstring 参照）
+    canon = canonical_sha256(Document(str(OUT)))
+    print("CANONICAL_SHA256 =", emit(canon, "record_id", "log", "operator"))
+    if canon != TEMPLATE_CANONICAL_SHA256:
+        die("生成物の canonical が pin（hub/houki_shinjutsu."
+            "TEMPLATE_CANONICAL_SHA256）と一致しません。原本改訂等の意図的"
+            "更新なら docstring の手順で pin を更新してください")
+    print("canonical: OK (matches pinned TEMPLATE_CANONICAL_SHA256)")
 
 
 if __name__ == "__main__":
