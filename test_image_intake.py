@@ -206,6 +206,15 @@ class TestDebounceElect(_Base):
 class TestSendReceiptAndClose(_Base):
     UID = "U_close"
 
+    def setUp(self):
+        super().setUp()
+        # fix2: 送信は「未返信マーカーあり」が前提（永続再確認）——各テストに
+        # 未返信マーカーを種入れ（検査の意味は fix1 と同一）
+        _run(self.store.create(None, {
+            "line_user_id": self.UID,
+            "category": ii.marker_category("houki", "cl1"),
+            "message": cr.IMAGE_INBOUND_MARKER}))
+
     def test_success_saves_receipt(self):
         with patch.object(ii, "push_text", AsyncMock(return_value=True)):
             ok = _run(ii.send_receipt_and_close("houki", ii.HOUKI_CHANNEL,
@@ -551,6 +560,120 @@ class TestHealWiring(_Base):
             _run(hearing.handle_houki_hearing("rt", "U_wire_h", "こんにちは"))
         spy.assert_awaited_once()
         self.assertEqual(spy.await_args.args[0], "houki")
+
+
+# ── fix2[fix1-01]: 送信 claim（heal×代表・heal×heal の二重送信遮断） ─────────────
+class TestSendClaim(_Base):
+    UID = "U_claim"
+
+    def _marker(self, evid="cv1"):
+        return _run(self.store.create(None, {
+            "line_user_id": self.UID,
+            "category": ii.marker_category("houki", evid),
+            "message": cr.IMAGE_INBOUND_MARKER}))
+
+    def test_parallel_heals_single_push(self):
+        # heal 同士の並行進入 → push 合計 1 回・受領済み行 1 行
+        self._marker()
+        gate = asyncio.Event()
+        calls = []
+
+        async def slow_push(channel, to, text):
+            calls.append(text)
+            await gate.wait()
+            return True
+
+        async def scenario():
+            with patch.object(ii, "push_text", slow_push):
+                t1 = asyncio.ensure_future(ii.heal_unreplied(
+                    "houki", ii.HOUKI_CHANNEL, self.UID))
+                await asyncio.sleep(0.01)      # t1 が claim→push 待ちに入る
+                t2 = asyncio.ensure_future(ii.heal_unreplied(
+                    "houki", ii.HOUKI_CHANNEL, self.UID))
+                await asyncio.sleep(0.01)      # t2 は claim 済みに阻まれ終了
+                gate.set()
+                return await t1, await t2
+        r1, r2 = _run(scenario())
+        self.assertTrue(r1)
+        self.assertFalse(r2)
+        self.assertEqual(len(calls), 1)                      # push 1 回
+        self.assertEqual(len(self.store.receipts("houki")), 1)
+        self.assertEqual(ii._send_claims, set())             # claim リークなし
+
+    def test_representative_gap_heal_interleave_single_push(self):
+        # Codex 指摘の実再現: 代表が _pending.pop 後の await（elect の最新
+        # 照会）で停止→heal が進入して送信完了→代表再開、で push 合計 1 回
+        push = AsyncMock(return_value=True)
+        gate = asyncio.Event()
+        state = {"blocked": False}
+        real_search = self.store.search
+
+        async def gated_search(app, query, fields=None):
+            if ('like "画像受領:houki:' in query
+                    and not state["blocked"]):
+                state["blocked"] = True        # 代表の elect 照会だけ止める
+                await gate.wait()
+            return await real_search(app, query, fields)
+
+        async def scenario():
+            with patch.object(hub_kintone, "search_records", gated_search),                     patch.object(ii, "push_text", push),                     patch.object(ii, "is_suppressed",
+                                 AsyncMock(return_value=False)):
+                rep = asyncio.ensure_future(
+                    ii.handle_houki_image(self.UID, "cv1"))
+                await asyncio.sleep(0.08)      # marker→winner→debounce→pop→照会で停止
+                healed = await ii.heal_unreplied(
+                    "houki", ii.HOUKI_CHANNEL, self.UID)
+                gate.set()
+                await rep
+                return healed
+        healed = _run(scenario())
+        self.assertTrue(healed)                              # heal が閉じた
+        push.assert_awaited_once()                           # push 合計 1 回
+        self.assertEqual(len(self.store.receipts("houki")), 1)
+        self.assertEqual(ii._send_claims, set())
+
+    def test_claim_released_on_push_failure(self):
+        # 全終了経路で解放（失敗時も）→ 次の heal で回収できる
+        self._marker()
+        with patch.object(ii, "push_text", AsyncMock(return_value=False)):
+            self.assertFalse(_run(ii.heal_unreplied(
+                "houki", ii.HOUKI_CHANNEL, self.UID)))
+        self.assertEqual(ii._send_claims, set())
+        with patch.object(ii, "push_text", AsyncMock(return_value=True)):
+            self.assertTrue(_run(ii.heal_unreplied(
+                "houki", ii.HOUKI_CHANNEL, self.UID)))
+        self.assertEqual(ii._send_claims, set())
+
+    def test_claim_released_on_transport_exception(self):
+        self._marker()
+        with patch.object(ii, "push_text",
+                          AsyncMock(side_effect=RuntimeError("net"))):
+            self.assertFalse(_run(ii.heal_unreplied(
+                "houki", ii.HOUKI_CHANNEL, self.UID)))
+        self.assertEqual(ii._send_claims, set())
+
+    def test_already_replied_send_is_noop(self):
+        # claim 取得後の永続再確認: 並行相手が閉じ切った後の後追い送信は no-op
+        self._marker()
+        with patch.object(ii, "push_text", AsyncMock(return_value=True)):
+            self.assertIs(_run(ii.send_receipt_and_close(
+                "houki", ii.HOUKI_CHANNEL, self.UID)), True)
+            res = _run(ii.send_receipt_and_close(
+                "houki", ii.HOUKI_CHANNEL, self.UID))
+        self.assertIsNone(res)                               # 送信不要=None
+        self.assertEqual(len(self.store.receipts("houki")), 1)
+
+
+class TestSingleWorkerPinned(unittest.TestCase):
+    def test_procfile_single_worker(self):
+        # fix2[3]: in-memory 排他（_pending/_send_claims/_notify_in_flight）は
+        # 単一 worker・単一イベントループ前提（既存裁定）。本番起動構成が
+        # workers=1（uvicorn 既定）であることを pin——worker 複数化票では
+        # 永続 CAS/一意キーによる排他への置換が必須（既知の制約）
+        text = open("Procfile", encoding="utf-8").read()
+        self.assertIn("uvicorn main:app", text)
+        self.assertNotIn("--workers", text)
+        self.assertNotIn("gunicorn", text)
 
 
 if __name__ == "__main__":

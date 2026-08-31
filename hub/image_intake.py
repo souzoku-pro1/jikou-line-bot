@@ -61,9 +61,19 @@ _APP_CHATLOG = kintone.KintoneApp(
 _MARKER_PREFIX = "画像受領:"          # 実カテゴリ= 画像受領:{channel}:{event_id}
 _RECEIPT_PREFIX = "画像受領済:"       # 実カテゴリ= 画像受領済:{channel}
 
-# 束ね予約: "channel:userId" → 最新受信のマーカー行 ID（単一イベントループ
-# 前提の in-memory。消失時は個別返信へ縮退＝無返信にはならない）
+# 束ね予約: "channel:userId" → 最新受信イベントの冪等キー（単一イベント
+# ループ前提の in-memory。消失時は個別返信へ縮退＝無返信にはならない）
 _pending: dict[str, str] = {}
+
+# fix2[fix1-01]: 送信 claim（"channel:userId"・単一保持者）。代表経路と
+# heal 経路は**同じ send_receipt_and_close を通る**ため、claim もここで共有
+# される（片方だけ見る抜け道がない）。確認→取得は await を挟まない同期区間
+# （H4-fix2 の _notify_in_flight / fix1 の _pending と同型）。
+# 【単一 worker 前提（既存裁定）】conversation_histories・_notify_in_flight・
+# _pending と同じく in-memory 排他は uvicorn workers=1（Procfile 実測・
+# test_image_intake が pin）が前提。worker 複数化票では永続 CAS/一意キーに
+# よる排他へ置換すること（既知の制約・司令塔裁定でスコープ外）
+_send_claims: set[str] = set()
 
 
 def marker_category(channel_name: str, event_id: str) -> str:
@@ -156,38 +166,62 @@ async def debounce_and_elect(channel_name: str, user_id: str,
 
 
 async def send_receipt_and_close(channel_name: str, channel,
-                                 user_id: str) -> bool:
+                                 user_id: str) -> bool | None:
     """受領返信を push し、**成功（True）を確認できたときだけ**受領済み行を
     保存して冪等を閉じる（fix1[03]・H-4 の「通知 True 時のみ書込」と同型）。
 
-    失敗（非 2xx・通信例外）は受領済み行を残さず False——「未返信」のまま
-    自己修復発火（heal_unreplied）が回収する。受領済み行の保存失敗も同様に
-    未返信のまま（再発火の重複受領文は許容・安全側）。要確認通知は呼び出し
-    側の責務（チャネル別の既存流儀に合わせる）。"""
+    戻り値（fix2[fix1-01]）:
+      True  = 送信+閉鎖に成功
+      None  = 送信不要（claim を他タスクが保持中／永続再確認で返信済み・
+              マーカーなし）＝呼び出し側は沈黙してよい（失敗ではない）
+      False = 送信失敗（非 2xx・通信例外・受領済み行の保存失敗）＝未返信の
+              まま（heal が回収）。要確認通知は呼び出し側の責務
+
+    fix2[fix1-01]: 送信 claim——確認→取得は await を挟まない同期区間で行い、
+    push 前に単一保持者へ閉じる（代表経路と heal 経路の共有関門）。claim は
+    try/finally で**全終了経路（成功・失敗・例外）**で解放される。claim 取得
+    後に永続正本（App 28）で未返信を再確認する＝並行相手が閉じ切った後の
+    後追い送信（claim 解放後の TOCTOU）も遮断。"""
+    key = _key(channel_name, user_id)
+    if key in _send_claims:                  # 確認→取得（同期区間・awaitなし）
+        logger.info("[IMAGE_INTAKE] send claim held elsewhere (skip)")
+        return None
+    _send_claims.add(key)
     try:
-        sent = await push_text(channel, user_id, IMAGE_RECEIPT_REPLY)
-    except Exception:
-        logger.error("[IMAGE_INTAKE] receipt push transport error "
-                     "(stays unreplied)")
-        return False
-    if sent is not True:
-        logger.error("[IMAGE_INTAKE] receipt push rejected (stays unreplied)")
-        return False
-    try:
-        await kintone.create_record(_APP_CHATLOG, {
-            "line_user_id": user_id,
-            "role": "assistant",
-            "message": IMAGE_RECEIPT_REPLY,
-            "category": _receipt_category(channel_name),
-            "auto_sent": "yes",
-        })
-    except Exception:
-        # 送信は済んでいる。閉鎖に失敗＝未返信のまま→自己修復で再送
-        # （at-least-once・重複受領文は許容）
-        logger.error("[IMAGE_INTAKE] receipt record save failed "
-                     "(will re-fire)")
-        return False
-    return True
+        # claim 取得後の永続再確認（未返信でなければ送らない）
+        marker = await latest_marker_row_id(channel_name, user_id)
+        if not marker:
+            return None
+        receipt = await _latest_receipt_row_id(channel_name, user_id)
+        if receipt and int(receipt) > int(marker):
+            return None                      # 既に閉鎖済み（重複送信の遮断）
+        try:
+            sent = await push_text(channel, user_id, IMAGE_RECEIPT_REPLY)
+        except Exception:
+            logger.error("[IMAGE_INTAKE] receipt push transport error "
+                         "(stays unreplied)")
+            return False
+        if sent is not True:
+            logger.error("[IMAGE_INTAKE] receipt push rejected "
+                         "(stays unreplied)")
+            return False
+        try:
+            await kintone.create_record(_APP_CHATLOG, {
+                "line_user_id": user_id,
+                "role": "assistant",
+                "message": IMAGE_RECEIPT_REPLY,
+                "category": _receipt_category(channel_name),
+                "auto_sent": "yes",
+            })
+        except Exception:
+            # 送信は済んでいる。閉鎖に失敗＝未返信のまま→自己修復で再送
+            # （at-least-once・重複受領文は許容）
+            logger.error("[IMAGE_INTAKE] receipt record save failed "
+                         "(will re-fire)")
+            return False
+        return True
+    finally:
+        _send_claims.discard(key)            # 全終了経路で解放（リークなし）
 
 
 async def heal_unreplied(channel_name: str, channel, user_id: str) -> bool:
@@ -209,14 +243,13 @@ async def heal_unreplied(channel_name: str, channel, user_id: str) -> bool:
     try:
         if _key(channel_name, user_id) in _pending:
             return False                     # 生きた待機タスクが回収する
-        marker = await latest_marker_row_id(channel_name, user_id)
-        if not marker:
-            return False
-        receipt = await _latest_receipt_row_id(channel_name, user_id)
-        if receipt and int(receipt) > int(marker):
-            return False                     # 返信済み（永続正本で確認）
-        logger.info("[IMAGE_INTAKE] unreplied marker found (healing)")
-        return await send_receipt_and_close(channel_name, channel, user_id)
+        # 未返信判定は send_receipt_and_close の claim 取得後の永続再確認に
+        # 集約（fix2: 判定と送信の間に await の隙間を作らない）。返信済み・
+        # マーカーなし・claim 保持中は None（送信不要）が返る
+        result = await send_receipt_and_close(channel_name, channel, user_id)
+        if result is True:
+            logger.info("[IMAGE_INTAKE] unreplied marker healed")
+        return result is True
     except Exception:
         logger.info("[IMAGE_INTAKE] heal check failed (retry on next event)")
         return False
@@ -302,7 +335,12 @@ async def handle_houki_image(user_id: str, event_id: str) -> None:
     if not await debounce_and_elect("houki", user_id, idem_key, _latest):
         logger.info("[IMAGE_INTAKE] bundled (superseded)")
         return
-    if not await send_receipt_and_close("houki", HOUKI_CHANNEL, user_id):
+    result = await send_receipt_and_close("houki", HOUKI_CHANNEL, user_id)
+    if result is None:
+        # fix2: claim 保持中/既に閉鎖済み=送信不要（他タスクが閉じる・沈黙）
+        logger.info("[IMAGE_INTAKE] receipt not needed (claimed or closed)")
+        return
+    if result is not True:
         # fix1[03]: 未返信のまま（自己修復が回収）+代表経路の失敗は要確認通知
         await _alert_houki_image_failure(user_id, "受領返信の送信")
         return

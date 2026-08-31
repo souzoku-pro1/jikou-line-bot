@@ -1061,9 +1061,13 @@ async def _process_line_image_event(reply_token: str, user_id: str,
                         emit(user_id, "external_ref", "log", "operator"))
             return
         # fix1[03]: push 成功を確認できたときだけ受領済み行で閉鎖（App 28 が
-        # 正本）。失敗=未返信のまま（自己修復発火が回収）+要確認通知
-        if not await image_intake.send_receipt_and_close(
-                "jikou", hub_line_channel.JIKOU_CHANNEL, user_id):
+        # 正本）。失敗=未返信のまま（自己修復発火が回収）+要確認通知。
+        # fix2: None=送信不要（claim 保持中/既に閉鎖済み）は沈黙
+        _receipt_result = await image_intake.send_receipt_and_close(
+                "jikou", hub_line_channel.JIKOU_CHANNEL, user_id)
+        if _receipt_result is None:
+            return
+        if _receipt_result is not True:
             await _notify_image_failure()
             return
         # ヒアリング中のメモリ履歴にも受領を残す（既知項目台帳の
