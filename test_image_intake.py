@@ -776,6 +776,83 @@ class TestFailureNotifyUnified(_Base):
         self.alert.assert_awaited_once()
 
 
+# ── fix4[fix3-01]: throttle key 分離+success_only 統一（実 notify 込み） ─────────
+class TestFailureNotifyThrottleKeys(_Base):
+    """notify_admin_line の実装込み（モックは最下層 push_line_message のみ）で
+    Codex 指摘の経路を再現する。"""
+    UID = "U_throttle_keys_0123456789"
+
+    def setUp(self):
+        super().setUp()
+        from hub import notify as notify_mod
+        self.notify_mod = notify_mod
+        notify_mod._last_notify_at.clear()
+        notify_mod._notify_in_flight.clear()
+        self.addCleanup(notify_mod._last_notify_at.clear)
+        self.addCleanup(notify_mod._notify_in_flight.clear)
+        p = patch.object(notify_mod, "get_admin_line_user_id",
+                         lambda: "U_admin")
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _marker(self, evid="tk1"):
+        return _run(self.store.create(None, {
+            "line_user_id": self.UID,
+            "category": ii.marker_category("houki", evid),
+            "message": cr.IMAGE_INBOUND_MARKER}))
+
+    def test_prior_failed_notice_does_not_silence_send_failure_notice(self):
+        # Codex 指摘の経路そのもの: 既存系（受領記録失敗）の通知が**送信失敗**
+        # →300 秒以内に受領返信失敗→受領返信失敗の要確認が**実送信**される
+        self._marker()
+        push_down = AsyncMock(return_value=False)
+        with patch.object(self.notify_mod, "push_line_message", push_down):
+            _run(ii._alert_houki_image_failure(self.UID, "受領記録"))
+        push_up = AsyncMock(return_value=True)
+        with patch.object(self.notify_mod, "push_line_message", push_up),                 patch.object(ii, "push_text", AsyncMock(return_value=False)):
+            self.assertFalse(_run(ii.send_receipt_and_close(
+                "houki", ii.HOUKI_CHANNEL, self.UID)))
+        push_up.assert_awaited_once()          # 実送信 1 回（黙らない）
+        self.assertIn("受領返信の送信", push_up.await_args.args[1])
+
+    def test_same_kind_failures_coalesce_after_success(self):
+        # キー分離後の正常系: 同種（受領返信失敗）の連続は成功後 300 秒集約
+        self._marker()
+        push = AsyncMock(return_value=True)
+        with patch.object(self.notify_mod, "push_line_message", push),                 patch.object(ii, "push_text", AsyncMock(return_value=False)):
+            self.assertFalse(_run(ii.send_receipt_and_close(
+                "houki", ii.HOUKI_CHANNEL, self.UID)))
+            self.assertFalse(_run(ii.send_receipt_and_close(
+                "houki", ii.HOUKI_CHANNEL, self.UID)))
+        push.assert_awaited_once()             # 2 回目はスロットル集約
+
+    def test_alert_notice_failure_does_not_stamp(self):
+        # houki 画像系の success_only 統一: 通知自体の送信失敗は刻印されず、
+        # 直後の再試行が実送信できる（「1 回も出ない」を作らない）
+        self._marker()
+        with patch.object(self.notify_mod, "push_line_message",
+                          AsyncMock(return_value=False)):
+            _run(ii._alert_houki_image_failure(self.UID, "受領記録"))
+        push = AsyncMock(return_value=True)
+        with patch.object(self.notify_mod, "push_line_message", push):
+            _run(ii._alert_houki_image_failure(self.UID, "受領記録"))
+        push.assert_awaited_once()             # スロットルに阻まれない
+
+    def test_keys_are_separated(self):
+        # キー割り当ての pin: 受領返信失敗=houki_image_send_failure:/既存系=
+        # houki_image_failure:（同一ユーザーでも独立に 1 回ずつ実送信）
+        self._marker()
+        push = AsyncMock(return_value=True)
+        with patch.object(self.notify_mod, "push_line_message", push),                 patch.object(ii, "push_text", AsyncMock(return_value=False)):
+            _run(ii._alert_houki_image_failure(self.UID, "受領記録"))
+            self.assertFalse(_run(ii.send_receipt_and_close(
+                "houki", ii.HOUKI_CHANNEL, self.UID)))
+        self.assertEqual(push.await_count, 2)  # キーが別=双方とも実送信
+        keys = set(self.notify_mod._last_notify_at)
+        self.assertIn(f"houki_image_failure:{self.UID}", keys)
+        self.assertIn(f"houki_image_send_failure:{self.UID}", keys)
+
+
 class TestSingleWorkerPinned(unittest.TestCase):
     def test_procfile_single_worker(self):
         # fix2[3]: in-memory 排他（_pending/_send_claims/_notify_in_flight）は

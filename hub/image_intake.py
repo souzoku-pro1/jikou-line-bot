@@ -282,7 +282,10 @@ async def _notify_send_failure(channel_name: str, user_id: str) -> None:
                 "【相続放棄・要確認】書類写真の受領返信の送信に失敗しました。"
                 "LINE アプリで受信をご確認ください。\n"
                 f"userId: {user_id[:10]}...",
-                throttle_key=f"houki_image_failure:{user_id}",
+                # fix4[fix3-01]: 受領返信失敗は**専用キー**（既存系の受領記録/
+                # 勝者判定失敗と分離——共有キー+モード混在で「失敗刻印が
+                # 本通知を黙らせて実送信 0 回」になる穴を塞ぐ）
+                throttle_key=f"houki_image_send_failure:{user_id}",
                 throttle_on_success_only=True,
             )
         else:
@@ -304,6 +307,10 @@ async def _alert_houki_image_failure(user_id: str, what: str) -> None:
         "LINE アプリで受信をご確認ください。\n"
         f"userId: {user_id[:10]}...",
         throttle_key=f"houki_image_failure:{user_id}",
+        # fix4[fix3-01]: houki 画像系の失敗通知は success_only へ統一——
+        # 「通知の送信失敗が刻印を残して以後を黙らせる」経路をこの系から一掃
+        # （既定 False 挙動に依存する他の共用 caller には触れない）
+        throttle_on_success_only=True,
     )
 
 
