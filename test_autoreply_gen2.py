@@ -43,6 +43,7 @@ for _k, _v in _ENV.items():
 
 import chat_responder as cr  # noqa: E402
 import main  # noqa: E402
+from hub import image_intake as _ii_mod  # noqa: E402
 from hub import reply_sanitizer as rs  # noqa: E402
 
 
@@ -336,9 +337,22 @@ class _FakeChatlog:
             raise RuntimeError("search down")
         import re as _re
         m = _re.search('category = "([^"]+)"', query)
-        rows = [r for r in self.rows if r.get("category") == m.group(1)]
-        rows.sort(key=lambda r: int(r["$id"]))
-        return [{"$id": {"value": r["$id"]}} for r in rows[:1]]
+        m_like = _re.search('category like "([^"]+)"', query)
+        m_uid = _re.search('line_user_id = "([^"]+)"', query)
+        rows = self.rows
+        if m_uid:
+            rows = [r for r in rows
+                    if r.get("line_user_id") == m_uid.group(1)]
+        if m:
+            rows = [r for r in rows if r.get("category") == m.group(1)]
+        elif m_like:
+            rows = [r for r in rows
+                    if m_like.group(1) in str(r.get("category") or "")]
+        rows = sorted(rows, key=lambda r: int(r["$id"]),
+                      reverse=("desc" in query))
+        return [{"$id": {"value": r["$id"]},
+                 "category": {"value": r.get("category", "")}}
+                for r in rows[:1]]
 
 
 class TestImageEvent(_AsyncBase):
@@ -348,10 +362,9 @@ class TestImageEvent(_AsyncBase):
         super().setUp()
         self.store = _FakeChatlog()
         # IMAGE-INTAKE-1: 束ね待ちの短縮+予約の初期化（挙動検査は不変）
-        from hub import image_intake as _ii
-        _ii._pending.clear()
-        self.addCleanup(_ii._pending.clear)
-        _p = patch.object(_ii, "DEBOUNCE_SEC", 0)
+        _ii_mod._pending.clear()
+        self.addCleanup(_ii_mod._pending.clear)
+        _p = patch.object(_ii_mod, "DEBOUNCE_SEC", 0)
         _p.start()
         self.addCleanup(_p.stop)
 
@@ -361,7 +374,8 @@ class TestImageEvent(_AsyncBase):
                          AsyncMock(return_value=False)),
             patch.object(main, "get_app21_record",
                          AsyncMock(return_value=record)),
-            patch.object(main.hub_line_channel, "push_text", AsyncMock()),
+            patch.object(_ii_mod, "push_text",
+                         AsyncMock(return_value=True)),
             patch.object(main, "save_to_chatlog", AsyncMock()),
             patch("hub.notify.notify_business", AsyncMock(return_value=True)),
             patch.object(main, "ATTORNEY_LINE_USER_ID", "Uattorney"),
@@ -382,14 +396,17 @@ class TestImageEvent(_AsyncBase):
         reply, log, notify = self._run_image(self._patches())
         reply.assert_awaited_once()
         self.assertEqual(reply.await_args.args[2], cr.IMAGE_RECEIPT_REPLY)
-        # 受信マーカーは strict 保存（category=画像受領:{event_id}）
-        self.assertEqual(len(self.store.rows), 1)
-        self.assertEqual(self.store.rows[0]["category"], "画像受領:evt-1")
-        self.assertEqual(self.store.rows[0]["message"],
-                         cr.IMAGE_INBOUND_MARKER)
-        # assistant 記録は fail-open writer 経由
-        log.assert_awaited_once()
-        self.assertEqual(log.await_args.args[2], cr.IMAGE_RECEIPT_REPLY)
+        # 受信マーカーは strict 保存（fix1[02]: category=画像受領:jikou:{event_id}）
+        markers = [r for r in self.store.rows
+                   if r["category"].startswith("画像受領:jikou:")]
+        self.assertEqual(len(markers), 1)
+        self.assertEqual(markers[0]["category"], "画像受領:jikou:evt-1")
+        self.assertEqual(markers[0]["message"], cr.IMAGE_INBOUND_MARKER)
+        # fix1[03]: push 成功の確認後に受領済み行（永続正本）で閉鎖
+        receipts = [r for r in self.store.rows
+                    if r.get("category") == "画像受領済:jikou"]
+        self.assertEqual(len(receipts), 1)
+        self.assertEqual(receipts[0]["message"], cr.IMAGE_RECEIPT_REPLY)
         notify.assert_awaited_once()
         self.assertIn("書類写真受領", notify.await_args.args[1])
 
@@ -400,9 +417,9 @@ class TestImageEvent(_AsyncBase):
         r2, l2, n2 = self._run_image(self._patches())
         r1.assert_awaited_once()
         r2.assert_not_awaited()
-        l2.assert_not_awaited()
         n2.assert_not_awaited()
-        self.assertEqual(len(self.store.rows), 1)
+        self.assertEqual(len([r for r in self.store.rows
+                              if r["category"].startswith("画像受領:")]), 1)
 
     def test_concurrent_race_single_effect(self):
         # fix1[03] negative: pre-check をすり抜けた並行 2 配送でも、保存後の
@@ -414,7 +431,9 @@ class TestImageEvent(_AsyncBase):
         r1.assert_awaited_once()
         r2.assert_not_awaited()          # 敗者は作用 0
         n2.assert_not_awaited()
-        self.assertEqual(len(self.store.rows), 2)
+        self.assertEqual(len([r for r in self.store.rows
+                              if r["category"].startswith("画像受領:jikou:")]),
+                         2)
 
     def test_marker_save_failure_no_reply_and_raises(self):
         # fix1[03] 部分失敗: 保存失敗＝返信・通知なしで例外（握りつぶし廃止）
@@ -488,7 +507,12 @@ class TestImageEvent(_AsyncBase):
         replies, notifies = _run(scenario())
         self.assertEqual(replies, 1)
         self.assertEqual(notifies, 1)
-        self.assertEqual(len(self.store.rows), 2)
+        # fix1: 受信行 2 件（マーカー）+受領済み行 1 件（push 成功の閉鎖）
+        self.assertEqual(len([r for r in self.store.rows
+                              if r["category"].startswith("画像受領:jikou:")]),
+                         2)
+        self.assertEqual(len([r for r in self.store.rows
+                              if r.get("category") == "画像受領済:jikou"]), 1)
 
     def test_winner_query_one_side_failure(self):
         # fix2[03] negative: 勝者照会の片側失敗→その側は送信 0+要確認通知・

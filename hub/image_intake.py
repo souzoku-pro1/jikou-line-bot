@@ -1,4 +1,4 @@
-"""画像受信の複数枚まとめ受領返信 — IMAGE-INTAKE-1（両チャネル・AI読解なし）
+"""画像受信の複数枚まとめ受領返信 — IMAGE-INTAKE-1（+fix1）
 
 スコープ（票裁定）:
 - 画像バイナリの取得（LINE コンテンツ API）と kintone 添付は**保留**——
@@ -8,20 +8,33 @@
   本 module に取得+添付を実装する（AI 読解は IMG-2）。
 - 本票は「複数枚まとめ受領返信（デバウンス）」のみ。
 
-束ね方式（IMAGE-INTAKE-SURVEY 提言 3 の導出型）:
-1. 受信ごとの App 28 マーカー保存（category=画像受領:{event_id}・冪等キー）は
-   従来どおり（時効側=main.py の strict 保存・相続放棄側=本 module）。
+fix1（R-IMAGE-INTAKE-01/02/03・統一設計）: 返信完了の正本を App 28 に置く
+——H-4 の確立形（冪等キー=永続非空・送信 True 時のみ閉鎖・自己修復発火）と
+同じ型。
+- マーカー（user 行）: category = 画像受領:{channel}:{event_id}
+  （fix1[02]: チャネル識別子込み。旧形式 画像受領:{event_id} の既存行は
+  新クエリに一致しない=返信済みの既往として扱う）
+- 受領返信済み（assistant 行）: category = 画像受領済:{channel}。
+  **push 成功（True）を確認できたときだけ**保存する（fix1[03]）
+- 未返信の永続判定: チャネル別の最新マーカー行 $id > 最新受領済み行 $id
+  （受領済み行なしを含む）
+- 自己修復発火（fix1[01]）: 同一ユーザーの次のイベント受信時
+  （時効=テキスト worker・相続放棄=ヒアリング入口・画像は代表選出自体が
+  回収）に heal_unreplied() が未返信を検知して受領返信を送る。起動時 sweep は
+  実装しない=「次のイベントまで返信が出ない」残余は票報告に明記
+
+束ね方式:
+1. 受信ごとに App 28 マーカーを strict 保存（冪等キー）。
 2. 返信は DEBOUNCE_SEC 待つ。in-memory 予約 _pending（H4-fix2 の
-   _notify_in_flight と同型: 単一イベントループ前提・予約の確認と更新は
-   **await を挟まない同期区間**で行う）で新着受信に代表を譲る。
-3. 代表候補は App 28 照会（自分のマーカーがそのユーザーの最新受領行か）で
-   確定してから push 1 通（reply token は待ち合わせで失効するため不使用）。
-4. fail-safe（無返信を作らない）: in-memory 予約の消失（再起動相当）=
-   個別返信に縮退・App 28 照会失敗=個別返信に縮退。束ね損ねは重複受領文の
-   み＝安全側。
+   _notify_in_flight と同型: 予約の確認・更新は await を挟まない同期区間）で
+   新着受信に代表を譲る。
+3. 代表候補は App 28 照会（チャネル別の最新受領行=自分）で確定してから
+   push 1 通（reply token は待ち合わせで失効するため不使用）。
+4. fail-safe: in-memory 予約の消失・照会失敗は個別返信側へ縮退（束ね損ね=
+   重複受領文のみ・安全側）。push 失敗・受領済み行の保存失敗は「未返信」の
+   まま残り、自己修復発火が回収する（無返信を恒久化しない）。
 
 弁護士決定（凍結）: 受領文言は両チャネルとも chat_responder.IMAGE_RECEIPT_REPLY
-（「書類のお写真を受領いたしました。弁護士が確認のうえご連絡いたします。」）
 を使用。枚数の文言追加はしない。
 """
 
@@ -29,8 +42,7 @@ import asyncio
 import logging
 import os
 
-from chat_responder import (IMAGE_INBOUND_MARKER, IMAGE_RECEIPT_REPLY,
-                            save_to_chatlog)
+from chat_responder import IMAGE_INBOUND_MARKER, IMAGE_RECEIPT_REPLY
 from hub import kintone
 from hub import notify
 from hub.autoreply_stoplist import is_suppressed
@@ -39,29 +51,69 @@ from hub.redact import emit
 
 logger = logging.getLogger("hub.image_intake")
 
-# デバウンス秒数（実装判断・完了報告に明記）: LINE の複数枚送信は通常
+# デバウンス秒数（実装判断・票報告に明記）: LINE の複数枚送信は通常
 # 数秒〜数十秒間隔で届く。90 秒は「ゆっくり撮り直しながらの連続送信」を
 # 概ね 1 束に収めつつ、受領応答の遅延として許容できる上限として採用
 DEBOUNCE_SEC = 90
 
 _APP_CHATLOG = kintone.KintoneApp(
     "App 28 (チャットログ)", "APP_CHATLOG", "TOKEN_CHATLOG")
-_MARKER_PREFIX = "画像受領:"
+_MARKER_PREFIX = "画像受領:"          # 実カテゴリ= 画像受領:{channel}:{event_id}
+_RECEIPT_PREFIX = "画像受領済:"       # 実カテゴリ= 画像受領済:{channel}
 
 # 束ね予約: "channel:userId" → 最新受信のマーカー行 ID（単一イベントループ
 # 前提の in-memory。消失時は個別返信へ縮退＝無返信にはならない）
 _pending: dict[str, str] = {}
 
 
+def marker_category(channel_name: str, event_id: str) -> str:
+    return f"{_MARKER_PREFIX}{channel_name}:{event_id}"
+
+
+def _receipt_category(channel_name: str) -> str:
+    return f"{_RECEIPT_PREFIX}{channel_name}"
+
+
 def _key(channel_name: str, user_id: str) -> str:
     return f"{channel_name}:{user_id}"
 
 
-async def latest_marker_row_id(user_id: str) -> str:
-    """そのユーザーの最新の画像受領マーカー行 ID（App 28 が永続正本）。"""
+async def _latest_marker_row(channel_name: str,
+                             user_id: str) -> tuple[str, str]:
+    """そのユーザー×チャネルの最新の画像受領マーカー行 ($id, category)
+    （App 28 が永続正本・fix1[02]: チャネル識別込みで判定する）。"""
     rows = await kintone.search_records(
         _APP_CHATLOG,
-        f'line_user_id = "{user_id}" and category like "{_MARKER_PREFIX}" '
+        f'line_user_id = "{user_id}" and '
+        f'category like "{_MARKER_PREFIX}{channel_name}:" '
+        "order by $id desc limit 1",
+        fields=["$id", "category"])
+    if not rows:
+        return "", ""
+    row = rows[0]
+    return (str(((row.get("$id") or {}).get("value")) or ""),
+            str(((row.get("category") or {}).get("value")) or ""))
+
+
+async def latest_marker_row_id(channel_name: str, user_id: str) -> str:
+    rid, _cat = await _latest_marker_row(channel_name, user_id)
+    return rid
+
+
+async def latest_marker_category(channel_name: str, user_id: str) -> str:
+    """代表判定用: 最新マーカー行の category（=最新イベントの冪等キー）。
+    同一イベントの並行二重配送は同じ category を共有するため、勝者決定
+    （最小 $id）と代表判定（最新イベント）が矛盾しない（fix1 実装時の
+    barrier 並行テストで発見した統合バグの根治）。"""
+    _rid, cat = await _latest_marker_row(channel_name, user_id)
+    return cat
+
+
+async def _latest_receipt_row_id(channel_name: str, user_id: str) -> str:
+    rows = await kintone.search_records(
+        _APP_CHATLOG,
+        f'line_user_id = "{user_id}" and '
+        f'category = "{_receipt_category(channel_name)}" '
         "order by $id desc limit 1",
         fields=["$id"])
     if not rows:
@@ -70,7 +122,7 @@ async def latest_marker_row_id(user_id: str) -> str:
 
 
 async def debounce_and_elect(channel_name: str, user_id: str,
-                             my_row_id: str, latest_row_query) -> bool:
+                             my_token: str, latest_token_query) -> bool:
     """デバウンス待ち→代表選出。True=返信する（代表 or 縮退の個別返信）・
     False=沈黙（より新しい受信のタスクが代表して返信する）。
 
@@ -80,7 +132,7 @@ async def debounce_and_elect(channel_name: str, user_id: str,
       無返信を作らない。最悪は束ね損ねの個別返信）
     """
     key = _key(channel_name, user_id)
-    my = str(my_row_id)
+    my = str(my_token)
     _pending[key] = my                       # 登録（同期区間）
     await asyncio.sleep(DEBOUNCE_SEC)
     cur = _pending.get(key)
@@ -93,12 +145,81 @@ async def debounce_and_elect(channel_name: str, user_id: str,
         return False                         # 新着が待機中=代表を譲る
     _pending.pop(key, None)                  # 自分の予約のみ解除（同期区間）
     try:
-        latest = await latest_row_query()
+        latest = await latest_token_query()
     except Exception:
         logger.info("[IMAGE_INTAKE] latest-marker query failed "
                     "(degraded to individual reply)")
         return True                          # fail-safe
+    # token=マーカー category＝イベント冪等キー（行 ID 比較だと同一
+    # イベントの二重配送行が勝者を「非最新」に見せて無返信になる）
     return str(latest) == my                 # 永続正本（App 28）で代表確定
+
+
+async def send_receipt_and_close(channel_name: str, channel,
+                                 user_id: str) -> bool:
+    """受領返信を push し、**成功（True）を確認できたときだけ**受領済み行を
+    保存して冪等を閉じる（fix1[03]・H-4 の「通知 True 時のみ書込」と同型）。
+
+    失敗（非 2xx・通信例外）は受領済み行を残さず False——「未返信」のまま
+    自己修復発火（heal_unreplied）が回収する。受領済み行の保存失敗も同様に
+    未返信のまま（再発火の重複受領文は許容・安全側）。要確認通知は呼び出し
+    側の責務（チャネル別の既存流儀に合わせる）。"""
+    try:
+        sent = await push_text(channel, user_id, IMAGE_RECEIPT_REPLY)
+    except Exception:
+        logger.error("[IMAGE_INTAKE] receipt push transport error "
+                     "(stays unreplied)")
+        return False
+    if sent is not True:
+        logger.error("[IMAGE_INTAKE] receipt push rejected (stays unreplied)")
+        return False
+    try:
+        await kintone.create_record(_APP_CHATLOG, {
+            "line_user_id": user_id,
+            "role": "assistant",
+            "message": IMAGE_RECEIPT_REPLY,
+            "category": _receipt_category(channel_name),
+            "auto_sent": "yes",
+        })
+    except Exception:
+        # 送信は済んでいる。閉鎖に失敗＝未返信のまま→自己修復で再送
+        # （at-least-once・重複受領文は許容）
+        logger.error("[IMAGE_INTAKE] receipt record save failed "
+                     "(will re-fire)")
+        return False
+    return True
+
+
+async def heal_unreplied(channel_name: str, channel, user_id: str) -> bool:
+    """自己修復発火（fix1[01]）: 未返信（最新マーカー行 > 最新受領済み行）を
+    検知したら受領返信を送って閉じる。送ったら True。
+
+    - _pending に予約がある間は生きた待機タスクに任せる（早すぎる送信をしない）
+    - 照会失敗・送信失敗は静かに次のイベントへ持ち越す（fail-open・
+      毎イベント再試行になるため通知はしない=スパム防止。代表経路の失敗
+      通知は呼び出し側が担う）
+    - 例外は外へ出さない（テキスト会話・ヒアリングを道連れにしない）
+    """
+    # テスト既定無効の env ゲート（conftest が IMAGE_HEAL_DISABLED=1 を
+    # setdefault・KOSEKI_READER_DISABLED と同区分）: 本発火は全テキスト受信の
+    # 入口に配線されるため、これを知らない既存テストから実 kintone へ到達
+    # し得る。本番は env 未設定＝有効
+    if os.environ.get("IMAGE_HEAL_DISABLED") == "1":
+        return False
+    try:
+        if _key(channel_name, user_id) in _pending:
+            return False                     # 生きた待機タスクが回収する
+        marker = await latest_marker_row_id(channel_name, user_id)
+        if not marker:
+            return False
+        receipt = await _latest_receipt_row_id(channel_name, user_id)
+        if receipt and int(receipt) > int(marker):
+            return False                     # 返信済み（永続正本で確認）
+        logger.info("[IMAGE_INTAKE] unreplied marker found (healing)")
+        return await send_receipt_and_close(channel_name, channel, user_id)
+    except Exception:
+        logger.info("[IMAGE_INTAKE] heal check failed (retry on next event)")
+        return False
 
 
 # ── 相続放棄チャネルの画像受信（受領返信の新設・IMAGE-INTAKE-1） ─────────────────
@@ -118,7 +239,7 @@ async def handle_houki_image(user_id: str, event_id: str) -> None:
     時効側（main._process_line_image_event）と同じゲート順・同じ冪等設計:
     全業務ブレーキ→停止リスト→冪等 pre-check→マーカー strict 保存
     （保存不能=返信しない fail-closed+要確認通知）→並行配送の勝者決定
-    （最小 $id）→束ね選出→push 受領返信+assistant 記録。
+    （最小 $id）→束ね選出→push 成功時のみ受領済み行で閉鎖（fix1[03]）。
     管理者への受信通知は router 側の既存 _record_inbound（300 秒スロットル）を
     維持し、本関数では送らない。"""
     if not event_id:
@@ -133,7 +254,7 @@ async def handle_houki_image(user_id: str, event_id: str) -> None:
                     emit(user_id[:10], "record_id", "log", "operator"))
         return
 
-    idem_key = _MARKER_PREFIX + event_id
+    idem_key = marker_category("houki", event_id)
     # 冪等 pre-check（失敗は続行に倒してよい——返信の重複は strict 保存+勝者
     # 決定が防ぐ。時効側 fix1[03] と同型）
     try:
@@ -176,13 +297,14 @@ async def handle_houki_image(user_id: str, event_id: str) -> None:
         return
 
     async def _latest():
-        return await latest_marker_row_id(user_id)
+        return await latest_marker_category("houki", user_id)
 
-    if not await debounce_and_elect("houki", user_id, my_id, _latest):
+    if not await debounce_and_elect("houki", user_id, idem_key, _latest):
         logger.info("[IMAGE_INTAKE] bundled (superseded)")
         return
-    await push_text(HOUKI_CHANNEL, user_id, IMAGE_RECEIPT_REPLY)
-    await save_to_chatlog(user_id, "assistant", IMAGE_RECEIPT_REPLY,
-                          "画像受領", "yes")
+    if not await send_receipt_and_close("houki", HOUKI_CHANNEL, user_id):
+        # fix1[03]: 未返信のまま（自己修復が回収）+代表経路の失敗は要確認通知
+        await _alert_houki_image_failure(user_id, "受領返信の送信")
+        return
     logger.info("[IMAGE_INTAKE] houki receipt sent userId=%s...",
                 emit(user_id[:10], "record_id", "log", "operator"))

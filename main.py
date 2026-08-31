@@ -729,6 +729,11 @@ async def _process_line_event(reply_token: str, user_id: str, user_text: str) ->
         await _handle_suppressed_inbound(user_id, user_text,
                                          _durable_event_id.get())
         return
+    # IMAGE-INTAKE-1-fix1[01]: 自己修復発火——再起動等でデバウンス待機タスク
+    # ごと消えた未返信の画像受領マーカーを、次のテキスト受信時に回収する
+    # （heal は内部で例外を握る=会話を道連れにしない）
+    await image_intake.heal_unreplied("jikou", hub_line_channel.JIKOU_CHANNEL,
+                                      user_id)
     try:
         # ── ルーティング判定 ──────────────────────────────────────────────
         in_hearing_session = (
@@ -917,7 +922,10 @@ _IMAGE_IDEM_PREFIX = "画像受領"
 
 
 def _image_idem_key(event_id: str) -> str:
-    return f"{_IMAGE_IDEM_PREFIX}:{event_id}"
+    # IMAGE-INTAKE-1-fix1[02]: チャネル識別子込み（image_intake.marker_category
+    # と同形）。旧形式 画像受領:{event_id} の既存行は新クエリに一致しない=
+    # 返信済みの既往として扱う（再配送のデプロイ跨ぎのみ理論上重複・許容）
+    return image_intake.marker_category("jikou", event_id)
 
 
 async def _image_already_handled(idem_key: str) -> bool:
@@ -1046,15 +1054,18 @@ async def _process_line_image_event(reply_token: str, user_id: str,
         # ため不使用。縮退時=個別返信で無返信は作らない）。譲った側は
         # 記録済み（マーカー）のまま無言
         if not await image_intake.debounce_and_elect(
-                "jikou", user_id, my_id,
-                lambda: image_intake.latest_marker_row_id(user_id)):
+                "jikou", user_id, idem_key,
+                lambda: image_intake.latest_marker_category("jikou",
+                                                            user_id)):
             logger.info("[IMAGE] bundled (superseded) user_id=%s",
                         emit(user_id, "external_ref", "log", "operator"))
             return
-        await hub_line_channel.push_text(hub_line_channel.JIKOU_CHANNEL,
-                                         user_id, IMAGE_RECEIPT_REPLY)
-        await save_to_chatlog(user_id, "assistant", IMAGE_RECEIPT_REPLY,
-                              "画像受領", "yes")
+        # fix1[03]: push 成功を確認できたときだけ受領済み行で閉鎖（App 28 が
+        # 正本）。失敗=未返信のまま（自己修復発火が回収）+要確認通知
+        if not await image_intake.send_receipt_and_close(
+                "jikou", hub_line_channel.JIKOU_CHANNEL, user_id):
+            await _notify_image_failure()
+            return
         # ヒアリング中のメモリ履歴にも受領を残す（既知項目台帳の
         # 「書類写真: 受領済み」の源になる）
         history = conversation_histories.get(user_id)
