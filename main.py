@@ -196,6 +196,7 @@ LINE_CHANNEL_SECRET = os.environ["LINE_CHANNEL_SECRET"]
 LINE_CHANNEL_ACCESS_TOKEN = os.environ["LINE_CHANNEL_ACCESS_TOKEN"]
 from hub import line_channel as hub_line_channel  # noqa: E402
 from hub import image_intake  # noqa: E402
+from hub import form_link  # noqa: E402  JIKOU-FORM-2: 受付番号による LINE 紐付け
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 KINTONE_SUBDOMAIN = os.environ["KINTONE_SUBDOMAIN"]
 KINTONE_APP_ID = os.environ["KINTONE_APP_ID"]
@@ -474,7 +475,8 @@ def _normalize_history(rows: list[dict]) -> list[dict]:
 
 
 async def ask_claude(user_id: str, user_message: str,
-                     known_items: dict | None = None) -> str:
+                     known_items: dict | None = None,
+                     form_handover: bool = False) -> str:
     history = conversation_histories.setdefault(user_id, [])
     history.append({"role": "user", "content": user_message})
 
@@ -486,6 +488,10 @@ async def ask_claude(user_id: str, user_message: str,
         system += ("\n\n【収集済み項目（既知・再質問禁止）】\n" + lines
                    + "\n上記は既に回答済み・受領済みの項目です。同じ内容を"
                      "再度質問・依頼しないでください。")
+    # JIKOU-FORM-2: 受付番号で紐付けた直後のターンにのみ、引き継ぎの旨を
+    # 一度だけ注入（履歴には残さない=system への追記のみ）
+    if form_handover:
+        system += "\n\n" + form_link.HANDOVER_PROMPT_NOTE
 
     response = await create_message_with_fallback(
         claude_client,
@@ -743,8 +749,60 @@ async def _process_line_event(reply_token: str, user_id: str, user_text: str) ->
             and user_id not in hearing_completed
         )
 
+        app21_record = None
         if not in_hearing_session:
             app21_record = await get_app21_record(user_id)
+
+        # ── JIKOU-FORM-2: 受付番号による紐付け（pause/停止リスト判定の後・
+        #    App 21 に未紐付けのユーザーからの「6 桁の数字のみ」に限る。
+        #    メモリ上のヒアリング中でも未紐付けなら対象=台帳を 1 照会して確認。
+        #    紐付け成功は同一ターンで通常ヒアリングへ流す（既知項目台帳が
+        #    フォーム回答を既知として注入）。不該当=固定文言 B・上限超過=無言）──
+        form_handover = False
+        linked_id_this_turn = ""      # fix2: 同ターンで確定した紐付け先（bind 結果）
+        receipt_number = form_link.detect_receipt_number(user_text)
+        if receipt_number is not None:
+            if in_hearing_session:
+                app21_record = await get_app21_record(user_id)
+            if app21_record is None:
+                outcome, linked_id = await form_link.try_link(
+                    user_id, receipt_number)
+                if outcome == "linked":
+                    # 紐付けで確定した事実（linked_id）を同ターン以降の正として
+                    # 持ち回る（再取得の成否に依存しない）
+                    kintone_record_ids[user_id] = linked_id
+                    linked_id_this_turn = linked_id
+                    form_handover = True
+                    # fix1-01: 紐付け先レコードの最新状態（ID で再取得）に対して
+                    # 人対応・status ルーティングを再評価する（メモリ上の
+                    # ヒアリング中でも迂回させない）。取得できなければ
+                    # fail-closed=自動返信しない+弁護士通知
+                    linked_record = await form_link.fetch_linked_record(linked_id)
+                    if linked_record is None:
+                        logger.error("[FORM_LINK] post-link refetch failed "
+                                     "(fail-closed, no auto reply) record_id=%s",
+                                     emit(linked_id, "record_id", "log", "operator"))
+                        await form_link.notify_fail_closed(linked_id)
+                        await save_to_chatlog(user_id, "user", user_text,
+                                              "ヒアリング", "no")
+                        return
+                    app21_record = linked_record
+                    in_hearing_session = False
+                    logger.info("[FORM_LINK] linked → re-evaluate routing user_id=%s",
+                                emit(user_id, "external_ref", "log", "operator"))
+                elif outcome == "not_matched":
+                    await _line_reply_with_fallback(
+                        reply_token, user_id, form_link.REPLY_NOT_MATCHED)
+                    await save_to_chatlog(user_id, "user", user_text,
+                                          "ヒアリング", "no")
+                    await save_to_chatlog(user_id, "assistant",
+                                          form_link.REPLY_NOT_MATCHED,
+                                          "ヒアリング", "yes")
+                    return
+                else:
+                    return                    # silent（上限超過・通知は module 側）
+
+        if not in_hearing_session:
             if app21_record is not None:
                 # ── 対応モード「人対応」判定 ────────────────────────────────
                 # App21参照後・既存ルーティング分岐の手前で早期return する。
@@ -828,8 +886,23 @@ async def _process_line_event(reply_token: str, user_id: str, user_text: str) ->
             _known_rec, conversation_histories.get(user_id, []))
         try:
             claude_reply = await ask_claude(user_id, user_text,
-                                            known_items=known_items)
+                                            known_items=known_items,
+                                            form_handover=form_handover)
         except ClaudeUnavailableError as e:
+            if form_handover:
+                # JIKOU-FORM-2: 紐付け直後のターンの AI 失敗は固定文言 A のみ
+                # （紐付けは成立済み・次のメッセージから通常ヒアリング）
+                await _line_reply_with_fallback(
+                    reply_token, user_id, form_link.REPLY_LINKED_FALLBACK)
+                await save_to_chatlog(user_id, "user", user_text,
+                                      "ヒアリング", "no")
+                await save_to_chatlog(user_id, "assistant",
+                                      form_link.REPLY_LINKED_FALLBACK,
+                                      "ヒアリング", "yes")
+                history = conversation_histories.get(user_id, [])
+                if history and history[-1].get("role") == "user":
+                    history.pop()
+                return
             # PRIMARY / FALLBACK 両方失敗 → 確認中応答 + 承認キューに要対応レコード
             async def _reply_func(token: str, text: str) -> None:
                 await _line_reply_with_fallback(token, user_id, text)
@@ -852,10 +925,52 @@ async def _process_line_event(reply_token: str, user_id: str, user_text: str) ->
             kintone_record["LINEユーザーID"] = user_id
             kintone_record["status"] = "問い合わせ"
             user_business_names[user_id] = kintone_record.get("問い合わせ業者名", "")
-            record_id = await post_to_kintone(kintone_record)
+            # JIKOU-FORM-2: 本人のレコードが既にあるなら create せず統合へ
+            # 振り替える（二重 create 抑止）。判定順（fix2=fix1-01）:
+            #   (a) 同ターンで紐付けが成立した場合は確定した linked_id を最優先
+            #       （ローカルの bind 結果で判定・userId 検索の結果に依存しない）
+            #   (b) 紐付け成立ターンでない既存ユーザーは台帳照会 _known_rec の $id
+            #   (c) いずれもない場合のみ create（レコード無しの新規客=従来どおり。
+            #       メモリ上の kintone_record_ids は判定に使わない）
+            # 統合は form_link.merge_hearing_fields（fix1-03: $revision CAS・
+            # Bot 欄の閉集合・最新レコードで空欄の欄のみ埋める=人の編集を上書き
+            # しない・409 は再取得再構成≤MERGE_RETRIES・収束不能は中止+要確認）。
+            # LINEユーザーID/status は非対象
+            known_id = str(((_known_rec or {}).get("$id") or {})
+                           .get("value") or "")
+            if linked_id_this_turn:
+                existing_id = linked_id_this_turn
+                if known_id and known_id != linked_id_this_turn:
+                    # 分裂の検知: userId 検索が別レコードを返した（並行処理が作った
+                    # 通常レコード等）。統合先は本人性を確定した linked_id のまま・
+                    # 別レコードへは書かない。弁護士が突合できるよう要確認通知
+                    logger.error("[FORM_LINK] split detected linked_id=%s other_id=%s",
+                                 emit(linked_id_this_turn, "record_id", "log", "operator"),
+                                 emit(known_id, "record_id", "log", "operator"))
+                    await hub_notify.notify_admin_line(
+                        "【フォーム紐付け・要確認】同一 LINE ユーザーに複数の"
+                        f"レコードがあります（紐付け先:{linked_id_this_turn} "
+                        f"別レコード:{known_id}）。ヒアリング内容は紐付け先へ"
+                        "統合しました。案件の分裂がないか App 21 を確認してください。",
+                        throttle_key="form_link_split",
+                    )
+            else:
+                existing_id = known_id
+            if existing_id:
+                merge_outcome = await form_link.merge_hearing_fields(
+                    existing_id,
+                    {k: v for k, v in kintone_record.items()
+                     if k not in ("LINEユーザーID", "status")})
+                record_id = existing_id
+                logger.info("[KINTONE] RECORD merged into existing record_id=%s "
+                            "outcome=%s",
+                            emit(record_id, "record_id", "log", "operator"),
+                            emit(merge_outcome, "freetext", "log", "operator"))
+            else:
+                record_id = await post_to_kintone(kintone_record)
+                logger.info("[KINTONE] RECORD created record_id=%s",
+                            emit(record_id, "record_id", "log", "operator"))
             kintone_record_ids[user_id] = record_id
-            logger.info("[KINTONE] RECORD created record_id=%s",
-                        emit(record_id, "record_id", "log", "operator"))
             claude_reply = clean_reply
 
         # 第2段階：既存レコードを更新
