@@ -131,11 +131,14 @@ async def reply_with_push_fallback(channel: LineChannelConfig,
                      emit(push_resp.text[:200], "vendor_raw", "log", "operator"))
 
 
-async def push_text(channel: LineChannelConfig, to: str, text: str) -> None:
-    """LINE Push API でメッセージを送信する。
+async def push_text(channel: LineChannelConfig, to: str, text: str) -> bool:
+    """LINE Push API でメッセージを送信する。送信成功（2xx）で True。
 
     実装は旧 chat_responder.send_line_push の逐語移設（ログ文言不変）。
-    トークンのみチャネル引数から解決する。"""
+    トークンのみチャネル引数から解決する。
+    IMAGE-INTAKE-1-fix1[03]: 戻り値 bool を追加（非 2xx=False）。既存 caller は
+    戻り値を見ていないため挙動不変（非 2xx を例外化しない・通信例外は従来
+    どおり送出のまま。test_image_intake が pin）。"""
     async with httpx.AsyncClient() as client:
         resp = await client.post(
             _PUSH_URL,
@@ -151,3 +154,4 @@ async def push_text(channel: LineChannelConfig, to: str, text: str) -> None:
     if not resp.is_success:
         logger.error("[LINE_PUSH] ERROR: %s",
                      emit(resp.text, "vendor_raw", "log", "operator"))
+    return bool(resp.is_success)

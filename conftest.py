@@ -21,6 +21,12 @@ from pathlib import Path
 
 os.environ.setdefault("KOSEKI_READER_DISABLED", "1")
 
+# 4. IMAGE-INTAKE-1-fix1: 画像受領の自己修復発火（heal_unreplied）は全テキスト
+#    受信の入口に配線されるため、テストでは既定無効にする（3 と同区分。
+#    heal 自身のテストは "0" に上書きした上で kintone をモックする。
+#    本番は env 未設定＝有効）
+os.environ.setdefault("IMAGE_HEAL_DISABLED", "1")
+
 try:
     import truststore
 

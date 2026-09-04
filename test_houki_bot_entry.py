@@ -108,7 +108,7 @@ def _post(body: bytes, signature: str | None = None, alert=None):
          patch.object(line_channel, "reply_with_push_fallback",
                       new=reply_helper), \
          patch.object(line_channel, "push_text", new=push_helper), \
-         patch("houki_bot.router.handle_houki_hearing", new=AsyncMock()):
+         patch("houki_bot.router.handle_houki_hearing", new=AsyncMock()),          patch("hub.image_intake.handle_houki_image", new=AsyncMock()):
         resp = client.post(URL, content=body, headers=headers)
     return resp, alert, reply_helper, push_helper
 

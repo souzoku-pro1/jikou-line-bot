@@ -26,6 +26,7 @@ import logging
 
 from hub import houki_case_store
 from hub import houki_phone_triage
+from hub import image_intake
 from hub import reply_sanitizer
 from hub.houki_profile import (
     HEARING_TEMPLATE_BLOCKS_HOUKI,
@@ -194,6 +195,10 @@ async def handle_houki_hearing(reply_token: str, user_id: str,
         logger.info("[HOUKI_HEARING] suppressed (stoplist) userId=%s...",
                     emit(user_id[:10], "record_id", "log", "operator"))
         return
+
+    # IMAGE-INTAKE-1-fix1[01]: 自己修復発火——未返信の画像受領マーカーを
+    # 次のテキスト受信時に回収（内部で例外を握る・会話を道連れにしない）
+    await image_intake.heal_unreplied("houki", HOUKI_CHANNEL, user_id)
 
     history = conversation_histories.setdefault(user_id, [])
     if not history:

@@ -1,0 +1,869 @@
+"""IMAGE-INTAKE-1（+fix1）: 画像の複数枚まとめ受領返信（両チャネル・AI読解なし）。
+
+固定する仕様:
+- 添付先 FILE 欄は App 21/App 40 とも実測で適切な欄が不在=取得+添付は保留
+  （不足フィールド報告・本票は束ね返信のみ）。
+- 束ね方式: 受信ごとの App 28 マーカー保存（冪等キー=event_id・fix1[02]:
+  category=画像受領:{channel}:{event_id} のチャネル識別込み）は現行維持。
+  返信は DEBOUNCE_SEC 待ち→in-memory 予約（H4-fix2 の check-then-act 同型）で
+  新着に譲り→代表候補は App 28 照会（**チャネル別**最新受領行=自分）で確定→
+  push 1 通。
+- fix1[03]: push 成功（True）を確認できたときだけ受領済み行
+  （category=画像受領済:{channel}）で冪等を閉じる。非 2xx・通信例外・
+  受領済み行の保存失敗=未返信のまま。
+- fix1[01]: 未返信（チャネル別最新マーカー行 > 最新受領済み行）は自己修復
+  発火 heal_unreplied（次のイベント受信時）が回収——待機タスクの消滅
+  （再起動）でも恒久無返信にならない。
+- push_text の既定挙動 pin: 非 2xx は例外化せず False を返す・通信例外は
+  従来どおり送出（既存 caller への非影響）。
+"""
+
+import asyncio
+import os
+import re
+import unittest
+from unittest.mock import AsyncMock, patch
+
+_ENV = {
+    "ANTHROPIC_API_KEY": "dummy", "LINE_CHANNEL_SECRET": "dummy_secret",
+    "LINE_CHANNEL_ACCESS_TOKEN": "dummy_token", "KINTONE_SUBDOMAIN": "testsub",
+    "KINTONE_APP_ID": "21", "KINTONE_API_TOKEN": "dummy",
+    "SOUZOKU_KINTONE_APP_ID": "26", "SOUZOKU_KINTONE_API_TOKEN": "dummy",
+    "CLOUDSIGN_CLIENT_ID": "c", "CLOUDSIGN_WEBHOOK_SECRET": "cs",
+    "KINTONE_WEBHOOK_TOKEN": "kintone-token",
+    "DOCUMENT_WEBHOOK_SECRET": "doc-secret",
+    "APP_APPROVAL": "29", "TOKEN_APPROVAL": "d", "HEALTHCHECK_DISABLED": "1",
+    "STRIPE_WEBHOOK_SECRET": "w", "GOOGLE_VISION_API_KEY": "dummy_vision",
+    "APP_CHATLOG": "28", "TOKEN_CHATLOG": "d",
+    "APP_HOUKI": "40", "TOKEN_HOUKI": "d",
+    "HOUKI_LINE_CHANNEL_SECRET": "houki_secret",
+    "HOUKI_LINE_CHANNEL_ACCESS_TOKEN": "houki_token",
+}
+for _k, _v in _ENV.items():
+    os.environ.setdefault(_k, _v)
+
+import chat_responder as cr  # noqa: E402
+import main  # noqa: E402
+from hub import image_intake as ii  # noqa: E402
+from hub import kintone as hub_kintone  # noqa: E402
+from hub import line_channel  # noqa: E402
+
+
+def _run(coro):
+    return asyncio.run(coro)
+
+
+class _FakeChatlog28:
+    """App 28 フェイク（category 完全一致/部分一致・line_user_id・desc 対応）。"""
+
+    def __init__(self):
+        self.rows = []
+        self._id = 0
+
+    async def create(self, app, fields):
+        self._id += 1
+        self.rows.append({"$id": str(self._id), **fields})
+        return str(self._id)
+
+    async def search(self, app, query, fields=None):
+        m_eq = re.search('category = "([^"]+)"', query)
+        m_like = re.search('category like "([^"]+)"', query)
+        m_uid = re.search('line_user_id = "([^"]+)"', query)
+        rows = self.rows
+        if m_uid:
+            rows = [r for r in rows if r.get("line_user_id") == m_uid.group(1)]
+        if m_eq:
+            rows = [r for r in rows if r.get("category") == m_eq.group(1)]
+        elif m_like:
+            rows = [r for r in rows
+                    if m_like.group(1) in str(r.get("category") or "")]
+        desc = "desc" in query
+        rows = sorted(rows, key=lambda r: int(r["$id"]), reverse=desc)
+        return [{"$id": {"value": r["$id"]},
+                 "category": {"value": r.get("category", "")}}
+                for r in rows[:1]]
+
+    def markers(self, channel=None):
+        prefix = "画像受領:" + (f"{channel}:" if channel else "")
+        return [r for r in self.rows
+                if str(r.get("category", "")).startswith(prefix)]
+
+    def receipts(self, channel):
+        return [r for r in self.rows
+                if r.get("category") == f"画像受領済:{channel}"]
+
+
+class _Base(unittest.TestCase):
+    def setUp(self):
+        ii._pending.clear()
+        self.addCleanup(ii._pending.clear)
+        self.store = _FakeChatlog28()
+        for p in (patch.object(hub_kintone, "create_record",
+                               self.store.create),
+                  patch.object(hub_kintone, "search_records",
+                               self.store.search),
+                  patch.object(ii, "DEBOUNCE_SEC", 0.03),
+                  # conftest の既定無効を本 suite では解除（kintone はフェイク）
+                  patch.dict(os.environ, {"IMAGE_HEAL_DISABLED": "0"})):
+            p.start()
+            self.addCleanup(p.stop)
+
+
+async def _delayed(coro, delay):
+    await asyncio.sleep(delay)
+    return await coro
+
+
+# ── 束ね選出（debounce_and_elect 単体） ─────────────────────────────────────────
+class TestDebounceElect(_Base):
+    def _latest(self, uid, channel="jikou"):
+        async def q():
+            return await ii.latest_marker_category(channel, uid)
+        return q
+
+    async def _marker(self, uid, channel, evid):
+        return await self.store.create(None, {
+            "line_user_id": uid,
+            "category": ii.marker_category(channel, evid),
+            "message": cr.IMAGE_INBOUND_MARKER})
+
+    async def _scenario_three(self, uid="U_bundle"):
+        results = {}
+
+        async def one(i, delay):
+            await asyncio.sleep(delay)
+            await self._marker(uid, "jikou", f"e{i}")
+            results[i] = await ii.debounce_and_elect(
+                "jikou", uid, ii.marker_category("jikou", f"e{i}"),
+                self._latest(uid))
+        await asyncio.gather(one(1, 0), one(2, 0.005), one(3, 0.01))
+        return results
+
+    def test_three_rapid_images_single_representative(self):
+        results = _run(self._scenario_three())
+        self.assertEqual([results[1], results[2], results[3]],
+                         [False, False, True])
+        self.assertEqual(len(self.store.markers("jikou")), 3)
+
+    def test_state_loss_degrades_to_individual_replies(self):
+        async def scenario():
+            uid = "U_lost"
+            await self._marker(uid, "jikou", "l1")
+            await self._marker(uid, "jikou", "l2")
+
+            async def one(evid, delay):
+                await asyncio.sleep(delay)
+                return await ii.debounce_and_elect(
+                    "jikou", uid, ii.marker_category("jikou", evid),
+                    self._latest(uid))
+
+            async def wipe():
+                await asyncio.sleep(0.01)
+                ii._pending.clear()
+            r1, r2, _ = await asyncio.gather(one("l1", 0),
+                                             one("l2", 0.005), wipe())
+            return r1, r2
+        self.assertEqual(_run(scenario()), (True, True))
+
+    def test_query_failure_degrades_to_reply(self):
+        async def scenario():
+            uid = "U_qfail"
+            await self._marker(uid, "jikou", "q1")
+
+            async def broken():
+                raise RuntimeError("down")
+            return await ii.debounce_and_elect(
+                "jikou", uid, ii.marker_category("jikou", "q1"), broken)
+        self.assertTrue(_run(scenario()))
+
+    def test_parallel_registration_single_winner(self):
+        results = _run(self._scenario_three())
+        self.assertEqual(sum(1 for v in results.values() if v), 1)
+
+    def test_channel_scoped_latest_marker(self):
+        # fix1[02]: 両チャネル利用ユーザーでもチャネル別に最新行を判定し、
+        # どちらの代表も沈黙しない
+        async def scenario():
+            uid = "U_both"
+            rid_j = await self._marker(uid, "jikou", "j1")
+            rid_h = await self._marker(uid, "houki", "h1")   # 全体最新は houki
+            self.assertEqual(await ii.latest_marker_row_id("jikou", uid),
+                             rid_j)
+            self.assertEqual(await ii.latest_marker_row_id("houki", uid),
+                             rid_h)
+            r_j, r_h = await asyncio.gather(
+                ii.debounce_and_elect("jikou", uid,
+                                      ii.marker_category("jikou", "j1"),
+                                      self._latest(uid, "jikou")),
+                ii.debounce_and_elect("houki", uid,
+                                      ii.marker_category("houki", "h1"),
+                                      self._latest(uid, "houki")))
+            return r_j, r_h
+        self.assertEqual(_run(scenario()), (True, True))
+
+
+# ── fix1[03]: push 成功時のみ閉鎖 ───────────────────────────────────────────────
+class TestSendReceiptAndClose(_Base):
+    UID = "U_close"
+
+    def setUp(self):
+        super().setUp()
+        # fix2: 送信は「未返信マーカーあり」が前提（永続再確認）——各テストに
+        # 未返信マーカーを種入れ（検査の意味は fix1 と同一）
+        _run(self.store.create(None, {
+            "line_user_id": self.UID,
+            "category": ii.marker_category("houki", "cl1"),
+            "message": cr.IMAGE_INBOUND_MARKER}))
+
+    def test_success_saves_receipt(self):
+        with patch.object(ii, "push_text", AsyncMock(return_value=True)):
+            ok = _run(ii.send_receipt_and_close("houki", ii.HOUKI_CHANNEL,
+                                                self.UID))
+        self.assertTrue(ok)
+        self.assertEqual(len(self.store.receipts("houki")), 1)
+        row = self.store.receipts("houki")[0]
+        self.assertEqual(row["message"], cr.IMAGE_RECEIPT_REPLY)
+        self.assertEqual(row["role"], "assistant")
+
+    def test_non2xx_no_receipt(self):
+        with patch.object(ii, "push_text", AsyncMock(return_value=False)):
+            ok = _run(ii.send_receipt_and_close("houki", ii.HOUKI_CHANNEL,
+                                                self.UID))
+        self.assertFalse(ok)
+        self.assertEqual(self.store.receipts("houki"), [])
+
+    def test_transport_error_no_receipt(self):
+        with patch.object(ii, "push_text",
+                          AsyncMock(side_effect=RuntimeError("net"))):
+            ok = _run(ii.send_receipt_and_close("houki", ii.HOUKI_CHANNEL,
+                                                self.UID))
+        self.assertFalse(ok)
+        self.assertEqual(self.store.receipts("houki"), [])
+
+    def test_receipt_save_failure_stays_unreplied(self):
+        async def broken(app, fields):
+            raise RuntimeError("kintone down")
+        with patch.object(ii, "push_text", AsyncMock(return_value=True)), \
+                patch.object(hub_kintone, "create_record", broken):
+            ok = _run(ii.send_receipt_and_close("houki", ii.HOUKI_CHANNEL,
+                                                self.UID))
+        self.assertFalse(ok)
+
+
+# ── fix1[01]: 自己修復発火（待機タスク消滅→恒久無返信の遮断） ─────────────────────
+class TestHealUnreplied(_Base):
+    UID = "U_heal"
+
+    def _make_unreplied(self, channel="houki", evid="hv1"):
+        return _run(self.store.create(None, {
+            "line_user_id": self.UID,
+            "category": ii.marker_category(channel, evid),
+            "message": cr.IMAGE_INBOUND_MARKER}))
+
+    def test_cancelled_debounce_task_then_heal_replies(self):
+        # 待機タスクの消滅を実際に再現: 画像処理タスクを cancel → マーカーは
+        # 残る→次イベント相当の heal で受領返信が送られる
+        push = AsyncMock(return_value=True)
+
+        async def scenario():
+            with patch.object(ii, "DEBOUNCE_SEC", 5), \
+                    patch.object(ii, "push_text", push), \
+                    patch.object(ii, "is_suppressed",
+                                 AsyncMock(return_value=False)):
+                task = asyncio.ensure_future(
+                    ii.handle_houki_image(self.UID, "hv1"))
+                await asyncio.sleep(0.05)      # マーカー保存+待機に入るまで
+                task.cancel()                  # 再起動相当（タスク消滅）
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                ii._pending.clear()            # プロセス消滅なら予約も消える
+                self.assertEqual(len(self.store.markers("houki")), 1)
+                self.assertEqual(self.store.receipts("houki"), [])
+                # 次のイベント受信時の自己修復発火
+                healed = await ii.heal_unreplied("houki", ii.HOUKI_CHANNEL,
+                                                 self.UID)
+                return healed
+        self.assertTrue(_run(scenario()))
+        push.assert_awaited_once()
+        self.assertEqual(len(self.store.receipts("houki")), 1)
+
+    def test_heal_noop_when_replied(self):
+        self._make_unreplied()
+        with patch.object(ii, "push_text", AsyncMock(return_value=True)):
+            self.assertTrue(_run(ii.heal_unreplied(
+                "houki", ii.HOUKI_CHANNEL, self.UID)))
+            # 2 回目: 受領済み行が最新=再送しない（永続正本で確認）
+            push2 = AsyncMock(return_value=True)
+            with patch.object(ii, "push_text", push2):
+                self.assertFalse(_run(ii.heal_unreplied(
+                    "houki", ii.HOUKI_CHANNEL, self.UID)))
+            push2.assert_not_awaited()
+
+    def test_heal_noop_without_markers(self):
+        push = AsyncMock(return_value=True)
+        with patch.object(ii, "push_text", push):
+            self.assertFalse(_run(ii.heal_unreplied(
+                "houki", ii.HOUKI_CHANNEL, self.UID)))
+        push.assert_not_awaited()
+
+    def test_heal_defers_to_live_task(self):
+        self._make_unreplied()
+        ii._pending[ii._key("houki", self.UID)] = "9"   # 生きた待機タスク相当
+        push = AsyncMock(return_value=True)
+        with patch.object(ii, "push_text", push):
+            self.assertFalse(_run(ii.heal_unreplied(
+                "houki", ii.HOUKI_CHANNEL, self.UID)))
+        push.assert_not_awaited()
+
+    def test_push_fail_then_next_heal_retries(self):
+        # 03×01: push 失敗→未返信のまま→次の heal で再送できる
+        self._make_unreplied()
+        with patch.object(ii, "push_text", AsyncMock(return_value=False)):
+            self.assertFalse(_run(ii.heal_unreplied(
+                "houki", ii.HOUKI_CHANNEL, self.UID)))
+        self.assertEqual(self.store.receipts("houki"), [])
+        with patch.object(ii, "push_text", AsyncMock(return_value=True)):
+            self.assertTrue(_run(ii.heal_unreplied(
+                "houki", ii.HOUKI_CHANNEL, self.UID)))
+        self.assertEqual(len(self.store.receipts("houki")), 1)
+
+
+# ── push_text の既定挙動 pin（既存 caller への非影響・fix1[03]） ──────────────────
+class _FakeResp:
+    def __init__(self, status):
+        self.status_code = status
+        self.text = "resp"
+
+    @property
+    def is_success(self):
+        return 200 <= self.status_code < 300
+
+
+class _FakeClient:
+    responses: list = []
+    raise_exc: Exception | None = None
+
+    def __init__(self, **_kw):
+        pass
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_a):
+        return False
+
+    async def post(self, url, headers=None, json=None):
+        if _FakeClient.raise_exc is not None:
+            raise _FakeClient.raise_exc
+        return _FakeClient.responses.pop(0)
+
+
+class TestPushTextDefaultBehaviorPinned(unittest.TestCase):
+    def _call(self):
+        return _run(line_channel.push_text(
+            line_channel.JIKOU_CHANNEL, "Ux", "hello"))
+
+    def test_2xx_returns_true(self):
+        _FakeClient.responses = [_FakeResp(200)]
+        _FakeClient.raise_exc = None
+        with patch.object(line_channel.httpx, "AsyncClient", _FakeClient):
+            self.assertIs(self._call(), True)
+
+    def test_non2xx_returns_false_without_raising(self):
+        # 既存 caller pin: 非 2xx は従来どおり例外化しない（ログのみ）
+        _FakeClient.responses = [_FakeResp(500)]
+        _FakeClient.raise_exc = None
+        with patch.object(line_channel.httpx, "AsyncClient", _FakeClient):
+            self.assertIs(self._call(), False)
+
+    def test_transport_error_still_raises(self):
+        # 既存 caller pin: 通信例外は従来どおり送出（挙動不変）
+        _FakeClient.raise_exc = RuntimeError("net down")
+        with patch.object(line_channel.httpx, "AsyncClient", _FakeClient):
+            with self.assertRaises(RuntimeError):
+                self._call()
+        _FakeClient.raise_exc = None
+
+
+# ── 時効側統合（main._process_line_image_event） ────────────────────────────────
+class TestJikouBundledFlow(_Base):
+    USER = "U_jikou_img"
+
+    def _patches(self):
+        return [
+            patch.object(main.autoreply_stoplist, "is_suppressed",
+                         AsyncMock(return_value=False)),
+            patch.object(main, "get_app21_record",
+                         AsyncMock(return_value=None)),
+            patch.object(ii, "push_text", AsyncMock(return_value=True)),
+            patch("hub.notify.notify_business", AsyncMock(return_value=True)),
+            patch.object(main, "ATTORNEY_LINE_USER_ID", "Uattorney"),
+            # fix3: 関門内の jikou 失敗通知は env から弁護士 ID を読む
+            patch.dict(os.environ, {"ATTORNEY_LINE_USER_ID": "Uattorney"}),
+        ]
+
+    def test_three_images_one_push_three_markers(self):
+        ps = self._patches()
+
+        async def scenario():
+            await asyncio.gather(
+                main._process_line_image_event("t1", self.USER, "ev1"),
+                _delayed(main._process_line_image_event("t2", self.USER,
+                                                        "ev2"), 0.005),
+                _delayed(main._process_line_image_event("t3", self.USER,
+                                                        "ev3"), 0.01))
+        with ps[0], ps[1], ps[2] as push_m, ps[3] as notify, ps[4], ps[5]:
+            _run(scenario())
+        push_m.assert_awaited_once()
+        self.assertEqual(push_m.await_args.args[2], cr.IMAGE_RECEIPT_REPLY)
+        self.assertEqual(len(self.store.markers("jikou")), 3)
+        self.assertEqual(len(self.store.receipts("jikou")), 1)   # 閉鎖も 1 回
+        notify.assert_awaited_once()
+
+    def test_push_failure_no_close_and_failure_notice(self):
+        # fix1[03]: push 失敗=受領済み行なし+失敗通知→次イベントの heal で回収
+        ps = self._patches()
+        with ps[0], ps[1], \
+                patch.object(ii, "push_text",
+                             AsyncMock(return_value=False)), \
+                ps[3] as notify, ps[4], ps[5]:
+            _run(main._process_line_image_event("t1", self.USER, "ev1"))
+        self.assertEqual(self.store.receipts("jikou"), [])
+        notify.assert_awaited_once()
+        self.assertIn("失敗", notify.await_args.args[1])
+        # 次イベント相当の heal で回収
+        with patch.object(ii, "push_text", AsyncMock(return_value=True)):
+            self.assertTrue(_run(ii.heal_unreplied(
+                "jikou", main.hub_line_channel.JIKOU_CHANNEL, self.USER)))
+        self.assertEqual(len(self.store.receipts("jikou")), 1)
+
+    def test_existing_gates_kept(self):
+        ps = self._patches()
+        with patch.object(main.autoreply_stoplist, "is_suppressed",
+                          AsyncMock(return_value=True)), \
+             patch.object(main, "_handle_suppressed_inbound",
+                          AsyncMock()) as sup, \
+             ps[1], ps[2] as push_m, ps[3], ps[4], ps[5]:
+            _run(main._process_line_image_event("t", self.USER, "ev-s"))
+        sup.assert_awaited_once()
+        push_m.assert_not_awaited()
+
+
+# ── 相続放棄側（handle_houki_image） ──────────────────────────────────────────
+class TestHoukiImageFlow(_Base):
+    USER = "U_houki_img"
+
+    def _patches(self):
+        return [
+            patch.object(ii, "is_suppressed",
+                         AsyncMock(return_value=False)),
+            patch.object(ii, "push_text", AsyncMock(return_value=True)),
+            patch.object(ii.notify, "notify_admin_line",
+                         AsyncMock(return_value=True)),
+        ]
+
+    def test_receipt_reply_new_behavior(self):
+        ps = self._patches()
+        with ps[0], ps[1] as push, ps[2] as notify:
+            _run(ii.handle_houki_image(self.USER, "hv1"))
+        push.assert_awaited_once()
+        self.assertIs(push.await_args.args[0], ii.HOUKI_CHANNEL)
+        self.assertEqual(push.await_args.args[2], cr.IMAGE_RECEIPT_REPLY)
+        notify.assert_not_awaited()
+        self.assertEqual(len(self.store.markers("houki")), 1)
+        self.assertEqual(len(self.store.receipts("houki")), 1)
+
+    def test_two_images_bundled_single_push(self):
+        ps = self._patches()
+
+        async def scenario():
+            await asyncio.gather(
+                ii.handle_houki_image(self.USER, "hv1"),
+                _delayed(ii.handle_houki_image(self.USER, "hv2"), 0.005))
+        with ps[0], ps[1] as push, ps[2]:
+            _run(scenario())
+        push.assert_awaited_once()
+        self.assertEqual(len(self.store.markers("houki")), 2)
+        self.assertEqual(len(self.store.receipts("houki")), 1)
+
+    def test_redelivery_idempotent(self):
+        ps = self._patches()
+        with ps[0], ps[1] as push, ps[2]:
+            _run(ii.handle_houki_image(self.USER, "hv1"))
+            _run(ii.handle_houki_image(self.USER, "hv1"))
+        push.assert_awaited_once()
+        self.assertEqual(len(self.store.markers("houki")), 1)
+
+    def test_marker_save_failure_no_reply_and_alert(self):
+        async def broken(app, fields):
+            raise RuntimeError("kintone down")
+        ps = self._patches()
+        with ps[0], ps[1] as push, ps[2] as notify, \
+                patch.object(hub_kintone, "create_record", broken):
+            _run(ii.handle_houki_image(self.USER, "hv9"))
+        push.assert_not_awaited()
+        notify.assert_awaited_once()
+        text = notify.await_args.args[0]
+        self.assertIn("要確認", text)
+        self.assertIn(self.USER[:10], text)
+        self.assertNotIn(self.USER, text)
+
+    def test_push_failure_notifies_and_stays_unreplied(self):
+        # fix1[03]: 代表の push 失敗=要確認通知+受領済み行なし（heal が回収）
+        ps = self._patches()
+        with ps[0], patch.object(ii, "push_text",
+                                 AsyncMock(return_value=False)), \
+                ps[2] as notify:
+            _run(ii.handle_houki_image(self.USER, "hv1"))
+        notify.assert_awaited_once()
+        self.assertIn("受領返信の送信", notify.await_args.args[0])
+        self.assertEqual(self.store.receipts("houki"), [])
+
+    def test_paused_gate_silent(self):
+        ps = self._patches()
+        with patch.dict(os.environ, {"AUTOREPLY_PAUSED": "1"}), \
+                ps[0], ps[1] as push, ps[2]:
+            _run(ii.handle_houki_image(self.USER, "hv1"))
+        push.assert_not_awaited()
+        self.assertEqual(len(self.store.markers("houki")), 0)
+
+    def test_stoplist_gate_silent(self):
+        ps = self._patches()
+        with patch.object(ii, "is_suppressed",
+                          AsyncMock(return_value=True)), \
+                ps[1] as push, ps[2]:
+            _run(ii.handle_houki_image(self.USER, "hv1"))
+        push.assert_not_awaited()
+
+
+# ── 自己修復発火の配線（両チャネルの入口から呼ばれること） ────────────────────────
+class TestHealWiring(_Base):
+    def test_jikou_text_worker_calls_heal(self):
+        spy = AsyncMock(return_value=False)
+        stop = AsyncMock(side_effect=RuntimeError("halt after heal"))
+        with patch.object(main, "_autoreply_paused", lambda: False),                 patch.object(main.autoreply_stoplist, "is_suppressed",
+                             AsyncMock(return_value=False)),                 patch("hub.image_intake.heal_unreplied", spy),                 patch.object(main, "get_app21_record", stop):
+            _run(main._process_line_event("t", "U_wire", "こんにちは"))
+        spy.assert_awaited_once()
+        self.assertEqual(spy.await_args.args[0], "jikou")
+        self.assertEqual(spy.await_args.args[2], "U_wire")
+
+    def test_houki_hearing_calls_heal(self):
+        from houki_bot import hearing
+        spy = AsyncMock(return_value=False)
+        with patch.object(hearing, "autoreply_paused", lambda: False),                 patch.object(hearing, "is_suppressed",
+                             AsyncMock(return_value=False)),                 patch.object(hearing.image_intake, "heal_unreplied", spy),                 patch.object(hearing, "get_recent_chat_history",
+                             AsyncMock(return_value=[])),                 patch.object(hearing, "call_hearing_model",
+                             AsyncMock(side_effect=RuntimeError("halt"))),                 patch.object(hearing, "reply_with_push_fallback",
+                             AsyncMock()):
+            hearing.conversation_histories.pop("U_wire_h", None)
+            _run(hearing.handle_houki_hearing("rt", "U_wire_h", "こんにちは"))
+        spy.assert_awaited_once()
+        self.assertEqual(spy.await_args.args[0], "houki")
+
+
+# ── fix2[fix1-01]: 送信 claim（heal×代表・heal×heal の二重送信遮断） ─────────────
+class TestSendClaim(_Base):
+    UID = "U_claim"
+
+    def _marker(self, evid="cv1"):
+        return _run(self.store.create(None, {
+            "line_user_id": self.UID,
+            "category": ii.marker_category("houki", evid),
+            "message": cr.IMAGE_INBOUND_MARKER}))
+
+    def test_parallel_heals_single_push(self):
+        # heal 同士の並行進入 → push 合計 1 回・受領済み行 1 行
+        self._marker()
+        gate = asyncio.Event()
+        calls = []
+
+        async def slow_push(channel, to, text):
+            calls.append(text)
+            await gate.wait()
+            return True
+
+        async def scenario():
+            with patch.object(ii, "push_text", slow_push):
+                t1 = asyncio.ensure_future(ii.heal_unreplied(
+                    "houki", ii.HOUKI_CHANNEL, self.UID))
+                await asyncio.sleep(0.01)      # t1 が claim→push 待ちに入る
+                t2 = asyncio.ensure_future(ii.heal_unreplied(
+                    "houki", ii.HOUKI_CHANNEL, self.UID))
+                await asyncio.sleep(0.01)      # t2 は claim 済みに阻まれ終了
+                gate.set()
+                return await t1, await t2
+        r1, r2 = _run(scenario())
+        self.assertTrue(r1)
+        self.assertFalse(r2)
+        self.assertEqual(len(calls), 1)                      # push 1 回
+        self.assertEqual(len(self.store.receipts("houki")), 1)
+        self.assertEqual(ii._send_claims, set())             # claim リークなし
+
+    def test_representative_gap_heal_interleave_single_push(self):
+        # Codex 指摘の実再現: 代表が _pending.pop 後の await（elect の最新
+        # 照会）で停止→heal が進入して送信完了→代表再開、で push 合計 1 回
+        push = AsyncMock(return_value=True)
+        gate = asyncio.Event()
+        state = {"blocked": False}
+        real_search = self.store.search
+
+        async def gated_search(app, query, fields=None):
+            if ('like "画像受領:houki:' in query
+                    and not state["blocked"]):
+                state["blocked"] = True        # 代表の elect 照会だけ止める
+                await gate.wait()
+            return await real_search(app, query, fields)
+
+        async def scenario():
+            with patch.object(hub_kintone, "search_records", gated_search),                     patch.object(ii, "push_text", push),                     patch.object(ii, "is_suppressed",
+                                 AsyncMock(return_value=False)):
+                rep = asyncio.ensure_future(
+                    ii.handle_houki_image(self.UID, "cv1"))
+                await asyncio.sleep(0.08)      # marker→winner→debounce→pop→照会で停止
+                healed = await ii.heal_unreplied(
+                    "houki", ii.HOUKI_CHANNEL, self.UID)
+                gate.set()
+                await rep
+                return healed
+        healed = _run(scenario())
+        self.assertTrue(healed)                              # heal が閉じた
+        push.assert_awaited_once()                           # push 合計 1 回
+        self.assertEqual(len(self.store.receipts("houki")), 1)
+        self.assertEqual(ii._send_claims, set())
+
+    def test_claim_released_on_push_failure(self):
+        # 全終了経路で解放（失敗時も）→ 次の heal で回収できる
+        self._marker()
+        with patch.object(ii, "push_text", AsyncMock(return_value=False)):
+            self.assertFalse(_run(ii.heal_unreplied(
+                "houki", ii.HOUKI_CHANNEL, self.UID)))
+        self.assertEqual(ii._send_claims, set())
+        with patch.object(ii, "push_text", AsyncMock(return_value=True)):
+            self.assertTrue(_run(ii.heal_unreplied(
+                "houki", ii.HOUKI_CHANNEL, self.UID)))
+        self.assertEqual(ii._send_claims, set())
+
+    def test_claim_released_on_transport_exception(self):
+        self._marker()
+        with patch.object(ii, "push_text",
+                          AsyncMock(side_effect=RuntimeError("net"))):
+            self.assertFalse(_run(ii.heal_unreplied(
+                "houki", ii.HOUKI_CHANNEL, self.UID)))
+        self.assertEqual(ii._send_claims, set())
+
+    def test_already_replied_send_is_noop(self):
+        # claim 取得後の永続再確認: 並行相手が閉じ切った後の後追い送信は no-op
+        self._marker()
+        with patch.object(ii, "push_text", AsyncMock(return_value=True)):
+            self.assertIs(_run(ii.send_receipt_and_close(
+                "houki", ii.HOUKI_CHANNEL, self.UID)), True)
+            res = _run(ii.send_receipt_and_close(
+                "houki", ii.HOUKI_CHANNEL, self.UID))
+        self.assertIsNone(res)                               # 送信不要=None
+        self.assertEqual(len(self.store.receipts("houki")), 1)
+
+
+# ── fix3[fix2-01]: 失敗通知の関門内一元化（競合時も必ず 1 回） ──────────────────
+class TestFailureNotifyUnified(_Base):
+    UID = "U_notify_unified_0123456789"   # [:10] が真部分列になる長さ
+
+    def setUp(self):
+        super().setUp()
+        self.alert = AsyncMock(return_value=True)
+        self.biz = AsyncMock(return_value=True)
+        for p in (patch.object(ii.notify, "notify_admin_line", self.alert),
+                  patch("hub.notify.notify_business", self.biz),
+                  patch.dict(os.environ,
+                             {"ATTORNEY_LINE_USER_ID": "Uattorney"})):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def _marker(self, channel="houki", evid="nf1"):
+        return _run(self.store.create(None, {
+            "line_user_id": self.UID,
+            "category": ii.marker_category(channel, evid),
+            "message": cr.IMAGE_INBOUND_MARKER}))
+
+    def _interleave(self, push_outcome):
+        """Codex 指摘の interleave: heal が claim 取得→代表進入 None 終了→
+        heal の push 失敗。(heal結果, 代表結果) を返す。"""
+        self._marker()
+        gate = asyncio.Event()
+
+        async def gated_push(channel, to, text):
+            await gate.wait()
+            if isinstance(push_outcome, Exception):
+                raise push_outcome
+            return push_outcome
+
+        async def scenario():
+            with patch.object(ii, "push_text", gated_push):
+                holder = asyncio.ensure_future(ii.heal_unreplied(
+                    "houki", ii.HOUKI_CHANNEL, self.UID))
+                await asyncio.sleep(0.01)          # heal が claim→push 待ち
+                rep = await ii.send_receipt_and_close(
+                    "houki", ii.HOUKI_CHANNEL, self.UID)   # 後発代表
+                gate.set()
+                return await holder, rep
+        return _run(scenario())
+
+    def test_interleave_holder_non2xx_notifies_exactly_once(self):
+        healed, rep = self._interleave(False)
+        self.assertFalse(healed)
+        self.assertIsNone(rep)                     # 後発は None 終了（沈黙）
+        self.alert.assert_awaited_once()           # 要確認ちょうど 1 回
+        text = self.alert.await_args.args[0]
+        self.assertIn("要確認", text)
+        self.assertIn(self.UID[:10], text)
+        self.assertNotIn(self.UID, text)
+        self.assertEqual(self.store.receipts("houki"), [])   # 未返信維持
+
+    def test_interleave_holder_transport_error_notifies_exactly_once(self):
+        healed, rep = self._interleave(RuntimeError("net"))
+        self.assertFalse(healed)
+        self.assertIsNone(rep)
+        self.alert.assert_awaited_once()
+        self.assertEqual(self.store.receipts("houki"), [])
+
+    def test_heal_only_failure_notifies(self):
+        # heal 単独の失敗も関門内で通知される（fix2 までは無通知で吸収）
+        self._marker()
+        with patch.object(ii, "push_text", AsyncMock(return_value=False)):
+            self.assertFalse(_run(ii.heal_unreplied(
+                "houki", ii.HOUKI_CHANNEL, self.UID)))
+        self.alert.assert_awaited_once()
+
+    def test_representative_single_failure_single_notice(self):
+        # 呼出側撤去後も二重通知にならない（houki 代表経路・マーカーは
+        # handle 自身が保存する）
+        with patch.object(ii, "push_text", AsyncMock(return_value=False)),                 patch.object(ii, "is_suppressed",
+                             AsyncMock(return_value=False)):
+            _run(ii.handle_houki_image(self.UID, "nf-rep"))
+        self.assertEqual(self.alert.await_count, 1)
+
+    def test_jikou_failure_notifies_business_once(self):
+        self._marker(channel="jikou")
+        with patch.object(ii, "push_text", AsyncMock(return_value=False)):
+            self.assertFalse(_run(ii.send_receipt_and_close(
+                "jikou", None, self.UID)))
+        self.biz.assert_awaited_once()
+        text = self.biz.await_args.args[1]
+        self.assertIn("要確認", text)
+        self.assertNotIn(self.UID, text)
+
+    def test_success_no_failure_notice(self):
+        self._marker()
+        with patch.object(ii, "push_text", AsyncMock(return_value=True)):
+            self.assertIs(_run(ii.send_receipt_and_close(
+                "houki", ii.HOUKI_CHANNEL, self.UID)), True)
+        self.alert.assert_not_awaited()
+        self.biz.assert_not_awaited()
+
+    def test_receipt_save_failure_also_notifies(self):
+        # 保存失敗（push は成功）も要確認 1 回（呼出側撤去の穴を作らない）
+        self._marker()
+
+        async def broken_create(app, fields):
+            if (fields.get("category") or "").startswith("画像受領済:"):
+                raise RuntimeError("kintone down")
+            return await self.store.create(app, fields)
+        with patch.object(ii, "push_text", AsyncMock(return_value=True)),                 patch.object(hub_kintone, "create_record", broken_create):
+            self.assertFalse(_run(ii.send_receipt_and_close(
+                "houki", ii.HOUKI_CHANNEL, self.UID)))
+        self.alert.assert_awaited_once()
+
+
+# ── fix4[fix3-01]: throttle key 分離+success_only 統一（実 notify 込み） ─────────
+class TestFailureNotifyThrottleKeys(_Base):
+    """notify_admin_line の実装込み（モックは最下層 push_line_message のみ）で
+    Codex 指摘の経路を再現する。"""
+    UID = "U_throttle_keys_0123456789"
+
+    def setUp(self):
+        super().setUp()
+        from hub import notify as notify_mod
+        self.notify_mod = notify_mod
+        notify_mod._last_notify_at.clear()
+        notify_mod._notify_in_flight.clear()
+        self.addCleanup(notify_mod._last_notify_at.clear)
+        self.addCleanup(notify_mod._notify_in_flight.clear)
+        p = patch.object(notify_mod, "get_admin_line_user_id",
+                         lambda: "U_admin")
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _marker(self, evid="tk1"):
+        return _run(self.store.create(None, {
+            "line_user_id": self.UID,
+            "category": ii.marker_category("houki", evid),
+            "message": cr.IMAGE_INBOUND_MARKER}))
+
+    def test_prior_failed_notice_does_not_silence_send_failure_notice(self):
+        # Codex 指摘の経路そのもの: 既存系（受領記録失敗）の通知が**送信失敗**
+        # →300 秒以内に受領返信失敗→受領返信失敗の要確認が**実送信**される
+        self._marker()
+        push_down = AsyncMock(return_value=False)
+        with patch.object(self.notify_mod, "push_line_message", push_down):
+            _run(ii._alert_houki_image_failure(self.UID, "受領記録"))
+        push_up = AsyncMock(return_value=True)
+        with patch.object(self.notify_mod, "push_line_message", push_up),                 patch.object(ii, "push_text", AsyncMock(return_value=False)):
+            self.assertFalse(_run(ii.send_receipt_and_close(
+                "houki", ii.HOUKI_CHANNEL, self.UID)))
+        push_up.assert_awaited_once()          # 実送信 1 回（黙らない）
+        self.assertIn("受領返信の送信", push_up.await_args.args[1])
+
+    def test_same_kind_failures_coalesce_after_success(self):
+        # キー分離後の正常系: 同種（受領返信失敗）の連続は成功後 300 秒集約
+        self._marker()
+        push = AsyncMock(return_value=True)
+        with patch.object(self.notify_mod, "push_line_message", push),                 patch.object(ii, "push_text", AsyncMock(return_value=False)):
+            self.assertFalse(_run(ii.send_receipt_and_close(
+                "houki", ii.HOUKI_CHANNEL, self.UID)))
+            self.assertFalse(_run(ii.send_receipt_and_close(
+                "houki", ii.HOUKI_CHANNEL, self.UID)))
+        push.assert_awaited_once()             # 2 回目はスロットル集約
+
+    def test_alert_notice_failure_does_not_stamp(self):
+        # houki 画像系の success_only 統一: 通知自体の送信失敗は刻印されず、
+        # 直後の再試行が実送信できる（「1 回も出ない」を作らない）
+        self._marker()
+        with patch.object(self.notify_mod, "push_line_message",
+                          AsyncMock(return_value=False)):
+            _run(ii._alert_houki_image_failure(self.UID, "受領記録"))
+        push = AsyncMock(return_value=True)
+        with patch.object(self.notify_mod, "push_line_message", push):
+            _run(ii._alert_houki_image_failure(self.UID, "受領記録"))
+        push.assert_awaited_once()             # スロットルに阻まれない
+
+    def test_keys_are_separated(self):
+        # キー割り当ての pin: 受領返信失敗=houki_image_send_failure:/既存系=
+        # houki_image_failure:（同一ユーザーでも独立に 1 回ずつ実送信）
+        self._marker()
+        push = AsyncMock(return_value=True)
+        with patch.object(self.notify_mod, "push_line_message", push),                 patch.object(ii, "push_text", AsyncMock(return_value=False)):
+            _run(ii._alert_houki_image_failure(self.UID, "受領記録"))
+            self.assertFalse(_run(ii.send_receipt_and_close(
+                "houki", ii.HOUKI_CHANNEL, self.UID)))
+        self.assertEqual(push.await_count, 2)  # キーが別=双方とも実送信
+        keys = set(self.notify_mod._last_notify_at)
+        self.assertIn(f"houki_image_failure:{self.UID}", keys)
+        self.assertIn(f"houki_image_send_failure:{self.UID}", keys)
+
+
+class TestSingleWorkerPinned(unittest.TestCase):
+    def test_procfile_single_worker(self):
+        # fix2[3]: in-memory 排他（_pending/_send_claims/_notify_in_flight）は
+        # 単一 worker・単一イベントループ前提（既存裁定）。本番起動構成が
+        # workers=1（uvicorn 既定）であることを pin——worker 複数化票では
+        # 永続 CAS/一意キーによる排他への置換が必須（既知の制約）
+        text = open("Procfile", encoding="utf-8").read()
+        self.assertIn("uvicorn main:app", text)
+        self.assertNotIn("--workers", text)
+        self.assertNotIn("gunicorn", text)
+
+
+if __name__ == "__main__":
+    unittest.main()
