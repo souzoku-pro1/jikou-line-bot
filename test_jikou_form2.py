@@ -106,6 +106,8 @@ class _FakeApp21:
         self.loose_query = loose_query   # True=受付番号のみで返す（module 側再検査の検証用）
         self.search_calls: list[str] = []
         self.update_calls: list[tuple] = []
+        self.get_calls: list[str] = []
+        self.get_fail_next = 0
 
     def add(self, rid: str, number: str, *, user_id: str = "",
             channel: str = "フォーム", created: datetime = NOW,
@@ -169,6 +171,16 @@ class _FakeApp21:
             if r["LINEユーザーID"]["value"] == user_id:
                 return dict(r)
         return None
+
+    async def get_by_id(self, app, record_id):
+        self.get_calls.append(record_id)
+        if self.get_fail_next > 0:
+            self.get_fail_next -= 1
+            raise hub_kintone.KintoneError(500, "GAIA_XX", "down")
+        row = self.rows.get(record_id)
+        if row is None:
+            raise hub_kintone.KintoneError(404, "GAIA_RE01", "not found")
+        return {k: dict(v) for k, v in row.items()}
 
 
 # ── 照合・紐付け（module 単体） ──────────────────────────────────────────────────
@@ -322,9 +334,13 @@ class _FlowBase(unittest.TestCase):
             patch.object(main, "post_to_kintone", self.create),
             patch.object(main, "update_kintone_record", self.update),
             patch.object(main, "handle_claude_outage", self.outage),
+            patch.object(main, "ATTORNEY_LINE_USER_ID", "U_attorney"),
             patch.object(fl.hub_kintone, "search_records", self.fake.search),
             patch.object(fl.hub_kintone, "update_record", self.fake.update),
+            patch.object(fl.hub_kintone, "get_record", self.fake.get_by_id),
             patch.object(fl.notify, "notify_business", self.notify),
+            patch.object(fl.notify, "notify_admin_line",
+                         AsyncMock(return_value=True)),
             patch.dict(os.environ, {"ATTORNEY_LINE_USER_ID": "U_attorney",
                                     "AUTOREPLY_PAUSED": "0"}),
         ]
@@ -472,18 +488,123 @@ class TestDoubleCreateSuppression(_FlowBase):
               '[/KINTONE_RECORD]')
 
     def test_bound_user_marker_updates_instead_of_create(self):
-        self.fake.add("10", "123456", user_id=USER)      # 紐付け済み
+        self.fake.add("10", "123456", user_id=USER, revision="5")   # 紐付け済み
         self.ask.return_value = self.MARKER
         self.run_event("いいえ")
         self.create.assert_not_awaited()
-        self.update.assert_awaited_once()
-        rid, fields = self.update.await_args.args
-        self.assertEqual(rid, "10")
-        self.assertEqual(fields["信用情報確認"], "いいえ")
-        self.assertNotIn("LINEユーザーID", fields)
-        self.assertNotIn("status", fields)                 # 人の変更を上書きしない
+        self.update.assert_not_awaited()                   # 非 CAS の旧関数は使わない
+        # fix1-03: $revision CAS・Bot が埋める欄のうち空欄（信用情報確認）のみ
+        self.assertEqual(self.fake.update_calls,
+                         [("10", {"信用情報確認": "いいえ"}, "5")])
+        self.assertEqual(self.fake.rows["10"]["信用情報確認"]["value"], "いいえ")
+        self.assertEqual(self.fake.rows["10"]["LINEユーザーID"]["value"], USER)
+        self.assertEqual(self.fake.rows["10"]["status"]["value"], "問い合わせ")
         self.assertEqual(main.kintone_record_ids[USER], "10")
         self.assertEqual(self.reply.await_args.args[2], "了解しました。")
+
+    # ── fix1-02: 再取得失敗でも create へ落ちない ─────────────────────────────
+    def test_bind_then_lookup_failure_merges_into_linked_id(self):
+        self.fake.add("10", "123456", revision="5")
+        real_get = self.fake.get_by_user
+        calls = []
+
+        async def _get(user_id):
+            calls.append(user_id)
+            if len(calls) >= 2:
+                raise RuntimeError("kintone transient")   # _known_rec 取得が失敗
+            return await real_get(user_id)
+        self.ask.return_value = self.MARKER
+        with patch.object(main, "get_app21_record", _get):
+            self.run_event("123456")
+        self.assertEqual(self.fake.rows["10"]["LINEユーザーID"]["value"], USER)
+        self.create.assert_not_awaited()                   # 二重 create なし
+        self.assertEqual([c[0] for c in self.fake.update_calls if "信用情報確認" in c[1]],
+                         ["10"])                            # 紐付け済み ID へ統合
+        self.assertEqual(main.kintone_record_ids[USER], "10")
+
+    def test_judgement_order_known_rec_then_linked_id_then_create(self):
+        # 判定順: _known_rec の $id → kintone_record_ids → 両方空のときだけ create
+        main.kintone_record_ids[USER] = "77"
+        self.fake.add("77", "000001", user_id="Usomeone_else", revision="2")
+        with patch.object(main, "get_app21_record", AsyncMock(return_value=None)):
+            self.ask.return_value = self.MARKER
+            self.run_event("いいえ")
+        self.create.assert_not_awaited()
+        self.assertEqual(self.fake.update_calls[0][0], "77")
+
+    # ── fix1-03: CAS マージ（空欄のみ・人の編集を上書きしない） ────────────────
+    def test_toctou_attorney_edit_preserved(self):
+        self.fake.add("10", "123456", user_id=USER, revision="5")
+
+        async def _ask(user_id, text, **kw):
+            # _known_rec 取得後・マーカー処理前に弁護士が債権者名を訂正
+            self.fake.rows["10"]["問い合わせ業者名"] = {"value": "訂正後の債権者"}
+            self.fake.rows["10"]["$revision"] = {"value": "6"}
+            return self.MARKER                              # 旧値を含む
+        self.ask.side_effect = _ask
+        self.run_event("いいえ")
+        row = self.fake.rows["10"]
+        self.assertEqual(row["問い合わせ業者名"]["value"], "訂正後の債権者")   # 保持
+        self.assertEqual(row["信用情報確認"]["value"], "いいえ")             # 空欄は埋める
+        self.assertEqual(self.fake.update_calls,
+                         [("10", {"信用情報確認": "いいえ"}, "6")])        # 最新 revision
+        self.create.assert_not_awaited()
+
+    def test_cas_409_refetch_and_converge(self):
+        self.fake.add("10", "123456", user_id=USER, revision="5")
+        real_update = self.fake.update
+        state = {"n": 0}
+
+        async def _update(app, record_id, fields, revision=None):
+            state["n"] += 1
+            if state["n"] == 1:
+                # 取得後に他者が更新（revision 進行+人が別欄を埋めた）
+                self.fake.rows["10"]["$revision"] = {"value": "9"}
+                self.fake.rows["10"]["裁判所書類"] = {"value": "人が訂正"}
+            return await real_update(app, record_id, fields, revision)
+        with patch.object(fl.hub_kintone, "update_record", _update):
+            self.ask.return_value = self.MARKER
+            self.run_event("いいえ")
+        self.assertEqual(state["n"], 2)                     # 409 → 再取得 → 再構成
+        row = self.fake.rows["10"]
+        self.assertEqual(row["信用情報確認"]["value"], "いいえ")
+        self.assertEqual(row["裁判所書類"]["value"], "人が訂正")  # 再構成で保持
+        self.assertEqual(self.fake.update_calls[-1][2], "9")
+        self.create.assert_not_awaited()
+
+    def test_cas_unconverged_no_overwrite_and_alert(self):
+        self.fake.add("10", "123456", user_id=USER, revision="5")
+
+        async def _update(app, record_id, fields, revision=None):
+            self.fake.update_calls.append((record_id, dict(fields), revision))
+            raise hub_kintone.KintoneConflict(409, "GAIA_CO02", "conflict")
+        admin = AsyncMock(return_value=True)
+        with patch.object(fl.hub_kintone, "update_record", _update), \
+                patch.object(fl.notify, "notify_admin_line", admin):
+            self.ask.return_value = self.MARKER
+            self.run_event("いいえ")
+        self.assertEqual(len(self.fake.update_calls), 1 + fl.MERGE_RETRIES)
+        self.assertEqual(self.fake.rows["10"].get("信用情報確認", {}).get("value", ""),
+                         "")                                                    # 書込なし
+        admin.assert_awaited_once()
+        self.assertIn("要確認", admin.await_args.args[0])
+        self.assertNotIn("フォーム債権者株式会社", admin.await_args.args[0])
+        self.create.assert_not_awaited()
+        self.assertEqual(main.kintone_record_ids[USER], "10")
+        self.assertEqual(self.reply.await_args.args[2], "了解しました。")
+
+    def test_bot_fill_fields_closed_set_and_noop(self):
+        self.assertEqual(fl.BOT_FILL_FIELDS, frozenset({
+            "問い合わせ業者名", "借入時期_テキスト", "最終返済日_テキスト",
+            "裁判所書類", "信用情報確認"}))
+        self.assertEqual(fl.MERGE_RETRIES, 3)
+        # 全欄が埋まっていれば書込 0（noop）
+        self.fake.add("10", "123456", user_id=USER, revision="5",
+                      信用情報確認="はい")
+        self.ask.return_value = self.MARKER
+        self.run_event("いいえ")
+        self.assertEqual(self.fake.update_calls, [])
+        self.create.assert_not_awaited()
 
     def test_new_customer_marker_still_creates(self):
         self.ask.return_value = self.MARKER
@@ -493,7 +614,82 @@ class TestDoubleCreateSuppression(_FlowBase):
         self.assertEqual(rec["LINEユーザーID"], USER)
         self.assertEqual(rec["status"], "問い合わせ")
         self.update.assert_not_awaited()
+        self.assertEqual(self.fake.update_calls, [])
         self.assertEqual(main.kintone_record_ids[USER], "900")
+
+    def test_marker_with_disallowed_field_is_ignored(self):
+        self.fake.add("10", "123456", user_id=USER, revision="5")
+        self.ask.return_value = self.MARKER.replace(
+            '"信用情報確認": "いいえ"',
+            '"信用情報確認": "いいえ", "顧客名": "勝手な名前", "status": "受任"')
+        self.run_event("いいえ")
+        self.assertEqual(self.fake.update_calls,
+                         [("10", {"信用情報確認": "いいえ"}, "5")])
+        self.assertEqual(self.fake.rows["10"]["status"]["value"], "問い合わせ")
+
+
+# ── fix1-01: 紐付け後の再評価（人対応・status ゲート） ───────────────────────────
+class TestPostLinkReevaluation(_FlowBase):
+    def _in_session(self):
+        main.conversation_histories[USER] = [
+            {"role": "user", "content": "こんにちは"},
+            {"role": "assistant", "content": "①債権者名を教えてください"}]
+
+    def test_human_mode_record_in_session_link_is_silent(self):
+        self.fake.add("10", "123456", response_mode="人対応", 顧客名="")
+        self._in_session()
+        queue = AsyncMock(return_value="q-1")
+        with patch.object(main, "save_to_approval_queue", queue):
+            self.run_event("123456")
+        self.assertEqual(self.fake.rows["10"]["LINEユーザーID"]["value"], USER)  # bind 成立
+        self.ask.assert_not_awaited()                 # Claude 呼出 0
+        self.reply.assert_not_awaited()               # 顧客返信 0
+        queue.assert_not_awaited()                    # 承認キュー 0
+        # 弁護士通知: 紐付け通知+人対応通知
+        texts = [c.args[1] for c in self.notify.await_args_list]
+        self.assertTrue(any("【フォーム紐付け】" in t for t in texts))
+        self.assertTrue(any("【人対応中】" in t for t in texts))
+        self.assertEqual(self.fake.get_calls, ["10"])  # bind 直後の最新状態で再評価
+
+    def test_human_mode_record_not_in_session_link_is_silent(self):
+        self.fake.add("10", "123456", response_mode="人対応")
+        self.run_event("123456")
+        self.ask.assert_not_awaited()
+        self.reply.assert_not_awaited()
+
+    def test_status_routing_reevaluated_in_session(self):
+        # 紐付け先が受任後 status → メモリ上ヒアリング中でも顧客対応経路へ
+        self.fake.add("10", "123456", status="受任")
+        self._in_session()
+        with patch.object(main, "handle_customer_message", AsyncMock()) as hcm:
+            self.run_event("123456")
+        hcm.assert_awaited_once()
+        self.assertEqual(hcm.await_args.kwargs["app21_record"]["$id"]["value"], "10")
+        self.ask.assert_not_awaited()
+
+    def test_refetch_failure_fail_closed(self):
+        self.fake.add("10", "123456")
+        self.fake.get_fail_next = 9
+        self._in_session()
+        self.run_event("123456")
+        self.assertEqual(self.fake.rows["10"]["LINEユーザーID"]["value"], USER)  # bind は成立
+        self.ask.assert_not_awaited()                 # 自動返信しない
+        self.reply.assert_not_awaited()
+        self.create.assert_not_awaited()
+        texts = [c.args[1] for c in self.notify.await_args_list]
+        self.assertTrue(any("要確認" in t and "10" in t for t in texts))
+        self.assertEqual(main.kintone_record_ids[USER], "10")   # 正は持ち回る
+
+    def test_reevaluation_uses_bind_result_not_user_lookup(self):
+        # 再評価は紐付け先 ID の再取得（get_record）で行い、userId 検索の成否に
+        # 依存しない
+        self.fake.add("10", "123456")
+        with patch.object(main, "get_app21_record",
+                          AsyncMock(side_effect=[None, RuntimeError("x")])):
+            self.run_event("123456")
+        self.ask.assert_awaited_once()
+        self.assertTrue(self.ask.await_args.kwargs.get("form_handover"))
+        self.assertEqual(self.fake.get_calls, ["10"])
 
 
 if __name__ == "__main__":

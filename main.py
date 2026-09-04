@@ -767,11 +767,26 @@ async def _process_line_event(reply_token: str, user_id: str, user_text: str) ->
                 outcome, linked_id = await form_link.try_link(
                     user_id, receipt_number)
                 if outcome == "linked":
+                    # 紐付けで確定した事実（linked_id）を同ターン以降の正として
+                    # 持ち回る（再取得の成否に依存しない）
                     kintone_record_ids[user_id] = linked_id
                     form_handover = True
-                    if not in_hearing_session:
-                        app21_record = await get_app21_record(user_id)
-                    logger.info("[FORM_LINK] linked → hearing user_id=%s",
+                    # fix1-01: 紐付け先レコードの最新状態（ID で再取得）に対して
+                    # 人対応・status ルーティングを再評価する（メモリ上の
+                    # ヒアリング中でも迂回させない）。取得できなければ
+                    # fail-closed=自動返信しない+弁護士通知
+                    linked_record = await form_link.fetch_linked_record(linked_id)
+                    if linked_record is None:
+                        logger.error("[FORM_LINK] post-link refetch failed "
+                                     "(fail-closed, no auto reply) record_id=%s",
+                                     emit(linked_id, "record_id", "log", "operator"))
+                        await form_link.notify_fail_closed(linked_id)
+                        await save_to_chatlog(user_id, "user", user_text,
+                                              "ヒアリング", "no")
+                        return
+                    app21_record = linked_record
+                    in_hearing_session = False
+                    logger.info("[FORM_LINK] linked → re-evaluate routing user_id=%s",
                                 emit(user_id, "external_ref", "log", "operator"))
                 elif outcome == "not_matched":
                     await _line_reply_with_fallback(
@@ -908,20 +923,28 @@ async def _process_line_event(reply_token: str, user_id: str, user_text: str) ->
             kintone_record["LINEユーザーID"] = user_id
             kintone_record["status"] = "問い合わせ"
             user_business_names[user_id] = kintone_record.get("問い合わせ業者名", "")
-            # JIKOU-FORM-2: 本人のレコードが既にある（受付番号で紐付け済み等・
-            # 同ターンの台帳照会 _known_rec の正）なら create せず update へ
-            # 振り替える（二重 create 抑止）。LINEユーザーID/status は既存値を
-            # 保持（人の変更を上書きしない）。レコード無しの新規客は従来どおり create
-            existing_id = str(((_known_rec or {}).get("$id") or {})
-                              .get("value") or "")
+            # JIKOU-FORM-2: 本人のレコードが既にあるなら create せず統合へ
+            # 振り替える（二重 create 抑止）。判定順（fix1-02）:
+            #   ① 同ターンの台帳照会 _known_rec の $id
+            #   ② 紐付けで確定した kintone_record_ids[user_id]（再取得失敗でも正）
+            #   ③ 両方空のときだけ create（レコード無しの新規客=従来どおり）
+            # 統合は form_link.merge_hearing_fields（fix1-03: $revision CAS・
+            # Bot 欄の閉集合・最新レコードで空欄の欄のみ埋める=人の編集を上書き
+            # しない・409 は再取得再構成≤MERGE_RETRIES・収束不能は中止+要確認）。
+            # LINEユーザーID/status は非対象
+            existing_id = (str(((_known_rec or {}).get("$id") or {})
+                               .get("value") or "")
+                           or str(kintone_record_ids.get(user_id) or ""))
             if existing_id:
-                await update_kintone_record(
+                merge_outcome = await form_link.merge_hearing_fields(
                     existing_id,
                     {k: v for k, v in kintone_record.items()
                      if k not in ("LINEユーザーID", "status")})
                 record_id = existing_id
-                logger.info("[KINTONE] RECORD merged into existing record_id=%s",
-                            emit(record_id, "record_id", "log", "operator"))
+                logger.info("[KINTONE] RECORD merged into existing record_id=%s "
+                            "outcome=%s",
+                            emit(record_id, "record_id", "log", "operator"),
+                            emit(merge_outcome, "freetext", "log", "operator"))
             else:
                 record_id = await post_to_kintone(kintone_record)
                 logger.info("[KINTONE] RECORD created record_id=%s",

@@ -238,3 +238,83 @@ async def try_link(user_id: str, number: str,
                 emit(rid, "record_id", "log", "operator"))
     await _notify(f"【フォーム紐付け】受付番号:{number} → レコード番号:{rid}")
     return "linked", rid
+
+
+# ── fix1-01: 紐付け後の再評価用の最新状態取得（fail-closed の材料） ──────────────
+async def fetch_linked_record(record_id: str) -> dict | None:
+    """紐付け先レコードを ID で再取得（GET・冪等）。失敗は None（呼び出し元が
+    fail-closed=自動返信しない+弁護士通知）。userId 検索の成否に依存しない。"""
+    try:
+        return await hub_kintone.get_record(APP_JIKOU_CASE, record_id)
+    except hub_kintone.KintoneError as e:
+        logger.warning("[FORM_LINK] post-link refetch failed code=%s",
+                       emit(e.code, "vendor_raw", "log", "operator"))
+        return None
+
+
+async def notify_fail_closed(record_id: str) -> None:
+    await _notify(
+        "【フォーム紐付け・要確認】紐付けは成立しました（レコード番号:"
+        f"{record_id}）が、直後のレコード再取得に失敗したため自動返信を行って"
+        "いません。App 21 のレコードと受信内容（App 28）を確認し、必要なら"
+        "手動で対応してください。")
+
+
+# ── fix1-03: ヒアリング内容の既存レコードへの統合（$revision CAS・空欄のみ） ─────
+# Bot が埋める欄の閉集合（KINTONE_RECORD マーカーの 5 項目）。これ以外の欄
+# （顧客名・status・LINEユーザーID 等）はマーカーに含まれても書かない
+BOT_FILL_FIELDS = frozenset({
+    "問い合わせ業者名", "借入時期_テキスト", "最終返済日_テキスト",
+    "裁判所書類", "信用情報確認"})
+MERGE_RETRIES = 3        # 409 → 再取得・再構成の再試行上限
+
+
+def _merge_plan(latest: dict, candidate: dict) -> dict:
+    """最新レコードで空欄の Bot 欄にだけ候補値を入れる（人の値は上書きしない・
+    H-3 upsert_case_fields の「空欄のみ」流儀）。"""
+    return {k: v for k, v in candidate.items() if _value(latest, k) == ""}
+
+
+async def merge_hearing_fields(record_id: str, fields: dict) -> str:
+    """既存レコードへヒアリング抽出値を統合する。戻り値:
+    updated=書込成立／noop=埋める欄なし（書込 0）／
+    unconverged=409 が再試行上限まで続いた（上書きせず中止+要確認通知）／
+    failed=取得/書込の確定失敗（書込 0+要確認通知）。"""
+    candidate = {k: str(v) for k, v in (fields or {}).items()
+                 if k in BOT_FILL_FIELDS and str(v or "").strip()}
+    outcome = "unconverged"
+    for _attempt in range(MERGE_RETRIES + 1):
+        try:
+            latest = await hub_kintone.get_record(APP_JIKOU_CASE, record_id)
+        except hub_kintone.KintoneError as e:
+            logger.warning("[FORM_LINK] merge refetch failed code=%s",
+                           emit(e.code, "vendor_raw", "log", "operator"))
+            outcome = "failed"
+            break
+        to_write = _merge_plan(latest, candidate)
+        if not to_write:
+            return "noop"
+        try:
+            await hub_kintone.update_record(
+                APP_JIKOU_CASE, record_id, to_write,
+                revision=_value(latest, "$revision"))
+            return "updated"
+        except hub_kintone.KintoneConflict:
+            logger.info("[FORM_LINK] merge cas conflict (retry)")
+            continue
+        except hub_kintone.KintoneError as e:
+            logger.warning("[FORM_LINK] merge update failed code=%s",
+                           emit(e.code, "vendor_raw", "log", "operator"))
+            outcome = "failed"
+            break
+    logger.error("[FORM_LINK] merge not applied outcome=%s record_id=%s",
+                 emit(outcome, "freetext", "log", "operator"),
+                 emit(record_id, "record_id", "log", "operator"))
+    await notify.notify_admin_line(
+        "【フォーム紐付け・要確認】ヒアリング内容の既存レコードへの統合更新が"
+        f"確定できませんでした（区分:{outcome} レコード番号:{record_id}）。"
+        "上書きせず中止しています。App 21 のレコードと App 28 の会話を確認して"
+        "ください。",
+        throttle_key="form_link_merge",
+    )
+    return outcome
