@@ -157,6 +157,19 @@ async def _apply_record_hearing(user_id: str, record: dict | None,
     return result, latest
 
 
+def _resolve_reply(candidates: list[str], record: dict | None) -> str:
+    """HOUKI-HEARING-UX-1（空応答の解消）: 候補文（優先順）のうち最初の
+    「空でない返信」を採用する。全候補が空応答（締め・相づちの定型句のみ・
+    実測 2026-09-04: 法律質問の直後に「よろしくお願い致します。」だけが
+    auto 送信された経路）なら、固定の受け流し文+現在の通の未回答項目の再提示
+    に差し替える（全通完了なら確認中定型）。法的説明は生成しない。"""
+    for text in candidates:
+        if not houki_case_store.is_hollow_reply(text):
+            return text
+    logger.info("[HOUKI_HEARING] hollow reply replaced (deflect+reask)")
+    return houki_case_store.fallback_reply(record, HOUKI_PROFILE.pending_reply)
+
+
 async def _converse(user_id: str, record: dict | None,
                     history: list[dict]) -> str:
     """Claude と最大 2 往復（tool 実行 1 回まで）して最終返信文を得る。"""
@@ -165,9 +178,9 @@ async def _converse(user_id: str, record: dict | None,
     response = await call_hearing_model(system, messages)
     tool_use = _extract_tool_use(response)
     if tool_use is None:
-        return _extract_text(response)
+        return _resolve_reply([_extract_text(response)], record)
 
-    tool_result, _latest = await _apply_record_hearing(
+    tool_result, latest = await _apply_record_hearing(
         user_id, record, tool_use.input or {})
     messages = messages + [
         {"role": "assistant", "content": response.content},
@@ -178,10 +191,9 @@ async def _converse(user_id: str, record: dict | None,
         }]},
     ]
     followup = await call_hearing_model(system, messages)
-    text = _extract_text(followup)
-    if text:
-        return text
-    return _extract_text(response)
+    # 2 回目の本文を優先し、空応答なら 1 回目の本文、なお空なら差し替え
+    return _resolve_reply([_extract_text(followup), _extract_text(response)],
+                          latest if latest is not None else record)
 
 
 async def handle_houki_hearing(reply_token: str, user_id: str,
