@@ -48,6 +48,8 @@ app.include_router(valuation_ingest_router)
 app.include_router(zaisan_router)
 app.include_router(notice_router)
 app.include_router(shinjutsu_router)
+from shindan_form import router as shindan_router
+app.include_router(shindan_router)
 
 from chat_responder import (
     get_app21_record,

@@ -104,6 +104,23 @@ EXPECTED_KINTONE_SCHEMA = {
             "furigana": {"type": "SINGLE_LINE_TEXT"},      # ラベル: ふりがな
             "old_address": {"type": "SINGLE_LINE_TEXT"},   # ラベル: 旧住所
             "notice_file": {"type": "FILE"},               # ラベル: 時効援用通知書
+            # ── JIKOU-FORM-1: 時効診断フォーム（shindan_form.py が書く。
+            # 受付番号は kintone 側「値の重複を禁止する」ON が前提=CU 実測済み。
+            # 受信書類写真 FILE は FORM-3 で書くようになった時点で追加する）
+            "受付番号": {"type": "SINGLE_LINE_TEXT"},
+            "受付チャネル": {"type": "DROP_DOWN",
+                             "required_options": ["フォーム"]},
+            "診断パターン": {"type": "DROP_DOWN",
+                             "required_options": ["A", "B", "C", "D"]},
+            # 必須 RADIO（既定値「あり」を書かない=明示指定で書く 4 欄）
+            "ラジオボタン": {"type": "RADIO_BUTTON",       # １０年以内の訴訟の有無
+                             "required_options": ["あり", "なし", "不明"]},
+            "ラジオボタン_2": {"type": "RADIO_BUTTON",     # 住民票と居住地の相違
+                               "required_options": ["不明"]},
+            "ラジオボタン_3": {"type": "RADIO_BUTTON",     # 業者への電話有無
+                               "required_options": ["不明"]},
+            "ラジオボタン_4": {"type": "RADIO_BUTTON",     # アンケート・書面送付有無
+                               "required_options": ["不明"]},
         },
     },
     "App 28 (チャットログ)": {

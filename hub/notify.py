@@ -176,6 +176,8 @@ def _log_throttled(throttle_key: str) -> None:
         logger.info("admin LINE notify throttled kind=return_deadline_fetch_error")
     elif head == "return_deadline_check":
         logger.info("admin LINE notify throttled kind=return_deadline_check")
+    elif head == "shindan_numbering":
+        logger.info("admin LINE notify throttled kind=shindan_numbering")
     else:
         logger.info("admin LINE notify throttled kind=unknown_kind")
 
