@@ -234,16 +234,17 @@ async def upsert_case_fields(user_id: str, fields: dict,
       担う。単発の低レベル書込としては作用 0）
     """
     if existing is None:
-        payload = {code: {"value": v} for code, v in fields.items()}
-        payload["LINEユーザーID"] = {"value": user_id}
-        payload["受付チャネル"] = {"value": "LINE"}
-        payload[STATUS_FIELD] = {"value": STATUS_INQUIRY}
+        # HOUKI-STORE-FIX1: hub.kintone へは plain 値（_wrap が包む契約）
+        payload = dict(fields)
+        payload["LINEユーザーID"] = user_id
+        payload["受付チャネル"] = "LINE"
+        payload[STATUS_FIELD] = STATUS_INQUIRY
         rid = await kintone.create_record(APP_HOUKI_CASE, payload)
         logger.info("[HOUKI_CASE] created record_id=%s",
                     emit(rid, "record_id", "log", "operator"))
         return str(rid)
     rid = _v(existing, "$id")
-    update = {code: {"value": v} for code, v in fields.items()
+    update = {code: v for code, v in fields.items()
               if not _v(existing, code)}
     if update:
         await kintone.update_record(APP_HOUKI_CASE, rid, update,
@@ -335,8 +336,9 @@ async def append_creditors(record_id: str, existing: dict | None,
         if not added:
             return 0
         try:
+            # SUBTABLE の plain 値=行 list（行内の kintone 行構造はそのまま）
             await kintone.update_record(
-                APP_HOUKI_CASE, record_id, {CREDITOR_TABLE: {"value": rows}},
+                APP_HOUKI_CASE, record_id, {CREDITOR_TABLE: rows},
                 revision=_v(existing or {}, "$revision") or None)
             logger.info("[HOUKI_CASE] creditors appended record_id=%s rows=%s",
                         emit(record_id, "record_id", "log", "operator"),
@@ -402,7 +404,7 @@ async def add_mismatch_marker(record_id: str, existing: dict) -> bool:
         new_memo = (memo + "\n" if memo else "") + MISMATCH_MARKER
         try:
             await kintone.update_record(
-                APP_HOUKI_CASE, record_id, {MEMO_FIELD: {"value": new_memo}},
+                APP_HOUKI_CASE, record_id, {MEMO_FIELD: new_memo},
                 revision=_v(existing, "$revision") or None)
             logger.info("[HOUKI_CASE] mismatch marker set record_id=%s",
                         emit(record_id, "record_id", "log", "operator"))
@@ -429,10 +431,10 @@ async def mark_date_mismatch_flag(record_id: str, existing: dict) -> bool:
         if KIKEN_FLAG_DATE_MISMATCH in current:
             return False
         try:
+            # CHECK_BOX の plain 値=選択値の list
             await kintone.update_record(
                 APP_HOUKI_CASE, record_id,
-                {KIKEN_FLAG_FIELD:
-                 {"value": current + [KIKEN_FLAG_DATE_MISMATCH]}},
+                {KIKEN_FLAG_FIELD: current + [KIKEN_FLAG_DATE_MISMATCH]},
                 revision=_v(existing, "$revision") or None)
             logger.info("[HOUKI_CASE] kiken flag set record_id=%s",
                         emit(record_id, "record_id", "log", "operator"))
@@ -477,7 +479,7 @@ async def add_kiken_flags(record_id: str, existing: dict,
         try:
             await kintone.update_record(
                 APP_HOUKI_CASE, record_id,
-                {KIKEN_FLAG_FIELD: {"value": current + add}},
+                {KIKEN_FLAG_FIELD: current + add},
                 revision=_v(existing, "$revision") or None)
             logger.info("[HOUKI_CASE] kiken flags added record_id=%s count=%s",
                         emit(record_id, "record_id", "log", "operator"),
@@ -505,8 +507,8 @@ async def set_phone_recommendation(record_id: str, existing: dict,
         try:
             await kintone.update_record(
                 APP_HOUKI_CASE, record_id,
-                {PHONE_RECO_FIELD: {"value": recommendation},
-                 PHONE_RECO_RATIONALE_FIELD: {"value": rationale}},
+                {PHONE_RECO_FIELD: recommendation,
+                 PHONE_RECO_RATIONALE_FIELD: rationale},
                 revision=_v(existing, "$revision") or None)
             logger.info("[HOUKI_CASE] phone recommendation set record_id=%s",
                         emit(record_id, "record_id", "log", "operator"))
@@ -543,7 +545,7 @@ async def promote_status_to_phone_triage(record_id: str,
     try:
         await kintone.update_record(
             APP_HOUKI_CASE, record_id,
-            {STATUS_FIELD: {"value": STATUS_PHONE_TRIAGE}},
+            {STATUS_FIELD: STATUS_PHONE_TRIAGE},
             revision=revision or None)
     except kintone.KintoneConflict:
         logger.info("[HOUKI_CASE] status promote cas_lost record_id=%s",
