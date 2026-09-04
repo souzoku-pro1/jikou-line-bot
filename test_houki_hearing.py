@@ -87,6 +87,18 @@ class _FakeApp40:
         self.rows: dict[str, dict] = {}
         self._id = 0
 
+    @staticmethod
+    def _reject_double_wrap(fields):
+        # HOUKI-STORE-FIX1 シーム: hub.kintone.create/update_record の契約は
+        # plain 値（kintone 側 _wrap が {code:{"value":v}} へ包む）。呼び出し側
+        # が包んだ {"value":…} 形が来たら二重ラップ＝実 kintone は CB_IJ01 で
+        # 書込全体を拒否するため、fake でも即 fail させる
+        for code, v in (fields or {}).items():
+            if isinstance(v, dict) and "value" in v:
+                raise AssertionError(
+                    f"double-wrapped payload: {code}={v!r}"
+                    "（hub.kintone へは plain 値を渡す契約・_wrap が包む）")
+
     async def search_records(self, app, query, fields=None):
         uid = query.split('"')[1]
         found = [r for r in self.rows.values()
@@ -95,27 +107,29 @@ class _FakeApp40:
         return found[:1]
 
     async def create_record(self, app, fields):
+        self._reject_double_wrap(fields)
         # fix3[H3-06]: App 40 の LINEユーザーID 欄は「値の重複を禁止する」
         # 設定（方式(a)・大野の点火作業）＝一意制約違反を模す
-        uid = (fields.get("LINEユーザーID") or {}).get("value")
+        uid = fields.get("LINEユーザーID")
         if uid and any(r.get("LINEユーザーID", {}).get("value") == uid
                        for r in self.rows.values()):
             raise store.kintone.KintoneError(400, "CB_VA01",
                                              "unique constraint")
         self._id += 1
         rid = str(self._id)
-        rec = dict(fields)
+        rec = {k: {"value": v} for k, v in fields.items()}   # 実 API の _wrap
         rec["$id"] = {"value": rid}
         rec["$revision"] = {"value": "1"}
         self.rows[rid] = rec
         return rid
 
     async def update_record(self, app, record_id, fields, revision=None):
+        self._reject_double_wrap(fields)
         rec = self.rows[str(record_id)]
         cur = int(rec["$revision"]["value"])
         if revision is not None and int(revision) != cur:
             raise store.kintone.KintoneConflict(409, "GAIA_CO02", "conflict")
-        rec.update(fields)
+        rec.update({k: {"value": v} for k, v in fields.items()})   # _wrap
         rec["$revision"] = {"value": str(cur + 1)}
 
     async def get_record(self, app, record_id):
@@ -326,7 +340,7 @@ class TestUpsert(_StoreBase):
         stale = copy.deepcopy(self.fake.rows[rid])   # Bot が読んだ時点の姿
         self.assertEqual(stale["status"]["value"], "問い合わせ")
         # 弁護士が先に変更（revision が進む）
-        _run(self.fake.update_record(None, rid, {"status": {"value": "受任"}}))
+        _run(self.fake.update_record(None, rid, {"status": "受任"}))
         # Bot の昇格試行（stale で CAS）→ 敗北・作用 0
         self.assertFalse(_run(store.promote_status_to_phone_triage(rid, stale)))
         self.assertEqual(self.fake.field(rid, "status"), "受任")
@@ -391,8 +405,7 @@ class TestFix2CASConvergence(_StoreBase):
             "U_cas3", {"日付申告メモ": "5月頃"}, None))
         stale = copy.deepcopy(self.fake.rows[rid])
         _run(self.fake.update_record(None, rid,
-                                     {"日付申告メモ": {"value":
-                                                       "5月頃\n人の追記"}}))
+                                     {"日付申告メモ": "5月頃\n人の追記"}))
         self.assertTrue(_run(store.add_mismatch_marker(rid, stale)))
         memo = self.fake.field(rid, "日付申告メモ")
         self.assertEqual(memo, "5月頃\n人の追記\n" + store.MISMATCH_MARKER)
@@ -403,7 +416,7 @@ class TestFix2CASConvergence(_StoreBase):
         rid = _run(store.upsert_case_fields("U_cas4", {}, None))
         stale = copy.deepcopy(self.fake.rows[rid])
         _run(self.fake.update_record(
-            None, rid, {"危険類型フラグ": {"value": ["訴訟・督促あり"]}}))
+            None, rid, {"危険類型フラグ": ["訴訟・督促あり"]}))
         self.assertTrue(_run(store.mark_date_mismatch_flag(rid, stale)))
         self.assertEqual(self.fake.field(rid, "危険類型フラグ"),
                          ["訴訟・督促あり", "申告内容の矛盾"])
@@ -415,8 +428,8 @@ class TestFix2CASConvergence(_StoreBase):
         stale = copy.deepcopy(self.fake.rows[rid])
         _run(self.fake.update_record(
             None, rid,
-            {"日付申告メモ": {"value": store.MISMATCH_MARKER},
-             "危険類型フラグ": {"value": ["申告内容の矛盾"]}}))
+            {"日付申告メモ": store.MISMATCH_MARKER,
+             "危険類型フラグ": ["申告内容の矛盾"]}))
         rev_after = self.fake.rows[rid]["$revision"]["value"]
         self.assertFalse(_run(store.add_mismatch_marker(rid, stale)))
         self.assertFalse(_run(store.mark_date_mismatch_flag(rid, stale)))
@@ -544,6 +557,81 @@ class TestFix3DoubleCreateAndCreditors(_StoreBase):
         names = [r["value"]["債権者名"]["value"]
                  for r in self.fake.field(rid, "債権者一覧")]
         self.assertEqual(names, ["X社"])    # 既存表は上書きされていない
+
+
+class TestPlainPayloadShapes(_StoreBase):
+    """HOUKI-STORE-FIX1: hub.kintone へ渡す書込 payload の実形 pin（型別）。
+
+    契約=呼び出し側は plain 値（kintone._wrap が {code:{"value":v}} へ包む）:
+    - 文字列/DATE = plain str（DATE は "YYYY-MM-DD"）
+    - CHECK_BOX = plain list[str]
+    - SUBTABLE = plain の行 list（行内は {"value": {subcode: {"value": v}}} の
+      kintone 行構造そのまま・_wrap はフィールド最上位のみ包む）
+    """
+
+    def _spy_updates(self):
+        calls = []
+        real = self.fake.update_record
+
+        async def _spy(app, rid, fields, revision=None):
+            calls.append(fields)
+            return await real(app, rid, fields, revision=revision)
+        return calls, patch.object(store.kintone, "update_record", _spy)
+
+    def test_create_payload_plain_str_and_date(self):
+        seen = {}
+        real = self.fake.create_record
+
+        async def _spy(app, fields):
+            seen.update(fields)
+            return await real(app, fields)
+        with patch.object(store.kintone, "create_record", _spy):
+            _run(store.upsert_case_fields(
+                "U_shape1", {"顧客名": "山田", "死亡日_申告": "2026-05-01"},
+                None))
+        self.assertEqual(seen["顧客名"], "山田")
+        self.assertEqual(seen["死亡日_申告"], "2026-05-01")
+        self.assertEqual(seen["LINEユーザーID"], "U_shape1")
+        self.assertEqual(seen["受付チャネル"], "LINE")
+        self.assertEqual(seen["status"], "問い合わせ")
+
+    def test_update_and_status_payload_plain_str(self):
+        rid = _run(store.upsert_case_fields("U_shape2", {}, None))
+        calls, p = self._spy_updates()
+        with p:
+            _run(store.upsert_case_fields(
+                "U_shape2", {"電話番号": "090-0000-0000"},
+                self.fake.rows[rid]))
+            _run(store.promote_status_to_phone_triage(
+                rid, self.fake.rows[rid]))
+            _run(store.set_phone_recommendation(
+                rid, self.fake.rows[rid], "強推奨", "根拠"))
+        self.assertEqual(calls[0], {"電話番号": "090-0000-0000"})
+        self.assertEqual(calls[1], {"status": "電話判断待ち"})
+        self.assertEqual(calls[2], {"電話推奨度": "強推奨",
+                                    "電話推奨根拠": "根拠"})
+
+    def test_checkbox_payload_plain_list(self):
+        rid = _run(store.upsert_case_fields("U_shape3", {}, None))
+        calls, p = self._spy_updates()
+        with p:
+            _run(store.mark_date_mismatch_flag(rid, self.fake.rows[rid]))
+            _run(store.add_kiken_flags(rid, self.fake.rows[rid],
+                                       ["訴訟・督促あり"]))
+        self.assertEqual(calls[0], {"危険類型フラグ": ["申告内容の矛盾"]})
+        self.assertEqual(calls[1],
+                         {"危険類型フラグ": ["申告内容の矛盾",
+                                             "訴訟・督促あり"]})
+
+    def test_subtable_payload_plain_rows(self):
+        rid = _run(store.upsert_case_fields("U_shape4", {}, None))
+        calls, p = self._spy_updates()
+        with p:
+            _run(store.append_creditors(rid, self.fake.rows[rid], ["A社"]))
+        rows = calls[-1]["債権者一覧"]
+        self.assertIsInstance(rows, list)
+        self.assertEqual(rows, [{"value": {"債権者名": {"value": "A社"},
+                                           "通知要否": {"value": "未確認"}}}])
 
 
 class TestCrossTurnDateRules(_StoreBase):

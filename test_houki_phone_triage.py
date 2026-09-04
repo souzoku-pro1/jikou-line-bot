@@ -306,9 +306,9 @@ class _TriageBase(_StoreBase):
     def make_case(self, status="電話判断待ち", **over):
         values = _clean_values(**over)
         rid = _run(store.kintone.create_record(None, {
-            "LINEユーザーID": {"value": self.UID},
-            "status": {"value": status},
-            **{c: {"value": v} for c, v in values.items()}}))
+            "LINEユーザーID": self.UID,
+            "status": status,
+            **values}))
         return str(rid)
 
 
@@ -416,7 +416,7 @@ class TestCasConvergence(_TriageBase):
         stale = _run(store.fetch_case(self.UID))
         # 人が別フラグを先に追加（$revision が進む）
         _run(store.kintone.update_record(
-            None, rid, {"危険類型フラグ": {"value": ["未成年・後見関与"]}}))
+            None, rid, {"危険類型フラグ": ["未成年・後見関与"]}))
         added = _run(store.add_kiken_flags(
             rid, stale, [tri.FLAG_ASSET_CONTACT]))
         self.assertEqual(added, 1)
@@ -427,8 +427,7 @@ class TestCasConvergence(_TriageBase):
         rid = self.make_case()
         stale = _run(store.fetch_case(self.UID))
         _run(store.kintone.update_record(
-            None, rid, {"電話推奨度": {"value": "推奨"},
-                        "電話推奨根拠": {"value": "先勝ち"}}))
+            None, rid, {"電話推奨度": "推奨", "電話推奨根拠": "先勝ち"}))
         self.assertFalse(_run(store.set_phone_recommendation(
             rid, stale, "強推奨", "後発")))
         self.assertEqual(self.fake.field(rid, "電話推奨度"), "推奨")
@@ -685,8 +684,8 @@ class TestHearingTrigger(_HearingBase):
     def test_repair_path_fires_when_pending(self):
         # 遷移済み×判定未了（取りこぼし）の自己修復発火
         _run(store.kintone.create_record(None, {
-            "LINEユーザーID": {"value": self.uid},
-            "status": {"value": "電話判断待ち"}}))
+            "LINEユーザーID": self.uid,
+            "status": "電話判断待ち"}))
         fire = AsyncMock(return_value=True)
         with patch.object(tri, "run_phone_triage", fire):
             self.run_turn([_text_response("補足です。")],
@@ -695,9 +694,9 @@ class TestHearingTrigger(_HearingBase):
 
     def test_repair_path_silent_when_judged(self):
         _run(store.kintone.create_record(None, {
-            "LINEユーザーID": {"value": self.uid},
-            "status": {"value": "電話判断待ち"},
-            "電話推奨度": {"value": "推奨"}}))
+            "LINEユーザーID": self.uid,
+            "status": "電話判断待ち",
+            "電話推奨度": "推奨"}))
         fire = AsyncMock(return_value=True)
         with patch.object(tri, "run_phone_triage", fire):
             self.run_turn([_text_response("補足です。")],
