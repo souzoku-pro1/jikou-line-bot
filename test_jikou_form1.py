@@ -8,12 +8,18 @@
 - 公開条件 fail-closed: env JIKOU_LINE_ADD_URL 未設定なら /shindan 系は
   GET/POST とも 404・設定時のみ公開
 - honeypot（非表示 website 欄）: 値があれば無言破棄（保存も通知もしない）
-- レート制限: X-Forwarded-For 最終要素 SHA-256 キーの固定窓（10 回/600 秒）・
-  超過は固定応答（非反射）
+- レート制限: 信頼済み proxy ヘッダ（env SHINDAN_CLIENT_IP_HEADER・既定
+  X-Real-IP）の SHA-256 キーの固定窓（10 回/600 秒）・超過は固定応答（非反射）
+  （fix1 02: X-Forwarded-For は採用しない・ヘッダ欠落は client.host）
 - App 21 保存は plain 値（hub.kintone の _wrap 契約・STORE-FIX1 の教訓どおり
   fake は _wrap 境界を模し {"value":…} 形は二重ラップとして fail）
-- 受付番号: secrets 乱数 6 桁ゼロ埋め・重複 create 失敗→再採番（上限 5 回・
-  全失敗=固定文言 500+要確認通知）・レコード番号流用禁止
+- 受付番号: secrets 乱数 6 桁ゼロ埋め・**一意制約違反と確認できた閉集合**
+  （400/CB_VA01/errors["record.受付番号.value"]）のみ再採番（上限 5 回）・
+  結果不明（transport/5xx）は同じ番号へ収束（照会→同番号 create 再試行）・
+  403 等の確定失敗は即 500+要確認・レコード番号流用禁止（fix1 01）
+- ゲート順序（fix1 04）: env→メソッド/別名→Content-Length（64KB）→レート
+  →**その後にのみ body 読取**・別名は 307 でなく 404・multipart は解析しない
+- バケット有界（fix1 03）: OrderedDict LRU・MAX_BUCKETS 厳密上限・最古退避
 - 必須 RADIO 4 種は既定値任せにしない（④→訴訟有無の写像+他 3 種は「不明」
   明示指定）・status=問い合わせ・LINEユーザーID=""（空）を明示
 - 弁護士通知は「【時効診断フォーム受付】受付番号:xxxxxx 診断パターン:X」のみ
@@ -121,11 +127,41 @@ class TestJudge(unittest.TestCase):
 
 
 # ── App 21 の in-memory フェイク（_wrap 境界を模す・STORE-FIX1 の教訓） ───────────
+def _unique_violation() -> "sf.hub_kintone.KintoneError":
+    """実 kintone の「値の重複を禁止する」違反（HTTP 400 / CB_VA01 /
+    errors["record.受付番号.value"]）と同形の例外。"""
+    return sf.hub_kintone.KintoneError(
+        400, "CB_VA01", "入力内容が正しくありません。",
+        errors={"record.受付番号.value":
+                {"messages": ["値がほかのレコードと重複しています。"]}})
+
+
+def _transport_error() -> "sf.hub_kintone.KintoneError":
+    return sf.hub_kintone.KintoneError(0, "transport_error", "ReadTimeout")
+
+
 class _FakeApp21:
     def __init__(self):
         self.rows: dict[str, dict] = {}
         self._id = 0
         self.fail_next = 0          # 次の create を何回失敗させるか（一意制約模擬）
+        self.transport_fail_next = 0   # 保存せず transport 例外（結果不明・未着）
+        self.landed_fail_next = 0      # 保存した上で transport 例外（結果不明・着）
+        self.search_fail_next = 0      # 照会（search_records）を失敗させる回数
+        self.create_calls: list[dict] = []
+        self.search_calls: list[str] = []
+
+    async def search_records(self, app, query, fields=None):
+        self.search_calls.append(query)
+        if self.search_fail_next > 0:
+            self.search_fail_next -= 1
+            raise _transport_error()
+        # query は sf 側が組む '受付番号 = "NNNNNN"' 形のみ受け付ける
+        prefix = '受付番号 = "'
+        assert query.startswith(prefix) and query.endswith('"'), query
+        num = query[len(prefix):-1]
+        return [{"$id": r["$id"]} for r in self.rows.values()
+                if (r.get("受付番号") or {}).get("value") == num]
 
     @staticmethod
     def _reject_double_wrap(fields):
@@ -139,20 +175,25 @@ class _FakeApp21:
 
     async def create_record(self, app, fields):
         self._reject_double_wrap(fields)
+        self.create_calls.append(dict(fields))
         if self.fail_next > 0:
             self.fail_next -= 1
-            raise sf.hub_kintone.KintoneError(400, "CB_VA01",
-                                              "unique constraint")
+            raise _unique_violation()
+        if self.transport_fail_next > 0:
+            self.transport_fail_next -= 1
+            raise _transport_error()
         num = fields.get("受付番号")
         if num and any((r.get("受付番号") or {}).get("value") == num
                        for r in self.rows.values()):
-            raise sf.hub_kintone.KintoneError(400, "CB_VA01",
-                                              "unique constraint")
+            raise _unique_violation()
         self._id += 1
         rid = str(self._id)
         rec = {k: {"value": v} for k, v in fields.items()}   # 実 API の _wrap
         rec["$id"] = {"value": rid}
         self.rows[rid] = rec
+        if self.landed_fail_next > 0:
+            self.landed_fail_next -= 1
+            raise _transport_error()        # 保存は成立したが応答が届かない
         return rid
 
     def last_fields(self) -> dict:
@@ -180,6 +221,8 @@ class _FormBase(unittest.TestCase):
                                     "ATTORNEY_LINE_USER_ID": "U_attorney"}),
             patch.object(sf.hub_kintone, "create_record",
                          self.fake.create_record),
+            patch.object(sf.hub_kintone, "search_records",
+                         self.fake.search_records),
             patch.object(sf.notify, "notify_business", self.notify_biz),
             patch.object(sf.notify, "notify_admin_line", self.notify_admin),
         ]
@@ -410,6 +453,406 @@ class TestWiring(unittest.TestCase):
                     out.extend(_paths(inner.routes))
             return out
         self.assertIn("/shindan", _paths(main.app.routes))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# fix1（R-JIKOU-FORM-1 の 01〜04・全て HIGH）
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── 01: 書込結果不明時の再採番で二重作成 ─────────────────────────────────────────
+class TestUniqueViolationClosedSet(unittest.TestCase):
+    """再採番は「kintone の一意制約違反」と確認できた閉集合のみ（fail-closed）。"""
+
+    def test_closed_set_pinned(self):
+        self.assertEqual(sf.UNIQUE_VIOLATION_STATUS, 400)
+        self.assertEqual(sf.UNIQUE_VIOLATION_CODES, frozenset({"CB_VA01"}))
+        self.assertEqual(sf.UNIQUE_VIOLATION_ERROR_KEY, "record.受付番号.value")
+
+    def test_hub_kintone_normalization_keeps_errors_detail(self):
+        # hub.kintone._raise_error の分類を実測: errors 詳細が KintoneError に残る
+        class _Resp:
+            status_code = 400
+            text = "x"
+
+            @staticmethod
+            def json():
+                return {"code": "CB_VA01", "id": "x",
+                        "message": "入力内容が正しくありません。",
+                        "errors": {"record.受付番号.value":
+                                   {"messages": ["値がほかのレコードと重複しています。"]}}}
+        with self.assertRaises(sf.hub_kintone.KintoneError) as ctx:
+            sf.hub_kintone._raise_error(_Resp())
+        e = ctx.exception
+        self.assertEqual((e.status, e.code), (400, "CB_VA01"))
+        self.assertIn("record.受付番号.value", e.errors)
+        self.assertTrue(sf._is_unique_violation(e))
+
+    def test_classification_table(self):
+        K = sf.hub_kintone.KintoneError
+        cases = {
+            "unique": (_unique_violation(), "duplicate"),
+            # CB_VA01 でも受付番号以外の欄（スキーマ不整合）は再採番しない
+            "cb_va01_other_field": (
+                K(400, "CB_VA01", "x",
+                  errors={"record.診断パターン.value": {"messages": ["x"]}}),
+                "failed"),
+            "cb_va01_no_detail": (K(400, "CB_VA01", "x"), "failed"),
+            "forbidden_403": (K(403, "GAIA_AP15", "x"), "failed"),
+            "unauth_401": (K(401, "GAIA_IA02", "x"), "failed"),
+            "not_found_404": (K(404, "GAIA_RE01", "x"), "failed"),
+            "transport": (_transport_error(), "unknown"),
+            "server_500": (K(500, "GAIA_UN01", "x"), "unknown"),
+            "bad_gateway_502": (K(502, "", ""), "unknown"),
+            "unavailable_503": (K(503, "", ""), "unknown"),
+        }
+        for name, (err, want) in cases.items():
+            with self.subTest(name=name):
+                self.assertEqual(sf._classify_create_error(err), want)
+
+
+class TestWriteConvergence(_FormBase):
+    """結果不明（transport/5xx）は再採番せず同じ受付番号へ収束する。"""
+
+    def test_landed_then_transport_error_converges_single_record(self):
+        # 保存は成立したが応答が届かない → 照会で発見 → 同番号で成功扱い
+        self.fake.landed_fail_next = 1
+        with patch.object(sf, "_draw_number", return_value="424242"):
+            resp = self.post()
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(len(self.fake.rows), 1)                # 二重作成なし
+        self.assertEqual(self.fake.last_fields()["受付番号"], "424242")
+        self.assertIn("受付番号：424242", resp.text)              # 表示番号一致
+        self.assertEqual(len(self.fake.create_calls), 1)
+        self.assertEqual(len(self.fake.search_calls), 1)
+        self.notify_admin.assert_not_awaited()
+        _to, text = self.notify_biz.await_args.args
+        self.assertIn("424242", text)
+
+    def test_unlanded_transport_error_retries_same_number(self):
+        # 未着 → 照会で不在 → 同じ番号で create 再試行 → 成功（再採番しない）
+        self.fake.transport_fail_next = 1
+        draws = iter(["313131", "999999"])
+        with patch.object(sf, "_draw_number", side_effect=draws):
+            resp = self.post()
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(len(self.fake.rows), 1)
+        self.assertEqual(self.fake.last_fields()["受付番号"], "313131")
+        numbers = [c["受付番号"] for c in self.fake.create_calls]
+        self.assertEqual(numbers, ["313131", "313131"])
+        self.assertIn("受付番号：313131", resp.text)
+
+    def test_server_5xx_then_unique_on_retry_resolves_by_lookup(self):
+        # 5xx 応答（実は着）→ 照会失敗 → 同番号 create が一意違反 → 再照会で発見
+        async def _create(app, fields):
+            self.fake.create_calls.append(dict(fields))
+            if len(self.fake.create_calls) == 1:
+                rid = await real_create(app, fields)          # 着
+                raise sf.hub_kintone.KintoneError(500, "GAIA_UN01", "x")
+            raise _unique_violation()
+        real_create = _FakeApp21.create_record.__get__(self.fake)
+        self.fake.search_fail_next = 1
+        with patch.object(sf.hub_kintone, "create_record", _create), \
+                patch.object(sf, "_draw_number", return_value="515151"):
+            resp = self.post()
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(len(self.fake.rows), 1)
+        self.assertIn("受付番号：515151", resp.text)
+        self.notify_admin.assert_not_awaited()
+
+    def test_unknown_exhausted_fixed_500_alert_with_number_no_pii(self):
+        self.fake.transport_fail_next = 99
+        with patch.object(sf, "_draw_number", return_value="616161"):
+            resp = self.post(creditor="秘匿すべき債権者名")
+        self.assertEqual(resp.status_code, 500)
+        self.assertEqual(len(self.fake.rows), 0)
+        # 再採番なし（同一番号のみ・上限付き）
+        self.assertEqual({c["受付番号"] for c in self.fake.create_calls},
+                         {"616161"})
+        self.assertLessEqual(len(self.fake.create_calls),
+                             1 + sf._UNKNOWN_RETRIES)
+        self.notify_admin.assert_awaited_once()
+        text = self.notify_admin.await_args.args[0]
+        self.assertIn("要確認", text)
+        self.assertIn("616161", text)                 # 弁護士が突合できる番号
+        self.assertNotIn("秘匿すべき債権者名", text)  # PII 非搭載
+        self.notify_biz.assert_not_awaited()
+        self.assertNotIn("秘匿すべき債権者名", resp.text)
+
+    def test_unique_violation_only_redraws(self):
+        self.fake.fail_next = 2
+        draws = iter(["111111", "111111", "999999"])
+        with patch.object(sf, "_draw_number", side_effect=draws):
+            resp = self.post()
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(self.fake.last_fields()["受付番号"], "999999")
+        self.assertEqual(self.fake.search_calls, [])   # 一意違反は照会不要
+
+    def test_403_no_redraw_immediate_500(self):
+        err = sf.hub_kintone.KintoneError(403, "GAIA_AP15", "forbidden")
+        with patch.object(sf.hub_kintone, "create_record",
+                          AsyncMock(side_effect=err)) as create:
+            resp = self.post()
+        self.assertEqual(resp.status_code, 500)
+        self.assertEqual(create.await_count, 1)        # 再採番なし・再試行なし
+        self.assertEqual(self.fake.search_calls, [])
+        self.notify_admin.assert_awaited_once()
+        self.assertIn("要確認", self.notify_admin.await_args.args[0])
+        self.notify_biz.assert_not_awaited()
+
+    def test_cb_va01_other_field_no_redraw(self):
+        err = sf.hub_kintone.KintoneError(
+            400, "CB_VA01", "x",
+            errors={"record.診断パターン.value": {"messages": ["x"]}})
+        with patch.object(sf.hub_kintone, "create_record",
+                          AsyncMock(side_effect=err)) as create:
+            resp = self.post()
+        self.assertEqual(resp.status_code, 500)
+        self.assertEqual(create.await_count, 1)
+        self.notify_admin.assert_awaited_once()
+
+
+# ── 02: クライアント IP の導出（信頼済み proxy ヘッダのみ・XFF 不採用） ─────────
+class TestClientIpDerivation(_FormBase):
+    def test_default_header_and_env_pinned(self):
+        self.assertEqual(sf.CLIENT_IP_HEADER_ENV, "SHINDAN_CLIENT_IP_HEADER")
+        self.assertEqual(sf.DEFAULT_CLIENT_IP_HEADER, "X-Real-IP")
+
+    def test_variable_xff_same_bucket(self):
+        # 固定クライアント（TestClient の client.host）+ 可変 XFF → 同一 bucket
+        for i in range(sf.RATE_LIMIT):
+            r = self.client.post("/shindan", data=self.VALID,
+                                 headers={"X-Forwarded-For": f"10.0.{i}.1"})
+            self.assertEqual(r.status_code, 200)
+        r = self.client.post("/shindan", data=self.VALID,
+                             headers={"X-Forwarded-For": "10.9.9.9"})
+        self.assertEqual(r.status_code, 429)
+        self.assertEqual(len(sf._attempts), 1)
+
+    def test_trusted_header_splits_buckets(self):
+        for _ in range(sf.RATE_LIMIT):
+            self.assertEqual(self.client.post(
+                "/shindan", data=self.VALID,
+                headers={"X-Real-IP": "203.0.113.1"}).status_code, 200)
+        self.assertEqual(self.client.post(
+            "/shindan", data=self.VALID,
+            headers={"X-Real-IP": "203.0.113.1"}).status_code, 429)
+        self.assertEqual(self.client.post(
+            "/shindan", data=self.VALID,
+            headers={"X-Real-IP": "203.0.113.2"}).status_code, 200)
+        self.assertEqual(len(sf._attempts), 2)
+
+    def test_env_header_override(self):
+        with patch.dict(os.environ, {sf.CLIENT_IP_HEADER_ENV: "CF-Connecting-IP"}):
+            for _ in range(sf.RATE_LIMIT):
+                self.assertEqual(self.client.post(
+                    "/shindan", data=self.VALID,
+                    headers={"CF-Connecting-IP": "198.51.100.1",
+                             "X-Real-IP": "203.0.113.7"}).status_code, 200)
+            self.assertEqual(self.client.post(
+                "/shindan", data=self.VALID,
+                headers={"CF-Connecting-IP": "198.51.100.1",
+                         "X-Real-IP": "203.0.113.8"}).status_code, 429)
+            self.assertEqual(self.client.post(
+                "/shindan", data=self.VALID,
+                headers={"CF-Connecting-IP": "198.51.100.2",
+                         "X-Real-IP": "203.0.113.7"}).status_code, 200)
+
+    def test_env_cannot_select_xff(self):
+        # X-Forwarded-For は env で指定しても採用しない（既定へ fail-closed）
+        with patch.dict(os.environ, {sf.CLIENT_IP_HEADER_ENV: "x-forwarded-for"}):
+            self.assertEqual(sf._client_ip_header(), sf.DEFAULT_CLIENT_IP_HEADER)
+
+    def test_missing_header_falls_back_to_client_host(self):
+        class _Req:
+            headers = {}
+
+            class client:
+                host = "192.0.2.10"
+        self.assertEqual(sf._rate_key(_Req()),
+                         hashlib.sha256(b"192.0.2.10").hexdigest())
+        # ヘッダ値は SHA-256 のみ保持（生 IP を鍵に残さない）
+        class _Req2:
+            headers = {"x-real-ip": "203.0.113.5"}
+            client = None
+        self.assertEqual(sf._rate_key(_Req2()),
+                         hashlib.sha256(b"203.0.113.5").hexdigest())
+
+
+# ── 03: MAX_BUCKETS の厳密上限（OrderedDict LRU・最古退避） ──────────────────────
+class TestBoundedBuckets(unittest.TestCase):
+    def setUp(self):
+        sf._attempts.clear()
+        self.addCleanup(sf._attempts.clear)
+
+    def test_structure_is_ordered_dict(self):
+        from collections import OrderedDict
+        self.assertIsInstance(sf._attempts, OrderedDict)
+        self.assertEqual(sf.MAX_BUCKETS, 5000)
+
+    def test_size_never_exceeds_max(self):
+        now = 1_000_000.0
+        with patch.object(sf, "MAX_BUCKETS", 5):
+            for i in range(5 + 1):
+                sf._rate_exceeded(f"k{i}", now)
+                self.assertLessEqual(len(sf._attempts), 5)
+            self.assertEqual(len(sf._attempts), 5)
+            self.assertNotIn("k0", sf._attempts)      # 最古（LRU）を退避
+            self.assertIn("k5", sf._attempts)
+
+    def test_surviving_bucket_keeps_limit_after_eviction(self):
+        now = 1_000_000.0
+        with patch.object(sf, "MAX_BUCKETS", 5):
+            for i in range(4):
+                sf._rate_exceeded(f"k{i}", now)
+            for _ in range(sf.RATE_LIMIT):            # A を上限まで消費（最終 touch）
+                self.assertFalse(sf._rate_exceeded("A", now))
+            self.assertEqual(len(sf._attempts), 5)
+            self.assertFalse(sf._rate_exceeded("new1", now))   # 新規は退避で受入
+            self.assertEqual(len(sf._attempts), 5)     # 上限超えなし
+            self.assertNotIn("k0", sf._attempts)        # 最古（k0）が退避された
+            self.assertIn("A", sf._attempts)            # 直近 touch は生存
+            self.assertTrue(sf._rate_exceeded("A", now))   # 制限は効いたまま
+
+    def test_expired_front_pruned_amortized(self):
+        now = 1_000_000.0
+        with patch.object(sf, "MAX_BUCKETS", 5):
+            sf._rate_exceeded("old", now - sf.RATE_WINDOW_SECONDS - 1)
+            for i in range(4):
+                sf._rate_exceeded(f"k{i}", now)
+            sf._rate_exceeded("fresh", now)
+            self.assertNotIn("old", sf._attempts)      # 期限切れは先頭から掃除
+            self.assertEqual(len(sf._attempts), 5)
+
+    def test_no_full_scan_on_request(self):
+        # リクエストごとの全件走査をしない（先頭から定数ステップのみ）
+        self.assertLessEqual(sf._PRUNE_STEPS, 4)
+
+
+# ── 04: env ゲート・レート制限が Form 解析より前 ─────────────────────────────────
+class _NoParse:
+    """body 解析器に触れた時点で失敗させる（ゲート前解析の検出）。"""
+
+    def __enter__(self):
+        import starlette.requests as sr
+        import starlette.formparsers as fp
+
+        def _boom(*a, **k):
+            raise AssertionError("body parser reached before gate")
+
+        async def _aboom(*a, **k):
+            raise AssertionError("request.form() reached before gate")
+        self._p = [patch.object(sr.Request, "form", _aboom),
+                   patch.object(fp.MultiPartParser, "__init__", _boom),
+                   patch.object(fp.FormParser, "__init__", _boom)]
+        for p in self._p:
+            p.start()
+        return self
+
+    def __exit__(self, *exc):
+        for p in self._p:
+            p.stop()
+        return False
+
+
+def _multipart_body() -> tuple[str, bytes]:
+    boundary = "----boundary123"
+    body = (f"--{boundary}\r\nContent-Disposition: form-data; name=\"f\";"
+            " filename=\"a.bin\"\r\nContent-Type: application/octet-stream"
+            "\r\n\r\n" + "A" * 2000 + "\r\n--" + boundary + "--\r\n")
+    return f"multipart/form-data; boundary={boundary}", body.encode()
+
+
+class TestGateBeforeBody(unittest.TestCase):
+    ALIASES = ("/shindan/", "/shindan%2F", "/shindan/x", "/shindan%2Fx")
+
+    def setUp(self):
+        self.client = TestClient(main.app)
+        os.environ.pop("JIKOU_LINE_ADD_URL", None)
+        sf._attempts.clear()
+        self.addCleanup(sf._attempts.clear)
+
+    def test_body_limit_pinned(self):
+        self.assertEqual(sf.MAX_BODY_BYTES, 64 * 1024)
+
+    def test_env_unset_all_methods_and_aliases_404_without_parse(self):
+        with _NoParse():
+            self.assertEqual(self.client.get("/shindan").status_code, 404)
+            self.assertEqual(self.client.head("/shindan").status_code, 404)
+            for method in ("put", "patch", "delete", "options"):
+                with self.subTest(method=method):
+                    r = getattr(self.client, method)("/shindan")
+                    self.assertEqual(r.status_code, 404)
+            r = self.client.post("/shindan", data=_FormBase.VALID)
+            self.assertEqual(r.status_code, 404)
+            for alias in self.ALIASES:
+                for method in ("get", "post"):
+                    with self.subTest(alias=alias, method=method):
+                        r = getattr(self.client, method)(
+                            alias, follow_redirects=False)
+                        self.assertEqual(r.status_code, 404)   # 307 でない
+                        self.assertNotIn("location", r.headers)
+
+    def test_env_unset_huge_and_malformed_bodies_404_without_parse(self):
+        with _NoParse():
+            big = "creditor=" + "a" * (sf.MAX_BODY_BYTES + 1)
+            r = self.client.post("/shindan", content=big.encode(), headers={
+                "Content-Type": "application/x-www-form-urlencoded"})
+            self.assertEqual(r.status_code, 404)
+            ct, body = _multipart_body()
+            r = self.client.post("/shindan", content=body,
+                                 headers={"Content-Type": ct})
+            self.assertEqual(r.status_code, 404)
+            r = self.client.post("/shindan", content=b"--garbage", headers={
+                "Content-Type": "multipart/form-data; boundary=zzz"})
+            self.assertEqual(r.status_code, 404)      # parser 由来 400 が出ない
+
+    def test_env_set_aliases_and_other_methods_still_404(self):
+        with patch.dict(os.environ, {"JIKOU_LINE_ADD_URL": _LINE_URL}):
+            for alias in self.ALIASES:
+                with self.subTest(alias=alias):
+                    r = self.client.post(alias, data=_FormBase.VALID,
+                                         follow_redirects=False)
+                    self.assertEqual(r.status_code, 404)
+            for method in ("put", "patch", "delete"):
+                self.assertEqual(
+                    getattr(self.client, method)("/shindan").status_code, 404)
+            self.assertEqual(self.client.head("/shindan").status_code, 200)
+
+    def test_env_set_oversize_and_multipart_rejected_before_parse(self):
+        with patch.dict(os.environ, {"JIKOU_LINE_ADD_URL": _LINE_URL}), \
+                _NoParse():
+            big = "creditor=" + "a" * (sf.MAX_BODY_BYTES + 1)
+            r = self.client.post("/shindan", content=big.encode(), headers={
+                "Content-Type": "application/x-www-form-urlencoded"})
+            self.assertEqual(r.status_code, 404)
+            ct, body = _multipart_body()
+            r = self.client.post("/shindan", content=body,
+                                 headers={"Content-Type": ct})
+            self.assertEqual(r.status_code, 404)        # multipart は受けない
+            self.assertEqual(len(sf._attempts), 0)      # レート計上より前に遮断
+
+    def test_env_set_rate_limit_stops_before_parse(self):
+        fake = _FakeApp21()
+        with patch.dict(os.environ, {"JIKOU_LINE_ADD_URL": _LINE_URL}), \
+                patch.object(sf.hub_kintone, "create_record", fake.create_record), \
+                patch.object(sf.hub_kintone, "search_records", fake.search_records), \
+                patch.object(sf.notify, "notify_business", AsyncMock(return_value=True)):
+            for _ in range(sf.RATE_LIMIT):
+                self.assertEqual(self.client.post(
+                    "/shindan", data=_FormBase.VALID).status_code, 200)
+            with _NoParse():
+                r = self.client.post("/shindan", data=_FormBase.VALID)
+                self.assertEqual(r.status_code, 429)
+                # honeypot 値があっても解析前に止まる（bot の連射も計上）
+                r = self.client.post("/shindan", data={**_FormBase.VALID,
+                                                       "website": "x"})
+                self.assertEqual(r.status_code, 429)
+
+    def test_gate_order_is_documented_in_entry(self):
+        # POST 入口は Form パラメータ依存を持たない（素の Request のみ）
+        import inspect
+        params = list(inspect.signature(sf.shindan_entry).parameters)
+        self.assertEqual(params, ["request"])
 
 
 if __name__ == "__main__":

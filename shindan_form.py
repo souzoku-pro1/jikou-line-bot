@@ -1,4 +1,4 @@
-"""時効診断フォーム（公開ページ）— JIKOU-FORM-1
+"""時効診断フォーム（公開ページ）— JIKOU-FORM-1（fix1 反映）
 
 HP 設置の簡易診断: 4 問（①債権者名・②借入時期・③最終返済・④裁判所書類）
 → サーバ側ルール判定（A〜D）→ 弁護士凍結の結果文言+受付番号を表示し、
@@ -6,31 +6,44 @@ LINE 友だち追加へ誘導する。回答は App 21 へ保存（LINE 紐付�
 写真アップロードは FORM-3 の別票）。
 
 設計（票の逐語+SURVEY 実測）:
-- prefix /shindan（/app 配下に置かない=test_p4_001 の PUBLIC_ROUTES pin 維持。
-  route 内 gate 方式のため encoded alias も starlette の decode 後に本 route へ
-  落ちて gate を通る=service_auth normalize_path と同じ入口遮断の思想）
+- prefix /shindan（/app 配下に置かない=test_p4_001 の PUBLIC_ROUTES pin 維持）
 - 公開条件 fail-closed: env JIKOU_LINE_ADD_URL（時効 LINE 友だち追加 URL）が
-  未設定/空白なら GET/POST とも 404（存在しないフリ・shinjutsu_webhook 同型）
+  未設定/空白なら全メソッド・全別名で 404（存在しないフリ・shinjutsu_webhook 同型）
 - 判定はサーバ側のみ（優先順 C→B→D→A・②は判定に使わず保存のみ・
   「その他の督促通知」は裁判所手続でないため C 非該当=司令塔裁定）
 - 凍結文言（FROZEN_RESULTS/FROZEN_NOTE）は test_jikou_form1 が sha256 pin。
   {受付番号} プレースホルダのみ実値置換（改変禁止）
-- スパム対策: honeypot（非表示 website 欄・値あり=無言破棄=保存も通知もしない）
-  + X-Forwarded-For 最終要素の SHA-256 キー（webapp_auth._rate_key 流儀・
-  生 IP を保持しない）による固定窓レート制限（RATE_LIMIT 回/RATE_WINDOW 秒）
 - 非反射: 入力値をエラー応答・結果画面のどこにも出さない（固定文言のみ）。
   結果画面に出る可変値は**サーバ生成の受付番号のみ**
 - App 21 保存は hub.kintone（plain 値契約・HOUKI-STORE-FIX1 の教訓）。
-  受付番号=secrets 乱数 6 桁ゼロ埋め・「値の重複を禁止する」（CU 済み実測）
-  による create 失敗→再採番リトライ（上限 _NUMBER_ATTEMPTS 回・全失敗=
-  固定文言 500+要確認通知）。レコード番号の流用は禁止（連番=推測可能で
-  FORM-2 の紐付け乗っ取りリスク）
+  受付番号=secrets 乱数 6 桁ゼロ埋め・「値の重複を禁止する」（CU 済み実測）。
+  レコード番号の流用は禁止（連番=推測可能で FORM-2 の紐付け乗っ取りリスク）
 - 必須 RADIO 4 種（既定値「あり」の誤登録防止・form fields API 実測）:
   １０年以内の訴訟の有無←④写像／他 3 種（住民票相違・業者電話・アンケート
   送付）は④から写像できないため「不明」を明示指定（既定値任せにしない）
 - 弁護士通知は notify_business 流儀・固定文言+受付番号+診断パターンのみ
   （債権者名・回答本文は載せない=PII 規律）。通知は best-effort
   （App 21 レコードが正本・失敗しても受付は成立）
+
+fix1（R-JIKOU-FORM-1 01〜04）:
+- 01 二重作成防止: 再採番は「kintone の一意制約違反」と確認できた閉集合
+  （HTTP 400 / code CB_VA01 / errors["record.受付番号.value"] 在）のみ。
+  結果不明（transport 例外=status 0・5xx）は**同じ受付番号へ収束**:
+  App 21 を受付番号で照会（読取は冪等）→在れば成功扱い→無ければ同番号で
+  create 再試行（上限 _UNKNOWN_RETRIES）→なお不明なら固定 500+要確認通知
+  （通知本文に受付番号を含め弁護士が突合できるようにする・PII 非搭載）。
+  403・スキーマ不整合（CB_VA01 でも他欄）等の確定失敗は再採番せず即 500+要確認
+- 02 クライアント IP: 信頼済み proxy の契約に基づくヘッダのみ採用
+  （env SHINDAN_CLIENT_IP_HEADER・既定 X-Real-IP）。X-Forwarded-For は採用しない
+  （env で指定されても既定へ倒す）。ヘッダ欠落時は request.client.host
+- 03 有界バケット: OrderedDict の LRU・MAX_BUCKETS を厳密上限とし、上限到達時は
+  最古（最終 touch が最も古い）を退避。期限切れ掃除は先頭から定数ステップ
+  （償却 O(1)）で、リクエストごとの全件走査をしない
+- 04 ゲート順序: 素の Request を受ける単一入口（Form パラメータ依存なし）で
+  ①env→②メソッド/別名→③Content-Type/Content-Length（MAX_BODY_BYTES）→④レート
+  を通過した後にのみ body を読む。body は urlencoded のみ自前解析
+  （starlette の FormParser/MultiPartParser を呼ばない=一時ファイル化なし）。
+  別名（末尾スラッシュ・%2F・配下パス）は明示 catch-all route で 404（307 なし）
 """
 
 import hashlib
@@ -39,8 +52,10 @@ import logging
 import os
 import secrets
 import time
+from collections import OrderedDict
+from urllib.parse import parse_qsl
 
-from fastapi import APIRouter, Form, Request
+from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from hub import kintone as hub_kintone
@@ -99,45 +114,178 @@ _COURT_DOC_TO_SOSHO = {
     "不明": "不明",
 }
 
-# ── 受付番号（6 桁ゼロ埋め乱数・重複は再採番） ──────────────────────────────────
-_NUMBER_ATTEMPTS = 5
+# ── 受付番号（6 桁ゼロ埋め乱数・一意制約違反の確定時のみ再採番） ─────────────────
+_NUMBER_ATTEMPTS = 5      # 再採番の上限（一意制約違反が続いた場合）
+_UNKNOWN_RETRIES = 2      # 結果不明時の「照会→同番号 create」再試行の上限
+_NUMBER_FIELD = "受付番号"
+
+# 一意制約違反の閉集合（kintone REST API の検証エラー形: HTTP 400 / code CB_VA01 /
+# errors={"record.<fieldcode>.value": {"messages": [...]}}。hub.kintone._raise_error
+# が errors 詳細を KintoneError.errors に保持する）。**受付番号の欄に対する
+# CB_VA01 のみ**を一意制約違反とみなす（受付番号は本モジュールが生成する 6 桁
+# 数字なので、この欄で起き得る検証エラーは重複のみ）。他欄の CB_VA01 はスキーマ
+# 不整合=確定失敗。code/欄が特定できない場合は再採番しない（fail-closed）
+UNIQUE_VIOLATION_STATUS = 400
+UNIQUE_VIOLATION_CODES = frozenset({"CB_VA01"})
+UNIQUE_VIOLATION_ERROR_KEY = f"record.{_NUMBER_FIELD}.value"
 
 
 def _draw_number() -> str:
     return f"{secrets.randbelow(1_000_000):06d}"
 
 
-# ── レート制限（webapp_auth._rate_key 流儀の固定窓・単一 worker 前提） ────────────
-RATE_WINDOW_SECONDS = 600
-RATE_LIMIT = 10
-MAX_BUCKETS = 5000
-_attempts: dict[str, tuple[float, int]] = {}
+def _is_unique_violation(e: hub_kintone.KintoneError) -> bool:
+    return (e.status == UNIQUE_VIOLATION_STATUS
+            and e.code in UNIQUE_VIOLATION_CODES
+            and UNIQUE_VIOLATION_ERROR_KEY in (getattr(e, "errors", None) or {}))
+
+
+def _classify_create_error(e: hub_kintone.KintoneError) -> str:
+    """create 失敗の三分類:
+    duplicate=一意制約違反（確定・再採番可）／
+    unknown=結果不明（transport 例外=status 0・5xx=書込が着いた可能性あり）／
+    failed=確定失敗（上記以外の 4xx: 403・401・404・他欄の CB_VA01 等）"""
+    if _is_unique_violation(e):
+        return "duplicate"
+    if e.status == 0 or e.status >= 500:
+        return "unknown"
+    return "failed"
+
+
+async def _lookup_by_number(number: str) -> str | None:
+    """受付番号で App 21 を照会（読取は冪等）。在れば record_id・無ければ None。
+    照会自体の失敗は None ではなく例外のまま呼び出し元へ（不在と区別する）。"""
+    rows = await hub_kintone.search_records(
+        APP_JIKOU_CASE, f'{_NUMBER_FIELD} = "{number}"', fields=["$id"])
+    for row in rows:
+        rid = (row.get("$id") or {}).get("value")
+        if rid:
+            return str(rid)
+    return None
+
+
+async def _persist_with_number(fields_base: dict, number: str) -> tuple[str, str]:
+    """同じ受付番号で保存を確定させる。戻り値 (outcome, record_id):
+    created=保存確定／duplicate=一意制約違反（初回送信で確定・再採番可）／
+    failed=確定失敗／unknown=収束不能（レコードの有無が不明）。
+
+    結果不明の収束手順（01）: 照会→在れば created／無ければ同番号 create 再試行。
+    再試行で一意制約違反が返ったら（=先の書込が着いていた）再照会で確定する。
+    照会が失敗した回は create を送らない（着いていた場合の二重作成を避ける）。"""
+    fields = {**fields_base, _NUMBER_FIELD: number}
+    try:
+        return "created", await hub_kintone.create_record(APP_JIKOU_CASE, fields)
+    except hub_kintone.KintoneError as e:
+        kind = _classify_create_error(e)
+        logger.warning("[SHINDAN] create failed kind=%s code=%s",
+                       emit(kind, "freetext", "log", "operator"),
+                       emit(e.code, "vendor_raw", "log", "operator"))
+        if kind != "unknown":
+            return kind, ""
+
+    for _retry in range(_UNKNOWN_RETRIES):
+        try:
+            rid = await _lookup_by_number(number)
+        except hub_kintone.KintoneError as e:
+            logger.warning("[SHINDAN] lookup failed code=%s",
+                           emit(e.code, "vendor_raw", "log", "operator"))
+            continue                      # 有無不明のまま create は送らない
+        if rid:
+            logger.info("[SHINDAN] converged by lookup (record exists)")
+            return "created", rid
+        try:
+            return "created", await hub_kintone.create_record(APP_JIKOU_CASE, fields)
+        except hub_kintone.KintoneError as e:
+            kind = _classify_create_error(e)
+            logger.warning("[SHINDAN] create retry failed kind=%s code=%s",
+                           emit(kind, "freetext", "log", "operator"),
+                           emit(e.code, "vendor_raw", "log", "operator"))
+            if kind == "duplicate":
+                # 同番号で一意制約違反=先の書込が着いていた → 再照会で確定
+                try:
+                    rid = await _lookup_by_number(number)
+                except hub_kintone.KintoneError:
+                    rid = None
+                return ("created", rid) if rid else ("unknown", "")
+            if kind == "failed":
+                # 一度結果不明を経ているため「確定失敗」とは言えない=unknown 扱い
+                return "unknown", ""
+    return "unknown", ""
+
+
+# ── クライアント IP の導出（02: 信頼済み proxy ヘッダのみ） ───────────────────────
+# Railway の公開仕様（docs.railway.com → Public Networking → Specs & Limits）は
+# edge proxy が付加するヘッダとして「X-Real-IP for identifying client's remote IP」
+# を明記している。本モジュールはこの契約に依存し、既定で X-Real-IP のみを採用する。
+# X-Forwarded-For は多段 proxy でクライアント側の付加値と proxy 付加値が混在し、
+# どの要素を信頼できるかがデプロイ環境に依存するため採用しない（env で指定されても
+# 既定へ倒す）。proxy 構成が変わった場合は env SHINDAN_CLIENT_IP_HEADER で切り替える。
+CLIENT_IP_HEADER_ENV = "SHINDAN_CLIENT_IP_HEADER"
+DEFAULT_CLIENT_IP_HEADER = "X-Real-IP"
+_REJECTED_IP_HEADERS = frozenset({"x-forwarded-for"})
+
+
+def _client_ip_header() -> str:
+    name = os.environ.get(CLIENT_IP_HEADER_ENV, "").strip()
+    if not name or name.lower() in _REJECTED_IP_HEADERS:
+        return DEFAULT_CLIENT_IP_HEADER
+    return name
 
 
 def _rate_key(request: Request) -> str:
-    """X-Forwarded-For の最終要素（単一信頼 proxy=Railway が付加した実クライアント）
-    を SHA-256 のみで保持する（生 IP/生 XFF を状態・ログに残さない）。
-    XFF 不在時（直接接続・テスト）は client.host に fallback。"""
-    xff = request.headers.get("x-forwarded-for", "")
-    if xff:
-        ip = xff.split(",")[-1].strip()
-    else:
-        ip = request.client.host if request.client else ""
-    return hashlib.sha256(ip.encode("utf-8")).hexdigest()
+    """信頼済み proxy ヘッダ（既定 X-Real-IP）の値を SHA-256 のみで保持する
+    （生 IP を状態・ログに残さない）。ヘッダ欠落時（直接接続・テスト）は
+    request.client.host に fallback。"""
+    ip = (request.headers.get(_client_ip_header().lower(), "") or "").strip()
+    if not ip:
+        client = getattr(request, "client", None)
+        ip = getattr(client, "host", "") if client else ""
+    return hashlib.sha256((ip or "").encode("utf-8")).hexdigest()
+
+
+# ── レート制限（03: 固定窓・OrderedDict LRU の厳密上限・単一 worker 前提） ─────────
+RATE_WINDOW_SECONDS = 600
+RATE_LIMIT = 10
+MAX_BUCKETS = 5000
+_PRUNE_STEPS = 2          # リクエストごとに先頭（最古 touch）から見る定数ステップ
+_attempts: "OrderedDict[str, tuple[float, int]]" = OrderedDict()
 
 
 def _rate_exceeded(key: str, now: float) -> bool:
     """固定窓カウンタを 1 進め、上限超過なら True。窓満了で自然解除。
-    バケット暴走時は期限切れのみ掃除（ロック中は保全）。"""
-    if len(_attempts) > MAX_BUCKETS:
-        for k in [k for k, (start, _c) in _attempts.items()
-                  if now - start >= RATE_WINDOW_SECONDS]:
-            del _attempts[k]
-    start, count = _attempts.get(key, (now, 0))
-    if now - start >= RATE_WINDOW_SECONDS:
+    - 期限切れ掃除: 先頭（最終 touch が最も古い）から _PRUNE_STEPS 件だけ見て
+      期限切れなら捨てる（償却 O(1)・全件走査なし）
+    - 上限: 新規キーで len が MAX_BUCKETS に達していれば最古を 1 件退避してから
+      挿入する（辞書サイズは MAX_BUCKETS を超えない）。退避=429 ではなく受入
+      （新規利用者の可用性優先。退避で制限を外すには MAX_BUCKETS 個の別 IP から
+      の送信が要り、それ自体が上限回数×MAX_BUCKETS を超えるコストになる）"""
+    for _ in range(_PRUNE_STEPS):
+        if not _attempts:
+            break
+        oldest_key = next(iter(_attempts))
+        if now - _attempts[oldest_key][0] >= RATE_WINDOW_SECONDS:
+            del _attempts[oldest_key]
+        else:
+            break
+    if key in _attempts:
+        start, count = _attempts[key]
+        if now - start >= RATE_WINDOW_SECONDS:
+            start, count = now, 0
+        _attempts.move_to_end(key)
+    else:
         start, count = now, 0
+        while len(_attempts) >= MAX_BUCKETS:
+            _attempts.popitem(last=False)        # 最古（LRU）を退避
     _attempts[key] = (start, count + 1)
     return count + 1 > RATE_LIMIT
+
+
+# ── ゲート（04: body 読取前に通す関門） ────────────────────────────────────────────
+MAX_BODY_BYTES = 64 * 1024        # FORM-1 は写真なし（回答 4 問+100 字）=64KB で十分
+_FORM_CONTENT_TYPE = "application/x-www-form-urlencoded"
+_MAX_FORM_FIELDS = 16
+_ENTRY_METHODS = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE",
+                  "OPTIONS", "TRACE"]
 
 
 def _disabled() -> bool:
@@ -147,6 +295,31 @@ def _disabled() -> bool:
 
 def _not_found() -> JSONResponse:
     return JSONResponse(status_code=404, content={"error": "not found"})
+
+
+def _content_length_ok(request: Request) -> bool:
+    """Content-Length が数値で MAX_BODY_BYTES 以下（欠落=chunked 等は fail-closed）。"""
+    raw = (request.headers.get("content-length", "") or "").strip()
+    if not raw.isdigit():
+        return False
+    return int(raw) <= MAX_BODY_BYTES
+
+
+def _content_type_ok(request: Request) -> bool:
+    """urlencoded のみ受理（multipart は解析器に渡さない=一時ファイル化なし）。"""
+    ct = (request.headers.get("content-type", "") or "").split(";", 1)[0]
+    return ct.strip().lower() == _FORM_CONTENT_TYPE
+
+
+def _parse_form(body: bytes) -> dict[str, str] | None:
+    """urlencoded を自前解析（starlette の FormParser を呼ばない）。
+    復号不能・項目数超過は None（固定 400 へ）。"""
+    try:
+        pairs = parse_qsl(body.decode("utf-8"), keep_blank_values=True,
+                          max_num_fields=_MAX_FORM_FIELDS)
+    except (UnicodeDecodeError, ValueError):
+        return None
+    return {k: v for k, v in pairs}
 
 
 def judge(last_pay: str, court_doc: str) -> str:
@@ -253,22 +426,64 @@ def _fixed_page(title: str, message: str, status: int) -> HTMLResponse:
                         status_code=status)
 
 
-@router.get("/shindan")
-async def shindan_form_page():
-    if _disabled():
-        return _not_found()
-    return HTMLResponse(_form_html())
+def _error_500() -> HTMLResponse:
+    return _fixed_page(
+        "エラーが発生しました",
+        "申し訳ありません。システムエラーが発生しました。お手数ですが、"
+        "時間をおいてもう一度お試しください。", 500)
 
 
-@router.post("/shindan")
-async def shindan_submit(request: Request,
-                         creditor: str = Form(default=""),
-                         borrow: str = Form(default=""),
-                         last_pay: str = Form(default=""),
-                         court_doc: str = Form(default=""),
-                         website: str = Form(default="")):
+# ── 入口（04: 単一 route・素の Request・ゲート通過後にのみ body 読取） ──────────────
+async def shindan_entry(request: Request):
+    # ① env 未設定 → 全メソッド 404（存在しないフリ）
     if _disabled():
         return _not_found()
+    # ② メソッド: GET/HEAD=フォーム表示・POST=送信・他=404
+    method = request.method.upper()
+    if method in ("GET", "HEAD"):
+        return HTMLResponse(_form_html())
+    if method != "POST":
+        return _not_found()
+    # ③ Content-Type/Content-Length（urlencoded のみ・上限超過/欠落は 404）
+    if not _content_type_ok(request) or not _content_length_ok(request):
+        logger.info("[SHINDAN] body gate rejected (type/length)")
+        return _not_found()
+    # ④ レート制限（固定窓・キーは SHA-256 のみ保持・超過は固定応答）
+    if _rate_exceeded(_rate_key(request), time.time()):
+        logger.info("[SHINDAN] rate limited")
+        return _fixed_page(
+            "アクセスが集中しています",
+            "アクセスが集中しています。しばらく時間をおいてから"
+            "もう一度お試しください。", 429)
+    # ── ここで初めて body を読む（上限を再確認・urlencoded 自前解析） ──
+    body = await request.body()
+    if len(body) > MAX_BODY_BYTES:
+        return _not_found()
+    form = _parse_form(body)
+    if form is None:
+        return _fixed_page(
+            "入力内容をご確認ください",
+            "入力内容を確認して、もう一度お試しください。", 400)
+    return await _handle_submit(form)
+
+
+async def shindan_alias_not_found(request: Request, _rest: str = ""):
+    """末尾スラッシュ・%2F・配下パス等の別名は 307 でなく明示 404。"""
+    return _not_found()
+
+
+router.add_api_route("/shindan", shindan_entry, methods=_ENTRY_METHODS,
+                     include_in_schema=False)
+router.add_api_route("/shindan/{_rest:path}", shindan_alias_not_found,
+                     methods=_ENTRY_METHODS, include_in_schema=False)
+
+
+async def _handle_submit(form: dict[str, str]):
+    creditor = str(form.get("creditor", "") or "").strip()
+    borrow = form.get("borrow", "")
+    last_pay = form.get("last_pay", "")
+    court_doc = form.get("court_doc", "")
+    website = form.get("website", "")
 
     # honeypot: 値があれば無言破棄（保存も通知もしない・番号も発行しない。
     # bot に検知させないため固定の受付風ページを 200 で返す）
@@ -278,16 +493,7 @@ async def shindan_submit(request: Request,
             "送信を受け付けました",
             "送信を受け付けました。LINEの無料相談へお進みください。", 200)
 
-    # レート制限（固定窓・キーは SHA-256 のみ保持・超過は固定応答）
-    if _rate_exceeded(_rate_key(request), time.time()):
-        logger.info("[SHINDAN] rate limited")
-        return _fixed_page(
-            "アクセスが集中しています",
-            "アクセスが集中しています。しばらく時間をおいてから"
-            "もう一度お試しください。", 429)
-
     # サーバ側検証（閉集合・上限。失敗は固定文言のみ=非反射）
-    creditor = str(creditor or "").strip()
     if (len(creditor) > CREDITOR_MAX_CHARS
             or borrow not in CHOICES_BORROW
             or last_pay not in CHOICES_LAST_PAY
@@ -298,7 +504,7 @@ async def shindan_submit(request: Request,
 
     pattern = judge(last_pay, court_doc)
 
-    # App 21 保存（plain 値契約）。受付番号の一意制約 create 失敗は再採番
+    # App 21 保存（plain 値契約）
     fields_base = {
         "受付チャネル": "フォーム",
         "診断パターン": pattern,
@@ -316,28 +522,25 @@ async def shindan_submit(request: Request,
     }
     number = ""
     record_id = ""
+    outcome = "duplicate"
     for _attempt in range(_NUMBER_ATTEMPTS):
         number = _draw_number()
-        try:
-            record_id = await hub_kintone.create_record(
-                APP_JIKOU_CASE, {**fields_base, "受付番号": number})
-            break
-        except hub_kintone.KintoneError as e:
-            # 一意制約（重複）想定の再採番。他要因でも上限までで打ち切り=固定 500
-            logger.warning("[SHINDAN] create failed (redraw) code=%s",
-                           emit(e.code, "vendor_raw", "log", "operator"))
-    else:
-        logger.error("[SHINDAN] numbering exhausted (no record)")
+        outcome, record_id = await _persist_with_number(fields_base, number)
+        if outcome != "duplicate":
+            break                      # created / failed / unknown は再採番しない
+    if outcome != "created":
+        # 保存できていない（failed）／有無不明（unknown）／再採番上限（duplicate）
+        # → 固定 500+要確認通知（受付番号を含め弁護士が App 21 と突合できる）
+        logger.error("[SHINDAN] record not confirmed outcome=%s",
+                     emit(outcome, "freetext", "log", "operator"))
         await notify.notify_admin_line(
-            "【時効診断フォーム・要確認】受付番号の採番・レコード作成に"
-            "失敗しました（保存できていません）。kintone と Railway ログを"
+            "【時効診断フォーム・要確認】レコード作成を確定できませんでした"
+            f"（区分:{outcome} 受付番号:{number}）。App 21 に同じ受付番号の"
+            "レコードが無ければ保存できていません。kintone と Railway ログを"
             "確認してください。",
             throttle_key="shindan_numbering",
         )
-        return _fixed_page(
-            "エラーが発生しました",
-            "申し訳ありません。システムエラーが発生しました。お手数ですが、"
-            "時間をおいてもう一度お試しください。", 500)
+        return _error_500()
 
     logger.info("[SHINDAN] record created record_id=%s pattern=%s",
                 emit(record_id, "record_id", "log", "operator"),

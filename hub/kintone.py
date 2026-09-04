@@ -37,10 +37,15 @@ class KintoneApp:
 class KintoneError(Exception):
     """kintone API 呼び出しの失敗（HTTP エラー・通信エラーの正規化）"""
 
-    def __init__(self, status: int, code: str = "", message: str = ""):
+    def __init__(self, status: int, code: str = "", message: str = "",
+                 errors: dict | None = None):
         self.status = status
         self.code = code
         self.message = message
+        # kintone 検証エラー（CB_VA01）の欄別詳細 {"record.<code>.value": {"messages": [...]}}。
+        # 呼び出し元が「どの欄の違反か」を閉集合で判定するために保持する
+        # （JIKOU-FORM-1-fix1 01: 一意制約違反の確定判定）。str() には含めない
+        self.errors: dict = errors if isinstance(errors, dict) else {}
         super().__init__(f"kintone error status={status} code={code} message={message}")
 
 
@@ -68,12 +73,15 @@ def _raise_error(resp) -> None:
         err = resp.json()
     except Exception:
         err = {}
+    if not isinstance(err, dict):
+        err = {}
     code = err.get("code", "")
     message = err.get("message", "") or getattr(resp, "text", "")[:200]
+    errors = err.get("errors")
     # revision 不一致は HTTP 409（コード GAIA_CO02）
     if resp.status_code == 409 or code == "GAIA_CO02":
-        raise KintoneConflict(resp.status_code, code, message)
-    raise KintoneError(resp.status_code, code, message)
+        raise KintoneConflict(resp.status_code, code, message, errors)
+    raise KintoneError(resp.status_code, code, message, errors)
 
 
 async def _get(url: str, app: KintoneApp, params: dict) -> httpx.Response:
