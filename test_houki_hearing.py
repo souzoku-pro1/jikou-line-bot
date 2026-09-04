@@ -950,7 +950,9 @@ class TestHoukiProfileAndPrompt(unittest.TestCase):
     # HOUKI-HEARING-UX-1: 新正本（7 通構成・弁護士決定 A/B）の凍結 pin。
     # 旧 1 問ずつ方式の要語 pin は本票の弁護士決定を根拠に書き換え（削除ではなく
     # 検証内容の置換）。意図的変更時は本 hash を票の根拠つきで更新する
-    PROMPT_SHA256 = ("1ab7fb0d7641b6cb16f6f931fe0fb5613722253bc255c6091807a6f6e37cbb38")
+    # HOUKI-HEARING-UX-1-fix1: 弁護士確認による第 3 通③・第 5 通①の文言差し替え
+    # （旧 1ab7fb0d…→本値）。他の文面は凍結のまま
+    PROMPT_SHA256 = ("12a1a94c85897d8e1ef747d08b673287e242760616643a0ea5b41e57d9465716")
 
     def test_prompt_frozen_hash(self):
         self.assertEqual(
@@ -990,13 +992,16 @@ class TestHoukiProfileAndPrompt(unittest.TestCase):
             "知った経緯",
             "亡くなった方に借金や未払いはありますか",
             "亡くなった方の不動産以外の財産",
-            # 財産処分の中立質問（民法921条直結・逐語維持）
-            "亡くなった方の財産（預貯金・不動産・車など）について、使ったり、"
-            "処分したり、解約したり、そこから何かのお支払いをされたものはありますか。",
+            # 財産処分の中立質問（民法921条直結・逐語維持。UX-1-fix1 で弁護士確認の
+            # 文言へ差し替え・記録先 財産処分有無 は不変）
+            "③亡くなった方の預貯金を死亡後に出金して使用したり、価値のある財産を"
+            "処分したりしたことはありますか",
             "あなた以外に相続人にあたる方",
             "一緒に相続放棄をしたいご希望",
-            "戸籍謄本や住民票（除票）",
-            "事務所で職務上請求により取得可能",
+            # 戸籍（UX-1-fix1: 「職務上請求」の語を顧客向け文面から除去）
+            "①亡くなった方の戸籍謄本や住民票（除票）を、すでに取得されていますか。"
+            "それともこれから取得のご予定ですか（お手元になくても、事務所で戸籍謄本等の"
+            "必要書類を取得可能です）",
             "ご依頼者様ご自身のお名前とふりがな",
             "ご依頼者様ご自身のご住所",
             "ご依頼者様ご自身の生年月日",
@@ -1020,6 +1025,33 @@ class TestHoukiProfileAndPrompt(unittest.TestCase):
                 self.assertIn(phrase, p)
         # 文体（無内容見本・両業務共通の正）を収載
         self.assertIn(cr.HEARING_STYLE_SECTION_BASE, p)
+
+    def test_prompt_ux1_fix1_wording_replaced(self):
+        # HOUKI-HEARING-UX-1-fix1（弁護士決定）: 第 3 通③・第 5 通①の旧文言は不在、
+        # 「職務上請求」の語はプロンプト全体（定型ブロック・記録メモ・規則）に不在。
+        # 記録先（財産処分有無）と判定への接続は不変
+        p = hp.HOUKI_HEARING_PROMPT
+        for old in (
+            "亡くなった方の財産（預貯金・不動産・車など）について",
+            "そこから何かのお支払いをされたものはありますか",
+            "事務所で職務上請求により取得可能",
+            "職務上請求",
+        ):
+            with self.subTest(old=old):
+                self.assertNotIn(old, p)
+        for block in hp.HEARING_TEMPLATE_BLOCKS_HOUKI:
+            self.assertNotIn("職務上請求", block)
+        round3 = store.HEARING_ROUNDS[2]
+        self.assertEqual(round3[0], "借金と財産について")
+        self.assertEqual(round3[2][2], (
+            "亡くなった方の預貯金を死亡後に出金して使用したり、価値のある財産を"
+            "処分したりしたことはありますか", ("財産処分有無",)))
+        round5 = store.HEARING_ROUNDS[4]
+        self.assertEqual(round5[0], "戸籍について")
+        self.assertEqual(round5[2][0], (
+            "亡くなった方の戸籍謄本や住民票（除票）を、すでに取得されていますか。"
+            "それともこれから取得のご予定ですか（お手元になくても、事務所で戸籍謄本等の"
+            "必要書類を取得可能です）", ()))
 
     def test_prompt_minor_guardian_removed(self):
         # 弁護士決定 B: 未成年のお子様・後見人の質問を全て撤去（文字列レベル）
