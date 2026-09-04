@@ -1406,6 +1406,139 @@ class TestKosekiRoundCompletion(_HearingBase):
         self.assertNotIn("第5通（戸籍について）", system.split("【進行状況")[1])
 
 
+class TestSecondCallSystemRefresh(_HearingBase):
+    """HOUKI-HEARING-UX-1-fix3（R-HOUKI-HEARING-UX-1-fix2 UX1-fix2-01・HIGH）:
+    tool 書込み後の 2 回目モデル呼出しは、更新後レコード（latest）+同じ履歴で
+    system（既知項目注入+進行状況）を再構築して受け取る。2 回目 system と空応答
+    fallback は同じ unanswered_items(latest, history) を参照する。"""
+
+    def run_turn_ex(self, responses, text, restored=None):
+        send, queue = AsyncMock(), AsyncMock(return_value="q-1")
+        model = AsyncMock(side_effect=list(responses))
+        with patch.object(hearing, "call_hearing_model", model), \
+             patch.object(hearing, "reply_with_push_fallback", send), \
+             patch.object(hearing, "save_to_approval_queue", queue), \
+             patch.object(hearing, "save_to_chatlog", AsyncMock()), \
+             patch.object(hearing, "get_recent_chat_history",
+                          AsyncMock(return_value=list(restored or []))), \
+             patch.object(hearing, "is_suppressed",
+                          AsyncMock(return_value=False)), \
+             patch.object(hearing, "autoreply_paused", lambda: False):
+            _run(hearing.handle_houki_hearing("rtok", self.uid, text))
+        return send, queue, model
+
+    @staticmethod
+    def _progress(system: str) -> str:
+        return system.split("【進行状況（サーバ判定）】", 1)[1]
+
+    def _seed_round1_partial(self):
+        _run(store.upsert_case_fields(
+            self.uid, {"被相続人氏名": "山田花子", "続柄": "子"}, None))
+
+    _ROUND1_REST = {"phase": "1_deceased",
+                    "fields": {"被相続人最後の住所": "川口市",
+                               "被相続人本籍": "不明"},
+                    "phase_done": True, "hearing_done": False}
+
+    # Codex 指定 4 形 ─────────────────────────────────────────────────────
+    def test_second_system_shows_round2_after_round1_saved(self):
+        # 第 1 通の残項目（住所・本籍）を tool で保存した後、2 回目 system の
+        # 進行状況が第 2 通を示す（既知項目注入も更新後レコードへ追随）
+        self._seed_round1_partial()
+        _s, _q, model = self.run_turn_ex(
+            [_tool_response(dict(self._ROUND1_REST)),
+             _text_response("ありがとうございます。\n"
+                            + hp.HEARING_TEMPLATE_BLOCKS_HOUKI[1])],
+            text="川口市です。本籍は分かりません")
+        self.assertEqual(model.await_count, 2)
+        second = model.await_args_list[1].args[0]
+        self.assertTrue(second.startswith(hp.HOUKI_HEARING_PROMPT))
+        self.assertIn("次に進める通: 第2通（日付について）", self._progress(second))
+        self.assertIn("- 被相続人最後の住所: 川口市", second)
+        self.assertIn("- 被相続人本籍: 不明", second)
+
+    def test_system_progress_updates_between_first_and_second_call(self):
+        # tool 適用前（1 回目）と適用後（2 回目）で「次に進める通」が更新される
+        self._seed_round1_partial()
+        _s, _q, model = self.run_turn_ex(
+            [_tool_response(dict(self._ROUND1_REST)),
+             _text_response("ありがとうございます。\n"
+                            + hp.HEARING_TEMPLATE_BLOCKS_HOUKI[1])],
+            text="川口市です。本籍は分かりません")
+        first = model.await_args_list[0].args[0]
+        second = model.await_args_list[1].args[0]
+        self.assertIn("次に進める通: 第1通（亡くなった方について）",
+                      self._progress(first))
+        self.assertIn("①亡くなった方の最後のお住まい", self._progress(first))
+        self.assertNotIn("被相続人最後の住所: 川口市", first)
+        self.assertIn("次に進める通: 第2通（日付について）", self._progress(second))
+        self.assertNotIn("第1通（", self._progress(second))
+        self.assertNotEqual(first, second)
+        # 履歴（messages）は同じ会話+tool 往復のみ（system 以外は従来どおり）
+        self.assertEqual(model.await_args_list[1].args[1][-1]["role"], "user")
+
+    def test_second_model_and_fallback_share_updated_judgement(self):
+        # 2 回目本文が空 → fallback が第 2 通を再提示・2 回目 system も第 2 通
+        self._seed_round1_partial()
+        send, queue, model = self.run_turn_ex(
+            [_tool_response(dict(self._ROUND1_REST)), _text_response("")],
+            text="川口市です。本籍は分かりません")
+        second = model.await_args_list[1].args[0]
+        self.assertIn("次に進める通: 第2通（日付について）", self._progress(second))
+        sent = send.await_args.args[3]
+        self.assertTrue(sent.startswith(store.DEFLECT_REPLY))
+        self.assertIn("改めて、日付について", sent)
+        self.assertIn("①亡くなった方が亡くなった日", sent)
+        self.assertNotIn("お住まい", sent)          # 保存済み項目は再提示しない
+        queue.assert_not_awaited()
+
+    def test_phase5_tool_path_uses_history_in_second_system_and_fallback(self):
+        # phase=5_koseki の tool 経路: 履歴上未実施なら第 5 通・提示後の user 回答が
+        # あれば第 6 通（2 回目 system・fallback とも）
+        _run(store.upsert_case_fields(
+            self.uid, dict(TestKosekiRoundCompletion.ROUNDS_1_4), None))
+        block5 = hp.HEARING_TEMPLATE_BLOCKS_HOUKI[4]
+        label5 = store.HEARING_ROUNDS[4][2][0][0]
+        label6 = store.HEARING_ROUNDS[5][2][0][0]
+        tool = {"phase": "5_koseki", "fields": {},
+                "phase_done": True, "hearing_done": False}
+        # (a) 未実施
+        send, _q, model = self.run_turn_ex(
+            [_tool_response(dict(tool)), _text_response("承知いたしました。")],
+            text="他の相続人はいません")
+        second = self._progress(model.await_args_list[1].args[0])
+        self.assertIn("次に進める通: 第5通（戸籍について）", second)
+        self.assertIn("①" + label5, second)
+        sent = send.await_args.args[3]
+        self.assertIn("改めて、戸籍について", sent)
+        self.assertIn("①" + label5, sent)
+        # (b) 「再起動」後に App 28 復元履歴で提示+user 回答あり
+        hearing.conversation_histories.pop(self.uid, None)
+        send, _q, model = self.run_turn_ex(
+            [_tool_response(dict(tool)), _text_response("")],
+            text="取得済みです",
+            restored=[{"role": "assistant", "content": block5},
+                      {"role": "user", "content": "まだ取っていません"},
+                      {"role": "assistant", "content": "ありがとうございます。"}])
+        second = self._progress(model.await_args_list[1].args[0])
+        self.assertIn("次に進める通: 第6通（ご依頼者ご自身について）", second)
+        self.assertNotIn(label5, second)
+        sent = send.await_args.args[3]
+        self.assertIn("改めて、ご依頼者ご自身について", sent)
+        self.assertIn("①" + label6, sent)
+        self.assertNotIn(label5, sent)
+
+    def test_text_path_unchanged_single_system(self):
+        # 修正水準 3: tool 呼出しなしの text 経路は 1 回呼出し・取得時点の record
+        self._seed_round1_partial()
+        send, _q, model = self.run_turn_ex(
+            [_text_response("よろしくお願い致します。")], text="費用は？")
+        self.assertEqual(model.await_count, 1)
+        self.assertIn("次に進める通: 第1通（亡くなった方について）",
+                      self._progress(model.await_args_list[0].args[0]))
+        self.assertIn("①亡くなった方の最後のお住まい", send.await_args.args[3])
+
+
 class TestChoiceFieldGuardFlow(_HearingBase):
     """HEARING-FIX1: 会話フロー——選択肢外値でも全断せず聞き直しで継続。"""
 

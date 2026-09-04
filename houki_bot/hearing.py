@@ -174,18 +174,26 @@ def _resolve_reply(candidates: list[str], record: dict | None,
                                            history)
 
 
+def _build_system(record: dict | None, history: list[dict]) -> str:
+    """system prompt の組み立て（凍結本文+既知項目注入+進行状況注入）。
+    UX-1-fix2（UX1-01）: 進行状況（次に進める通・未回答項目）をサーバ判定から
+    注入し、モデルの進行（次の通へ進む条件）と空応答時の再提示を同じ完了判定
+    （unanswered_items・記録欄なし通は会話履歴で判定）に揃える。
+    UX-1-fix3（UX1-fix2-01）: tool 適用後は更新後レコードで再構築する（既知項目
+    注入・進行状況の両方が同じレコード+履歴に追随）。"""
+    return (HOUKI_HEARING_PROMPT + _known_items_note(record)
+            + houki_case_store.progress_note(record, history))
+
+
 async def _converse(user_id: str, record: dict | None,
                     history: list[dict]) -> str:
     """Claude と最大 2 往復（tool 実行 1 回まで）して最終返信文を得る。"""
-    # UX-1-fix2（UX1-01）: 進行状況（次に進める通・未回答項目）をサーバ判定から
-    # 注入し、モデルの進行（次の通へ進む条件）と空応答時の再提示を同じ完了判定
-    # （unanswered_items・記録欄なし通は会話履歴で判定）に揃える
-    system = (HOUKI_HEARING_PROMPT + _known_items_note(record)
-              + houki_case_store.progress_note(record, history))
     messages = list(history)
-    response = await call_hearing_model(system, messages)
+    response = await call_hearing_model(_build_system(record, history),
+                                        messages)
     tool_use = _extract_tool_use(response)
     if tool_use is None:
+        # text 経路: 取得時点の record で判定（挙動不変）
         return _resolve_reply([_extract_text(response)], record, history)
 
     tool_result, latest = await _apply_record_hearing(
@@ -198,10 +206,14 @@ async def _converse(user_id: str, record: dict | None,
             "content": tool_result,
         }]},
     ]
-    followup = await call_hearing_model(system, messages)
+    # UX-1-fix3: 2 回目の system と空応答 fallback は同じ「更新後レコード
+    # （取得不能なら record）+ history」を unanswered_items へ渡す（二重管理なし）
+    current = latest if latest is not None else record
+    followup = await call_hearing_model(_build_system(current, history),
+                                        messages)
     # 2 回目の本文を優先し、空応答なら 1 回目の本文、なお空なら差し替え
     return _resolve_reply([_extract_text(followup), _extract_text(response)],
-                          latest if latest is not None else record, history)
+                          current, history)
 
 
 async def handle_houki_hearing(reply_token: str, user_id: str,
