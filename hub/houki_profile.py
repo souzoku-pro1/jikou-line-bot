@@ -40,6 +40,7 @@ from hub.houki_case_store import (
     HEARING_CHOICE_FIELDS,
     HEARING_ROUNDS,
     HEARING_WRITABLE_FIELDS,
+    round_body,
 )
 
 # HOUKI-HEARING-UX-1（弁護士決定 B）: 質問しない・記録しない欄（App 40 の欄と
@@ -133,10 +134,10 @@ _CIRCLED = "①②③④⑤⑥⑦⑧⑨"
 
 
 def _round_block(intro: str, items: tuple) -> str:
-    lines = [_RULE, intro]
-    lines += [f"{_CIRCLED[i]}{label}" for i, (label, _f) in enumerate(items)]
-    lines += ["分かる範囲でお答えください。", _RULE]
-    return "\n".join(lines)
+    # UX-1-fix2: 本文（導入文+項目行）は houki_case_store.round_body が単一の正
+    # （記録欄なし項目の完了判定が同じ逐語ラベルで送信済みを検知する）
+    return "\n".join([_RULE, round_body(intro, items),
+                      "分かる範囲でお答えください。", _RULE])
 
 
 def _rounds_text() -> str:

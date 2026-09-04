@@ -191,26 +191,75 @@ def is_hollow_reply(text: str) -> bool:
     return not t.strip(_HOLLOW_STRIP)
 
 
-def unanswered_items(record: dict | None) -> tuple[int, str, list[str]]:
+def round_body(intro: str, items: tuple) -> str:
+    """定型ブロックの本文（導入文+番号付き項目ラベル）。houki_profile の罫線
+    ブロックはこの本文を罫線と定型末尾で挟むだけ（項目行の逐語は単一の正）。"""
+    return "\n".join([intro] + [f"{_CIRCLED[i]}{label}"
+                                for i, (label, _f) in enumerate(items)])
+
+
+def _asked_and_answered(label: str, history: list | None) -> bool:
+    """HOUKI-HEARING-UX-1-fix2（UX1-01）: 記録欄のない項目の完了判定。
+    「その項目ラベルを逐語で含む assistant 発話（定型ブロック／fallback の
+    再提示。閉集合=HEARING_ROUNDS のラベル）が送信済み、かつ その後に
+    お客様（user）の発話がある」とき True。正本は会話履歴（in-memory と
+    App 28 復元で同じ role/content 文字列の形）＝再起動後も同じ結果。
+    tool の phase/phase_done は使わない（安全側=未実施扱いが優先）。"""
+    asked = False
+    for msg in history or ():
+        content = msg.get("content")
+        if not isinstance(content, str):
+            continue        # tool_use/tool_result 等の block 列は判定に使わない
+        role = msg.get("role")
+        if role == "assistant" and label in content:
+            asked = True
+        elif role == "user" and asked:
+            return True
+    return False
+
+
+def unanswered_items(record: dict | None,
+                     history: list | None = None) -> tuple[int, str, list[str]]:
     """最初の未完了の通を返す: (通番号 1-7, 見出し, 未回答項目ラベル)。
-    記録欄のない項目（第 5 通）は判定対象外。全通完了なら (0, "", [])。"""
+    記録欄のある項目=欄の充足（現行どおり）。記録欄のない項目（第 5 通・将来
+    同型の項目も同じ規則）=会話履歴で「提示済み かつ その後にお客様の発話あり」
+    （_asked_and_answered）。全通完了なら (0, "", [])。
+    fallback_reply（再提示）と進行状況の注入（houki_bot.hearing）が共にこの
+    関数を使う（完了判定の二重管理をしない）。"""
     for i, (title, _intro, items, _note) in enumerate(HEARING_ROUNDS, start=1):
-        missing = [label for label, fields in items
-                   if fields and not any(_v(record or {}, f) for f in fields)]
+        missing = [
+            label for label, fields in items
+            if (not any(_v(record or {}, f) for f in fields) if fields
+                else not _asked_and_answered(label, history))]
         if missing:
             return i, title, missing
     return 0, "", []
 
 
-def fallback_reply(record: dict | None, all_done_text: str) -> str:
+def fallback_reply(record: dict | None, all_done_text: str,
+                   history: list | None = None) -> str:
     """空応答の差し替え文: 受け流し文+現在の通の未回答項目の再提示（疑問符なし・
     定型ブロックは再送しない）。全通完了なら all_done_text（確認中定型）。"""
-    n, title, missing = unanswered_items(record)
+    n, title, missing = unanswered_items(record, history)
     if not missing:
         return all_done_text
     lines = [f"{_CIRCLED[i]}{label}" for i, label in enumerate(missing)]
     return (DEFLECT_REPLY + "\n\n改めて、" + title + "、次の点をお伺いします。\n"
             + "\n".join(lines) + "\n分かる範囲でお答えください。")
+
+
+def progress_note(record: dict | None, history: list | None = None) -> str:
+    """進行状況の注入文（system prompt の末尾に動的付加。凍結 prompt 本文
+    HOUKI_HEARING_PROMPT には含めない）。次に進める通と未回答項目をサーバ
+    判定（unanswered_items）から示し、モデル側の進行判定を同じ正に揃える。"""
+    n, title, missing = unanswered_items(record, history)
+    if not missing:
+        return ("\n\n【進行状況（サーバ判定）】\n全7通の項目が揃っています。"
+                "新たな質問は不要です。")
+    lines = [f"{_CIRCLED[i]}{label}" for i, label in enumerate(missing)]
+    return ("\n\n【進行状況（サーバ判定）】\n次に進める通: 第" + str(n) + "通（"
+            + title + "）。この通の未回答項目:\n" + "\n".join(lines)
+            + "\n上記より先の通には進まないでください。")
 
 
 STATUS_FIELD = "status"
