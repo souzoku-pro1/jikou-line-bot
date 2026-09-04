@@ -15,7 +15,8 @@
   fake は _wrap 境界を模し {"value":…} 形は二重ラップとして fail）
 - 受付番号: secrets 乱数 6 桁ゼロ埋め・**一意制約違反と確認できた閉集合**
   （400/CB_VA01/errors["record.受付番号.value"]）のみ再採番（上限 5 回）・
-  結果不明（transport/5xx）は同じ番号へ収束（照会→同番号 create 再試行）・
+  結果不明（transport/5xx）は**即 unknown**=500+要確認（番号照会・同番号
+  再試行はしない=fix2 fix1-01: 別申込の既存レコードを今回の成功と誤認しない）・
   403 等の確定失敗は即 500+要確認・レコード番号流用禁止（fix1 01）
 - ゲート順序（fix1 04）: env→メソッド/別名→Content-Length（64KB）→レート
   →**その後にのみ body 読取**・別名は 307 でなく 404・multipart は解析しない
@@ -511,72 +512,88 @@ class TestUniqueViolationClosedSet(unittest.TestCase):
 
 
 class TestWriteConvergence(_FormBase):
-    """結果不明（transport/5xx）は再採番せず同じ受付番号へ収束する。"""
+    """fix2（fix1-01）: 結果不明（transport/5xx）は**即 unknown**。番号照会で
+    既存レコードを今回の成功と誤認しない・同番号の create 再試行もしない
+    （再試行の一意違反が今回の書込か別申込かを識別できないため）。"""
 
-    def test_landed_then_transport_error_converges_single_record(self):
-        # 保存は成立したが応答が届かない → 照会で発見 → 同番号で成功扱い
-        self.fake.landed_fail_next = 1
-        with patch.object(sf, "_draw_number", return_value="424242"):
-            resp = self.post()
-        self.assertEqual(resp.status_code, 200)
-        self.assertEqual(len(self.fake.rows), 1)                # 二重作成なし
-        self.assertEqual(self.fake.last_fields()["受付番号"], "424242")
-        self.assertIn("受付番号：424242", resp.text)              # 表示番号一致
-        self.assertEqual(len(self.fake.create_calls), 1)
-        self.assertEqual(len(self.fake.search_calls), 1)
-        self.notify_admin.assert_not_awaited()
-        _to, text = self.notify_biz.await_args.args
-        self.assertIn("424242", text)
-
-    def test_unlanded_transport_error_retries_same_number(self):
-        # 未着 → 照会で不在 → 同じ番号で create 再試行 → 成功（再採番しない）
-        self.fake.transport_fail_next = 1
-        draws = iter(["313131", "999999"])
-        with patch.object(sf, "_draw_number", side_effect=draws):
-            resp = self.post()
-        self.assertEqual(resp.status_code, 200)
-        self.assertEqual(len(self.fake.rows), 1)
-        self.assertEqual(self.fake.last_fields()["受付番号"], "313131")
-        numbers = [c["受付番号"] for c in self.fake.create_calls]
-        self.assertEqual(numbers, ["313131", "313131"])
-        self.assertIn("受付番号：313131", resp.text)
-
-    def test_server_5xx_then_unique_on_retry_resolves_by_lookup(self):
-        # 5xx 応答（実は着）→ 照会失敗 → 同番号 create が一意違反 → 再照会で発見
-        async def _create(app, fields):
-            self.fake.create_calls.append(dict(fields))
-            if len(self.fake.create_calls) == 1:
-                rid = await real_create(app, fields)          # 着
-                raise sf.hub_kintone.KintoneError(500, "GAIA_UN01", "x")
-            raise _unique_violation()
-        real_create = _FakeApp21.create_record.__get__(self.fake)
-        self.fake.search_fail_next = 1
-        with patch.object(sf.hub_kintone, "create_record", _create), \
-                patch.object(sf, "_draw_number", return_value="515151"):
-            resp = self.post()
-        self.assertEqual(resp.status_code, 200)
-        self.assertEqual(len(self.fake.rows), 1)
-        self.assertIn("受付番号：515151", resp.text)
-        self.notify_admin.assert_not_awaited()
-
-    def test_unknown_exhausted_fixed_500_alert_with_number_no_pii(self):
-        self.fake.transport_fail_next = 99
-        with patch.object(sf, "_draw_number", return_value="616161"):
-            resp = self.post(creditor="秘匿すべき債権者名")
+    def _assert_unknown_500(self, resp, number: str, creditor: str):
         self.assertEqual(resp.status_code, 500)
-        self.assertEqual(len(self.fake.rows), 0)
-        # 再採番なし（同一番号のみ・上限付き）
-        self.assertEqual({c["受付番号"] for c in self.fake.create_calls},
-                         {"616161"})
-        self.assertLessEqual(len(self.fake.create_calls),
-                             1 + sf._UNKNOWN_RETRIES)
+        self.assertNotIn("受付番号：", resp.text)          # 表示番号なし
+        self.assertNotIn(number, resp.text)
+        self.assertNotIn(creditor, resp.text)
+        self.assertEqual(self.fake.search_calls, [])       # 番号照会をしない
+        self.assertEqual(len(self.fake.create_calls), 1)   # 同番号再試行もしない
+        self.notify_biz.assert_not_awaited()               # 受付通知しない
         self.notify_admin.assert_awaited_once()
         text = self.notify_admin.await_args.args[0]
         self.assertIn("要確認", text)
-        self.assertIn("616161", text)                 # 弁護士が突合できる番号
-        self.assertNotIn("秘匿すべき債権者名", text)  # PII 非搭載
-        self.notify_biz.assert_not_awaited()
-        self.assertNotIn("秘匿すべき債権者名", resp.text)
+        self.assertIn(number, text)                        # 弁護士が突合できる番号
+        self.assertIn("unknown", text)                     # 区分
+        self.assertIn(sf.ALERT_OTHER_APPLICANT_NOTE, text)  # 別申込の可能性の注意
+        self.assertIn("別申込", sf.ALERT_OTHER_APPLICANT_NOTE)
+        self.assertNotIn(creditor, text)                   # PII 非搭載
+
+    def test_preexisting_other_record_and_unlanded_transport_is_unknown(self):
+        # 同番号の別顧客レコードが事前存在 + 今回の create は未着 transport 例外
+        # → 既存レコードを今回の成功と誤認しない（unknown → 500+要確認）
+        other = {**_FormBase.VALID, "受付番号": "424242",
+                 "問い合わせ業者名": "別申込の債権者", "website": ""}
+        other.pop("website")
+        self.fake.rows["100"] = {k: {"value": v} for k, v in other.items()}
+        self.fake.rows["100"]["$id"] = {"value": "100"}
+        self.fake.transport_fail_next = 1
+        with patch.object(sf, "_draw_number", return_value="424242"):
+            resp = self.post(creditor="今回の債権者")
+        self._assert_unknown_500(resp, "424242", "今回の債権者")
+        self.assertEqual(len(self.fake.rows), 1)           # 別申込の行のみ
+        self.assertEqual(self.fake.rows["100"]["問い合わせ業者名"]["value"],
+                         "別申込の債権者")                 # 上書きもしない
+
+    def test_other_process_wins_same_number_after_unknown(self):
+        # 結果不明の直後に別処理が同番号で先勝ち → 照会も再試行もせず unknown
+        real_create = _FakeApp21.create_record.__get__(self.fake)
+
+        async def _create(app, fields):
+            self.fake.create_calls.append(dict(fields))
+            if len(self.fake.create_calls) == 1:
+                # 未着のまま、別処理が同番号の行を作る
+                self.fake.rows["200"] = {
+                    "受付番号": {"value": fields["受付番号"]},
+                    "問い合わせ業者名": {"value": "別申込"},
+                    "$id": {"value": "200"}}
+                raise _transport_error()
+            return await real_create(app, fields)
+        with patch.object(sf.hub_kintone, "create_record", _create), \
+                patch.object(sf, "_draw_number", return_value="313131"):
+            resp = self.post(creditor="今回の債権者")
+        self._assert_unknown_500(resp, "313131", "今回の債権者")
+        self.assertEqual(list(self.fake.rows), ["200"])
+
+    def test_landed_transport_error_is_unknown_not_created(self):
+        # 保存は成立したが応答が届かない → 有無を確定できないので unknown
+        # （レコードは残るため、通知の番号で弁護士が App 21 と突合する）
+        self.fake.landed_fail_next = 1
+        with patch.object(sf, "_draw_number", return_value="515151"):
+            resp = self.post(creditor="今回の債権者")
+        self._assert_unknown_500(resp, "515151", "今回の債権者")
+        self.assertEqual(len(self.fake.rows), 1)
+
+    def test_server_5xx_is_unknown_no_retry(self):
+        err = sf.hub_kintone.KintoneError(503, "GAIA_XX02", "x")
+        with patch.object(sf.hub_kintone, "create_record",
+                          AsyncMock(side_effect=err)) as create, \
+                patch.object(sf, "_draw_number", return_value="616161"):
+            resp = self.post(creditor="秘匿すべき債権者名")
+        self.assertEqual(create.await_count, 1)
+        self.fake.create_calls.append({})                  # helper 用の件数合わせ
+        self._assert_unknown_500(resp, "616161", "秘匿すべき債権者名")
+
+    def test_lookup_and_retry_paths_removed(self):
+        self.assertFalse(hasattr(sf, "_lookup_by_number"))
+        self.assertFalse(hasattr(sf, "_UNKNOWN_RETRIES"))
+        import inspect
+        src = inspect.getsource(sf)
+        self.assertNotIn("search_records(", src)           # 照会経路が存在しない
 
     def test_unique_violation_only_redraws(self):
         self.fake.fail_next = 2

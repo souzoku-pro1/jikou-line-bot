@@ -28,11 +28,18 @@ LINE 友だち追加へ誘導する。回答は App 21 へ保存（LINE 紐付�
 fix1（R-JIKOU-FORM-1 01〜04）:
 - 01 二重作成防止: 再採番は「kintone の一意制約違反」と確認できた閉集合
   （HTTP 400 / code CB_VA01 / errors["record.受付番号.value"] 在）のみ。
-  結果不明（transport 例外=status 0・5xx）は**同じ受付番号へ収束**:
-  App 21 を受付番号で照会（読取は冪等）→在れば成功扱い→無ければ同番号で
-  create 再試行（上限 _UNKNOWN_RETRIES）→なお不明なら固定 500+要確認通知
-  （通知本文に受付番号を含め弁護士が突合できるようにする・PII 非搭載）。
+  結果不明（transport 例外=status 0・5xx）は**即 unknown**=固定 500+要確認通知
+  （通知本文に区分と受付番号を含め弁護士が突合できるようにする・PII 非搭載）。
   403・スキーマ不整合（CB_VA01 でも他欄）等の確定失敗は再採番せず即 500+要確認
+  fix2（fix1-01）: 結果不明時の「受付番号で照会→在れば成功扱い」と「同番号で
+  create 再試行」は撤去した。受付番号は 6 桁乱数で他申込と衝突し得るため、
+  番号一致だけでは今回の書込か別申込の既存レコードかを識別できず、成功扱いに
+  すると今回の回答を保存していないのに番号を表示・通知し FORM-2 で別顧客の
+  案件へ紐付く経路が生じる（同番号再試行の一意違反も同様に識別不能）。
+  要確認通知には「同番号のレコードがあっても今回の申込とは限らない」旨を明記。
+  将来 transport 障害が実運用で頻発する場合の改善案: App 21 に申込 ID 欄
+  （本モジュール生成の UUID・UNIQUE）を CU で追加し、申込 ID 一致で所有元を
+  確定できる照会に置き換える（Codex 第 1 案・CU を伴うため今回は不採用）
 - 02 クライアント IP: 信頼済み proxy の契約に基づくヘッダのみ採用
   （env SHINDAN_CLIENT_IP_HEADER・既定 X-Real-IP）。X-Forwarded-For は採用しない
   （env で指定されても既定へ倒す）。ヘッダ欠落時は request.client.host
@@ -116,8 +123,13 @@ _COURT_DOC_TO_SOSHO = {
 
 # ── 受付番号（6 桁ゼロ埋め乱数・一意制約違反の確定時のみ再採番） ─────────────────
 _NUMBER_ATTEMPTS = 5      # 再採番の上限（一意制約違反が続いた場合）
-_UNKNOWN_RETRIES = 2      # 結果不明時の「照会→同番号 create」再試行の上限
 _NUMBER_FIELD = "受付番号"
+
+# 要確認通知の固定注意文（fix2）: 受付番号は乱数で他申込と衝突し得るため、
+# 同番号のレコードの存在は今回の申込の保存を意味しない
+ALERT_OTHER_APPLICANT_NOTE = (
+    "App 21 に同じ受付番号のレコードがあっても、今回の申込のものとは限りません"
+    "（別申込の可能性あり）。")
 
 # 一意制約違反の閉集合（kintone REST API の検証エラー形: HTTP 400 / code CB_VA01 /
 # errors={"record.<fieldcode>.value": {"messages": [...]}}。hub.kintone._raise_error
@@ -152,26 +164,13 @@ def _classify_create_error(e: hub_kintone.KintoneError) -> str:
     return "failed"
 
 
-async def _lookup_by_number(number: str) -> str | None:
-    """受付番号で App 21 を照会（読取は冪等）。在れば record_id・無ければ None。
-    照会自体の失敗は None ではなく例外のまま呼び出し元へ（不在と区別する）。"""
-    rows = await hub_kintone.search_records(
-        APP_JIKOU_CASE, f'{_NUMBER_FIELD} = "{number}"', fields=["$id"])
-    for row in rows:
-        rid = (row.get("$id") or {}).get("value")
-        if rid:
-            return str(rid)
-    return None
-
-
 async def _persist_with_number(fields_base: dict, number: str) -> tuple[str, str]:
-    """同じ受付番号で保存を確定させる。戻り値 (outcome, record_id):
-    created=保存確定／duplicate=一意制約違反（初回送信で確定・再採番可）／
-    failed=確定失敗／unknown=収束不能（レコードの有無が不明）。
+    """受付番号を付けて 1 回だけ create を送る。戻り値 (outcome, record_id):
+    created=保存確定／duplicate=一意制約違反（確定・再採番可）／
+    failed=確定失敗／unknown=結果不明（レコードの有無を確定できない）。
 
-    結果不明の収束手順（01）: 照会→在れば created／無ければ同番号 create 再試行。
-    再試行で一意制約違反が返ったら（=先の書込が着いていた）再照会で確定する。
-    照会が失敗した回は create を送らない（着いていた場合の二重作成を避ける）。"""
+    fix2: unknown に対する番号照会・同番号再試行は行わない（番号一致では
+    今回の書込か別申込の既存レコードかを識別できないため=fail-closed）。"""
     fields = {**fields_base, _NUMBER_FIELD: number}
     try:
         return "created", await hub_kintone.create_record(APP_JIKOU_CASE, fields)
@@ -180,37 +179,7 @@ async def _persist_with_number(fields_base: dict, number: str) -> tuple[str, str
         logger.warning("[SHINDAN] create failed kind=%s code=%s",
                        emit(kind, "freetext", "log", "operator"),
                        emit(e.code, "vendor_raw", "log", "operator"))
-        if kind != "unknown":
-            return kind, ""
-
-    for _retry in range(_UNKNOWN_RETRIES):
-        try:
-            rid = await _lookup_by_number(number)
-        except hub_kintone.KintoneError as e:
-            logger.warning("[SHINDAN] lookup failed code=%s",
-                           emit(e.code, "vendor_raw", "log", "operator"))
-            continue                      # 有無不明のまま create は送らない
-        if rid:
-            logger.info("[SHINDAN] converged by lookup (record exists)")
-            return "created", rid
-        try:
-            return "created", await hub_kintone.create_record(APP_JIKOU_CASE, fields)
-        except hub_kintone.KintoneError as e:
-            kind = _classify_create_error(e)
-            logger.warning("[SHINDAN] create retry failed kind=%s code=%s",
-                           emit(kind, "freetext", "log", "operator"),
-                           emit(e.code, "vendor_raw", "log", "operator"))
-            if kind == "duplicate":
-                # 同番号で一意制約違反=先の書込が着いていた → 再照会で確定
-                try:
-                    rid = await _lookup_by_number(number)
-                except hub_kintone.KintoneError:
-                    rid = None
-                return ("created", rid) if rid else ("unknown", "")
-            if kind == "failed":
-                # 一度結果不明を経ているため「確定失敗」とは言えない=unknown 扱い
-                return "unknown", ""
-    return "unknown", ""
+        return kind, ""
 
 
 # ── クライアント IP の導出（02: 信頼済み proxy ヘッダのみ） ───────────────────────
@@ -535,9 +504,9 @@ async def _handle_submit(form: dict[str, str]):
                      emit(outcome, "freetext", "log", "operator"))
         await notify.notify_admin_line(
             "【時効診断フォーム・要確認】レコード作成を確定できませんでした"
-            f"（区分:{outcome} 受付番号:{number}）。App 21 に同じ受付番号の"
-            "レコードが無ければ保存できていません。kintone と Railway ログを"
-            "確認してください。",
+            f"（区分:{outcome} 受付番号:{number}）。"
+            + ALERT_OTHER_APPLICANT_NOTE
+            + "kintone と Railway ログを確認してください。",
             throttle_key="shindan_numbering",
         )
         return _error_500()
