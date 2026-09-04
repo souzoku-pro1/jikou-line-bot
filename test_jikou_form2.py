@@ -522,15 +522,65 @@ class TestDoubleCreateSuppression(_FlowBase):
                          ["10"])                            # 紐付け済み ID へ統合
         self.assertEqual(main.kintone_record_ids[USER], "10")
 
-    def test_judgement_order_known_rec_then_linked_id_then_create(self):
-        # 判定順: _known_rec の $id → kintone_record_ids → 両方空のときだけ create
+    # ── fix2（fix1-01）: 判定順 (a)同ターンで確定した linked_id → (b)_known_rec の
+    #    $id → (c)いずれもなければ create。紐付け成立ターンかはローカルの bind 結果で
+    #    判定し userId 検索に依存しない ──────────────────────────────────────────
+    def test_link_turn_prefers_linked_id_over_other_known_rec(self):
+        # bind 成功後の userId 検索が別レコード（並行処理が作った通常レコード等）を
+        # 返しても、統合先は CAS で本人性を確定した linked_id・別レコードへの PUT 0
+        self.fake.add("10", "123456", revision="5")                      # フォーム由来
+        other = self.fake.add("77", "", user_id=USER, channel="LINE", revision="2",
+                              問い合わせ業者名="", 借入時期_テキスト="",
+                              最終返済日_テキスト="", 裁判所書類="")         # 別レコード
+        real_get = self.fake.get_by_user
+        calls = []
+
+        async def _get(user_id):
+            calls.append(user_id)
+            if len(calls) == 1:
+                return None                      # 検知時: 未紐付け
+            return dict(other)                   # _known_rec: 別レコードを返す
+        admin = AsyncMock(return_value=True)
+        self.ask.return_value = self.MARKER
+        with patch.object(main, "get_app21_record", _get), \
+                patch.object(fl.notify, "notify_admin_line", admin):
+            self.run_event("123456")
+        self.assertEqual(self.fake.rows["10"]["LINEユーザーID"]["value"], USER)
+        self.create.assert_not_awaited()
+        merged_to = [c[0] for c in self.fake.update_calls if "信用情報確認" in c[1]]
+        self.assertEqual(merged_to, ["10"])                               # 統合先=linked_id
+        self.assertEqual([c for c in self.fake.update_calls if c[0] == "77"], [])
+        self.assertEqual(other.get("信用情報確認", {}).get("value", ""), "")
+        self.assertEqual(main.kintone_record_ids[USER], "10")
+        # 分裂検知の要確認通知（PII なし・レコード番号のみ）
+        admin.assert_awaited_once()
+        text = admin.await_args.args[0]
+        self.assertIn("要確認", text)
+        self.assertIn("10", text)
+        self.assertIn("77", text)
+        self.assertNotIn("フォーム債権者株式会社", text)
+        self.assertNotIn(USER, text)
+
+    def test_non_link_turn_uses_known_rec_id(self):
+        # 紐付け成立ターンでない既存ユーザー → _known_rec の $id へ統合（従来どおり）
+        self.fake.add("10", "123456", user_id=USER, revision="5")
+        main.kintone_record_ids[USER] = "77"                              # 判定に使わない
+        self.ask.return_value = self.MARKER
+        self.run_event("いいえ")
+        self.create.assert_not_awaited()
+        self.assertEqual([c[0] for c in self.fake.update_calls], ["10"])
+
+    def test_non_link_turn_without_known_rec_creates_even_if_memory_id(self):
+        # (c) 紐付けターンでなく _known_rec も無い → create（メモリ上の ID は判定に
+        #     使わない=判定は同ターンの確定事実と台帳の正のみ）
         main.kintone_record_ids[USER] = "77"
         self.fake.add("77", "000001", user_id="Usomeone_else", revision="2")
         with patch.object(main, "get_app21_record", AsyncMock(return_value=None)):
             self.ask.return_value = self.MARKER
             self.run_event("いいえ")
-        self.create.assert_not_awaited()
-        self.assertEqual(self.fake.update_calls[0][0], "77")
+        self.create.assert_awaited_once()
+        self.assertEqual(self.fake.update_calls, [])
+        self.assertEqual(main.kintone_record_ids[USER], "900")
 
     # ── fix1-03: CAS マージ（空欄のみ・人の編集を上書きしない） ────────────────
     def test_toctou_attorney_edit_preserved(self):

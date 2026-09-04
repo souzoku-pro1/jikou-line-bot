@@ -759,6 +759,7 @@ async def _process_line_event(reply_token: str, user_id: str, user_text: str) ->
         #    紐付け成功は同一ターンで通常ヒアリングへ流す（既知項目台帳が
         #    フォーム回答を既知として注入）。不該当=固定文言 B・上限超過=無言）──
         form_handover = False
+        linked_id_this_turn = ""      # fix2: 同ターンで確定した紐付け先（bind 結果）
         receipt_number = form_link.detect_receipt_number(user_text)
         if receipt_number is not None:
             if in_hearing_session:
@@ -770,6 +771,7 @@ async def _process_line_event(reply_token: str, user_id: str, user_text: str) ->
                     # 紐付けで確定した事実（linked_id）を同ターン以降の正として
                     # 持ち回る（再取得の成否に依存しない）
                     kintone_record_ids[user_id] = linked_id
+                    linked_id_this_turn = linked_id
                     form_handover = True
                     # fix1-01: 紐付け先レコードの最新状態（ID で再取得）に対して
                     # 人対応・status ルーティングを再評価する（メモリ上の
@@ -924,17 +926,36 @@ async def _process_line_event(reply_token: str, user_id: str, user_text: str) ->
             kintone_record["status"] = "問い合わせ"
             user_business_names[user_id] = kintone_record.get("問い合わせ業者名", "")
             # JIKOU-FORM-2: 本人のレコードが既にあるなら create せず統合へ
-            # 振り替える（二重 create 抑止）。判定順（fix1-02）:
-            #   ① 同ターンの台帳照会 _known_rec の $id
-            #   ② 紐付けで確定した kintone_record_ids[user_id]（再取得失敗でも正）
-            #   ③ 両方空のときだけ create（レコード無しの新規客=従来どおり）
+            # 振り替える（二重 create 抑止）。判定順（fix2=fix1-01）:
+            #   (a) 同ターンで紐付けが成立した場合は確定した linked_id を最優先
+            #       （ローカルの bind 結果で判定・userId 検索の結果に依存しない）
+            #   (b) 紐付け成立ターンでない既存ユーザーは台帳照会 _known_rec の $id
+            #   (c) いずれもない場合のみ create（レコード無しの新規客=従来どおり。
+            #       メモリ上の kintone_record_ids は判定に使わない）
             # 統合は form_link.merge_hearing_fields（fix1-03: $revision CAS・
             # Bot 欄の閉集合・最新レコードで空欄の欄のみ埋める=人の編集を上書き
             # しない・409 は再取得再構成≤MERGE_RETRIES・収束不能は中止+要確認）。
             # LINEユーザーID/status は非対象
-            existing_id = (str(((_known_rec or {}).get("$id") or {})
-                               .get("value") or "")
-                           or str(kintone_record_ids.get(user_id) or ""))
+            known_id = str(((_known_rec or {}).get("$id") or {})
+                           .get("value") or "")
+            if linked_id_this_turn:
+                existing_id = linked_id_this_turn
+                if known_id and known_id != linked_id_this_turn:
+                    # 分裂の検知: userId 検索が別レコードを返した（並行処理が作った
+                    # 通常レコード等）。統合先は本人性を確定した linked_id のまま・
+                    # 別レコードへは書かない。弁護士が突合できるよう要確認通知
+                    logger.error("[FORM_LINK] split detected linked_id=%s other_id=%s",
+                                 emit(linked_id_this_turn, "record_id", "log", "operator"),
+                                 emit(known_id, "record_id", "log", "operator"))
+                    await hub_notify.notify_admin_line(
+                        "【フォーム紐付け・要確認】同一 LINE ユーザーに複数の"
+                        f"レコードがあります（紐付け先:{linked_id_this_turn} "
+                        f"別レコード:{known_id}）。ヒアリング内容は紐付け先へ"
+                        "統合しました。案件の分裂がないか App 21 を確認してください。",
+                        throttle_key="form_link_split",
+                    )
+            else:
+                existing_id = known_id
             if existing_id:
                 merge_outcome = await form_link.merge_hearing_fields(
                     existing_id,
