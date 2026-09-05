@@ -19,7 +19,8 @@ skip=app_mismatch・作用 0）→ record id → get_record → 相談カード�
     → 再実行（reconciled=True・通知に「取り残しを再実行しました」）
 → 読取本体は BackgroundTasks（run_card_read_by_id: claim 後の正本取得も本体側で
 行い、失敗しても finally で 要確認 へ倒す）。claim が同期なので二重配信は敗者
-0 作用。
+0 作用。claim が返す世代番号を本体へ渡し、reclaim で失効した旧処理は転記・終端・
+通知を行わない（fix2 HCRF1-01・hub/houki_card_read の世代フェンス）。
 
 状態機械は 相談カード読取 欄そのもの（本モジュールはメモリ状態を持たない）。
 読取本体の終端（読取済/要確認）と通知は hub/houki_card_read が担う。
@@ -94,7 +95,8 @@ async def houki_card_webhook(secret: str, request: Request,
         if reconciled and not reader.is_stale(record):
             return JSONResponse(status_code=200,
                                 content={"ok": True, "skip": "in_flight"})
-        if await reader.claim(record) is None:
+        generation = await reader.claim(record)      # fix2: 勝者は claim 世代（所有権）
+        if generation is None:
             logger.info("[HOUKI_CARD] cas lost record_id=%s",
                         emit(record_id, "record_id", "log", "operator"))
             return JSONResponse(status_code=200,
@@ -112,7 +114,7 @@ async def houki_card_webhook(secret: str, request: Request,
     else:
         logger.info("[HOUKI_CARD] claimed record_id=%s",
                     emit(record_id, "record_id", "log", "operator"))
-    background.add_task(reader.run_card_read_by_id, record_id, reconciled)
+    background.add_task(reader.run_card_read_by_id, record_id, reconciled, generation)
     return JSONResponse(status_code=200,
                         content={"ok": True, "record_id": record_id,
                                  "claimed": True, "reconciled": reconciled})

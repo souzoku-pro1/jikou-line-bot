@@ -18,6 +18,10 @@ kintone Webhook → houki_card_webhook（POST /souzoku-houki/card/{token}）→
         読取中 のときだけ CAS で行う。人が 要確認/未読取/読取依頼 に変えていた場合は
         作用 0（finalize_preempted・通知 1 行）。409 後の再取得でも同じ状態検査
   終端への CAS が失敗（409 以外/再試行超過）→ ログ+通知（houki_card_read_failure）
+  claim 世代フェンス（fix2 HCRF1-01）: claim/reclaim のたびに in-memory の世代番号を
+        +1 し読取本体へ所有権として渡す。転記直前・終端直前（_finish）・_finalize
+        の再取得ごとに「自分の世代 == 現在の世代」を検査し、不一致（reclaim で
+        失効した旧処理）は作用 0・通知なし（fenced）。終端成功で所有権を消す
   通知 kind: 読取済/要確認（読めた・検証落ち）= houki_card_read、
   失敗分類（AI/ダウンロード/読めない添付/版不一致/例外/終端失敗）= houki_card_read_failure
   再実行は人が 読取依頼 に戻す運用（空欄のみ書込なので二重実行しても上書きしない）
@@ -70,6 +74,27 @@ STATUS_REVIEW = "要確認"
 
 FIELD_UPDATED = "更新日時"                # App 40 UPDATED_TIME（分解能 1 分・実測 2026-09-06）
 STALE_MINUTES = 10                        # 読取中 の取り残し判定（更新日時 がこれより古い）
+
+# 【単一 worker 前提（既存裁定）】image_intake._send_claims と同型の in-memory 状態。
+# uvicorn workers=1（Procfile 実測・test_image_intake が pin）が前提。worker 複数化
+# 票では永続 CAS/一意キーによる排他へ置換すること（既知の制約・司令塔裁定でスコープ外）
+# _generations: record_id → 現在の所有世代（読取が進行中の間だけ存在。終端成功で削除）
+# _generation_counter: record_id → 単調増加の採番（削除後の再 claim が旧世代と衝突しない）
+_generations: dict[str, int] = {}
+_generation_counter: dict[str, int] = {}
+
+
+def _next_generation(record_id: str) -> int:
+    gen = _generation_counter.get(record_id, 0) + 1
+    _generation_counter[record_id] = gen
+    _generations[record_id] = gen
+    return gen
+
+
+def _owns(record_id: str, generation: int | None) -> bool:
+    """自分の世代が現在の所有世代か。None は claim を経ない直接呼出（フェンスなし）。
+    登録なし（終端済み）や不一致（reclaim 済み）は False。"""
+    return generation is None or _generations.get(record_id) == generation
 MAX_FILES = 5
 MAX_AI_IMAGE_BYTES = 5 * 1024 * 1024      # 1 ファイル上限（API の画像上限と同値）
 MAX_PDF_PAGES = 10                        # PDF のページ数上限（Anthropic 仕様 100 頁内・pin）
@@ -454,10 +479,11 @@ def is_stale(record: dict, now: datetime.datetime | None = None) -> bool:
     return ((now or _now()) - ts) > datetime.timedelta(minutes=STALE_MINUTES)
 
 
-async def claim(record: dict) -> str | None:
-    """相談カード読取 を 読取中 に（$revision CAS）。勝者は次 revision・敗者は None。
-    読取依頼→読取中（初回 claim）と 読取中→読取中（reconcile の claim 取り直し。
-    kintone は値が同じでも PUT で revision を進める）の両方に使う。"""
+async def claim(record: dict) -> int | None:
+    """相談カード読取 を 読取中 に（$revision CAS）。勝者は新しい claim 世代（int）・
+    敗者は None。読取依頼→読取中（初回 claim）と 読取中→読取中（reconcile の claim
+    取り直し。kintone は値が同じでも PUT で revision を進める）の両方に使う。
+    世代の +1 は CAS 成功後の同期区間（await なし）で行う（fix2）。"""
     rid = store._v(record, "$id")
     rev = store._v(record, "$revision")
     try:
@@ -465,23 +491,30 @@ async def claim(record: dict) -> str | None:
                                     {FIELD_STATUS: STATUS_WORKING}, revision=rev or None)
     except kintone.KintoneConflict:
         return None
-    return str(int(rev) + 1) if rev.isdigit() else None
+    return _next_generation(rid)
 
 
-async def _finalize(record_id: str, status: str) -> str:
-    """終端ステータスの書込。戻り値 done / preempted / failed。
+async def _finalize(record_id: str, status: str,
+                    generation: int | None = None) -> str:
+    """終端ステータスの書込。戻り値 done / preempted / fenced / failed。
 
     fix1 HCR-02: 再取得した最新の 相談カード読取 が 読取中 のときだけ CAS で
     読取済/要確認 へ遷移する。人が別の状態に変えていた場合は作用 0（preempted）。
-    409 は再取得して 1 回再試行し、再取得後も同じ状態検査を行う。"""
+    fix2: 加えて自分の claim 世代が現在の所有世代であること（不一致は fenced・
+    作用 0）。409 は再取得して 1 回再試行し、再取得後も両方を再検査する。
+    終端成功で所有権を消す（遅れて来た旧処理は登録なし=不一致で作用 0）。"""
     for _attempt in range(2):
         try:
             latest = await kintone.get_record(store.APP_HOUKI_CASE, record_id)
+            if not _owns(record_id, generation):
+                return "fenced"
             if store._v(latest, FIELD_STATUS) != STATUS_WORKING:
                 return "preempted"
             await kintone.update_record(store.APP_HOUKI_CASE, record_id,
                                         {FIELD_STATUS: status},
                                         revision=store._v(latest, "$revision") or None)
+            if _owns(record_id, generation):
+                _generations.pop(record_id, None)
             return "done"
         except kintone.KintoneConflict:
             continue
@@ -507,14 +540,25 @@ def _log(outcome: str) -> None:
         logger.error("[HOUKI_CARD] finalize failed (status may stay working)")
     elif outcome == "finalize_preempted":
         logger.info("[HOUKI_CARD] finalize preempted (status changed by operator)")
+    elif outcome == "fenced":
+        logger.info("[HOUKI_CARD] fenced (superseded by a newer claim; no effect)")
     else:
         logger.error("[HOUKI_CARD] failed (fixed reason)")
 
 
 # ── 終端（状態検査つき CAS）と通知 ─────────────────────────────────────────────
-async def _finish(record_id: str, outcome: str, summary: dict) -> None:
+async def _finish(record_id: str, outcome: str, summary: dict,
+                  generation: int | None = None) -> None:
+    # fix2: 終端直前の世代検査（転記中に reclaim されたケースを含む）。旧処理は
+    # 黙って終わる（終端も通知もしない）
+    if outcome == "fenced" or not _owns(record_id, generation):
+        _log("fenced")
+        return
     status = STATUS_DONE if outcome == "done" else STATUS_REVIEW
-    result = await _finalize(record_id, status)
+    result = await _finalize(record_id, status, generation)
+    if result == "fenced":
+        _log("fenced")
+        return
     _log(outcome)
     if result == "preempted":
         _log("finalize_preempted")
@@ -532,23 +576,27 @@ async def _finish(record_id: str, outcome: str, summary: dict) -> None:
     await _notify(build_notice(record_id, status, summary), f"{kind}:{record_id}")
 
 
-async def run_card_read_by_id(record_id: str, reconciled: bool = False) -> str:
+async def run_card_read_by_id(record_id: str, reconciled: bool = False,
+                              generation: int | None = None) -> str:
     """claim 後の入口（BackgroundTasks から）。claim 直後の正本取得に失敗しても
-    要確認へ倒す（fix1 HCR-01: 読取中 の取り残しを作らない）。"""
+    要確認へ倒す（fix1 HCR-01: 読取中 の取り残しを作らない）。generation は
+    claim が返した世代（所有権・fix2）。"""
     try:
         record = await kintone.get_record(store.APP_HOUKI_CASE, record_id)
     except Exception:
         await _finish(record_id, "failed",
                       {"reason": "claim 後のレコード取得に失敗しました",
-                       "reconciled": reconciled})
+                       "reconciled": reconciled}, generation)
         return "failed"
-    return await run_card_read(record, reconciled)
+    return await run_card_read(record, reconciled, generation)
 
 
 # ── 本体（claim 後に呼ぶ・例外は外へ出さず finally で要確認へ） ─────────────────
-async def run_card_read(record: dict, reconciled: bool = False) -> str:
-    """claim（読取中）済みのレコードで読取→転記→終端。戻り値 done/review/失敗分類。
-    reconciled=True は取り残しの再実行（通知に 1 行足す）。"""
+async def run_card_read(record: dict, reconciled: bool = False,
+                        generation: int | None = None) -> str:
+    """claim（読取中）済みのレコードで読取→転記→終端。戻り値 done/review/fenced/
+    失敗分類。reconciled=True は取り残しの再実行（通知に 1 行足す）。generation は
+    claim 世代（None=直接呼出・フェンスなし）。"""
     record_id = store._v(record, "$id")
     user_id = store._v(record, "LINEユーザーID")
     summary: dict = {"reconciled": reconciled}
@@ -606,6 +654,9 @@ async def run_card_read(record: dict, reconciled: bool = False) -> str:
         preexisting = [c for c in ex["fields"] if store._v(record, c)]
         to_write = {c: v for c, v in ex["fields"].items() if c not in preexisting}
         problems: list[str] = []
+        if not _owns(record_id, generation):          # fix2: 転記直前の世代検査
+            outcome = "fenced"
+            return outcome
         if to_write:
             _rid, problems, _choice = await store.apply_hearing_fields(
                 user_id, to_write, record)
@@ -630,4 +681,4 @@ async def run_card_read(record: dict, reconciled: bool = False) -> str:
         outcome = "failed"
         return outcome
     finally:
-        await _finish(record_id, outcome, summary)
+        await _finish(record_id, outcome, summary, generation)
