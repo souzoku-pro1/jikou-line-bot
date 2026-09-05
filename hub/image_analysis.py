@@ -117,12 +117,14 @@ REPORT_TOOL = {
                                        "enum": list(CONFIDENCES)},
                     },
                     "required": ["name", "role", "confidence"],
+                    "additionalProperties": False,
                 },
             },
             "court_document": {"type": "string", "enum": list(COURT_DOCUMENTS)},
             "legible": {"type": "boolean"},
         },
         "required": ["creditors", "court_document", "legible"],
+        "additionalProperties": False,
     },
 }
 
@@ -208,20 +210,33 @@ def valid_creditor_name(name) -> bool:
 
 
 # ── 出力の検証（閉集合スキーマ。逸脱は None=ai_failed） ─────────────────────────
+_TOP_KEYS = frozenset({"creditors", "court_document", "legible"})
+_CREDITOR_KEYS = frozenset({"name", "role", "confidence"})
+
+
 def parse_report(tool_input) -> dict | None:
+    """閉集合スキーマの検証（fix2 I2-01: サーバ側検証が正）。None=ai_failed
+    （質問のみ版）。拒否条件:
+    - dict でない／トップレベルの未知キー／必須キー欠落
+    - creditors が list でない／len > MAX_CREDITORS（切り捨て受理しない）
+    - 各要素が dict でない／要素の未知キー／必須キー欠落／name が str でない／
+      role・confidence が閉集合外
+    - court_document が閉集合外／legible が bool でない"""
     if not isinstance(tool_input, dict):
         return None
-    creditors = tool_input.get("creditors")
-    court = tool_input.get("court_document")
-    legible = tool_input.get("legible")
-    if (not isinstance(creditors, list) or court not in COURT_DOCUMENTS
-            or not isinstance(legible, bool)):
+    if set(tool_input) != _TOP_KEYS:
+        return None
+    creditors = tool_input["creditors"]
+    court = tool_input["court_document"]
+    legible = tool_input["legible"]
+    if (not isinstance(creditors, list) or len(creditors) > MAX_CREDITORS
+            or court not in COURT_DOCUMENTS or not isinstance(legible, bool)):
         return None
     out = []
-    for c in creditors[:MAX_CREDITORS]:
-        if not isinstance(c, dict):
+    for c in creditors:
+        if not isinstance(c, dict) or set(c) != _CREDITOR_KEYS:
             return None
-        name, role, conf = c.get("name"), c.get("role"), c.get("confidence")
+        name, role, conf = c["name"], c["role"], c["confidence"]
         if (not isinstance(name, str) or role not in CREDITOR_ROLES
                 or conf not in CONFIDENCES):
             return None
@@ -360,6 +375,19 @@ async def _fetch_record(user_id: str) -> dict | None:
     return rows[0] if rows else None
 
 
+async def _refetch_record(user_id: str) -> dict | None:
+    """fix2 I2-02: 送信直前の再取得（fail-closed）。例外・0 件・複数件は None。"""
+    try:
+        rows = await kintone.search_records(
+            APP_JIKOU_CASE,
+            f'LINEユーザーID = "{user_id}" order by $id desc limit 2')
+    except Exception:
+        return None
+    if len(rows) != 1:
+        return None
+    return rows[0]
+
+
 def _file_keys_newest_first(record: dict) -> list[str]:
     files = ((record or {}).get(PHOTO_FIELD) or {}).get("value") or []
     keys = [str((f or {}).get("fileKey") or "") for f in files
@@ -470,6 +498,8 @@ def _log_result(outcome: str) -> None:
         logger.error("[IMAGE_ANALYSIS] reply too long (not sent)")
     elif outcome == "blocked":
         logger.info("[IMAGE_ANALYSIS] blocked (paused/stoplist/human)")
+    elif outcome == "recheck_failed":
+        logger.warning("[IMAGE_ANALYSIS] recheck_failed (no send, no marker)")
     elif outcome == "send_failed":
         logger.error("[IMAGE_ANALYSIS] send failed (no marker)")
     elif outcome == "sent":
@@ -546,7 +576,16 @@ async def _analyze_and_reply(user_id: str, event_id: str) -> str:
     if ai_state != "ok":
         _log_result(ai_state)
 
-    known = build_known_items(record, [])
+    # fix2 I2-02: 送信直前に App 21 を再取得し（fail-closed）、最新レコードで
+    # (1) 人対応 (2) 再取得失敗 (3) 既知項目台帳の再構成 (4) 業者名の空欄判定
+    # （_store_creditor_names 内の get_record）を行う。AI 処理中の変化を反映する
+    latest = await _refetch_record(user_id)
+    if latest is None:
+        return "recheck_failed"
+    record_id = _v(latest, "$id") or record_id
+    if _blocked(latest, user_id):
+        return "blocked"
+    known = build_known_items(latest, [])
     questions = pending_questions(known, has_creditor_line=line is not None)
     text = compose_reply(line, questions)
     if text is None:
@@ -559,8 +598,8 @@ async def _analyze_and_reply(user_id: str, event_id: str) -> str:
             f"image_analysis_send_failure:{user_id}")
         return "too_long"
 
-    # 送信直前の抑止判定（pause／人対応／停止リスト）
-    if _blocked(record, user_id) or await is_suppressed(user_id):
+    # 送信直前の抑止判定（pause／停止リスト。人対応は上の再取得判定で済み）
+    if os.environ.get("AUTOREPLY_PAUSED") == "1" or await is_suppressed(user_id):
         return "blocked"
     try:
         sent = await push_text(JIKOU_CHANNEL, user_id, text)

@@ -87,6 +87,7 @@ class _FakeStore:
         self.files: dict[str, bytes] = {}
         self._id = 0
         self.downloaded: list[str] = []
+        self.case_queries = 0
         self.conflicts_left = 0
         self.update_error: Exception | None = None
         self.download_error: Exception | None = None
@@ -123,10 +124,14 @@ class _FakeStore:
     async def search_records(self, app, query, fields=None):
         m = re.search('LINEユーザーID = "([^"]+)"', query)
         if m:
+            self.case_queries += 1
             rows = [r for r in self.cases.values()
                     if r.get("LINEユーザーID", {}).get("value") == m.group(1)]
             rows.sort(key=lambda r: -int(r["$id"]["value"]))
-            return rows[:1]
+            m_lim = re.search(r"limit (\d+)", query)
+            lim = int(m_lim.group(1)) if m_lim else 1
+            return [{k: (dict(v) if isinstance(v, dict) else v)
+                     for k, v in r.items()} for r in rows[:lim]]
         m_uid = re.search('line_user_id = "([^"]+)"', query)
         m_eq = re.search('category = "([^"]+)"', query)
         m_like = re.search('category like "([^"]+)"', query)
@@ -502,7 +507,9 @@ class TestStoreAndCourt(_Base):
         self.assertEqual(self.go(), "sent")
         self.assertEqual(self.store.field(rid, "問い合わせ業者名"), "アコム、レイク")
         self.assertEqual(self.store.field(rid, "$revision"), "2")
-        # 非空なら書かない
+        # 非空なら書かない（fix2: 同一 userId の複数件は fail-closed になるため
+        # 前のレコードを消してから seed する）
+        self.store.cases.clear()
         rid2 = self.store.seed_case({"LINEユーザーID": UID, "問い合わせ業者名": "既存"},
                                     ["z1"])
         ia._claims.clear()
@@ -766,6 +773,161 @@ class TestHookFromReceipt(unittest.TestCase):
         result = _run(ii.send_receipt_and_close("jikou", main.hub_line_channel.JIKOU_CHANNEL,
                                                 UID))
         self.assertTrue(result)                         # 受領返信の結果は不変
+
+
+# ── fix2: I2-01（閉集合検証の抜け）・I2-02（送信直前の再取得） ─────────────────
+class TestFix2StrictParseAndRecheck(_Base):
+    def _assert_questions_only_no_side_effects(self, rid):
+        text = self.sent_text()
+        self.assertNotIn("読み取れました", text)
+        self.assertIn(ia.QUESTION_1, text)
+        self.assertEqual(self.store.field(rid, "問い合わせ業者名"), "")
+        self.admin.assert_not_awaited()
+
+    def test_i2_01_four_creditors_rejected(self):
+        rid = self.seed()
+        four = [{"name": f"社{i}", "role": "原債権者", "confidence": "high"}
+                for i in range(4)]
+        self.ai.return_value = _tool_response({"creditors": four,
+                                               "court_document": "訴状",
+                                               "legible": True})
+        self.assertEqual(self.go(), "sent")
+        self._assert_questions_only_no_side_effects(rid)   # 通知（訴状）も起きない
+        self.assertIsNone(ia.parse_report({"creditors": four,
+                                           "court_document": "なし",
+                                           "legible": True}))
+
+    def test_i2_01_unknown_keys_and_type_mismatch_rejected(self):
+        ok_c = {"name": "アコム", "role": "原債権者", "confidence": "high"}
+        bad_inputs = {
+            "unknown_top": {"creditors": [ok_c], "court_document": "なし",
+                            "legible": True, "debtor_name": "山田"},
+            "unknown_elem": {"creditors": [{**ok_c, "amount": "100万円"}],
+                             "court_document": "なし", "legible": True},
+            "missing_top": {"creditors": [ok_c], "legible": True},
+            "missing_elem": {"creditors": [{"name": "アコム", "role": "原債権者"}],
+                             "court_document": "なし", "legible": True},
+            "creditors_not_list": {"creditors": {"name": "アコム"},
+                                   "court_document": "なし", "legible": True},
+            "name_not_str": {"creditors": [{**ok_c, "name": 123}],
+                             "court_document": "なし", "legible": True},
+            "legible_not_bool": {"creditors": [ok_c], "court_document": "なし",
+                                 "legible": "true"},
+            "elem_not_dict": {"creditors": ["アコム"], "court_document": "なし",
+                              "legible": True},
+            "not_dict": ["アコム"],
+        }
+        for label, bad in bad_inputs.items():
+            with self.subTest(case=label):
+                self.setUp()
+                rid = self.seed()
+                self.assertIsNone(ia.parse_report(bad))
+                self.ai.return_value = _tool_response(bad)
+                self.assertEqual(self.go(), "sent")
+                self._assert_questions_only_no_side_effects(rid)
+        # 0〜3 件は従来どおり受理
+        for n in range(0, 4):
+            with self.subTest(n=n):
+                rep = ia.parse_report({"creditors": [ok_c] * n,
+                                       "court_document": "なし", "legible": True})
+                self.assertIsNotNone(rep)
+                self.assertEqual(len(rep["creditors"]), n)
+        # JSON Schema 側にも additionalProperties: false（サーバ側検証が正）
+        schema = ia.REPORT_TOOL["input_schema"]
+        self.assertIs(schema["additionalProperties"], False)
+        self.assertIs(schema["properties"]["creditors"]["items"]
+                      ["additionalProperties"], False)
+
+    def _ai_with_side_effect(self, mutate):
+        async def ai(*_a, **_k):
+            mutate()
+            return _tool_response(_report(
+                [{"name": "アコム", "role": "原債権者", "confidence": "high"}]))
+        self.ai.side_effect = ai
+
+    def test_i2_02_human_switch_during_ai_blocks_send(self):
+        rid = self.seed()
+        self._ai_with_side_effect(
+            lambda: self.store.cases[rid].update(
+                {"response_mode": {"value": "人対応"}}))
+        self.assertEqual(self.go(), "blocked")
+        self.push.assert_not_awaited()
+        self.assertEqual(self.store.analysis_rows(), [])
+        self.assertEqual(self.store.analyzed_keys(), [])
+        self.assertEqual(self.store.field(rid, "問い合わせ業者名"), "")
+        self.assertGreaterEqual(self.store.case_queries, 2)   # 送信直前に再取得
+
+    def test_i2_02_field_filled_during_ai_is_not_asked(self):
+        rid = self.seed()
+        self._ai_with_side_effect(
+            lambda: self.store.cases[rid].update(
+                {"借入時期_テキスト": {"value": "2015年頃"}}))
+        self.assertEqual(self.go(), "sent")
+        text = self.sent_text()
+        self.assertNotIn(ia.QUESTION_2, text)
+        self.assertIn(ia.QUESTION_3, text)
+        # AI 中に全欄が埋まり債権者行もない → 送らない
+        self.setUp()
+        rid = self.seed()
+
+        async def ai_low(*_a, **_k):
+            self.store.cases[rid].update({
+                "借入時期_テキスト": {"value": "x"},
+                "最終返済日_テキスト": {"value": "x"},
+                "裁判所書類": {"value": "x"},
+                "問い合わせ業者名": {"value": "x"}})
+            return _tool_response(_report(
+                [{"name": "アコム", "role": "原債権者", "confidence": "low"}]))
+        self.ai.side_effect = ai_low
+        self.assertEqual(self.go(), "nothing_to_send")
+        self.push.assert_not_awaited()
+
+    def test_i2_02_recheck_failure_is_fail_closed(self):
+        # 再取得が None（例外扱い）
+        self.seed()
+        with patch.object(ia, "_refetch_record", AsyncMock(return_value=None)):
+            self.assertEqual(self.go(), "recheck_failed")
+        self.push.assert_not_awaited()
+        self.assertEqual(self.store.analysis_rows(), [])
+        self.admin.assert_not_awaited()                     # 通知不要
+        # 0 件（AI 中にレコードが消えた）
+        self.setUp()
+        rid = self.seed()
+        self._ai_with_side_effect(lambda: self.store.cases.clear())
+        self.assertEqual(self.go(), "recheck_failed")
+        self.push.assert_not_awaited()
+        # 複数件
+        self.setUp()
+        self.seed()
+        self.store.seed_case({"LINEユーザーID": UID, "response_mode": "自動"}, ["z9"])
+        self.assertEqual(self.go(), "recheck_failed")
+        self.push.assert_not_awaited()
+        self.assertEqual(self.store.analyzed_keys(), [])
+        # 再取得の search が例外
+        self.setUp()
+        self.seed()
+        orig = self.store.search_records
+
+        async def flaky(app, query, fields=None):
+            if "limit 2" in query:
+                raise hub_kintone.KintoneError(500, "x", "y")
+            return await orig(app, query, fields)
+        with patch.object(hub_kintone, "search_records", flaky):
+            self.assertEqual(self.go(), "recheck_failed")
+        self.push.assert_not_awaited()
+
+    def test_i2_02_length_limit_applies_to_rebuilt_text(self):
+        rid = self.seed(known={"借入時期_テキスト": "x", "最終返済日_テキスト": "x",
+                               "裁判所書類": "x"})
+
+        # AI 中に欄が空に戻る → 再構成後の本文（長い方）で上限判定
+        def clear():
+            for c in ("借入時期_テキスト", "最終返済日_テキスト", "裁判所書類"):
+                self.store.cases[rid][c] = {"value": ""}
+        self._ai_with_side_effect(clear)
+        with patch.object(ia, "REPLY_MAX_CHARS", 150):
+            self.assertEqual(self.go(), "too_long")
+        self.push.assert_not_awaited()
 
 
 if __name__ == "__main__":
