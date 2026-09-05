@@ -57,6 +57,7 @@ import hashlib
 import html
 import logging
 import os
+import re
 import secrets
 import time
 from collections import OrderedDict
@@ -65,6 +66,7 @@ from urllib.parse import parse_qsl
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
+from hub import image_store
 from hub import kintone as hub_kintone
 from hub import notify
 from hub.redact import emit
@@ -220,33 +222,134 @@ _PRUNE_STEPS = 2          # リクエストごとに先頭（最古 touch）か�
 _attempts: "OrderedDict[str, tuple[float, int]]" = OrderedDict()
 
 
-def _rate_exceeded(key: str, now: float) -> bool:
+def _bump_fixed_window(bucket: "OrderedDict[str, tuple[float, int]]",
+                       key: str, now: float, limit: int, window: float,
+                       max_buckets: int) -> bool:
     """固定窓カウンタを 1 進め、上限超過なら True。窓満了で自然解除。
     - 期限切れ掃除: 先頭（最終 touch が最も古い）から _PRUNE_STEPS 件だけ見て
       期限切れなら捨てる（償却 O(1)・全件走査なし）
-    - 上限: 新規キーで len が MAX_BUCKETS に達していれば最古を 1 件退避してから
-      挿入する（辞書サイズは MAX_BUCKETS を超えない）。退避=429 ではなく受入
-      （新規利用者の可用性優先。退避で制限を外すには MAX_BUCKETS 個の別 IP から
-      の送信が要り、それ自体が上限回数×MAX_BUCKETS を超えるコストになる）"""
+    - 上限: 新規キーで len が max_buckets に達していれば最古を 1 件退避してから
+      挿入する（辞書サイズは max_buckets を超えない）。退避=429 ではなく受入
+      （新規利用者の可用性優先。退避で制限を外すには max_buckets 個の別 IP から
+      の送信が要り、それ自体が上限回数×max_buckets を超えるコストになる）
+    FORM-3: 本申込（_attempts）と写真アップロード（_photo_attempts）の専用
+    バケットで共用する汎用形（本申込側の挙動は不変）。"""
     for _ in range(_PRUNE_STEPS):
-        if not _attempts:
+        if not bucket:
             break
-        oldest_key = next(iter(_attempts))
-        if now - _attempts[oldest_key][0] >= RATE_WINDOW_SECONDS:
-            del _attempts[oldest_key]
+        oldest_key = next(iter(bucket))
+        if now - bucket[oldest_key][0] >= window:
+            del bucket[oldest_key]
         else:
             break
-    if key in _attempts:
-        start, count = _attempts[key]
-        if now - start >= RATE_WINDOW_SECONDS:
+    if key in bucket:
+        start, count = bucket[key]
+        if now - start >= window:
             start, count = now, 0
-        _attempts.move_to_end(key)
+        bucket.move_to_end(key)
     else:
         start, count = now, 0
-        while len(_attempts) >= MAX_BUCKETS:
-            _attempts.popitem(last=False)        # 最古（LRU）を退避
-    _attempts[key] = (start, count + 1)
-    return count + 1 > RATE_LIMIT
+        while len(bucket) >= max_buckets:
+            bucket.popitem(last=False)           # 最古（LRU）を退避
+    bucket[key] = (start, count + 1)
+    return count + 1 > limit
+
+
+def _rate_exceeded(key: str, now: float) -> bool:
+    """本申込（/shindan）のレート制限（FORM-1 のまま・専用バケット _attempts）。"""
+    return _bump_fixed_window(_attempts, key, now, RATE_LIMIT,
+                              RATE_WINDOW_SECONDS, MAX_BUCKETS)
+
+
+# ── FORM-3 Part B: 写真アップロード（第 2 段）の上限・トークン・専用バケット ──────
+# 画面文言（お客様向け・弁護士裁定で差し替え可・凍結後は test_jikou_form3 が pin）
+PHOTO_PROMPT_TEXT = (
+    "督促状・請求書・訴状などのお写真をお持ちの場合は、こちらから送信できます"
+    "（任意・5枚まで）。後からLINEでお送りいただくこともできます。")
+PHOTO_DONE_TEXT = "お写真を受け付けました。LINEの無料相談へお進みください。"
+
+# 上限（実装判断・票報告に明記）
+PHOTO_MAX_PARTS = 5                                  # パート数（枚数）上限
+PHOTO_MAX_PART_BYTES = image_store.MAX_IMAGE_BYTES   # 1 ファイル 10MB（Part A と同値）
+PHOTO_MAX_TOTAL_BYTES = 30 * 1024 * 1024             # Content-Length 上限（body 読取前）
+PHOTO_PART_NAME = "photo"                            # 受け取る項目名（これ以外は拒否）
+_PHOTO_HEADER_MAX_BYTES = 8 * 1024                   # 1 パートのヘッダ上限
+_PHOTO_RATE_LIMIT = 5                                # 写真 POST の専用レート（回/窓）
+_photo_attempts: "OrderedDict[str, tuple[float, int]]" = OrderedDict()
+
+# 使い捨てアップロードトークン: token → (発行時刻, record_id, 受付番号)。
+# secrets 生成・受付番号（レコード）に紐付け・TTL 15 分・1 回限り（消費で削除）。
+# 【単一 worker 前提】in-memory の有界 LRU（MAX_UPLOAD_TOKENS 厳密上限・最古退避）。
+# uvicorn workers=1（Procfile 実測・test_image_intake が pin）が前提であり、
+# worker 複数化票では永続ストアへ置換すること（_attempts と同じ既知の制約）
+UPLOAD_TOKEN_TTL_SECONDS = 15 * 60
+MAX_UPLOAD_TOKENS = 5000
+# token → (発行時刻, record_id, 受付番号, claimed)
+# fix1（H3-01）: 状態は 3 つ——未使用（claimed=False）／予約中（claimed=True・
+# 解析〜検査の間だけ）／使用済み（辞書から削除=consumed）。解析・容量・形式の
+# 失敗は release で未使用へ戻し（TTL 内なら同じ URL で再送可）、添付呼び出しに
+# 進む時点で consume（以後は添付結果に関わらず 404=再試行しない規律）。
+# TTL は発行時刻基準のまま（claim/release で延長しない）
+_upload_tokens: "OrderedDict[str, tuple[float, str, str, bool]]" = OrderedDict()
+
+
+def issue_upload_token(record_id: str, number: str, now: float) -> str:
+    """結果画面に埋め込む使い捨てトークンを発行する（生成=secrets）。"""
+    token = secrets.token_urlsafe(32)
+    while len(_upload_tokens) >= MAX_UPLOAD_TOKENS:
+        _upload_tokens.popitem(last=False)           # 最古（LRU）を退避
+    _upload_tokens[token] = (now, record_id, number, False)
+    return token
+
+
+def _upload_token_entry(token: str, now: float) -> tuple[str, str] | None:
+    """有効（存在・未期限・未使用かつ予約中でない）なら (record_id, 受付番号)。
+    期限切れは削除。予約中（他の POST が解析中）は無効扱い（404）。"""
+    if not token:
+        return None
+    entry = _upload_tokens.get(token)
+    if entry is None:
+        return None
+    issued, record_id, number, claimed = entry
+    if now - issued > UPLOAD_TOKEN_TTL_SECONDS:
+        _upload_tokens.pop(token, None)
+        return None
+    if claimed:
+        return None
+    return record_id, number
+
+
+def claim_upload_token(token: str, now: float) -> tuple[str, str] | None:
+    """トークンを予約する（check-then-act は await を挟まない同期区間＝
+    H4-fix2 / IMG-1 _send_claims と同型・単一 worker 前提）。未使用かつ TTL 内
+    なら予約成功・予約中/使用済み/期限切れは None（404）。"""
+    entry = _upload_token_entry(token, now)
+    if entry is None:
+        return None
+    issued, record_id, number, _claimed = _upload_tokens[token]
+    _upload_tokens[token] = (issued, record_id, number, True)
+    return entry
+
+
+def release_upload_token(token: str) -> None:
+    """予約を解除して未使用へ戻す（解析・容量・形式の失敗・予期しない例外）。
+    使用済み（削除済み）なら何もしない。"""
+    entry = _upload_tokens.get(token)
+    if entry is None:
+        return
+    issued, record_id, number, _claimed = entry
+    _upload_tokens[token] = (issued, record_id, number, False)
+
+
+def consume_upload_token(token: str, now: float | None = None) -> None:
+    """使用済みに確定する（辞書から削除・以後は 404）。添付呼び出しに進む時点で
+    呼ぶ。添付の結果（成功・失敗・unconverged）に関わらず戻さない。"""
+    _upload_tokens.pop(token, None)
+
+
+def _photo_rate_exceeded(key: str, now: float) -> bool:
+    return _bump_fixed_window(_photo_attempts, key, now, _PHOTO_RATE_LIMIT,
+                              RATE_WINDOW_SECONDS, MAX_BUCKETS)
 
 
 # ── ゲート（04: body 読取前に通す関門） ────────────────────────────────────────────
@@ -326,6 +429,12 @@ _PAGE_STYLE = """
        padding:14px;border:none;border-radius:10px;text-decoration:none}
   .note{font-size:12px;color:#777;margin-top:16px}
   .num{font-size:18px;font-weight:bold}
+  h2{font-size:17px;margin:22px 0 8px}
+  input[type=file]{display:block;width:100%;box-sizing:border-box;
+       margin:8px 0 12px;font-size:15px}
+  .btn2{display:block;width:100%;box-sizing:border-box;text-align:center;
+       background:#fff;color:#06c755;font-size:16px;font-weight:bold;
+       padding:12px;border:2px solid #06c755;border-radius:10px}
 """
 
 
@@ -375,7 +484,25 @@ def _form_html() -> str:
     return _page("消滅時効かんたん診断", body)
 
 
-def _result_html(pattern: str, number: str, line_url: str) -> str:
+def _photo_section_html(upload_token: str) -> str:
+    """FORM-3 Part B: 結果画面の任意の第 2 段（写真送信）。使い捨てトークンは
+    専用ルートのパスに載せる（本申込 /shindan の公開面は不変）。"""
+    if not upload_token:
+        return ""
+    return (
+        "<h2>お写真の送信（任意）</h2>"
+        f"<p>{PHOTO_PROMPT_TEXT}</p>"
+        "<form method=\"post\" enctype=\"multipart/form-data\" "
+        f"action=\"{PHOTO_ROUTE}/{html.escape(upload_token, quote=True)}\">"
+        f"<input type=\"file\" name=\"{PHOTO_PART_NAME}\" "
+        "accept=\"image/jpeg,image/png,image/heic,application/pdf\" multiple>"
+        "<button class=\"btn2\" type=\"submit\">お写真を送信する</button>"
+        "</form>"
+    )
+
+
+def _result_html(pattern: str, number: str, line_url: str,
+                 upload_token: str = "") -> str:
     text_html = html.escape(result_text(pattern, number)).replace("\n", "<br>")
     body = (
         "<h1>診断結果</h1>"
@@ -384,9 +511,23 @@ def _result_html(pattern: str, number: str, line_url: str) -> str:
         "LINEで無料相談する（友だち追加）</a>"
         "<p>LINEで上記の受付番号をお送りいただくと、ご回答内容を引き継いで"
         "スムーズにご案内できます。</p>"
-        f"<p class=\"note\">{FROZEN_NOTE}</p>"
+        + _photo_section_html(upload_token)
+        + f"<p class=\"note\">{FROZEN_NOTE}</p>"
     )
     return _page("診断結果", body)
+
+
+def _photo_done_html(count: int, line_url: str) -> str:
+    """完了画面（固定文言+枚数のみ・入力値は反射しない）。"""
+    body = (
+        "<h1>お写真の送信</h1>"
+        f"<p class=\"num\">{PHOTO_DONE_TEXT}</p>"
+        f"<p>受け付けた枚数: {int(count)}枚</p>"
+        f"<a class=\"btn\" href=\"{html.escape(line_url, quote=True)}\">"
+        "LINEで無料相談する（友だち追加）</a>"
+        f"<p class=\"note\">{FROZEN_NOTE}</p>"
+    )
+    return _page("お写真の送信", body)
 
 
 def _fixed_page(title: str, message: str, status: int) -> HTMLResponse:
@@ -441,8 +582,241 @@ async def shindan_alias_not_found(request: Request, _rest: str = ""):
     return _not_found()
 
 
+# ── FORM-3 Part B: 写真アップロード（専用ルート・multipart はここでのみ受ける） ────
+PHOTO_ROUTE = "/shindan/photos"
+_MULTIPART_CONTENT_TYPE = "multipart/form-data"
+_BOUNDARY_RE = re.compile(r"^[A-Za-z0-9'()+_,\-./:=? ]{1,70}$")
+_DISPOSITION_NAME_RE = re.compile(r';\s*name="([^"]*)"')
+_DISPOSITION_FILENAME_RE = re.compile(r';\s*filename="([^"]*)"')
+
+
+class _MultipartLimit(Exception):
+    """上限超過（パート数・1 ファイル・合計）＝即中断（残りは読まない）。"""
+
+
+class _MultipartBad(Exception):
+    """multipart の形式不正・許可外の項目名。"""
+
+
+def _multipart_boundary(request: Request) -> bytes | None:
+    """Content-Type が multipart/form-data かつ boundary が妥当なら boundary。"""
+    ct = (request.headers.get("content-type", "") or "")
+    main_type, _, rest = ct.partition(";")
+    if main_type.strip().lower() != _MULTIPART_CONTENT_TYPE:
+        return None
+    boundary = ""
+    for param in rest.split(";"):
+        k, _, v = param.strip().partition("=")
+        if k.strip().lower() == "boundary":
+            boundary = v.strip().strip('"')
+    if not boundary or not _BOUNDARY_RE.match(boundary):
+        return None
+    return boundary.encode("ascii")
+
+
+def _content_length_within(request: Request, limit: int) -> bool:
+    raw = (request.headers.get("content-length", "") or "").strip()
+    return raw.isdigit() and int(raw) <= limit
+
+
+def _parse_part_headers(raw: bytes) -> tuple[str, str | None]:
+    """パートヘッダから (name, filename|None) を取り出す。"""
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        raise _MultipartBad()
+    name, filename = "", None
+    for line in text.split("\r\n"):
+        key, _, value = line.partition(":")
+        if key.strip().lower() != "content-disposition":
+            continue
+        m = _DISPOSITION_NAME_RE.search(value)
+        name = m.group(1) if m else ""
+        m = _DISPOSITION_FILENAME_RE.search(value)
+        filename = m.group(1) if m else None
+    return name, filename
+
+
+async def _parse_multipart_stream(stream, boundary: bytes) -> list[bytes]:
+    """有界ストリーミング解析（starlette の MultiPartParser を使わない・一時
+    ファイルなし）。項目名 PHOTO_PART_NAME のファイルパート本文だけを返す
+    （filename 空・本文空=未選択の入力は読み飛ばし）。
+    上限: パート数 PHOTO_MAX_PARTS・1 ファイル PHOTO_MAX_PART_BYTES・合計
+    PHOTO_MAX_TOTAL_BYTES（Content-Length が偽でも実読込で検査）。超過は
+    _MultipartLimit で即中断。形式不正・許可外の項目名は _MultipartBad。"""
+    delim = b"--" + boundary
+    buf = bytearray()
+    body = bytearray()
+    files: list[bytes] = []
+    state = "preamble"
+    part_count = 0
+    total = 0
+    cur_filename: str | None = None
+    keep = len(delim) + 4                     # 区切り検出のために残す末尾長
+
+    async for chunk in stream:
+        total += len(chunk)
+        if total > PHOTO_MAX_TOTAL_BYTES:
+            raise _MultipartLimit()
+        buf += chunk
+        while True:
+            if state == "preamble":
+                i = buf.find(delim)
+                if i < 0:
+                    if len(buf) > keep:
+                        del buf[:-keep]
+                    break
+                del buf[:i + len(delim)]
+                state = "after_delim"
+            if state == "after_delim":
+                if len(buf) < 2:
+                    break
+                if buf[:2] == b"--":
+                    state = "done"
+                    break
+                if buf[:2] != b"\r\n":
+                    raise _MultipartBad()
+                del buf[:2]
+                state = "headers"
+            if state == "headers":
+                j = buf.find(b"\r\n\r\n")
+                if j < 0:
+                    if len(buf) > _PHOTO_HEADER_MAX_BYTES:
+                        raise _MultipartBad()
+                    break
+                part_count += 1
+                if part_count > PHOTO_MAX_PARTS:
+                    raise _MultipartLimit()
+                name, cur_filename = _parse_part_headers(bytes(buf[:j]))
+                if name != PHOTO_PART_NAME:
+                    raise _MultipartBad()      # 項目名以外の入力は受け取らない
+                del buf[:j + 4]
+                body = bytearray()
+                state = "body"
+            if state == "body":
+                k = buf.find(b"\r\n" + delim)
+                if k < 0:
+                    if len(buf) > keep:
+                        body += buf[:-keep]
+                        del buf[:-keep]
+                    if len(body) > PHOTO_MAX_PART_BYTES:
+                        raise _MultipartLimit()
+                    break
+                body += buf[:k]
+                if len(body) > PHOTO_MAX_PART_BYTES:
+                    raise _MultipartLimit()
+                del buf[:k + 2 + len(delim)]
+                if cur_filename and len(body) > 0:
+                    files.append(bytes(body))
+                body = bytearray()
+                state = "after_delim"
+        if state == "done":
+            break
+    if state != "done":
+        raise _MultipartBad()
+    return files
+
+
+def _photo_limit_page() -> HTMLResponse:
+    return _fixed_page(
+        "お写真をご確認ください",
+        "お写真のサイズまたは枚数が上限（1枚10MB・5枚まで）を超えています。"
+        "枚数やサイズを減らしてもう一度お試しいただくか、後からLINEでお送り"
+        "ください。", 413)
+
+
+def _photo_bad_page() -> HTMLResponse:
+    return _fixed_page(
+        "お写真をご確認ください",
+        "お写真を受け付けられませんでした。JPEG・PNG・HEIC・PDF の形式で、"
+        "もう一度お試しいただくか、後からLINEでお送りください。", 400)
+
+
+async def shindan_photos_entry(request: Request, token: str = ""):
+    """写真アップロードの単一入口（素の Request）。ゲート順（body 読取前）:
+    ①env → ②メソッド（POST 以外 404）→ ③トークン有効性（無し/期限切れ/使用済み
+    =404・存在しないフリ）→ ④Content-Type（multipart+boundary）/Content-Length
+    （PHOTO_MAX_TOTAL_BYTES・欠落=404）→ ⑤レート（専用バケット）→ ⑥トークン消費
+    （1 回限り）→ ここで初めて body をストリーミング解析。"""
+    if _disabled():
+        return _not_found()
+    if request.method.upper() != "POST":
+        return _not_found()
+    now = time.time()
+    if _upload_token_entry(token, now) is None:
+        return _not_found()
+    boundary = _multipart_boundary(request)
+    if boundary is None or not _content_length_within(
+            request, PHOTO_MAX_TOTAL_BYTES):
+        logger.info("[SHINDAN_PHOTOS] body gate rejected (type/length)")
+        return _not_found()
+    if _photo_rate_exceeded(_rate_key(request), now):
+        logger.info("[SHINDAN_PHOTOS] rate limited")
+        return _fixed_page(
+            "アクセスが集中しています",
+            "アクセスが集中しています。しばらく時間をおいてから"
+            "もう一度お試しください。", 429)
+    # fix1（H3-01）: ⑥予約（claim・同期区間）。解析〜検査の失敗は finally で
+    # release（未使用へ戻す=TTL 内なら同じ URL で再送可）。添付呼び出しに進む
+    # 時点で consume に確定し、以後は添付結果に関わらず戻さない
+    entry = claim_upload_token(token, now)
+    if entry is None:
+        return _not_found()
+    record_id, number = entry
+    consumed = False
+    try:
+        # ── ここで初めて body を読む（有界ストリーミング・一時ファイルなし） ──
+        try:
+            contents = await _parse_multipart_stream(request.stream(), boundary)
+        except _MultipartLimit:
+            logger.info("[SHINDAN_PHOTOS] limit exceeded (aborted)")
+            return _photo_limit_page()
+        except _MultipartBad:
+            logger.info("[SHINDAN_PHOTOS] malformed multipart")
+            return _photo_bad_page()
+        if not contents:
+            return _photo_bad_page()
+        files: list[tuple[str, bytes, str]] = []
+        for i, data in enumerate(contents, start=1):
+            fmt = image_store.detect_format(data)
+            if fmt is None:
+                logger.info("[SHINDAN_PHOTOS] unknown format (no attach)")
+                return _photo_bad_page()
+            ext, mime = fmt
+            files.append((f"form_{number}_{i}.{ext}", data, mime))
+        consume_upload_token(token)
+        consumed = True
+    finally:
+        if not consumed:
+            release_upload_token(token)          # 成功確定前の離脱は必ず解除
+    outcome = await image_store.attach_files(
+        APP_JIKOU_CASE, record_id, files)
+    if outcome != "attached":
+        logger.error("[SHINDAN_PHOTOS] attach not confirmed record_id=%s",
+                     emit(record_id, "record_id", "log", "operator"))
+        await notify.notify_admin_line(
+            "【時効診断フォーム・要確認】お写真の添付を確定できませんでした"
+            f"（区分:{outcome} 受付番号:{number}）。上書きせず中止しています。"
+            "kintone と Railway ログを確認してください。",
+            throttle_key="shindan_photos",
+        )
+        return _fixed_page(
+            "エラーが発生しました",
+            "申し訳ありません。お写真を受け付けられませんでした。お手数ですが、"
+            "後からLINEでお送りください。", 500)
+    logger.info("[SHINDAN_PHOTOS] attached record_id=%s count=%s",
+                emit(record_id, "record_id", "log", "operator"),
+                emit(len(files), "count", "log", "operator"))
+    return HTMLResponse(_photo_done_html(
+        len(files), os.environ.get(_LINE_URL_ENV, "").strip()))
+
+
 router.add_api_route("/shindan", shindan_entry, methods=_ENTRY_METHODS,
                      include_in_schema=False)
+# FORM-3: 写真ルートは別名 catch-all より先に登録（トークン無しの
+# /shindan/photos や配下パスは従来どおり catch-all の 404）
+router.add_api_route(PHOTO_ROUTE + "/{token}", shindan_photos_entry,
+                     methods=_ENTRY_METHODS, include_in_schema=False)
 router.add_api_route("/shindan/{_rest:path}", shindan_alias_not_found,
                      methods=_ENTRY_METHODS, include_in_schema=False)
 
@@ -526,5 +900,9 @@ async def _handle_submit(form: dict[str, str]):
     else:
         logger.info("[SHINDAN] ATTORNEY_LINE_USER_ID not set, notify skipped")
 
+    # FORM-3 Part B: 結果画面に写真送信（任意・第 2 段）の使い捨てトークンを
+    # 埋め込む（受付番号のレコードに紐付け・TTL 15 分・1 回限り）
+    upload_token = issue_upload_token(record_id, number, time.time())
     return HTMLResponse(_result_html(
-        pattern, number, os.environ.get(_LINE_URL_ENV, "").strip()))
+        pattern, number, os.environ.get(_LINE_URL_ENV, "").strip(),
+        upload_token))

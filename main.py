@@ -196,6 +196,7 @@ LINE_CHANNEL_SECRET = os.environ["LINE_CHANNEL_SECRET"]
 LINE_CHANNEL_ACCESS_TOKEN = os.environ["LINE_CHANNEL_ACCESS_TOKEN"]
 from hub import line_channel as hub_line_channel  # noqa: E402
 from hub import image_intake  # noqa: E402
+from hub import image_store  # noqa: E402  JIKOU-FORM-3: 受信書類写真の取得+添付
 from hub import form_link  # noqa: E402  JIKOU-FORM-2: 受付番号による LINE 紐付け
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 KINTONE_SUBDOMAIN = os.environ["KINTONE_SUBDOMAIN"]
@@ -1116,8 +1117,25 @@ async def _notify_image_failure() -> None:
         logger.error("[IMAGE] failure notify also failed (fixed text)")
 
 
+async def _store_jikou_image(user_id: str, record: dict | None,
+                             message_id: str) -> str:
+    """JIKOU-FORM-3 Part A: 時効チャネルの受信画像を取得し App 21 の受信書類
+    写真へ添付する（受領返信の成否と独立・例外は外へ出さない）。対象レコード=
+    get_app21_record(userId) のレコード（未存在は未添付=保留・分類ログのみ）。"""
+    if not message_id:
+        return "no_message_id"
+    try:
+        rid = str(((record or {}).get("$id") or {}).get("value") or "")
+        return await image_store.intake_line_image(
+            "jikou", hub_line_channel.JIKOU_CHANNEL, image_store.APP_JIKOU_CASE,
+            user_id, message_id, rid)
+    except Exception:
+        logger.error("[IMAGE] image store failed (fixed reason)")
+        return "failed"
+
+
 async def _process_line_image_event(reply_token: str, user_id: str,
-                                    event_id: str) -> None:
+                                    event_id: str, message_id: str = "") -> None:
     """AUTOREPLY-GEN2 要件4+fix1[03]: 画像メッセージへの固定受領応答
     （決定的 event ID による冪等化・採用方式=画像専用の回収可能な状態管理）。
 
@@ -1157,6 +1175,9 @@ async def _process_line_image_event(reply_token: str, user_id: str,
             logger.info("[IMAGE] concurrent duplicate lost user_id=%s",
                         emit(user_id, "external_ref", "log", "operator"))
             return
+        # JIKOU-FORM-3 Part A: 勝者のみ取得+添付（人対応中でも添付する。
+        # 受領返信の成否と独立・不成立でも以降の返信経路は不変）
+        await _store_jikou_image(user_id, record, message_id)
         if human:
             # 人対応: 顧客へは完全無言・弁護士通知のみ（受信行は保存済み）
             if ATTORNEY_LINE_USER_ID:
@@ -1290,10 +1311,11 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
                     json.dumps(event, sort_keys=True,
                                ensure_ascii=False).encode()
                 ).hexdigest()[:32])
+            # JIKOU-FORM-3 Part A: コンテンツ API 取得用の message id を渡す
             background_tasks.add_task(
                 _process_line_image_event,
                 event["replyToken"], event["source"]["userId"],
-                image_event_id)
+                image_event_id, str(event["message"].get("id", "") or ""))
             logger.info("[WEBHOOK] queued image user_id=%s",
                         emit(event["source"]["userId"], "external_ref",
                              "log", "operator"))
