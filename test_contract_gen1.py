@@ -102,7 +102,8 @@ class TestTemplateIntegrity(unittest.TestCase):
 
     def test_registered_keys_eight_unique(self):
         keys = EXPECTED_DOCX_TEMPLATES["docx_templates/jikou/委任契約書.docx"]
-        self.assertEqual(len(keys), 8)          # 一意プレースホルダ 8 キー
+        # JIKOU-CONTRACT-TOKUYAKU: 8 キー+{{特約}}（pin 更新のみ）
+        self.assertEqual(len(keys), 9)
         text = _docx_text(open(cw.TEMPLATE_PATH, "rb").read())
         for k in keys:
             self.assertIn(k, text)

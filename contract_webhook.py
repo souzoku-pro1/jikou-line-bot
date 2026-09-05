@@ -63,14 +63,35 @@ PDF 化の設計（CONTRACT-GEN-2 条件）:
 
 スコープ外: CloudSign 送信 API の呼び出し・締結後処理（既存
 cloudsign_webhook が cloudsign_document_id で照合して担う）。
+
+特約（JIKOU-CONTRACT-TOKUYAKU）:
+  - App 21 の 特約（MULTI_LINE_TEXT）を、雛形の「特約事項」見出し+{{特約}} 本文
+    （最後の条文の後・締結文の前）へ差し込む。空（空白のみ）なら 2 段落とも
+    削除。非空なら改行ごとに段落を分け、本文段落の書式（pPr・rPr）を複製する
+    （apply_tokuyaku・fill_template の run 潰しの影響を受けない専用処理）。
+    特約本文の {{ }} は展開しない。TOKUYAKU_MAX_CHARS 超は生成せず「要確認」。
+  - docx と CloudSign 用 PDF の両方がテンプレ+レコード値から生成されるため、
+    特約を反映する正規の手段は「契約書ステータスを『契約書作成』に戻して
+    再生成」（添付は置換される）。ただし cloudsign_document_id が非空
+    （CloudSign 下書き作成済み）の再生成要求は「要確認」へ倒す（下書きとの齟齬
+    防止・下書きを削除してから再実行）。
+  - 運用上の注意: 添付 docx を人が差し替えても、CloudSign 用 PDF はテンプレ+
+    レコード値から再生成されるため**差し替え内容は CloudSign に反映されない**。
+    文面の変更は雛形（テンプレ）か 特約 欄で行うこと。
+  - fix1（CT-01/CT-02）: ガードは _regeneration_guard 1 関数に集約し、契約書作成
+    トリガ／作成中 reconcile／クラウドサイン登録 の 3 経路が同じ判定順
+    （cs_registered → tokuyaku_too_long → tokuyaku_invalid）で「要確認」へ倒す。
+    特約に {{ }} を含む入力は展開せず入力不正として拒否する。
 """
 
+import copy
 import hashlib
 import io
 import logging
 import re
 
 from docx import Document
+from docx.text.paragraph import Paragraph
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
@@ -96,6 +117,12 @@ TEMPLATE_PATH    = "docx_templates/jikou/委任契約書.docx"
 OUTPUT_FILENAME  = "委任契約書_時効援用.docx"
 _BLANK           = "　"
 
+# ── 特約（JIKOU-CONTRACT-TOKUYAKU） ──────────────────────────────────────────
+FIELD_TOKUYAKU     = "特約"
+TOKUYAKU_HEADING   = "特約事項"          # 雛形の見出し段落（逐語）
+TOKUYAKU_KEY       = "{{特約}}"          # 雛形の本文段落（単一 run）
+TOKUYAKU_MAX_CHARS = 600                 # 超過は生成せず「要確認」（pin）
+
 # ── 第2版（CONTRACT-GEN-2）: CloudSign 登録の状態 3 値+フィールド ──────────
 STATUS_CS_TRIGGER = "クラウドサイン登録"
 STATUS_CS_WORKING = "クラウドサイン登録中"
@@ -107,9 +134,12 @@ OUTPUT_PDF_NAME   = "委任契約書_時効援用.pdf"
 # 全角・空白・@ 二重などは形式不正として登録しない
 _EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 
-# fix1[03]: 人承認済み現物テンプレートの SHA-256（2026-08-22 収載時実測）
+# fix1[03]: 人承認済み現物テンプレートの SHA-256。
+# JIKOU-CONTRACT-TOKUYAKU: 2026-08-22 収載現物（7cc168a1…・scripts/fixtures に
+# 保存）へ scripts/add_contract_tokuyaku.py で「特約事項」+{{特約}} の 2 段落を
+# 追加した現物（決定的 zip・再現性は test_contract_tokuyaku が pin）
 TEMPLATE_SHA256 = (
-    "7cc168a1bbce3ca183e9f4a3d46b6b8288c17d4d21954f07cdf038428c355334")
+    "ead90bb8154f64318cc80ee7d6a2dda129192936ca29e32746348ac6145856fd")
 # fix1[03]: 報酬条項（第2条全体）の正規化済み逐語（弁護士凍結事項）
 FROZEN_CLAUSE = (
     "第2条（弁護士報酬）",
@@ -158,6 +188,10 @@ def _missing_fields(record: dict) -> list[str]:
 
 
 def build_fill_data(record: dict) -> dict:
+    """fill_template 用 8 キー+{{特約}}（生値）。render_contract_docx は
+    {{特約}} を fill_template に渡さず apply_tokuyaku で専用処理する（run 潰しの
+    影響を受けず・改行ごとに段落化）。fill_template に直接渡した場合は単一段落
+    への素朴な置換になる（互換のため値は同じ）。"""
     return {
         "{{依頼者氏名}}":  _fv(record, _REQUIRED_NAME),
         "{{依頼者住所}}":  _fv(record, _REQUIRED_ADDR),
@@ -165,7 +199,82 @@ def build_fill_data(record: dict) -> dict:
         "{{対象債権者2}}": _fv(record, "対象債権者2") or _BLANK,
         "{{対象債権者3}}": _fv(record, "対象債権者3") or _BLANK,
         "{{契約年}}": _BLANK, "{{契約月}}": _BLANK, "{{契約日}}": _BLANK,
+        TOKUYAKU_KEY: str((record.get(FIELD_TOKUYAKU) or {}).get("value") or ""),
     }
+
+
+def _placeholder_data(data: dict) -> dict:
+    """{{特約}} を除いた 8 キー（apply_tokuyaku が専用処理するため）。"""
+    return {k: v for k, v in data.items() if k != TOKUYAKU_KEY}
+
+
+def tokuyaku_lines(text: str) -> list[str]:
+    """特約本文を段落へ分ける（改行ごと・空行は除く）。空/空白のみは []。"""
+    return [ln.strip() for ln in str(text or "").splitlines() if ln.strip()]
+
+
+def tokuyaku_problem(record: dict) -> str | None:
+    """特約の入力検査（fail-closed）。判定順: 上限超（tokuyaku_too_long）→
+    使用できない記号 {{ }}（tokuyaku_invalid・fix1 CT-02: 仕様変更=展開しない
+    ではなく入力不正として拒否）。該当なら skip 分類、なければ None。"""
+    text = str((record.get(FIELD_TOKUYAKU) or {}).get("value") or "")
+    if len(text.strip()) > TOKUYAKU_MAX_CHARS:
+        return "tokuyaku_too_long"
+    if "{{" in text or "}}" in text:
+        return "tokuyaku_invalid"
+    return None
+
+
+def apply_tokuyaku(docx_bytes: bytes, text: str) -> bytes:
+    """雛形の「特約事項」見出し+{{特約}} 本文を特約の実値で置き換える専用処理
+    （fill_template の「全 run を先頭 run に潰す」既知問題の影響を受けない）。
+    - 空（空白のみ）: 見出し・本文の 2 段落を削除（空の見出しを残さない）
+    - 非空: 改行ごとに段落を分け、本文段落の書式（pPr・rPr）を複製して差し込む
+      （1 行なら 1 段落）。特約本文の {{ }} は展開しない（文字として出す）——
+      fix1 CT-02 で {{ }} を含む特約は tokuyaku_problem が入力不正として拒否する
+      ため、本関数には到達しない（防御的に「展開しない」実装は維持）"""
+    doc = Document(io.BytesIO(docx_bytes))
+    body = next((p for p in doc.paragraphs if p.text == TOKUYAKU_KEY), None)
+    if body is None:
+        raise ContractIntegrityError("tokuyaku placeholder missing")
+    heading = body._p.getprevious()
+    if heading is None or Paragraph(heading, body._parent).text != TOKUYAKU_HEADING:
+        raise ContractIntegrityError("tokuyaku heading missing")
+    lines = tokuyaku_lines(text)
+    if not lines:
+        parent = body._p.getparent()
+        parent.remove(heading)
+        parent.remove(body._p)
+    else:
+        template_p = copy.deepcopy(body._p)      # 書式（pPr・rPr）の原型
+        _set_paragraph_text(body, lines[0])
+        prev = body._p
+        for line in lines[1:]:
+            new_p = copy.deepcopy(template_p)
+            prev.addnext(new_p)
+            _set_paragraph_text(Paragraph(new_p, body._parent), line)
+            prev = new_p
+    out = io.BytesIO()
+    doc.save(out)
+    return out.getvalue()
+
+
+def _set_paragraph_text(para, line: str) -> None:
+    """先頭 run（rPr 保持）にテキストを置き、残りの run を空にする。"""
+    para.runs[0].text = line
+    for r in para.runs[1:]:
+        r.text = ""
+
+
+def render_contract_docx(record: dict) -> bytes:
+    """雛形の整合検証 → 8 キー差し込み → 特約の専用処理 → 凍結条項検証。
+    docx 添付と CloudSign 用 PDF の両方がこの単一の生成経路を使う。"""
+    verify_template_integrity()
+    data = build_fill_data(record)
+    docx_bytes = fill_template(TEMPLATE_PATH, _placeholder_data(data))
+    docx_bytes = apply_tokuyaku(docx_bytes, data[TOKUYAKU_KEY])
+    verify_frozen_clause(docx_bytes)
+    return docx_bytes
 
 
 def _clause_of(docx_bytes: bytes) -> tuple:
@@ -236,9 +345,7 @@ async def _notify(text: str) -> None:
 async def _generate_and_attach(record_id: str, record: dict,
                                final_revision: str) -> None:
     """生成 → 凍結文言検証 → upload → 添付+作成済（revision CAS つき PUT）。"""
-    verify_template_integrity()
-    docx_bytes = fill_template(TEMPLATE_PATH, build_fill_data(record))
-    verify_frozen_clause(docx_bytes)
+    docx_bytes = render_contract_docx(record)
     logger.info("[CONTRACT] generated record_id=%s bytes=%d",
                 emit(record_id, "record_id", "log", "operator"),
                 len(docx_bytes))
@@ -372,6 +479,46 @@ async def _claim(record_id: str, revision: str, to_status: str) -> str | None:
     return str(int(revision) + 1)
 
 
+async def _to_review(record_id: str, revision: str, text: str, skip: str):
+    """生成せず「要確認」へ CAS 遷移+管理者通知（reconcile と同型）。"""
+    next_rev = await _claim(record_id, revision, STATUS_REVIEW)
+    if next_rev is None:
+        return JSONResponse(status_code=200,
+                            content={"ok": True, "skip": "cas_lost"})
+    await _notify(text)
+    return JSONResponse(status_code=200, content={"ok": True, "skip": skip})
+
+
+def _regeneration_guard(record_id: str, record: dict,
+                        context: str = "regenerate") -> tuple[str, str] | None:
+    """再生成/再登録の運用ガード（3 経路共通の単一判定関数。判定順:
+    ①CloudSign 下書き作成済み（cs_registered）→ ②特約上限（tokuyaku_too_long）
+    → ③特約の使用不可記号（tokuyaku_invalid）。該当なら (skip 分類, 固定文言)。
+    context="regenerate"（契約書作成トリガ・作成中 reconcile）／"register"
+    （クラウドサイン登録）で cs_registered の文言を分ける。"""
+    if _fv(record, FIELD_CS_DOC_ID):
+        if context == "register":
+            return ("cs_registered",
+                    f"【委任契約書・要確認】CloudSign 登録済みのため再登録を中止しま"
+                    f"した（レコード番号 {record_id}）。既存の下書きを確認してください。")
+        return ("cs_registered",
+                f"【委任契約書・要確認】CloudSign 登録済みのため再生成を中止しました"
+                f"（レコード番号 {record_id}）。特約を反映する場合は CloudSign の"
+                "下書きを削除してから再度お試しください。")
+    tk = tokuyaku_problem(record)
+    if tk == "tokuyaku_too_long":
+        return (tk,
+                f"【委任契約書・要確認】特約が {TOKUYAKU_MAX_CHARS} 字を超えている"
+                f"ため生成を中止しました（レコード番号 {record_id}）。特約を短くして"
+                f"から契約書ステータスを「{STATUS_TRIGGER}」に設定し直してください。")
+    if tk == "tokuyaku_invalid":
+        return (tk,
+                "【委任契約書・要確認】特約欄に使用できない記号（{{ }}）が含まれて"
+                f"います（レコード番号 {record_id}）。特約欄を修正して再度お試し"
+                "ください。")
+    return None
+
+
 async def _reconcile_working(record_id: str, record: dict,
                              revision: str):
     """fix1[02] reconcile: 「作成中」で停止した行の回収。
@@ -392,6 +539,9 @@ async def _reconcile_working(record_id: str, record: dict,
             "ください")
         return JSONResponse(status_code=200, content={
             "ok": True, "skip": "needs_review"})
+    guard = _regeneration_guard(record_id, record, "regenerate")
+    if guard:
+        return await _to_review(record_id, revision, guard[1], guard[0])
     next_rev = await _claim(record_id, revision, STATUS_WORKING)
     if next_rev is None:
         return JSONResponse(status_code=200,
@@ -414,6 +564,8 @@ async def _cloudsign_flow(record_id: str, record: dict, revision: str):
         problems.append(FIELD_EMAIL)
     elif not _EMAIL_RE.fullmatch(email):
         problems.append(f"{FIELD_EMAIL}（形式不正）")
+    # 特約の検査（上限/使用不可記号）と CloudSign 登録済みは dispatcher の
+    # _regeneration_guard（3 経路共通）で「要確認」へ倒し済み（fix1 CT-01/02）
     if problems:
         logger.info("[CONTRACT] cloudsign preconditions unmet record_id=%s "
                     "count=%d",
@@ -437,9 +589,7 @@ async def _cloudsign_flow(record_id: str, record: dict, revision: str):
 
     # PDF 生成（テンプレ=単一の正）+ 凍結検証（docx 段・PDF 段の二層）。
     # 検証失敗はここで 500（系統的エラー→再配送が reconcile で「要確認」へ）
-    verify_template_integrity()
-    docx_bytes = fill_template(TEMPLATE_PATH, build_fill_data(record))
-    verify_frozen_clause(docx_bytes)
+    docx_bytes = render_contract_docx(record)   # 特約込み（単一の生成経路）
     pdf_bytes = contract_pdf.docx_to_pdf_bytes(docx_bytes)
     verify_frozen_pdf(pdf_bytes)
     verify_pdf_full_text(docx_bytes, pdf_bytes)   # fix1[02] 全文 pin
@@ -564,6 +714,11 @@ async def contract_webhook(secret: str, request: Request):
         if current == STATUS_CS_WORKING:
             return await _reconcile_cs_working(record_id, revision)
         if current == STATUS_CS_TRIGGER:
+            # fix1 CT-01: 登録経路にも共通ガード（cs_registered=再登録の文言）。
+            # 該当は CloudSign API 作用 0 で「要確認」へ CAS 遷移+通知
+            guard = _regeneration_guard(record_id, record, "register")
+            if guard:
+                return await _to_review(record_id, revision, guard[1], guard[0])
             return await _cloudsign_flow(record_id, record, revision)
         if current != STATUS_TRIGGER:
             logger.info("[CONTRACT] stale status record_id=%s",
@@ -585,6 +740,12 @@ async def contract_webhook(secret: str, request: Request):
                 f"「{STATUS_TRIGGER}」に設定し直してください")
             return JSONResponse(status_code=200, content={
                 "ok": True, "skip": "missing_fields", "missing": missing})
+
+        # JIKOU-CONTRACT-TOKUYAKU: 再生成の運用ガード（①CloudSign 下書き作成済み
+        # → ②特約上限 → ③使用不可記号）。該当は生成せず「要確認」へ CAS 遷移+通知
+        guard = _regeneration_guard(record_id, record, "regenerate")
+        if guard:
+            return await _to_review(record_id, revision, guard[1], guard[0])
 
         # fix1[02]: CAS（作成→作成中）勝者のみ生成（並行 2 本でも upload 1 回）
         next_rev = await _claim(record_id, revision, STATUS_WORKING)
