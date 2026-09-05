@@ -178,6 +178,24 @@ def _log_throttled(throttle_key: str) -> None:
         logger.info("admin LINE notify throttled kind=return_deadline_check")
     elif head == "shindan_numbering":
         logger.info("admin LINE notify throttled kind=shindan_numbering")
+    # JIKOU-IMG-2: 書類写真の AI 読解系 3 種+既存で未登録だった 5 種を可視化
+    # （動作変更なし・unknown_kind 表示の解消のみ）
+    elif head == "image_analysis_send_failure":
+        logger.info("admin LINE notify throttled kind=image_analysis_send_failure")
+    elif head == "image_analysis_store":
+        logger.info("admin LINE notify throttled kind=image_analysis_store")
+    elif head == "image_analysis_court":
+        logger.info("admin LINE notify throttled kind=image_analysis_court")
+    elif head == "houki_image_send_failure":
+        logger.info("admin LINE notify throttled kind=houki_image_send_failure")
+    elif head == "houki_image_failure":
+        logger.info("admin LINE notify throttled kind=houki_image_failure")
+    elif head == "houki_image_attach":
+        logger.info("admin LINE notify throttled kind=houki_image_attach")
+    elif head == "shindan_photos":
+        logger.info("admin LINE notify throttled kind=shindan_photos")
+    elif head == "form_link_merge":
+        logger.info("admin LINE notify throttled kind=form_link_merge")
     else:
         logger.info("admin LINE notify throttled kind=unknown_kind")
 
