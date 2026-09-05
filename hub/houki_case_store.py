@@ -102,6 +102,166 @@ HEARING_REQUIRED_FIELDS: tuple = (
     "顧客名", "住所", "生年月日", "電話番号",
 )
 
+# ── HOUKI-HEARING-UX-1: ヒアリング台本の構造（7 通・弁護士決定・凍結） ──────────
+# 各通 = (見出し, 導入文, 項目タプル, 記録メモ)。項目 = (質問ラベル, 対応欄)。
+# 質問ラベルは「誰の・何を」を必ず明示する。対応欄は「その項目が回答済みか」を
+# レコード実値で判定するための欄（いずれか非空=回答済み）。空タプル=記録欄なし
+# （第 5 通・戸籍。会話で確認するのみ）。項目の追加・削減は本票の凍結範囲外
+HEARING_ROUNDS: tuple = (
+    ("亡くなった方について", "亡くなった方についてお伺いします。", (
+        ("亡くなった方のお名前とふりがな", ("被相続人氏名", "被相続人ふりがな")),
+        ("亡くなった方とあなたとのご関係（母・父・兄・叔父など）", ("続柄",)),
+        ("亡くなった方の最後のお住まい（市区町村まででも構いません）",
+         ("被相続人最後の住所",)),
+        ("亡くなった方の本籍（分からなければ「不明」で構いません）",
+         ("被相続人本籍",)),
+    ), "記録: 被相続人氏名／被相続人ふりがな／続柄（選択肢へ読み替え・その他は 続柄その他 に"
+       "具体的内容）／被相続人最後の住所／被相続人本籍。続柄から 相続順位 も記録する"
+       "（子→子・配偶者→配偶者・父母や祖父母→直系尊属・兄弟姉妹→兄弟姉妹・"
+       "おいめい→甥姪（代襲）・判断できなければ 不明）"),
+    ("日付について", "日付についてお伺いします。正確でなくても「◯年◯月頃」で構いません。", (
+        ("亡くなった方が亡くなった日", ("死亡日_申告",)),
+        ("あなたが、亡くなったことを知った日", ("死亡を知った日_申告",)),
+        ("あなたが、ご自身は相続人だと知った日", ("相続人と知った日_申告",)),
+        ("亡くなったこと（相続人であること）を知った経緯"
+         "（役所からの通知・債権者からの請求・親族からの連絡など）", ("知った経緯",)),
+    ), "記録: 死亡日_申告／死亡を知った日_申告／相続人と知った日_申告（YYYY-MM-DD が"
+       "確定した場合のみ。曖昧な答えは 日付申告メモ に原文のまま）／知った経緯"),
+    ("借金と財産について", "亡くなった方の借金と財産についてお伺いします。", (
+        ("亡くなった方に借金や未払いはありますか。督促状や裁判所からの書類が"
+         "届いていれば、その内容も教えてください", ("財産_負債", "訴訟督促有無")),
+        ("亡くなった方の不動産以外の財産（預貯金・車・株など）で、分かっている"
+         "ものはありますか（無ければ「なし」で構いません）",
+         ("財産_現金預貯金", "財産_有価証券")),
+        # HOUKI-HEARING-UX-1-fix1: 弁護士確認による文言差し替え（記録先は不変）
+        ("亡くなった方の預貯金を死亡後に出金して使用したり、価値のある財産を"
+         "処分したりしたことはありますか",
+         ("財産処分有無",)),
+    ), "記録: 財産_負債（借金・未払いの概要。無ければ なし）／訴訟督促有無（督促状・"
+       "訴状などが届いていれば あり・無ければ なし・曖昧なら 不明）／債権者名は "
+       "creditor_names／財産_現金預貯金・財産_有価証券（判明した範囲で短く。無ければ "
+       "なし）／財産処分有無（なし/あり/不明）"),
+    ("他の相続人について", "他の相続人についてお伺いします。", (
+        ("あなた以外に相続人にあたる方（亡くなった方の配偶者・お子さん・親・"
+         "兄弟姉妹など）はいらっしゃいますか。いれば続柄と人数を教えてください",
+         ("他の相続人",)),
+        ("その方々と一緒に相続放棄をしたいご希望はありますか", ("同時申述希望",)),
+    ), "記録: 他の相続人（いなければ なし）／同時申述希望（なし/あり）。先順位の方が"
+       "放棄済みと分かれば 先順位相続人の状況・先順位者の放棄状況 にも記録"),
+    ("戸籍について", "戸籍についてお伺いします。", (
+        # HOUKI-HEARING-UX-1-fix1: 弁護士確認による文言差し替え（「職務上請求」の
+        # 語は顧客向け文面から除去）
+        ("亡くなった方の戸籍謄本や住民票（除票）を、すでに取得されていますか。"
+         "それともこれから取得のご予定ですか（お手元になくても、事務所で戸籍"
+         "謄本等の必要書類を取得可能です）", ()),
+    ), "記録欄なし（会話で確認するのみ。回答後は次の通へ進む）"),
+    ("ご依頼者ご自身について", "ご依頼者様ご自身についてお伺いします。", (
+        ("ご依頼者様ご自身のお名前とふりがな", ("顧客名", "furigana")),
+        ("ご依頼者様ご自身のご住所", ("住所",)),
+        ("ご依頼者様ご自身の生年月日", ("生年月日",)),
+        ("ご依頼者様ご自身のお電話番号", ("電話番号",)),
+        ("ご依頼者様ご自身のメールアドレス", ("メールアドレス",)),
+    ), "記録: 顧客名／furigana／住所／生年月日／電話番号／メールアドレス"),
+    ("ご相談の区分について", "最後に確認です。", (
+        ("今回は、ご依頼者様ご本人としてのご依頼でしょうか。それとも、ご親族などの"
+         "代理としてのご相談でしょうか", ("本人区分",)),
+    ), "記録: 本人区分（本人／親族（本人依頼予定）／その他）"),
+)
+
+# 法律質問等への固定の受け流し文（弁護士決定・凍結。法的説明は送らない）
+DEFLECT_REPLY = ("その点は弁護士が確認のうえご案内します。ヒアリング終了後に"
+                 "お伝えできますので、引き続きよろしくお願いいたします。")
+
+# 空応答の判定: 締め・相づちの定型句だけで構成された返信（閉集合）
+HOLLOW_FORMULAS: tuple = (
+    "よろしくお願い致します", "よろしくお願いいたします",
+    "ありがとうございます", "ありがとうございました",
+    "承知いたしました", "承知しました", "かしこまりました", "了解しました",
+    "記録しました", "はい",
+)
+_HOLLOW_STRIP = "。、．，！!？?・…　 \n\t\r"
+_CIRCLED = "①②③④⑤⑥⑦⑧⑨"
+
+
+def is_hollow_reply(text: str) -> bool:
+    """返信が空、または HOLLOW_FORMULAS の定型句と句読点だけなら True。"""
+    t = str(text or "")
+    for phrase in HOLLOW_FORMULAS:
+        t = t.replace(phrase, "")
+    return not t.strip(_HOLLOW_STRIP)
+
+
+def round_body(intro: str, items: tuple) -> str:
+    """定型ブロックの本文（導入文+番号付き項目ラベル）。houki_profile の罫線
+    ブロックはこの本文を罫線と定型末尾で挟むだけ（項目行の逐語は単一の正）。"""
+    return "\n".join([intro] + [f"{_CIRCLED[i]}{label}"
+                                for i, (label, _f) in enumerate(items)])
+
+
+def _asked_and_answered(label: str, history: list | None) -> bool:
+    """HOUKI-HEARING-UX-1-fix2（UX1-01）: 記録欄のない項目の完了判定。
+    「その項目ラベルを逐語で含む assistant 発話（定型ブロック／fallback の
+    再提示。閉集合=HEARING_ROUNDS のラベル）が送信済み、かつ その後に
+    お客様（user）の発話がある」とき True。正本は会話履歴（in-memory と
+    App 28 復元で同じ role/content 文字列の形）＝再起動後も同じ結果。
+    tool の phase/phase_done は使わない（安全側=未実施扱いが優先）。"""
+    asked = False
+    for msg in history or ():
+        content = msg.get("content")
+        if not isinstance(content, str):
+            continue        # tool_use/tool_result 等の block 列は判定に使わない
+        role = msg.get("role")
+        if role == "assistant" and label in content:
+            asked = True
+        elif role == "user" and asked:
+            return True
+    return False
+
+
+def unanswered_items(record: dict | None,
+                     history: list | None = None) -> tuple[int, str, list[str]]:
+    """最初の未完了の通を返す: (通番号 1-7, 見出し, 未回答項目ラベル)。
+    記録欄のある項目=欄の充足（現行どおり）。記録欄のない項目（第 5 通・将来
+    同型の項目も同じ規則）=会話履歴で「提示済み かつ その後にお客様の発話あり」
+    （_asked_and_answered）。全通完了なら (0, "", [])。
+    fallback_reply（再提示）と進行状況の注入（houki_bot.hearing）が共にこの
+    関数を使う（完了判定の二重管理をしない）。"""
+    for i, (title, _intro, items, _note) in enumerate(HEARING_ROUNDS, start=1):
+        missing = [
+            label for label, fields in items
+            if (not any(_v(record or {}, f) for f in fields) if fields
+                else not _asked_and_answered(label, history))]
+        if missing:
+            return i, title, missing
+    return 0, "", []
+
+
+def fallback_reply(record: dict | None, all_done_text: str,
+                   history: list | None = None) -> str:
+    """空応答の差し替え文: 受け流し文+現在の通の未回答項目の再提示（疑問符なし・
+    定型ブロックは再送しない）。全通完了なら all_done_text（確認中定型）。"""
+    n, title, missing = unanswered_items(record, history)
+    if not missing:
+        return all_done_text
+    lines = [f"{_CIRCLED[i]}{label}" for i, label in enumerate(missing)]
+    return (DEFLECT_REPLY + "\n\n改めて、" + title + "、次の点をお伺いします。\n"
+            + "\n".join(lines) + "\n分かる範囲でお答えください。")
+
+
+def progress_note(record: dict | None, history: list | None = None) -> str:
+    """進行状況の注入文（system prompt の末尾に動的付加。凍結 prompt 本文
+    HOUKI_HEARING_PROMPT には含めない）。次に進める通と未回答項目をサーバ
+    判定（unanswered_items）から示し、モデル側の進行判定を同じ正に揃える。"""
+    n, title, missing = unanswered_items(record, history)
+    if not missing:
+        return ("\n\n【進行状況（サーバ判定）】\n全7通の項目が揃っています。"
+                "新たな質問は不要です。")
+    lines = [f"{_CIRCLED[i]}{label}" for i, label in enumerate(missing)]
+    return ("\n\n【進行状況（サーバ判定）】\n次に進める通: 第" + str(n) + "通（"
+            + title + "）。この通の未回答項目:\n" + "\n".join(lines)
+            + "\n上記より先の通には進まないでください。")
+
+
 STATUS_FIELD = "status"
 STATUS_INQUIRY = "問い合わせ"
 STATUS_PHONE_TRIAGE = "電話判断待ち"

@@ -75,9 +75,11 @@ FLAG_ORDER: tuple = (
 STRONG_FLAGS = frozenset({
     FLAG_DEADLINE_NEAR, FLAG_DEADLINE_DOUBT, FLAG_ASSET_CONTACT,
     FLAG_DEATH_3MONTHS, FLAG_DISPUTE, FLAG_MISMATCH})
+# HOUKI-HEARING-UX-1（弁護士決定 C）: #9 未成年・後見関与は判定から外す。
+# App 40 の欄・選択肢（FLAG_ORDER の並び）は残すが、ルール判定・推奨度の算出の
+# いずれにも寄与しない（人が手で立てたフラグも推奨度には影響しない）
 MODERATE_FLAGS = frozenset({
-    FLAG_PRIOR_RENUNCIATION, FLAG_NOT_PRINCIPAL, FLAG_MINOR_GUARDIAN,
-    FLAG_LITIGATION})
+    FLAG_PRIOR_RENUNCIATION, FLAG_NOT_PRINCIPAL, FLAG_LITIGATION})
 
 RECO_STRONG = "強推奨"
 RECO_MODERATE = "推奨"
@@ -166,7 +168,8 @@ def compute_rule_flags(record: dict,
     - #3: 財産処分有無の空欄は「不明」扱いで該当（必須質問文言があるため
       通常は非空。空=未回答も安全側）
     - #8: 本人区分の空欄は「本人と未確認」として該当（安全側）
-    - #9: 「不明」も該当（曖昧・不明は該当フラグの原則）。空欄は非該当
+    - #9: HOUKI-HEARING-UX-1（弁護士決定 C）で判定から撤去。未成年後見関与の
+      値（あり/不明/空）はフラグ・推奨度に一切影響しない
     - #10: 正本の機械的ルールどおり「あり」のみ（不明の解釈は Claude 補助）
     """
     today = today or _today_jst()
@@ -230,11 +233,7 @@ def compute_rule_flags(record: dict,
         flags.add(FLAG_NOT_PRINCIPAL)
         rationale.append(f"依頼者が本人でない: 本人区分={principal or '未回答'}")
 
-    # #9: 未成年・後見関与（不明も該当=安全側）
-    guardian = _v(record, "未成年後見関与")
-    if guardian in ("あり", "不明"):
-        flags.add(FLAG_MINOR_GUARDIAN)
-        rationale.append(f"未成年・後見関与: 未成年後見関与={guardian}")
+    # #9: 未成年・後見関与 — HOUKI-HEARING-UX-1 で判定から撤去（欄の値は読まない）
 
     # #10: 訴訟・督促あり
     if _v(record, "訴訟督促有無") == "あり":

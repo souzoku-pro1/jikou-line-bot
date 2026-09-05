@@ -173,18 +173,40 @@ class TestRule8NotPrincipal(unittest.TestCase):
         self.assertNotIn(tri.FLAG_NOT_PRINCIPAL, _flags(本人区分="本人"))
 
 
-class TestRule9MinorGuardian(unittest.TestCase):
-    def test_ari_fumei_flag(self):
+class TestRule9MinorGuardianRemoved(unittest.TestCase):
+    """HOUKI-HEARING-UX-1（弁護士決定 C）: #9 未成年・後見関与は判定から撤去。
+    旧「あり/不明=該当」の pin は本票の弁護士決定を根拠に「影響なし」の検証へ
+    書き換え（削除ではない）。欄・選択肢は残置。"""
+
+    def test_any_value_no_flag_and_no_rationale(self):
+        for v in ("あり", "不明", "なし", ""):
+            with self.subTest(v=v):
+                flags, rationale = tri.compute_rule_flags(
+                    _rec(**_clean_values(未成年後見関与=v)), today=TODAY)
+                self.assertNotIn(tri.FLAG_MINOR_GUARDIAN, flags)
+                self.assertEqual(flags, set())                 # 他ルール不変
+                self.assertFalse(any("後見" in r for r in rationale))
+
+    def test_recommendation_unaffected(self):
+        # 後見あり/不明のみのケースで推奨度が上がらない（不要寄りのまま）
         for v in ("あり", "不明"):
             with self.subTest(v=v):
-                self.assertIn(tri.FLAG_MINOR_GUARDIAN,
-                              _flags(未成年後見関与=v))
+                flags, _ = tri.compute_rule_flags(
+                    _rec(**_clean_values(未成年後見関与=v)), today=TODAY)
+                self.assertEqual(tri.derive_recommendation(flags), "不要寄り")
+        # 人が手で立てたフラグも推奨度には寄与しない（判定から完全に外す）
+        self.assertEqual(tri.derive_recommendation({tri.FLAG_MINOR_GUARDIAN}),
+                         "不要寄り")
+        self.assertNotIn(tri.FLAG_MINOR_GUARDIAN, tri.MODERATE_FLAGS)
+        self.assertNotIn(tri.FLAG_MINOR_GUARDIAN, tri.STRONG_FLAGS)
+        self.assertNotIn(tri.FLAG_MINOR_GUARDIAN, tri.CLAUDE_ASSISTABLE_FLAGS)
+        # 欄の選択肢（表示順）は残置
+        self.assertIn(tri.FLAG_MINOR_GUARDIAN, tri.FLAG_ORDER)
 
-    def test_nashi_and_empty_no_flag(self):
-        for v in ("なし", ""):
-            with self.subTest(v=v):
-                self.assertNotIn(tri.FLAG_MINOR_GUARDIAN,
-                                 _flags(未成年後見関与=v))
+    def test_other_rules_still_moderate(self):
+        self.assertEqual(tri.MODERATE_FLAGS, frozenset({
+            tri.FLAG_PRIOR_RENUNCIATION, tri.FLAG_NOT_PRINCIPAL,
+            tri.FLAG_LITIGATION}))
 
 
 class TestRule10Litigation(unittest.TestCase):
@@ -663,7 +685,7 @@ class TestHearingTrigger(_HearingBase):
         fire = AsyncMock(return_value=True)
         with patch.object(tri, "run_phone_triage", fire):
             self.run_turn(
-                [_tool_response({"phase": "7_applicant",
+                [_tool_response({"phase": "6_applicant",
                                  "fields": dict(_REQUIRED_FIELDS_INPUT),
                                  "phase_done": True, "hearing_done": True}),
                  _text_response("ありがとうございました。")])

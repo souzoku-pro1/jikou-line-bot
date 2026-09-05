@@ -157,17 +157,46 @@ async def _apply_record_hearing(user_id: str, record: dict | None,
     return result, latest
 
 
+def _resolve_reply(candidates: list[str], record: dict | None,
+                   history: list[dict]) -> str:
+    """HOUKI-HEARING-UX-1（空応答の解消）: 候補文（優先順）のうち最初の
+    「空でない返信」を採用する。全候補が空応答（締め・相づちの定型句のみ・
+    実測 2026-09-04: 法律質問の直後に「よろしくお願い致します。」だけが
+    auto 送信された経路）なら、固定の受け流し文+現在の通の未回答項目の再提示
+    に差し替える（全通完了なら確認中定型）。法的説明は生成しない。
+    UX-1-fix2（UX1-01）: 記録欄のない通（第 5 通）の完了は会話履歴で判定する
+    ため history を渡す（判定は houki_case_store.unanswered_items の単一の正）。"""
+    for text in candidates:
+        if not houki_case_store.is_hollow_reply(text):
+            return text
+    logger.info("[HOUKI_HEARING] hollow reply replaced (deflect+reask)")
+    return houki_case_store.fallback_reply(record, HOUKI_PROFILE.pending_reply,
+                                           history)
+
+
+def _build_system(record: dict | None, history: list[dict]) -> str:
+    """system prompt の組み立て（凍結本文+既知項目注入+進行状況注入）。
+    UX-1-fix2（UX1-01）: 進行状況（次に進める通・未回答項目）をサーバ判定から
+    注入し、モデルの進行（次の通へ進む条件）と空応答時の再提示を同じ完了判定
+    （unanswered_items・記録欄なし通は会話履歴で判定）に揃える。
+    UX-1-fix3（UX1-fix2-01）: tool 適用後は更新後レコードで再構築する（既知項目
+    注入・進行状況の両方が同じレコード+履歴に追随）。"""
+    return (HOUKI_HEARING_PROMPT + _known_items_note(record)
+            + houki_case_store.progress_note(record, history))
+
+
 async def _converse(user_id: str, record: dict | None,
                     history: list[dict]) -> str:
     """Claude と最大 2 往復（tool 実行 1 回まで）して最終返信文を得る。"""
-    system = HOUKI_HEARING_PROMPT + _known_items_note(record)
     messages = list(history)
-    response = await call_hearing_model(system, messages)
+    response = await call_hearing_model(_build_system(record, history),
+                                        messages)
     tool_use = _extract_tool_use(response)
     if tool_use is None:
-        return _extract_text(response)
+        # text 経路: 取得時点の record で判定（挙動不変）
+        return _resolve_reply([_extract_text(response)], record, history)
 
-    tool_result, _latest = await _apply_record_hearing(
+    tool_result, latest = await _apply_record_hearing(
         user_id, record, tool_use.input or {})
     messages = messages + [
         {"role": "assistant", "content": response.content},
@@ -177,11 +206,14 @@ async def _converse(user_id: str, record: dict | None,
             "content": tool_result,
         }]},
     ]
-    followup = await call_hearing_model(system, messages)
-    text = _extract_text(followup)
-    if text:
-        return text
-    return _extract_text(response)
+    # UX-1-fix3: 2 回目の system と空応答 fallback は同じ「更新後レコード
+    # （取得不能なら record）+ history」を unanswered_items へ渡す（二重管理なし）
+    current = latest if latest is not None else record
+    followup = await call_hearing_model(_build_system(current, history),
+                                        messages)
+    # 2 回目の本文を優先し、空応答なら 1 回目の本文、なお空なら差し替え
+    return _resolve_reply([_extract_text(followup), _extract_text(response)],
+                          current, history)
 
 
 async def handle_houki_hearing(reply_token: str, user_id: str,

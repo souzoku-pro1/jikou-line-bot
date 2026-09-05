@@ -47,6 +47,7 @@ fix3（R-SOUZOKU-HOUKI-H3-3・H3-06/H3-07 HIGH）:
 
 import asyncio
 import datetime
+import hashlib
 import os
 import unittest
 from types import SimpleNamespace
@@ -853,7 +854,7 @@ class TestHearingFlow(_HearingBase):
         filled["死亡を知った日_申告"] = "2026-05-01"
         filled["相続人と知った日_申告"] = "2026-05-02"
         _s, _q, _c = self.run_turn(
-            [_tool_response({"phase": "7_applicant", "fields": filled,
+            [_tool_response({"phase": "6_applicant", "fields": filled,
                              "phase_done": True, "hearing_done": True}),
              _text_response("ありがとうございます。弁護士が確認いたします。")])
         rid = list(self.fake.rows)[0]
@@ -946,45 +947,596 @@ class TestHoukiProfileAndPrompt(unittest.TestCase):
                                       route="houki_hearing")
         self.assertTrue(any("根拠のない具体値" in x for x in v))
 
-    def test_prompt_verbatim_items(self):
-        # 質問項目の文言は正本 souzoku-houki/02 §2 の逐語（要語 pin）
+    # HOUKI-HEARING-UX-1: 新正本（7 通構成・弁護士決定 A/B）の凍結 pin。
+    # 旧 1 問ずつ方式の要語 pin は本票の弁護士決定を根拠に書き換え（削除ではなく
+    # 検証内容の置換）。意図的変更時は本 hash を票の根拠つきで更新する
+    # HOUKI-HEARING-UX-1-fix1: 弁護士確認による第 3 通③・第 5 通①の文言差し替え
+    # （旧 1ab7fb0d…→本値）。他の文面は凍結のまま
+    PROMPT_SHA256 = ("12a1a94c85897d8e1ef747d08b673287e242760616643a0ea5b41e57d9465716")
+
+    def test_prompt_frozen_hash(self):
+        self.assertEqual(
+            hashlib.sha256(hp.HOUKI_HEARING_PROMPT.encode("utf-8")).hexdigest(),
+            self.PROMPT_SHA256, "HOUKI_HEARING_PROMPT が改変されている")
+
+    def test_prompt_seven_rounds_and_blocks(self):
+        p = hp.HOUKI_HEARING_PROMPT
+        self.assertEqual(len(store.HEARING_ROUNDS), 7)
+        self.assertEqual(len(hp.HEARING_TEMPLATE_BLOCKS_HOUKI), 7)
+        titles = [r[0] for r in store.HEARING_ROUNDS]
+        self.assertEqual(titles, [
+            "亡くなった方について", "日付について", "借金と財産について",
+            "他の相続人について", "戸籍について", "ご依頼者ご自身について",
+            "ご相談の区分について"])
+        for i in range(1, 8):
+            self.assertIn(f"第{i}通（", p)
+        # 各通 = 番号付き複数項目・1 通 1 テーマ（項目数は凍結どおり）
+        self.assertEqual([len(r[2]) for r in store.HEARING_ROUNDS],
+                         [4, 4, 3, 2, 1, 5, 1])
+        # 定型ブロックは疑問符を含まない（送信ゲートの質問数上限に触れない）
+        for block in hp.HEARING_TEMPLATE_BLOCKS_HOUKI:
+            self.assertNotIn("？", block)
+            self.assertNotIn("?", block)
+            self.assertIn(block, p)
+
+    def test_prompt_who_and_what_explicit(self):
         p = hp.HOUKI_HEARING_PROMPT
         for phrase in (
-            "亡くなった方の氏名・依頼者との続柄",
-            "最後の住所（市区町村まででも可）・本籍（分かれば）",
-            "死亡日（分からなければおおよそ）",
-            "死亡を知った日・自分が相続人だと知った日（別々に質問）",
-            "知った経緯（役所からの通知・債権者からの請求・親族からの連絡 等）",
-            "借金・督促の有無、督促状・訴状が届いているか",
-            "依頼者は配偶者・子・親・兄弟姉妹のどれか",
-            "先順位者（子・親）の有無と、その人達が放棄したか",
-            "同順位の相続人（兄弟等）の人数・一緒に放棄したい人がいるか",
-            "依頼者本人が相続人か（親族代理の相談か）",
-            "未成年・成年後見の関与有無",
-            "手元にある戸籍・住民票の有無（自分で取った/これから）",
-            "事務所で職務上請求により取得可能",
-            # 財産処分の中立質問（民法921条直結・プロンプト固定文言）
-            "使ったり、処分したり、解約したり、そこから何かのお支払いをされた"
-            "ものはありますか。",
+            "亡くなった方のお名前とふりがな",
+            "亡くなった方とあなたとのご関係",
+            "亡くなった方の最後のお住まい",
+            "亡くなった方の本籍",
+            "亡くなった方が亡くなった日",
+            "あなたが、亡くなったことを知った日",
+            "あなたが、ご自身は相続人だと知った日",
+            "知った経緯",
+            "亡くなった方に借金や未払いはありますか",
+            "亡くなった方の不動産以外の財産",
+            # 財産処分の中立質問（民法921条直結・逐語維持。UX-1-fix1 で弁護士確認の
+            # 文言へ差し替え・記録先 財産処分有無 は不変）
+            "③亡くなった方の預貯金を死亡後に出金して使用したり、価値のある財産を"
+            "処分したりしたことはありますか",
+            "あなた以外に相続人にあたる方",
+            "一緒に相続放棄をしたいご希望",
+            # 戸籍（UX-1-fix1: 「職務上請求」の語を顧客向け文面から除去）
+            "①亡くなった方の戸籍謄本や住民票（除票）を、すでに取得されていますか。"
+            "それともこれから取得のご予定ですか（お手元になくても、事務所で戸籍謄本等の"
+            "必要書類を取得可能です）",
+            "ご依頼者様ご自身のお名前とふりがな",
+            "ご依頼者様ご自身のご住所",
+            "ご依頼者様ご自身の生年月日",
+            "ご依頼者様ご自身のお電話番号",
+            "ご依頼者様ご自身のメールアドレス",
+            "ご依頼者様ご本人としてのご依頼でしょうか",
+            "代理としてのご相談でしょうか",
+            # 部分回答時の規則・既知項目との整合
+            "答えてもらえた項目だけを record_hearing で記録し、抜けた項目だけを短く聞き直す",
+            "収集済み項目（既知）がある通は、その項目を除いた残りだけを聞く",
+            # 受け流し文（凍結）と締め文のみの禁止
+            store.DEFLECT_REPLY,
+            "締めの言葉（「よろしくお願い致します。」等）だけの返信は禁止",
+            # 既存禁止事項の維持
             "YYYY-MM頃",
             "日付の確定は弁護士が行う",
             "熟慮期間の残日数・間に合うかどうかにも言及しない",
+            "記録にない事実・日付・金額の創作は禁止",
         ):
             with self.subTest(phrase=phrase[:20]):
                 self.assertIn(phrase, p)
         # 文体（無内容見本・両業務共通の正）を収載
         self.assertIn(cr.HEARING_STYLE_SECTION_BASE, p)
-        self.assertEqual(hp.HEARING_TEMPLATE_BLOCKS_HOUKI, ())
+
+    def test_prompt_ux1_fix1_wording_replaced(self):
+        # HOUKI-HEARING-UX-1-fix1（弁護士決定）: 第 3 通③・第 5 通①の旧文言は不在、
+        # 「職務上請求」の語はプロンプト全体（定型ブロック・記録メモ・規則）に不在。
+        # 記録先（財産処分有無）と判定への接続は不変
+        p = hp.HOUKI_HEARING_PROMPT
+        for old in (
+            "亡くなった方の財産（預貯金・不動産・車など）について",
+            "そこから何かのお支払いをされたものはありますか",
+            "事務所で職務上請求により取得可能",
+            "職務上請求",
+        ):
+            with self.subTest(old=old):
+                self.assertNotIn(old, p)
+        for block in hp.HEARING_TEMPLATE_BLOCKS_HOUKI:
+            self.assertNotIn("職務上請求", block)
+        round3 = store.HEARING_ROUNDS[2]
+        self.assertEqual(round3[0], "借金と財産について")
+        self.assertEqual(round3[2][2], (
+            "亡くなった方の預貯金を死亡後に出金して使用したり、価値のある財産を"
+            "処分したりしたことはありますか", ("財産処分有無",)))
+        round5 = store.HEARING_ROUNDS[4]
+        self.assertEqual(round5[0], "戸籍について")
+        self.assertEqual(round5[2][0], (
+            "亡くなった方の戸籍謄本や住民票（除票）を、すでに取得されていますか。"
+            "それともこれから取得のご予定ですか（お手元になくても、事務所で戸籍謄本等の"
+            "必要書類を取得可能です）", ()))
+
+    def test_prompt_minor_guardian_removed(self):
+        # 弁護士決定 B: 未成年のお子様・後見人の質問を全て撤去（文字列レベル）
+        p = hp.HOUKI_HEARING_PROMPT
+        self.assertNotIn("未成年", p)
+        self.assertNotIn("後見", p)
+        self.assertNotIn("質問は一度に1つ", p)          # 旧 1 問ずつ方式の撤去
+        desc = hp.RECORD_HEARING_TOOL["input_schema"]["properties"]["fields"][
+            "description"]
+        self.assertNotIn("未成年後見関与", desc)
+        self.assertEqual(hp.NOT_ASKED_FIELDS, frozenset({"未成年後見関与"}))
+        # 欄自体は残置（書かれない）
+        self.assertIn("未成年後見関与", store.HEARING_WRITABLE_FIELDS)
+        self.assertIn("未成年後見関与", store.HEARING_CHOICE_FIELDS)
+        # hearing_done の必須条件に含まれない（実測・変更なし）
+        self.assertNotIn("未成年後見関与", store.HEARING_REQUIRED_FIELDS)
 
     def test_record_hearing_tool_schema(self):
         tool = hp.RECORD_HEARING_TOOL
         self.assertEqual(tool["name"], "record_hearing")
         self.assertEqual(
             tool["input_schema"]["properties"]["phase"]["enum"],
-            ["1_deceased", "2_dates", "3_debts", "4_assets",
-             "5_others", "6_koseki", "7_applicant"])
+            ["1_deceased", "2_dates", "3_debts_assets", "4_other_heirs",
+             "5_koseki", "6_applicant", "7_principal"])
         self.assertEqual(sorted(tool["input_schema"]["required"]),
                          ["fields", "hearing_done", "phase", "phase_done"])
+
+
+class TestHollowReplyFallback(_HearingBase):
+    """HOUKI-HEARING-UX-1（空応答の解消）: 実測（2026-09-04 App 28）で法律質問の
+    直後に「よろしくお願い致します。」だけが auto=yes で送られた経路（App 29 の
+    降格 0 件=ゲートは通過・モデル本文が締め文のみ）を、固定の受け流し文+
+    現在の通の未回答項目の再提示に差し替える。"""
+
+    def test_is_hollow_reply_closed_set(self):
+        for t in ("よろしくお願い致します。", "", "  ", "ありがとうございます。",
+                  "承知しました。よろしくお願いいたします。", "記録しました。",
+                  "はい。ありがとうございました。"):
+            with self.subTest(t=t):
+                self.assertTrue(store.is_hollow_reply(t))
+        for t in ("亡くなった方のお名前を教えてください。",
+                  "よろしくお願い致します。次に日付を伺います。",
+                  store.DEFLECT_REPLY):
+            with self.subTest(t=t):
+                self.assertFalse(store.is_hollow_reply(t))
+
+    def test_unanswered_items_and_fallback_text(self):
+        n, title, missing = store.unanswered_items(None)
+        self.assertEqual((n, title, len(missing)), (1, "亡くなった方について", 4))
+        rec = {"被相続人氏名": {"value": "山田"}, "続柄": {"value": "子"}}
+        n, _t, missing = store.unanswered_items(rec)
+        self.assertEqual(n, 1)
+        self.assertEqual(len(missing), 2)                 # 住所・本籍のみ再提示
+        text = store.fallback_reply(rec, "PENDING")
+        self.assertTrue(text.startswith(store.DEFLECT_REPLY))
+        self.assertIn("①亡くなった方の最後のお住まい", text)
+        self.assertIn("②亡くなった方の本籍", text)
+        self.assertNotIn("お名前", text)
+        self.assertNotIn("？", text)                      # 質問数上限に触れない
+        # UX-1-fix2（UX1-01）: 旧 pin「第 5 通（記録欄なし）は判定対象外=第 4 通
+        # 完了なら第 6 通へ」は凍結構造（7 通・第 5 通は会話で確認）と矛盾する
+        # ため訂正。記録欄のない項目は会話履歴（提示済み かつ その後に user 発話）
+        # で完了判定する。履歴なし=未実施（安全側）
+        full = {c: {"value": "x"} for c in (
+            "被相続人氏名", "続柄", "被相続人最後の住所", "被相続人本籍",
+            "死亡日_申告", "死亡を知った日_申告", "相続人と知った日_申告",
+            "知った経緯", "財産_負債", "財産_現金預貯金", "財産処分有無",
+            "他の相続人", "同時申述希望")}
+        label5 = store.HEARING_ROUNDS[4][2][0][0]
+        self.assertEqual(store.unanswered_items(full),
+                         (5, "戸籍について", [label5]))
+        self.assertEqual(store.unanswered_items(full, []),
+                         (5, "戸籍について", [label5]))
+        block5 = hp.HEARING_TEMPLATE_BLOCKS_HOUKI[4]
+        # 提示のみ（その後の user 発話なし）=未完了
+        self.assertEqual(store.unanswered_items(
+            full, [{"role": "assistant", "content": block5}])[0], 5)
+        # user 発話が提示より前にしかない=未完了
+        self.assertEqual(store.unanswered_items(
+            full, [{"role": "user", "content": "はい"},
+                   {"role": "assistant", "content": block5}])[0], 5)
+        # 提示 → user 発話（定型ブロック）=完了 → 第 6 通
+        asked = [{"role": "assistant", "content": "ありがとうございます。\n" + block5},
+                 {"role": "user", "content": "まだ取っていません"}]
+        self.assertEqual(store.unanswered_items(full, asked)[0], 6)
+        # fallback の再提示形（①ラベル）でも同じ逐語で検知
+        reask = [{"role": "assistant",
+                  "content": store.fallback_reply(full, "PENDING")},
+                 {"role": "user", "content": "取得済みです"}]
+        self.assertEqual(store.unanswered_items(full, reask)[0], 6)
+        # 文字列でない content（tool block 列）は判定に使わない
+        self.assertEqual(store.unanswered_items(
+            full, [{"role": "assistant", "content": [{"type": "text",
+                                                      "text": block5}]},
+                   {"role": "user", "content": "はい"}])[0], 5)
+        full.update({c: {"value": "x"} for c in (
+            "顧客名", "住所", "生年月日", "電話番号", "メールアドレス", "本人区分")})
+        self.assertEqual(store.unanswered_items(full), (5, "戸籍について", [label5]))
+        self.assertEqual(store.unanswered_items(full, asked), (0, "", []))
+        self.assertEqual(store.fallback_reply(full, "PENDING", asked), "PENDING")
+        # 定型ブロック本文は round_body が単一の正（罫線ブロック=本文+定型末尾）
+        intro, items = store.HEARING_ROUNDS[4][1], store.HEARING_ROUNDS[4][2]
+        self.assertIn(store.round_body(intro, items), block5)
+
+    def test_deflect_reply_frozen(self):
+        self.assertEqual(
+            store.DEFLECT_REPLY,
+            "その点は弁護士が確認のうえご案内します。ヒアリング終了後にお伝え"
+            "できますので、引き続きよろしくお願いいたします。")
+
+    def test_closing_only_text_reply_replaced(self):
+        # モデルが締め文だけを返した → 受け流し文+第1通の再提示が送られる
+        send, queue, _c = self.run_turn(
+            [_text_response("よろしくお願い致します。")],
+            text="息子も相続放棄必要ですか？")
+        send.assert_awaited_once()
+        sent = send.await_args.args[3]
+        self.assertNotEqual(sent, "よろしくお願い致します。")
+        self.assertTrue(sent.startswith(store.DEFLECT_REPLY))
+        self.assertIn("①亡くなった方のお名前とふりがな", sent)
+        queue.assert_not_awaited()                       # ゲート通過（降格なし）
+        self.assertNotEqual(sent, hp.HOUKI_PROFILE.pending_reply)
+
+    def test_tool_path_hollow_followup_uses_first_text(self):
+        send, queue, _c = self.run_turn(
+            [_tool_response({"phase": "1_deceased",
+                             "fields": {"被相続人氏名": "山田花子"},
+                             "phase_done": False, "hearing_done": False},
+                            text=store.DEFLECT_REPLY),
+             _text_response("よろしくお願い致します。")],
+            text="母が亡くなりました。手続きは必要ですか？")
+        self.assertEqual(send.await_args.args[3], store.DEFLECT_REPLY)
+        queue.assert_not_awaited()
+
+    def test_tool_path_both_hollow_reasks_current_round(self):
+        send, queue, _c = self.run_turn(
+            [_tool_response({"phase": "1_deceased",
+                             "fields": {"被相続人氏名": "山田花子",
+                                        "続柄": "子"},
+                             "phase_done": False, "hearing_done": False}),
+             _text_response("")],
+            text="母の山田花子です")
+        sent = send.await_args.args[3]
+        self.assertTrue(sent.startswith(store.DEFLECT_REPLY))
+        # 記録済み（氏名・続柄）は再提示せず、残り 2 項目だけ
+        self.assertNotIn("お名前", sent)
+        self.assertIn("①亡くなった方の最後のお住まい", sent)
+        self.assertIn("②亡くなった方の本籍", sent)
+        queue.assert_not_awaited()
+
+    _ALL_FILLED = {
+        "続柄": "子", "相続順位": "子",
+        "死亡日_申告": "2026-05-01", "死亡を知った日_申告": "2026-05-01",
+        "相続人と知った日_申告": "2026-05-02",
+        "被相続人最後の住所": "川口市", "被相続人本籍": "不明",
+        "知った経緯": "役所", "財産_負債": "なし",
+        "財産_現金預貯金": "なし", "財産処分有無": "なし",
+        "他の相続人": "なし", "同時申述希望": "なし",
+        "メールアドレス": "a@example.com", "本人区分": "本人"}
+
+    def _all_filled(self):
+        filled = {c: "x" for c in store.HEARING_REQUIRED_FIELDS}
+        filled.update(self._ALL_FILLED)
+        return filled
+
+    def test_all_rounds_done_hollow_uses_pending_text(self):
+        # UX-1-fix2（UX1-01）訂正: 「全欄充足=全通完了」は第 5 通（記録欄なし）を
+        # 飛ばす前提だったため、第 5 通ブロック送信済み+その後の user 発話を履歴に
+        # 置いた状態で確認中定型になることを pin（履歴なしの形は次のテスト）
+        hearing.conversation_histories[self.uid] = [
+            {"role": "assistant", "content": hp.HEARING_TEMPLATE_BLOCKS_HOUKI[4]},
+            {"role": "user", "content": "まだ取っていません"},
+            {"role": "assistant", "content": hp.HEARING_TEMPLATE_BLOCKS_HOUKI[5]},
+        ]
+        send, _q, _c = self.run_turn(
+            [_tool_response({"phase": "7_principal", "fields": self._all_filled(),
+                             "phase_done": True, "hearing_done": True}),
+             _text_response("ありがとうございました。")],
+            text="山田太郎です")
+        self.assertEqual(send.await_args.args[3], hp.HOUKI_PROFILE.pending_reply)
+
+    def test_all_fields_filled_but_koseki_unasked_reasks_round5(self):
+        # 全欄充足でも第 5 通が未実施（履歴に提示なし）なら確認中定型ではなく
+        # 第 5 通を再提示（安全側=未実施扱いが優先・tool の phase_done/hearing_done
+        # では完了にしない）
+        send, _q, _c = self.run_turn(
+            [_tool_response({"phase": "7_principal", "fields": self._all_filled(),
+                             "phase_done": True, "hearing_done": True}),
+             _text_response("ありがとうございました。")],
+            text="山田太郎です")
+        sent = send.await_args.args[3]
+        self.assertNotEqual(sent, hp.HOUKI_PROFILE.pending_reply)
+        self.assertTrue(sent.startswith(store.DEFLECT_REPLY))
+        self.assertIn("戸籍について", sent)
+        self.assertIn("①" + store.HEARING_ROUNDS[4][2][0][0], sent)
+
+    def test_legal_explanation_still_demoted(self):
+        # 法的説明（根拠のない具体値）を含む返信は従来どおり承認降格=送らない
+        send, queue, _c = self.run_turn(
+            [_text_response("熟慮期間は3ヶ月ですが、5年程度は問題ありません。")])
+        self.assertEqual(send.await_args.args[3], hp.HOUKI_PROFILE.pending_reply)
+        queue.assert_awaited_once()
+
+    def test_template_block_exempt_from_gate(self):
+        block = hp.HEARING_TEMPLATE_BLOCKS_HOUKI[0]
+        reply = "ありがとうございます。\n" + block
+        send, queue, _c = self.run_turn([_text_response(reply)])
+        self.assertEqual(send.await_args.args[3], reply)
+        queue.assert_not_awaited()
+        # ブロック 2 回はブロック分が自由文扱い（既存の免除規約: 各 1 回）
+        v = hearing.reply_sanitizer.structure_violations(
+            block + "\n" + block, exempt_blocks=hp.HEARING_TEMPLATE_BLOCKS_HOUKI)
+        self.assertTrue(v or len(block) <= 300)
+
+
+class TestKosekiRoundCompletion(_HearingBase):
+    """HOUKI-HEARING-UX-1-fix2（R-HOUKI-HEARING-UX-1 UX1-01・HIGH）: 記録欄の
+    ない第 5 通（戸籍）は「ブロック提示済み かつ その後にお客様の発話あり」を
+    会話履歴（in-memory と App 28 復元で同じ形）で判定する。第 1〜4 通の欄が
+    充足しても第 5 通を実施していなければ第 6 通へ進まない。tool の phase／
+    phase_done は完了判定を上書きしない。"""
+
+    ROUNDS_1_4 = {
+        "被相続人氏名": "山田花子", "続柄": "子",
+        "被相続人最後の住所": "川口市", "被相続人本籍": "不明",
+        "死亡日_申告": "2026-05-01", "死亡を知った日_申告": "2026-05-01",
+        "相続人と知った日_申告": "2026-05-02", "知った経緯": "役所からの通知",
+        "財産_負債": "なし", "財産_現金預貯金": "なし", "財産処分有無": "なし",
+        "他の相続人": "なし", "同時申述希望": "なし"}
+
+    def setUp(self):
+        super().setUp()
+        _run(store.upsert_case_fields(self.uid, dict(self.ROUNDS_1_4), None))
+        self.block5 = hp.HEARING_TEMPLATE_BLOCKS_HOUKI[4]
+        self.label5 = store.HEARING_ROUNDS[4][2][0][0]
+        self.label6_first = store.HEARING_ROUNDS[5][2][0][0]
+
+    def run_turn_ex(self, responses, text, restored=None):
+        """run_turn と同型だが App 28 復元履歴（restored）を差し込み model も返す。"""
+        send, queue = AsyncMock(), AsyncMock(return_value="q-1")
+        model = AsyncMock(side_effect=list(responses))
+        with patch.object(hearing, "call_hearing_model", model), \
+             patch.object(hearing, "reply_with_push_fallback", send), \
+             patch.object(hearing, "save_to_approval_queue", queue), \
+             patch.object(hearing, "save_to_chatlog", AsyncMock()), \
+             patch.object(hearing, "get_recent_chat_history",
+                          AsyncMock(return_value=list(restored or []))), \
+             patch.object(hearing, "is_suppressed",
+                          AsyncMock(return_value=False)), \
+             patch.object(hearing, "autoreply_paused", lambda: False):
+            _run(hearing.handle_houki_hearing("rtok", self.uid, text))
+        return send, queue, model
+
+    def _assert_round5_reask(self, sent):
+        self.assertTrue(sent.startswith(store.DEFLECT_REPLY))
+        self.assertIn("改めて、戸籍について", sent)
+        self.assertIn("①" + self.label5, sent)
+        self.assertNotIn(self.label6_first, sent)
+        self.assertNotEqual(sent, hp.HOUKI_PROFILE.pending_reply)
+
+    def _assert_round6(self, sent):
+        self.assertTrue(sent.startswith(store.DEFLECT_REPLY))
+        self.assertIn("改めて、ご依頼者ご自身について", sent)
+        self.assertIn("①" + self.label6_first, sent)
+        self.assertNotIn(self.label5, sent)
+
+    # Codex 指定 4 形 ─────────────────────────────────────────────────────
+    def test_rounds_1_4_filled_round5_unasked_hollow_reasks_round5(self):
+        # 第 1〜4 通充足・第 5 通未実施・空応答 → 第 5 通を再提示（第 6 通に進まない）
+        send, queue, _m = self.run_turn_ex(
+            [_text_response("よろしくお願い致します。")], text="相続放棄は必要ですか？")
+        self._assert_round5_reask(send.await_args.args[3])
+        queue.assert_not_awaited()
+
+    def test_phase_5_koseki_phase_done_false_both_hollow_reasks_round5(self):
+        # phase=5_koseki・phase_done=False・両本文が空応答 → 第 5 通を再提示
+        send, _q, _m = self.run_turn_ex(
+            [_tool_response({"phase": "5_koseki", "fields": {},
+                             "phase_done": False, "hearing_done": False}),
+             _text_response("承知いたしました。")],
+            text="他の相続人はいません")
+        self._assert_round5_reask(send.await_args.args[3])
+
+    def test_round5_block_sent_and_user_replied_advances_to_round6(self):
+        # 第 5 通ブロック送信済み+その後にお客様発話あり → 第 6 通（fallback も第 6 通）
+        hearing.conversation_histories[self.uid] = [
+            {"role": "user", "content": "兄弟はいません"},
+            {"role": "assistant", "content": "ありがとうございます。\n" + self.block5},
+        ]
+        send, _q, _m = self.run_turn_ex(
+            [_text_response("よろしくお願い致します。")], text="まだ取っていません")
+        self._assert_round6(send.await_args.args[3])
+
+    def test_history_restored_from_app28_not_misjudged(self):
+        # 履歴復元後（in-memory 空・App 28 から再構成）でも第 5 通の実施有無を誤認しない
+        self.assertNotIn(self.uid, hearing.conversation_histories)
+        # (a) 復元履歴に第 5 通の提示なし → 未実施=第 5 通を再提示
+        send, _q, _m = self.run_turn_ex(
+            [_text_response("よろしくお願い致します。")], text="費用はいくらですか",
+            restored=[{"role": "user", "content": "兄弟はいません"},
+                      {"role": "assistant", "content": "ありがとうございます。"}])
+        self._assert_round5_reask(send.await_args.args[3])
+        # (b) 「再起動」: in-memory を消し、復元履歴に提示+その後の user 発話あり
+        #     → 実施済み=第 6 通
+        hearing.conversation_histories.pop(self.uid, None)
+        send, _q, _m = self.run_turn_ex(
+            [_text_response("よろしくお願い致します。")], text="費用はいくらですか",
+            restored=[{"role": "assistant", "content": self.block5},
+                      {"role": "user", "content": "取得済みです"},
+                      {"role": "assistant", "content": "ありがとうございます。"}])
+        self._assert_round6(send.await_args.args[3])
+
+    # 補助 ────────────────────────────────────────────────────────────────
+    def test_tool_phase_done_true_does_not_override_history(self):
+        # 修正水準 3: tool の phase=5_koseki・phase_done=True でも履歴に提示が
+        # なければ完了にしない（安全側=未実施扱いが優先）
+        send, _q, _m = self.run_turn_ex(
+            [_tool_response({"phase": "5_koseki", "fields": {},
+                             "phase_done": True, "hearing_done": False}),
+             _text_response("")],
+            text="他の相続人はいません")
+        self._assert_round5_reask(send.await_args.args[3])
+
+    def test_round5_ask_in_same_turn_not_yet_complete(self):
+        # 提示済みでも、その後の user 発話がまだ無い（提示が最後）=未完了。
+        # 次ターンの user 発話（現在の受信）が続けば完了
+        hearing.conversation_histories[self.uid] = [
+            {"role": "user", "content": "兄弟はいません"}]
+        self.assertEqual(store.unanswered_items(
+            _run(store.fetch_case(self.uid)),
+            hearing.conversation_histories[self.uid]
+            + [{"role": "assistant", "content": self.block5}])[0], 5)
+
+    def test_progress_note_shares_same_judgement(self):
+        # 修正水準 2: モデルへ注入する進行状況（次に進める通）と fallback が同じ
+        # 判定（unanswered_items）を使う。凍結 prompt 本文は不変（hash pin 別）
+        _s, _q, model = self.run_turn_ex(
+            [_text_response("ありがとうございます。\n" + self.block5)],
+            text="兄弟はいません")
+        system = model.await_args_list[0].args[0]
+        self.assertTrue(system.startswith(hp.HOUKI_HEARING_PROMPT))
+        self.assertIn("【進行状況（サーバ判定）】\n次に進める通: 第5通（戸籍について）",
+                      system)
+        self.assertIn("①" + self.label5, system)
+        # ブロック送信後にお客様が答えた次ターンは第 6 通
+        _s, _q, model = self.run_turn_ex(
+            [_text_response("ありがとうございます。\n"
+                            + hp.HEARING_TEMPLATE_BLOCKS_HOUKI[5])],
+            text="取得済みです")
+        system = model.await_args_list[0].args[0]
+        self.assertIn("次に進める通: 第6通（ご依頼者ご自身について）", system)
+        self.assertNotIn("第5通（戸籍について）", system.split("【進行状況")[1])
+
+
+class TestSecondCallSystemRefresh(_HearingBase):
+    """HOUKI-HEARING-UX-1-fix3（R-HOUKI-HEARING-UX-1-fix2 UX1-fix2-01・HIGH）:
+    tool 書込み後の 2 回目モデル呼出しは、更新後レコード（latest）+同じ履歴で
+    system（既知項目注入+進行状況）を再構築して受け取る。2 回目 system と空応答
+    fallback は同じ unanswered_items(latest, history) を参照する。"""
+
+    def run_turn_ex(self, responses, text, restored=None):
+        send, queue = AsyncMock(), AsyncMock(return_value="q-1")
+        model = AsyncMock(side_effect=list(responses))
+        with patch.object(hearing, "call_hearing_model", model), \
+             patch.object(hearing, "reply_with_push_fallback", send), \
+             patch.object(hearing, "save_to_approval_queue", queue), \
+             patch.object(hearing, "save_to_chatlog", AsyncMock()), \
+             patch.object(hearing, "get_recent_chat_history",
+                          AsyncMock(return_value=list(restored or []))), \
+             patch.object(hearing, "is_suppressed",
+                          AsyncMock(return_value=False)), \
+             patch.object(hearing, "autoreply_paused", lambda: False):
+            _run(hearing.handle_houki_hearing("rtok", self.uid, text))
+        return send, queue, model
+
+    @staticmethod
+    def _progress(system: str) -> str:
+        return system.split("【進行状況（サーバ判定）】", 1)[1]
+
+    def _seed_round1_partial(self):
+        _run(store.upsert_case_fields(
+            self.uid, {"被相続人氏名": "山田花子", "続柄": "子"}, None))
+
+    _ROUND1_REST = {"phase": "1_deceased",
+                    "fields": {"被相続人最後の住所": "川口市",
+                               "被相続人本籍": "不明"},
+                    "phase_done": True, "hearing_done": False}
+
+    # Codex 指定 4 形 ─────────────────────────────────────────────────────
+    def test_second_system_shows_round2_after_round1_saved(self):
+        # 第 1 通の残項目（住所・本籍）を tool で保存した後、2 回目 system の
+        # 進行状況が第 2 通を示す（既知項目注入も更新後レコードへ追随）
+        self._seed_round1_partial()
+        _s, _q, model = self.run_turn_ex(
+            [_tool_response(dict(self._ROUND1_REST)),
+             _text_response("ありがとうございます。\n"
+                            + hp.HEARING_TEMPLATE_BLOCKS_HOUKI[1])],
+            text="川口市です。本籍は分かりません")
+        self.assertEqual(model.await_count, 2)
+        second = model.await_args_list[1].args[0]
+        self.assertTrue(second.startswith(hp.HOUKI_HEARING_PROMPT))
+        self.assertIn("次に進める通: 第2通（日付について）", self._progress(second))
+        self.assertIn("- 被相続人最後の住所: 川口市", second)
+        self.assertIn("- 被相続人本籍: 不明", second)
+
+    def test_system_progress_updates_between_first_and_second_call(self):
+        # tool 適用前（1 回目）と適用後（2 回目）で「次に進める通」が更新される
+        self._seed_round1_partial()
+        _s, _q, model = self.run_turn_ex(
+            [_tool_response(dict(self._ROUND1_REST)),
+             _text_response("ありがとうございます。\n"
+                            + hp.HEARING_TEMPLATE_BLOCKS_HOUKI[1])],
+            text="川口市です。本籍は分かりません")
+        first = model.await_args_list[0].args[0]
+        second = model.await_args_list[1].args[0]
+        self.assertIn("次に進める通: 第1通（亡くなった方について）",
+                      self._progress(first))
+        self.assertIn("①亡くなった方の最後のお住まい", self._progress(first))
+        self.assertNotIn("被相続人最後の住所: 川口市", first)
+        self.assertIn("次に進める通: 第2通（日付について）", self._progress(second))
+        self.assertNotIn("第1通（", self._progress(second))
+        self.assertNotEqual(first, second)
+        # 履歴（messages）は同じ会話+tool 往復のみ（system 以外は従来どおり）
+        self.assertEqual(model.await_args_list[1].args[1][-1]["role"], "user")
+
+    def test_second_model_and_fallback_share_updated_judgement(self):
+        # 2 回目本文が空 → fallback が第 2 通を再提示・2 回目 system も第 2 通
+        self._seed_round1_partial()
+        send, queue, model = self.run_turn_ex(
+            [_tool_response(dict(self._ROUND1_REST)), _text_response("")],
+            text="川口市です。本籍は分かりません")
+        second = model.await_args_list[1].args[0]
+        self.assertIn("次に進める通: 第2通（日付について）", self._progress(second))
+        sent = send.await_args.args[3]
+        self.assertTrue(sent.startswith(store.DEFLECT_REPLY))
+        self.assertIn("改めて、日付について", sent)
+        self.assertIn("①亡くなった方が亡くなった日", sent)
+        self.assertNotIn("お住まい", sent)          # 保存済み項目は再提示しない
+        queue.assert_not_awaited()
+
+    def test_phase5_tool_path_uses_history_in_second_system_and_fallback(self):
+        # phase=5_koseki の tool 経路: 履歴上未実施なら第 5 通・提示後の user 回答が
+        # あれば第 6 通（2 回目 system・fallback とも）
+        _run(store.upsert_case_fields(
+            self.uid, dict(TestKosekiRoundCompletion.ROUNDS_1_4), None))
+        block5 = hp.HEARING_TEMPLATE_BLOCKS_HOUKI[4]
+        label5 = store.HEARING_ROUNDS[4][2][0][0]
+        label6 = store.HEARING_ROUNDS[5][2][0][0]
+        tool = {"phase": "5_koseki", "fields": {},
+                "phase_done": True, "hearing_done": False}
+        # (a) 未実施
+        send, _q, model = self.run_turn_ex(
+            [_tool_response(dict(tool)), _text_response("承知いたしました。")],
+            text="他の相続人はいません")
+        second = self._progress(model.await_args_list[1].args[0])
+        self.assertIn("次に進める通: 第5通（戸籍について）", second)
+        self.assertIn("①" + label5, second)
+        sent = send.await_args.args[3]
+        self.assertIn("改めて、戸籍について", sent)
+        self.assertIn("①" + label5, sent)
+        # (b) 「再起動」後に App 28 復元履歴で提示+user 回答あり
+        hearing.conversation_histories.pop(self.uid, None)
+        send, _q, model = self.run_turn_ex(
+            [_tool_response(dict(tool)), _text_response("")],
+            text="取得済みです",
+            restored=[{"role": "assistant", "content": block5},
+                      {"role": "user", "content": "まだ取っていません"},
+                      {"role": "assistant", "content": "ありがとうございます。"}])
+        second = self._progress(model.await_args_list[1].args[0])
+        self.assertIn("次に進める通: 第6通（ご依頼者ご自身について）", second)
+        self.assertNotIn(label5, second)
+        sent = send.await_args.args[3]
+        self.assertIn("改めて、ご依頼者ご自身について", sent)
+        self.assertIn("①" + label6, sent)
+        self.assertNotIn(label5, sent)
+
+    def test_text_path_unchanged_single_system(self):
+        # 修正水準 3: tool 呼出しなしの text 経路は 1 回呼出し・取得時点の record
+        self._seed_round1_partial()
+        send, _q, model = self.run_turn_ex(
+            [_text_response("よろしくお願い致します。")], text="費用は？")
+        self.assertEqual(model.await_count, 1)
+        self.assertIn("次に進める通: 第1通（亡くなった方について）",
+                      self._progress(model.await_args_list[0].args[0]))
+        self.assertIn("①亡くなった方の最後のお住まい", send.await_args.args[3])
 
 
 class TestChoiceFieldGuardFlow(_HearingBase):
@@ -1044,7 +1596,7 @@ class TestChoiceFieldGuardFlow(_HearingBase):
 
     def test_shokugyou_dropped_others_written_no_crash(self):
         send, _q, _c, model = self.run_turn_with_model(
-            [_tool_response({"phase": "7_applicant",
+            [_tool_response({"phase": "6_applicant",
                              "fields": {"顧客名": "山田花子",
                                         "職業": "会社員"},
                              "phase_done": False, "hearing_done": False}),
