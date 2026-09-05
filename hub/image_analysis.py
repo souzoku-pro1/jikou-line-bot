@@ -509,6 +509,8 @@ def _log_result(outcome: str) -> None:
         logger.warning("[IMAGE_ANALYSIS] recheck_failed (no send, no marker)")
     elif outcome == "date_inconsistent":
         logger.info("[IMAGE_ANALYSIS] date_inconsistent (death date not stored)")
+    elif outcome == "date_preempted":
+        logger.info("[IMAGE_ANALYSIS] date_preempted (existing value kept)")
     elif outcome == "send_failed":
         logger.error("[IMAGE_ANALYSIS] send failed (no marker)")
     elif outcome == "sent":
@@ -969,8 +971,16 @@ async def _houki_store_death_date(record_id: str, latest: dict, iso: str) -> str
     validate_hearing_dates〔死亡日_申告 ≤ 死亡を知った日_申告 ≤ 相続人と知った日_申告・
     未来日・形式〕→ upsert_case_fields〔空でない現値は上書きしない〕→ 409 は
     再取得・再検証・再試行 ≤ _CAS_RETRIES）を経由する。独自の CAS 直書きはしない。
-    noop=非空／date_inconsistent=矛盾（write 0・既存欄不変・通知なし）／
-    stored／failed（KintoneError）。"""
+
+    fix2（HI2F1-01）: apply の戻り値は write の成否を含まないため、呼び出し後に
+    App 40 を record_id で再取得し 死亡日_申告 の実値で判定する:
+      実値 == 書こうとした値 → stored（自分が書いた／競合相手が先に同値を保存=noop 収束）
+      実値が空             → failed（CAS 再試行超過・write 0）→ 転記失敗通知
+      実値が別の非空値     → skipped（競合相手が先に別値を保存・既存値を尊重・
+                              ログ分類 date_preempted のみ・通知なし）
+      再取得が例外/0 件    → failed → 転記失敗通知
+    日付矛盾で write 0（date_inconsistent）は従来どおり通知なし（problems で判別）。
+    noop=元の最新レコードで非空（検証にも入らず転記しない）。"""
     if _v(latest, "死亡日_申告").strip():
         return "noop"
     user_id = _v(latest, "LINEユーザーID")
@@ -982,7 +992,17 @@ async def _houki_store_death_date(record_id: str, latest: dict, iso: str) -> str
     if problems:
         _log_result("date_inconsistent")
         return "date_inconsistent"
-    return "stored"
+    try:
+        after = await kintone.get_record(houki_case_store.APP_HOUKI_CASE, record_id)
+    except Exception:
+        return "failed"
+    actual = _v(after, "死亡日_申告").strip()
+    if actual == iso:
+        return "stored"
+    if not actual:
+        return "failed"
+    _log_result("date_preempted")
+    return "skipped"
 
 
 async def _houki_store(record_id: str, latest: dict, composed: Composed) -> str:

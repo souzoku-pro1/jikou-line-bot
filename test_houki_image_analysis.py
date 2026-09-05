@@ -669,5 +669,108 @@ class TestFix1DeathDateValidation(_Base):
         self.assertIsNotNone(rep)
 
 
+# ── fix2: HI2F1-01（転記結果を App 40 実値で判定） ──────────────────────────────
+class TestFix2DeathDateOutcome(_Base):
+    DEATH = "2024-06-01"
+
+    def _seed_and_ai(self):
+        rid = self.seed()
+        self.set_ai(death=self.DEATH, death_conf="high")
+        return rid
+
+    def test_1_cas_exhausted_write0_notifies(self):
+        rid = self._seed_and_ai()
+        self.store.conflicts_left = houki_case_store._CAS_RETRIES + 1
+        self.assertEqual(self.go(), "sent")
+        self.assertEqual(self.store.field(rid, "死亡日_申告"), "")     # write 0
+        self.assertEqual(self.notify_kinds().count("houki_image_analysis_store"), 1)
+        store_call = [c for c in self.admin.await_args_list
+                      if c.kwargs["throttle_key"].startswith("houki_image_analysis_store")][0]
+        self.assertIn(f"レコード番号 {rid}", store_call.args[0])
+
+    def test_2_rival_stored_same_value_is_stored_no_notify(self):
+        rid = self._seed_and_ai()
+        orig = self.store.update_record
+
+        async def racing(app, record_id, fields, revision=None):
+            if "死亡日_申告" in fields:
+                rec = self.store.cases[str(record_id)]
+                if not rec["死亡日_申告"]["value"]:
+                    rec["死亡日_申告"] = {"value": self.DEATH}   # 競合相手が同値を先に保存
+                    rec["$revision"] = {"value": str(int(rec["$revision"]["value"]) + 1)}
+                    raise hub_kintone.KintoneConflict(409, "GAIA_CO02", "c")
+            return await orig(app, record_id, fields, revision)
+        with patch.object(hub_kintone, "update_record", racing):
+            self.assertEqual(self.go(), "sent")
+        self.assertEqual(self.store.field(rid, "死亡日_申告"), self.DEATH)
+        self.assertNotIn("houki_image_analysis_store", self.notify_kinds())
+
+    def test_3_rival_stored_other_value_is_skipped_no_notify(self):
+        rid = self._seed_and_ai()
+        orig = self.store.update_record
+
+        async def racing(app, record_id, fields, revision=None):
+            if "死亡日_申告" in fields:
+                rec = self.store.cases[str(record_id)]
+                if not rec["死亡日_申告"]["value"]:
+                    rec["死亡日_申告"] = {"value": "2024-05-20"}   # 競合相手が別値を先に保存
+                    rec["$revision"] = {"value": str(int(rec["$revision"]["value"]) + 1)}
+                    raise hub_kintone.KintoneConflict(409, "GAIA_CO02", "c")
+            return await orig(app, record_id, fields, revision)
+        with patch.object(hub_kintone, "update_record", racing), \
+                self.assertLogs(ia.logger, level="INFO") as cm:
+            self.assertEqual(self.go(), "sent")
+        self.assertEqual(self.store.field(rid, "死亡日_申告"), "2024-05-20")   # 既存値を尊重
+        self.assertNotIn("houki_image_analysis_store", self.notify_kinds())
+        self.assertIn("date_preempted", "\n".join(cm.output))
+
+    def test_4_refetch_failure_after_store_is_failed(self):
+        rid = self._seed_and_ai()
+        orig = self.store.get_record
+        calls = {"n": 0}
+
+        async def flaky(app, record_id):
+            # 転記後の再取得（apply の後）だけ失敗させる
+            if self.store.cases[str(record_id)]["死亡日_申告"]["value"] == self.DEATH:
+                raise hub_kintone.KintoneError(500, "x", "y")
+            return await orig(app, record_id)
+        with patch.object(hub_kintone, "get_record", flaky):
+            self.assertEqual(self.go(), "sent")
+        self.assertEqual(self.notify_kinds().count("houki_image_analysis_store"), 1)
+        # 0 件（レコードが消えた）
+        self.setUp()
+        rid = self._seed_and_ai()
+
+        async def gone(app, record_id):
+            if self.store.cases[str(record_id)]["死亡日_申告"]["value"] == self.DEATH:
+                raise hub_kintone.KintoneError(404, "GAIA_RE01", "nf")
+            return await orig(app, record_id)
+        with patch.object(hub_kintone, "get_record", gone):
+            self.assertEqual(self.go(), "sent")
+        self.assertEqual(self.notify_kinds().count("houki_image_analysis_store"), 1)
+
+    def test_5_inconsistent_write0_still_no_notify(self):
+        rid = self.seed(**{"死亡を知った日_申告": "2024-05-01"})
+        self.set_ai(death=self.DEATH, death_conf="high")
+        self.assertEqual(self.go(), "sent")
+        self.assertEqual(self.store.field(rid, "死亡日_申告"), "")
+        self.assertNotIn("houki_image_analysis_store", self.notify_kinds())
+
+    def test_6_success_path_refetches_once_and_stored(self):
+        rid = self._seed_and_ai()
+        orig = self.store.get_record
+        seen = []
+
+        async def counting(app, record_id):
+            rec = await orig(app, record_id)
+            seen.append(rec["死亡日_申告"]["value"])
+            return rec
+        with patch.object(hub_kintone, "get_record", counting):
+            self.assertEqual(self.go(), "sent")
+        self.assertEqual(self.store.field(rid, "死亡日_申告"), self.DEATH)
+        self.assertEqual(seen.count(self.DEATH), 1)         # 転記後の再取得 1 回
+        self.assertNotIn("houki_image_analysis_store", self.notify_kinds())
+
+
 if __name__ == "__main__":
     unittest.main()
