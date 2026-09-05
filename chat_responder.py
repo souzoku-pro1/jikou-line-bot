@@ -303,6 +303,12 @@ def build_known_items(app21_record: Optional[dict],
         if any(IMAGE_RECEIPT_REPLY in (m.get("content") or "")
                for m in history if m.get("role") == "assistant"):
             items["書類写真"] = "受領済み"
+        # JIKOU-FORM-3 Part B-5: 受信書類写真（FILE）欄の実値も正にする
+        # （フォーム経由の写真・再起動後の履歴消失でも受領済みと判定できる）
+        if app21_record:
+            photos = (app21_record.get("受信書類写真") or {}).get("value") or []
+            if isinstance(photos, list) and photos:
+                items["書類写真"] = "受領済み"
     except Exception:
         return items
     return items

@@ -43,6 +43,8 @@ import logging
 import os
 
 from chat_responder import IMAGE_INBOUND_MARKER, IMAGE_RECEIPT_REPLY
+from hub import houki_case_store
+from hub import image_store
 from hub import kintone
 from hub import notify
 from hub.autoreply_stoplist import is_suppressed
@@ -314,7 +316,25 @@ async def _alert_houki_image_failure(user_id: str, what: str) -> None:
     )
 
 
-async def handle_houki_image(user_id: str, event_id: str) -> None:
+async def store_houki_image(user_id: str, message_id: str) -> str:
+    """JIKOU-FORM-3 Part A: 相続放棄チャネルの受信画像を取得し App 40 の
+    受信書類写真へ添付する（受領返信の成否と独立・例外は外へ出さない）。
+    対象レコード=App 40 の LINEユーザーID 一致レコード（未存在は未添付=保留）。"""
+    if not message_id:
+        return "no_message_id"
+    try:
+        rec = await houki_case_store.fetch_case(user_id)
+        rid = str(((rec or {}).get("$id") or {}).get("value") or "")
+        return await image_store.intake_line_image(
+            "houki", HOUKI_CHANNEL, houki_case_store.APP_HOUKI_CASE,
+            user_id, message_id, rid)
+    except Exception:
+        logger.error("[IMAGE_INTAKE] houki image store failed (fixed reason)")
+        return "failed"
+
+
+async def handle_houki_image(user_id: str, event_id: str,
+                             message_id: str = "") -> None:
     """相続放棄チャネルの画像受信（router から BackgroundTasks で実行）。
 
     時効側（main._process_line_image_event）と同じゲート順・同じ冪等設計:
@@ -322,7 +342,9 @@ async def handle_houki_image(user_id: str, event_id: str) -> None:
     （保存不能=返信しない fail-closed+要確認通知）→並行配送の勝者決定
     （最小 $id）→束ね選出→push 成功時のみ受領済み行で閉鎖（fix1[03]）。
     管理者への受信通知は router 側の既存 _record_inbound（300 秒スロットル）を
-    維持し、本関数では送らない。"""
+    維持し、本関数では送らない。
+    JIKOU-FORM-3 Part A: 勝者決定後に取得+添付（store_houki_image）を行う。
+    束ね返信・heal・claim の構造は不変（添付の失敗は返信を止めない）。"""
     if not event_id:
         logger.warning("[IMAGE_INTAKE] houki image without event id (skip)")
         return
@@ -376,6 +398,10 @@ async def handle_houki_image(user_id: str, event_id: str) -> None:
             != my_id:
         logger.info("[IMAGE_INTAKE] concurrent duplicate lost")
         return
+
+    # JIKOU-FORM-3 Part A: 取得+添付は勝者のみ・デバウンス待ちの前に行う
+    # （受領返信の成否と独立。不成立でも返信は続行する）
+    await store_houki_image(user_id, message_id)
 
     async def _latest():
         return await latest_marker_category("houki", user_id)

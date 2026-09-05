@@ -130,8 +130,12 @@ async def houki_webhook(request: Request, background_tasks: BackgroundTasks):
             # IMAGE-INTAKE-1: 受領返信（束ね方式）を追加。既存の管理者通知
             # （_record_inbound・300 秒スロットル）は維持。event id 不明は
             # 冪等キーが作れないため受領返信なし（通知のみ）
-            image_event_id = event.get("webhookEventId") or (
-                (event.get("message") or {}).get("id", ""))
+            message_id = str((event.get("message") or {}).get("id", "") or "")
+            image_event_id = event.get("webhookEventId") or message_id
+            # JIKOU-FORM-3 Part A: message id は hub 側（image_intake 配下の
+            # 添付層）でのコンテンツ API 取得+App 40 添付に使う（houki_bot 内には
+            # 取得・書込の実体を置かない=checker 閉集合不変）
             background_tasks.add_task(
-                image_intake.handle_houki_image, user_id, image_event_id)
+                image_intake.handle_houki_image, user_id, image_event_id,
+                message_id)
     return {"status": "ok"}
