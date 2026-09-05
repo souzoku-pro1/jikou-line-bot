@@ -80,10 +80,11 @@ STALE_MINUTES = 10                        # 読取中 の取り残し判定（�
 # uvicorn workers=1（Procfile 実測・test_image_intake が pin）が前提。worker 複数化
 # 票では永続 CAS/一意キーによる排他へ置換すること（既知の制約・司令塔裁定でスコープ外）
 # _generations: record_id → 現在の所有世代（読取が進行中の間だけ存在）。削除条件
-#   （fix3 HCRF2-02）: 終端成功／preempted（担当者の状態変更で終端しなかった）で
+#   （fix4 HCRF3-01: _finish の finally 1 か所に集約）: 終端成功／preempted（担当者の
+#   状態変更で終端しなかった）／終端失敗（5xx・通信例外・CAS 再試行超過）のいずれも
 #   「自世代が現在の所有者」のときに削除。fenced（他世代が所有）は削除しない。
-#   終端 CAS 失敗（読取中 のまま）は残す（次の reclaim で上書き・削除される）。
-#   record_id ごとの int なので肥大しない
+#   reclaim（claim）は entry の有無に依存せず常に新世代を採番して上書きするので、
+#   entry が残っても消えても回収経路には影響しない。record_id ごとの int で肥大しない
 # _generation_seq: プロセス全体の単一採番（itertools.count・単調増加・record_id 別
 #   カウンタは持たない=削除後の再 claim が旧世代と衝突しない）
 _generations: dict[str, int] = {}
@@ -507,22 +508,18 @@ async def _finalize(record_id: str, status: str,
     読取済/要確認 へ遷移する。人が別の状態に変えていた場合は作用 0（preempted）。
     fix2: 加えて自分の claim 世代が現在の所有世代であること（不一致は fenced・
     作用 0）。409 は再取得して 1 回再試行し、再取得後も両方を再検査する。
-    終端成功と preempted では所有権を消す（自世代が所有者のときのみ・fix3）。
-    失敗（読取中 のまま）は残す。"""
+    所有権の削除は行わない（fix4: _finish の finally が全経路で「自世代が所有者なら
+    削除」を担う）。"""
     for _attempt in range(2):
         try:
             latest = await kintone.get_record(store.APP_HOUKI_CASE, record_id)
             if not _owns(record_id, generation):
                 return "fenced"
             if store._v(latest, FIELD_STATUS) != STATUS_WORKING:
-                if _owns(record_id, generation):
-                    _generations.pop(record_id, None)
                 return "preempted"
             await kintone.update_record(store.APP_HOUKI_CASE, record_id,
                                         {FIELD_STATUS: status},
                                         revision=store._v(latest, "$revision") or None)
-            if _owns(record_id, generation):
-                _generations.pop(record_id, None)
             return "done"
         except kintone.KintoneConflict:
             continue
@@ -557,6 +554,18 @@ def _log(outcome: str) -> None:
 # ── 終端（状態検査つき CAS）と通知 ─────────────────────────────────────────────
 async def _finish(record_id: str, outcome: str, summary: dict,
                   generation: int | None = None) -> None:
+    try:
+        await _finish_inner(record_id, outcome, summary, generation)
+    finally:
+        # fix4 HCRF3-01: _finish を抜けるすべての経路（終端成功/preempted/終端失敗/
+        # 通知中の例外）で「自世代が所有者なら削除」を 1 か所に集約。他世代へ交代
+        # していれば削除しない。generation=None（直接呼出）は所有権を持たない
+        if generation is not None and _owns(record_id, generation):
+            _generations.pop(record_id, None)
+
+
+async def _finish_inner(record_id: str, outcome: str, summary: dict,
+                        generation: int | None) -> None:
     # fix2: 終端直前の世代検査（転記中に reclaim されたケースを含む）。旧処理は
     # 黙って終わる（終端も通知もしない）
     if outcome == "fenced" or not _owns(record_id, generation):

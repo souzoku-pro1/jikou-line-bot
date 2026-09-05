@@ -19,6 +19,8 @@
 - fix3 HCRF2-01: フェンスは houki_case_store の CAS 再試行中（各試行の前・409 後の
   再取得の前）にも効く（fence 引数・既定 None は従来挙動）。HCRF2-02: 採番は
   プロセス単一の itertools.count・所有権は終端成功/preempted で自世代のときだけ削除
+- fix4 HCRF3-01: 終端失敗（5xx・通信例外・再試行超過）でも自世代なら削除（_finish の
+  finally に集約）。他世代へ交代していれば削除しない
 """
 
 import asyncio
@@ -1000,20 +1002,60 @@ class TestGenerationTableCleanup(_Base):
         self.assertEqual(r._generations, {"other": other})                 # 他は消さない
         self.assertIn("担当者の変更を検知", self.notices()[0][1])
 
-    def test_entry_kept_on_finalize_failure(self):
-        rid = self.store.seed_card()
-        gen = r._next_generation(rid)
+    def _run_with_failing_status_put(self, rid, gen, exc, on_fail=None):
         real = self.store.update_record
 
         async def flaky(app, record_id, fields, revision=None):
             if r.FIELD_STATUS in fields:
-                raise hub_kintone.KintoneError(500, "x", "y")
+                if on_fail is not None:
+                    on_fail()
+                raise exc
             return await real(app, record_id, fields, revision)
         rec = _run(self.store.get_record(None, rid))
         with patch.object(hub_kintone, "update_record", flaky):
-            _run(r.run_card_read(rec, False, gen))
+            return _run(r.run_card_read(rec, False, gen))
+
+    def test_entry_removed_on_finalize_failure(self):
+        """fix4 HCRF3-01: 終端の確定失敗（5xx）でも自世代 entry は残さない（fix3 までは
+        「残す」pin だったが、reclaim は entry に依存せず新世代を採番するため残す理由が
+        なく、不要 entry=肥大要因になるだけ）。通知は従来どおり failure+結果の 2 通。"""
+        rid = self.store.seed_card()
+        gen = r._next_generation(rid)
+        self._run_with_failing_status_put(rid, gen, hub_kintone.KintoneError(500, "x", "y"))
         self.assertEqual(self.store.status(rid), r.STATUS_WORKING)
-        self.assertEqual(r._generations.get(rid), gen)                     # 残す（次の reclaim で上書き）
+        self.assertNotIn(rid, r._generations)
+        self.assertEqual(self.kinds(), ["houki_card_read_failure", "houki_card_read"])
+
+    def test_entry_removed_on_finalize_cas_exhausted(self):
+        """CAS 再試行超過（409 が続く）でも自世代 entry は残さない。"""
+        rid = self.store.seed_card()
+        gen = r._next_generation(rid)
+        self._run_with_failing_status_put(rid, gen,
+                                          hub_kintone.KintoneConflict(409, "GAIA_CO02", "c"))
+        self.assertEqual(self.store.status(rid), r.STATUS_WORKING)
+        self.assertNotIn(rid, r._generations)
+        self.assertEqual(self.kinds(), ["houki_card_read_failure", "houki_card_read"])
+
+    def test_entry_removed_on_finalize_unknown_result_exception(self):
+        """結果不明相当（PUT 中の通信例外）でも entry は残さない。"""
+        rid = self.store.seed_card()
+        gen = r._next_generation(rid)
+        self._run_with_failing_status_put(rid, gen, ConnectionError("reset"))
+        self.assertNotIn(rid, r._generations)
+        self.assertEqual(self.kinds(), ["houki_card_read_failure", "houki_card_read"])
+
+    def test_new_generation_kept_when_reclaimed_during_failure(self):
+        """失敗処理中に新世代へ交代（reclaim）していた場合、新世代の entry は保持。"""
+        rid = self.store.seed_card()
+        gen = r._next_generation(rid)
+        holder = {}
+
+        def reclaim():
+            holder["new"] = r._next_generation(rid)
+        self._run_with_failing_status_put(rid, gen, hub_kintone.KintoneError(500, "x", "y"),
+                                          on_fail=reclaim)
+        self.assertEqual(r._generations.get(rid), holder["new"])
+        # 交代は PUT 中（所有権検査の後）なので通知規律は fix3 までと同じ（failure+結果）
         self.assertEqual(self.kinds(), ["houki_card_read_failure", "houki_card_read"])
 
     def test_entry_kept_for_owner_when_old_process_is_fenced(self):
