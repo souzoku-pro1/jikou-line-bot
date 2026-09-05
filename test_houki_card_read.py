@@ -9,9 +9,15 @@
   （apply_hearing_fields / append_creditors）・書かない欄の閉集合
 - tool 出力は閉集合スキーマ（キー集合の完全一致・逸脱=ai_failed）
 - 通知は欄コードのみ（カードの値は載せない）・kind 2 種を登録
+- fix1 HCR-01: 読取中 の取り残し（更新日時 が STALE_MINUTES より古い）は再配送で
+  CAS claim し直して再実行（新しい 読取中 は in_flight・作用 0）。claim 直後の
+  正本取得失敗も finally で 要確認
+- fix1 HCR-02: 終端遷移は最新の 相談カード読取 が 読取中 のときだけ（人の変更を
+  検知したら作用 0・通知 1 行）
 """
 
 import asyncio
+import datetime
 import hashlib
 import os
 import unittest
@@ -39,6 +45,11 @@ JPEG = b"\xff\xd8\xff\xe0" + b"J" * 32
 PNG = b"\x89PNG\r\n\x1a\n" + b"P" * 32
 HEIC = b"\x00\x00\x00\x18ftypheic" + b"H" * 32
 PROMPT_SHA256 = "bfd462383c45689b01434f5ca3383d808012a7a8add13015b2b41e875feac76e"
+NOW = datetime.datetime(2026, 9, 6, 12, 0, 0, tzinfo=datetime.timezone.utc)
+
+
+def _ts(minutes_ago: int) -> str:
+    return (NOW - datetime.timedelta(minutes=minutes_ago)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 # カード上の「値」（通知・ログに出てはいけない語）
 V_NAME = "山田太郎"
@@ -96,6 +107,7 @@ class _FakeApp40(_FakeStore):
         for code in ("死亡日", "起算日_確定", "相続の開始を知った日"):
             base.setdefault(code, "")
         base[r.FIELD_STATUS] = status
+        base.setdefault(r.FIELD_UPDATED, _ts(0))
         base.update(fields)
         rid = super().seed_case(base, [], None)
         rec = self.cases[rid]
@@ -114,6 +126,17 @@ class _FakeApp40(_FakeStore):
     def status(self, rid):
         return self.field(rid, r.FIELD_STATUS)
 
+    async def update_record(self, app, record_id, fields, revision=None):
+        await super().update_record(app, record_id, fields, revision)
+        self.cases[str(record_id)][r.FIELD_UPDATED] = {"value": _ts(0)}   # kintone 同様
+
+    def status_puts(self):
+        return self.status_put_count
+
+    def __init__(self):
+        super().__init__()
+        self.status_put_count = 0
+
 
 class _Base(unittest.TestCase):
     def setUp(self):
@@ -123,15 +146,27 @@ class _Base(unittest.TestCase):
         for p in (patch.object(hub_kintone, "search_records", self.store.search_records),
                   patch.object(hub_kintone, "create_record", self.store.create_record),
                   patch.object(hub_kintone, "get_record", self.store.get_record),
-                  patch.object(hub_kintone, "update_record", self.store.update_record),
+                  patch.object(hub_kintone, "update_record", self._update_record),
                   patch.object(hub_kintone, "download_file", self.store.download_file),
                   patch.object(r, "create_message_with_fallback", self.ai),
+                  patch.object(r, "_now", lambda: NOW),
                   patch.object(hub_notify, "notify_admin_line", self.admin)):
             p.start()
             self.addCleanup(p.stop)
 
+    async def _update_record(self, app, record_id, fields, revision=None):
+        if r.FIELD_STATUS in fields:
+            self.store.status_put_count += 1
+        return await self.store.update_record(app, record_id, fields, revision)
+
     def set_ai(self, report):
         self.ai.return_value = _tool_response(report, name="read_card")
+
+    def human_change(self, rid, status):
+        """人が kintone 画面で 相談カード読取 を変えた（revision が進む）。"""
+        rec = self.store.cases[str(rid)]
+        rec[r.FIELD_STATUS] = {"value": status}
+        rec["$revision"] = {"value": str(int(rec["$revision"]["value"]) + 1)}
 
     def read(self, rid):
         rec = _run(self.store.get_record(None, rid))
@@ -154,7 +189,7 @@ class TestWebhookGates(_Base):
     def setUp(self):
         super().setUp()
         self.runner = AsyncMock(return_value="done")
-        p = patch.object(r, "run_card_read", self.runner)
+        p = patch.object(r, "run_card_read_by_id", self.runner)
         p.start()
         self.addCleanup(p.stop)
 
@@ -196,12 +231,15 @@ class TestWebhookGates(_Base):
         self.runner.assert_not_awaited()
 
     def test_state_gate_requested_and_card_present(self):
-        for status in (r.STATUS_UNREAD, r.STATUS_WORKING, r.STATUS_DONE, r.STATUS_REVIEW):
+        for status in (r.STATUS_UNREAD, r.STATUS_DONE, r.STATUS_REVIEW):
             with self.subTest(status=status):
                 rid = self.store.seed_card(status=status)
                 self.assertEqual(self.post(rid=rid).json().get("skip"),
                                  "status_not_requested")
                 self.assertEqual(self.store.status(rid), status)
+        rid = self.store.seed_card(status=r.STATUS_WORKING)                # 新しい 読取中
+        self.assertEqual(self.post(rid=rid).json().get("skip"), "in_flight")
+        self.assertEqual(self.store.field(rid, "$revision"), "1")
         rid = self.store.seed_card(status=r.STATUS_REQUESTED, keys=())
         self.assertEqual(self.post(rid=rid).json().get("skip"), "no_card")
         self.assertEqual(self.store.status(rid), r.STATUS_REQUESTED)
@@ -211,12 +249,12 @@ class TestWebhookGates(_Base):
     def test_claim_cas_then_background_read(self):
         rid = self.store.seed_card(status=r.STATUS_REQUESTED)
         resp = self.post(rid=rid)
-        self.assertEqual(resp.json(), {"ok": True, "record_id": rid, "claimed": True})
+        self.assertEqual(resp.json(), {"ok": True, "record_id": rid, "claimed": True,
+                                       "reconciled": False})
         self.assertEqual(self.store.status(rid), r.STATUS_WORKING)
+        self.assertEqual(self.store.field(rid, "$revision"), "2")   # claim で revision が進む
         self.runner.assert_awaited_once()
-        passed = self.runner.await_args.args[0]
-        self.assertEqual(passed["$revision"]["value"], "2")      # claim 後の正本
-        self.assertEqual(passed[r.FIELD_STATUS]["value"], r.STATUS_WORKING)
+        self.assertEqual(self.runner.await_args.args, (rid, False))
         # 二重配信の敗者（CAS 409）は 0 作用
         rid2 = self.store.seed_card(status=r.STATUS_REQUESTED)
         self.store.conflicts_left = 1
@@ -447,6 +485,150 @@ class TestFailures(_Base):
         self.assertEqual(self.store.status(rid), r.STATUS_WORKING)      # 更新できず
         self.assertEqual(self.kinds(), ["houki_card_read_failure", "houki_card_read"])
         self.assertIn("ステータス更新（読取済）に失敗", self.notices()[0][1])
+
+
+# ── 6. fix1 HCR-01: 読取中 の取り残し回収（reconcile） ───────────────────────────
+class TestReconcile(_Base):
+    def post(self, rid):
+        return _client.post(_URL, json={"app": {"id": "40"},
+                                        "record": {"$id": {"value": rid}}})
+
+    def test_hcr01_1_get_record_failure_after_claim_ends_in_review(self):
+        rid = self.store.seed_card(status=r.STATUS_REQUESTED)
+        real = self.store.get_record
+        calls = {"n": 0}
+
+        async def flaky(app, record_id):
+            calls["n"] += 1
+            if calls["n"] == 2:                       # claim 直後の正本取得だけ失敗
+                raise hub_kintone.KintoneError(500, "x", "y")
+            return await real(app, record_id)
+        with patch.object(hub_kintone, "get_record", flaky):
+            resp = self.post(rid)
+        self.assertEqual(resp.json().get("claimed"), True)
+        self.assertEqual(self.store.status(rid), r.STATUS_REVIEW)   # 読取中 を残さない
+        self.ai.assert_not_awaited()
+        self.assertEqual(self.kinds(), ["houki_card_read_failure"])
+        self.assertIn("claim 後のレコード取得に失敗", self.notices()[0][1])
+
+    def test_hcr01_2_stale_working_is_rerun_without_double_write(self):
+        rid = self.store.seed_card(status=r.STATUS_WORKING, 被相続人氏名=V_NAME,
+                                   **{r.FIELD_UPDATED: _ts(r.STALE_MINUTES + 1)})
+        _run(store.append_creditors(rid, _run(self.store.get_record(None, rid)), [V_CRED]))
+        self.store.cases[rid][r.FIELD_UPDATED] = {"value": _ts(r.STALE_MINUTES + 1)}
+        rev_before = int(self.store.field(rid, "$revision"))
+        resp = self.post(rid)
+        self.assertEqual(resp.json(), {"ok": True, "record_id": rid, "claimed": True,
+                                       "reconciled": True})
+        self.assertEqual(self.store.status(rid), r.STATUS_DONE)          # 収束
+        self.assertGreater(int(self.store.field(rid, "$revision")), rev_before)
+        self.assertEqual(self.store.creditors(rid), [V_CRED])            # 二重なし
+        self.assertEqual(self.store.field(rid, "被相続人氏名"), V_NAME)   # 上書きなし
+        self.assertEqual(self.store.field(rid, "顧客名"), V_ME)          # 空欄は転記
+        text = self.notices()[-1][1]
+        self.assertIn("・取り残しを再実行しました", text)
+        self.assertIn("・既に値があり転記しなかった欄: ", text)
+        self.assert_no_values(text)
+        # 要確認 に倒れる再実行にも 1 行が付く
+        rid2 = self.store.seed_card(status=r.STATUS_WORKING,
+                                    **{r.FIELD_UPDATED: _ts(r.STALE_MINUTES + 1)})
+        self.set_ai(_filled(_2=_e(V_ADDR, "low")))
+        self.post(rid2)
+        self.assertEqual(self.store.status(rid2), r.STATUS_REVIEW)
+        self.assertIn("・取り残しを再実行しました", self.notices()[-1][1])
+
+    def test_hcr01_3_fresh_working_is_in_flight(self):
+        for age in (0, 1, r.STALE_MINUTES):                 # ちょうど 10 分は処理中扱い
+            with self.subTest(age=age):
+                rid = self.store.seed_card(status=r.STATUS_WORKING,
+                                           **{r.FIELD_UPDATED: _ts(age)})
+                self.assertEqual(self.post(rid).json().get("skip"), "in_flight")
+                self.assertEqual(self.store.field(rid, "$revision"), "1")
+        rid = self.store.seed_card(status=r.STATUS_WORKING, **{r.FIELD_UPDATED: ""})
+        self.assertEqual(self.post(rid).json().get("skip"), "in_flight")   # 不明=処理中扱い
+        self.ai.assert_not_awaited()
+        self.assertEqual(self.kinds(), [])
+        self.assertEqual(r.STALE_MINUTES, 10)
+        self.assertEqual(r.FIELD_UPDATED, "更新日時")
+
+    def test_hcr01_4_concurrent_reconcile_runs_once(self):
+        rid = self.store.seed_card(status=r.STATUS_WORKING,
+                                   **{r.FIELD_UPDATED: _ts(r.STALE_MINUTES + 1)})
+        with patch.object(r, "run_card_read_by_id", AsyncMock(return_value="done")) as run:
+            self.assertEqual(self.post(rid).json().get("reconciled"), True)
+            self.assertEqual(self.post(rid).json().get("skip"), "in_flight")  # 更新日時 が進んだ
+            self.assertEqual(run.await_count, 1)
+        rid2 = self.store.seed_card(status=r.STATUS_WORKING,
+                                    **{r.FIELD_UPDATED: _ts(r.STALE_MINUTES + 1)})
+        self.store.conflicts_left = 1                                       # 同時配送の敗者
+        with patch.object(r, "run_card_read_by_id", AsyncMock(return_value="done")) as run:
+            self.assertEqual(self.post(rid2).json().get("skip"), "cas_lost")
+            self.assertEqual(run.await_count, 0)
+
+
+# ── 7. fix1 HCR-02: 終端遷移は最新が 読取中 のときだけ ──────────────────────────
+class TestFinalizePreempted(_Base):
+    def test_hcr02_1_human_change_during_ai_keeps_it(self):
+        rid = self.store.seed_card()
+
+        async def ai_then_human(*a, **k):
+            self.human_change(rid, r.STATUS_REVIEW)
+            return _tool_response(_filled(), name="read_card")
+        self.ai.side_effect = ai_then_human
+        self.read(rid)
+        self.assertEqual(self.store.status(rid), r.STATUS_REVIEW)
+        self.assertEqual(self.store.status_puts(), 0)                     # PUT 0
+        self.assertEqual(self.notices(), [("houki_card_read",
+                                           f"【相談カード読取】案件レコードNo.{rid}: 担当者の"
+                                           "変更を検知したため終端遷移を行いませんでした。")])
+        self.assertEqual(self.store.field(rid, "被相続人氏名"), V_NAME)    # 転記は独立に安全
+
+    def test_hcr02_2_interleave_after_refetch_is_zero_effect(self):
+        rid = self.store.seed_card()
+        real = self.store.update_record
+        state = {"fired": False}
+
+        async def interleave(app, record_id, fields, revision=None):
+            if r.FIELD_STATUS in fields and not state["fired"]:
+                state["fired"] = True
+                self.human_change(rid, r.STATUS_UNREAD)      # 再取得後・PUT 直前に人が変更
+                raise hub_kintone.KintoneConflict(409, "GAIA_CO02", "c")
+            if r.FIELD_STATUS in fields:
+                self.store.status_put_count += 1
+            return await real(app, record_id, fields, revision)
+        with patch.object(hub_kintone, "update_record", interleave):
+            self.assertEqual(self.read(rid), "done")
+        self.assertEqual(self.store.status(rid), r.STATUS_UNREAD)
+        self.assertEqual(self.store.status_puts(), 0)
+        self.assertEqual(self.kinds(), ["houki_card_read"])
+        self.assertIn("担当者の変更を検知したため終端遷移を行いませんでした",
+                      self.notices()[0][1])
+
+    def test_hcr02_3_normal_path_still_finalizes(self):
+        rid = self.store.seed_card()
+        self.assertEqual(self.read(rid), "done")
+        self.assertEqual(self.store.status(rid), r.STATUS_DONE)
+        self.assertEqual(self.store.status_puts(), 1)
+        self.assertEqual(self.kinds(), ["houki_card_read"])
+
+    def test_hcr02_4_reverted_to_requested_then_redelivery_no_double_write(self):
+        rid = self.store.seed_card()
+
+        async def ai_then_revert(*a, **k):
+            self.human_change(rid, r.STATUS_REQUESTED)
+            return _tool_response(_filled(), name="read_card")
+        self.ai.side_effect = ai_then_revert
+        self.read(rid)
+        self.assertEqual(self.store.status(rid), r.STATUS_REQUESTED)
+        self.assertEqual(self.store.creditors(rid), [V_CRED])
+        self.ai.side_effect = None
+        resp = _client.post(_URL, json={"app": {"id": "40"},
+                                        "record": {"$id": {"value": rid}}})
+        self.assertEqual(resp.json().get("claimed"), True)
+        self.assertEqual(self.store.status(rid), r.STATUS_DONE)
+        self.assertEqual(self.store.creditors(rid), [V_CRED])              # 二重なし
+        self.assertEqual(self.store.field(rid, "被相続人氏名"), V_NAME)
+        self.assertIn("・既に値があり転記しなかった欄: ", self.notices()[-1][1])
 
 
 # ── 5. スキーマ・pin・sink ────────────────────────────────────────────────────────

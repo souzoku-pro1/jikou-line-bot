@@ -8,8 +8,16 @@ kintone Webhook → houki_card_webhook（POST /souzoku-houki/card/{token}）→
   読取依頼 --（webhook が $revision CAS で claim）--> 読取中
     --（読取・検証・転記が終わり、読めなかった欄/検証落ち/未転記が 0）--> 読取済
     --（読めなかった欄あり／AI 失敗／ダウンロード失敗／版不一致／添付が読めない
-        形式／予期しない例外）--> 要確認（try/finally: 成功確定前の離脱は必ず要確認）
-  要確認 への CAS が失敗 → ログ+通知（houki_card_read_failure）
+        形式／予期しない例外／claim 後のレコード取得失敗）--> 要確認
+        （try/finally: 成功確定前の離脱は必ず要確認）
+  読取中（取り残し）--（fix1 HCR-01 reconcile: 更新日時 が STALE_MINUTES より古い
+        読取中 への再配送 → 読取中→読取中 を CAS で claim し直す）--> 読取中 → 再実行
+        （新しい 読取中 は処理中の可能性 = skip in_flight・作用 0。再実行は空欄のみ
+        書込・同名債権者スキップ・実値判定の規律で二重転記しない）
+  終端遷移（読取済/要確認）は fix1 HCR-02: 再取得した最新の 相談カード読取 が
+        読取中 のときだけ CAS で行う。人が 要確認/未読取/読取依頼 に変えていた場合は
+        作用 0（finalize_preempted・通知 1 行）。409 後の再取得でも同じ状態検査
+  終端への CAS が失敗（409 以外/再試行超過）→ ログ+通知（houki_card_read_failure）
   通知 kind: 読取済/要確認（読めた・検証落ち）= houki_card_read、
   失敗分類（AI/ダウンロード/読めない添付/版不一致/例外/終端失敗）= houki_card_read_failure
   再実行は人が 読取依頼 に戻す運用（空欄のみ書込なので二重実行しても上書きしない）
@@ -60,6 +68,8 @@ STATUS_WORKING = "読取中"
 STATUS_DONE = "読取済"
 STATUS_REVIEW = "要確認"
 
+FIELD_UPDATED = "更新日時"                # App 40 UPDATED_TIME（分解能 1 分・実測 2026-09-06）
+STALE_MINUTES = 10                        # 読取中 の取り残し判定（更新日時 がこれより古い）
 MAX_FILES = 5
 MAX_AI_IMAGE_BYTES = 5 * 1024 * 1024      # 1 ファイル上限（API の画像上限と同値）
 MAX_PDF_PAGES = 10                        # PDF のページ数上限（Anthropic 仕様 100 頁内・pin）
@@ -388,6 +398,8 @@ async def _call_ai(blocks: list[dict]) -> dict | None:
 # ── 通知（申述書型の箇条書き・欄コードのみ・値なし） ──────────────────────────────
 def build_notice(record_id: str, result: str, summary: dict) -> str:
     lines = [f"【相談カード読取】案件レコードNo.{record_id}（結果: {result}）"]
+    if summary.get("reconciled"):
+        lines.append("・取り残しを再実行しました")
     if summary.get("reason"):
         lines.append(f"・{summary['reason']}")
     if summary.get("written"):
@@ -419,8 +431,33 @@ async def _notify(text: str, key: str) -> None:
 
 
 # ── 状態遷移（CAS） ───────────────────────────────────────────────────────────
+def _now() -> datetime.datetime:
+    return datetime.datetime.now(datetime.timezone.utc)
+
+
+def updated_at(record: dict) -> datetime.datetime | None:
+    """更新日時（UPDATED_TIME・ISO 8601 UTC）を aware datetime に。不明は None。"""
+    raw = store._v(record, FIELD_UPDATED)
+    try:
+        return datetime.datetime.strptime(raw, "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=datetime.timezone.utc)
+    except ValueError:
+        return None
+
+
+def is_stale(record: dict, now: datetime.datetime | None = None) -> bool:
+    """読取中 の取り残し判定: 更新日時 が STALE_MINUTES より古い。更新日時 が
+    読めないときは False（処理中とみなす=fail-closed・自動再実行しない）。"""
+    ts = updated_at(record)
+    if ts is None:
+        return False
+    return ((now or _now()) - ts) > datetime.timedelta(minutes=STALE_MINUTES)
+
+
 async def claim(record: dict) -> str | None:
-    """読取依頼→読取中（$revision CAS）。勝者は次 revision・敗者は None。"""
+    """相談カード読取 を 読取中 に（$revision CAS）。勝者は次 revision・敗者は None。
+    読取依頼→読取中（初回 claim）と 読取中→読取中（reconcile の claim 取り直し。
+    kintone は値が同じでも PUT で revision を進める）の両方に使う。"""
     rid = store._v(record, "$id")
     rev = store._v(record, "$revision")
     try:
@@ -431,20 +468,26 @@ async def claim(record: dict) -> str | None:
     return str(int(rev) + 1) if rev.isdigit() else None
 
 
-async def _finalize(record_id: str, status: str) -> bool:
-    """終端ステータスの書込（最新 revision で CAS・409 は再取得して 1 回再試行）。"""
+async def _finalize(record_id: str, status: str) -> str:
+    """終端ステータスの書込。戻り値 done / preempted / failed。
+
+    fix1 HCR-02: 再取得した最新の 相談カード読取 が 読取中 のときだけ CAS で
+    読取済/要確認 へ遷移する。人が別の状態に変えていた場合は作用 0（preempted）。
+    409 は再取得して 1 回再試行し、再取得後も同じ状態検査を行う。"""
     for _attempt in range(2):
         try:
             latest = await kintone.get_record(store.APP_HOUKI_CASE, record_id)
+            if store._v(latest, FIELD_STATUS) != STATUS_WORKING:
+                return "preempted"
             await kintone.update_record(store.APP_HOUKI_CASE, record_id,
                                         {FIELD_STATUS: status},
                                         revision=store._v(latest, "$revision") or None)
-            return True
+            return "done"
         except kintone.KintoneConflict:
             continue
         except Exception:
-            return False
-    return False
+            return "failed"
+    return "failed"
 
 
 def _log(outcome: str) -> None:
@@ -462,17 +505,53 @@ def _log(outcome: str) -> None:
         logger.warning("[HOUKI_CARD] version mismatch")
     elif outcome == "finalize_failed":
         logger.error("[HOUKI_CARD] finalize failed (status may stay working)")
+    elif outcome == "finalize_preempted":
+        logger.info("[HOUKI_CARD] finalize preempted (status changed by operator)")
     else:
         logger.error("[HOUKI_CARD] failed (fixed reason)")
 
 
+# ── 終端（状態検査つき CAS）と通知 ─────────────────────────────────────────────
+async def _finish(record_id: str, outcome: str, summary: dict) -> None:
+    status = STATUS_DONE if outcome == "done" else STATUS_REVIEW
+    result = await _finalize(record_id, status)
+    _log(outcome)
+    if result == "preempted":
+        _log("finalize_preempted")
+        await _notify(
+            f"【相談カード読取】案件レコードNo.{record_id}: 担当者の変更を検知したため"
+            "終端遷移を行いませんでした。", f"houki_card_read:{record_id}")
+        return
+    if result == "failed":
+        _log("finalize_failed")
+        await _notify(
+            f"【相談カード読取・要確認】案件レコードNo.{record_id} の読取結果の"
+            f"ステータス更新（{status}）に失敗しました。kintone で 相談カード読取 を"
+            "確認してください。", f"houki_card_read_failure:{record_id}")
+    kind = "houki_card_read" if outcome in ("done", "review") else "houki_card_read_failure"
+    await _notify(build_notice(record_id, status, summary), f"{kind}:{record_id}")
+
+
+async def run_card_read_by_id(record_id: str, reconciled: bool = False) -> str:
+    """claim 後の入口（BackgroundTasks から）。claim 直後の正本取得に失敗しても
+    要確認へ倒す（fix1 HCR-01: 読取中 の取り残しを作らない）。"""
+    try:
+        record = await kintone.get_record(store.APP_HOUKI_CASE, record_id)
+    except Exception:
+        await _finish(record_id, "failed",
+                      {"reason": "claim 後のレコード取得に失敗しました",
+                       "reconciled": reconciled})
+        return "failed"
+    return await run_card_read(record, reconciled)
+
+
 # ── 本体（claim 後に呼ぶ・例外は外へ出さず finally で要確認へ） ─────────────────
-async def run_card_read(record: dict) -> str:
-    """claim（読取中）済みのレコードで読取→転記→終端。戻り値 done/review/失敗分類。"""
+async def run_card_read(record: dict, reconciled: bool = False) -> str:
+    """claim（読取中）済みのレコードで読取→転記→終端。戻り値 done/review/失敗分類。
+    reconciled=True は取り残しの再実行（通知に 1 行足す）。"""
     record_id = store._v(record, "$id")
     user_id = store._v(record, "LINEユーザーID")
-    finalized = False
-    summary: dict = {}
+    summary: dict = {"reconciled": reconciled}
     outcome = "failed"
     try:
         # 1. 添付の取得と振り分け
@@ -551,14 +630,4 @@ async def run_card_read(record: dict) -> str:
         outcome = "failed"
         return outcome
     finally:
-        status = STATUS_DONE if outcome == "done" else STATUS_REVIEW
-        finalized = await _finalize(record_id, status)
-        _log(outcome)
-        if not finalized:
-            _log("finalize_failed")
-            await _notify(
-                f"【相談カード読取・要確認】案件レコードNo.{record_id} の読取結果の"
-                f"ステータス更新（{status}）に失敗しました。kintone で 相談カード読取 を"
-                "確認してください。", f"houki_card_read_failure:{record_id}")
-        kind = "houki_card_read" if outcome in ("done", "review") else "houki_card_read_failure"
-        await _notify(build_notice(record_id, status, summary), f"{kind}:{record_id}")
+        await _finish(record_id, outcome, summary)

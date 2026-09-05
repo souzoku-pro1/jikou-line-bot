@@ -11,10 +11,15 @@ hub/houki_card_read がスキャンを読み取って空欄へ転記する。
 
 ゲート順: token → body の app.id が App 40 と完全一致（不在・不一致は
 skip=app_mismatch・作用 0）→ record id → get_record → 相談カード読取 が
-読取依頼 かつ 相談カード が非空（それ以外は skip・作用 0）→ claim
-（読取依頼→読取中 を $revision CAS・敗者は skip=cas_lost）→ 読取本体は
-BackgroundTasks（kintone Webhook の応答待ちを AI 呼出で占有しない。claim が
-同期なので二重配信は敗者 0 作用）。
+読取依頼 または 読取中 かつ 相談カード が非空（それ以外は skip・作用 0）→
+  読取依頼: claim（読取依頼→読取中 を $revision CAS・敗者は skip=cas_lost）
+  読取中（fix1 HCR-01 reconcile・contract_webhook の「作成中」回収と同型）:
+    更新日時 が STALE_MINUTES より新しい=処理中の可能性 → skip=in_flight（作用 0）
+    古い=取り残し → 読取中→読取中 を CAS で claim し直し（敗者 skip=cas_lost）
+    → 再実行（reconciled=True・通知に「取り残しを再実行しました」）
+→ 読取本体は BackgroundTasks（run_card_read_by_id: claim 後の正本取得も本体側で
+行い、失敗しても finally で 要確認 へ倒す）。claim が同期なので二重配信は敗者
+0 作用。
 
 状態機械は 相談カード読取 欄そのもの（本モジュールはメモリ状態を持たない）。
 読取本体の終端（読取済/要確認）と通知は hub/houki_card_read が担う。
@@ -78,19 +83,22 @@ async def houki_card_webhook(secret: str, request: Request,
 
     try:
         record = await hub_kintone.get_record(APP_HOUKI_CASE, record_id)
-        if _fv(record, reader.FIELD_STATUS) != reader.STATUS_REQUESTED:
+        status = _fv(record, reader.FIELD_STATUS)
+        if status not in (reader.STATUS_REQUESTED, reader.STATUS_WORKING):
             return JSONResponse(status_code=200, content={
                 "ok": True, "skip": "status_not_requested"})
         if not ((record.get(reader.FIELD_CARD) or {}).get("value") or []):
             return JSONResponse(status_code=200, content={
                 "ok": True, "skip": "no_card"})
+        reconciled = status == reader.STATUS_WORKING
+        if reconciled and not reader.is_stale(record):
+            return JSONResponse(status_code=200,
+                                content={"ok": True, "skip": "in_flight"})
         if await reader.claim(record) is None:
             logger.info("[HOUKI_CARD] cas lost record_id=%s",
                         emit(record_id, "record_id", "log", "operator"))
             return JSONResponse(status_code=200,
                                 content={"ok": True, "skip": "cas_lost"})
-        # claim 後の正本（次 revision）を読取本体へ渡す（CAS の起点を揃える）
-        latest = await hub_kintone.get_record(APP_HOUKI_CASE, record_id)
     except Exception as e:
         logger.error("[HOUKI_CARD] error record_id=%s: %s",
                      emit(record_id, "record_id", "log", "operator"),
@@ -98,9 +106,13 @@ async def houki_card_webhook(secret: str, request: Request,
         return JSONResponse(status_code=500,
                             content={"error": "internal_error"})
 
-    logger.info("[HOUKI_CARD] claimed record_id=%s",
-                emit(record_id, "record_id", "log", "operator"))
-    background.add_task(reader.run_card_read, latest)
+    if reconciled:
+        logger.info("[HOUKI_CARD] reclaimed stale working record_id=%s",
+                    emit(record_id, "record_id", "log", "operator"))
+    else:
+        logger.info("[HOUKI_CARD] claimed record_id=%s",
+                    emit(record_id, "record_id", "log", "operator"))
+    background.add_task(reader.run_card_read_by_id, record_id, reconciled)
     return JSONResponse(status_code=200,
                         content={"ok": True, "record_id": record_id,
-                                 "claimed": True})
+                                 "claimed": True, "reconciled": reconciled})
