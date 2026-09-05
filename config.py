@@ -98,6 +98,9 @@ EXPECTED_KINTONE_SCHEMA = {
                                      "時効援用通知作成済", "要確認"],
             },
             "委任契約書": {"type": "FILE"},
+            # JIKOU-CONTRACT-TOKUYAKU: 事案ごとの契約条件（特約事項）。CU 済み
+            # （2026-09-05 form fields API 実測）。契約書 docx/PDF へ差し込む
+            "特約": {"type": "MULTI_LINE_TEXT"},
             # ── JIKOU-NOTICE-1: 時効援用通知書生成（notice_webhook.py が
             # 読む/書く）。CU（大野）でのフィールド追加が前提——追加までは
             # daily_healthcheck が App21 の不足として日次警告する
@@ -746,11 +749,12 @@ EXPECTED_DOCX_TEMPLATES = {
     ],
     # contract_webhook.py（CONTRACT-GEN-1 委任契約書生成）が差し込む8キー
     # （一意プレースホルダ数・2026-08-22 実テンプレートで確認。
-    # {{依頼者氏名}} は本文中 2 箇所）
+    # {{依頼者氏名}} は本文中 2 箇所）+ JIKOU-CONTRACT-TOKUYAKU の {{特約}}
+    # （apply_tokuyaku が専用処理・空なら段落ごと削除）
     "docx_templates/jikou/委任契約書.docx": [
         "{{依頼者氏名}}", "{{依頼者住所}}",
         "{{対象債権者1}}", "{{対象債権者2}}", "{{対象債権者3}}",
-        "{{契約年}}", "{{契約月}}", "{{契約日}}",
+        "{{契約年}}", "{{契約月}}", "{{契約日}}", "{{特約}}",
     ],
     # channels/soufu_annai.py（M4 送付案内）が差し込むキー（事務所正式書式・2026-07-03 差替）
     "docx_templates/jikou/送付案内.docx": [
