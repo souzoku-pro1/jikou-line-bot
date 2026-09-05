@@ -126,39 +126,59 @@ REPORT_TOOL = {
     },
 }
 
-# ── 相談者への返信（凍結テンプレ・司令塔案・弁護士裁定で差し替え可・sha256 pin） ──
+# ── 相談者への返信（弁護士文言・凍結・sha256 pin） ────────────────────────────
+# JIKOU-IMG-2-fix1: 弁護士決定の文言へ差し替え（逐語・記号・全角空白・改行・
+# 「1．」の全角ピリオドを含めて一字も変えない）。「〇〇」の位置が債権者名の
+# 差し込み位置で、鉤括弧「」はテンプレ側に残す。質問文は _HEARING_PROMPT_FROZEN
+# の逐語ではなく IMG-2 固有の凍結文（test_image_analysis が sha256 pin）
+IMG2_HEADER = "お写真をありがとうございます。"
+CREDITOR_CONFIRM = "誤りがある場合は、正しい名称をお知らせください。"
+QUESTIONS_LEAD = "あわせて、次の点について、分かる範囲で教えてください。"
 IMG2_REPLY_TEMPLATE = (
-    "お写真をありがとうございます。\n"
+    IMG2_HEADER + "\n"
     "{債権者行}\n"
-    "あわせて、次の点を教えてください。わかる範囲で結構です。\n"
+    + CREDITOR_CONFIRM + "\n"
+    + QUESTIONS_LEAD + "\n"
     "{質問}"
 )
-CREDITOR_LINE_SINGLE = ("お写真から、債権者は{A}とお見受けします。"
-                        "違っている場合は教えてください。")
-CREDITOR_LINE_MULTI = ("お写真から、債権者は{LIST}とお見受けします。"
-                       "違っている場合は教えてください。")
-CREDITOR_LINE_ASSIGNED = ("お写真から、債権者は{譲受人}（{原債権者}から債権譲渡を"
-                          "受けたもの）とお見受けします。違っている場合は教えて"
-                          "ください。")
-CREDITOR_LINE_AGENT = ("お写真から、債権者は{債権者}（ご連絡元の{代理人}はその"
-                       "代理人）とお見受けします。違っている場合は教えてください。")
+# (a) 債権者名が読み取れなかった場合（質問のみ版）: 2 行目を置き換え、
+#     「あわせて、」の行は「次の点について、…」に置き換える（司令塔案）
+NO_CREDITOR_LINE = "お写真からは、債権者名を読み取ることができませんでした。"
+QUESTIONS_LEAD_NO_CREDITOR = "次の点について、分かる範囲で教えてください。"
+IMG2_REPLY_TEMPLATE_NO_CREDITOR = (
+    IMG2_HEADER + "\n"
+    + NO_CREDITOR_LINE + "\n"
+    + QUESTIONS_LEAD_NO_CREDITOR + "\n"
+    "{質問}"
+)
+# 債権者行（2 行目。3 行目 CREDITOR_CONFIRM は 4 文型共通）
+CREDITOR_LINE_SINGLE = "お写真からは、債権者名が「{A}」と読み取れました。"
+# (b) 複数（2〜3 社）: {LIST}=「A」「B」（3 社は「A」「B」「C」）
+CREDITOR_LINE_MULTI = "お写真からは、債権者名が{LIST}と読み取れました。"
+# (c) 譲渡
+CREDITOR_LINE_ASSIGNED = ("お写真からは、債権者名が「{譲受人}」（「{原債権者}」から"
+                          "債権譲渡を受けたもの）と読み取れました。")
+# (d) 代理人
+CREDITOR_LINE_AGENT = ("お写真からは、債権者名が「{債権者}」（ご連絡元の「{代理人}」"
+                       "はその代理人）と読み取れました。")
 
-# 質問文（main._HEARING_PROMPT_FROZEN の ①〜④ を逐語で流用。⑤写真依頼は入れない。
-# test_image_analysis が凍結プロンプトの部分文字列であることを pin＝単一の正）
-QUESTION_1 = ("①債権者名（例：アコム、レイクなど）\n"
-              "※債権回収会社や法律事務所から通知や訴状、支払督促が来ている場合は、"
-              "その名前")
-QUESTION_2 = ("②おおよその借入時期\n"
-              "※不明な場合は「不明」とご記入ください")
-QUESTION_3 = ("③おおよその最終返済日\n"
-              "（1）不明な場合は「不明」とご記入ください\n"
-              "（2）過去5年以内に返済しましたか？")
-QUESTION_4 = ("④10年以内に裁判所から以下の書類は届きましたか？\n"
-              "・1 訴状が届いた\n"
-              "・2 支払督促が届いた\n"
-              "・3 その他の督促通知が届いた\n"
-              "・4 何も届いていない\n"
-              "※番号でお答えください")
+# 質問ブロック（弁護士文言・逐語。番号は振り直さない。①は司令塔案=債権者行が
+# 無い場合のみ ②③④ の前に置く）
+QUESTION_1 = ("① 債権者（業者）の名称\n"
+              "債権回収会社や法律事務所から通知が届いている場合は、その名称も"
+              "お知らせください。")
+QUESTION_2 = ("② おおよその借入時期\n"
+              "不明な場合は「不明」とお答えください。")
+QUESTION_3 = ("③ おおよその最終返済日\n"
+              "不明な場合は「不明」とお答えください。\n"
+              "また、過去5年以内に返済したことがあるかどうかも教えてください。")
+QUESTION_4 = ("④ 過去10年以内に、次のような書類が届いたことはありますか？\n"
+              "1．訴状\n"
+              "2．支払督促\n"
+              "3．その他の督促状や通知書\n"
+              "4．何も届いていない\n"
+              "5．不明\n"
+              "該当する番号でお答えください。")
 # (既知項目台帳のキー, 質問文)。①は債権者行がある場合は省く
 QUESTIONS = (("債権者名", QUESTION_1), ("借入時期", QUESTION_2),
              ("最終返済日", QUESTION_3), ("裁判所書類の有無", QUESTION_4))
@@ -211,9 +231,8 @@ def parse_report(tool_input) -> dict | None:
 
 # ── 債権者行の組み立て（high のみ・差し込み値検証・1 つでも落ちたら省略） ────────
 def _join_names(names: list[str]) -> str:
-    if len(names) == 1:
-        return names[0]
-    return "、".join(names[:-1]) + "および" + names[-1]
+    """(b) 複数の並び: 「A」「B」（3 社は「A」「B」「C」）。"""
+    return "".join(f"「{n}」" for n in names)
 
 
 def creditor_line(creditors: list[dict]) -> str | None:
@@ -268,15 +287,22 @@ def pending_questions(known: dict, has_creditor_line: bool) -> list[str]:
 
 
 def compose_reply(line: str | None, questions: list[str]) -> str | None:
-    """本文。債権者行も質問も無ければ None（送らない）。質問 0 件なら
-    「あわせて〜」以下を省く。長文ゲートは通さない（docstring 冒頭の規律）。"""
+    """本文。債権者行も質問も無ければ None（送らない）。
+    - 債権者行あり+質問あり: IMG2_REPLY_TEMPLATE（冒頭・債権者行・確認行・
+      「あわせて、…」・質問）
+    - 債権者行あり+質問なし: 「あわせて、…」以下を省く
+    - 債権者行なし+質問あり: IMG2_REPLY_TEMPLATE_NO_CREDITOR（(a) 読み取れ
+      なかった旨+「次の点について、…」+質問。①は pending_questions が先頭に置く）
+    長文ゲートは通さない（docstring 冒頭の規律）。"""
     if not line and not questions:
         return None
-    head, _, tail = IMG2_REPLY_TEMPLATE.partition("{債権者行}\n")
+    joined = "\n".join(questions)
+    if not line:
+        return IMG2_REPLY_TEMPLATE_NO_CREDITOR.replace("{質問}", joined)
+    body = IMG2_REPLY_TEMPLATE.replace("{債権者行}", line)
     if not questions:
-        return head + line
-    body = head + (line + "\n" if line else "") + tail
-    return body.replace("{質問}", "\n".join(questions))
+        return body.split("\n" + QUESTIONS_LEAD + "\n", 1)[0]
+    return body.replace("{質問}", joined)
 
 
 # ── App 28 マーカー ───────────────────────────────────────────────────────────

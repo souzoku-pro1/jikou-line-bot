@@ -239,13 +239,15 @@ class TestCreditorLineAndQuestions(_Base):
         self.assertEqual(self.go(), "sent")
         text = self.sent_text()
         self.assertTrue(text.startswith("お写真をありがとうございます。\n"))
-        self.assertIn("お写真から、債権者はアコムとお見受けします。"
-                      "違っている場合は教えてください。", text)
+        # fix1: 弁護士文言（2 行目=債権者行・3 行目=確認行・4 行目=「あわせて、」）
+        self.assertIn("お写真からは、債権者名が「アコム」と読み取れました。\n"
+                      "誤りがある場合は、正しい名称をお知らせください。\n"
+                      "あわせて、次の点について、分かる範囲で教えてください。\n", text)
         self.assertNotIn(ia.QUESTION_1, text)          # 債権者行があるので①省略
         self.assertNotIn(ia.QUESTION_2, text)          # 既知（借入時期）は省く
         self.assertIn(ia.QUESTION_3, text)
         self.assertIn(ia.QUESTION_4, text)
-        self.assertIn("あわせて、次の点を教えてください。わかる範囲で結構です。", text)
+        self.assertNotIn("読み取ることができませんでした", text)
         self.assertNotIn("⑤", text)
         self.assertLessEqual(len(text), ia.REPLY_MAX_CHARS)
 
@@ -254,7 +256,8 @@ class TestCreditorLineAndQuestions(_Base):
         self.set_ai([{"name": "アコム", "role": "原債権者", "confidence": "high"},
                      {"name": "レイク", "role": "不明", "confidence": "high"}])
         self.go()
-        self.assertIn("債権者はアコムおよびレイクとお見受けします", self.sent_text())
+        self.assertIn("お写真からは、債権者名が「アコム」「レイク」と読み取れました。\n"
+                      "誤りがある場合は、正しい名称をお知らせください。", self.sent_text())
         self.push.reset_mock()
         ia._claims.clear()
         self.store.chatlog.clear()
@@ -262,7 +265,7 @@ class TestCreditorLineAndQuestions(_Base):
                      {"name": "レイク", "role": "サービサー", "confidence": "high"},
                      {"name": "プロミス", "role": "不明", "confidence": "high"}])
         self.go("evt-2")
-        self.assertIn("債権者はアコム、レイクおよびプロミスとお見受けします",
+        self.assertIn("債権者名が「アコム」「レイク」「プロミス」と読み取れました。",
                       self.sent_text())
 
     def test_3_assigned_and_agent(self):
@@ -270,8 +273,9 @@ class TestCreditorLineAndQuestions(_Base):
         self.set_ai([{"name": "日本債権回収", "role": "譲受人", "confidence": "high"},
                      {"name": "アコム", "role": "原債権者", "confidence": "high"}])
         self.go()
-        self.assertIn("債権者は日本債権回収（アコムから債権譲渡を受けたもの）"
-                      "とお見受けします", self.sent_text())
+        self.assertIn("お写真からは、債権者名が「日本債権回収」（「アコム」から債権譲渡を"
+                      "受けたもの）と読み取れました。\n"
+                      "誤りがある場合は、正しい名称をお知らせください。", self.sent_text())
         # 譲渡型は譲受人・原債権者の両方を 問い合わせ業者名 へ（「、」区切り）
         self.assertEqual(self.store.field("1", "問い合わせ業者名"), "日本債権回収、アコム")
         self.setUp()
@@ -279,8 +283,9 @@ class TestCreditorLineAndQuestions(_Base):
         self.set_ai([{"name": "アコム", "role": "原債権者", "confidence": "high"},
                      {"name": "山田法律事務所", "role": "代理人", "confidence": "high"}])
         self.go("evt-2")
-        self.assertIn("債権者はアコム（ご連絡元の山田法律事務所はその代理人）"
-                      "とお見受けします", self.sent_text())
+        self.assertIn("お写真からは、債権者名が「アコム」（ご連絡元の「山田法律事務所」は"
+                      "その代理人）と読み取れました。\n"
+                      "誤りがある場合は、正しい名称をお知らせください。", self.sent_text())
         # 問い合わせ業者名 には代理人を書かない
         self.assertEqual(self.store.field("1", "問い合わせ業者名"), "アコム")
 
@@ -291,17 +296,24 @@ class TestCreditorLineAndQuestions(_Base):
         self.assertEqual(self.go(), "sent")
         text = self.sent_text()
         self.assertEqual(text, "お写真をありがとうございます。\n"
-                         + ia.CREDITOR_LINE_SINGLE.replace("{A}", "アコム"))
+                         "お写真からは、債権者名が「アコム」と読み取れました。\n"
+                         "誤りがある場合は、正しい名称をお知らせください。")
         self.assertNotIn("あわせて", text)
 
 
 # ── 4〜5: 失敗時は質問のみ版・差し込み値検証 ───────────────────────────────────
 class TestQuestionsOnlyFallbacks(_Base):
     def _assert_questions_only(self, outcome_log=None):
+        # fix1 (a): 2 行目=読み取れなかった旨・3 行目=「次の点について、…」・
+        # ① を ②③④ の前に置く（「あわせて、」の行は無い）
         text = self.sent_text()
-        self.assertNotIn("お見受けします", text)
-        self.assertIn(ia.QUESTION_1, text)
-        self.assertIn(ia.QUESTION_2, text)
+        self.assertNotIn("読み取れました", text)
+        self.assertNotIn("あわせて", text)
+        self.assertTrue(text.startswith(
+            "お写真をありがとうございます。\n"
+            "お写真からは、債権者名を読み取ることができませんでした。\n"
+            "次の点について、分かる範囲で教えてください。\n"
+            + ia.QUESTION_1 + "\n" + ia.QUESTION_2), text)
         self.assertIn(ia.QUESTION_3, text)
         self.assertIn(ia.QUESTION_4, text)
         self.assertEqual(self.store.field("1", "問い合わせ業者名"), "")
@@ -552,9 +564,107 @@ class TestStoreAndCourt(_Base):
 
 # ── 13〜14: claim・長文ゲート不使用・凍結 pin ──────────────────────────────────
 class TestClaimAndPins(_Base):
+    # fix1: 弁護士文言へ差し替え（テンプレ・債権者行・質問ブロックの pin 更新。
+    # system prompt は不変）。質問文は _HEARING_PROMPT_FROZEN の逐語ではなく
+    # IMG-2 固有の凍結文（main.py と test_autoreply_style1 の pin は触らない）
     SYSTEM_SHA256 = "538e10dd53dbfa93680d1287f00df51fd08e8e213a7431e14fafc824f13ad935"
-    TEMPLATE_SHA256 = "b97d20bbfe56f4bc4e177b7d4ece623620f1d0cd94ae9705f02e3fedf76f9087"
-    LINES_SHA256 = "0bf3d53d51882ad3eedbc6cb1d3f62a41c8b4699eecfb4e49289929d09fef763"
+    TEMPLATE_SHA256 = "ca8d578c3d044407be94d5fafcfe7ce9b45ca6983c56e47c73df39967ac4dcd9"
+    LINES_SHA256 = "a7722d6447473611348da8fb1a08a18fcae24f22ba230ef912b108b11010eea1"
+    QUESTIONS_SHA256 = "bb13f98727cb7172a2ecccfca7ea0b4a92714dfdde1f81b48d3a8dfee8c1f106"
+
+    # 弁護士文言（逐語・記号・全角空白・改行・「1．」の全角ピリオドを含む）
+    LAWYER_TEXT = (
+        "お写真をありがとうございます。\n"
+        "お写真からは、債権者名が「〇〇」と読み取れました。\n"
+        "誤りがある場合は、正しい名称をお知らせください。\n"
+        "あわせて、次の点について、分かる範囲で教えてください。\n"
+        "② おおよその借入時期\n"
+        "不明な場合は「不明」とお答えください。\n"
+        "③ おおよその最終返済日\n"
+        "不明な場合は「不明」とお答えください。\n"
+        "また、過去5年以内に返済したことがあるかどうかも教えてください。\n"
+        "④ 過去10年以内に、次のような書類が届いたことはありますか？\n"
+        "1．訴状\n"
+        "2．支払督促\n"
+        "3．その他の督促状や通知書\n"
+        "4．何も届いていない\n"
+        "5．不明\n"
+        "該当する番号でお答えください。")
+
+    def test_lawyer_text_verbatim_single_creditor_all_questions(self):
+        # 1 社 high・①以外すべて未回答 → 弁護士文言の「〇〇」を債権者名にした逐語
+        # 「〇〇」は差し込み位置（記号 〇 は差し込み値検証の許可文字ではない）
+        self.seed()
+        self.set_ai([{"name": "テスト", "role": "原債権者", "confidence": "high"}])
+        self.assertEqual(self.go(), "sent")
+        self.assertEqual(self.sent_text(), self.LAWYER_TEXT.replace("〇〇", "テスト"))
+        # 組立関数でも同一（compose_reply が凍結テンプレを崩さない）
+        text = ia.compose_reply(ia.CREDITOR_LINE_SINGLE.replace("{A}", "〇〇"),
+                                [ia.QUESTION_2, ia.QUESTION_3, ia.QUESTION_4])
+        self.assertEqual(text, self.LAWYER_TEXT)
+        self.assertFalse(ia.valid_creditor_name("〇〇"))
+
+    def test_question_block_4_verbatim_fullwidth_period_and_unknown(self):
+        self.assertEqual(ia.QUESTION_4,
+                         "④ 過去10年以内に、次のような書類が届いたことはありますか？\n"
+                         "1．訴状\n2．支払督促\n3．その他の督促状や通知書\n"
+                         "4．何も届いていない\n5．不明\n該当する番号でお答えください。")
+        self.assertIn("1．訴状", ia.QUESTION_4)            # 全角ピリオド
+        self.assertNotIn("1.訴状", ia.QUESTION_4)
+        self.assertIn("5．不明", ia.QUESTION_4)
+        self.assertEqual(_sha("|".join((ia.QUESTION_1, ia.QUESTION_2,
+                                        ia.QUESTION_3, ia.QUESTION_4))),
+                         self.QUESTIONS_SHA256)
+
+    def test_forms_a_b_c_d(self):
+        # (a) 質問のみ版
+        self.assertEqual(
+            ia.compose_reply(None, [ia.QUESTION_1, ia.QUESTION_2]),
+            "お写真をありがとうございます。\n"
+            "お写真からは、債権者名を読み取ることができませんでした。\n"
+            "次の点について、分かる範囲で教えてください。\n"
+            "① 債権者（業者）の名称\n"
+            "債権回収会社や法律事務所から通知が届いている場合は、その名称も"
+            "お知らせください。\n"
+            "② おおよその借入時期\n"
+            "不明な場合は「不明」とお答えください。")
+        # 並びは既存ロジックのまま（役割順: 原債権者→譲受人→サービサー→不明）
+        h = [{"name": "A", "role": "原債権者", "confidence": "high"},
+             {"name": "B", "role": "サービサー", "confidence": "high"},
+             {"name": "C", "role": "不明", "confidence": "high"}]
+        # (b) 複数
+        self.assertEqual(ia.creditor_line(h[:2]),
+                         "お写真からは、債権者名が「A」「B」と読み取れました。")
+        self.assertEqual(ia.creditor_line(h),
+                         "お写真からは、債権者名が「A」「B」「C」と読み取れました。")
+        # (c) 譲渡
+        self.assertEqual(ia.creditor_line(
+            [{"name": "X", "role": "譲受人", "confidence": "high"},
+             {"name": "Y", "role": "原債権者", "confidence": "high"}]),
+            "お写真からは、債権者名が「X」（「Y」から債権譲渡を受けたもの）と"
+            "読み取れました。")
+        # (d) 代理人
+        self.assertEqual(ia.creditor_line(
+            [{"name": "Y", "role": "原債権者", "confidence": "high"},
+             {"name": "Z", "role": "代理人", "confidence": "high"}]),
+            "お写真からは、債権者名が「Y」（ご連絡元の「Z」はその代理人）と"
+            "読み取れました。")
+        # (b)(c)(d) とも 3 行目の確認行は共通
+        for line in (ia.creditor_line(h), ia.creditor_line(
+                [{"name": "X", "role": "譲受人", "confidence": "high"},
+                 {"name": "Y", "role": "原債権者", "confidence": "high"}])):
+            text = ia.compose_reply(line, [ia.QUESTION_2])
+            self.assertIn(line + "\n誤りがある場合は、正しい名称をお知らせください。\n"
+                          "あわせて、次の点について、分かる範囲で教えてください。\n",
+                          text)
+        # 最長ケース（3 社×40 字+②③④）は 600 字以内
+        big = [{"name": "あ" * 40, "role": "原債権者", "confidence": "high"},
+               {"name": "い" * 40, "role": "不明", "confidence": "high"},
+               {"name": "う" * 40, "role": "サービサー", "confidence": "high"}]
+        longest = ia.compose_reply(ia.creditor_line(big),
+                                   [ia.QUESTION_2, ia.QUESTION_3, ia.QUESTION_4])
+        self.assertEqual(len(longest), 404)
+        self.assertLessEqual(len(longest), ia.REPLY_MAX_CHARS)
 
     def test_13_concurrent_same_event_sends_once(self):
         self.seed()
@@ -583,14 +693,20 @@ class TestClaimAndPins(_Base):
         src = open("hub/image_analysis.py", encoding="utf-8").read()
         self.assertNotIn("structure_violations(", src.split('"""', 2)[2])
         self.assertEqual(_sha(ia.SYSTEM_PROMPT), self.SYSTEM_SHA256)
-        self.assertEqual(_sha(ia.IMG2_REPLY_TEMPLATE), self.TEMPLATE_SHA256)
+        self.assertEqual(_sha(ia.IMG2_REPLY_TEMPLATE + "|"
+                              + ia.IMG2_REPLY_TEMPLATE_NO_CREDITOR),
+                         self.TEMPLATE_SHA256)
         self.assertEqual(_sha("|".join((ia.CREDITOR_LINE_SINGLE, ia.CREDITOR_LINE_MULTI,
                                         ia.CREDITOR_LINE_ASSIGNED,
                                         ia.CREDITOR_LINE_AGENT))),
                          self.LINES_SHA256)
-        # 質問文は _HEARING_PROMPT_FROZEN の逐語（単一の正）・⑤は流用しない
-        for q in (ia.QUESTION_1, ia.QUESTION_2, ia.QUESTION_3, ia.QUESTION_4):
-            self.assertIn(q, main._HEARING_PROMPT_FROZEN)
+        # fix1: 質問文は IMG-2 固有の凍結文（_HEARING_PROMPT_FROZEN の逐語ではない・
+        # main.py の凍結プロンプトと test_autoreply_style1 の pin は不変）
+        self.assertEqual(_sha("|".join((ia.QUESTION_1, ia.QUESTION_2,
+                                        ia.QUESTION_3, ia.QUESTION_4))),
+                         self.QUESTIONS_SHA256)
+        self.assertIn("【友達追加・最初のメッセージへの自動返信】",
+                      main._HEARING_PROMPT_FROZEN)          # 参照のみ（不変）
         self.assertFalse(any(q.startswith("⑤") for _k, q in ia.QUESTIONS))
         self.assertEqual([k for k, _q in ia.QUESTIONS],
                          ["債権者名", "借入時期", "最終返済日", "裁判所書類の有無"])
