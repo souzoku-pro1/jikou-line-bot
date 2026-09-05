@@ -756,11 +756,13 @@ class TestHookFromReceipt(unittest.TestCase):
         self.analyze.assert_awaited_once_with(UID, "evt-77")
         self.assertEqual(ii._send_claims, set())        # claim 解放後に呼ばれる
 
-    def test_houki_not_triggered(self):
+    def test_houki_triggered_with_houki_cfg(self):
+        # HOUKI-IMG-2: 相続放棄は houki cfg で呼ばれる（旧「houki は起動しない」pin
+        # は本票で展開されたため置換・時効は既定 cfg=引数 2 つのまま）
         result = _run(ii.send_receipt_and_close("houki", main.hub_line_channel.HOUKI_CHANNEL,
                                                 UID))
         self.assertTrue(result)
-        self.analyze.assert_not_awaited()
+        self.analyze.assert_awaited_once_with(UID, "evt-77", ia.HOUKI)
 
     def test_receipt_failure_no_analysis_and_hook_error_contained(self):
         with patch.object(ii, "push_text", AsyncMock(return_value=False)), \

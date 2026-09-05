@@ -196,6 +196,19 @@ def _log_throttled(throttle_key: str) -> None:
         logger.info("admin LINE notify throttled kind=shindan_photos")
     elif head == "form_link_merge":
         logger.info("admin LINE notify throttled kind=form_link_merge")
+    # HOUKI-IMG-2: 相続放棄の書類写真読解 5 種
+    elif head == "houki_image_analysis_court":
+        logger.info("admin LINE notify throttled kind=houki_image_analysis_court")
+    elif head == "houki_image_analysis_notice":
+        logger.info("admin LINE notify throttled kind=houki_image_analysis_notice")
+    elif head == "houki_image_analysis_disposition":
+        logger.info("admin LINE notify throttled "
+                    "kind=houki_image_analysis_disposition")
+    elif head == "houki_image_analysis_send_failure":
+        logger.info("admin LINE notify throttled "
+                    "kind=houki_image_analysis_send_failure")
+    elif head == "houki_image_analysis_store":
+        logger.info("admin LINE notify throttled kind=houki_image_analysis_store")
     else:
         logger.info("admin LINE notify throttled kind=unknown_kind")
 

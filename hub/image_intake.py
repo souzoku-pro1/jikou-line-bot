@@ -175,13 +175,18 @@ async def send_receipt_and_close(channel_name: str, channel,
     （書類写真の AI 読解→債権者確認+未回答質問）を続ける。IMG-1 の受領返信・
     heal・claim の構造は不変。2 通目の失敗は握る（受領返信の結果を変えない）。"""
     result = await _send_receipt_and_close(channel_name, channel, user_id)
-    if result is True and channel_name == "jikou":
+    if result is True and channel_name in ("jikou", "houki"):
         try:
-            # event_id は最新マーカー行の category（画像受領:jikou:{event_id}）
-            cat = await latest_marker_category("jikou", user_id)
+            # event_id は最新マーカー行の category（画像受領:{channel}:{event_id}）
+            cat = await latest_marker_category(channel_name, user_id)
             event_id = cat.rsplit(":", 1)[-1] if cat else ""
-            if event_id:
+            if event_id and channel_name == "jikou":
                 await image_analysis.analyze_and_reply(user_id, event_id)
+            elif event_id:
+                # HOUKI-IMG-2: 相続放棄は houki cfg（App 40・読み取り項目の確認+
+                # 弁護士通知・質問なし）
+                await image_analysis.analyze_and_reply(user_id, event_id,
+                                                       image_analysis.HOUKI)
         except Exception:
             logger.error("[IMAGE_INTAKE] image analysis hook failed "
                          "(fixed reason)")
