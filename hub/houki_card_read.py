@@ -48,6 +48,7 @@ system prompt〔sha256 pin〕・timeout 60 秒・max_retries 1）→ 閉集合�
 
 import base64
 import datetime
+import itertools
 import logging
 import os
 import re
@@ -78,15 +79,19 @@ STALE_MINUTES = 10                        # 読取中 の取り残し判定（�
 # 【単一 worker 前提（既存裁定）】image_intake._send_claims と同型の in-memory 状態。
 # uvicorn workers=1（Procfile 実測・test_image_intake が pin）が前提。worker 複数化
 # 票では永続 CAS/一意キーによる排他へ置換すること（既知の制約・司令塔裁定でスコープ外）
-# _generations: record_id → 現在の所有世代（読取が進行中の間だけ存在。終端成功で削除）
-# _generation_counter: record_id → 単調増加の採番（削除後の再 claim が旧世代と衝突しない）
+# _generations: record_id → 現在の所有世代（読取が進行中の間だけ存在）。削除条件
+#   （fix3 HCRF2-02）: 終端成功／preempted（担当者の状態変更で終端しなかった）で
+#   「自世代が現在の所有者」のときに削除。fenced（他世代が所有）は削除しない。
+#   終端 CAS 失敗（読取中 のまま）は残す（次の reclaim で上書き・削除される）。
+#   record_id ごとの int なので肥大しない
+# _generation_seq: プロセス全体の単一採番（itertools.count・単調増加・record_id 別
+#   カウンタは持たない=削除後の再 claim が旧世代と衝突しない）
 _generations: dict[str, int] = {}
-_generation_counter: dict[str, int] = {}
+_generation_seq = itertools.count(1)
 
 
 def _next_generation(record_id: str) -> int:
-    gen = _generation_counter.get(record_id, 0) + 1
-    _generation_counter[record_id] = gen
+    gen = next(_generation_seq)
     _generations[record_id] = gen
     return gen
 
@@ -502,13 +507,16 @@ async def _finalize(record_id: str, status: str,
     読取済/要確認 へ遷移する。人が別の状態に変えていた場合は作用 0（preempted）。
     fix2: 加えて自分の claim 世代が現在の所有世代であること（不一致は fenced・
     作用 0）。409 は再取得して 1 回再試行し、再取得後も両方を再検査する。
-    終端成功で所有権を消す（遅れて来た旧処理は登録なし=不一致で作用 0）。"""
+    終端成功と preempted では所有権を消す（自世代が所有者のときのみ・fix3）。
+    失敗（読取中 のまま）は残す。"""
     for _attempt in range(2):
         try:
             latest = await kintone.get_record(store.APP_HOUKI_CASE, record_id)
             if not _owns(record_id, generation):
                 return "fenced"
             if store._v(latest, FIELD_STATUS) != STATUS_WORKING:
+                if _owns(record_id, generation):
+                    _generations.pop(record_id, None)
                 return "preempted"
             await kintone.update_record(store.APP_HOUKI_CASE, record_id,
                                         {FIELD_STATUS: status},
@@ -654,16 +662,25 @@ async def run_card_read(record: dict, reconciled: bool = False,
         preexisting = [c for c in ex["fields"] if store._v(record, c)]
         to_write = {c: v for c, v in ex["fields"].items() if c not in preexisting}
         problems: list[str] = []
-        if not _owns(record_id, generation):          # fix2: 転記直前の世代検査
+        if not _owns(record_id, generation):          # fix2: 転記直前の世代検査（早期離脱）
             outcome = "fenced"
             return outcome
+        # fix3 HCRF2-01: CAS 再試行中の所有権検査（各試行の前・409 後の再取得の前）
+        def fence() -> bool:
+            return _owns(record_id, generation)
         if to_write:
             _rid, problems, _choice = await store.apply_hearing_fields(
-                user_id, to_write, record)
+                user_id, to_write, record, fence=fence)
+            if "fenced" in problems:
+                outcome = "fenced"
+                return outcome
         if ex["creditors"]:
             latest_for_cred = await kintone.get_record(store.APP_HOUKI_CASE, record_id)
             summary["creditors_added"] = await store.append_creditors(
-                record_id, latest_for_cred, ex["creditors"])
+                record_id, latest_for_cred, ex["creditors"], fence=fence)
+            if not fence():
+                outcome = "fenced"
+                return outcome
 
         # 4. 実値で判定
         latest = await kintone.get_record(store.APP_HOUKI_CASE, record_id)

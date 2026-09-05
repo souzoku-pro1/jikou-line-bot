@@ -16,11 +16,15 @@
   検知したら作用 0・通知 1 行）
 - fix2 HCRF1-01: claim 世代フェンス。reclaim で失効した旧処理は転記・終端・通知を
   行わない（in-memory・単一 worker 前提）
+- fix3 HCRF2-01: フェンスは houki_case_store の CAS 再試行中（各試行の前・409 後の
+  再取得の前）にも効く（fence 引数・既定 None は従来挙動）。HCRF2-02: 採番は
+  プロセス単一の itertools.count・所有権は終端成功/preempted で自世代のときだけ削除
 """
 
 import asyncio
 import datetime
 import hashlib
+import itertools
 import os
 import unittest
 from unittest.mock import AsyncMock, patch
@@ -145,9 +149,7 @@ class _FakeApp40(_FakeStore):
 class _Base(unittest.TestCase):
     def setUp(self):
         r._generations.clear()
-        r._generation_counter.clear()
         self.addCleanup(r._generations.clear)
-        self.addCleanup(r._generation_counter.clear)
         self.store = _FakeApp40()
         self.admin = AsyncMock(return_value=True)
         self.ai = AsyncMock(return_value=_tool_response(_filled(), name="read_card"))
@@ -262,7 +264,9 @@ class TestWebhookGates(_Base):
         self.assertEqual(self.store.status(rid), r.STATUS_WORKING)
         self.assertEqual(self.store.field(rid, "$revision"), "2")   # claim で revision が進む
         self.runner.assert_awaited_once()
-        self.assertEqual(self.runner.await_args.args, (rid, False, 1))   # 世代 1 を所有
+        gen = self.runner.await_args.args[2]
+        self.assertEqual(self.runner.await_args.args, (rid, False, gen))  # 世代を所有
+        self.assertIsInstance(gen, int)
         # 二重配信の敗者（CAS 409）は 0 作用
         rid2 = self.store.seed_card(status=r.STATUS_REQUESTED)
         self.store.conflicts_left = 1
@@ -675,13 +679,15 @@ class TestGenerationFence(_Base):
                                          base_url="http://t") as client:
                 task_a = asyncio.create_task(self._post(client, rid))
                 await self._spin(at_gate)
-                self.assertEqual(r._generations[rid], 1)
+                gen_a = r._generations[rid]           # A が所有
                 self._make_stale(rid)                 # A が取り残しに見える
                 res_b = await self._post(client, rid)  # B: reclaim（世代 2）→ 完走
                 self.assertEqual(res_b.get("reconciled"), True)
                 self.assertEqual(self.store.status(rid), r.STATUS_DONE)
                 self.assertEqual(self.store.status_puts(), 1)
                 self.assertNotIn(rid, r._generations)  # B の終端で所有権が消える
+                self.assertNotEqual(r._next_generation("x"), gen_a)   # 採番は使い回さない
+                r._generations.pop("x")
                 gate.set()                             # A 復帰
                 res_a = await task_a
                 self.assertEqual(res_a.get("claimed"), True)
@@ -767,7 +773,6 @@ class TestGenerationFence(_Base):
         self.assertEqual(self.store.status_puts(), 1)
         self.assertEqual(self.kinds(), ["houki_card_read"])
         self.assertNotIn(rid, r._generations)
-        self.assertEqual(r._generation_counter[rid], 1)
 
     def test_fence_5_late_old_process_after_terminal_has_no_effect(self):
         rid = self.store.seed_card(status=r.STATUS_REQUESTED)
@@ -785,8 +790,8 @@ class TestGenerationFence(_Base):
         self.assertEqual(self.store.field(rid, "被相続人最後の住所"), "")
         self.assertEqual(self.store.status(rid), r.STATUS_DONE)
         self.admin.assert_not_awaited()
-        # 次の claim は旧世代と衝突しない（採番は単調増加）
-        self.assertEqual(r._next_generation(rid), 2)
+        # 次の claim は旧世代と衝突しない（採番はプロセス単一・単調増加）
+        self.assertGreater(r._next_generation(rid), 1)
 
     def test_fence_6_finalize_rechecks_generation_after_409(self):
         rid = self.store.seed_card()
@@ -808,6 +813,218 @@ class TestGenerationFence(_Base):
         self.assertEqual(self.store.status(rid), r.STATUS_WORKING)
         self.assertEqual(self.store.status_puts(), 0)
         self.assertEqual(self.kinds(), [])
+
+
+# ── 9. fix3 HCRF2-01: CAS 再試行中の所有権検査（実経路 interleave） ─────────────
+class TestFenceInCasRetry(_Base):
+    """A が転記直前の世代検査を通過 → A の第 1 PUT の直前に B が reclaim →
+    A の PUT は 409 → A は再取得・再試行せず write 0。B は空欄のみ転記。"""
+
+    def _body(self, rid):
+        return {"app": {"id": "40"}, "record": {"$id": {"value": rid}}}
+
+    async def _post(self, client, rid):
+        return (await client.post(_URL, json=self._body(rid))).json()
+
+    def _make_stale(self, rid):
+        self.store.cases[rid][r.FIELD_UPDATED] = {"value": _ts(r.STALE_MINUTES + 1)}
+
+    def _gate_first_field_put(self):
+        """最初の非ステータス PUT（A の転記）を gate で止める update_record ラッパ。"""
+        real = self.store.update_record
+        gate, at_gate = asyncio.Event(), asyncio.Event()
+        state = {"fired": False, "field_puts": 0}
+
+        async def update(app, record_id, fields, revision=None):
+            if r.FIELD_STATUS not in fields:
+                state["field_puts"] += 1
+                if not state["fired"]:
+                    state["fired"] = True
+                    at_gate.set()
+                    await gate.wait()
+            elif fields.get(r.FIELD_STATUS) in (r.STATUS_DONE, r.STATUS_REVIEW):
+                self.store.status_put_count += 1
+            return await real(app, record_id, fields, revision)
+        return update, gate, at_gate, state
+
+    def _ai_by_call(self, first, rest):
+        calls = {"n": 0}
+
+        async def ai(*a, **k):
+            calls["n"] += 1
+            return _tool_response(first if calls["n"] == 1 else rest, name="read_card")
+        self.ai.side_effect = ai
+
+    def _scenario(self, rid, update):
+        gate, at_gate = update[1], update[2]
+
+        async def run():
+            with patch.object(hub_kintone, "update_record", update[0]):
+                async with httpx.AsyncClient(transport=httpx.ASGITransport(app=main.app),
+                                             base_url="http://t") as client:
+                    task_a = asyncio.create_task(self._post(client, rid))
+                    await asyncio.wait_for(at_gate.wait(), timeout=5)
+                    self._make_stale(rid)
+                    res_b = await self._post(client, rid)   # B: reclaim → 完走
+                    gate.set()                               # A の PUT（旧 revision）
+                    res_a = await task_a
+                    return res_a, res_b
+        return _run(run())
+
+    def test_hcrf2_01_fields_first_put_409_then_no_retry(self):
+        rid = self.store.seed_card(status=r.STATUS_REQUESTED)
+        self._ai_by_call(_filled(), _filled(_2=_e(None)))     # A は住所あり・B は住所なし
+        update = self._gate_first_field_put()
+        res_a, res_b = self._scenario(rid, update)
+        self.assertEqual(res_b.get("reconciled"), True)
+        self.assertEqual(res_a.get("claimed"), True)
+        self.assertEqual(self.store.field(rid, "被相続人最後の住所"), "")   # A は write 0
+        self.assertEqual(self.store.field(rid, "被相続人氏名"), V_NAME)      # B が転記
+        self.assertEqual(self.store.case_queries, 0)                        # A は再取得しない
+        self.assertEqual(update[3]["field_puts"], 3)     # A 1 回（再試行なし）+ B 2 回（欄・債権者）
+        self.assertEqual(self.store.status(rid), r.STATUS_DONE)
+        self.assertEqual(self.store.status_puts(), 1)
+        self.assertEqual(self.kinds(), ["houki_card_read"])                 # B の 1 通のみ
+        self.assertEqual(self.store.creditors(rid), [V_CRED])
+
+    def test_hcrf2_01_creditors_first_put_409_then_no_retry(self):
+        rid = self.store.seed_card(status=r.STATUS_REQUESTED)
+        a_card = _report(_12=_e([{"name": V_CRED, "contact": None, "court_document": "なし"}]))
+        b_card = _report(_12=_e([{"name": "プロミス", "contact": None, "court_document": "なし"}]))
+        self._ai_by_call(a_card, b_card)
+        update = self._gate_first_field_put()
+        res_a, res_b = self._scenario(rid, update)
+        self.assertEqual(res_b.get("reconciled"), True)
+        self.assertEqual(self.store.creditors(rid), ["プロミス"])           # A の行は入らない
+        self.assertEqual(update[3]["field_puts"], 2)                        # A 1 回 + B 1 回
+        self.assertEqual(self.store.status(rid), r.STATUS_DONE)
+        self.assertEqual(self.kinds(), ["houki_card_read"])                 # 収束不能通知なし
+
+    def test_hcrf2_01_a_put_first_then_b_reclaim_loses(self):
+        rid = self.store.seed_card(status=r.STATUS_REQUESTED)
+        real = self.store.update_record
+        gate_a, at_gate_a, a_put_done = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        state = {"claims": 0, "fired": False}
+
+        async def update(app, record_id, fields, revision=None):
+            if fields.get(r.FIELD_STATUS) == r.STATUS_WORKING:
+                state["claims"] += 1
+                if state["claims"] == 2:                 # B の reclaim: A の PUT を先行させる
+                    gate_a.set()
+                    await asyncio.wait_for(a_put_done.wait(), timeout=5)
+            elif r.FIELD_STATUS not in fields and not state["fired"]:
+                state["fired"] = True
+                at_gate_a.set()
+                await gate_a.wait()
+                out = await real(app, record_id, fields, revision)
+                a_put_done.set()
+                return out
+            elif fields.get(r.FIELD_STATUS) in (r.STATUS_DONE, r.STATUS_REVIEW):
+                self.store.status_put_count += 1
+            return await real(app, record_id, fields, revision)
+
+        async def run():
+            with patch.object(hub_kintone, "update_record", update):
+                async with httpx.AsyncClient(transport=httpx.ASGITransport(app=main.app),
+                                             base_url="http://t") as client:
+                    task_a = asyncio.create_task(self._post(client, rid))
+                    await asyncio.wait_for(at_gate_a.wait(), timeout=5)
+                    self._make_stale(rid)
+                    res_b = await self._post(client, rid)
+                    res_a = await task_a
+                    return res_a, res_b
+        res_a, res_b = _run(run())
+        self.assertEqual(res_b.get("skip"), "cas_lost")                   # B は敗北
+        self.assertEqual(res_a.get("claimed"), True)
+        self.assertEqual(self.store.status(rid), r.STATUS_DONE)           # A が終端まで所有
+        self.assertEqual(self.store.field(rid, "被相続人氏名"), V_NAME)
+        self.assertEqual(self.store.creditors(rid), [V_CRED])
+        self.assertEqual(self.store.status_puts(), 1)
+        self.assertEqual(self.kinds(), ["houki_card_read"])
+        self.assertNotIn(rid, r._generations)
+
+    def test_hcrf2_01_fence_none_keeps_default_behaviour(self):
+        """fence=None（既存呼び出し）は 409 で再取得・再試行する従来挙動。"""
+        rid = self.store.seed_card()
+        rec = _run(self.store.get_record(None, rid))
+        self.store.conflicts_left = 1
+        _rid, problems, _c = _run(store.apply_hearing_fields(UID, {"被相続人氏名": V_NAME}, rec))
+        self.assertEqual(problems, [])
+        self.assertEqual(self.store.field(rid, "被相続人氏名"), V_NAME)    # 再試行して書けた
+        self.assertEqual(self.store.case_queries, 1)
+        rec = _run(self.store.get_record(None, rid))
+        self.store.conflicts_left = 1
+        self.assertEqual(_run(store.append_creditors(rid, rec, [V_CRED])), 1)
+        self.assertEqual(self.store.creditors(rid), [V_CRED])
+        # fence が False を返すときは初回から write 0
+        rec = _run(self.store.get_record(None, rid))
+        _rid, problems, _c = _run(store.apply_hearing_fields(
+            UID, {"被相続人最後の住所": V_ADDR}, rec, fence=lambda: False))
+        self.assertEqual(problems, ["fenced"])
+        self.assertEqual(self.store.field(rid, "被相続人最後の住所"), "")
+        self.assertEqual(_run(store.append_creditors(rid, rec, ["プロミス"],
+                                                     fence=lambda: False)), 0)
+        self.assertEqual(self.store.creditors(rid), [V_CRED])
+        self.assertEqual(self.kinds(), [])                                 # 収束不能通知なし
+
+
+# ── 10. fix3 HCRF2-02: 世代テーブルの肥大防止 ───────────────────────────────────
+class TestGenerationTableCleanup(_Base):
+    def test_single_process_counter_pinned(self):
+        self.assertFalse(hasattr(r, "_generation_counter"))
+        self.assertIsInstance(r._generation_seq, itertools.count)
+        a = r._next_generation("1")
+        b = r._next_generation("2")
+        self.assertGreater(b, a)                                            # 単調増加
+        self.assertEqual(r._generations, {"1": a, "2": b})
+
+    def test_entry_removed_on_normal_terminal(self):
+        rid = self.store.seed_card()
+        gen = r._next_generation(rid)
+        rec = _run(self.store.get_record(None, rid))
+        self.assertEqual(_run(r.run_card_read(rec, False, gen)), "done")
+        self.assertNotIn(rid, r._generations)
+
+    def test_entry_removed_on_preempted_when_owner(self):
+        rid = self.store.seed_card()
+        gen = r._next_generation(rid)
+        other = r._next_generation("other")                                 # 他レコードの所有権
+
+        async def ai_then_human(*a, **k):
+            self.human_change(rid, r.STATUS_REVIEW)
+            return _tool_response(_filled(), name="read_card")
+        self.ai.side_effect = ai_then_human
+        rec = _run(self.store.get_record(None, rid))
+        _run(r.run_card_read(rec, False, gen))
+        self.assertNotIn(rid, r._generations)                              # 自世代なので削除
+        self.assertEqual(r._generations, {"other": other})                 # 他は消さない
+        self.assertIn("担当者の変更を検知", self.notices()[0][1])
+
+    def test_entry_kept_on_finalize_failure(self):
+        rid = self.store.seed_card()
+        gen = r._next_generation(rid)
+        real = self.store.update_record
+
+        async def flaky(app, record_id, fields, revision=None):
+            if r.FIELD_STATUS in fields:
+                raise hub_kintone.KintoneError(500, "x", "y")
+            return await real(app, record_id, fields, revision)
+        rec = _run(self.store.get_record(None, rid))
+        with patch.object(hub_kintone, "update_record", flaky):
+            _run(r.run_card_read(rec, False, gen))
+        self.assertEqual(self.store.status(rid), r.STATUS_WORKING)
+        self.assertEqual(r._generations.get(rid), gen)                     # 残す（次の reclaim で上書き）
+        self.assertEqual(self.kinds(), ["houki_card_read_failure", "houki_card_read"])
+
+    def test_entry_kept_for_owner_when_old_process_is_fenced(self):
+        rid = self.store.seed_card()
+        old = r._next_generation(rid)
+        new = r._next_generation(rid)                                       # B が reclaim 済み
+        rec = _run(self.store.get_record(None, rid))
+        self.assertEqual(_run(r.run_card_read(rec, False, old)), "fenced")
+        self.assertEqual(r._generations.get(rid), new)                     # 他世代の所有権は消さない
+        self.assertEqual(self.kinds(), [])
+        self.assertEqual(self.store.status(rid), r.STATUS_WORKING)
 
 
 # ── 5. スキーマ・pin・sink ────────────────────────────────────────────────────────
