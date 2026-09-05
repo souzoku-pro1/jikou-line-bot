@@ -129,7 +129,7 @@ REPORT_TOOL = {
 }
 
 # ── 相談者への返信（弁護士文言・凍結・sha256 pin） ────────────────────────────
-# JIKOU-IMG-2-fix1: 弁護士決定の文言へ差し替え（逐語・記号・全角空白・改行・
+# JIKOU-IMG-2-fix1/fix3: 弁護士決定の文言へ差し替え（逐語・記号・全角空白・改行・
 # 「1．」の全角ピリオドを含めて一字も変えない）。「〇〇」の位置が債権者名の
 # 差し込み位置で、鉤括弧「」はテンプレ側に残す。質問文は _HEARING_PROMPT_FROZEN
 # の逐語ではなく IMG-2 固有の凍結文（test_image_analysis が sha256 pin）
@@ -145,7 +145,7 @@ IMG2_REPLY_TEMPLATE = (
 )
 # (a) 債権者名が読み取れなかった場合（質問のみ版）: 2 行目を置き換え、
 #     「あわせて、」の行は「次の点について、…」に置き換える（司令塔案）
-NO_CREDITOR_LINE = "お写真からは、債権者名を読み取ることができませんでした。"
+NO_CREDITOR_LINE = "お写真からは、債権者名を確認できませんでした。"
 QUESTIONS_LEAD_NO_CREDITOR = "次の点について、分かる範囲で教えてください。"
 IMG2_REPLY_TEMPLATE_NO_CREDITOR = (
     IMG2_HEADER + "\n"
@@ -155,14 +155,14 @@ IMG2_REPLY_TEMPLATE_NO_CREDITOR = (
 )
 # 債権者行（2 行目。3 行目 CREDITOR_CONFIRM は 4 文型共通）
 CREDITOR_LINE_SINGLE = "お写真からは、債権者名が「{A}」と読み取れました。"
-# (b) 複数（2〜3 社）: {LIST}=「A」「B」（3 社は「A」「B」「C」）
+# (b) 複数（2〜3 社）: {LIST}=「A」と「B」（3 社は「A」と「B」と「C」）
 CREDITOR_LINE_MULTI = "お写真からは、債権者名が{LIST}と読み取れました。"
 # (c) 譲渡
 CREDITOR_LINE_ASSIGNED = ("お写真からは、債権者名が「{譲受人}」（「{原債権者}」から"
-                          "債権譲渡を受けたもの）と読み取れました。")
+                          "債権を譲り受けた会社）と読み取れました。")
 # (d) 代理人
 CREDITOR_LINE_AGENT = ("お写真からは、債権者名が「{債権者}」（ご連絡元の「{代理人}」"
-                       "はその代理人）と読み取れました。")
+                       "は債権者の代理人）と読み取れました。")
 
 # 質問ブロック（弁護士文言・逐語。番号は振り直さない。①は司令塔案=債権者行が
 # 無い場合のみ ②③④ の前に置く）
@@ -246,8 +246,8 @@ def parse_report(tool_input) -> dict | None:
 
 # ── 債権者行の組み立て（high のみ・差し込み値検証・1 つでも落ちたら省略） ────────
 def _join_names(names: list[str]) -> str:
-    """(b) 複数の並び: 「A」「B」（3 社は「A」「B」「C」）。"""
-    return "".join(f"「{n}」" for n in names)
+    """(b) 複数の並び: 「A」と「B」（3 社は「A」と「B」と「C」・司令塔の補完）。"""
+    return "と".join(f"「{n}」" for n in names)
 
 
 def creditor_line(creditors: list[dict]) -> str | None:
