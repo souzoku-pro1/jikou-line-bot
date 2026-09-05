@@ -331,10 +331,18 @@ class TestNoticeOnlyItems(_Base):
         self.assertNotIn("アコム", notice.args[0])
         for code in ("財産処分有無", "訴訟督促有無", "財産_負債"):
             self.assertEqual(self.store.field(rid, code), "", code)
-        # knowledge_timing=該当 だけでも通知（kind=不明）
+        # HI2-02（票の訂正）: knowledge_timing 単独では発火しない（kind のみ）。
+        # 旧 pin「kind=不明でも該当なら通知」は訂正により置換（緩和ではない）
+        for kind in ("不明", "なし"):
+            with self.subTest(kind=kind):
+                self.setUp()
+                self.seed()
+                self.set_ai(inh_kind=kind, timing="該当")
+                self.go()
+                self.admin.assert_not_awaited()
         self.setUp()
         self.seed()
-        self.set_ai(inh_kind="不明", timing="該当")
+        self.set_ai(inh_kind="相続放棄申述受理通知書", timing="不明")
         self.go()
         self.assertEqual(self.notify_kinds(), ["houki_image_analysis_notice"])
         # 不明 は通知しない
@@ -563,6 +571,102 @@ class TestConfigSeparationAndPins(_Base):
         with boom:
             self.assertEqual(self.go(), "sent")
         self.assertEqual(ia.REPLY_MAX_CHARS, 600)
+
+
+# ── fix1: HI2-01（死亡日_申告 の整合検証経由）・HI2-02（notice 条件） ──────────────
+class TestFix1DeathDateValidation(_Base):
+    def test_hi2_01_inconsistent_with_known_date_write0(self):
+        # (1) 死亡を知った日_申告=2024-05-01 保存済み・death_date=2024-06-01 →
+        #     死亡日 > 知った日 の矛盾 → write 0・既存欄不変・通知なし
+        rid = self.seed(**{"死亡を知った日_申告": "2024-05-01"})
+        self.set_ai(death="2024-06-01", death_conf="high")
+        with self.assertLogs(ia.logger, level="INFO") as cm:
+            self.assertEqual(self.go(), "sent")
+        self.assertIn("date_inconsistent", "\n".join(cm.output))
+        self.assertIn("「2024年6月1日」", self.sent_text())        # 表示はする
+        self.assertEqual(self.store.field(rid, "死亡日_申告"), "")
+        self.assertEqual(self.store.field(rid, "死亡を知った日_申告"), "2024-05-01")
+        self.assertEqual(self.store.field(rid, "$revision"), "1")
+        self.assertNotIn("houki_image_analysis_store", self.notify_kinds())
+
+    def test_hi2_01_conflict_then_inconsistent_after_refetch(self):
+        # (2) CAS 競合中に 死亡を知った日_申告 が書き換えられ矛盾 → 再取得後 write 0
+        rid = self.seed()
+        self.set_ai(death="2024-06-01", death_conf="high")
+        orig = self.store.update_record
+        state = {"n": 0}
+
+        async def racing(app, record_id, fields, revision=None):
+            if "死亡日_申告" in fields and state["n"] == 0:
+                state["n"] += 1
+                rec = self.store.cases[str(record_id)]
+                rec["死亡を知った日_申告"] = {"value": "2024-05-01"}
+                rec["$revision"] = {"value": str(int(rec["$revision"]["value"]) + 1)}
+                raise hub_kintone.KintoneConflict(409, "GAIA_CO02", "c")
+            return await orig(app, record_id, fields, revision)
+        with patch.object(hub_kintone, "update_record", racing):
+            self.assertEqual(self.go(), "sent")
+        self.assertEqual(state["n"], 1)
+        self.assertEqual(self.store.field(rid, "死亡日_申告"), "")
+        self.assertEqual(self.store.field(rid, "死亡を知った日_申告"), "2024-05-01")
+
+    def test_hi2_01_consistent_stored_and_existing_not_overwritten(self):
+        # (3) 整合（死亡日 ≤ 知った日）→ 従来どおり転記
+        rid = self.seed(**{"死亡を知った日_申告": "2024-06-10",
+                           "相続人と知った日_申告": "2024-06-12"})
+        self.set_ai(death="2024-06-01", death_conf="high")
+        self.assertEqual(self.go(), "sent")
+        self.assertEqual(self.store.field(rid, "死亡日_申告"), "2024-06-01")
+        self.assertEqual(self.store.field(rid, "死亡を知った日_申告"), "2024-06-10")
+        # CAS 競合 1 回（矛盾なし）でも収束して転記
+        self.setUp()
+        rid = self.seed()
+        self.set_ai(death="2024-06-01", death_conf="high")
+        self.store.conflicts_left = 1
+        self.assertEqual(self.go(), "sent")
+        self.assertEqual(self.store.field(rid, "死亡日_申告"), "2024-06-01")
+        # (4) 死亡日_申告 が非空なら転記しない（検証にも入らない）
+        self.setUp()
+        rid = self.seed(**{"死亡日_申告": "2020-01-01"})
+        self.set_ai(death="2024-06-01", death_conf="high")
+        with patch.object(houki_case_store, "apply_hearing_fields",
+                          AsyncMock(side_effect=AssertionError("must not be called"))):
+            self.assertEqual(self.go(), "sent")
+        self.assertEqual(self.store.field(rid, "死亡日_申告"), "2020-01-01")
+
+    def test_hi2_01_goes_through_houki_case_store(self):
+        # 独自 CAS 直書きではなく apply_hearing_fields（検証+収束）を経由する
+        rid = self.seed()
+        self.set_ai(death="2024-06-01", death_conf="high")
+        with patch.object(houki_case_store, "apply_hearing_fields",
+                          AsyncMock(return_value=(rid, [], []))) as apply:
+            self.assertEqual(self.go(), "sent")
+        apply.assert_awaited_once()
+        args = apply.await_args.args
+        self.assertEqual(args[0], UID)
+        self.assertEqual(args[1], {"死亡日_申告": "2024-06-01"})
+        self.assertEqual(args[2]["$id"]["value"], rid)
+        src = open("hub/image_analysis.py", encoding="utf-8").read()
+        body = src[src.index("async def _houki_store_death_date("):
+                   src.index("async def _houki_store(")]
+        self.assertNotIn("update_record", body)
+        self.assertIn("apply_hearing_fields", body)
+
+    def test_hi2_02_notice_condition(self):
+        cases = {("不明", "該当"): 0, ("なし", "該当"): 0,
+                 ("相続放棄申述受理通知書", "不明"): 1,
+                 ("その他", "非該当"): 1, ("なし", "不明"): 0}
+        for (kind, timing), expected in cases.items():
+            with self.subTest(kind=kind, timing=timing):
+                self.setUp()
+                self.seed()
+                self.set_ai(inh_kind=kind, timing=timing)
+                self.go()
+                self.assertEqual(self.notify_kinds().count("houki_image_analysis_notice"),
+                                 expected)
+        # parse 段階では組合せを拒否しない（他の有効情報を失わない）
+        rep = ia.parse_houki_report(_hrep([_hc("アコム")], inh_kind="不明", timing="該当"))
+        self.assertIsNotNone(rep)
 
 
 if __name__ == "__main__":

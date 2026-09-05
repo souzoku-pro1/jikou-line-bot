@@ -507,6 +507,8 @@ def _log_result(outcome: str) -> None:
         logger.info("[IMAGE_ANALYSIS] blocked (paused/stoplist/human)")
     elif outcome == "recheck_failed":
         logger.warning("[IMAGE_ANALYSIS] recheck_failed (no send, no marker)")
+    elif outcome == "date_inconsistent":
+        logger.info("[IMAGE_ANALYSIS] date_inconsistent (death date not stored)")
     elif outcome == "send_failed":
         logger.error("[IMAGE_ANALYSIS] send failed (no marker)")
     elif outcome == "sent":
@@ -961,33 +963,33 @@ def _houki_compose(report: dict | None, latest: dict) -> Composed:
     return Composed(text, ai_state, items)
 
 
-async def _houki_store_death_date(record_id: str, iso: str) -> str:
-    """死亡日_申告 が空欄のときのみ $revision CAS で書く（noop/stored/failed）。
-    死亡日（確定）・起算日_確定・知った日 3 欄には書かない。"""
-    for _attempt in range(HOUKI_STORE_RETRIES + 1):
-        try:
-            latest = await kintone.get_record(houki_case_store.APP_HOUKI_CASE,
-                                              record_id)
-        except kintone.KintoneError:
-            return "failed"
-        if _v(latest, "死亡日_申告").strip():
-            return "noop"
-        try:
-            await kintone.update_record(
-                houki_case_store.APP_HOUKI_CASE, record_id,
-                {"死亡日_申告": iso}, revision=_v(latest, "$revision"))
-            return "stored"
-        except kintone.KintoneConflict:
-            continue
-        except kintone.KintoneError:
-            return "failed"
-    return "failed"
+async def _houki_store_death_date(record_id: str, latest: dict, iso: str) -> str:
+    """死亡日_申告 の転記（HI2-01）: houki_case_store.apply_hearing_fields
+    （H-3 の「最新レコード+書込値」合成 postimage 検証 split_valid_fields →
+    validate_hearing_dates〔死亡日_申告 ≤ 死亡を知った日_申告 ≤ 相続人と知った日_申告・
+    未来日・形式〕→ upsert_case_fields〔空でない現値は上書きしない〕→ 409 は
+    再取得・再検証・再試行 ≤ _CAS_RETRIES）を経由する。独自の CAS 直書きはしない。
+    noop=非空／date_inconsistent=矛盾（write 0・既存欄不変・通知なし）／
+    stored／failed（KintoneError）。"""
+    if _v(latest, "死亡日_申告").strip():
+        return "noop"
+    user_id = _v(latest, "LINEユーザーID")
+    try:
+        _rid, problems, _choice = await houki_case_store.apply_hearing_fields(
+            user_id, {"死亡日_申告": iso}, latest)
+    except kintone.KintoneError:
+        return "failed"
+    if problems:
+        _log_result("date_inconsistent")
+        return "date_inconsistent"
+    return "stored"
 
 
 async def _houki_store(record_id: str, latest: dict, composed: Composed) -> str:
     """App 40 への転記: 債権者名は houki_case_store.append_creditors（重複除去・
     CAS 収束・収束不能は同関数が要確認通知）・死亡日_申告 は空欄のみ CAS。
-    訴訟督促有無・財産処分有無・財産_負債 は書かない。"""
+    訴訟督促有無・財産処分有無・財産_負債 は書かない。死亡日_申告 は
+    houki_case_store の日付整合検証（3 欄の順序制約）を経由する（HI2-01）。"""
     items = composed.data
     outcome = "noop"
     if items["creditor_names"]:
@@ -999,7 +1001,8 @@ async def _houki_store(record_id: str, latest: dict, composed: Composed) -> str:
         except Exception:
             outcome = "failed"
     if items["death_date"] is not None:
-        res = await _houki_store_death_date(record_id, items["death_date"].isoformat())
+        res = await _houki_store_death_date(record_id, latest,
+                                            items["death_date"].isoformat())
         if res == "failed":
             outcome = "failed"
         elif res == "stored" and outcome != "failed":
@@ -1019,7 +1022,8 @@ async def _houki_notify(report: dict | None, record_id: str, user_id: str) -> No
             f"（レコード番号 {record_id}）。内容を確認してください。",
             f"houki_image_analysis_court:{record_id}")
     inh = report["inheritance_document"]
-    if inh["kind"] not in ("なし", "不明") or inh["knowledge_timing"] == "該当":
+    # HI2-02（票の訂正）: 発火は kind のみ。knowledge_timing 単独では発火しない
+    if inh["kind"] not in ("なし", "不明"):
         d = parse_iso_date(inh["document_date"])
         date_text = format_date_ja(d) if d else "不明"
         await _notify(
