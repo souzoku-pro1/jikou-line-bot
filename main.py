@@ -34,6 +34,7 @@ from valuation_ingest import router as valuation_ingest_router
 from zaisan_webhook import router as zaisan_router
 from notice_webhook import router as notice_router
 from shinjutsu_webhook import router as shinjutsu_router
+from houki_card_webhook import router as houki_card_router
 app.include_router(cloudsign_router)
 app.include_router(contract_router)
 app.include_router(document_router)
@@ -48,6 +49,7 @@ app.include_router(valuation_ingest_router)
 app.include_router(zaisan_router)
 app.include_router(notice_router)
 app.include_router(shinjutsu_router)
+app.include_router(houki_card_router)
 from shindan_form import router as shindan_router
 app.include_router(shindan_router)
 
