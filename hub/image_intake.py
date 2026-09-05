@@ -44,6 +44,7 @@ import os
 
 from chat_responder import IMAGE_INBOUND_MARKER, IMAGE_RECEIPT_REPLY
 from hub import houki_case_store
+from hub import image_analysis
 from hub import image_store
 from hub import kintone
 from hub import notify
@@ -169,6 +170,26 @@ async def debounce_and_elect(channel_name: str, user_id: str,
 
 async def send_receipt_and_close(channel_name: str, channel,
                                  user_id: str) -> bool | None:
+    """受領返信の送信+閉鎖（_send_receipt_and_close）。JIKOU-IMG-2: 時効
+    チャネルで True（送信+閉鎖成功）のときだけ、claim 解放後に 2 通目
+    （書類写真の AI 読解→債権者確認+未回答質問）を続ける。IMG-1 の受領返信・
+    heal・claim の構造は不変。2 通目の失敗は握る（受領返信の結果を変えない）。"""
+    result = await _send_receipt_and_close(channel_name, channel, user_id)
+    if result is True and channel_name == "jikou":
+        try:
+            # event_id は最新マーカー行の category（画像受領:jikou:{event_id}）
+            cat = await latest_marker_category("jikou", user_id)
+            event_id = cat.rsplit(":", 1)[-1] if cat else ""
+            if event_id:
+                await image_analysis.analyze_and_reply(user_id, event_id)
+        except Exception:
+            logger.error("[IMAGE_INTAKE] image analysis hook failed "
+                         "(fixed reason)")
+    return result
+
+
+async def _send_receipt_and_close(channel_name: str, channel,
+                                  user_id: str) -> bool | None:
     """受領返信を push し、**成功（True）を確認できたときだけ**受領済み行を
     保存して冪等を閉じる（fix1[03]・H-4 の「通知 True 時のみ書込」と同型）。
 
