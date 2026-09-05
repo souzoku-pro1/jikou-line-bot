@@ -284,7 +284,13 @@ _photo_attempts: "OrderedDict[str, tuple[float, int]]" = OrderedDict()
 # worker 複数化票では永続ストアへ置換すること（_attempts と同じ既知の制約）
 UPLOAD_TOKEN_TTL_SECONDS = 15 * 60
 MAX_UPLOAD_TOKENS = 5000
-_upload_tokens: "OrderedDict[str, tuple[float, str, str]]" = OrderedDict()
+# token → (発行時刻, record_id, 受付番号, claimed)
+# fix1（H3-01）: 状態は 3 つ——未使用（claimed=False）／予約中（claimed=True・
+# 解析〜検査の間だけ）／使用済み（辞書から削除=consumed）。解析・容量・形式の
+# 失敗は release で未使用へ戻し（TTL 内なら同じ URL で再送可）、添付呼び出しに
+# 進む時点で consume（以後は添付結果に関わらず 404=再試行しない規律）。
+# TTL は発行時刻基準のまま（claim/release で延長しない）
+_upload_tokens: "OrderedDict[str, tuple[float, str, str, bool]]" = OrderedDict()
 
 
 def issue_upload_token(record_id: str, number: str, now: float) -> str:
@@ -292,31 +298,53 @@ def issue_upload_token(record_id: str, number: str, now: float) -> str:
     token = secrets.token_urlsafe(32)
     while len(_upload_tokens) >= MAX_UPLOAD_TOKENS:
         _upload_tokens.popitem(last=False)           # 最古（LRU）を退避
-    _upload_tokens[token] = (now, record_id, number)
+    _upload_tokens[token] = (now, record_id, number, False)
     return token
 
 
 def _upload_token_entry(token: str, now: float) -> tuple[str, str] | None:
-    """有効（存在・未期限・未使用）なら (record_id, 受付番号)。期限切れは削除。"""
+    """有効（存在・未期限・未使用かつ予約中でない）なら (record_id, 受付番号)。
+    期限切れは削除。予約中（他の POST が解析中）は無効扱い（404）。"""
     if not token:
         return None
     entry = _upload_tokens.get(token)
     if entry is None:
         return None
-    issued, record_id, number = entry
+    issued, record_id, number, claimed = entry
     if now - issued > UPLOAD_TOKEN_TTL_SECONDS:
         _upload_tokens.pop(token, None)
+        return None
+    if claimed:
         return None
     return record_id, number
 
 
-def consume_upload_token(token: str, now: float) -> tuple[str, str] | None:
-    """有効なトークンを 1 回限りで消費する（消費後は 404 に戻る）。"""
+def claim_upload_token(token: str, now: float) -> tuple[str, str] | None:
+    """トークンを予約する（check-then-act は await を挟まない同期区間＝
+    H4-fix2 / IMG-1 _send_claims と同型・単一 worker 前提）。未使用かつ TTL 内
+    なら予約成功・予約中/使用済み/期限切れは None（404）。"""
     entry = _upload_token_entry(token, now)
     if entry is None:
         return None
-    _upload_tokens.pop(token, None)
+    issued, record_id, number, _claimed = _upload_tokens[token]
+    _upload_tokens[token] = (issued, record_id, number, True)
     return entry
+
+
+def release_upload_token(token: str) -> None:
+    """予約を解除して未使用へ戻す（解析・容量・形式の失敗・予期しない例外）。
+    使用済み（削除済み）なら何もしない。"""
+    entry = _upload_tokens.get(token)
+    if entry is None:
+        return
+    issued, record_id, number, _claimed = entry
+    _upload_tokens[token] = (issued, record_id, number, False)
+
+
+def consume_upload_token(token: str, now: float | None = None) -> None:
+    """使用済みに確定する（辞書から削除・以後は 404）。添付呼び出しに進む時点で
+    呼ぶ。添付の結果（成功・失敗・unconverged）に関わらず戻さない。"""
+    _upload_tokens.pop(token, None)
 
 
 def _photo_rate_exceeded(key: str, now: float) -> bool:
@@ -728,29 +756,39 @@ async def shindan_photos_entry(request: Request, token: str = ""):
             "アクセスが集中しています",
             "アクセスが集中しています。しばらく時間をおいてから"
             "もう一度お試しください。", 429)
-    entry = consume_upload_token(token, now)
+    # fix1（H3-01）: ⑥予約（claim・同期区間）。解析〜検査の失敗は finally で
+    # release（未使用へ戻す=TTL 内なら同じ URL で再送可）。添付呼び出しに進む
+    # 時点で consume に確定し、以後は添付結果に関わらず戻さない
+    entry = claim_upload_token(token, now)
     if entry is None:
         return _not_found()
     record_id, number = entry
-    # ── ここで初めて body を読む（有界ストリーミング・一時ファイルなし） ──
+    consumed = False
     try:
-        contents = await _parse_multipart_stream(request.stream(), boundary)
-    except _MultipartLimit:
-        logger.info("[SHINDAN_PHOTOS] limit exceeded (aborted)")
-        return _photo_limit_page()
-    except _MultipartBad:
-        logger.info("[SHINDAN_PHOTOS] malformed multipart")
-        return _photo_bad_page()
-    if not contents:
-        return _photo_bad_page()
-    files: list[tuple[str, bytes, str]] = []
-    for i, data in enumerate(contents, start=1):
-        fmt = image_store.detect_format(data)
-        if fmt is None:
-            logger.info("[SHINDAN_PHOTOS] unknown format (no attach)")
+        # ── ここで初めて body を読む（有界ストリーミング・一時ファイルなし） ──
+        try:
+            contents = await _parse_multipart_stream(request.stream(), boundary)
+        except _MultipartLimit:
+            logger.info("[SHINDAN_PHOTOS] limit exceeded (aborted)")
+            return _photo_limit_page()
+        except _MultipartBad:
+            logger.info("[SHINDAN_PHOTOS] malformed multipart")
             return _photo_bad_page()
-        ext, mime = fmt
-        files.append((f"form_{number}_{i}.{ext}", data, mime))
+        if not contents:
+            return _photo_bad_page()
+        files: list[tuple[str, bytes, str]] = []
+        for i, data in enumerate(contents, start=1):
+            fmt = image_store.detect_format(data)
+            if fmt is None:
+                logger.info("[SHINDAN_PHOTOS] unknown format (no attach)")
+                return _photo_bad_page()
+            ext, mime = fmt
+            files.append((f"form_{number}_{i}.{ext}", data, mime))
+        consume_upload_token(token)
+        consumed = True
+    finally:
+        if not consumed:
+            release_upload_token(token)          # 成功確定前の離脱は必ず解除
     outcome = await image_store.attach_files(
         APP_JIKOU_CASE, record_id, files)
     if outcome != "attached":

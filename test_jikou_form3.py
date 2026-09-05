@@ -675,15 +675,27 @@ class TestUploadToken(unittest.TestCase):
         sf._upload_tokens.clear()
         self.addCleanup(sf._upload_tokens.clear)
 
-    def test_issue_peek_consume_once(self):
+    def test_issue_peek_claim_release_consume(self):
+        # fix1（H3-01）: 未使用 → 予約（claim）→ 解除（release）で未使用へ戻る／
+        # 予約 → 確定（consume）で使用済み（削除・以後 404）
         tok = sf.issue_upload_token("12", "123456", 1000.0)
         self.assertGreaterEqual(len(tok), 32)
         self.assertEqual(sf._upload_token_entry(tok, 1000.0), ("12", "123456"))
-        self.assertEqual(sf.consume_upload_token(tok, 1001.0), ("12", "123456"))
-        self.assertIsNone(sf._upload_token_entry(tok, 1001.0))   # 1 回限り
-        self.assertIsNone(sf.consume_upload_token(tok, 1001.0))
-        self.assertIsNone(sf.consume_upload_token("", 1001.0))
-        self.assertIsNone(sf.consume_upload_token("nope", 1001.0))
+        self.assertEqual(sf.claim_upload_token(tok, 1001.0), ("12", "123456"))
+        self.assertIsNone(sf._upload_token_entry(tok, 1001.0))   # 予約中は無効扱い
+        self.assertIsNone(sf.claim_upload_token(tok, 1001.0))    # 二重予約不可
+        sf.release_upload_token(tok)
+        self.assertEqual(sf._upload_token_entry(tok, 1002.0), ("12", "123456"))
+        self.assertEqual(sf._upload_tokens[tok][0], 1000.0)      # TTL は発行時刻基準
+        self.assertEqual(sf.claim_upload_token(tok, 1002.0), ("12", "123456"))
+        sf.consume_upload_token(tok)
+        self.assertNotIn(tok, sf._upload_tokens)
+        self.assertIsNone(sf._upload_token_entry(tok, 1002.0))
+        self.assertIsNone(sf.claim_upload_token(tok, 1002.0))
+        sf.release_upload_token(tok)                              # 使用済みは戻らない
+        self.assertNotIn(tok, sf._upload_tokens)
+        self.assertIsNone(sf.claim_upload_token("", 1001.0))
+        self.assertIsNone(sf.claim_upload_token("nope", 1001.0))
 
     def test_ttl_expiry(self):
         tok = sf.issue_upload_token("12", "123456", 1000.0)
@@ -791,9 +803,9 @@ class TestPhotoGatesBeforeBody(_PhotoBase):
                 self.assertEqual(r.status_code, 404, path)
                 self.assertNotIn("location", r.headers)
             # 期限切れ
-            issued, rid, num = sf._upload_tokens[tok]
+            issued, rid, num, claimed = sf._upload_tokens[tok]
             sf._upload_tokens[tok] = (issued - sf.UPLOAD_TOKEN_TTL_SECONDS - 1,
-                                      rid, num)
+                                      rid, num, claimed)
             r = self.post_photos(tok, [("photo", "a.jpg", JPEG)])
             self.assertEqual(r.status_code, 404)
             self.assertNotIn(tok, sf._upload_tokens)
@@ -982,6 +994,152 @@ class TestPhotoAttachAndPages(_PhotoBase):
         paths = [r.path for r in sf.router.routes]
         self.assertEqual(paths, ["/shindan", sf.PHOTO_ROUTE + "/{token}",
                                  "/shindan/{_rest:path}"])
+
+
+class TestTokenClaimReleaseConsume(_PhotoBase):
+    """JIKOU-FORM-3-fix1（R-JIKOU-FORM-3 H3-01 MEDIUM）: トークンは解析〜検査の
+    間だけ予約（claim）し、失敗は解除（release）して再送可能にする。添付呼び出し
+    に進む時点で使用済み（consume）に確定し、添付結果に関わらず戻さない。"""
+
+    def _photo_ok(self, tok):
+        return self.post_photos(tok, [("photo", "a.jpg", JPEG)])
+
+    def test_1_retry_after_413_is_accepted_once(self):
+        tok, rid = self.submit()
+        big = b"\xff\xd8\xff" + b"x" * sf.PHOTO_MAX_PART_BYTES
+        self.assertEqual(self.post_photos(tok, [("photo", "big.jpg", big)])
+                         .status_code, 413)
+        self.assertIn(tok, sf._upload_tokens)                    # 未使用へ戻る
+        self.assertFalse(sf._upload_tokens[tok][3])
+        self.assertEqual(self._photo_ok(tok).status_code, 200)
+        self.assertEqual(self.fake.photos(rid), ["key1"])
+        self.assertEqual(len(self.fake.uploads), 1)
+
+    def test_2_retry_after_400_is_accepted_once(self):
+        tok, rid = self.submit()
+        self.assertEqual(self.post_photos(tok, [("photo", "x.exe", UNKNOWN)])
+                         .status_code, 400)                      # 形式不正
+        self.assertEqual(self.post_photos(tok, [("creditor", None, b"x")])
+                         .status_code, 400)                      # 許可外項目名
+        r = self.client.post(f"{sf.PHOTO_ROUTE}/{tok}", content=b"--garbage",
+                             headers={"Content-Type":
+                                      "multipart/form-data; boundary=zzz"})
+        self.assertEqual(r.status_code, 400)                     # 形式不正 multipart
+        self.assertEqual(self.post_photos(tok, [("photo", "", b"")])
+                         .status_code, 400)                      # 未選択
+        self.assertIn(tok, sf._upload_tokens)
+        self.assertEqual(self._photo_ok(tok).status_code, 200)
+        self.assertEqual(self.fake.photos(rid), ["key1"])
+        self.assertEqual(len(self.fake.uploads), 1)
+
+    def test_3_resend_after_success_is_404_and_attach_once(self):
+        tok, rid = self.submit()
+        self.assertEqual(self._photo_ok(tok).status_code, 200)
+        self.assertNotIn(tok, sf._upload_tokens)
+        with _NoParser():
+            self.assertEqual(self._photo_ok(tok).status_code, 404)
+        self.assertEqual(self.fake.photos(rid), ["key1"])
+        self.assertEqual(len(self.fake.uploads), 1)
+
+    def test_4_concurrent_two_posts_same_token_attach_once(self):
+        from starlette.requests import Request
+        tok, rid = self.submit()
+        ct, body = _multipart([("photo", "a.jpg", JPEG)])
+
+        def _request():
+            sent = {"done": False}
+
+            async def receive():
+                if sent["done"]:
+                    return {"type": "http.request", "body": b"", "more_body": False}
+                sent["done"] = True
+                await asyncio.sleep(0.01)                        # 解析中に他方が到達
+                return {"type": "http.request", "body": body, "more_body": False}
+            scope = {"type": "http", "method": "POST", "http_version": "1.1",
+                     "path": f"{sf.PHOTO_ROUTE}/{tok}", "query_string": b"",
+                     "headers": [(b"content-type", ct.encode()),
+                                 (b"content-length", str(len(body)).encode())],
+                     "client": ("10.0.0.1", 1234), "server": ("test", 80)}
+            return Request(scope, receive)
+
+        async def scenario():
+            return await asyncio.gather(
+                sf.shindan_photos_entry(_request(), tok),
+                sf.shindan_photos_entry(_request(), tok))
+        r1, r2 = _run(scenario())
+        self.assertEqual(sorted([r1.status_code, r2.status_code]), [200, 404])
+        self.assertEqual(self.fake.photos(rid), ["key1"])
+        self.assertEqual(len(self.fake.uploads), 1)
+        self.assertNotIn(tok, sf._upload_tokens)
+
+    def test_5_expired_token_404_without_parse(self):
+        tok, _rid = self.submit()
+        issued, rid, num, claimed = sf._upload_tokens[tok]
+        sf._upload_tokens[tok] = (issued - sf.UPLOAD_TOKEN_TTL_SECONDS - 1,
+                                  rid, num, claimed)
+        with _NoParser():
+            self.assertEqual(self._photo_ok(tok).status_code, 404)
+        self.assertNotIn(tok, sf._upload_tokens)
+        self.assertEqual(self.fake.uploads, {})
+
+    def test_6_unexpected_exception_releases_claim(self):
+        tok, rid = self.submit()
+
+        async def _boom(*_a, **_k):
+            raise RuntimeError("unexpected")
+        with patch.object(sf, "_parse_multipart_stream", _boom):
+            with self.assertRaises(RuntimeError):
+                self._photo_ok(tok)
+        self.assertIn(tok, sf._upload_tokens)
+        self.assertFalse(sf._upload_tokens[tok][3])              # 予約解除済み
+        self.assertEqual(self._photo_ok(tok).status_code, 200)   # 再送可能
+        self.assertEqual(self.fake.photos(rid), ["key1"])
+        # 形式判定中の例外でも同様に解除される
+        tok2, rid2 = self.submit()
+        with patch.object(ims, "detect_format",
+                          side_effect=RuntimeError("unexpected")):
+            with self.assertRaises(RuntimeError):
+                self._photo_ok(tok2)
+        self.assertIn(tok2, sf._upload_tokens)
+        self.assertFalse(sf._upload_tokens[tok2][3])
+        self.assertEqual(self._photo_ok(tok2).status_code, 200)
+
+    def test_7_attach_failure_keeps_consumed_no_retry(self):
+        # unconverged
+        tok, rid = self.submit()
+        self.fake.conflicts_left = ims.ATTACH_RETRIES + 1
+        self.assertEqual(self._photo_ok(tok).status_code, 500)
+        self.assertNotIn(tok, sf._upload_tokens)
+        with _NoParser():
+            self.assertEqual(self._photo_ok(tok).status_code, 404)
+        self.assertEqual(self.fake.photos(rid), [])
+        self.admin.assert_awaited_once()
+        # attach_files の例外（予期しない失敗）でも consumed のまま
+        tok2, rid2 = self.submit()
+        with patch.object(ims, "attach_files",
+                          AsyncMock(side_effect=RuntimeError("boom"))):
+            with self.assertRaises(RuntimeError):
+                self._photo_ok(tok2)
+        self.assertNotIn(tok2, sf._upload_tokens)
+        with _NoParser():
+            self.assertEqual(self._photo_ok(tok2).status_code, 404)
+        self.assertEqual(self.fake.photos(rid2), [])
+
+    def test_8_gate_order_unchanged_claim_after_rate(self):
+        # レート超過（429）は claim 前=トークンは未使用のまま・解析不到達
+        toks = [self.submit()[0] for _ in range(sf._PHOTO_RATE_LIMIT + 1)]
+        for tok in toks[:-1]:
+            self.assertEqual(self._photo_ok(tok).status_code, 200)
+        with _NoParser():
+            self.assertEqual(self._photo_ok(toks[-1]).status_code, 429)
+        self.assertIn(toks[-1], sf._upload_tokens)
+        self.assertFalse(sf._upload_tokens[toks[-1]][3])
+        # 凍結文言・上限 pin は無変更（本クラスは fix1 で文言に触れない）
+        self.assertEqual(_sha(sf.PHOTO_PROMPT_TEXT),
+                         TestPhotoFrozenTextsAndLimits.PROMPT_SHA256)
+        self.assertEqual(_sha(sf.PHOTO_DONE_TEXT),
+                         TestPhotoFrozenTextsAndLimits.DONE_SHA256)
+        self.assertEqual(sf.PHOTO_MAX_PARTS, 5)
 
 
 if __name__ == "__main__":
