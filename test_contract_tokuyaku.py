@@ -165,13 +165,41 @@ class TestTokuyakuFill(_Base):
                 self.assertEqual(cw._clause_of(docx), cw.FROZEN_CLAUSE)
                 cw.verify_pdf_full_text(docx, contract_pdf.docx_to_pdf_bytes(docx))
 
-    def test_4_placeholder_syntax_in_tokuyaku_not_expanded(self):
-        docx = self.generated(特約="{{依頼者氏名}}は{{対象債権者1}}に対し…")
+    def test_4_placeholder_syntax_in_tokuyaku_is_rejected(self):
+        # fix1 CT-02（仕様変更）: {{ }} を含む特約は「展開せずそのまま出す」から
+        # 「入力不正として要確認」へ。旧 test_4 は本票の訂正により置換
+        for bad in ("{{依頼者氏名}}は…", "x}}y", "{{", "a{{b}}c"):
+            with self.subTest(bad=bad):
+                r, upload, update, notify = self.post(record=_record(特約=bad))
+                self.assertEqual(r.json().get("skip"), "tokuyaku_invalid")
+                upload.assert_not_awaited()                             # docx/PDF とも生成しない
+                update.assert_awaited_once()
+                self.assertEqual(update.await_args.args[2], {"契約書ステータス": "要確認"})
+                self.assertNotIn("委任契約書", update.await_args.args[2])   # 添付不変
+                notify.assert_awaited_once_with(
+                    "【委任契約書・要確認】特約欄に使用できない記号（{{ }}）が含まれて"
+                    "います（レコード番号 12）。特約欄を修正して再度お試しください。")
+        # 二重でない「{」「}」1 個は正常に生成
+        docx = self.generated(特約="{分割払い}は可とする。")
         texts = _texts(docx)
-        i = texts.index("特約事項")
-        self.assertEqual(texts[i + 1], "{{依頼者氏名}}は{{対象債権者1}}に対し…")
-        self.assertEqual("\n".join(texts).count("熊澤花子"), 2)         # 展開されない
-        self.assertEqual("\n".join(texts).count("株式会社Aファイナンス"), 1)
+        self.assertIn("{分割払い}は可とする。", texts)
+        self.assertEqual("\n".join(texts).count("熊澤花子"), 2)
+        # CloudSign 経路でも同じ判定で 500 にならず要確認
+        record = _record(契約書ステータス="クラウドサイン登録",
+                         委任契約書=[{"fileKey": "fk-0"}], メールアドレス=_EMAIL,
+                         特約="{{依頼者氏名}}")
+        update, notify = AsyncMock(), AsyncMock(return_value=True)
+        with patch.dict(os.environ, _ENV), \
+             patch.object(cw.hub_kintone, "get_record", AsyncMock(return_value=record)), \
+             patch.object(cw.hub_kintone, "update_record", update), \
+             patch.object(cw, "_cs_create_document", MagicMock()) as create, \
+             patch("hub.notify.notify_admin_line", notify):
+            r = _client.post(_URL, json=_body(status="クラウドサイン登録"))
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json().get("skip"), "tokuyaku_invalid")
+        create.assert_not_called()
+        self.assertEqual(update.await_args.args[2], {"契約書ステータス": "要確認"})
+        notify.assert_awaited_once()
 
 
 # ── 5〜6: 生成ガード ─────────────────────────────────────────────────────────
@@ -254,19 +282,60 @@ class TestCloudSignPdf(_Base):
         self.assertIn("特約事項1分割払いを認める。2期限は3か月。", flat)
         cw.verify_frozen_pdf(pdf_bytes)
         notify.assert_not_awaited()
-        # 上限超は登録前提未充足（状態を動かさず通知）
+        # fix1: 上限超は登録経路でも共通ガード（要確認へ CAS+通知・API 作用 0）
         record = _record(契約書ステータス="クラウドサイン登録",
                          委任契約書=[{"fileKey": "fk-0"}], メールアドレス=_EMAIL,
                          特約="あ" * (cw.TOKUYAKU_MAX_CHARS + 1))
+        update, notify = AsyncMock(), AsyncMock(return_value=True)
         with patch.dict(os.environ, _ENV), \
              patch.object(cw.hub_kintone, "get_record", AsyncMock(return_value=record)), \
              patch.object(cw.hub_kintone, "update_record", update), \
              patch.object(cw, "_cs_create_document", MagicMock()) as create, \
              patch("hub.notify.notify_admin_line", notify):
             r = _client.post(_URL, json=_body(status="クラウドサイン登録"))
-        self.assertEqual(r.json().get("skip"), "cs_preconditions")
+        self.assertEqual(r.json().get("skip"), "tokuyaku_too_long")
         create.assert_not_called()
-        self.assertIn("特約（600 字超）", r.json()["missing"])
+        self.assertEqual(update.await_args.args[2], {"契約書ステータス": "要確認"})
+        notify.assert_awaited_once()
+
+    def test_ct01_cloudsign_registered_blocks_reregistration(self):
+        record = _record(契約書ステータス="クラウドサイン登録",
+                         委任契約書=[{"fileKey": "fk-0"}], メールアドレス=_EMAIL,
+                         cloudsign_document_id="doc-old", 特約="分割払い可")
+        update, notify = AsyncMock(), AsyncMock(return_value=True)
+        create, attach, participant = MagicMock(), MagicMock(), MagicMock()
+        with patch.dict(os.environ, _ENV), \
+             patch.object(cw.hub_kintone, "get_record", AsyncMock(return_value=record)), \
+             patch.object(cw.hub_kintone, "update_record", update), \
+             patch.object(cw.hub_kintone, "upload_file", AsyncMock()) as upload, \
+             patch.object(cw, "_cs_create_document", create), \
+             patch.object(cw, "_cs_attach_pdf", attach), \
+             patch.object(cw, "_cs_add_participant", participant), \
+             patch("hub.notify.notify_admin_line", notify):
+            r = _client.post(_URL, json=_body(status="クラウドサイン登録"))
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json().get("skip"), "cs_registered")
+        create.assert_not_called()
+        attach.assert_not_called()
+        participant.assert_not_called()
+        upload.assert_not_awaited()
+        update.assert_awaited_once()
+        self.assertEqual(update.await_args.args[2], {"契約書ステータス": "要確認"})
+        self.assertEqual(update.await_args.kwargs.get("revision"), "5")
+        self.assertNotIn("委任契約書", update.await_args.args[2])          # 添付不変
+        notify.assert_awaited_once_with(
+            "【委任契約書・要確認】CloudSign 登録済みのため再登録を中止しました"
+            "（レコード番号 12）。既存の下書きを確認してください。")
+        # 判定順（共通）: cs_registered → too_long → invalid
+        rec = _record(cloudsign_document_id="doc-1",
+                      特約="{{x}}" + "あ" * cw.TOKUYAKU_MAX_CHARS)
+        self.assertEqual(cw._regeneration_guard("12", rec, "register")[0], "cs_registered")
+        self.assertEqual(cw._regeneration_guard("12", rec, "regenerate")[0], "cs_registered")
+        rec = _record(特約="{{x}}" + "あ" * cw.TOKUYAKU_MAX_CHARS)
+        self.assertEqual(cw._regeneration_guard("12", rec, "register")[0], "tokuyaku_too_long")
+        rec = _record(特約="{{x}}")
+        self.assertEqual(cw._regeneration_guard("12", rec, "regenerate")[0], "tokuyaku_invalid")
+        self.assertIsNone(cw._regeneration_guard("12", _record(特約="通常"), "register"))
 
 
 # ── 8: 雛形 pin と再現性 ───────────────────────────────────────────────────────

@@ -78,6 +78,10 @@ cloudsign_webhook が cloudsign_document_id で照合して担う）。
   - 運用上の注意: 添付 docx を人が差し替えても、CloudSign 用 PDF はテンプレ+
     レコード値から再生成されるため**差し替え内容は CloudSign に反映されない**。
     文面の変更は雛形（テンプレ）か 特約 欄で行うこと。
+  - fix1（CT-01/CT-02）: ガードは _regeneration_guard 1 関数に集約し、契約書作成
+    トリガ／作成中 reconcile／クラウドサイン登録 の 3 経路が同じ判定順
+    （cs_registered → tokuyaku_too_long → tokuyaku_invalid）で「要確認」へ倒す。
+    特約に {{ }} を含む入力は展開せず入力不正として拒否する。
 """
 
 import copy
@@ -210,10 +214,14 @@ def tokuyaku_lines(text: str) -> list[str]:
 
 
 def tokuyaku_problem(record: dict) -> str | None:
-    """特約の上限検査（fail-closed）。超過なら固定語彙の不足理由。"""
+    """特約の入力検査（fail-closed）。判定順: 上限超（tokuyaku_too_long）→
+    使用できない記号 {{ }}（tokuyaku_invalid・fix1 CT-02: 仕様変更=展開しない
+    ではなく入力不正として拒否）。該当なら skip 分類、なければ None。"""
     text = str((record.get(FIELD_TOKUYAKU) or {}).get("value") or "")
     if len(text.strip()) > TOKUYAKU_MAX_CHARS:
-        return f"{FIELD_TOKUYAKU}（{TOKUYAKU_MAX_CHARS} 字超）"
+        return "tokuyaku_too_long"
+    if "{{" in text or "}}" in text:
+        return "tokuyaku_invalid"
     return None
 
 
@@ -222,7 +230,9 @@ def apply_tokuyaku(docx_bytes: bytes, text: str) -> bytes:
     （fill_template の「全 run を先頭 run に潰す」既知問題の影響を受けない）。
     - 空（空白のみ）: 見出し・本文の 2 段落を削除（空の見出しを残さない）
     - 非空: 改行ごとに段落を分け、本文段落の書式（pPr・rPr）を複製して差し込む
-      （1 行なら 1 段落）。特約本文の {{ }} は展開しない（文字として出す）"""
+      （1 行なら 1 段落）。特約本文の {{ }} は展開しない（文字として出す）——
+      fix1 CT-02 で {{ }} を含む特約は tokuyaku_problem が入力不正として拒否する
+      ため、本関数には到達しない（防御的に「展開しない」実装は維持）"""
     doc = Document(io.BytesIO(docx_bytes))
     body = next((p for p in doc.paragraphs if p.text == TOKUYAKU_KEY), None)
     if body is None:
@@ -479,20 +489,33 @@ async def _to_review(record_id: str, revision: str, text: str, skip: str):
     return JSONResponse(status_code=200, content={"ok": True, "skip": skip})
 
 
-def _regeneration_guard(record_id: str, record: dict) -> tuple[str, str] | None:
-    """再生成の運用ガード（判定順: ①CloudSign 下書き作成済み → ②特約上限）。
-    該当なら (skip 分類, 固定文言)。"""
+def _regeneration_guard(record_id: str, record: dict,
+                        context: str = "regenerate") -> tuple[str, str] | None:
+    """再生成/再登録の運用ガード（3 経路共通の単一判定関数。判定順:
+    ①CloudSign 下書き作成済み（cs_registered）→ ②特約上限（tokuyaku_too_long）
+    → ③特約の使用不可記号（tokuyaku_invalid）。該当なら (skip 分類, 固定文言)。
+    context="regenerate"（契約書作成トリガ・作成中 reconcile）／"register"
+    （クラウドサイン登録）で cs_registered の文言を分ける。"""
     if _fv(record, FIELD_CS_DOC_ID):
+        if context == "register":
+            return ("cs_registered",
+                    f"【委任契約書・要確認】CloudSign 登録済みのため再登録を中止しま"
+                    f"した（レコード番号 {record_id}）。既存の下書きを確認してください。")
         return ("cs_registered",
                 f"【委任契約書・要確認】CloudSign 登録済みのため再生成を中止しました"
                 f"（レコード番号 {record_id}）。特約を反映する場合は CloudSign の"
                 "下書きを削除してから再度お試しください。")
     tk = tokuyaku_problem(record)
-    if tk:
-        return ("tokuyaku_too_long",
+    if tk == "tokuyaku_too_long":
+        return (tk,
                 f"【委任契約書・要確認】特約が {TOKUYAKU_MAX_CHARS} 字を超えている"
                 f"ため生成を中止しました（レコード番号 {record_id}）。特約を短くして"
                 f"から契約書ステータスを「{STATUS_TRIGGER}」に設定し直してください。")
+    if tk == "tokuyaku_invalid":
+        return (tk,
+                "【委任契約書・要確認】特約欄に使用できない記号（{{ }}）が含まれて"
+                f"います（レコード番号 {record_id}）。特約欄を修正して再度お試し"
+                "ください。")
     return None
 
 
@@ -516,7 +539,7 @@ async def _reconcile_working(record_id: str, record: dict,
             "ください")
         return JSONResponse(status_code=200, content={
             "ok": True, "skip": "needs_review"})
-    guard = _regeneration_guard(record_id, record)
+    guard = _regeneration_guard(record_id, record, "regenerate")
     if guard:
         return await _to_review(record_id, revision, guard[1], guard[0])
     next_rev = await _claim(record_id, revision, STATUS_WORKING)
@@ -541,9 +564,8 @@ async def _cloudsign_flow(record_id: str, record: dict, revision: str):
         problems.append(FIELD_EMAIL)
     elif not _EMAIL_RE.fullmatch(email):
         problems.append(f"{FIELD_EMAIL}（形式不正）")
-    tk = tokuyaku_problem(record)
-    if tk:
-        problems.append(tk)
+    # 特約の検査（上限/使用不可記号）と CloudSign 登録済みは dispatcher の
+    # _regeneration_guard（3 経路共通）で「要確認」へ倒し済み（fix1 CT-01/02）
     if problems:
         logger.info("[CONTRACT] cloudsign preconditions unmet record_id=%s "
                     "count=%d",
@@ -692,6 +714,11 @@ async def contract_webhook(secret: str, request: Request):
         if current == STATUS_CS_WORKING:
             return await _reconcile_cs_working(record_id, revision)
         if current == STATUS_CS_TRIGGER:
+            # fix1 CT-01: 登録経路にも共通ガード（cs_registered=再登録の文言）。
+            # 該当は CloudSign API 作用 0 で「要確認」へ CAS 遷移+通知
+            guard = _regeneration_guard(record_id, record, "register")
+            if guard:
+                return await _to_review(record_id, revision, guard[1], guard[0])
             return await _cloudsign_flow(record_id, record, revision)
         if current != STATUS_TRIGGER:
             logger.info("[CONTRACT] stale status record_id=%s",
@@ -715,8 +742,8 @@ async def contract_webhook(secret: str, request: Request):
                 "ok": True, "skip": "missing_fields", "missing": missing})
 
         # JIKOU-CONTRACT-TOKUYAKU: 再生成の運用ガード（①CloudSign 下書き作成済み
-        # → ②特約上限）。該当は生成せず「要確認」へ CAS 遷移+通知
-        guard = _regeneration_guard(record_id, record)
+        # → ②特約上限 → ③使用不可記号）。該当は生成せず「要確認」へ CAS 遷移+通知
+        guard = _regeneration_guard(record_id, record, "regenerate")
         if guard:
             return await _to_review(record_id, revision, guard[1], guard[0])
 
