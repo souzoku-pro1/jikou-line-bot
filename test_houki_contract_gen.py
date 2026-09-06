@@ -15,6 +15,9 @@
   HCGF1-02: 結果不明は cloudsign_document_id の印「結果不明:要手動確認」で永続的に遮断
 - fix3 HCGF2-01: CloudSign 作成呼出し後は結果（ID または印）を最新 revision で必ず永続化
   （最大 5 回・人の変更を保全）。5 回とも失敗は failed 通知 + 500（persist_failed）
+- fix4 HCGF3-01: 回収情報（二重 ID・結果不明・永続化失敗）は回収専用 kind
+  houki_contract_recovery（キー :{record_id}:{reason}:{id_part}・窓 60 秒）+ App 28 マーカー
+  で到達を確認してから閉じる。_houki_notify は sent/throttled/failed の 3 値
 """
 
 import asyncio
@@ -41,6 +44,7 @@ _ENV = {
     "APP_HOUKI": "40", "TOKEN_HOUKI": "d",
     "HOUKI_LINE_CHANNEL_SECRET": "houki_secret",
     "HOUKI_WEBHOOK_TOKEN": "houki-hook",
+    "LINE_ADMIN_USER_ID": "U_admin", "DISPATCHBOT_CHANNEL_ACCESS_TOKEN": "dispatch-token",
 }
 for _k, _v in _ENV.items():
     os.environ.setdefault(_k, _v)
@@ -59,6 +63,7 @@ from hub.kintone import KintoneError  # noqa: E402
 
 _client = TestClient(main.app)
 _URL = "/souzoku-houki/contract/houki-hook"
+_REAL_NOTIFY_ADMIN_LINE = hub_notify.notify_admin_line      # patch 前の実物（fix4 テスト用）
 NOW = datetime.datetime(2026, 9, 6, 15, 0, tzinfo=hc.JST)
 EMAIL_A, EMAIL_B, EMAIL_C = "a@example.com", "b@example.com", "c@example.com"
 
@@ -107,6 +112,13 @@ class _Base(unittest.TestCase):
         self.cs_attach = MagicMock()
         self.cs_participant = MagicMock()
         self.cs_delete = MagicMock(return_value=True)
+        self.push = AsyncMock(return_value=True)            # 最下層の LINE 送信（回収通知）
+        self.markers: list[dict] = []
+
+        async def create_record(app, fields):
+            self.markers.append(dict(fields))
+            return str(1000 + len(self.markers))
+        self.create_record = create_record
 
         async def get_record(app, rid):
             rec = self.records.get(str(rid))
@@ -146,9 +158,14 @@ class _Base(unittest.TestCase):
                   patch.object(cw, "_cs_delete_draft", self.cs_delete),
                   patch.object(hub_notify, "notify_admin_line", self.admin),
                   patch("hub.notify.notify_admin_line", self.admin),
+                  patch.object(hub_notify, "push_line_message", self.push),
+                  patch.object(cw.hub_kintone, "create_record", self.create_record),
                   patch.object(cw, "_persist_wait", AsyncMock())):
             p.start()
             self.addCleanup(p.stop)
+        hub_notify._last_notify_at.clear()
+        hub_notify._notify_in_flight.clear()
+        self.addCleanup(hub_notify._last_notify_at.clear)
 
     def seed(self, *recs):
         for r in recs:
@@ -170,6 +187,12 @@ class _Base(unittest.TestCase):
 
     def last_docx(self) -> bytes:
         return self.uploads[-1][1]
+
+    def recovery_keys(self):
+        return [c.args[0] for c in self.push.await_args_list]
+
+    def recovery_texts(self):
+        return [c.args[1] for c in self.push.await_args_list]
 
 
 # ── 1. 雛形と凍結 pin ─────────────────────────────────────────────────────────
@@ -898,9 +921,10 @@ class TestResultUnknownMark(_Base):
         self.assertEqual(r.json().get("persist"), "persist_failed")
         self.assertEqual(calls["n"], cw._PERSIST_ATTEMPTS)
         self.assertEqual(self.field("1", "契約書ステータス"), "クラウドサイン登録中")
-        self.assertEqual(self.kinds(), ["houki_contract_failed"])
-        self.assertIn("doc-h1", self.texts()[0])
-        self.assertIn("唯一の回収手段", self.texts()[0])
+        self.assertEqual(self.kinds(), [])                                # fix4: failed は送らない
+        self.assertIn("doc-h1", self.recovery_texts()[0])                 # 回収専用通知
+        self.assertIn("唯一の回収手段", self.recovery_texts()[0])
+        self.assertEqual(self.markers[0]["category"], "契約書回収:houki:1:persist_failed:doc-h1")
 
     def test_reconcile_stale_working_marks(self):
         self._seed_group(a_status="クラウドサイン登録中")
@@ -1113,9 +1137,10 @@ class TestPersistAfterExternal(_Base):
                 self.assertEqual(r.status_code, 500)
                 self.assertEqual(r.json(), {"error": "persist_failed", "persist": "persist_failed"})
                 self.assertEqual(calls["n"], cw._PERSIST_ATTEMPTS)
-                self.assertEqual(self.kinds(), ["houki_contract_failed"])
-                self.assertIn("doc-h1", self.texts()[0])
-                self.assertIn("唯一の回収手段", self.texts()[0])
+                self.assertEqual(self.kinds(), [])                        # fix4: 回収通知に統合
+                self.assertIn("doc-h1", self.recovery_texts()[0])
+                self.assertIn("唯一の回収手段", self.recovery_texts()[0])
+                self.assertEqual(len(self.markers), 1)
 
     def test_normal_paths_unchanged(self):
         self._seed()
@@ -1131,6 +1156,190 @@ class TestPersistAfterExternal(_Base):
         self.assertEqual(self.field("1", "契約書ステータス"), "要確認")
         self.assertEqual(self.field("1", "cloudsign_document_id"), self.MARK)
         self.assertIsNone(getattr(cw, "_to_review_marked", None))        # 旧経路は残さない
+
+
+# ── 5g. fix4 HCGF3-01: 回収専用通知・到達確認・マーカー ──────────────────────────
+class _RealNotifyBase(_Base):
+    """notify_admin_line / _houki_notify は実物を使い、最下層の push_line_message だけ mock。"""
+
+    def setUp(self):
+        super().setUp()
+        for p in (patch.object(hub_notify, "notify_admin_line", _REAL_NOTIFY_ADMIN_LINE),
+                  patch("hub.notify.notify_admin_line", _REAL_NOTIFY_ADMIN_LINE)):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def _seed(self, status="クラウドサイン登録"):
+        self.seed(_rec("1", "代表花子", group="1", sign="全員", revision="5", status=status,
+                       attachment=[{"fileKey": "k"}]),
+                  _rec("2", "二郎", group="1", email=EMAIL_B, status=""))
+
+    def _human(self, rid, **fields):
+        rec = self.records[rid]
+        for k, v in fields.items():
+            rec[k] = {"value": v}
+        rec["$revision"] = {"value": str(int(rec["$revision"]["value"]) + 1)}
+
+    def pushed_texts(self):
+        return [c.args[1] for c in self.push.await_args_list]
+
+
+class TestRecoveryNotification(_RealNotifyBase):
+    MARK = hc.CLOUDSIGN_RESULT_UNKNOWN_MARK
+
+    def test_codex_repro_1_dup_id_after_recent_created_notice(self):
+        # docx 作成の created 通知が成功（窓 300 秒内）
+        self.seed(_rec("1", "代表花子", group="1", sign="全員"),
+                  _rec("2", "二郎", group="1", email=EMAIL_B, status=""))
+        self.assertEqual(self.post().json().get("record_id"), "1")
+        self.assertEqual(len(self.push.await_args_list), 1)
+        self.assertTrue(hub_notify.is_throttled("houki_contract_created:1"))
+        # 300 秒以内に登録 → 人が本物の ID を入れた直後に作成 → 二重 ID
+        self.records["1"]["契約書ステータス"] = {"value": "クラウドサイン登録"}
+
+        def create(record_id, title):
+            self._human("1", cloudsign_document_id="doc-real")
+            return "doc-h1"
+        self.cs_create.side_effect = create
+        r = self.post(status="クラウドサイン登録")
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json().get("persist"), "persisted_with_recovery")
+        texts = self.pushed_texts()
+        self.assertEqual(len(texts), 2)                           # created(1回目) + 回収
+        self.assertIn("二重下書きの疑い", texts[1])
+        self.assertIn("doc-real", texts[1])
+        self.assertIn("doc-h1", texts[1])
+        self.assertTrue(hub_notify.is_throttled("houki_contract_recovery:1:dup_id:doc-h1", 60))
+        self.assertEqual(len(self.markers), 1)
+        self.assertEqual(self.markers[0]["category"], "契約書回収:houki:1:dup_id:doc-h1")
+        self.assertIn("doc-h1", self.markers[0]["message"])
+        self.assertEqual(self.field("1", "cloudsign_document_id"), "doc-real")
+
+    def test_codex_repro_2_persist_failed_after_recent_failed_notice(self):
+        self._seed()
+        hub_notify._last_notify_at["houki_contract_failed:1"] = __import__("time").monotonic()
+        real_update = cw.hub_kintone.update_record
+
+        async def update(app, rid, fields, revision=None):
+            if "cloudsign_document_id" in fields:
+                raise KintoneError(409, "GAIA_CO02", "c")
+            return await real_update(app, rid, fields, revision)
+        with patch.object(cw.hub_kintone, "update_record", update):
+            r = self.post(status="クラウドサイン登録")
+        self.assertEqual(r.status_code, 500)
+        self.assertEqual(r.json().get("persist"), "persist_failed")
+        texts = self.pushed_texts()
+        self.assertEqual(len(texts), 1)
+        self.assertIn("doc-h1", texts[0])
+        self.assertIn("唯一の回収手段", texts[0])
+        self.assertEqual(self.markers[0]["category"],
+                         "契約書回収:houki:1:persist_failed:doc-h1")
+
+    def test_all_channels_fail(self):
+        # ① 二重 ID: LINE 3 回失敗 + マーカー失敗 → 500 recovery_failed + ERROR ログ
+        self._seed()
+        self.push.return_value = False
+
+        async def marker_fail(app, fields):
+            raise KintoneError(500, "x", "y")
+
+        def create(record_id, title):
+            self._human("1", cloudsign_document_id="doc-real")
+            return "doc-h1"
+        self.cs_create.side_effect = create
+        with patch.object(cw.hub_kintone, "create_record", marker_fail), \
+                self.assertLogs(cw.logger, level="ERROR") as cm:
+            r = self.post(status="クラウドサイン登録")
+        self.assertEqual(r.status_code, 500)
+        self.assertEqual(r.json(), {"error": "recovery_failed", "persist": "recovery_failed"})
+        # 回収通知は 3 回試行（+通常通知 created 1 回）
+        self.assertEqual(sum(1 for c in self.push.await_args_list
+                             if c.args[1].startswith("【相続放棄 委任契約書・回収】")),
+                         cw._RECOVERY_RETRIES)
+        out = "\n".join(cm.output)
+        self.assertIn("recovery failed reason=dup_id", out)
+        self.assertIn("kintone_id=", out)
+        self.assertIn("created_id=", out)
+        self.assertNotIn("doc-real", out)                         # external_ref は抑止
+        # ③ 永続化失敗: 同様に 500 persist_failed + ERROR ログ
+        self.setUp()
+        self._seed()
+        self.push.return_value = False
+        real_update = cw.hub_kintone.update_record
+
+        async def update(app, rid, fields, revision=None):
+            if "cloudsign_document_id" in fields:
+                raise KintoneError(409, "GAIA_CO02", "c")
+            return await real_update(app, rid, fields, revision)
+        with patch.object(cw.hub_kintone, "update_record", update), \
+                patch.object(cw.hub_kintone, "create_record", marker_fail), \
+                self.assertLogs(cw.logger, level="ERROR") as cm:
+            r = self.post(status="クラウドサイン登録")
+        self.assertEqual(r.status_code, 500)
+        self.assertEqual(r.json().get("persist"), "persist_failed")
+        out = "\n".join(cm.output)
+        self.assertIn("persist after cloudsign create failed (id known)", out)
+        self.assertIn("recovery failed reason=persist_failed", out)
+
+    def test_one_channel_is_enough(self):
+        def create(record_id, title):
+            self._human("1", cloudsign_document_id="doc-real")
+            return "doc-h1"
+        # マーカー成功・通知失敗 → 回収経路あり
+        self._seed()
+        self.push.return_value = False
+        self.cs_create.side_effect = create
+        r = self.post(status="クラウドサイン登録")
+        self.assertEqual((r.status_code, r.json().get("persist")), (200, "persisted_with_recovery"))
+        self.assertEqual(len(self.markers), 1)
+        # マーカー失敗・通知成功 → 回収経路あり
+        self.setUp()
+        self._seed()
+        self.cs_create.side_effect = create
+
+        async def marker_fail(app, fields):
+            raise KintoneError(500, "x", "y")
+        with patch.object(cw.hub_kintone, "create_record", marker_fail):
+            r = self.post(status="クラウドサイン登録")
+        self.assertEqual((r.status_code, r.json().get("persist")), (200, "persisted_with_recovery"))
+        self.assertEqual(self.markers, [])
+
+    def test_recovery_throttle_same_key_and_different_ids(self):
+        text = "回収文"
+        self.assertEqual(_run(cw._houki_recover("1", "dup_id", "doc-A", text)), True)
+        self.assertEqual(_run(cw._houki_recover("1", "dup_id", "doc-A", text)), True)   # throttled=成功扱い
+        self.assertEqual(len(self.push.await_args_list), 1)
+        self.assertEqual(_run(cw._houki_recover("1", "dup_id", "doc-B", text)), True)   # 別 D=別キー
+        self.assertEqual(len(self.push.await_args_list), 2)
+        self.assertEqual(_run(cw._houki_recover("1", "unknown_result", "unknown", text)), True)
+        self.assertEqual(len(self.push.await_args_list), 3)
+        self.assertEqual([m["category"] for m in self.markers],
+                         ["契約書回収:houki:1:dup_id:doc-A", "契約書回収:houki:1:dup_id:doc-A",
+                          "契約書回収:houki:1:dup_id:doc-B", "契約書回収:houki:1:unknown_result:unknown"])
+        self.assertEqual(hub_notify._RECOVERY_MIN_INTERVAL_SEC, 60)
+        with self.assertRaises(AssertionError):
+            _run(cw._houki_recover("1", "bogus", "x", text))
+
+    def test_houki_notify_three_values_and_existing_kinds_unchanged(self):
+        self.assertEqual(_run(cw._houki_notify("created", "9", "t")), "sent")
+        self.assertEqual(_run(cw._houki_notify("created", "9", "t")), "throttled")
+        self.push.return_value = False
+        self.assertEqual(_run(cw._houki_notify("review", "9", "t")), "failed")
+        self.assertEqual(_run(cw._houki_notify("failed", "9", "t")), "failed")
+        keys = [c.args[0] for c in self.push.await_args_list]
+        self.assertEqual(keys, ["U_admin"] * 3)
+        self.assertTrue(hub_notify.is_throttled("houki_contract_created:9"))
+        self.assertFalse(hub_notify.is_throttled("houki_contract_needs_review:9"))  # 失敗は刻印しない
+        self.assertEqual(hub_notify._NOTIFY_MIN_INTERVAL_SEC, 300)
+        self.assertEqual(cw._HOUKI_NOTIFY_KINDS,
+                         {"created": "houki_contract_created",
+                          "review": "houki_contract_needs_review",
+                          "failed": "houki_contract_failed"})
+        with patch.object(hub_notify, "get_admin_line_user_id", return_value=""):
+            self.assertEqual(_run(hub_notify.notify_admin_line_result("t", "k:1")), "failed")
+        with self.assertLogs(hub_notify.logger, level="INFO") as cm:
+            hub_notify._log_throttled("houki_contract_recovery:1:dup_id:x")
+        self.assertIn("kind=houki_contract_recovery", "\n".join(cm.output))
 
 
 # ── 6. cloudsign_webhook の App 40 対応 ───────────────────────────────────────

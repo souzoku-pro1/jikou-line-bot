@@ -247,16 +247,74 @@ def _jikou_cfg() -> ChannelConfig:
 _HOUKI_NOTIFY_KINDS = {"created": "houki_contract_created",
                        "review": "houki_contract_needs_review",
                        "failed": "houki_contract_failed"}
+# fix4 HCGF3-01: 回収専用 kind（新設はこの 1 つのみ）。キーは
+# houki_contract_recovery:{record_id}:{reason}:{id_part} で、異なる外部作成結果は必ず
+# 異なるキー。窓は 60 秒（同じ結果の連打だけを抑止）
+_RECOVERY_KIND = "houki_contract_recovery"
+_RECOVERY_REASONS = ("dup_id", "persist_failed", "unknown_result")
+_RECOVERY_RETRIES = 3
+_RECOVERY_MARKER_PREFIX = "契約書回収:houki"
+_APP_CHATLOG = hub_kintone.KintoneApp(
+    "App 28 (チャットログ)", "APP_CHATLOG", "TOKEN_CHATLOG")
 
 
-async def _houki_notify(kind: str, record_id: str, text: str) -> None:
-    key = _HOUKI_NOTIFY_KINDS.get(kind, "houki_contract_needs_review")
+async def _houki_notify(kind: str, record_id: str, text: str) -> str:
+    """既存 kind の通知（キー {kind}:{record_id}・窓 300 秒は不変）。戻り値は 3 値:
+    sent / throttled（同一キーが窓内に送達済み）/ failed（送信失敗・管理者 ID 未設定・
+    例外）。fix4: 抑止と失敗を呼出側が区別できる。"""
+    key = f"{_HOUKI_NOTIFY_KINDS.get(kind, 'houki_contract_needs_review')}:{record_id}"
     try:
-        from hub.notify import notify_admin_line
-        await notify_admin_line(text, throttle_key=f"{key}:{record_id}",
-                                throttle_on_success_only=True)
+        from hub.notify import is_throttled, notify_admin_line
+        if is_throttled(key):
+            return "throttled"
+        sent = await notify_admin_line(text, throttle_key=key,
+                                       throttle_on_success_only=True)
+        return "sent" if sent else "failed"
     except Exception:
         logger.error("[HOUKI_CONTRACT] admin notify failed (fixed text)")
+        return "failed"
+
+
+def _recovery_key(record_id: str, reason: str, id_part: str) -> str:
+    return f"{_RECOVERY_KIND}:{record_id}:{reason}:{id_part}"
+
+
+def _recovery_marker_category(record_id: str, reason: str, id_part: str) -> str:
+    return f"{_RECOVERY_MARKER_PREFIX}:{record_id}:{reason}:{id_part}"
+
+
+async def _houki_recover(record_id: str, reason: str, id_part: str, text: str,
+                         user_id: str = "") -> bool:
+    """fix4 HCGF3-01: 回収情報を (1) App 28 のマーカー（既存の書込関数）に書き、
+    (2) 回収専用通知（窓 60 秒・失敗は短い待機後に最大 3 回再送・throttled は成功扱い）
+    で送る。どちらか一方でも成功すれば「回収経路あり」= True。両方失敗 = False。"""
+    from hub.notify import _RECOVERY_MIN_INTERVAL_SEC, notify_admin_line_result
+    assert reason in _RECOVERY_REASONS
+    marker_ok = False
+    try:
+        await hub_kintone.create_record(_APP_CHATLOG, {
+            "line_user_id": user_id or f"houki:record:{record_id}",
+            "role": "assistant",
+            "message": text,
+            "category": _recovery_marker_category(record_id, reason, id_part),
+            "auto_sent": "no",
+        })
+        marker_ok = True
+    except Exception:
+        logger.error("[HOUKI_CONTRACT] recovery marker save failed (fixed reason)")
+    result = "failed"
+    key = _recovery_key(record_id, reason, id_part)
+    for attempt in range(_RECOVERY_RETRIES):
+        try:
+            result = await notify_admin_line_result(
+                text, key, min_interval=_RECOVERY_MIN_INTERVAL_SEC)
+        except Exception:
+            result = "failed"
+        if result in ("sent", "throttled"):
+            break
+        if attempt < _RECOVERY_RETRIES - 1:
+            await _persist_wait()
+    return marker_ok or result in ("sent", "throttled")
 
 
 async def _houki_prepare(record: dict, record_id: str, context: str) -> Prepared:
@@ -661,15 +719,27 @@ async def _persist_after_external(record_id: str, cfg: ChannelConfig,
             continue
         current = _fv(latest, FIELD_CS_DOC_ID)
         status_now = _fv(latest, FIELD_STATUS)
+        user_id = _fv(latest, "LINEユーザーID")
         fields: dict = {}
         notes: list[str] = []
+        recovery: tuple | None = None       # (reason, id_part, 回収文)
         if not current or current == mark:
             fields[FIELD_CS_DOC_ID] = doc_id if doc_id else mark
         elif doc_id and doc_id != current:
             notes.append(f"二重下書きの疑い: kintone の document ID={current}・今回作成した"
                          f"document ID={doc_id}（欄は上書きしていません）")
+            recovery = ("dup_id", doc_id,
+                        f"【相続放棄 委任契約書・回収】案件レコードNo.{record_id}: 二重下書きの"
+                        f"疑い。kintone の document ID={current}・今回作成した document ID="
+                        f"{doc_id}（欄は上書きしていません）。CloudSign の下書き一覧で両方を"
+                        "確認し、不要な下書きを削除してください。")
         elif doc_id is None:
             notes.append("既存の document ID を保持しました（結果不明の印は書いていません）")
+            recovery = ("unknown_result", "unknown",
+                        f"【相続放棄 委任契約書・回収】案件レコードNo.{record_id}: CloudSign "
+                        f"作成の結果が不明ですが、kintone には既に document ID={current} が"
+                        "あります（印は書いていません）。CloudSign の下書き一覧を確認し、"
+                        "重複があれば削除してください。")
         if status_now == STATUS_CS_WORKING:
             fields[FIELD_STATUS] = STATUS_CS_DONE if doc_id else STATUS_REVIEW
         else:
@@ -683,6 +753,12 @@ async def _persist_after_external(record_id: str, cfg: ChannelConfig,
                 await _persist_wait()
                 continue
         note_text = ("\n" + "\n".join(notes)) if notes else ""
+        # fix4 HCGF3-01: 回収情報は通常通知とは別の経路（マーカー + 回収専用通知）で
+        # 到達を確認してから閉じる。通常通知は従来どおり（抑止され得る）
+        recovered = True
+        if recovery is not None:
+            recovered = await _houki_recover(record_id, recovery[0], recovery[1],
+                                             recovery[2], user_id)
         if doc_id:
             logger.info("[CONTRACT] cloudsign registered record_id=%s",
                         emit(record_id, "record_id", "log", "operator"))
@@ -690,28 +766,54 @@ async def _persist_after_external(record_id: str, cfg: ChannelConfig,
                              f"【相続放棄 委任契約書】案件レコードNo.{record_id} を CloudSign に"
                              "下書き登録しました（送信は CloudSign 画面で行ってください）。"
                              f"{note_text}\n{summary}")
+        else:
+            await cfg.notify("review", record_id,
+                             reason + note_text + "\n" + hc.MANUAL_RESOLUTION_TEXT)
+        if recovery is not None and not recovered:
+            # 回収経路なし（マーカーも通知も失敗）＝閉じない。ID は redaction 規律により
+            # emit(external_ref) 経由（ログ上は抑止・本文はマーカー/通知に残す設計）
+            if recovery[0] == "dup_id":
+                logger.error("[CONTRACT] recovery failed reason=dup_id record_id=%s "
+                             "kintone_id=%s created_id=%s",
+                             emit(record_id, "record_id", "log", "operator"),
+                             emit(current, "external_ref", "log", "operator"),
+                             emit(doc_id, "external_ref", "log", "operator"))
+            else:
+                logger.error("[CONTRACT] recovery failed reason=unknown_result "
+                             "record_id=%s kintone_id=%s",
+                             emit(record_id, "record_id", "log", "operator"),
+                             emit(current, "external_ref", "log", "operator"))
+            return JSONResponse(status_code=500, content={
+                "error": "recovery_failed", "persist": "recovery_failed"})
+        persist = "persisted_with_recovery" if recovery is not None else "persisted"
+        if doc_id:
             return JSONResponse(status_code=200, content={
                 "ok": True, "record_id": record_id, "cloudsign": True,
-                "persist": "persisted"})
-        await cfg.notify("review", record_id,
-                         reason + note_text + "\n" + hc.MANUAL_RESOLUTION_TEXT)
+                "persist": persist})
         return JSONResponse(status_code=200, content={
-            "ok": True, "skip": skip, "persist": "persisted"})
-    # 5 回とも書けない＝通知が唯一の回収手段
-    if doc_id:
-        logger.error("[CONTRACT] persist after cloudsign create failed (id known) "
-                     "record_id=%s", emit(record_id, "record_id", "log", "operator"))
-    else:
-        logger.error("[CONTRACT] persist after cloudsign create failed (result unknown) "
-                     "record_id=%s", emit(record_id, "record_id", "log", "operator"))
-    await cfg.notify(
-        "failed", record_id,
-        f"【相続放棄 委任契約書・失敗】案件レコードNo.{record_id}: CloudSign で下書きを"
+            "ok": True, "skip": skip, "persist": persist})
+    # 5 回とも書けない＝回収通知（+マーカー）が唯一の回収手段。既存 houki_contract_failed
+    # は送らない（fix4: 回収専用通知に統合）
+    id_part = doc_id or "unknown"
+    recovered = await _houki_recover(
+        record_id, "persist_failed", id_part,
+        f"【相続放棄 委任契約書・回収】案件レコードNo.{record_id}: CloudSign で下書きを"
         "作成した可能性がありますが、kintone に結果を保存できませんでした"
         f"（document ID: {doc_id or '結果不明'}）。この通知が唯一の回収手段です。"
         "CloudSign の下書き一覧を確認し、document ID を cloudsign_document_id 欄に入れて"
         "契約書ステータスを整えてください（状態が「クラウドサイン登録中」でない場合、"
         "自動の回収は動きません）。")
+    if doc_id:
+        logger.error("[CONTRACT] persist after cloudsign create failed (id known) "
+                     "record_id=%s created_id=%s",
+                     emit(record_id, "record_id", "log", "operator"),
+                     emit(doc_id, "external_ref", "log", "operator"))
+    else:
+        logger.error("[CONTRACT] persist after cloudsign create failed (result unknown) "
+                     "record_id=%s", emit(record_id, "record_id", "log", "operator"))
+    if not recovered:
+        logger.error("[CONTRACT] recovery failed reason=persist_failed record_id=%s",
+                     emit(record_id, "record_id", "log", "operator"))
     return JSONResponse(status_code=500, content={"error": "persist_failed",
                                                   "persist": "persist_failed"})
 

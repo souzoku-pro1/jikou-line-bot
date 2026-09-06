@@ -219,6 +219,8 @@ def _log_throttled(throttle_key: str) -> None:
         logger.info("admin LINE notify throttled kind=houki_contract_needs_review")
     elif head == "houki_contract_failed":
         logger.info("admin LINE notify throttled kind=houki_contract_failed")
+    elif head == "houki_contract_recovery":
+        logger.info("admin LINE notify throttled kind=houki_contract_recovery")
     else:
         logger.info("admin LINE notify throttled kind=unknown_kind")
 
@@ -275,6 +277,45 @@ async def notify_admin_line(text: str, throttle_key: str = "",
             # 共存し得ない。成功刻印 _last_notify_at には触れない）
             _notify_in_flight.discard(throttle_key)
     return sent
+
+
+# ── HOUKI-CONTRACT-GEN-fix4: 到達確認つき通知（3 値）と回収用の短い窓 ─────────────
+_RECOVERY_MIN_INTERVAL_SEC = 60
+
+
+def is_throttled(throttle_key: str, min_interval: float | None = None) -> bool:
+    """同一キーの直近送達から min_interval 秒以内か（読むだけ・刻印しない）。
+    既定窓は _NOTIFY_MIN_INTERVAL_SEC（既存 kind の窓と同じ）。"""
+    if not throttle_key:
+        return False
+    interval = _NOTIFY_MIN_INTERVAL_SEC if min_interval is None else min_interval
+    return time.monotonic() - _last_notify_at.get(throttle_key, 0.0) < interval
+
+
+async def notify_admin_line_result(text: str, throttle_key: str,
+                                   min_interval: float | None = None) -> str:
+    """notify_admin_line と同じ規律（成功時のみ刻印・in-flight 予約）で送り、結果を
+    3 値で返す: sent / throttled（同一キーが窓内に送達済み、または送信中）/ failed
+    （管理者 ID 未設定・送信失敗）。既存の notify_admin_line は不変（時効側 caller の
+    挙動を変えない）。窓は呼出側が指定できる（回収通知=_RECOVERY_MIN_INTERVAL_SEC）。"""
+    admin_id = get_admin_line_user_id()
+    if not admin_id:
+        logger.warning("admin LINE notify skipped (no admin id)")
+        return "failed"
+    if is_throttled(throttle_key, min_interval):
+        _log_throttled(throttle_key)
+        return "throttled"
+    if throttle_key in _notify_in_flight:
+        logger.info("admin LINE notify suppressed (same key in flight)")
+        return "throttled"
+    _notify_in_flight.add(throttle_key)
+    try:
+        sent = await push_line_message(admin_id, text, token_env=business_token_env())
+        if sent:
+            _last_notify_at[throttle_key] = time.monotonic()
+    finally:
+        _notify_in_flight.discard(throttle_key)
+    return "sent" if sent else "failed"
 
 
 async def notify_attorney_approval(record: dict) -> None:
