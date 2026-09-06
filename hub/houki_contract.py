@@ -47,6 +47,7 @@ import io
 import json
 import re
 import unicodedata
+import uuid
 from dataclasses import dataclass
 from zoneinfo import ZoneInfo
 
@@ -353,13 +354,32 @@ def expand_applicants(docx_bytes: bytes, records: list[dict]) -> bytes:
     return out.getvalue()
 
 
-def recovery_memo_line(existing_id: str, doc_id: str | None,
+def new_attempt_id() -> str:
+    """fix6 HCGF5-02: 登録処理 1 回の実行（webhook 1 配送）ごとの識別子（uuid4 先頭 12 桁 hex）。
+    CloudSign 呼出し前に 1 度だけ生成し、永続化ループの再試行では同じ値を使う。"""
+    return uuid.uuid4().hex[:12]
+
+
+def memo_ref(doc_id: str | None, attempt_id: str) -> str:
+    """回収メモ行の安定識別子。既知 ID（D）は同一結果を、unknown は attempt_id で別の
+    外部作成試行を識別する（日時・本文一致による判定は使わない）。"""
+    return f"[ref:{doc_id}]" if doc_id else f"[ref:{attempt_id}]"
+
+
+def recovery_memo_line(existing_id: str, doc_id: str | None, attempt_id: str = "",
                        now: datetime.datetime | None = None) -> str:
-    """回収メモの 1 行。ok（D あり）=二重下書きの疑い、unknown=結果不明。"""
+    """回収メモの 1 行。ok（D あり）=二重下書きの疑い、unknown=結果不明。
+    形式: 「{JST 日時} [ref:X] …」。"""
     stamp = (now or datetime.datetime.now(JST)).strftime("%Y-%m-%d %H:%M")
+    ref = memo_ref(doc_id, attempt_id)
     if doc_id:
-        return f"{stamp} 二重下書きの疑い: 既存 {existing_id} / 今回 {doc_id}"
-    return f"{stamp} 結果不明: 既存 {existing_id} のまま"
+        return f"{stamp} {ref} 二重下書きの疑い: 既存 {existing_id} / 今回 {doc_id}"
+    return f"{stamp} {ref} 結果不明: 既存 {existing_id} のまま"
+
+
+def memo_has_ref(existing_text: str, ref: str) -> bool:
+    """同じ [ref:X] トークンが既に本文にあるか（冪等判定）。"""
+    return ref in str(existing_text or "")
 
 
 def append_memo(existing_text: str, line: str) -> str:

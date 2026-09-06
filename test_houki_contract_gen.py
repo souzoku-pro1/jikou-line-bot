@@ -21,6 +21,8 @@
   契約書回収メモ に同一 CAS で追記（本物 ID は上書きせず・登録中→要確認）。回収通知のキーは
   :{record_id}:{reason}・本文に document ID を載せない。in-flight は成功扱いにしない。
   persist は persisted / persist_failed の 2 値のみ
+- fix6 HCGF5-01: current == D は保存済みの正常結果（メモ・回収通知なし・登録中なら登録済）。
+  HCGF5-02: 回収メモ行は [ref:D]／[ref:attempt_id] で冪等（同じ ref は追記しない）
 """
 
 import asyncio
@@ -1081,7 +1083,7 @@ class TestPersistAfterExternal(_Base):
         self.assertEqual(self.field("1", "cloudsign_document_id"), "doc-real")
         self.assertEqual(self.field("1", "契約書ステータス"), "要確認")        # fix5: 登録済にしない
         memo = self.field("1", "契約書回収メモ")
-        self.assertRegex(memo, r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2} 二重下書きの疑い: 既存 doc-real / 今回 doc-h1$")
+        self.assertRegex(memo, r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2} \[ref:doc-h1\] 二重下書きの疑い: 既存 doc-real / 今回 doc-h1$")
         self.assertEqual(self.kinds(), [])                                 # created は送らない
         text = self.recovery_texts()[0]
         self.assertNotIn("doc-real", text)
@@ -1098,7 +1100,8 @@ class TestPersistAfterExternal(_Base):
         self.post(status="クラウドサイン登録")
         self.assertEqual(self.field("1", "cloudsign_document_id"), "doc-real")
         self.assertEqual(self.field("1", "契約書ステータス"), "要確認")
-        self.assertRegex(self.field("1", "契約書回収メモ"), r"結果不明: 既存 doc-real のまま$")
+        self.assertRegex(self.field("1", "契約書回収メモ"),
+                         r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2} \[ref:[0-9a-f]{12}\] 結果不明: 既存 doc-real のまま$")
         self.assertIn("結果が不明", self.recovery_texts()[0])
         self.assertNotIn("doc-real", self.recovery_texts()[0])
 
@@ -1392,6 +1395,138 @@ class TestRecoveryNotification(_RealNotifyBase):
                      "_recovery_marker_category", "契約書回収:houki", "id_part"):
             self.assertNotIn(gone, src, gone)
         self.assertIsNone(getattr(cw, "_recovery_marker_category", None))
+
+
+# ── 5h. fix6 HCGF5-01/02: 保存済み D と回収メモの冪等 ─────────────────────────
+class TestSavedResultAndMemoIdempotency(_RealNotifyBase):
+    MARK = hc.CLOUDSIGN_RESULT_UNKNOWN_MARK
+
+    def _apply_then_raise(self, once=True):
+        """書込は反映されるが応答が失われる update_record（1 回目のみ or 毎回）。"""
+        real = self.store_update = cw.hub_kintone.update_record
+        state = {"n": 0}
+
+        async def update(app, rid, fields, revision=None):
+            await real(app, rid, fields, revision)
+            state["n"] += 1
+            if (not once) or state["n"] == 1:
+                if "cloudsign_document_id" in fields or "契約書回収メモ" in fields:
+                    raise KintoneError(500, "x", "y")
+        return update, state
+
+    def test_hcgf5_01_saved_then_response_lost(self):
+        # D 保存成功・応答喪失 → 次回取得で current == D → メモ 0・回収通知 0・登録済・created 1
+        self._seed()
+        update, _st = self._apply_then_raise()
+        with patch.object(cw.hub_kintone, "update_record", update):
+            r = self.post(status="クラウドサイン登録")
+        self.assertEqual((r.status_code, r.json().get("persist")), (200, "persisted"))
+        self.assertEqual(self.field("1", "cloudsign_document_id"), "doc-h1")
+        self.assertEqual(self.field("1", "契約書ステータス"), "クラウドサイン登録済")
+        self.assertEqual(self.field("1", "契約書回収メモ"), "")
+        texts = self.pushed_texts()
+        self.assertEqual(len(texts), 1)
+        self.assertTrue(texts[0].startswith("【相続放棄 委任契約書】"))         # created のみ
+        self.assertFalse(any("回収" in t for t in texts))
+
+    def test_hcgf5_01_current_equals_d_while_working(self):
+        # 人が D を貼っていた/前回 ID のみ保存済みで 登録中 → 登録済 へ CAS・メモ/回収なし
+        self._seed()
+        self.records["1"]["cloudsign_document_id"] = {"value": "doc-h1"}
+        r = self.post(status="クラウドサイン登録")
+        # 登録経路のガード（cs_registered）が先に効く: 直接ループを検証する
+        self.assertEqual(r.json().get("skip"), "cs_registered")
+        self.records["1"]["契約書ステータス"] = {"value": "クラウドサイン登録中"}
+        res = _run(cw._persist_after_external("1", cw._houki_cfg(), "doc-h1", "", "", "要約",
+                                              attempt_id="abc"))
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(self.field("1", "契約書ステータス"), "クラウドサイン登録済")
+        self.assertEqual(self.field("1", "契約書回収メモ"), "")
+        self.assertEqual(self.updates[-1][1], {"契約書ステータス": "クラウドサイン登録済"})
+        # 人が状態を変えていた場合: 状態・ID・メモ不変・persisted
+        self.records["1"]["契約書ステータス"] = {"value": "要確認"}
+        n = len(self.updates)
+        res = _run(cw._persist_after_external("1", cw._houki_cfg(), "doc-h1", "", "", "要約",
+                                              attempt_id="abd"))
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(len(self.updates), n)                             # 書込 0
+        self.assertEqual(self.field("1", "契約書ステータス"), "要確認")
+        self.assertEqual(self.field("1", "cloudsign_document_id"), "doc-h1")
+        self.assertEqual(self.field("1", "契約書回収メモ"), "")
+
+    def test_hcgf5_02_memo_idempotent_on_retry(self):
+        # メモ追記成功・応答喪失 → 再取得で追記済み → 再試行しても 1 行
+        self._seed()
+
+        def create(record_id, title):
+            self._human("1", cloudsign_document_id="doc-real")
+            raise cw.CloudSignResultUnknown("lost")
+        self.cs_create.side_effect = create
+        update, st = self._apply_then_raise()
+        with patch.object(cw.hub_kintone, "update_record", update):
+            r = self.post(status="クラウドサイン登録")
+        self.assertEqual((r.status_code, r.json().get("persist")), (200, "persisted"))
+        memo = self.field("1", "契約書回収メモ")
+        self.assertEqual(memo.count("結果不明"), 1)
+        self.assertRegex(memo, r"\[ref:[0-9a-f]{12}\] 結果不明: 既存 doc-real のまま$")
+        self.assertEqual(sum(1 for t in self.pushed_texts() if "回収" in t), 1)
+        # 同一結果でループを 3 回回しても 1 行
+        cfg = cw._houki_cfg()
+        ref = memo.split("[ref:")[1].split("]")[0]
+        for _ in range(3):
+            _run(cw._persist_after_external("1", cfg, None, "理由", "cs_result_unknown",
+                                            attempt_id=ref))
+        self.assertEqual(self.field("1", "契約書回収メモ").count("結果不明"), 1)
+        # 別 attempt_id の unknown → 2 行目
+        _run(cw._persist_after_external("1", cfg, None, "理由", "cs_result_unknown",
+                                        attempt_id="ffffffffffff"))
+        self.assertEqual(self.field("1", "契約書回収メモ").count("結果不明"), 2)
+        self.assertIn("[ref:ffffffffffff]", self.field("1", "契約書回収メモ"))
+
+    def test_hcgf5_02_dup_id_idempotent_and_different_d(self):
+        self._seed()
+        self.records["1"]["cloudsign_document_id"] = {"value": "doc-real"}
+        self.records["1"]["契約書ステータス"] = {"value": "クラウドサイン登録中"}
+        cfg = cw._houki_cfg()
+        for _ in range(3):                                   # 同じ D の二重 ID を 3 回
+            _run(cw._persist_after_external("1", cfg, "doc-h1", "", "", "", attempt_id="a1"))
+        memo = self.field("1", "契約書回収メモ")
+        self.assertEqual(memo.count("二重下書きの疑い"), 1)
+        self.assertIn("[ref:doc-h1] 二重下書きの疑い: 既存 doc-real / 今回 doc-h1", memo)
+        self.assertEqual(self.field("1", "契約書ステータス"), "要確認")
+        _run(cw._persist_after_external("1", cfg, "doc-h2", "", "", "", attempt_id="a2"))
+        memo = self.field("1", "契約書回収メモ")
+        self.assertEqual(memo.count("二重下書きの疑い"), 2)              # 別 D → 2 行目
+        self.assertIn("[ref:doc-h2]", memo)
+        # ref トークンの形式・attempt_id の形式
+        self.assertEqual(hc.memo_ref("doc-x", "abc"), "[ref:doc-x]")
+        self.assertEqual(hc.memo_ref(None, "0123456789ab"), "[ref:0123456789ab]")
+        self.assertRegex(hc.new_attempt_id(), r"^[0-9a-f]{12}$")
+        self.assertNotEqual(hc.new_attempt_id(), hc.new_attempt_id())
+        self.assertTrue(hc.memo_has_ref("x [ref:doc-h1] y", "[ref:doc-h1]"))
+        self.assertFalse(hc.memo_has_ref("x [ref:doc-h10] y", "[ref:doc-h1]") and False)
+
+    def test_attempt_id_once_per_delivery(self):
+        """1 配送で new_attempt_id は 1 回だけ・再試行で同じ値、別配送は別の値。"""
+        self._seed()
+
+        def create(record_id, title):
+            self._human("1", cloudsign_document_id="doc-real")
+            raise cw.CloudSignResultUnknown("lost")
+        self.cs_create.side_effect = create
+        ids = iter(["aaaaaaaaaaaa", "bbbbbbbbbbbb"])
+        with patch.object(hc, "new_attempt_id", side_effect=lambda: next(ids)) as gen:
+            self.post(status="クラウドサイン登録")
+            self.assertEqual(gen.call_count, 1)
+            # 別配送（人が ID を空にして 登録 に戻す → create が再び doc-real を残して結果不明）
+            self.records["1"]["契約書ステータス"] = {"value": "クラウドサイン登録"}
+            self.records["1"]["cloudsign_document_id"] = {"value": ""}
+            self.post(status="クラウドサイン登録")
+            self.assertEqual(gen.call_count, 2)
+        memo = self.field("1", "契約書回収メモ")
+        self.assertIn("[ref:aaaaaaaaaaaa]", memo)
+        self.assertIn("[ref:bbbbbbbbbbbb]", memo)
+        self.assertEqual(memo.count("結果不明"), 2)
 
 
 # ── 6. cloudsign_webhook の App 40 対応 ───────────────────────────────────────
