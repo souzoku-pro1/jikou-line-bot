@@ -11,6 +11,7 @@
 呼び出し元の警報文言はここでは持たない（文言は呼び出し元の責務）。
 """
 
+import asyncio
 import logging
 import os
 import time
@@ -292,22 +293,33 @@ def is_throttled(throttle_key: str, min_interval: float | None = None) -> bool:
     return time.monotonic() - _last_notify_at.get(throttle_key, 0.0) < interval
 
 
+_INFLIGHT_WAIT_SEC = 0.05
+_INFLIGHT_WAIT_ROUNDS = 40           # 最長 2 秒: 先行送信の結果を待つ
+
+
 async def notify_admin_line_result(text: str, throttle_key: str,
                                    min_interval: float | None = None) -> str:
     """notify_admin_line と同じ規律（成功時のみ刻印・in-flight 予約）で送り、結果を
-    3 値で返す: sent / throttled（同一キーが窓内に送達済み、または送信中）/ failed
-    （管理者 ID 未設定・送信失敗）。既存の notify_admin_line は不変（時効側 caller の
-    挙動を変えない）。窓は呼出側が指定できる（回収通知=_RECOVERY_MIN_INTERVAL_SEC）。"""
+    3 値で返す: sent / throttled / failed。
+    - throttled は「同一キーの**成功刻印**が窓内にある」場合のみ（fix5 HCGF4-03）。
+    - 同一キーが送信中（in-flight）なら先行の結果を待つ。先行が成功していれば
+      throttled、失敗していれば自分で送る。待ち切れなければ failed（呼出側の再送へ）。
+      in-flight を成功扱いにしない。
+    - failed: 管理者 ID 未設定・送信失敗。既存の notify_admin_line は不変。"""
     admin_id = get_admin_line_user_id()
     if not admin_id:
         logger.warning("admin LINE notify skipped (no admin id)")
         return "failed"
-    if is_throttled(throttle_key, min_interval):
-        _log_throttled(throttle_key)
-        return "throttled"
-    if throttle_key in _notify_in_flight:
-        logger.info("admin LINE notify suppressed (same key in flight)")
-        return "throttled"
+    for _round in range(_INFLIGHT_WAIT_ROUNDS):
+        if is_throttled(throttle_key, min_interval):
+            _log_throttled(throttle_key)
+            return "throttled"
+        if throttle_key not in _notify_in_flight:
+            break
+        await asyncio.sleep(_INFLIGHT_WAIT_SEC)
+    else:
+        logger.info("admin LINE notify in-flight wait exhausted (treated as failed)")
+        return "failed"
     _notify_in_flight.add(throttle_key)
     try:
         sent = await push_line_message(admin_id, text, token_env=business_token_env())

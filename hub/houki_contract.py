@@ -105,6 +105,10 @@ FIELD_CS_DOC_ID = "cloudsign_document_id"
 # ので、印がある限りグループID の付け替えでも本人でも再登録できない。解除は人の
 # 操作のみ（MANUAL_RESOLUTION_TEXT の手順）。既に非空なら上書きしない
 CLOUDSIGN_RESULT_UNKNOWN_MARK = "結果不明:要手動確認"
+# fix5 HCGF4-01: 回収情報はレコード自身（契約書回収メモ・MULTI_LINE_TEXT・App 40 実測
+# 2026-09-06）に 1 行ずつ追記して持つ（既存本文を保全）。LINE 通知には document ID を
+# 載せない（redaction 規律: external_ref は全 sink 抑止）。指紋・docx 差し込みの対象外
+FIELD_RECOVERY_MEMO = "契約書回収メモ"
 MANUAL_RESOLUTION_TEXT = (
     "cloudsign_document_id に「結果不明:要手動確認」を記録しました。CloudSign 画面で"
     "下書きの有無を確認し、(i) 下書きがあれば本物の document ID を欄に入れて契約書"
@@ -347,6 +351,21 @@ def expand_applicants(docx_bytes: bytes, records: list[dict]) -> bytes:
     out = io.BytesIO()
     doc.save(out)
     return out.getvalue()
+
+
+def recovery_memo_line(existing_id: str, doc_id: str | None,
+                       now: datetime.datetime | None = None) -> str:
+    """回収メモの 1 行。ok（D あり）=二重下書きの疑い、unknown=結果不明。"""
+    stamp = (now or datetime.datetime.now(JST)).strftime("%Y-%m-%d %H:%M")
+    if doc_id:
+        return f"{stamp} 二重下書きの疑い: 既存 {existing_id} / 今回 {doc_id}"
+    return f"{stamp} 結果不明: 既存 {existing_id} のまま"
+
+
+def append_memo(existing_text: str, line: str) -> str:
+    """既存本文を保全して末尾に 1 行追加。"""
+    base = str(existing_text or "").rstrip("\n")
+    return (base + "\n" + line) if base else line
 
 
 def verify_template_integrity() -> None:
