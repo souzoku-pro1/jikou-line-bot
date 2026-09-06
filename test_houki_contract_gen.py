@@ -1401,25 +1401,29 @@ class TestRecoveryNotification(_RealNotifyBase):
 class TestSavedResultAndMemoIdempotency(_RealNotifyBase):
     MARK = hc.CLOUDSIGN_RESULT_UNKNOWN_MARK
 
-    def _apply_then_raise(self, once=True):
-        """書込は反映されるが応答が失われる update_record（1 回目のみ or 毎回）。"""
-        real = self.store_update = cw.hub_kintone.update_record
-        state = {"n": 0}
+    def _apply_then_raise(self):
+        """fix7 HCGF6-01: cloudsign_document_id または 契約書回収メモ を含む**初回の**書込を
+        サーバ側で適用したうえで例外（応答喪失）にする。登録中 への claim 書込は数えない。
+        2 回目以降の該当書込は正常応答。state["raised"] で例外が実際に起きた回数を数える。"""
+        real = cw.hub_kintone.update_record
+        state = {"saves": 0, "raised": 0}
 
         async def update(app, rid, fields, revision=None):
-            await real(app, rid, fields, revision)
-            state["n"] += 1
-            if (not once) or state["n"] == 1:
-                if "cloudsign_document_id" in fields or "契約書回収メモ" in fields:
-                    raise KintoneError(500, "x", "y")
+            await real(app, rid, fields, revision)          # サーバ側では適用済み
+            if "cloudsign_document_id" in fields or "契約書回収メモ" in fields:
+                state["saves"] += 1
+                if state["saves"] == 1:
+                    state["raised"] += 1
+                    raise KintoneError(500, "x", "y")        # 応答喪失
         return update, state
 
     def test_hcgf5_01_saved_then_response_lost(self):
         # D 保存成功・応答喪失 → 次回取得で current == D → メモ 0・回収通知 0・登録済・created 1
         self._seed()
-        update, _st = self._apply_then_raise()
+        update, st = self._apply_then_raise()
         with patch.object(cw.hub_kintone, "update_record", update):
             r = self.post(status="クラウドサイン登録")
+        self.assertEqual(st["raised"], 1)                                  # 応答喪失がちょうど 1 回
         self.assertEqual((r.status_code, r.json().get("persist")), (200, "persisted"))
         self.assertEqual(self.field("1", "cloudsign_document_id"), "doc-h1")
         self.assertEqual(self.field("1", "契約書ステータス"), "クラウドサイン登録済")
@@ -1465,6 +1469,7 @@ class TestSavedResultAndMemoIdempotency(_RealNotifyBase):
         update, st = self._apply_then_raise()
         with patch.object(cw.hub_kintone, "update_record", update):
             r = self.post(status="クラウドサイン登録")
+        self.assertEqual(st["raised"], 1)                                  # 応答喪失がちょうど 1 回
         self.assertEqual((r.status_code, r.json().get("persist")), (200, "persisted"))
         memo = self.field("1", "契約書回収メモ")
         self.assertEqual(memo.count("結果不明"), 1)
@@ -1504,7 +1509,12 @@ class TestSavedResultAndMemoIdempotency(_RealNotifyBase):
         self.assertRegex(hc.new_attempt_id(), r"^[0-9a-f]{12}$")
         self.assertNotEqual(hc.new_attempt_id(), hc.new_attempt_id())
         self.assertTrue(hc.memo_has_ref("x [ref:doc-h1] y", "[ref:doc-h1]"))
-        self.assertFalse(hc.memo_has_ref("x [ref:doc-h10] y", "[ref:doc-h1]") and False)
+        # fix7 HCGF6-02: 短い ref が長い ref の前方/後方/中間の部分文字列でも誤検知しない
+        self.assertFalse(hc.memo_has_ref("x [ref:doc-h10] y", "[ref:doc-h1]"))      # 前方
+        self.assertFalse(hc.memo_has_ref("x [ref:doc-h1] y", "[ref:h1]"))           # 後方
+        self.assertFalse(hc.memo_has_ref("x [ref:doc-h1] y", "[ref:oc-h]"))         # 中間
+        self.assertFalse(hc.memo_has_ref("", "[ref:doc-h1]"))
+        self.assertTrue(hc.memo_has_ref("a" + chr(10) + "2026-09-07 10:05 [ref:doc-h1] 二重", "[ref:doc-h1]"))
 
     def test_attempt_id_once_per_delivery(self):
         """1 配送で new_attempt_id は 1 回だけ・再試行で同じ値、別配送は別の値。"""
