@@ -13,6 +13,8 @@
   HCG-02: 登録直前に管理レコードを ID 指定で再取得して再検証。HCG-03: 指紋は JSON 直列化
 - fix2 HCGF1-01: 再取得後に 契約書ステータス と revision で所有権を確認してから外部 API。
   HCGF1-02: 結果不明は cloudsign_document_id の印「結果不明:要手動確認」で永続的に遮断
+- fix3 HCGF2-01: CloudSign 作成呼出し後は結果（ID または印）を最新 revision で必ず永続化
+  （最大 5 回・人の変更を保全）。5 回とも失敗は failed 通知 + 500（persist_failed）
 """
 
 import asyncio
@@ -143,7 +145,8 @@ class _Base(unittest.TestCase):
                   patch.object(cw, "_cs_add_participant", self.cs_participant),
                   patch.object(cw, "_cs_delete_draft", self.cs_delete),
                   patch.object(hub_notify, "notify_admin_line", self.admin),
-                  patch("hub.notify.notify_admin_line", self.admin)):
+                  patch("hub.notify.notify_admin_line", self.admin),
+                  patch.object(cw, "_persist_wait", AsyncMock())):
             p.start()
             self.addCleanup(p.stop)
 
@@ -878,19 +881,26 @@ class TestResultUnknownMark(_Base):
                 self.assertIn("結果不明:要手動確認", self.texts()[0])
                 self.assertIn("(i) 下書きがあれば", self.texts()[0])
 
-    def test_docid_save_failure_marks(self):
+    def test_docid_save_failure_five_times_is_persist_failed(self):
+        """fix3: document ID の保存が 5 回とも失敗 → failed 通知（D を含む）+ HTTP 500。"""
         self._seed_group()
         real_update = cw.hub_kintone.update_record
+        calls = {"n": 0}
 
         async def update(app, rid, fields, revision=None):
             if fields.get("cloudsign_document_id") == "doc-h1":
+                calls["n"] += 1
                 raise KintoneError(500, "x", "y")
             return await real_update(app, rid, fields, revision)
         with patch.object(cw.hub_kintone, "update_record", update):
-            res = self.post(status="クラウドサイン登録").json()
-        self.assertEqual(res.get("skip"), "cs_docid_save_failed")
-        self.assertEqual(self.field("1", "cloudsign_document_id"), self.MARK)
-        self.assertEqual(self.field("1", "契約書ステータス"), "要確認")
+            r = self.post(status="クラウドサイン登録")
+        self.assertEqual(r.status_code, 500)
+        self.assertEqual(r.json().get("persist"), "persist_failed")
+        self.assertEqual(calls["n"], cw._PERSIST_ATTEMPTS)
+        self.assertEqual(self.field("1", "契約書ステータス"), "クラウドサイン登録中")
+        self.assertEqual(self.kinds(), ["houki_contract_failed"])
+        self.assertIn("doc-h1", self.texts()[0])
+        self.assertIn("唯一の回収手段", self.texts()[0])
 
     def test_reconcile_stale_working_marks(self):
         self._seed_group(a_status="クラウドサイン登録中")
@@ -969,6 +979,158 @@ class TestResultUnknownMark(_Base):
             self.assertIsNone(mod.update_kintone_status("", "受任"))
         g.assert_not_called()
         p.assert_not_called()
+
+
+# ── 5f. fix3 HCGF2-01: 外部作成後の永続化ループ ──────────────────────────────────
+class TestPersistAfterExternal(_Base):
+    MARK = hc.CLOUDSIGN_RESULT_UNKNOWN_MARK
+
+    def _seed(self):
+        self.seed(_rec("1", "代表花子", group="1", sign="全員", revision="5",
+                       status="クラウドサイン登録", attachment=[{"fileKey": "k"}]),
+                  _rec("2", "二郎", group="1", email=EMAIL_B, status=""))
+
+    def _human(self, rid, **fields):
+        rec = self.records[rid]
+        for k, v in fields.items():
+            rec[k] = {"value": v}
+        rec["$revision"] = {"value": str(int(rec["$revision"]["value"]) + 1)}
+
+    def test_codex_repro_human_review_after_create_ok(self):
+        """claim(5→6)・再検証成功 → 作成 D → 人が 要確認（→7）→ D は保存・状態はそのまま。"""
+        self._seed()
+
+        def create(record_id, title):
+            self._human("1", 契約書ステータス="要確認")     # 作成直後の人の変更（rev 7）
+            return "doc-h1"
+        self.cs_create.side_effect = create
+        r = self.post(status="クラウドサイン登録")
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json().get("persist"), "persisted")
+        self.assertEqual(self.field("1", "cloudsign_document_id"), "doc-h1")
+        self.assertEqual(self.field("1", "契約書ステータス"), "要確認")
+        self.assertEqual(self.updates[-1][1], {"cloudsign_document_id": "doc-h1"})
+        self.assertEqual(self.field("1", "$revision"), "8")
+        self.assertEqual(self.kinds(), ["houki_contract_created"])
+        self.assertIn("ステータスは変更していません", self.texts()[0])
+
+    def test_codex_repro_unknown_after_human_change(self):
+        self._seed()
+
+        def create(record_id, title):
+            self._human("1", 契約書ステータス="要確認")
+            raise cw.CloudSignResultUnknown("lost")
+        self.cs_create.side_effect = create
+        r = self.post(status="クラウドサイン登録")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(self.field("1", "cloudsign_document_id"), self.MARK)
+        self.assertEqual(self.field("1", "契約書ステータス"), "要確認")
+        self.assertEqual(self.kinds(), ["houki_contract_needs_review"])
+        self.assertIn("(i) 下書きがあれば", self.texts()[0])
+        # B へ付け替えても other_member_has_contract で遮断（docx 0・CloudSign 0）
+        self.cs_create.side_effect = None
+        self.cs_create.reset_mock()
+        self.records["1"]["被相続人グループID"] = {"value": "2"}
+        self.records["2"]["被相続人グループID"] = {"value": "2"}
+        self.records["2"]["契約書ステータス"] = {"value": "契約書作成"}
+        self.assertEqual(self.post(rid="2").json().get("skip"), hc.OTHER_MEMBER_HAS_CONTRACT)
+        self.assertEqual(self.uploads, [])
+        self.cs_create.assert_not_called()
+
+    def test_real_id_preserved(self):
+        # ok で異なる D → 上書きなし・通知に両 ID
+        self._seed()
+
+        def create(record_id, title):
+            self._human("1", cloudsign_document_id="doc-real")
+            return "doc-h1"
+        self.cs_create.side_effect = create
+        r = self.post(status="クラウドサイン登録")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(self.field("1", "cloudsign_document_id"), "doc-real")
+        self.assertEqual(self.field("1", "契約書ステータス"), "クラウドサイン登録済")
+        text = self.texts()[0]
+        self.assertIn("doc-real", text)
+        self.assertIn("doc-h1", text)
+        self.assertIn("二重下書きの疑い", text)
+        # unknown → 通知のみ（印を書かない）
+        self.setUp()
+        self._seed()
+
+        def create2(record_id, title):
+            self._human("1", cloudsign_document_id="doc-real")
+            raise cw.CloudSignResultUnknown("lost")
+        self.cs_create.side_effect = create2
+        self.post(status="クラウドサイン登録")
+        self.assertEqual(self.field("1", "cloudsign_document_id"), "doc-real")
+        self.assertEqual(self.field("1", "契約書ステータス"), "要確認")
+        self.assertIn("既存の document ID を保持", self.texts()[0])
+
+    def test_loop_409_twice_then_success(self):
+        self._seed()
+        real_update = cw.hub_kintone.update_record
+        calls = {"n": 0}
+
+        async def update(app, rid, fields, revision=None):
+            if "cloudsign_document_id" in fields:
+                calls["n"] += 1
+                if calls["n"] <= 2:
+                    raise KintoneError(409, "GAIA_CO02", "c")
+            return await real_update(app, rid, fields, revision)
+        with patch.object(cw.hub_kintone, "update_record", update):
+            r = self.post(status="クラウドサイン登録")
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(calls["n"], 3)
+        self.assertEqual(self.field("1", "cloudsign_document_id"), "doc-h1")
+        self.assertEqual(self.field("1", "契約書ステータス"), "クラウドサイン登録済")
+        self.assertEqual(self.kinds(), ["houki_contract_created"])
+
+    def test_loop_all_409_and_refetch_failures(self):
+        for label in ("409", "refetch"):
+            with self.subTest(label=label):
+                self.setUp()
+                self._seed()
+                real_update = cw.hub_kintone.update_record
+                real_get = cw.hub_kintone.get_record
+                calls = {"n": 0}
+
+                async def update(app, rid, fields, revision=None):
+                    if "cloudsign_document_id" in fields:
+                        calls["n"] += 1
+                        raise KintoneError(409, "GAIA_CO02", "c")
+                    return await real_update(app, rid, fields, revision)
+
+                async def get(app, rid):
+                    if str(rid) == "1" and self.cs_create.call_count:      # 作成後の再取得のみ失敗
+                        calls["n"] += 1
+                        raise KintoneError(500, "x", "y")
+                    return await real_get(app, rid)
+                patches = ([patch.object(cw.hub_kintone, "update_record", update)]
+                           if label == "409" else
+                           [patch.object(cw.hub_kintone, "get_record", get)])
+                with patches[0]:
+                    r = self.post(status="クラウドサイン登録")
+                self.assertEqual(r.status_code, 500)
+                self.assertEqual(r.json(), {"error": "persist_failed", "persist": "persist_failed"})
+                self.assertEqual(calls["n"], cw._PERSIST_ATTEMPTS)
+                self.assertEqual(self.kinds(), ["houki_contract_failed"])
+                self.assertIn("doc-h1", self.texts()[0])
+                self.assertIn("唯一の回収手段", self.texts()[0])
+
+    def test_normal_paths_unchanged(self):
+        self._seed()
+        r = self.post(status="クラウドサイン登録")
+        self.assertEqual(r.json().get("persist"), "persisted")
+        self.assertEqual(self.field("1", "契約書ステータス"), "クラウドサイン登録済")
+        self.assertEqual(self.field("1", "cloudsign_document_id"), "doc-h1")
+        self.setUp()
+        self._seed()
+        self.cs_create.side_effect = cw.CloudSignResultUnknown("lost")
+        r = self.post(status="クラウドサイン登録")
+        self.assertEqual((r.status_code, r.json().get("skip")), (200, "cs_result_unknown"))
+        self.assertEqual(self.field("1", "契約書ステータス"), "要確認")
+        self.assertEqual(self.field("1", "cloudsign_document_id"), self.MARK)
+        self.assertIsNone(getattr(cw, "_to_review_marked", None))        # 旧経路は残さない
 
 
 # ── 6. cloudsign_webhook の App 40 対応 ───────────────────────────────────────

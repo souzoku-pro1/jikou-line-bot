@@ -93,6 +93,7 @@ ChannelConfig 化（HOUKI-CONTRACT-GEN）:
   同じトークン・同じ検証方式）。CloudSign 宛先は prepare が返す署名者（全員/代表者）。
 """
 
+import asyncio
 import copy
 import hashlib
 import hmac
@@ -624,24 +625,95 @@ async def _to_review(record_id: str, revision: str, text: str, skip: str,
     return JSONResponse(status_code=200, content={"ok": True, "skip": skip})
 
 
-async def _to_review_marked(record_id: str, revision: str, text: str, skip: str,
-                            cfg: ChannelConfig, current_doc_id: str):
-    """fix2 HCGF1-02（houki 専用）: 「要確認」へ CAS 遷移し、cloudsign_document_id が
-    空なら結果不明の印を同じ書込で残す（非空なら上書きしない）。409 は cas_lost
-    （登録中の残留は reconcile が印つきで要確認にする）。通知に人の解除手順を含める。"""
+_PERSIST_ATTEMPTS = 5          # fix3 HCGF2-01: 外部作成後の永続化ループの最大回数
+_PERSIST_WAIT_SEC = 0.3
+
+
+async def _persist_wait() -> None:
+    await asyncio.sleep(_PERSIST_WAIT_SEC)
+
+
+async def _persist_after_external(record_id: str, cfg: ChannelConfig,
+                                  doc_id: str | None, reason: str, skip: str,
+                                  summary: str = ""):
+    """fix3 HCGF2-01（houki 専用）: CloudSign 下書き作成の呼出しを発行した後は、結果
+    （本物の document ID=doc_id、または結果不明=None → 印）を必ず永続化する。
+
+    claim 時の revision に固定せず「最新レコードを ID 指定で再取得 → 人の変更を保全した
+    内容を最新 revision で CAS 書込」を最大 _PERSIST_ATTEMPTS 回繰り返す。
+      cloudsign_document_id: 空 or 印 → doc_id（ok）/ 印（unknown）。本物の ID が既に
+        あれば上書きしない（ok で異なる ID → 二重下書きの疑いとして両 ID を通知・
+        unknown → 通知のみ）
+      契約書ステータス: 最新が 登録中 のまま → ok は 登録済・unknown は 要確認。
+        それ以外（人が変えた）→ 触らない（document ID だけ書く）
+      他の欄は触らない。409/障害/再取得失敗 → 短い待機後に次回
+    成功 → 通知（ok: created・unknown: needs_review+解除手順）・HTTP 200・persisted。
+    5 回とも書けない → houki_contract_failed（外部で下書きを作成した可能性・唯一の回収
+    手段である旨）・HTTP 500・persist_failed。cas_lost / 200 正常終了で外部作成後の
+    処理を終えることはない。"""
     from hub import houki_contract as hc
-    fields = {FIELD_STATUS: STATUS_REVIEW}
-    if not current_doc_id:
-        fields[FIELD_CS_DOC_ID] = hc.CLOUDSIGN_RESULT_UNKNOWN_MARK
-    try:
-        await hub_kintone.update_record(cfg.app, record_id, fields, revision=revision)
-    except hub_kintone.KintoneError as e:
-        if getattr(e, "status", None) == 409:
-            return JSONResponse(status_code=200,
-                                content={"ok": True, "skip": "cas_lost"})
-        raise
-    await cfg.notify("review", record_id, text + "\n" + hc.MANUAL_RESOLUTION_TEXT)
-    return JSONResponse(status_code=200, content={"ok": True, "skip": skip})
+    mark = hc.CLOUDSIGN_RESULT_UNKNOWN_MARK
+    for _attempt in range(_PERSIST_ATTEMPTS):
+        try:
+            latest = await hub_kintone.get_record(cfg.app, record_id)
+        except Exception:
+            await _persist_wait()
+            continue
+        current = _fv(latest, FIELD_CS_DOC_ID)
+        status_now = _fv(latest, FIELD_STATUS)
+        fields: dict = {}
+        notes: list[str] = []
+        if not current or current == mark:
+            fields[FIELD_CS_DOC_ID] = doc_id if doc_id else mark
+        elif doc_id and doc_id != current:
+            notes.append(f"二重下書きの疑い: kintone の document ID={current}・今回作成した"
+                         f"document ID={doc_id}（欄は上書きしていません）")
+        elif doc_id is None:
+            notes.append("既存の document ID を保持しました（結果不明の印は書いていません）")
+        if status_now == STATUS_CS_WORKING:
+            fields[FIELD_STATUS] = STATUS_CS_DONE if doc_id else STATUS_REVIEW
+        else:
+            notes.append("人が状態を変更していたためステータスは変更していません"
+                         "（document ID のみ保存）")
+        if fields:
+            try:
+                await hub_kintone.update_record(cfg.app, record_id, fields,
+                                                revision=_fv(latest, "$revision") or None)
+            except Exception:
+                await _persist_wait()
+                continue
+        note_text = ("\n" + "\n".join(notes)) if notes else ""
+        if doc_id:
+            logger.info("[CONTRACT] cloudsign registered record_id=%s",
+                        emit(record_id, "record_id", "log", "operator"))
+            await cfg.notify("created", record_id,
+                             f"【相続放棄 委任契約書】案件レコードNo.{record_id} を CloudSign に"
+                             "下書き登録しました（送信は CloudSign 画面で行ってください）。"
+                             f"{note_text}\n{summary}")
+            return JSONResponse(status_code=200, content={
+                "ok": True, "record_id": record_id, "cloudsign": True,
+                "persist": "persisted"})
+        await cfg.notify("review", record_id,
+                         reason + note_text + "\n" + hc.MANUAL_RESOLUTION_TEXT)
+        return JSONResponse(status_code=200, content={
+            "ok": True, "skip": skip, "persist": "persisted"})
+    # 5 回とも書けない＝通知が唯一の回収手段
+    if doc_id:
+        logger.error("[CONTRACT] persist after cloudsign create failed (id known) "
+                     "record_id=%s", emit(record_id, "record_id", "log", "operator"))
+    else:
+        logger.error("[CONTRACT] persist after cloudsign create failed (result unknown) "
+                     "record_id=%s", emit(record_id, "record_id", "log", "operator"))
+    await cfg.notify(
+        "failed", record_id,
+        f"【相続放棄 委任契約書・失敗】案件レコードNo.{record_id}: CloudSign で下書きを"
+        "作成した可能性がありますが、kintone に結果を保存できませんでした"
+        f"（document ID: {doc_id or '結果不明'}）。この通知が唯一の回収手段です。"
+        "CloudSign の下書き一覧を確認し、document ID を cloudsign_document_id 欄に入れて"
+        "契約書ステータスを整えてください（状態が「クラウドサイン登録中」でない場合、"
+        "自動の回収は動きません）。")
+    return JSONResponse(status_code=500, content={"error": "persist_failed",
+                                                  "persist": "persist_failed"})
 
 
 def _regeneration_guard(record_id: str, record: dict,
@@ -805,9 +877,6 @@ async def _cloudsign_flow(record_id: str, record: dict, revision: str,
                 f"【相続放棄 委任契約書・要確認】案件レコードNo.{record_id}: "
                 "登録直前に申述人集合または署名者が変化したため CloudSign 登録を"
                 f"中止しました。\n{again.summary}", "applicants_changed", cfg)
-        current_doc_id = _fv(latest, FIELD_CS_DOC_ID)
-    else:
-        current_doc_id = _fv(record, FIELD_CS_DOC_ID)
 
     # PDF 生成（テンプレ=単一の正）+ 凍結検証（docx 段・PDF 段の二層）。
     # 検証失敗はここで 500（系統的エラー→再配送が reconcile で「要確認」へ）
@@ -842,22 +911,21 @@ async def _cloudsign_flow(record_id: str, record: dict, revision: str,
                      emit(record_id, "record_id", "log", "operator"))
         if cfg.name == "jikou":
             raise
-        # houki fix2 HCGF1-02: 結果不明を永続の印つきで「要確認」へ（再登録の遮断）
-        return await _to_review_marked(
-            record_id, next_rev,
+        # houki fix3 HCGF2-01: 外部作成後＝結果不明の印を永続化ループで必ず残す
+        return await _persist_after_external(
+            record_id, cfg, None,
             f"【相続放棄 委任契約書・要確認】案件レコードNo.{record_id}: CloudSign 書類"
-            "作成の結果が不明のため登録を中止しました。", "cs_result_unknown", cfg,
-            current_doc_id)
+            "作成の結果が不明のため登録を中止しました。", "cs_result_unknown")
     except Exception:
         cleaned = _cs_delete_draft(doc_id) if doc_id else True
         if cfg.name != "jikou":
-            # houki fix2 HCGF1-02: 作成後の添付/宛先追加失敗も結果不明として印つき要確認
+            # houki fix3 HCGF2-01: 作成後の添付/宛先追加失敗も結果不明として永続化ループ
             # （掃除の成否にかかわらず人が下書きの有無を確認する）
-            return await _to_review_marked(
-                record_id, next_rev,
+            return await _persist_after_external(
+                record_id, cfg, None,
                 f"【相続放棄 委任契約書・要確認】案件レコードNo.{record_id}: CloudSign 下書き"
                 "への添付または宛先追加に失敗したため登録を中止しました。",
-                "cs_partial_failure", cfg, current_doc_id)
+                "cs_partial_failure")
         if cleaned:
             try:
                 await hub_kintone.update_record(
@@ -875,22 +943,10 @@ async def _cloudsign_flow(record_id: str, record: dict, revision: str,
             FIELD_STATUS: STATUS_CS_DONE,
         }, revision=next_rev)
     else:
-        try:
-            await hub_kintone.update_record(cfg.app, record_id, {
-                FIELD_CS_DOC_ID: doc_id,
-                FIELD_STATUS: STATUS_CS_DONE,
-            }, revision=next_rev)
-        except Exception:
-            # houki fix2 HCGF1-02: document ID の保存失敗（409/障害）も結果不明の印つき
-            # 要確認（同じ revision の CAS が 409 なら cas_lost → 登録中の残留は
-            # reconcile が印つきで要確認にする）
-            logger.error("[CONTRACT] cs document id save failed record_id=%s",
-                         emit(record_id, "record_id", "log", "operator"))
-            return await _to_review_marked(
-                record_id, next_rev,
-                f"【相続放棄 委任契約書・要確認】案件レコードNo.{record_id}: CloudSign 下書き"
-                "は作成されましたが document ID の保存に失敗しました。",
-                "cs_docid_save_failed", cfg, current_doc_id)
+        # houki fix3 HCGF2-01: 本物の document ID を永続化ループで必ず保存（claim 時の
+        # revision に固定しない・人の変更を保全）
+        return await _persist_after_external(record_id, cfg, doc_id, "", "",
+                                             prepared.summary)
     logger.info("[CONTRACT] cloudsign registered record_id=%s",
                 emit(record_id, "record_id", "log", "operator"))
     await cfg.notify("created", record_id,
@@ -909,15 +965,14 @@ async def _reconcile_cs_working(record_id: str, revision: str,
     CloudSign 側に下書きが残っている可能性がある（外部状態・kintone からは
     機械確認できない）ため、v1 の回収と異なり自動再実行はせず、常に CAS で
     「要確認」へ倒して管理者通知（二重下書き防止の fail-closed）。
-    houki（fix2 HCGF1-02）: 前回の処理が外部呼出しに到達したか判別できないため、
-    結果不明の印を同じ書込で残す（安全側）。"""
+    houki（fix3 HCGF2-01）: 前回の処理が外部呼出しに到達したか判別できないため、
+    永続化ループを outcome=unknown で呼ぶ（最新が 登録中 なら 要確認・印は空なら書く）。"""
     cfg = _resolve(cfg)
     if cfg.name != "jikou":
-        return await _to_review_marked(
-            record_id, revision,
+        return await _persist_after_external(
+            record_id, cfg, None,
             f"【相続放棄 委任契約書・要確認】案件レコードNo.{record_id} はクラウドサイン"
-            "登録が中断した状態のため「要確認」にしました。", "cs_needs_review", cfg,
-            _fv(record or {}, FIELD_CS_DOC_ID))
+            "登録が中断した状態のため「要確認」にしました。", "cs_needs_review")
     next_rev = await _claim(record_id, revision, STATUS_REVIEW, cfg.app)
     if next_rev is None:
         return JSONResponse(status_code=200,
