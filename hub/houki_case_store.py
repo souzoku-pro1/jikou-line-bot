@@ -22,6 +22,7 @@ test_houki_bot_policy が pin する）。
 import datetime
 import logging
 import re
+from typing import Callable
 
 from hub import kintone
 from hub import notify
@@ -416,7 +417,8 @@ async def upsert_case_fields(user_id: str, fields: dict,
 
 
 async def apply_hearing_fields(user_id: str, raw_fields: dict,
-                               existing: dict | None
+                               existing: dict | None,
+                               fence: Callable[[], bool] | None = None
                                ) -> tuple[str, list[str], list[str]]:
     """record_hearing の生 fields を（検証→CAS upsert→409 収束）まで行う
     （fix2[H3-04]）。(レコード ID, 日付矛盾理由一覧, 選択肢外理由一覧) を返す
@@ -427,14 +429,24 @@ async def apply_hearing_fields(user_id: str, raw_fields: dict,
     矛盾が出れば日付 3 欄は write 0（矛盾理由を返し、不一致処理は呼び出し側）。
     再試行は _CAS_RETRIES 回まで。尽きたら書込を諦める（write 0・今ターンの
     データは次の発話で再収集される＝会話は継続。矛盾 postimage は成立しない）。
+
+    fence（HOUKI-CARD-READ-fix3・任意）: 所有権検査の callable。既定 None=従来と
+    完全に同一挙動。与えられたときは各 CAS 試行の前（初回を含む）と 409 後の
+    再取得の前に呼び、False なら再試行せず write 0（problems に固定語 "fenced" を
+    足して返す。戻り値の形は不変）。
     """
     fields, problems, choice_problems = split_valid_fields(
         raw_fields, existing)
     for _attempt in range(_CAS_RETRIES):
+        if fence is not None and not fence():          # 各試行の前（初回を含む）
+            return _v(existing or {}, "$id"), [*problems, "fenced"], choice_problems
         try:
             rid = await upsert_case_fields(user_id, fields, existing)
             return rid, problems, choice_problems
         except kintone.KintoneConflict:
+            if fence is not None and not fence():      # 409 後・再取得の前
+                return (_v(existing or {}, "$id"), [*problems, "fenced"],
+                        choice_problems)
             latest = await fetch_case(user_id)
             if latest is None:
                 logger.warning(
@@ -468,19 +480,27 @@ async def apply_hearing_fields(user_id: str, raw_fields: dict,
 
 
 async def append_creditors(record_id: str, existing: dict | None,
-                           names: list[str]) -> int:
+                           names: list[str],
+                           fence: Callable[[], bool] | None = None) -> int:
     """債権者一覧 SUBTABLE へ債権者名を追記（既存行保持・同名スキップ・
     新規行は 通知要否=未確認）。追加行数を返す。
 
     fix3[H3-07]: fix2 のマーカー/フラグと同型の $revision CAS 収束ループ——
     最新取得→既存行との併合（既存行保持+同名スキップの契約を維持）→CAS 更新。
     409 は再取得・再併合（≤_CAS_RETRIES）。収束不能=既存表を上書きせず
-    要確認通知+0（write 0）。"""
+    要確認通知+0（write 0）。
+
+    fence（HOUKI-CARD-READ-fix3・任意）: 所有権検査の callable。既定 None=従来と
+    完全に同一挙動。与えられたときは各 CAS 試行の前（初回を含む）と 409 後の
+    再取得の前に呼び、False なら再試行せず 0（要確認通知もしない=収束不能では
+    なく失効）。"""
     clean = [str(n or "").strip() for n in (names or [])]
     clean = [n for n in clean if n]
     if not clean:
         return 0
     for _attempt in range(_CAS_RETRIES):
+        if fence is not None and not fence():          # 各試行の前（初回を含む）
+            return 0
         rows = list(((existing or {}).get(CREDITOR_TABLE) or {})
                     .get("value") or [])
         known = {str(((r.get("value") or {}).get("債権者名") or {})
@@ -505,6 +525,8 @@ async def append_creditors(record_id: str, existing: dict | None,
                         emit(added, "count", "log", "operator"))
             return added
         except kintone.KintoneConflict:
+            if fence is not None and not fence():      # 409 後・再取得の前
+                return 0
             latest = await _refetch_by_id(record_id)
             if latest is None:
                 break

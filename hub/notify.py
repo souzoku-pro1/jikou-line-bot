@@ -209,6 +209,10 @@ def _log_throttled(throttle_key: str) -> None:
                     "kind=houki_image_analysis_send_failure")
     elif head == "houki_image_analysis_store":
         logger.info("admin LINE notify throttled kind=houki_image_analysis_store")
+    elif head == "houki_card_read":
+        logger.info("admin LINE notify throttled kind=houki_card_read")
+    elif head == "houki_card_read_failure":
+        logger.info("admin LINE notify throttled kind=houki_card_read_failure")
     else:
         logger.info("admin LINE notify throttled kind=unknown_kind")
 
