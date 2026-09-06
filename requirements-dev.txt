@@ -4,3 +4,6 @@ aiosqlite==0.22.1
 # RV-12: lock/SBOM 再生成ツール（scripts/regen_dependency_lock.py・runbook 参照）
 uv==0.11.28
 cyclonedx-bom==7.3.0
+# TEST-SPEED-1: 全 suite の並列実行（python -m pytest -n auto）。execnet は xdist の実行基盤
+pytest-xdist==3.8.0
+execnet==2.1.2
