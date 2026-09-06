@@ -268,7 +268,7 @@ async def _houki_prepare(record: dict, record_id: str, context: str) -> Prepared
         problems += p.email_problems
     review = None
     if problems:
-        review = ("houki_preconditions",
+        review = (p.skip or "houki_preconditions",
                   f"【相続放棄 委任契約書・要確認】案件レコードNo.{record_id} は前提を"
                   "満たしていないため処理を中止しました。\n・" + "\n・".join(problems)
                   + "\n" + p.summary())
@@ -738,9 +738,19 @@ async def _cloudsign_flow(record_id: str, record: dict, revision: str,
                             content={"ok": True, "skip": "cas_lost"})
 
     # HOUKI-CONTRACT-GEN: 送信直前に申述人集合を再取得（TOCTOU）。変化していれば
-    # CloudSign を呼ばず「要確認」へ（登録中→要確認・CAS）
+    # CloudSign を呼ばず「要確認」へ（登録中→要確認・CAS）。fix1 HCG-02: 起点
+    # （管理）レコードも ID 指定で再取得し、claim 時の record は使い回さない。
+    # 再取得不能は CloudSign を呼ばず「要確認」（refetch_failed）
     if prepared.fingerprint:
-        again = await cfg.prepare(record, record_id, "register")
+        try:
+            latest = await hub_kintone.get_record(cfg.app, record_id)
+        except Exception:
+            return await _to_review(
+                record_id, next_rev,
+                f"【相続放棄 委任契約書・要確認】案件レコードNo.{record_id}: 登録直前の"
+                "レコード再取得に失敗したため CloudSign 登録を中止しました。",
+                "refetch_failed", cfg)
+        again = await cfg.prepare(latest, record_id, "register")
         if again.review or again.fingerprint != prepared.fingerprint:
             return await _to_review(
                 record_id, next_rev,

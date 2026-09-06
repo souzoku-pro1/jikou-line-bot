@@ -8,11 +8,15 @@
 - 状態機械・CAS・_regeneration_guard 3 経路は時効版と共通（cfg 経由）
 - cloudsign_webhook は App 21 → App 40 の順に検索し、両方該当は fail-closed
 - 時効側の既存テスト（test_contract_gen1/gen2/tokuyaku・test_cloudsign_*）は無変更で green
+- fix1 HCG-01: 管理レコード（被相続人グループID == 自レコード番号）だけが生成/登録の経路に
+  入れる。非管理レコードは 要確認（代表者番号を通知）。規則 4（他レコードの契約状態）。
+  HCG-02: 登録直前に管理レコードを ID 指定で再取得して再検証。HCG-03: 指紋は JSON 直列化
 """
 
 import asyncio
 import datetime
 import hashlib
+import httpx
 import io
 import os
 import re
@@ -352,12 +356,12 @@ class TestGenerateFlow(_Base):
                          ["契約書作成中", "契約書作成済"])
 
     def test_group_of_three_representative_first_then_id_order(self):
-        self.seed(_rec("5", "代表花子", addr="住所5", group="G1", sign="全員",
+        self.seed(_rec("5", "代表花子", addr="住所5", group="5", sign="全員",
                        creditors=("アコム",)),
-                  _rec("2", "二郎", addr="住所2", group="G1", email=EMAIL_B,
-                       creditors=("ｱｺﾑ", "プロミス")),
-                  _rec("9", "九郎", addr="住所9", group="G1", email=EMAIL_C),
-                  _rec("7", "無関係", group="G2"))
+                  _rec("2", "二郎", addr="住所2", group="5", email=EMAIL_B,
+                       creditors=("ｱｺﾑ", "プロミス"), status=""),
+                  _rec("9", "九郎", addr="住所9", group="5", email=EMAIL_C, status=""),
+                  _rec("7", "無関係", group="7"))
         r = self.post(rid="5")
         self.assertEqual(r.status_code, 200, r.text)
         paras = _docx_paras(self.last_docx())
@@ -371,14 +375,14 @@ class TestGenerateFlow(_Base):
         self.assertEqual(paras[paras.index("特約事項") + 1], "特になし")
         # 他の申述人レコードは更新しない
         self.assertTrue(all(rid == "5" for rid, _f in self.updates))
-        self.assertEqual(self.field("2", "契約書ステータス"), "契約書作成")
+        self.assertEqual(self.field("2", "契約書ステータス"), "")
 
     def test_review_when_decedent_mismatch_or_missing_fields(self):
         for label, recs in {
-            "decedent": [_rec("1", "甲", group="G", decedent="A"),
-                         _rec("2", "乙", group="G", decedent="B")],
-            "name": [_rec("1", "甲", group="G"), _rec("2", "", group="G")],
-            "addr": [_rec("1", "甲", group="G"), _rec("2", "乙", group="G", addr="")],
+            "decedent": [_rec("1", "甲", group="1", decedent="A"),
+                         _rec("2", "乙", group="1", decedent="B", status="")],
+            "name": [_rec("1", "甲", group="1"), _rec("2", "", group="1", status="")],
+            "addr": [_rec("1", "甲", group="1"), _rec("2", "乙", group="1", addr="", status="")],
         }.items():
             with self.subTest(label=label):
                 self.setUp()
@@ -411,8 +415,8 @@ class TestGenerateFlow(_Base):
         self.assertEqual(self.kinds(), ["houki_contract_needs_review"])
         # 定型文は上限に含めない（欄 600 字ちょうど+代表者定型文でも生成される）
         self.setUp()
-        self.seed(_rec("1", "甲", group="G", tokuyaku="あ" * 600),
-                  _rec("2", "乙", group="G", email=EMAIL_B))
+        self.seed(_rec("1", "甲", group="1", tokuyaku="あ" * 600),
+                  _rec("2", "乙", group="1", email=EMAIL_B, status=""))
         self.assertEqual(self.post().status_code, 200)
         self.assertEqual(self.field("1", "契約書ステータス"), "契約書作成済")
 
@@ -441,9 +445,9 @@ class TestGenerateFlow(_Base):
 class TestCloudSignFlow(_Base):
     def _seed_registered(self, sign="全員", emails=(EMAIL_A, EMAIL_B)):
         return self.seed(
-            _rec("1", "代表花子", group="G", sign=sign, email=emails[0],
+            _rec("1", "代表花子", group="1", sign=sign, email=emails[0],
                  status="クラウドサイン登録", attachment=[{"fileKey": "k"}]),
-            _rec("2", "二郎", group="G", email=emails[1]))
+            _rec("2", "二郎", group="1", email=emails[1], status=""))
 
     def test_all_signers(self):
         self._seed_registered("全員")
@@ -500,7 +504,7 @@ class TestCloudSignFlow(_Base):
             calls["n"] += 1
             p = await real_plan(record)
             if calls["n"] == 1:                       # 1 回目の後に 3 人目が追加される
-                self.records["3"] = _rec("3", "三郎", group="G", email=EMAIL_C)
+                self.records["3"] = _rec("3", "三郎", group="1", email=EMAIL_C, status="")
             return p
         with patch.object(hc, "plan", plan_then_change):
             r = self.post(status="クラウドサイン登録")
@@ -515,6 +519,233 @@ class TestCloudSignFlow(_Base):
                          "cs_preconditions")
         self.assertEqual(self.field("1", "契約書ステータス"), "クラウドサイン登録")
         self.assertEqual(self.kinds(), ["houki_contract_needs_review"])
+
+
+# ── 5b. fix1 HCG-01: 管理レコード方式 ───────────────────────────────────────────
+class TestManagerRecord(_Base):
+    """A=管理レコード（No.1・group "1"）・B=同グループの申述人（No.2・group "1"）。"""
+
+    def _seed_pair(self, status="契約書作成"):
+        att = [{"fileKey": "k"}] if status == "クラウドサイン登録" else None
+        self.seed(_rec("1", "代表花子", group="1", sign="全員", status=status, attachment=att),
+                  _rec("2", "二郎", group="1", email=EMAIL_B, status=status, attachment=att))
+
+    def _counts(self):
+        return len(self.uploads), self.cs_create.call_count
+
+    def _expect_one(self, status):
+        return (1, 0) if status == "契約書作成" else (0, 1)
+
+    def test_sequential_a_then_b_and_b_then_a(self):
+        for status in ("契約書作成", "クラウドサイン登録"):
+            for order in (("1", "2"), ("2", "1")):
+                with self.subTest(status=status, order=order):
+                    self.setUp()
+                    self._seed_pair(status)
+                    results = {rid: self.post(rid=rid, status=status).json() for rid in order}
+                    self.assertEqual(self._counts(), self._expect_one(status))
+                    self.assertEqual(results["2"].get("skip"), hc.NOT_MANAGER)
+                    self.assertEqual(self.field("2", "契約書ステータス"), "要確認")
+                    self.assertEqual(self.field("1", "契約書ステータス"),
+                                     "契約書作成済" if status == "契約書作成"
+                                     else "クラウドサイン登録済")
+                    review_text = [t for t in self.texts() if hc.NOT_MANAGER in t][0]
+                    self.assertIn("代表者のレコード（No.1）で行ってください", review_text)
+                    self.assertNotIn("二郎", review_text)
+
+    def _parallel(self, first, second, status):
+        """first を prepare（plan）内で停止させ、その間に second を完走させる。"""
+        gate, at_gate = asyncio.Event(), asyncio.Event()
+        real_plan = hc.plan
+        calls = {"n": 0}
+
+        async def plan_gate(record):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                at_gate.set()
+                await gate.wait()
+            return await real_plan(record)
+
+        async def scenario():
+            with patch.object(hc, "plan", plan_gate):
+                async with httpx.AsyncClient(transport=httpx.ASGITransport(app=main.app),
+                                             base_url="http://t") as client:
+                    task_a = asyncio.create_task(
+                        client.post(_URL, json=_body(first, status)))
+                    await asyncio.wait_for(at_gate.wait(), timeout=5)
+                    res_b = (await client.post(_URL, json=_body(second, status))).json()
+                    gate.set()
+                    res_a = (await task_a).json()
+                    return res_a, res_b
+        return _run(scenario())
+
+    def test_parallel_a_and_b(self):
+        for status in ("契約書作成", "クラウドサイン登録"):
+            with self.subTest(status=status):
+                self.setUp()
+                self._seed_pair(status)
+                res_a, res_b = self._parallel("1", "2", status)
+                self.assertEqual(res_b.get("skip"), hc.NOT_MANAGER)
+                self.assertEqual(res_a.get("record_id"), "1")
+                self.assertEqual(self._counts(), self._expect_one(status))
+                self.assertEqual(self.field("2", "契約書ステータス"), "要確認")
+
+    def test_parallel_a_and_a(self):
+        for status in ("契約書作成", "クラウドサイン登録"):
+            with self.subTest(status=status):
+                self.setUp()
+                self._seed_pair(status)
+                res_a1, res_a2 = self._parallel("1", "1", status)
+                self.assertEqual(res_a2.get("record_id"), "1")          # 後続が勝つ
+                self.assertEqual(res_a1.get("skip"), "cas_lost")        # 先行は CAS 敗北
+                self.assertEqual(self._counts(), self._expect_one(status))
+
+    def test_group_invalid_and_missing(self):
+        self.seed(_rec("1", "甲", group="abc"))
+        self.assertEqual(self.post().json().get("skip"), hc.GROUP_INVALID)
+        self.assertEqual(self.field("1", "契約書ステータス"), "要確認")
+        self.assertIn("数値ではありません", self.texts()[0])
+        self.setUp()
+        self.seed(_rec("1", "甲", group="999"))
+        self.assertEqual(self.post().json().get("skip"), hc.GROUP_MISSING)
+        self.assertEqual(self.field("1", "契約書ステータス"), "要確認")
+        self.assertIn("No.999", self.texts()[0])
+        self.assertEqual(self.uploads, [])
+
+    def test_rule4_other_member_has_contract(self):
+        for label, other in {
+            "status": _rec("2", "乙", group="1", email=EMAIL_B, status="契約書作成済"),
+            "doc_id": _rec("2", "乙", group="1", email=EMAIL_B, status="", cs_doc_id="doc-z"),
+        }.items():
+            with self.subTest(label=label):
+                self.setUp()
+                self.seed(_rec("1", "甲", group="1", sign="全員"), other)
+                self.assertEqual(self.post().json().get("skip"), hc.OTHER_MEMBER_HAS_CONTRACT)
+                self.assertEqual(self.field("1", "契約書ステータス"), "要確認")
+                self.assertIn("レコード番号 2", self.texts()[0])
+                self.assertEqual(self.uploads, [])
+        # 登録直前の再検証でも規則 4 が効く
+        self.setUp()
+        self.seed(_rec("1", "甲", group="1", sign="全員", status="クラウドサイン登録",
+                       attachment=[{"fileKey": "k"}]),
+                  _rec("2", "乙", group="1", email=EMAIL_B, status=""))
+        real_plan = hc.plan
+        calls = {"n": 0}
+
+        async def plan_then_taint(record):
+            calls["n"] += 1
+            p = await real_plan(record)
+            if calls["n"] == 1:
+                self.records["2"]["cloudsign_document_id"] = {"value": "doc-z"}
+            return p
+        with patch.object(hc, "plan", plan_then_taint):
+            self.assertEqual(self.post(status="クラウドサイン登録").json().get("skip"),
+                             "applicants_changed")
+        self.cs_create.assert_not_called()
+        self.assertEqual(self.field("1", "契約書ステータス"), "要確認")
+
+    def test_manager_check_and_ordering(self):
+        self.assertEqual(hc.manager_check(_rec("1", "x", group="")), (None, ""))
+        self.assertEqual(hc.manager_check(_rec("1", "x", group="1")), (None, "1"))
+        self.assertEqual(hc.manager_check(_rec("2", "x", group="1")), (hc.NOT_MANAGER, "1"))
+        self.assertEqual(hc.manager_check(_rec("2", "x", group="x1")), (hc.GROUP_INVALID, "x1"))
+        self.seed(_rec("7", "代表", group="7"), _rec("3", "a", group="7", status=""),
+                  _rec("12", "b", group="7", status=""), _rec("8", "他", group="8"))
+        recs, group, problems = _run(hc.gather_applicants(self.records["7"]))
+        self.assertEqual(([r["$id"]["value"] for r in recs], group, problems), (["7", "3", "12"], "7", []))
+
+
+# ── 5c. fix1 HCG-02/03: 登録直前の再検証と指紋 ──────────────────────────────────
+class TestPreSendRevalidation(_Base):
+    def _seed(self):
+        self.seed(_rec("1", "代表花子", group="1", sign="全員", tokuyaku="",
+                       status="クラウドサイン登録", attachment=[{"fileKey": "k"}],
+                       creditors=("アコム",)),
+                  _rec("2", "二郎", group="1", email=EMAIL_B, status=""))
+
+    def _post_with_change(self, change):
+        """1 回目の plan の後に change() を適用（登録直前の再取得が変化を見る）。"""
+        real_plan = hc.plan
+        calls = {"n": 0}
+
+        async def plan_then_change(record):
+            calls["n"] += 1
+            p = await real_plan(record)
+            if calls["n"] == 1:
+                change()
+            return p
+        with patch.object(hc, "plan", plan_then_change):
+            return self.post(status="クラウドサイン登録").json()
+
+    def test_changes_detected_zero_cloudsign_calls(self):
+        cases = {
+            "rep_email": lambda: self.records["1"].update(メールアドレス={"value": "z@example.com"}),
+            "rep_addr": lambda: self.records["1"].update(住所={"value": "別住所"}),
+            "rep_sign": lambda: self.records["1"].update(契約署名={"value": "代表者のみ"}),
+            "rep_tokuyaku": lambda: self.records["1"].update(特約={"value": "分割可"}),
+            "member_email": lambda: self.records["2"].update(メールアドレス={"value": "y@example.com"}),
+            "creditor_added": lambda: self.records["2"].update(
+                債権者一覧={"value": _creditors("プロミス")}),
+        }
+        for label, change in cases.items():
+            with self.subTest(label=label):
+                self.setUp()
+                self._seed()
+                self.assertEqual(self._post_with_change(change).get("skip"), "applicants_changed")
+                self.cs_create.assert_not_called()
+                self.cs_participant.assert_not_called()
+                self.assertEqual(self.field("1", "契約書ステータス"), "要確認")
+                self.assertEqual(self.kinds(), ["houki_contract_needs_review"])
+
+    def test_unchanged_proceeds_using_refetched_record(self):
+        self._seed()
+        real_get = cw.hub_kintone.get_record
+        seen = []
+
+        async def spy(app, rid):
+            seen.append(str(rid))
+            return await real_get(app, rid)
+        with patch.object(cw.hub_kintone, "get_record", spy):
+            r = self.post(status="クラウドサイン登録")
+        self.assertTrue(r.json().get("cloudsign"), r.text)
+        self.assertGreaterEqual(seen.count("1"), 2)                     # webhook + 登録直前の再取得
+        self.cs_create.assert_called_once()
+
+    def test_refetch_failure_is_review(self):
+        self._seed()
+        real_get = cw.hub_kintone.get_record
+        calls = {"n": 0}
+
+        async def flaky(app, rid):
+            calls["n"] += 1
+            if str(rid) == "1" and calls["n"] >= 2:
+                raise KintoneError(500, "x", "y")
+            return await real_get(app, rid)
+        with patch.object(cw.hub_kintone, "get_record", flaky):
+            self.assertEqual(self.post(status="クラウドサイン登録").json().get("skip"),
+                             "refetch_failed")
+        self.cs_create.assert_not_called()
+        self.assertEqual(self.field("1", "契約書ステータス"), "要確認")
+
+    def test_fingerprint_is_json_serialized(self):
+        def plan_for(creditors_a, creditors_b, name="甲", addr="架空市"):
+            a = _rec("1", name, addr=addr, group="1", creditors=creditors_a)
+            b = _rec("2", "乙", group="1", email=EMAIL_B, creditors=creditors_b, status="")
+            fees = hc.compute_fees(2, len(hc.destinations([a, b])))
+            return hc.HoukiPlan([a, b], "1", hc.SIGN_ALL, False, fees, [], [],
+                                [(EMAIL_A, name), (EMAIL_B, "乙")])
+        p1 = plan_for(("A,B", "C"), ("D",))
+        p2 = plan_for(("A", "B", "C"), ("D",))
+        self.assertNotEqual(p1.fingerprint, p2.fingerprint)          # 配列境界を保持
+        p3 = plan_for(("A",), ("B",), name="甲|乙", addr="a,b")
+        p4 = plan_for(("A",), ("B",), name="甲", addr="乙|a,b")
+        self.assertNotEqual(p3.fingerprint, p4.fingerprint)          # 項目境界を保持
+        src = p1.fingerprint_source()
+        self.assertEqual(src["members"][0]["creditors"], ["A,B", "C"])
+        self.assertEqual(set(src["fees"]), {"報酬合計", "実費合計", "追加送付件数",
+                                             "追加送付料合計", "支払総額"})
+        self.assertEqual(src["signers"], [EMAIL_A, EMAIL_B])
+        self.assertEqual(p1.fingerprint, plan_for(("A,B", "C"), ("D",)).fingerprint)  # 決定的
 
 
 # ── 6. cloudsign_webhook の App 40 対応 ───────────────────────────────────────
