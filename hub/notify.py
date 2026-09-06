@@ -213,6 +213,12 @@ def _log_throttled(throttle_key: str) -> None:
         logger.info("admin LINE notify throttled kind=houki_card_read")
     elif head == "houki_card_read_failure":
         logger.info("admin LINE notify throttled kind=houki_card_read_failure")
+    elif head == "houki_contract_created":
+        logger.info("admin LINE notify throttled kind=houki_contract_created")
+    elif head == "houki_contract_needs_review":
+        logger.info("admin LINE notify throttled kind=houki_contract_needs_review")
+    elif head == "houki_contract_failed":
+        logger.info("admin LINE notify throttled kind=houki_contract_failed")
     else:
         logger.info("admin LINE notify throttled kind=unknown_kind")
 

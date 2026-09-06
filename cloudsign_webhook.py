@@ -47,6 +47,11 @@ KINTONE_API_TOKEN = os.environ["KINTONE_API_TOKEN"]
 # kintone のフィールドコード（App 21 の実フィールドコードに合わせる）
 FIELD_DOCUMENT_ID = "cloudsign_document_id"  # 送信時に documentID を保存しておくフィールド
 FIELD_STATUS = "status"                      # 案件ステータス（DROP_DOWN）のフィールドコード
+# HOUKI-CONTRACT-GEN: App 40（相続放棄案件）も同じ cloudsign_document_id / status（受任）
+# を持つ。検索は App 21 → App 40 の順。両方に該当があれば fail-closed（処理せず通知）。
+# env は houki_card_webhook / houki_case_store と同じ既存のもの（新規 env なし）
+HOUKI_APP_ID_ENV = "APP_HOUKI"
+HOUKI_TOKEN_ENV = "TOKEN_HOUKI"
 
 # LINE 通知（任意。設定が無ければスキップ）
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
@@ -155,21 +160,48 @@ def verify_completed_document(document_id: str) -> tuple[dict | None, str]:
 # ============================================================
 # kintone 更新
 # ============================================================
-def update_kintone_status(document_id: str, new_status: str):
-    """documentID で案件を探し、ステータスフィールドを更新する。
-    成功で kintone レコード No（str）・該当なし/未更新で None を返す（M06: 通知の書類特定用）。"""
-    # 1. documentID で検索
+class AmbiguousDocumentMatch(RuntimeError):
+    """HOUKI-CONTRACT-GEN: documentID が App 21 と App 40 の両方に該当（fail-closed）。"""
+
+
+def _search_by_document_id(app_id: str, token: str, document_id: str) -> list:
     r = requests.get(
         f"{KINTONE_BASE}/k/v1/records.json",
-        headers={"X-Cybozu-API-Token": KINTONE_API_TOKEN},
+        headers={"X-Cybozu-API-Token": token},
         params={
-            "app": KINTONE_APP_ID,
+            "app": app_id,
             "query": f'{FIELD_DOCUMENT_ID} = "{document_id}"',
         },
         timeout=10,
     )
     r.raise_for_status()
-    records = r.json().get("records", [])
+    return r.json().get("records", [])
+
+
+def _houki_app() -> tuple[str, str]:
+    """App 40 の接続情報（既存 env）。未設定なら ("", "")=検索しない。"""
+    return os.environ.get(HOUKI_APP_ID_ENV, ""), os.environ.get(HOUKI_TOKEN_ENV, "")
+
+
+def update_kintone_status(document_id: str, new_status: str):
+    """documentID で案件を探し、ステータスフィールドを更新する。
+    成功で kintone レコード No（str）・該当なし/未更新で None を返す（M06: 通知の書類特定用）。
+
+    HOUKI-CONTRACT-GEN: App 21 → App 40 の順で検索。両方に該当があれば
+    AmbiguousDocumentMatch（処理せず通知へ）。どちらにも無ければ従来どおり None。
+    App 40 の完了時後続処理（status=受任）は時効版と同じ。"""
+    # 1. documentID で検索（App 21 → App 40）
+    records = _search_by_document_id(KINTONE_APP_ID, KINTONE_API_TOKEN, document_id)
+    app_id, token = KINTONE_APP_ID, KINTONE_API_TOKEN
+    houki_app, houki_token = _houki_app()
+    if houki_app and houki_token and houki_app != KINTONE_APP_ID:
+        houki_records = _search_by_document_id(houki_app, houki_token, document_id)
+        if records and houki_records:
+            logger.warning("kintone両App該当のため処理せず document_id=%s",
+                           emit(document_id, "external_ref", "log", "operator"))
+            raise AmbiguousDocumentMatch("document id matched in both apps")
+        if houki_records:
+            records, app_id, token = houki_records, houki_app, houki_token
     if not records:
         logger.warning("kintoneに該当案件なし document_id=%s",
                        emit(document_id, "external_ref", "log", "operator"))
@@ -181,11 +213,11 @@ def update_kintone_status(document_id: str, new_status: str):
     u = requests.put(
         f"{KINTONE_BASE}/k/v1/record.json",
         headers={
-            "X-Cybozu-API-Token": KINTONE_API_TOKEN,
+            "X-Cybozu-API-Token": token,
             "Content-Type": "application/json",
         },
         json={
-            "app": KINTONE_APP_ID,
+            "app": app_id,
             "id": record_id,
             "record": {FIELD_STATUS: {"value": new_status}},
         },
@@ -534,7 +566,28 @@ def handle_webhook(secret: str, payload: dict) -> tuple[int, dict]:
             # 上記ログで判別できる（イベントの永続 journal 化は Phase 1）。
             return 200, {"ok": True, "state": "verification_failed"}
 
-        record_no = update_kintone_status(document_id, "受任")
+        try:
+            record_no = update_kintone_status(document_id, "受任")
+        except AmbiguousDocumentMatch:
+            # HOUKI-CONTRACT-GEN: App 21 と App 40 の両方に該当＝どちらの案件か
+            # 機械判定できないため処理せず（受任へ進めない）要確認封筒+通知
+            env_no = file_mismatch_envelope(document_id, "kintone_ambiguous_match")
+            if env_no:
+                notify_business_line(
+                    "【CloudSign締結・App二重該当・要確認】\n"
+                    f"要確認封筒 record No: {env_no}\n"
+                    "失敗分類: kintone_ambiguous_match\n"
+                    "documentID が時効援用案件と相続放棄案件の両方に一致したため、"
+                    "受任への自動遷移は行っていません。"
+                    "App 30（発送管理）の当該封筒を確認してください。")
+            else:
+                notify_business_line(
+                    "【CloudSign締結・App二重該当・要人手確認】\n"
+                    f"参照ID: {emit(document_id, 'external_ref', 'line_business', 'attorney')}\n"
+                    "失敗分類: kintone_ambiguous_match\n"
+                    "documentID が時効援用案件と相続放棄案件の両方に一致しました。"
+                    "cloudsign_document_id を突合してください。")
+            return 200, {"ok": True, "state": "ambiguous_match"}
         if not record_no:
             # RCF-M04: 照合は成功したが kintone に一致案件がない（未更新）。
             # 受任は成立していないので「締結完了」通知は出さず、要人手確認を
