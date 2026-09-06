@@ -190,6 +190,11 @@ def update_kintone_status(document_id: str, new_status: str):
     HOUKI-CONTRACT-GEN: App 21 → App 40 の順で検索。両方に該当があれば
     AmbiguousDocumentMatch（処理せず通知へ）。どちらにも無ければ従来どおり None。
     App 40 の完了時後続処理（status=受任）は時効版と同じ。"""
+    # HOUKI-CONTRACT-GEN-fix2: 結果不明の印は document ID ではない（検索しない）
+    from hub.houki_contract import CLOUDSIGN_RESULT_UNKNOWN_MARK
+    if not document_id or str(document_id) == CLOUDSIGN_RESULT_UNKNOWN_MARK:
+        logger.warning("kintone検索対象外のdocument_id（空または結果不明の印）")
+        return None
     # 1. documentID で検索（App 21 → App 40）
     records = _search_by_document_id(KINTONE_APP_ID, KINTONE_API_TOKEN, document_id)
     app_id, token = KINTONE_APP_ID, KINTONE_API_TOKEN

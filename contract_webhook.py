@@ -624,6 +624,26 @@ async def _to_review(record_id: str, revision: str, text: str, skip: str,
     return JSONResponse(status_code=200, content={"ok": True, "skip": skip})
 
 
+async def _to_review_marked(record_id: str, revision: str, text: str, skip: str,
+                            cfg: ChannelConfig, current_doc_id: str):
+    """fix2 HCGF1-02（houki 専用）: 「要確認」へ CAS 遷移し、cloudsign_document_id が
+    空なら結果不明の印を同じ書込で残す（非空なら上書きしない）。409 は cas_lost
+    （登録中の残留は reconcile が印つきで要確認にする）。通知に人の解除手順を含める。"""
+    from hub import houki_contract as hc
+    fields = {FIELD_STATUS: STATUS_REVIEW}
+    if not current_doc_id:
+        fields[FIELD_CS_DOC_ID] = hc.CLOUDSIGN_RESULT_UNKNOWN_MARK
+    try:
+        await hub_kintone.update_record(cfg.app, record_id, fields, revision=revision)
+    except hub_kintone.KintoneError as e:
+        if getattr(e, "status", None) == 409:
+            return JSONResponse(status_code=200,
+                                content={"ok": True, "skip": "cas_lost"})
+        raise
+    await cfg.notify("review", record_id, text + "\n" + hc.MANUAL_RESOLUTION_TEXT)
+    return JSONResponse(status_code=200, content={"ok": True, "skip": skip})
+
+
 def _regeneration_guard(record_id: str, record: dict,
                         context: str = "regenerate") -> tuple[str, str] | None:
     """再生成/再登録の運用ガード（3 経路共通の単一判定関数。判定順:
@@ -633,6 +653,12 @@ def _regeneration_guard(record_id: str, record: dict,
     （クラウドサイン登録）で cs_registered の文言を分ける。
     houki も同じ判定（欄コードは App 40 も同名・特約の上限は人が書いた欄のみ）。"""
     if _fv(record, FIELD_CS_DOC_ID):
+        from hub import houki_contract as hc
+        if _fv(record, FIELD_CS_DOC_ID) == hc.CLOUDSIGN_RESULT_UNKNOWN_MARK:
+            return ("cs_registered",
+                    f"【相続放棄 委任契約書・要確認】案件レコードNo.{record_id} は前回の"
+                    "CloudSign 登録の結果が不明のため、再生成・再登録を中止しました。\n"
+                    + hc.MANUAL_RESOLUTION_TEXT)
         if context == "register":
             return ("cs_registered",
                     f"【委任契約書・要確認】CloudSign 登録済みのため再登録を中止しま"
@@ -750,13 +776,38 @@ async def _cloudsign_flow(record_id: str, record: dict, revision: str,
                 f"【相続放棄 委任契約書・要確認】案件レコードNo.{record_id}: 登録直前の"
                 "レコード再取得に失敗したため CloudSign 登録を中止しました。",
                 "refetch_failed", cfg)
+        # fix2 HCGF1-01: 外部 API を呼ぶ前に所有権を確認する
+        status_now = _fv(latest, FIELD_STATUS)
+        rev_now = _fv(latest, "$revision")
+        if status_now != STATUS_CS_WORKING:
+            # 人が状態を変えた＝何も書かず・外部 API も呼ばず終了（情報通知 1 通）
+            logger.info("[CONTRACT] cs state changed during claim record_id=%s",
+                        emit(record_id, "record_id", "log", "operator"))
+            await cfg.notify(
+                "review", record_id,
+                f"【相続放棄 委任契約書】案件レコードNo.{record_id}: 登録処理中に契約書"
+                "ステータスが変更されたため、CloudSign 登録を行いませんでした"
+                "（レコードは変更していません）。")
+            return JSONResponse(status_code=200,
+                                content={"ok": True, "skip": "state_changed"})
+        if rev_now != next_rev:
+            # claim 中に編集があった＝外部 API を呼ばず、再取得した revision で要確認
+            return await _to_review(
+                record_id, rev_now,
+                f"【相続放棄 委任契約書・要確認】案件レコードNo.{record_id}: 登録処理中に"
+                "レコードが編集されたため CloudSign 登録を中止しました。内容を確認のうえ、"
+                f"再実行する場合は契約書ステータスを「{STATUS_CS_TRIGGER}」に設定し直して"
+                "ください。", "edited_during_claim", cfg)
         again = await cfg.prepare(latest, record_id, "register")
         if again.review or again.fingerprint != prepared.fingerprint:
             return await _to_review(
-                record_id, next_rev,
+                record_id, rev_now,
                 f"【相続放棄 委任契約書・要確認】案件レコードNo.{record_id}: "
                 "登録直前に申述人集合または署名者が変化したため CloudSign 登録を"
                 f"中止しました。\n{again.summary}", "applicants_changed", cfg)
+        current_doc_id = _fv(latest, FIELD_CS_DOC_ID)
+    else:
+        current_doc_id = _fv(record, FIELD_CS_DOC_ID)
 
     # PDF 生成（テンプレ=単一の正）+ 凍結検証（docx 段・PDF 段の二層）。
     # 検証失敗はここで 500（系統的エラー→再配送が reconcile で「要確認」へ）
@@ -789,9 +840,24 @@ async def _cloudsign_flow(record_id: str, record: dict, revision: str,
         logger.error("[CONTRACT] cloudsign create outcome unknown "
                      "record_id=%s",
                      emit(record_id, "record_id", "log", "operator"))
-        raise
+        if cfg.name == "jikou":
+            raise
+        # houki fix2 HCGF1-02: 結果不明を永続の印つきで「要確認」へ（再登録の遮断）
+        return await _to_review_marked(
+            record_id, next_rev,
+            f"【相続放棄 委任契約書・要確認】案件レコードNo.{record_id}: CloudSign 書類"
+            "作成の結果が不明のため登録を中止しました。", "cs_result_unknown", cfg,
+            current_doc_id)
     except Exception:
         cleaned = _cs_delete_draft(doc_id) if doc_id else True
+        if cfg.name != "jikou":
+            # houki fix2 HCGF1-02: 作成後の添付/宛先追加失敗も結果不明として印つき要確認
+            # （掃除の成否にかかわらず人が下書きの有無を確認する）
+            return await _to_review_marked(
+                record_id, next_rev,
+                f"【相続放棄 委任契約書・要確認】案件レコードNo.{record_id}: CloudSign 下書き"
+                "への添付または宛先追加に失敗したため登録を中止しました。",
+                "cs_partial_failure", cfg, current_doc_id)
         if cleaned:
             try:
                 await hub_kintone.update_record(
@@ -803,10 +869,28 @@ async def _cloudsign_flow(record_id: str, record: dict, revision: str,
                              emit(record_id, "record_id", "log", "operator"))
         raise
 
-    await hub_kintone.update_record(cfg.app, record_id, {
-        FIELD_CS_DOC_ID: doc_id,
-        FIELD_STATUS: STATUS_CS_DONE,
-    }, revision=next_rev)
+    if cfg.name == "jikou":
+        await hub_kintone.update_record(cfg.app, record_id, {
+            FIELD_CS_DOC_ID: doc_id,
+            FIELD_STATUS: STATUS_CS_DONE,
+        }, revision=next_rev)
+    else:
+        try:
+            await hub_kintone.update_record(cfg.app, record_id, {
+                FIELD_CS_DOC_ID: doc_id,
+                FIELD_STATUS: STATUS_CS_DONE,
+            }, revision=next_rev)
+        except Exception:
+            # houki fix2 HCGF1-02: document ID の保存失敗（409/障害）も結果不明の印つき
+            # 要確認（同じ revision の CAS が 409 なら cas_lost → 登録中の残留は
+            # reconcile が印つきで要確認にする）
+            logger.error("[CONTRACT] cs document id save failed record_id=%s",
+                         emit(record_id, "record_id", "log", "operator"))
+            return await _to_review_marked(
+                record_id, next_rev,
+                f"【相続放棄 委任契約書・要確認】案件レコードNo.{record_id}: CloudSign 下書き"
+                "は作成されましたが document ID の保存に失敗しました。",
+                "cs_docid_save_failed", cfg, current_doc_id)
     logger.info("[CONTRACT] cloudsign registered record_id=%s",
                 emit(record_id, "record_id", "log", "operator"))
     await cfg.notify("created", record_id,
@@ -818,13 +902,22 @@ async def _cloudsign_flow(record_id: str, record: dict, revision: str,
 
 
 async def _reconcile_cs_working(record_id: str, revision: str,
-                                cfg: ChannelConfig | None = None):
+                                cfg: ChannelConfig | None = None,
+                                record: dict | None = None):
     """CONTRACT-GEN-2 reconcile: 「クラウドサイン登録中」で停止した行の回収。
 
     CloudSign 側に下書きが残っている可能性がある（外部状態・kintone からは
     機械確認できない）ため、v1 の回収と異なり自動再実行はせず、常に CAS で
-    「要確認」へ倒して管理者通知（二重下書き防止の fail-closed）。"""
+    「要確認」へ倒して管理者通知（二重下書き防止の fail-closed）。
+    houki（fix2 HCGF1-02）: 前回の処理が外部呼出しに到達したか判別できないため、
+    結果不明の印を同じ書込で残す（安全側）。"""
     cfg = _resolve(cfg)
+    if cfg.name != "jikou":
+        return await _to_review_marked(
+            record_id, revision,
+            f"【相続放棄 委任契約書・要確認】案件レコードNo.{record_id} はクラウドサイン"
+            "登録が中断した状態のため「要確認」にしました。", "cs_needs_review", cfg,
+            _fv(record or {}, FIELD_CS_DOC_ID))
     next_rev = await _claim(record_id, revision, STATUS_REVIEW, cfg.app)
     if next_rev is None:
         return JSONResponse(status_code=200,
@@ -889,7 +982,7 @@ async def _dispatch(body, cfg: ChannelConfig):
         if current == STATUS_WORKING:
             return await _reconcile_working(record_id, record, revision, cfg)
         if current == STATUS_CS_WORKING:
-            return await _reconcile_cs_working(record_id, revision, cfg)
+            return await _reconcile_cs_working(record_id, revision, cfg, record)
         if current == STATUS_CS_TRIGGER:
             # fix1 CT-01: 登録経路にも共通ガード（cs_registered=再登録の文言）。
             # 該当は CloudSign API 作用 0 で「要確認」へ CAS 遷移+通知

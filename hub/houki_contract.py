@@ -99,6 +99,17 @@ TOKUYAKU_NONE = "特になし"
 FIELD_GROUP = "被相続人グループID"
 FIELD_CONTRACT_STATUS = "契約書ステータス"
 FIELD_CS_DOC_ID = "cloudsign_document_id"
+# fix2 HCGF1-02: CloudSign 下書き作成の呼出し後に document ID を確定できなかった
+# （結果不明）ことを cloudsign_document_id に永続的に残す印。非空の欄は規則 4
+# （member_state_problems）と _regeneration_guard（cs_registered）の両方が遮断する
+# ので、印がある限りグループID の付け替えでも本人でも再登録できない。解除は人の
+# 操作のみ（MANUAL_RESOLUTION_TEXT の手順）。既に非空なら上書きしない
+CLOUDSIGN_RESULT_UNKNOWN_MARK = "結果不明:要手動確認"
+MANUAL_RESOLUTION_TEXT = (
+    "cloudsign_document_id に「結果不明:要手動確認」を記録しました。CloudSign 画面で"
+    "下書きの有無を確認し、(i) 下書きがあれば本物の document ID を欄に入れて契約書"
+    "ステータスを「クラウドサイン登録済」に、(ii) 無ければ欄を空にして再度"
+    "「クラウドサイン登録」に設定してください。")
 # 管理レコード判定の分類（閉集合・通知の理由と JSON の skip に使う）
 NOT_MANAGER = "not_manager"
 GROUP_INVALID = "group_invalid"
