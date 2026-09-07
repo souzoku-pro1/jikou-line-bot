@@ -82,13 +82,27 @@ cloudsign_webhook が cloudsign_document_id で照合して担う）。
     トリガ／作成中 reconcile／クラウドサイン登録 の 3 経路が同じ判定順
     （cs_registered → tokuyaku_too_long → tokuyaku_invalid）で「要確認」へ倒す。
     特約に {{ }} を含む入力は展開せず入力不正として拒否する。
+
+ChannelConfig 化（HOUKI-CONTRACT-GEN）:
+  App 固定部分（app・雛形パス/SHA・凍結条項・出力名・CloudSign タイトル・差し込みの
+  準備〔prepare〕・通知）を ChannelConfig に切り出し、jikou（本モジュールの定数を
+  呼出し時に解決＝既存テストの patch がそのまま効く）と houki（hub/houki_contract）の
+  2 設定を持つ。状態機械・CAS・reconcile・_regeneration_guard・CloudSign 呼出し・
+  凍結検証の枠組みは 1 経路を共用し、cfg=None は jikou（時効側の挙動不変）。
+  houki route: POST /souzoku-houki/contract/{HOUKI_WEBHOOK_TOKEN}（相談カード読取と
+  同じトークン・同じ検証方式）。CloudSign 宛先は prepare が返す署名者（全員/代表者）。
 """
 
+import asyncio
 import copy
 import hashlib
+import hmac
 import io
 import logging
+import os
 import re
+from dataclasses import dataclass, field
+from typing import Awaitable, Callable
 
 from docx import Document
 from docx.text.paragraph import Paragraph
@@ -173,6 +187,179 @@ class CloudSignResultUnknown(RuntimeError):
 
 def _fv(record: dict, code: str) -> str:
     return str((record.get(code) or {}).get("value") or "").strip()
+
+
+# ── ChannelConfig（HOUKI-CONTRACT-GEN） ──────────────────────────────────────
+@dataclass
+class Prepared:
+    """prepare の結果（生成/登録の前提と差し込み済み生成関数）。
+    missing: 必須欠落（通知のみ・状態不変。jikou の _missing_fields）
+    review: (skip 分類, 通知文)＝「要確認」へ CAS 遷移する理由（houki の前提未充足）
+    render: 凍結検証込みの docx bytes を返す関数（docx 添付と PDF の単一経路）
+    participants: CloudSign 宛先 [(email, name)]（jikou=1 名・houki=署名者）
+    fingerprint: 送信直前の再取得で比較する指紋（jikou は "" =比較しない）
+    summary: 通知本文に添える要約（値を含まない）"""
+    missing: list = field(default_factory=list)
+    review: tuple | None = None
+    render: Callable[[], bytes] = lambda: b""
+    participants: list = field(default_factory=list)
+    fingerprint: str = ""
+    summary: str = ""
+
+
+@dataclass(frozen=True)
+class ChannelConfig:
+    name: str
+    app: hub_kintone.KintoneApp
+    template_path: str
+    template_sha256: str
+    frozen_clause: tuple
+    output_filename: str
+    output_pdf_name: str
+    cs_title: Callable[[str], str]
+    prepare: Callable[[dict, str, str], Awaitable[Prepared]]   # (record, record_id, context)
+    notify: Callable[[str, str, str], Awaitable[None]]         # (kind, record_id, text)
+
+
+async def _jikou_prepare(record: dict, record_id: str, context: str) -> Prepared:
+    return Prepared(missing=_missing_fields(record),
+                    render=lambda: render_contract_docx(record),
+                    participants=[(_fv(record, FIELD_EMAIL), _fv(record, _REQUIRED_NAME))])
+
+
+async def _jikou_notify(kind: str, record_id: str, text: str) -> None:
+    """時効側は従来どおり「通知のみ」の経路（missing/要確認/前提未充足）だけ管理者
+    LINE へ出す。created/failed は従来どおり通知しない（挙動不変）。"""
+    if kind == "review":
+        await _notify(text)
+
+
+def _jikou_cfg() -> ChannelConfig:
+    """時効版の設定。定数は呼出し時に解決する（テストの patch.object が効く）。"""
+    return ChannelConfig(
+        name="jikou", app=_APP, template_path=TEMPLATE_PATH,
+        template_sha256=TEMPLATE_SHA256, frozen_clause=FROZEN_CLAUSE,
+        output_filename=OUTPUT_FILENAME, output_pdf_name=OUTPUT_PDF_NAME,
+        cs_title=lambda rid: f"委任契約書_案件No.{rid}",
+        prepare=_jikou_prepare, notify=_jikou_notify)
+
+
+_HOUKI_NOTIFY_KINDS = {"created": "houki_contract_created",
+                       "review": "houki_contract_needs_review",
+                       "failed": "houki_contract_failed"}
+# fix4/fix5: 回収専用 kind（新設はこの 1 つのみ）。キーは
+# houki_contract_recovery:{record_id}:{reason}（fix5 HCGF4-03: ID 部分を廃止）・窓 60 秒。
+# 回収情報の正本はレコードの 契約書回収メモ（App 28 への書込は 0・fix5 HCGF4-02）。
+# 通知本文に document ID・氏名・メールは載せない（HCGF4-06）
+_RECOVERY_KIND = "houki_contract_recovery"
+_RECOVERY_REASONS = ("dup_id", "persist_failed", "unknown_result")
+_RECOVERY_RETRIES = 3
+
+
+async def _houki_notify(kind: str, record_id: str, text: str) -> str:
+    """既存 kind の通知（キー {kind}:{record_id}・窓 300 秒は不変）。戻り値は 3 値:
+    sent / throttled（同一キーが窓内に送達済み）/ failed（送信失敗・管理者 ID 未設定・
+    例外）。fix4: 抑止と失敗を呼出側が区別できる。"""
+    key = f"{_HOUKI_NOTIFY_KINDS.get(kind, 'houki_contract_needs_review')}:{record_id}"
+    try:
+        from hub.notify import is_throttled, notify_admin_line
+        if is_throttled(key):
+            return "throttled"
+        sent = await notify_admin_line(text, throttle_key=key,
+                                       throttle_on_success_only=True)
+        return "sent" if sent else "failed"
+    except Exception:
+        logger.error("[HOUKI_CONTRACT] admin notify failed (fixed text)")
+        return "failed"
+
+
+def _recovery_key(record_id: str, reason: str) -> str:
+    return f"{_RECOVERY_KIND}:{record_id}:{reason}"
+
+
+def _recovery_text(record_id: str, reason: str, cfg: ChannelConfig) -> str:
+    """回収通知の本文（HCGF4-06）: レコード番号・reason の説明・CloudSign の文書タイトル
+    （cfg.cs_title の値）・手順のみ。document ID・氏名・メールは載せない。"""
+    title = cfg.cs_title(record_id)
+    head = f"【相続放棄 委任契約書・回収】案件レコードNo.{record_id}: "
+    if reason == "dup_id":
+        return (head + "CloudSign の下書きが二重に作成された疑いがあります"
+                f"（文書タイトル「{title}」）。レコード No.{record_id} の 契約書回収メモ と "
+                "cloudsign_document_id を確認し、不要な下書きを削除してください。")
+    if reason == "unknown_result":
+        return (head + "CloudSign 書類作成の結果が不明ですが、既に document ID が保存されて"
+                f"います（文書タイトル「{title}」）。レコード No.{record_id} の 契約書回収メモ と "
+                "cloudsign_document_id を確認してください。")
+    return (head + "CloudSign で下書きを作成した可能性がありますが、kintone に結果を保存"
+            f"できませんでした。CloudSign の下書き一覧でタイトル「{title}」を確認し、kintone に"
+            f"保存できていなければレコード No.{record_id} の cloudsign_document_id に手動で"
+            "入力し、契約書ステータスを整えてください。")
+
+
+async def _houki_recover(record_id: str, reason: str, cfg: ChannelConfig) -> str:
+    """fix5: 回収通知（窓 60 秒・failed は短い待機後に最大 3 回再送）。戻り値は最後の
+    結果（sent / throttled / failed）。App 28 への書込は行わない（HCGF4-02）。"""
+    from hub.notify import _RECOVERY_MIN_INTERVAL_SEC, notify_admin_line_result
+    assert reason in _RECOVERY_REASONS
+    key = _recovery_key(record_id, reason)
+    text = _recovery_text(record_id, reason, cfg)
+    result = "failed"
+    for attempt in range(_RECOVERY_RETRIES):
+        try:
+            result = await notify_admin_line_result(
+                text, key, min_interval=_RECOVERY_MIN_INTERVAL_SEC)
+        except Exception:
+            result = "failed"
+        if result in ("sent", "throttled"):
+            break
+        if attempt < _RECOVERY_RETRIES - 1:
+            await _persist_wait()
+    if result == "failed":
+        if reason == "dup_id":
+            logger.error("[CONTRACT] recovery notify failed reason=dup_id record_id=%s",
+                         emit(record_id, "record_id", "log", "operator"))
+        elif reason == "unknown_result":
+            logger.error("[CONTRACT] recovery notify failed reason=unknown_result "
+                         "record_id=%s", emit(record_id, "record_id", "log", "operator"))
+        else:
+            logger.error("[CONTRACT] recovery notify failed reason=persist_failed "
+                         "record_id=%s", emit(record_id, "record_id", "log", "operator"))
+    return result
+
+
+async def _houki_prepare(record: dict, record_id: str, context: str) -> Prepared:
+    """申述人集合の取得（被相続人グループID）・費用計算・署名者決定。前提未充足は
+    review（要確認へ CAS）。context="register" ではメールアドレスも検査する。"""
+    from hub import houki_contract as hc
+    p = await hc.plan(record)
+    problems = list(p.applicant_problems)
+    if context == "register":
+        problems += p.email_problems
+    review = None
+    if problems:
+        review = (p.skip or "houki_preconditions",
+                  f"【相続放棄 委任契約書・要確認】案件レコードNo.{record_id} は前提を"
+                  "満たしていないため処理を中止しました。\n・" + "\n・".join(problems)
+                  + "\n" + p.summary())
+    return Prepared(review=review,
+                    render=lambda: hc.render(p.records, p.mode, p.fees),
+                    participants=list(p.participants), fingerprint=p.fingerprint,
+                    summary=p.summary())
+
+
+def _houki_cfg() -> ChannelConfig:
+    from hub import houki_contract as hc
+    from hub.houki_case_store import APP_HOUKI_CASE
+    return ChannelConfig(
+        name="houki", app=APP_HOUKI_CASE, template_path=hc.TEMPLATE_PATH,
+        template_sha256=hc.TEMPLATE_SHA256, frozen_clause=hc.FROZEN_CLAUSE,
+        output_filename=hc.OUTPUT_FILENAME, output_pdf_name=hc.OUTPUT_PDF_NAME,
+        cs_title=lambda rid: f"相続放棄_委任契約書_案件No.{rid}",
+        prepare=_houki_prepare, notify=_houki_notify)
+
+
+def _resolve(cfg: ChannelConfig | None) -> ChannelConfig:
+    return cfg if cfg is not None else _jikou_cfg()
 
 
 def _missing_fields(record: dict) -> list[str]:
@@ -277,15 +464,17 @@ def render_contract_docx(record: dict) -> bytes:
     return docx_bytes
 
 
-def _clause_of(docx_bytes: bytes) -> tuple:
-    """docx から第2条ブロック（見出し+3 項・正規化=前後空白除去）を抽出。"""
+def _clause_of(docx_bytes: bytes, frozen: tuple | None = None) -> tuple:
+    """docx から凍結ブロック（見出し+各項・正規化=前後空白除去）を抽出。
+    frozen 省略時は時効版の第2条（FROZEN_CLAUSE）。"""
+    frozen = FROZEN_CLAUSE if frozen is None else frozen
     doc = Document(io.BytesIO(docx_bytes))
     paras = [p.text.strip() for p in doc.paragraphs]
     try:
-        i = paras.index(FROZEN_CLAUSE[0])
+        i = paras.index(frozen[0])
     except ValueError:
         return ()
-    return tuple(paras[i:i + len(FROZEN_CLAUSE)])
+    return tuple(paras[i:i + len(frozen)])
 
 
 def verify_template_integrity() -> None:
@@ -296,14 +485,16 @@ def verify_template_integrity() -> None:
         raise ContractIntegrityError("template hash mismatch")
 
 
-def verify_frozen_clause(docx_bytes: bytes) -> None:
+def verify_frozen_clause(docx_bytes: bytes, frozen: tuple | None = None) -> None:
     """fix1[03]: 生成物の報酬条項（第2条全体）がテンプレートと逐語一致する
-    ことの実行時検証。不一致は添付しない（差し込み事故の構造検知）。"""
-    if _clause_of(docx_bytes) != FROZEN_CLAUSE:
+    ことの実行時検証。不一致は添付しない（差し込み事故の構造検知）。
+    frozen 省略時は時効版（houki は hub/houki_contract.FROZEN_CLAUSE を渡す）。"""
+    frozen = FROZEN_CLAUSE if frozen is None else frozen
+    if _clause_of(docx_bytes, frozen) != frozen:
         raise ContractIntegrityError("frozen clause mismatch")
 
 
-def verify_frozen_pdf(pdf_bytes: bytes) -> None:
+def verify_frozen_pdf(pdf_bytes: bytes, cfg: ChannelConfig | None = None) -> None:
     """CONTRACT-GEN-2: 生成 PDF の抽出テキストへの凍結検証（第1版同水準）。
 
     PDF は折返しで改行位置が変わるため、全空白（全角空白含む）除去後の
@@ -311,7 +502,7 @@ def verify_frozen_pdf(pdf_bytes: bytes) -> None:
     逐語一致すること、および差し込みキー（{{ / }}）が残存しないことを検証。
     不一致は CloudSign へ登録しない（500）。"""
     flat = "".join(contract_pdf.pdf_text(pdf_bytes).split())
-    frozen = "".join("".join(part.split()) for part in FROZEN_CLAUSE)
+    frozen = "".join("".join(part.split()) for part in _resolve(cfg).frozen_clause)
     if frozen not in flat:
         raise ContractIntegrityError("frozen clause missing in pdf")
     if "{{" in flat or "}}" in flat:
@@ -342,23 +533,28 @@ async def _notify(text: str) -> None:
         logger.error("[CONTRACT] admin notify failed (fixed text)")
 
 
-async def _generate_and_attach(record_id: str, record: dict,
-                               final_revision: str) -> None:
+async def _generate_and_attach(record_id: str, prepared: Prepared,
+                               final_revision: str,
+                               cfg: ChannelConfig | None = None) -> None:
     """生成 → 凍結文言検証 → upload → 添付+作成済（revision CAS つき PUT）。"""
-    docx_bytes = render_contract_docx(record)
+    cfg = _resolve(cfg)
+    docx_bytes = prepared.render()
     logger.info("[CONTRACT] generated record_id=%s bytes=%d",
                 emit(record_id, "record_id", "log", "operator"),
                 len(docx_bytes))
     mime = ("application/vnd.openxmlformats-officedocument"
             ".wordprocessingml.document")
     file_key = await hub_kintone.upload_file(
-        _APP, OUTPUT_FILENAME, docx_bytes, mime)
-    await hub_kintone.update_record(_APP, record_id, {
+        cfg.app, cfg.output_filename, docx_bytes, mime)
+    await hub_kintone.update_record(cfg.app, record_id, {
         FIELD_ATTACHMENT: [{"fileKey": file_key}],
         FIELD_STATUS: STATUS_DONE,
     }, revision=final_revision)
     logger.info("[CONTRACT] attached record_id=%s",
                 emit(record_id, "record_id", "log", "operator"))
+    await cfg.notify("created", record_id,
+                     f"【相続放棄 委任契約書】案件レコードNo.{record_id} の委任契約書を"
+                     f"作成し添付しました。\n{prepared.summary}")
 
 
 # ── CloudSign API（CONTRACT-GEN-2）───────────────────────────────────────────
@@ -418,14 +614,16 @@ def _cs_request(method: str, path: str, *, unknown_window: bool = False,
     return resp
 
 
-def _cs_create_document(record_id: str) -> str:
+def _cs_create_document(record_id: str, title: str | None = None) -> str:
     """書類作成（下書き）。タイトルは案件 No のみ（氏名等の PII は載せない）。
 
     fix1[01]: 唯一の unknown_window 呼出し。2xx 応答から id を取り出せない
     場合（本文不正・id 欠落）も「作成された可能性があるが特定できない」＝
     結果不明として扱う（ContractIntegrityError から変更・票 [01] 由来）。"""
+    if title is None:
+        title = f"委任契約書_案件No.{record_id}"
     resp = _cs_request("POST", "/documents", unknown_window=True,
-                       data={"title": f"委任契約書_案件No.{record_id}"})
+                       data={"title": title})
     try:
         doc_id = str((resp.json() or {}).get("id") or "")
     except Exception as e:
@@ -436,11 +634,13 @@ def _cs_create_document(record_id: str) -> str:
     return doc_id
 
 
-def _cs_attach_pdf(doc_id: str, pdf_bytes: bytes) -> None:
+def _cs_attach_pdf(doc_id: str, pdf_bytes: bytes, name: str | None = None) -> None:
+    if name is None:
+        name = OUTPUT_PDF_NAME
     _cs_request("POST", f"/documents/{doc_id}/files",
                 files={"uploadfile":
-                       (OUTPUT_PDF_NAME, pdf_bytes, "application/pdf")},
-                data={"name": OUTPUT_PDF_NAME})
+                       (name, pdf_bytes, "application/pdf")},
+                data={"name": name})
 
 
 def _cs_add_participant(doc_id: str, email: str, name: str) -> None:
@@ -459,7 +659,8 @@ def _cs_delete_draft(doc_id: str) -> bool:
         return False
 
 
-async def _claim(record_id: str, revision: str, to_status: str) -> str | None:
+async def _claim(record_id: str, revision: str, to_status: str,
+                 app: hub_kintone.KintoneApp | None = None) -> str | None:
     """CAS: $revision 一致時のみステータス遷移。勝者は次 revision（claim+1）を
     返す。
 
@@ -471,7 +672,8 @@ async def _claim(record_id: str, revision: str, to_status: str) -> str | None:
     3 箇所すべてで共用される単一の正。"""
     try:
         await hub_kintone.update_record(
-            _APP, record_id, {FIELD_STATUS: to_status}, revision=revision)
+            app if app is not None else _APP, record_id,
+            {FIELD_STATUS: to_status}, revision=revision)
     except hub_kintone.KintoneError as e:
         if getattr(e, "status", None) == 409:
             return None                  # CAS 敗者（競合）のみ 200/作用 0
@@ -479,14 +681,123 @@ async def _claim(record_id: str, revision: str, to_status: str) -> str | None:
     return str(int(revision) + 1)
 
 
-async def _to_review(record_id: str, revision: str, text: str, skip: str):
+async def _to_review(record_id: str, revision: str, text: str, skip: str,
+                     cfg: ChannelConfig | None = None):
     """生成せず「要確認」へ CAS 遷移+管理者通知（reconcile と同型）。"""
-    next_rev = await _claim(record_id, revision, STATUS_REVIEW)
+    cfg = _resolve(cfg)
+    next_rev = await _claim(record_id, revision, STATUS_REVIEW, cfg.app)
     if next_rev is None:
         return JSONResponse(status_code=200,
                             content={"ok": True, "skip": "cas_lost"})
-    await _notify(text)
+    await cfg.notify("review", record_id, text)
     return JSONResponse(status_code=200, content={"ok": True, "skip": skip})
+
+
+_PERSIST_ATTEMPTS = 5          # fix3 HCGF2-01: 外部作成後の永続化ループの最大回数
+_PERSIST_WAIT_SEC = 0.3
+
+
+async def _persist_wait() -> None:
+    await asyncio.sleep(_PERSIST_WAIT_SEC)
+
+
+async def _persist_after_external(record_id: str, cfg: ChannelConfig,
+                                  doc_id: str | None, reason: str, skip: str,
+                                  summary: str = "", attempt_id: str = ""):
+    """fix3 HCGF2-01（houki 専用）: CloudSign 下書き作成の呼出しを発行した後は、結果
+    （本物の document ID=doc_id、または結果不明=None → 印）を必ず永続化する。
+
+    claim 時の revision に固定せず「最新レコードを ID 指定で再取得 → 人の変更を保全した
+    内容を最新 revision で CAS 書込」を最大 _PERSIST_ATTEMPTS 回繰り返す。
+      cloudsign_document_id: 空 or 印 → doc_id（ok）/ 印（unknown）。本物の ID が既に
+        あれば上書きしない（ok で異なる ID → 二重下書きの疑いとして両 ID を通知・
+        unknown → 通知のみ）
+      契約書ステータス: 最新が 登録中 のまま → ok は 登録済・unknown は 要確認。
+        それ以外（人が変えた）→ 触らない（document ID だけ書く）
+      他の欄は触らない。409/障害/再取得失敗 → 短い待機後に次回
+    成功 → 通知（ok: created・unknown: needs_review+解除手順）・HTTP 200・persisted。
+    5 回とも書けない → houki_contract_failed（外部で下書きを作成した可能性・唯一の回収
+    手段である旨）・HTTP 500・persist_failed。cas_lost / 200 正常終了で外部作成後の
+    処理を終えることはない。"""
+    from hub import houki_contract as hc
+    mark = hc.CLOUDSIGN_RESULT_UNKNOWN_MARK
+    for _attempt in range(_PERSIST_ATTEMPTS):
+        try:
+            latest = await hub_kintone.get_record(cfg.app, record_id)
+        except Exception:
+            await _persist_wait()
+            continue
+        current = _fv(latest, FIELD_CS_DOC_ID)
+        status_now = _fv(latest, FIELD_STATUS)
+        fields: dict = {}
+        recovery: str | None = None         # 回収通知の reason（None=通常通知）
+        status_note = ""
+        if not current or current == mark:
+            # 1. 空または印: D（ok）/ 印（unknown）。状態は 登録中 のときだけ動かす
+            fields[FIELD_CS_DOC_ID] = doc_id if doc_id else mark
+            if status_now == STATUS_CS_WORKING:
+                fields[FIELD_STATUS] = STATUS_CS_DONE if doc_id else STATUS_REVIEW
+            else:
+                status_note = ("\n人が状態を変更していたためステータスは変更していません"
+                               "（document ID のみ保存）")
+        elif doc_id and current == doc_id:
+            # 2. fix6 HCGF5-01: current == D は「保存済みの正常結果」（前回の保存が届いて
+            # いたが応答が失われた等）。ID・メモは書かず、登録中 のままなら 登録済 へ
+            if status_now == STATUS_CS_WORKING:
+                fields[FIELD_STATUS] = STATUS_CS_DONE
+            else:
+                status_note = ("\n人が状態を変更していたためステータスは変更していません"
+                               "（document ID は保存済み）")
+        else:
+            # 3. 本物の ID が既にあり D と異なる／unknown: 上書きせず 契約書回収メモ に
+            # 1 行追記（既存本文を保全）。fix6 HCGF5-02: 同じ [ref:X] が既にあれば追記しない
+            # （冪等・回収情報は永続化済み扱い）。状態は 登録中 なら 要確認（登録済 には
+            # しない）。同一 CAS で書く
+            memo_now = _fv(latest, hc.FIELD_RECOVERY_MEMO)
+            if not hc.memo_has_ref(memo_now, hc.memo_ref(doc_id, attempt_id)):
+                fields[hc.FIELD_RECOVERY_MEMO] = hc.append_memo(
+                    memo_now, hc.recovery_memo_line(current, doc_id, attempt_id))
+            if status_now == STATUS_CS_WORKING:
+                fields[FIELD_STATUS] = STATUS_REVIEW
+            recovery = "dup_id" if (doc_id and doc_id != current) else "unknown_result"
+        if fields:
+            try:
+                await hub_kintone.update_record(cfg.app, record_id, fields,
+                                                revision=_fv(latest, "$revision") or None)
+            except Exception:
+                await _persist_wait()
+                continue
+        # 永続化済み（レコードに正本あり）。通知は 1 の ok=created、1 の unknown=
+        # needs_review（解除手順）、2=回収通知（失敗しても 200 のまま・ERROR ログ）
+        if recovery is None and doc_id:
+            logger.info("[CONTRACT] cloudsign registered record_id=%s",
+                        emit(record_id, "record_id", "log", "operator"))
+            await cfg.notify("created", record_id,
+                             f"【相続放棄 委任契約書】案件レコードNo.{record_id} を CloudSign に"
+                             "下書き登録しました（送信は CloudSign 画面で行ってください）。"
+                             f"{status_note}\n{summary}")
+        elif recovery is None:
+            await cfg.notify("review", record_id,
+                             reason + status_note + "\n" + hc.MANUAL_RESOLUTION_TEXT)
+        else:
+            await _houki_recover(record_id, recovery, cfg)
+        if doc_id:
+            return JSONResponse(status_code=200, content={
+                "ok": True, "record_id": record_id, "cloudsign": True,
+                "persist": "persisted"})
+        return JSONResponse(status_code=200, content={
+            "ok": True, "skip": skip, "persist": "persisted"})
+    # 5 回とも書けない＝状態は未書込（登録中 のまま→再配送の reconcile が 印+要確認 へ）。
+    # 回収通知（reason=persist_failed・ID は載せない）が唯一の即時手段。500 で閉じない
+    if doc_id:
+        logger.error("[CONTRACT] persist after cloudsign create failed (id known) "
+                     "record_id=%s", emit(record_id, "record_id", "log", "operator"))
+    else:
+        logger.error("[CONTRACT] persist after cloudsign create failed (result unknown) "
+                     "record_id=%s", emit(record_id, "record_id", "log", "operator"))
+    await _houki_recover(record_id, "persist_failed", cfg)
+    return JSONResponse(status_code=500, content={"error": "persist_failed",
+                                                  "persist": "persist_failed"})
 
 
 def _regeneration_guard(record_id: str, record: dict,
@@ -495,8 +806,15 @@ def _regeneration_guard(record_id: str, record: dict,
     ①CloudSign 下書き作成済み（cs_registered）→ ②特約上限（tokuyaku_too_long）
     → ③特約の使用不可記号（tokuyaku_invalid）。該当なら (skip 分類, 固定文言)。
     context="regenerate"（契約書作成トリガ・作成中 reconcile）／"register"
-    （クラウドサイン登録）で cs_registered の文言を分ける。"""
+    （クラウドサイン登録）で cs_registered の文言を分ける。
+    houki も同じ判定（欄コードは App 40 も同名・特約の上限は人が書いた欄のみ）。"""
     if _fv(record, FIELD_CS_DOC_ID):
+        from hub import houki_contract as hc
+        if _fv(record, FIELD_CS_DOC_ID) == hc.CLOUDSIGN_RESULT_UNKNOWN_MARK:
+            return ("cs_registered",
+                    f"【相続放棄 委任契約書・要確認】案件レコードNo.{record_id} は前回の"
+                    "CloudSign 登録の結果が不明のため、再生成・再登録を中止しました。\n"
+                    + hc.MANUAL_RESOLUTION_TEXT)
         if context == "register":
             return ("cs_registered",
                     f"【委任契約書・要確認】CloudSign 登録済みのため再登録を中止しま"
@@ -520,18 +838,20 @@ def _regeneration_guard(record_id: str, record: dict,
 
 
 async def _reconcile_working(record_id: str, record: dict,
-                             revision: str):
+                             revision: str, cfg: ChannelConfig | None = None):
     """fix1[02] reconcile: 「作成中」で停止した行の回収。
     添付なし=前回 run が upload/添付前に停止 → CAS 再claim して再生成（回収）。
     添付あり=起動内容との整合を機械確認できない → 自動上書きせず CAS で
     「要確認」へ倒し管理者通知。"""
+    cfg = _resolve(cfg)
     attachment = (record.get(FIELD_ATTACHMENT) or {}).get("value") or []
     if attachment:
-        next_rev = await _claim(record_id, revision, STATUS_REVIEW)
+        next_rev = await _claim(record_id, revision, STATUS_REVIEW, cfg.app)
         if next_rev is None:
             return JSONResponse(status_code=200, content={
                 "ok": True, "skip": "cas_lost"})
-        await _notify(
+        await cfg.notify(
+            "review", record_id,
             f"【委任契約書】案件 No.{record_id} は生成が中断した状態で既に"
             "添付ファイルが存在するため、自動では上書きせず"
             f"「{STATUS_REVIEW}」にしました。添付内容を確認のうえ、再生成する"
@@ -541,29 +861,40 @@ async def _reconcile_working(record_id: str, record: dict,
             "ok": True, "skip": "needs_review"})
     guard = _regeneration_guard(record_id, record, "regenerate")
     if guard:
-        return await _to_review(record_id, revision, guard[1], guard[0])
-    next_rev = await _claim(record_id, revision, STATUS_WORKING)
+        return await _to_review(record_id, revision, guard[1], guard[0], cfg)
+    prepared = await cfg.prepare(record, record_id, "generate")
+    if prepared.review:
+        return await _to_review(record_id, revision, prepared.review[1],
+                                prepared.review[0], cfg)
+    next_rev = await _claim(record_id, revision, STATUS_WORKING, cfg.app)
     if next_rev is None:
         return JSONResponse(status_code=200,
                             content={"ok": True, "skip": "cas_lost"})
-    await _generate_and_attach(record_id, record, next_rev)
+    await _generate_and_attach(record_id, prepared, next_rev, cfg)
     return JSONResponse(status_code=200, content={
         "ok": True, "record_id": record_id, "recovered": True})
 
 
-async def _cloudsign_flow(record_id: str, record: dict, revision: str):
+async def _cloudsign_flow(record_id: str, record: dict, revision: str,
+                          cfg: ChannelConfig | None = None):
     """CONTRACT-GEN-2: PDF 生成 → CloudSign 書類作成+PDF 添付+宛先追加 →
     doc id 書き戻し（登録済）。送信 API は呼ばない（対外効果の一線）。"""
+    cfg = _resolve(cfg)
+    prepared = await cfg.prepare(record, record_id, "register")
+    # houki: 前提未充足（申述人集合・メール）は「要確認」へ CAS 遷移（状態を動かす）
+    if prepared.review:
+        return await _to_review(record_id, revision, prepared.review[1],
+                                prepared.review[0], cfg)
     # fail-closed: 前提未充足は登録しない（状態も動かさない・値は非搭載）
-    problems = _missing_fields(record)
+    problems = list(prepared.missing)
     if not (record.get(FIELD_ATTACHMENT) or {}).get("value"):
         problems.append(f"{FIELD_ATTACHMENT}（docx 未添付＝先に"
                         f"「{STATUS_TRIGGER}」を実行してください）")
-    email = _fv(record, FIELD_EMAIL)
-    if not email:
-        problems.append(FIELD_EMAIL)
-    elif not _EMAIL_RE.fullmatch(email):
-        problems.append(f"{FIELD_EMAIL}（形式不正）")
+    for email, _name in prepared.participants:
+        if not email:
+            problems.append(FIELD_EMAIL)
+        elif not _EMAIL_RE.fullmatch(email):
+            problems.append(f"{FIELD_EMAIL}（形式不正）")
     # 特約の検査（上限/使用不可記号）と CloudSign 登録済みは dispatcher の
     # _regeneration_guard（3 経路共通）で「要確認」へ倒し済み（fix1 CT-01/02）
     if problems:
@@ -571,7 +902,8 @@ async def _cloudsign_flow(record_id: str, record: dict, revision: str):
                     "count=%d",
                     emit(record_id, "record_id", "log", "operator"),
                     len(problems))
-        await _notify(
+        await cfg.notify(
+            "review", record_id,
             f"【委任契約書】案件 No.{record_id} はクラウドサイン登録の前提を"
             f"満たしていないため登録しませんでした。不足: "
             f"{'・'.join(problems)}。kintone で解消後、契約書ステータスを"
@@ -580,18 +912,61 @@ async def _cloudsign_flow(record_id: str, record: dict, revision: str):
             "ok": True, "skip": "cs_preconditions", "missing": problems})
 
     # CAS（登録→登録中）勝者のみ実行（並行 2 本でも CloudSign 作成は 1 回）
-    next_rev = await _claim(record_id, revision, STATUS_CS_WORKING)
+    next_rev = await _claim(record_id, revision, STATUS_CS_WORKING, cfg.app)
     if next_rev is None:
         logger.info("[CONTRACT] cs cas lost record_id=%s",
                     emit(record_id, "record_id", "log", "operator"))
         return JSONResponse(status_code=200,
                             content={"ok": True, "skip": "cas_lost"})
 
+    # HOUKI-CONTRACT-GEN: 送信直前に申述人集合を再取得（TOCTOU）。変化していれば
+    # CloudSign を呼ばず「要確認」へ（登録中→要確認・CAS）。fix1 HCG-02: 起点
+    # （管理）レコードも ID 指定で再取得し、claim 時の record は使い回さない。
+    # 再取得不能は CloudSign を呼ばず「要確認」（refetch_failed）
+    if prepared.fingerprint:
+        try:
+            latest = await hub_kintone.get_record(cfg.app, record_id)
+        except Exception:
+            return await _to_review(
+                record_id, next_rev,
+                f"【相続放棄 委任契約書・要確認】案件レコードNo.{record_id}: 登録直前の"
+                "レコード再取得に失敗したため CloudSign 登録を中止しました。",
+                "refetch_failed", cfg)
+        # fix2 HCGF1-01: 外部 API を呼ぶ前に所有権を確認する
+        status_now = _fv(latest, FIELD_STATUS)
+        rev_now = _fv(latest, "$revision")
+        if status_now != STATUS_CS_WORKING:
+            # 人が状態を変えた＝何も書かず・外部 API も呼ばず終了（情報通知 1 通）
+            logger.info("[CONTRACT] cs state changed during claim record_id=%s",
+                        emit(record_id, "record_id", "log", "operator"))
+            await cfg.notify(
+                "review", record_id,
+                f"【相続放棄 委任契約書】案件レコードNo.{record_id}: 登録処理中に契約書"
+                "ステータスが変更されたため、CloudSign 登録を行いませんでした"
+                "（レコードは変更していません）。")
+            return JSONResponse(status_code=200,
+                                content={"ok": True, "skip": "state_changed"})
+        if rev_now != next_rev:
+            # claim 中に編集があった＝外部 API を呼ばず、再取得した revision で要確認
+            return await _to_review(
+                record_id, rev_now,
+                f"【相続放棄 委任契約書・要確認】案件レコードNo.{record_id}: 登録処理中に"
+                "レコードが編集されたため CloudSign 登録を中止しました。内容を確認のうえ、"
+                f"再実行する場合は契約書ステータスを「{STATUS_CS_TRIGGER}」に設定し直して"
+                "ください。", "edited_during_claim", cfg)
+        again = await cfg.prepare(latest, record_id, "register")
+        if again.review or again.fingerprint != prepared.fingerprint:
+            return await _to_review(
+                record_id, rev_now,
+                f"【相続放棄 委任契約書・要確認】案件レコードNo.{record_id}: "
+                "登録直前に申述人集合または署名者が変化したため CloudSign 登録を"
+                f"中止しました。\n{again.summary}", "applicants_changed", cfg)
+
     # PDF 生成（テンプレ=単一の正）+ 凍結検証（docx 段・PDF 段の二層）。
     # 検証失敗はここで 500（系統的エラー→再配送が reconcile で「要確認」へ）
-    docx_bytes = render_contract_docx(record)   # 特約込み（単一の生成経路）
+    docx_bytes = prepared.render()               # 特約込み（単一の生成経路）
     pdf_bytes = contract_pdf.docx_to_pdf_bytes(docx_bytes)
-    verify_frozen_pdf(pdf_bytes)
+    verify_frozen_pdf(pdf_bytes, cfg)
     verify_pdf_full_text(docx_bytes, pdf_bytes)   # fix1[02] 全文 pin
     logger.info("[CONTRACT] pdf generated record_id=%s bytes=%d",
                 emit(record_id, "record_id", "log", "operator"),
@@ -601,10 +976,20 @@ async def _cloudsign_flow(record_id: str, record: dict, revision: str):
     # ＋掃除成功時のみ巻き戻し（登録中→登録）→ raise → 500 → 再配送で
     # 自動再試行。掃除失敗時は巻き戻さない（reconcile が「要確認」へ倒す）
     doc_id = None
+    attempt_id = ""
     try:
-        doc_id = _cs_create_document(record_id)
-        _cs_attach_pdf(doc_id, pdf_bytes)
-        _cs_add_participant(doc_id, email, _fv(record, _REQUIRED_NAME))
+        if cfg.name == "jikou":
+            # 時効側は呼出し形も従来どおり（既存テストが引数形を pin）
+            doc_id = _cs_create_document(record_id)
+            _cs_attach_pdf(doc_id, pdf_bytes)
+        else:
+            # fix6 HCGF5-02: 1 配送 1 回だけ生成（CloudSign 呼出し前）・再試行では同じ値
+            from hub import houki_contract as _hc
+            attempt_id = _hc.new_attempt_id()
+            doc_id = _cs_create_document(record_id, cfg.cs_title(record_id))
+            _cs_attach_pdf(doc_id, pdf_bytes, cfg.output_pdf_name)
+        for email, name in prepared.participants:
+            _cs_add_participant(doc_id, email, name)
     except CloudSignResultUnknown:
         # fix1[01]: 作成結果不明＝下書きが存在し得るが id 不明。掃除も巻き
         # 戻しもせず「登録中」維持で 500 → 再配送は reconcile が「要確認」
@@ -612,13 +997,28 @@ async def _cloudsign_flow(record_id: str, record: dict, revision: str):
         logger.error("[CONTRACT] cloudsign create outcome unknown "
                      "record_id=%s",
                      emit(record_id, "record_id", "log", "operator"))
-        raise
+        if cfg.name == "jikou":
+            raise
+        # houki fix3 HCGF2-01: 外部作成後＝結果不明の印を永続化ループで必ず残す
+        return await _persist_after_external(
+            record_id, cfg, None,
+            f"【相続放棄 委任契約書・要確認】案件レコードNo.{record_id}: CloudSign 書類"
+            "作成の結果が不明のため登録を中止しました。", "cs_result_unknown",
+            attempt_id=attempt_id)
     except Exception:
         cleaned = _cs_delete_draft(doc_id) if doc_id else True
+        if cfg.name != "jikou":
+            # houki fix3 HCGF2-01: 作成後の添付/宛先追加失敗も結果不明として永続化ループ
+            # （掃除の成否にかかわらず人が下書きの有無を確認する）
+            return await _persist_after_external(
+                record_id, cfg, None,
+                f"【相続放棄 委任契約書・要確認】案件レコードNo.{record_id}: CloudSign 下書き"
+                "への添付または宛先追加に失敗したため登録を中止しました。",
+                "cs_partial_failure", attempt_id=attempt_id)
         if cleaned:
             try:
                 await hub_kintone.update_record(
-                    _APP, record_id, {FIELD_STATUS: STATUS_CS_TRIGGER},
+                    cfg.app, record_id, {FIELD_STATUS: STATUS_CS_TRIGGER},
                     revision=next_rev)
             except Exception:
                 logger.error("[CONTRACT] cs status rollback failed "
@@ -626,27 +1026,50 @@ async def _cloudsign_flow(record_id: str, record: dict, revision: str):
                              emit(record_id, "record_id", "log", "operator"))
         raise
 
-    await hub_kintone.update_record(_APP, record_id, {
-        FIELD_CS_DOC_ID: doc_id,
-        FIELD_STATUS: STATUS_CS_DONE,
-    }, revision=next_rev)
+    if cfg.name == "jikou":
+        await hub_kintone.update_record(cfg.app, record_id, {
+            FIELD_CS_DOC_ID: doc_id,
+            FIELD_STATUS: STATUS_CS_DONE,
+        }, revision=next_rev)
+    else:
+        # houki fix3 HCGF2-01: 本物の document ID を永続化ループで必ず保存（claim 時の
+        # revision に固定しない・人の変更を保全）
+        return await _persist_after_external(record_id, cfg, doc_id, "", "",
+                                             prepared.summary, attempt_id=attempt_id)
     logger.info("[CONTRACT] cloudsign registered record_id=%s",
                 emit(record_id, "record_id", "log", "operator"))
+    await cfg.notify("created", record_id,
+                     f"【相続放棄 委任契約書】案件レコードNo.{record_id} を CloudSign に"
+                     "下書き登録しました（送信は CloudSign 画面で行ってください）。"
+                     f"\n{prepared.summary}")
     return JSONResponse(status_code=200, content={
         "ok": True, "record_id": record_id, "cloudsign": True})
 
 
-async def _reconcile_cs_working(record_id: str, revision: str):
+async def _reconcile_cs_working(record_id: str, revision: str,
+                                cfg: ChannelConfig | None = None,
+                                record: dict | None = None):
     """CONTRACT-GEN-2 reconcile: 「クラウドサイン登録中」で停止した行の回収。
 
     CloudSign 側に下書きが残っている可能性がある（外部状態・kintone からは
     機械確認できない）ため、v1 の回収と異なり自動再実行はせず、常に CAS で
-    「要確認」へ倒して管理者通知（二重下書き防止の fail-closed）。"""
-    next_rev = await _claim(record_id, revision, STATUS_REVIEW)
+    「要確認」へ倒して管理者通知（二重下書き防止の fail-closed）。
+    houki（fix3 HCGF2-01）: 前回の処理が外部呼出しに到達したか判別できないため、
+    永続化ループを outcome=unknown で呼ぶ（最新が 登録中 なら 要確認・印は空なら書く）。"""
+    cfg = _resolve(cfg)
+    if cfg.name != "jikou":
+        from hub import houki_contract as _hc
+        return await _persist_after_external(
+            record_id, cfg, None,
+            f"【相続放棄 委任契約書・要確認】案件レコードNo.{record_id} はクラウドサイン"
+            "登録が中断した状態のため「要確認」にしました。", "cs_needs_review",
+            attempt_id=_hc.new_attempt_id())      # 別配送=別 attempt_id
+    next_rev = await _claim(record_id, revision, STATUS_REVIEW, cfg.app)
     if next_rev is None:
         return JSONResponse(status_code=200,
                             content={"ok": True, "skip": "cas_lost"})
-    await _notify(
+    await cfg.notify(
+        "review", record_id,
         f"【委任契約書】案件 No.{record_id} はクラウドサイン登録が中断した"
         "状態のため「要確認」にしました。CloudSign 画面で下書きの有無を確認し"
         "（重複下書きがあれば削除）、再実行する場合は契約書ステータスを"
@@ -655,21 +1078,14 @@ async def _reconcile_cs_working(record_id: str, revision: str):
                         content={"ok": True, "skip": "cs_needs_review"})
 
 
-@router.post("/contract/{secret}")
-async def contract_webhook(secret: str, request: Request):
-    if not verify_token(secret or "", "DOCUMENT_WEBHOOK_SECRET"):
-        return JSONResponse(status_code=403, content={"error": "forbidden"})
-
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse(status_code=400, content={"error": "invalid json"})
-
-    # fix1[01]: app 同一性——App21 の実 app ID と完全一致（欠落・非数字・
-    # 別 App は get_record 含め作用 0）
+async def _dispatch(body, cfg: ChannelConfig):
+    """token 検証後の共通経路（app 同一性 → record id → 本文ステータス gate →
+    正本の完全一致検証 → 各経路）。"""
+    # fix1[01]: app 同一性——実 app ID と完全一致（欠落・非数字・別 App は
+    # get_record 含め作用 0）
     app_in_body = str(((body.get("app") or {}) if isinstance(body, dict)
                        else {}).get("id") or "")
-    if not app_in_body.isdigit() or app_in_body != str(_APP.app_id()):
+    if not app_in_body.isdigit() or app_in_body != str(cfg.app.app_id()):
         logger.warning("[CONTRACT] app mismatch in webhook body")
         return JSONResponse(status_code=200,
                             content={"ok": True, "skip": "app_mismatch"})
@@ -693,7 +1109,7 @@ async def contract_webhook(secret: str, request: Request):
                             content={"ok": True, "skip": "not_triggered"})
 
     try:
-        record = await hub_kintone.get_record(_APP, record_id)
+        record = await hub_kintone.get_record(cfg.app, record_id)
         current = _fv(record, FIELD_STATUS)
         revision = _fv(record, "$revision")
 
@@ -710,30 +1126,32 @@ async def contract_webhook(secret: str, request: Request):
             return JSONResponse(status_code=200,
                                 content={"ok": True, "skip": "stale_status"})
         if current == STATUS_WORKING:
-            return await _reconcile_working(record_id, record, revision)
+            return await _reconcile_working(record_id, record, revision, cfg)
         if current == STATUS_CS_WORKING:
-            return await _reconcile_cs_working(record_id, revision)
+            return await _reconcile_cs_working(record_id, revision, cfg, record)
         if current == STATUS_CS_TRIGGER:
             # fix1 CT-01: 登録経路にも共通ガード（cs_registered=再登録の文言）。
             # 該当は CloudSign API 作用 0 で「要確認」へ CAS 遷移+通知
             guard = _regeneration_guard(record_id, record, "register")
             if guard:
-                return await _to_review(record_id, revision, guard[1], guard[0])
-            return await _cloudsign_flow(record_id, record, revision)
+                return await _to_review(record_id, revision, guard[1], guard[0], cfg)
+            return await _cloudsign_flow(record_id, record, revision, cfg)
         if current != STATUS_TRIGGER:
             logger.info("[CONTRACT] stale status record_id=%s",
                         emit(record_id, "record_id", "log", "operator"))
             return JSONResponse(status_code=200,
                                 content={"ok": True, "skip": "stale_status"})
 
+        prepared = await cfg.prepare(record, record_id, "generate")
         # fail-closed: 必須欠落は生成しない（状態も動かさない）
-        missing = _missing_fields(record)
+        missing = prepared.missing
         if missing:
             logger.info("[CONTRACT] missing required fields record_id=%s "
                         "count=%d",
                         emit(record_id, "record_id", "log", "operator"),
                         len(missing))
-            await _notify(
+            await cfg.notify(
+                "review", record_id,
                 f"【委任契約書】案件 No.{record_id} は必須項目が未入力のため"
                 f"生成しませんでした。不足: {'・'.join(missing)}。"
                 "kintone で入力後、契約書ステータスを"
@@ -745,23 +1163,63 @@ async def contract_webhook(secret: str, request: Request):
         # → ②特約上限 → ③使用不可記号）。該当は生成せず「要確認」へ CAS 遷移+通知
         guard = _regeneration_guard(record_id, record, "regenerate")
         if guard:
-            return await _to_review(record_id, revision, guard[1], guard[0])
+            return await _to_review(record_id, revision, guard[1], guard[0], cfg)
+        # houki: 申述人集合・被相続人氏名・顧客名/住所の前提未充足は「要確認」へ
+        if prepared.review:
+            return await _to_review(record_id, revision, prepared.review[1],
+                                    prepared.review[0], cfg)
 
         # fix1[02]: CAS（作成→作成中）勝者のみ生成（並行 2 本でも upload 1 回）
-        next_rev = await _claim(record_id, revision, STATUS_WORKING)
+        next_rev = await _claim(record_id, revision, STATUS_WORKING, cfg.app)
         if next_rev is None:
             logger.info("[CONTRACT] cas lost record_id=%s",
                         emit(record_id, "record_id", "log", "operator"))
             return JSONResponse(status_code=200,
                                 content={"ok": True, "skip": "cas_lost"})
-        await _generate_and_attach(record_id, record, next_rev)
+        await _generate_and_attach(record_id, prepared, next_rev, cfg)
     except Exception as e:
         logger.error("[CONTRACT] error record_id=%s cls=%s: %s",
                      emit(record_id, "record_id", "log", "operator"),
                      type(e).__name__,
                      emit(str(e), "vendor_raw", "log", "operator"))
+        await cfg.notify("failed", record_id,
+                         f"【相続放棄 委任契約書・失敗】案件レコードNo.{record_id} の処理で"
+                         "内部エラーが発生しました（kintone の再配送で再試行されます。"
+                         "契約書ステータスを確認してください）。")
         return JSONResponse(status_code=500,
                             content={"error": "internal_error"})
 
     return JSONResponse(status_code=200,
                         content={"ok": True, "record_id": record_id})
+
+
+@router.post("/contract/{secret}")
+async def contract_webhook(secret: str, request: Request):
+    if not verify_token(secret or "", "DOCUMENT_WEBHOOK_SECRET"):
+        return JSONResponse(status_code=403, content={"error": "forbidden"})
+
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "invalid json"})
+    return await _dispatch(body, _jikou_cfg())
+
+
+@router.post("/souzoku-houki/contract/{secret}")
+async def houki_contract_webhook(secret: str, request: Request):
+    """HOUKI-CONTRACT-GEN: App 40 の受け口。token は相談カード読取・申述書と同じ
+    HOUKI_WEBHOOK_TOKEN・同じ検証方式（未設定/時効側同値=404・不一致=403）。"""
+    from shinjutsu_webhook import _TOKEN_ENV, houki_webhook_disabled_reason
+    reason = houki_webhook_disabled_reason()
+    if reason is not None:
+        if reason != "token_unset":
+            logger.warning("[HOUKI_CONTRACT] endpoint disabled (token misconfig)")
+        return JSONResponse(status_code=404, content={"error": "not found"})
+    if not hmac.compare_digest(secret or "", os.environ.get(_TOKEN_ENV, "")):
+        return JSONResponse(status_code=403, content={"error": "forbidden"})
+
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "invalid json"})
+    return await _dispatch(body, _houki_cfg())

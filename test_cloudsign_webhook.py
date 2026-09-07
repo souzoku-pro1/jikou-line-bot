@@ -74,8 +74,13 @@ class TestUpdateKintoneStatusNormal(unittest.TestCase):
 
         update_resp = MagicMock()
         update_resp.raise_for_status = MagicMock()
+        # HOUKI-CONTRACT-GEN: 2 回目の GET（App 40 検索）は該当なし＝App 21 のみ該当
+        empty_resp = MagicMock()
+        empty_resp.raise_for_status = MagicMock()
+        empty_resp.json.return_value = {"records": []}
 
-        with patch("cloudsign_webhook.requests.get", return_value=search_resp) as mock_get, \
+        with patch("cloudsign_webhook.requests.get",
+                   side_effect=[search_resp, empty_resp]) as mock_get, \
              patch("cloudsign_webhook.requests.put", return_value=update_resp) as mock_put:
 
             result = mod.update_kintone_status("doc123", "受任")
