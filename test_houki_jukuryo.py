@@ -48,7 +48,7 @@ def _names(ms):
 
 # 社内締切当日（9/8）の案件。7 日前（9/1）は回収窓（今日−7）内に入るため、送信済みの履歴を
 # 持たせて「当日」だけを検証する（回収そのものは TestOneShotRecovery で検証）
-H7 = "2026-09-01 社内締切7日前 通知済"
+H7 = "2026-09-01 社内締切7日前@2026-09-01 通知済"
 
 
 def _due(rid="1", **kw):
@@ -205,14 +205,23 @@ class TestTargetAndHistory(unittest.TestCase):
         self.assertFalse(hj.history_has(line, TODAY, hj.MS_OVERDUE))
         self.assertFalse(hj.history_has("", TODAY, hj.MS_LEGAL_DAY))
 
-    def test_history_line_delayed_and_has_name(self):
-        line = hj.history_line(TODAY, hj.MS_INTERNAL_DAY, date(2026, 9, 7))
-        self.assertEqual(line, "2026-09-08 社内締切当日 通知済(本来 2026-09-07)")
-        self.assertEqual(hj.history_line(TODAY, hj.MS_INTERNAL_DAY, TODAY), "2026-09-08 社内締切当日 通知済")
-        self.assertTrue(hj.history_has_name(line, hj.MS_INTERNAL_DAY))
-        self.assertTrue(hj.history_has_name("2026-08-01 社内締切当日 通知済", hj.MS_INTERNAL_DAY))
-        self.assertFalse(hj.history_has_name(line, hj.MS_INTERNAL_PRE))
-        self.assertTrue(hj.history_has(line, TODAY, hj.MS_INTERNAL_DAY))
+    def test_one_shot_history_line_format_and_match(self):
+        """fix3: ONE_SHOT の履歴行は該当日を必ず含む（遅延でも同形式）。除外は名+該当日の一致。"""
+        late = hj.history_line(TODAY, hj.MS_INTERNAL_DAY, date(2026, 9, 7))
+        self.assertEqual(late, "2026-09-08 社内締切当日@2026-09-07 通知済")
+        on_time = hj.history_line(TODAY, hj.MS_INTERNAL_DAY, TODAY)
+        self.assertEqual(on_time, "2026-09-08 社内締切当日@2026-09-08 通知済")
+        self.assertNotIn("本来", late)
+        self.assertTrue(hj.history_has_one_shot(late, hj.MS_INTERNAL_DAY, date(2026, 9, 7)))
+        self.assertTrue(hj.history_has_one_shot("2026-08-01 社内締切当日@2026-07-31 通知済",
+                                                hj.MS_INTERNAL_DAY, date(2026, 7, 31)))   # 日付不問
+        self.assertFalse(hj.history_has_one_shot(late, hj.MS_INTERNAL_DAY, date(2026, 9, 8)))   # 該当日違い
+        self.assertFalse(hj.history_has_one_shot(late, hj.MS_INTERNAL_PRE, date(2026, 9, 7)))   # 名違い
+        self.assertFalse(hj.history_has(late, TODAY, hj.MS_INTERNAL_DAY))     # DAILY 判定は名@該当日を拾わない
+        self.assertFalse(hasattr(hj, "history_has_name"))                       # 名前だけの除外は廃止
+        # DAILY・起算日未設定は従来形式
+        self.assertEqual(hj.history_line(TODAY, hj.MS_LEGAL_DAY), "2026-09-08 法定満了当日 通知済")
+        self.assertEqual(hj.history_line(TODAY, hj.START_UNSET), "2026-09-08 起算日未設定 通知済")
 
     def test_append_history_text(self):
         self.assertEqual(hj.append_history_text("", "a"), "a")
@@ -277,7 +286,7 @@ class TestNoticeBody(unittest.TestCase):
         self.assertIn(hj.COMPACT_MARK, notices[0].text)
         self.assertIn("No.1 社内締切当日/法定満了3日前 / 法定満了 2026-09-11 / 社内締切 2026-09-08", notices[0].text)
         self.assertEqual(notices[0].entries[0].history_lines,
-                         ["2026-09-08 社内締切当日 通知済", "2026-09-08 法定満了3日前 通知済"])
+                         ["2026-09-08 社内締切当日@2026-09-08 通知済", "2026-09-08 法定満了3日前@2026-09-08 通知済"])
 
     def test_digest_depends_on_record_and_milestone_set(self):
         a = hj.plan_today([_due(rid="1")], TODAY)
@@ -364,7 +373,7 @@ class TestDailyJob(_Base):
         out = self.run_job()
         self.assertEqual(out, {"targets": 1, "items": 1, "unset": 0, "notices": 1, "sent": 1,
                                "failed": 0, "history_failed": 0})
-        self.assertEqual(self.history("1"), "2026-09-08 社内締切当日 通知済")
+        self.assertEqual(self.history("1"), "2026-09-08 社内締切当日@2026-09-08 通知済")
         self.assertEqual(self.written_fields(), ["熟慮期間通知履歴"])   # 履歴欄以外は書かない
         self.assertEqual(self.updates[0][0], "APP_HOUKI")                # App 40 のみ
         self.assertEqual(self.admin.await_count, 1)
@@ -381,14 +390,14 @@ class TestDailyJob(_Base):
         self.assertEqual((out["items"], out["notices"]), (0, 0))
         self.assertEqual(self.admin.await_count, 0)
         self.assertEqual(len(self.updates), n)                            # 追記もしない
-        self.assertEqual(self.history("1"), "2026-09-08 社内締切当日 通知済")
+        self.assertEqual(self.history("1"), "2026-09-08 社内締切当日@2026-09-08 通知済")
 
     def test_history_from_previous_day_does_not_block(self):
-        self.seed(_rec(rid="1", knew="2026-06-18", history="2026-09-01 社内締切7日前 通知済"))
+        self.seed(_rec(rid="1", knew="2026-06-18", history="2026-09-01 社内締切7日前@2026-09-01 通知済"))
         out = self.run_job()
         self.assertEqual(out["items"], 1)                                 # 7日前は同名履歴で除外・当日のみ
         self.assertEqual(self.raw_history("1"),
-                         "2026-09-01 社内締切7日前 通知済\n2026-09-08 社内締切当日 通知済")
+                         "2026-09-01 社内締切7日前@2026-09-01 通知済\n2026-09-08 社内締切当日@2026-09-08 通知済")
 
     def test_internal_day_without_prior_7day_notice_recovers_it_too(self):
         """7 日前の通知が一度も無い当日案件は、当日+遅延の 7 日前（本来 9/1）の 2 行になる。"""
@@ -399,7 +408,7 @@ class TestDailyJob(_Base):
         self.assertIn("No.1 社内締切7日前（遅延・本来 2026-09-01） /", body)
         self.assertIn("No.1 社内締切当日 /", body)
         self.assertEqual(self.raw_history("1"),
-                         "2026-09-08 社内締切7日前 通知済(本来 2026-09-01)\n2026-09-08 社内締切当日 通知済")
+                         "2026-09-08 社内締切7日前@2026-09-01 通知済\n2026-09-08 社内締切当日@2026-09-08 通知済")
 
     def test_cas_conflict_after_send_logs_warning_and_does_not_raise(self):
         self.seed(_due(rid="1"))
@@ -435,7 +444,7 @@ class TestDailyJob(_Base):
         self.admin.return_value = "sent"
         out2 = self.run_job()
         self.assertEqual((out2["items"], out2["unset"]), (1, 1))
-        self.assertEqual(self.history("1"), "2026-09-08 社内締切当日 通知済")
+        self.assertEqual(self.history("1"), "2026-09-08 社内締切当日@2026-09-08 通知済")
         self.assertEqual(self.history("5"), "2026-09-08 起算日未設定 通知済")
 
     def test_throttled_counts_as_sent_and_writes_history(self):
@@ -443,7 +452,7 @@ class TestDailyJob(_Base):
         self.admin.return_value = "throttled"
         out = self.run_job()
         self.assertEqual((out["sent"], out["history_failed"]), (1, 0))
-        self.assertEqual(self.history("1"), "2026-09-08 社内締切当日 通知済")
+        self.assertEqual(self.history("1"), "2026-09-08 社内締切当日@2026-09-08 通知済")
 
     def test_history_written_only_after_send(self):
         """送信呼出しの時点で履歴追記が 0 件であること（順序 pin）。"""
@@ -464,7 +473,7 @@ class TestDailyJob(_Base):
         self.assertEqual(out["items"], 2)
         self.assertEqual(len(self.updates), 1)                             # 1 レコード 1 回の CAS 更新
         self.assertEqual(self.history("1"),
-                         "2026-09-08 社内締切当日 通知済\n2026-09-08 法定満了3日前 通知済")
+                         "2026-09-08 社内締切当日@2026-09-08 通知済\n2026-09-08 法定満了3日前@2026-09-08 通知済")
 
     def test_non_target_records_are_skipped_even_if_returned(self):
         self.seed(_rec(rid="1", knew="2026-06-18", status="書類収集中"),
@@ -544,7 +553,7 @@ class TestSplitSend(_Base):
             self.assertLessEqual(len(t), hj.NOTICE_MAX_CHARS)
         for i in range(1, 61):
             self.assertEqual(sum(1 for t in texts if f"No.{i} 社内締切当日" in t), 1)
-            self.assertEqual(self.history(str(i)), "2026-09-08 社内締切当日 通知済")
+            self.assertEqual(self.history(str(i)), "2026-09-08 社内締切当日@2026-09-08 通知済")
         self.assertEqual(len(set(self.sent_keys())), out["notices"])
 
     def test_one_failed_notice_leaves_only_its_records_without_history(self):
@@ -563,7 +572,7 @@ class TestSplitSend(_Base):
             if str(i) in failed_ids:
                 self.assertEqual(self.history(str(i)), "")
             else:
-                self.assertEqual(self.history(str(i)), "2026-09-08 社内締切当日 通知済")
+                self.assertEqual(self.history(str(i)), "2026-09-08 社内締切当日@2026-09-08 通知済")
         # 13:00 の回: 失敗した通の案件だけが送られる
         self.admin.side_effect = None
         self.admin.return_value = "sent"
@@ -573,7 +582,7 @@ class TestSplitSend(_Base):
         sent_ids = {m for t in self.sent_texts() for m in re.findall(r"No\.(\d+) 社内締切当日", t)}
         self.assertEqual(sent_ids, failed_ids)
         for i in range(1, 61):
-            self.assertEqual(self.history(str(i)), "2026-09-08 社内締切当日 通知済")
+            self.assertEqual(self.history(str(i)), "2026-09-08 社内締切当日@2026-09-08 通知済")
 
 
 class TestDigestKeys(_Base):
@@ -610,12 +619,12 @@ class TestDigestKeys(_Base):
         self.records["1"]["熟慮期間通知履歴"] = {"value": H7}
         out2 = self.run_job()
         self.assertEqual((out2["sent"], out2["failed"], push.await_count), (1, 0, 1))   # 送信は増えない
-        self.assertEqual(self.history("1"), "2026-09-08 社内締切当日 通知済")
+        self.assertEqual(self.history("1"), "2026-09-08 社内締切当日@2026-09-08 通知済")
         # 別の案件集合は別キーで実送信される（300 秒窓内でも throttled にならない）
         self.seed(_due(rid="2"))
         out3 = self.run_job()
         self.assertEqual((out3["sent"], push.await_count), (1, 2))
-        self.assertEqual(self.history("2"), "2026-09-08 社内締切当日 通知済")
+        self.assertEqual(self.history("2"), "2026-09-08 社内締切当日@2026-09-08 通知済")
 
 
 class TestPaging(_Base):
@@ -645,7 +654,7 @@ class TestPaging(_Base):
         out = self.run_job()
         self.assertEqual((out["targets"], len(self.queries), out["items"]), (501, 2, 1))
         self.assertIn("No.501 社内締切当日", self.sent_texts()[0])
-        self.assertEqual(self.history("501"), "2026-09-08 社内締切当日 通知済")
+        self.assertEqual(self.history("501"), "2026-09-08 社内締切当日@2026-09-08 通知済")
 
     def test_over_1000_records_three_pages(self):
         self.seed_n(1001)
@@ -677,7 +686,7 @@ class TestOneShotRecovery(_Base):
         out = self.run_job()
         self.assertEqual(out["items"], 1)
         self.assertIn("No.1 社内締切当日（遅延・本来 2026-09-08） /", self.sent_texts()[0])
-        self.assertEqual(self.history("1"), "2026-09-09 社内締切当日 通知済(本来 2026-09-08)")
+        self.assertEqual(self.history("1"), "2026-09-09 社内締切当日@2026-09-08 通知済")
         # 翌々日: 送らない
         self.today = date(2026, 9, 10)
         self.admin.reset_mock()
@@ -693,10 +702,46 @@ class TestOneShotRecovery(_Base):
         self.assertEqual(out2["items"], 1)
         self.assertIn("No.2 社内締切当日（遅延・本来 2026-09-01）", self.sent_texts()[0])
 
-    def test_recovered_one_shot_excluded_by_name_regardless_of_date(self):
-        self.seed(_rec(rid="1", knew="2026-06-18", history=H7 + "\n" + "2026-09-02 社内締切当日 通知済(本来 2026-09-01)"))
+    def test_recovered_one_shot_excluded_by_name_and_due_regardless_of_date(self):
+        # 社内 9/1（今日−7・回収窓内）。該当日込みの同名行があれば日付不問で 1 回のみ
+        self.seed(_rec(rid="1", internal="2026-09-01", legal="2026-10-31",
+                       history="2026-09-02 社内締切当日@2026-09-01 通知済"))
         out = self.run_job()
         self.assertEqual((out["items"], out["notices"]), (0, 0))
+
+    def test_same_name_with_different_due_is_not_excluded(self):
+        # 同名でも該当日が違う行（8/31）しか無ければ、9/1 の分は再通知される
+        self.seed(_rec(rid="1", internal="2026-09-01", legal="2026-10-31",
+                       history="2026-09-01 社内締切当日@2026-08-31 通知済"))
+        out = self.run_job()
+        self.assertEqual(out["items"], 1)
+        self.assertIn("No.1 社内締切当日（遅延・本来 2026-09-01） /", self.sent_texts()[0])
+        self.assertEqual(self.history("1"), "2026-09-08 社内締切当日@2026-09-01 通知済")
+
+    def test_attorney_moves_legal_deadline_renotifies_new_due_dates(self):
+        """弁護士が 法定満了日 を後から変更 → 新しい該当日の 7 日前/当日/3 日前が再通知される。"""
+        rec = _due(rid="1", history=H7 + "\n" + "2026-09-08 社内締切当日@2026-09-08 通知済")
+        self.seed(rec)
+        self.assertEqual(self.run_job()["items"], 0)                            # 変更前: 送信済み
+        rec["法定満了日"] = {"value": "2026-09-25"}                              # 社内 9/15・7日前 9/8
+        out = self.run_job()
+        self.assertEqual(out["items"], 1)
+        self.assertIn("No.1 社内締切7日前 / 法定満了 2026-09-25（弁護士設定）", self.sent_texts()[0])
+        self.assertEqual(self.history("1"), "2026-09-08 社内締切7日前@2026-09-08 通知済")
+        self.admin.reset_mock()
+        self.today = date(2026, 9, 15)                                          # 新しい社内締切当日
+        out2 = self.run_job()
+        self.assertEqual(out2["items"], 1)
+        self.assertIn("No.1 社内締切当日 /", self.sent_texts()[0])              # 旧 @9/8 の行では除外されない
+        self.assertEqual(self.raw_history("1").splitlines()[-1], "2026-09-15 社内締切当日@2026-09-15 通知済")
+        self.admin.reset_mock()
+        self.today = date(2026, 9, 22)                                          # 新しい法定 3 日前
+        out3 = self.run_job()
+        self.assertEqual(out3["items"], 1)
+        self.assertEqual(self.raw_history("1").splitlines()[-1], "2026-09-22 法定満了3日前@2026-09-22 通知済")
+        self.admin.reset_mock()
+        self.today = date(2026, 9, 16)                                          # 動いていなければ 1 回のみ
+        self.assertEqual(self.run_job()["items"], 0)
 
     def test_1300_run_sends_only_what_0800_failed(self):
         self.seed(_due(rid="1"), _rec(rid="2", knew="2026-06-25"))   # 当日 / 7日前
@@ -707,8 +752,8 @@ class TestOneShotRecovery(_Base):
         self.admin.reset_mock()
         out = self.run_job(hour=13)
         self.assertEqual((out["items"], out["notices"]), (2, 1))
-        self.assertEqual(self.history("1"), "2026-09-08 社内締切当日 通知済")
-        self.assertEqual(self.history("2"), "2026-09-08 社内締切7日前 通知済")
+        self.assertEqual(self.history("1"), "2026-09-08 社内締切当日@2026-09-08 通知済")
+        self.assertEqual(self.history("2"), "2026-09-08 社内締切7日前@2026-09-08 通知済")
         self.admin.reset_mock()
         out2 = self.run_job(hour=18)
         self.assertEqual((out2["items"], self.admin.await_count), (0, 0))

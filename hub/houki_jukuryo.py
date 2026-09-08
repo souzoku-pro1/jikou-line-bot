@@ -24,8 +24,9 @@ fix2（Codex HJC-01〜04）:
  B. App 40 の全件取得（$id asc・500 件ごとに $id > 最後の id で継続）。
  C. マイルストーンを単発 ONE_SHOT（社内締切 7 日前／当日・法定満了 3 日前）と毎日 DAILY
     （法定満了 2 日前〜当日・満了超過）に分ける。ONE_SHOT は該当日が今日以前 7 日以内で
-    履歴に同名行が（日付を問わず）無ければ対象＝送信失敗の翌日以降も回収され、本文に
-    「（遅延・本来 {該当日}）」、履歴行に「通知済(本来 {該当日})」を付ける。ジョブは
+    履歴に同名かつ同じ該当日の行「{名}@{該当日}」が（日付を問わず）無ければ対象＝送信失敗の
+    翌日以降も回収され、本文に「（遅延・本来 {該当日}）」を付ける（fix3: 履歴行は
+    「{今日} {名}@{該当日} 通知済」。弁護士が期日欄を動かして該当日が変われば再通知）。ジョブは
     8:00・13:00・18:00 JST に登録し、各回は履歴の無い分だけを送る。起算日未設定の列挙は
     8:00 の回のみ。
 
@@ -93,7 +94,7 @@ MILESTONES = ONE_SHOT + DAILY
 
 HISTORY_SUFFIX = "通知済"
 DELAY_MARK = "遅延・本来"                   # 本文「（遅延・本来 YYYY-MM-DD）」
-HISTORY_DELAY_MARK = "本来"                  # 履歴「通知済(本来 YYYY-MM-DD)」
+HISTORY_DUE_SEP = "@"                        # fix3: ONE_SHOT 履歴「{今日} {名}@{該当日} 通知済」
 COMPACT_MARK = "（縮約）"
 NOTICE_HEADER = "【相続放棄 熟慮期間】"
 NOTICE_FOOTER = "期日は申告欄からの計算を含みます。レコードの期日欄・ステータスは変更していません。"
@@ -219,14 +220,14 @@ def search_query(after_id: str | None = None) -> str:
 
 
 def history_line(today: date, milestone: str, due: date | None = None) -> str:
-    """履歴行。単発の遅延回収は「通知済(本来 YYYY-MM-DD)」。"""
-    line = f"{today.isoformat()} {milestone} {HISTORY_SUFFIX}"
-    if due is not None and due != today:
-        line += f"({HISTORY_DELAY_MARK} {due.isoformat()})"
-    return line
+    """履歴行（fix3）。DAILY／起算日未設定は「{今日} {名} 通知済」、ONE_SHOT は該当日を
+    必ず含む「{今日} {名}@{該当日} 通知済」（遅延でも同形式・「本来」表記は @該当日 に統合）。"""
+    label = f"{milestone}{HISTORY_DUE_SEP}{due.isoformat()}" if due is not None else milestone
+    return f"{today.isoformat()} {label} {HISTORY_SUFFIX}"
 
 
 def _history_tokens(history: str):
+    """新形式のみ: (日付, 名[@該当日], 残り)。旧形式（fix2 まで）は本番未配備のため非対応。"""
     for ln in (history or "").splitlines():
         parts = ln.strip().split(" ", 2)
         if len(parts) >= 3:
@@ -234,14 +235,16 @@ def _history_tokens(history: str):
 
 
 def history_has(history: str, today: date, milestone: str) -> bool:
-    """同日・同名の履歴行があるか（DAILY の除外・fix2 前と同じ判定）。"""
+    """同日・同名の履歴行があるか（DAILY／起算日未設定の除外）。"""
     return any(d == today.isoformat() and n == milestone and rest.startswith(HISTORY_SUFFIX)
                for d, n, rest in _history_tokens(history))
 
 
-def history_has_name(history: str, milestone: str) -> bool:
-    """同名の履歴行が日付を問わず有るか（ONE_SHOT の除外・fix2 C-3）。"""
-    return any(n == milestone and rest.startswith(HISTORY_SUFFIX)
+def history_has_one_shot(history: str, milestone: str, due: date) -> bool:
+    """同名かつ同じ該当日（名@該当日）の履歴行が日付を問わず有るか（ONE_SHOT の除外・fix3）。
+    弁護士が期日欄を動かして該当日が変われば別行になり再通知される。"""
+    label = f"{milestone}{HISTORY_DUE_SEP}{due.isoformat()}"
+    return any(n == label and rest.startswith(HISTORY_SUFFIX)
                for _d, n, rest in _history_tokens(history))
 
 
@@ -304,7 +307,7 @@ def plan_today(records: list[dict], today: date, include_unset: bool = True) -> 
             continue
         pending = []
         for ms in milestones_for(today, dl):
-            skip = (history_has_name(history, ms.name) if ms.name in ONE_SHOT
+            skip = (history_has_one_shot(history, ms.name, ms.due) if ms.name in ONE_SHOT
                     else history_has(history, today, ms.name))
             if not skip:
                 pending.append(ms)
@@ -314,7 +317,7 @@ def plan_today(records: list[dict], today: date, include_unset: bool = True) -> 
             rec, rid,
             [format_item(rid, ms, dl, today) for ms in pending],
             [(rid, ms.name) for ms in pending],
-            [history_line(today, ms.name, ms.due) for ms in pending],
+            [history_line(today, ms.name, ms.due if ms.name in ONE_SHOT else None) for ms in pending],
             compact=format_item_compact(rid, [ms.name for ms in pending], dl)))
     return entries
 
