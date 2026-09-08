@@ -222,10 +222,18 @@ def build_notice(today: date, items: list[str], unset_ids: list[str]) -> str:
 
 # ── kintone 書込（履歴欄のみ・CAS） ──────────────────────────────────────────
 async def append_history(record: dict, line: str) -> bool:
-    """熟慮期間通知履歴 へ 1 行を $revision CAS で追記。409・その他失敗は False
-    （送らない＝fail-closed。翌日の再判定に任せる）。他の欄には書かない。"""
+    """熟慮期間通知履歴 へ 1 行を $revision CAS で追記。409・その他失敗は False。
+    他の欄には書かない。"""
+    return await append_history_lines(record, [line])
+
+
+async def append_history_lines(record: dict, lines: list[str]) -> bool:
+    """熟慮期間通知履歴 へ複数行を 1 回の $revision CAS 更新で追記（同一案件の
+    同日分をまとめる）。409・その他失敗は False。他の欄には書かない。"""
     rid = _v(record, "$id")
-    new_text = append_history_text(_v(record, FIELD_HISTORY), line)
+    new_text = _v(record, FIELD_HISTORY)
+    for line in lines:
+        new_text = append_history_text(new_text, line)
     try:
         await kintone.update_record(APP_HOUKI_CASE, rid, {FIELD_HISTORY: new_text},
                                     revision=_v(record, "$revision") or None)
@@ -242,18 +250,13 @@ async def append_history(record: dict, line: str) -> bool:
 
 
 # ── 日次ジョブ ───────────────────────────────────────────────────────────────
-async def jukuryo_daily_check() -> dict:
-    """受任×未提出の案件を判定し、当日分を 1 通で通知する。戻り値は件数（テスト用）。"""
-    today = _today_jst()
-    try:
-        records = await kintone.search_records(APP_HOUKI_CASE, search_query(), fields=SEARCH_FIELDS)
-    except kintone.KintoneError as e:
-        logger.error("houki_jukuryo fetch failed cls=%s",
-                     emit(type(e).__name__, "vendor_raw", "log", "operator"))
-        return {"targets": 0, "items": 0, "unset": 0, "sent": False}
-
+def plan_today(records: list[dict], today: date) -> tuple[list[str], list[str], list[tuple[dict, list[str]]]]:
+    """当日の通知計画（pure・書込なし）。戻り値 (本文行, 起算日未設定 ID, 追記予定
+    [(record, 履歴行...)])。当日分の履歴が既にあるレコード/マイルストーンは除外
+    （同日再実行の二重防止）。"""
     items: list[str] = []
     unset_ids: list[str] = []
+    writes: list[tuple[dict, list[str]]] = []
     for rec in records:
         if not is_target(rec):
             continue
@@ -261,36 +264,55 @@ async def jukuryo_daily_check() -> dict:
         dl = compute_deadlines(rec)
         history = _v(rec, FIELD_HISTORY)
         if not dl.determinable:
-            if history_has(history, today, START_UNSET):
-                continue
-            if await append_history(rec, history_line(today, START_UNSET)):
+            if not history_has(history, today, START_UNSET):
                 unset_ids.append(rid)
+                writes.append((rec, [history_line(today, START_UNSET)]))
             continue
         pending = [m for m in milestones_for(today, dl) if not history_has(history, today, m)]
         if not pending:
             continue
-        history_after = history
-        for ms in pending:
-            line = history_line(today, ms)
-            rec_now = {**rec, FIELD_HISTORY: {"value": history_after}}
-            if not await append_history(rec_now, line):
-                break                                  # fail-closed: 以降の同案件分も送らない
-            history_after = append_history_text(history_after, line)
-            rec["$revision"] = {"value": str(int(_v(rec, "$revision") or 0) + 1)}
-            items.append(format_item(rid, ms, dl))
+        items.extend(format_item(rid, ms, dl) for ms in pending)
+        writes.append((rec, [history_line(today, ms) for ms in pending]))
+    return items, unset_ids, writes
 
+
+async def jukuryo_daily_check() -> dict:
+    """受任×未提出の案件を判定し、当日分を 1 通で通知する（fix1: 送信 → 送信成功を
+    確認してから履歴追記）。送信失敗（failed）なら履歴は追記しない（同日の再実行や
+    翌日の判定でまた対象になる）。throttled は「同日既送」として成功扱い。送信成功後の
+    追記が CAS 等で書けなかったレコードは警告ログ（同日再実行での二重通知は許容）。
+    戻り値は件数（テスト用）。"""
+    today = _today_jst()
+    try:
+        records = await kintone.search_records(APP_HOUKI_CASE, search_query(), fields=SEARCH_FIELDS)
+    except kintone.KintoneError as e:
+        logger.error("houki_jukuryo fetch failed cls=%s",
+                     emit(type(e).__name__, "vendor_raw", "log", "operator"))
+        return {"targets": 0, "items": 0, "unset": 0, "sent": False, "history_failed": 0}
+
+    items, unset_ids, writes = plan_today(records, today)
     sent = False
+    history_failed = 0
     if items or unset_ids:
-        sent = await notify.notify_admin_line(
+        result = await notify.notify_admin_line_result(
             build_notice(today, items, unset_ids),
             throttle_key=f"{NOTIFY_KIND}:{today.isoformat()}")
+        sent = result in ("sent", "throttled")
         if not sent:
-            logger.warning("houki_jukuryo daily notice not sent")
-    logger.info("houki_jukuryo daily: targets=%s items=%s unset=%s",
+            logger.warning("houki_jukuryo daily notice not sent (history not written)")
+        else:
+            for rec, lines in writes:
+                if not await append_history_lines(rec, lines):
+                    history_failed += 1
+                    logger.warning("houki_jukuryo history append failed after notice record=%s",
+                                   emit(_v(rec, "$id"), "record_id", "log", "operator"))
+    logger.info("houki_jukuryo daily: targets=%s items=%s unset=%s history_failed=%s",
                 emit(len(records), "count", "log", "operator"),
                 emit(len(items), "count", "log", "operator"),
-                emit(len(unset_ids), "count", "log", "operator"))
-    return {"targets": len(records), "items": len(items), "unset": len(unset_ids), "sent": sent}
+                emit(len(unset_ids), "count", "log", "operator"),
+                emit(history_failed, "count", "log", "operator"))
+    return {"targets": len(records), "items": len(items), "unset": len(unset_ids),
+            "sent": sent, "history_failed": history_failed}
 
 
 def register_houki_jukuryo_job() -> None:

@@ -3,7 +3,8 @@
 - 期日計算（応当日・月末・閏年・起算日代用順・全空）
 - 社内締切 10 日前・マイルストーン判定（7 日前／当日／3 日前／毎日／超過・境界）
 - 対象抽出（受任以外・提出日ありは除外）・弁護士設定優先
-- 履歴による冪等（同日再実行 0 通）・履歴 CAS 失敗で送らない
+- 履歴による冪等（同日再実行 0 通）・fix1: 送信成功→履歴追記の順序（失敗時は追記しない・
+  追記 CAS 失敗は警告のみ・throttled は成功扱い）
 - 本文に個人情報なし・kind 登録・定数 pin・ジョブ登録（8:00 JST）・main 結線
 """
 
@@ -208,10 +209,10 @@ class _Base(unittest.TestCase):
                 rec[k] = {"value": v}
             rec["$revision"] = {"value": str(int(revision) + 1)}
 
-        self.admin = AsyncMock(return_value=True)
+        self.admin = AsyncMock(return_value="sent")       # fix1: 3 値（sent/throttled/failed）
         for p in (patch.object(hub_kintone, "search_records", search_records),
                   patch.object(hub_kintone, "update_record", update_record),
-                  patch.object(hub_notify, "notify_admin_line", self.admin),
+                  patch.object(hub_notify, "notify_admin_line_result", self.admin),
                   patch.object(hj, "_today_jst", return_value=TODAY)):
             p.start()
             self.addCleanup(p.stop)
@@ -237,7 +238,7 @@ class TestDailyJob(_Base):
     def test_internal_day_notifies_once_and_appends_history(self):
         self.seed(_rec(rid="1", knew="2026-06-18"))          # 法定 9/18・社内 9/8=TODAY
         out = self.run_job()
-        self.assertEqual(out, {"targets": 1, "items": 1, "unset": 0, "sent": True})
+        self.assertEqual(out, {"targets": 1, "items": 1, "unset": 0, "sent": True, "history_failed": 0})
         self.assertEqual(self.history("1"), "2026-09-08 社内締切当日 通知済")
         self.assertEqual(self.written_fields(), ["熟慮期間通知履歴"])   # 履歴欄以外は書かない
         self.assertEqual(self.updates[0][0], "APP_HOUKI")                # App 40 のみ
@@ -264,20 +265,70 @@ class TestDailyJob(_Base):
         self.assertEqual(self.history("1"),
                          "2026-09-01 社内締切7日前 通知済\n2026-09-08 社内締切当日 通知済")
 
-    def test_cas_conflict_sends_nothing(self):
+    def test_cas_conflict_after_send_logs_warning_and_does_not_raise(self):
         self.seed(_rec(rid="1", knew="2026-06-18"))
         self.conflict_on.add("1")
-        out = self.run_job()
-        self.assertEqual(out, {"targets": 1, "items": 0, "unset": 0, "sent": False})
-        self.assertEqual(self.admin.await_count, 0)
-        self.assertEqual(self.history("1"), "")
+        with self.assertLogs("hub.houki_jukuryo", level=logging.WARNING) as cm:
+            out = self.run_job()
+        self.assertEqual(out, {"targets": 1, "items": 1, "unset": 0, "sent": True, "history_failed": 1})
+        self.assertEqual(self.admin.await_count, 1)                       # 送信は行われる
+        self.assertEqual(self.history("1"), "")                           # 履歴は書けていない
+        self.assertTrue(any("history append failed after notice" in m for m in cm.output))
+        self.assertFalse(any("山田" in m for m in cm.output))
 
-    def test_write_error_sends_nothing(self):
+    def test_write_error_after_send_logs_warning_and_does_not_raise(self):
         self.seed(_rec(rid="1", knew="2026-06-18"))
         self.fail_on.add("1")
+        with self.assertLogs("hub.houki_jukuryo", level=logging.WARNING) as cm:
+            out = self.run_job()
+        self.assertEqual((out["items"], out["sent"], out["history_failed"]), (1, True, 1))
+        self.assertEqual(self.admin.await_count, 1)
+        self.assertTrue(any("history append failed after notice" in m for m in cm.output))
+
+    def test_send_failed_writes_no_history(self):
+        self.seed(_rec(rid="1", knew="2026-06-18"), _rec(rid="5"))
+        self.admin.return_value = "failed"
+        with self.assertLogs("hub.houki_jukuryo", level=logging.WARNING) as cm:
+            out = self.run_job()
+        self.assertEqual((out["items"], out["unset"], out["sent"]), (1, 1, False))
+        self.assertEqual(self.updates, [])                                # 履歴追記 0（未設定分も）
+        self.assertEqual(self.history("1"), "")
+        self.assertEqual(self.history("5"), "")
+        self.assertTrue(any("notice not sent" in m for m in cm.output))
+        # 同日の再実行で再び対象になる
+        self.admin.return_value = "sent"
+        out2 = self.run_job()
+        self.assertEqual((out2["items"], out2["unset"]), (1, 1))
+        self.assertEqual(self.history("1"), "2026-09-08 社内締切当日 通知済")
+        self.assertEqual(self.history("5"), "2026-09-08 起算日未設定 通知済")
+
+    def test_throttled_counts_as_sent_and_writes_history(self):
+        self.seed(_rec(rid="1", knew="2026-06-18"))
+        self.admin.return_value = "throttled"
         out = self.run_job()
-        self.assertEqual(out["items"], 0)
-        self.assertEqual(self.admin.await_count, 0)
+        self.assertEqual((out["sent"], out["history_failed"]), (True, 0))
+        self.assertEqual(self.history("1"), "2026-09-08 社内締切当日 通知済")
+
+    def test_history_written_only_after_send(self):
+        """送信呼出しの時点で履歴追記が 0 件であること（順序 pin）。"""
+        self.seed(_rec(rid="1", knew="2026-06-18"))
+        seen = []
+
+        async def admin(text, throttle_key=""):
+            seen.append(len(self.updates))
+            return "sent"
+        self.admin.side_effect = admin
+        self.run_job()
+        self.assertEqual(seen, [0])
+        self.assertEqual(len(self.updates), 1)
+
+    def test_multiple_milestones_same_record_one_update(self):
+        self.seed(_rec(rid="1", legal="2026-09-11", internal="2026-09-08"))   # 社内当日+法定3日前
+        out = self.run_job()
+        self.assertEqual(out["items"], 2)
+        self.assertEqual(len(self.updates), 1)                             # 1 レコード 1 回の CAS 更新
+        self.assertEqual(self.history("1"),
+                         "2026-09-08 社内締切当日 通知済\n2026-09-08 法定満了3日前 通知済")
 
     def test_non_target_records_are_skipped_even_if_returned(self):
         self.seed(_rec(rid="1", knew="2026-06-18", status="書類収集中"),
@@ -334,10 +385,11 @@ class TestDailyJob(_Base):
 
     def test_notify_failure_is_logged_not_raised(self):
         self.seed(_rec(rid="1", knew="2026-06-18"))
-        self.admin.return_value = False
+        self.admin.return_value = "failed"
         out = self.run_job()
         self.assertEqual(out["sent"], False)
         self.assertEqual(out["items"], 1)
+        self.assertEqual(self.history("1"), "")                           # fix1: 失敗時は追記しない
 
 
 # ── kind・定数・登録・結線 ────────────────────────────────────────────────────
