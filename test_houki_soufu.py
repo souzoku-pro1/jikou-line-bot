@@ -12,6 +12,11 @@
   claim は 409・作成失敗は 起票中 のまま次回回収・Lock
 - fix1 B: status=債権者通知 でも未 行の起票と回収・受理→債権者通知 は現在が 受理 のときだけ
 - fix1 C: 宛先は App 30 から・App 40 の行と不一致なら成果物 0＋要確認（PrepareDeferred＝下書きのまま）
+- fix2 A: claim は 起票中:{token}:{期限}（TTL 600 秒）・期限内は他者が回収しない・期限切れは自 token で claim し直し・
+  作成直前の所有権確認・作成後の重複検出（番号最小を正・自分の 下書き は 下書き→エラー で無効化〔物理削除は RV-08 pin で不可〕／
+  下書き でなければ要確認）・番号書込は再取得 revision で 1 回
+- fix2 B: 回収の新規作成前に 通知要否=要 ∧ 住所非空 を再確認・満たさなければ 未 に戻して要確認
+- fix2 C: 書き戻し失敗通知は notify_admin_line_result・failed は ERROR ログ（番号入り）・throttled は成功
 - 送付状の差し込み 15 個と和暦（昭和/平成/令和・非 ISO はそのまま）・凍結 pin・残存プレースホルダ拒否
 - M4 prepare の相続放棄分岐（成果物 3 点・ラベル 1 面・時効側は従来どおり）
 - 通知本文に個人情報なし・kind 登録・config 登録
@@ -24,7 +29,7 @@ import io
 import json
 import os
 import unittest
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -68,6 +73,7 @@ _client = TestClient(main.app)
 _URL = "/souzoku-houki/soufu/houki-hook"
 TODAY = date(2026, 9, 8)
 REPO = Path(__file__).parent
+_REAL_NOTIFY_RESULT = hub_notify.notify_admin_line_result      # _Base の mock 前に捕捉
 
 CASE_VALUES = {
     "顧客名": "申述太郎", "住所": "埼玉県テスト市1-1", "生年月日": "1980-02-03",
@@ -113,6 +119,9 @@ class _Base(unittest.TestCase):
         self.conflict_once: set[str] = set()
         self.conflict_on_nth: set[int] = set()        # App 40 の N 回目の update を 409 に（1 始まり）
         self.houki_update_calls = 0
+        self.deleted: list[str] = []
+        self.create_status = "下書き"                   # fake: 作成直後の 発送ステータス（重複テスト用）
+        self.now = datetime(2026, 9, 8, 0, 0, tzinfo=timezone.utc)
 
         async def get_record(app, rid):
             await asyncio.sleep(0)                      # 並行テストの yield 点
@@ -147,15 +156,21 @@ class _Base(unittest.TestCase):
             rec = {"$id": {"value": rid}, "$revision": {"value": "1"}}
             for k, v in fields.items():
                 rec[k] = {"value": copy.deepcopy(v)}
+            rec["発送ステータス"] = {"value": self.create_status}
             self.shipping[rid] = rec
             return rid
+
+        async def delete_record(app, rid):
+            self.assertEqual(app.app_id_env, "APP_SHIPPING")
+            self.deleted.append(str(rid))
+            self.shipping.pop(str(rid), None)
 
         async def search_records(app, query, fields=None):
             if app.app_id_env == "APP_ENCLOSURE":
                 return copy.deepcopy(self.blocks)
             if app.app_id_env == "APP_SHIPPING":
                 key = query.split('like "')[1].split('"')[0]
-                return [{"$id": {"value": r["$id"]["value"]}} for r in self.shipping.values()
+                return [copy.deepcopy(r) for r in sorted(self.shipping.values(), key=lambda r: int(r["$id"]["value"]))
                         if key in (r.get("チャネル固有データ", {}).get("value") or "")]
             if app.app_id_env == "APP_HOUKI":
                 gid = query.split('= "')[1].split('"')[0]
@@ -170,14 +185,18 @@ class _Base(unittest.TestCase):
             return b"%PDF-notice-" + key.encode()
 
         self.admin = AsyncMock(return_value=True)
+        self.admin_result = AsyncMock(return_value="sent")
         for p in (patch.object(hub_kintone, "get_record", get_record),
                   patch.object(hub_kintone, "update_record", update_record),
                   patch.object(hub_kintone, "create_record", create_record),
+                  patch.object(hub_kintone, "delete_record", delete_record),
                   patch.object(hub_kintone, "search_records", search_records),
                   patch.object(hub_kintone, "get_form_fields", get_form_fields),
                   patch.object(hub_kintone, "download_file", download_file),
                   patch.object(hub_notify, "notify_admin_line", self.admin),
-                  patch("hub.notify.notify_admin_line", self.admin)):
+                  patch("hub.notify.notify_admin_line", self.admin),
+                  patch.object(hub_notify, "notify_admin_line_result", self.admin_result),
+                  patch.object(hs, "_now_utc", lambda: self.now)):
             p.start()
             self.addCleanup(p.stop)
         hub_notify._last_notify_at.clear()
@@ -195,6 +214,15 @@ class _Base(unittest.TestCase):
 
     def texts(self):
         return [c.args[0] for c in self.admin.await_args_list]
+
+    def result_texts(self):
+        return [c.args[0] for c in self.admin_result.await_args_list]
+
+    def advance(self, seconds):
+        self.now = self.now + timedelta(seconds=seconds)
+
+    def ship_no(self, rid="1", idx=0):
+        return self.rows(rid)[idx]["value"]["送付発送管理No"]["value"]
 
     def kinds(self):
         return [c.kwargs.get("throttle_key", "").split(":", 1)[0] for c in self.admin.await_args_list]
@@ -306,7 +334,8 @@ class TestFiling(_Base):
         self.assertEqual([sorted(u[2]) for u in houki_updates], [["債権者一覧"], ["債権者一覧"], ["status"]])
         self.assertEqual(houki_updates[0][3], "3")                  # CAS: 取得時 revision
         claimed_row = houki_updates[0][2]["債権者一覧"][0]["value"]
-        self.assertEqual((claimed_row["送付状態"]["value"], claimed_row["送付発送管理No"]["value"]), ("起票済", "起票中"))
+        self.assertEqual(claimed_row["送付状態"]["value"], "起票済")
+        self.assertTrue(claimed_row["送付発送管理No"]["value"].startswith("起票中:"))   # fix2: 起票中:{token}:{期限}
         self.assertEqual(self.shipping["100"]["発送ステータス"]["value"], "下書き")   # 起票は claim の後
 
     def test_claim_cas_conflict_skips_row_and_next_run_files(self):
@@ -329,10 +358,13 @@ class TestFiling(_Base):
         out = self.run_soufu()
         self.assertEqual((out["filed"], out["pending"], out["promoted"]), (1, 1, True))
         row = self.rows()[0]["value"]
-        self.assertEqual((row["送付状態"]["value"], row["送付発送管理No"]["value"]), ("起票済", "起票中"))
+        self.assertEqual(row["送付状態"]["value"], "起票済")
+        self.assertTrue(row["送付発送管理No"]["value"].startswith("起票中:"))
         self.assertTrue(any("回収" in t for t in self.texts()))
         self.assertEqual(self.cases["1"]["status"]["value"], "債権者通知")
         self.admin.reset_mock()
+        self.assertEqual(self.run_soufu()["recovered"], 0)          # fix2 A-2: 期限内の 起票中 は触らない
+        self.advance(hs.CLAIM_TTL_SEC + 1)
         out2 = self.run_soufu()
         self.assertEqual((out2["filed"], out2["aligned"], out2["recovered"], out2["promoted"]), (0, 1, 1, False))
         self.assertEqual(len(self.shipping), 1)
@@ -387,12 +419,13 @@ class TestClaimAndRecovery(_Base):
         self.seed(_case())
         snapshot = copy.deepcopy(self.cases["1"])
         self.assertIsNone(asyncio.run(hs.find_existing_shipping("houki_soufu:1:11")))
-        self.assertTrue(asyncio.run(hs.claim_row("1", "11", copy.deepcopy(snapshot))))
+        self.assertTrue(asyncio.run(hs.claim_row("1", "11", copy.deepcopy(snapshot), "tokA")))
         self.assertIsNone(asyncio.run(hs.find_existing_shipping("houki_soufu:1:11")))
-        self.assertFalse(asyncio.run(hs.claim_row("1", "11", copy.deepcopy(snapshot))))   # revision 3 は古い
-        self.assertFalse(asyncio.run(hs.claim_row("1", "11", None)))                      # 最新でも 未 でないので不可
+        self.assertFalse(asyncio.run(hs.claim_row("1", "11", copy.deepcopy(snapshot), "tokB")))   # revision 3 は古い
+        self.assertFalse(asyncio.run(hs.claim_row("1", "11", None, "tokB")))                      # 最新でも 未 でないので不可
         row = self.rows()[0]["value"]
-        self.assertEqual((row["送付状態"]["value"], row["送付発送管理No"]["value"]), ("起票済", "起票中"))
+        self.assertEqual(row["送付状態"]["value"], "起票済")
+        self.assertEqual(hs.claim_owner(self.rows()[0]), "tokA")
         self.assertEqual(self.shipping, {})
 
     def test_create_failure_leaves_row_claiming_and_next_run_recovers(self):
@@ -409,11 +442,14 @@ class TestClaimAndRecovery(_Base):
             out = self.run_soufu()
             self.assertEqual((out["filed"], out["pending"], out["promoted"]), (0, 1, False))
             row = self.rows()[0]["value"]
-            self.assertEqual((row["送付状態"]["value"], row["送付発送管理No"]["value"]), ("起票済", "起票中"))
+            self.assertEqual(row["送付状態"]["value"], "起票済")
+            self.assertTrue(row["送付発送管理No"]["value"].startswith("起票中:"))
             self.assertEqual(self.shipping, {})
             self.assertEqual(self.cases["1"]["status"]["value"], "受理")
             self.assertTrue(any("次回の保存時に自動で回収" in t for t in self.texts()))
             self.admin.reset_mock()
+            self.assertEqual(self.run_soufu()["recovered"], 0)      # 期限内は回収しない
+            self.advance(hs.CLAIM_TTL_SEC + 1)
             out2 = self.run_soufu()
         self.assertEqual((out2["filed"], out2["recovered"], out2["promoted"]), (1, 1, True))
         self.assertEqual(len(self.shipping), 1)
@@ -436,6 +472,157 @@ class TestClaimAndRecovery(_Base):
         out = self.run_soufu()
         self.assertEqual((out["recovered"], out["filed"]), (0, 0))
         self.assertEqual(self.shipping, {})
+
+
+class TestOwnerClaim(_Base):
+    """fix2 A: 所有者付き claim・期限・所有権確認・重複検出。"""
+
+    def test_claim_value_format_and_expiry(self):
+        v = hs.claim_value("abc123def456", self.now)
+        self.assertEqual(v, "起票中:abc123def456:2026-09-08T00:10:00Z")
+        self.assertEqual(hs.parse_claim(v), ("abc123def456", datetime(2026, 9, 8, 0, 10, tzinfo=timezone.utc)))
+        self.assertEqual(hs.parse_claim("起票中"), ("", None))                 # 旧形式=期限切れ扱い
+        self.assertIsNone(hs.parse_claim("100"))
+        self.assertIsNone(hs.parse_claim(""))
+        row = _row("11", "甲社", state="起票済", ship_no=v)
+        self.assertFalse(hs.claim_expired(row, self.now + timedelta(seconds=599)))
+        self.assertTrue(hs.claim_expired(row, self.now + timedelta(seconds=600)))
+        self.assertTrue(hs.claim_expired(_row("11", "甲社", state="起票済", ship_no="起票中"), self.now))
+        self.assertTrue(hs.is_recovery_row(_row("11", "甲社", state="起票済", ship_no=""), self.now))
+        self.assertFalse(hs.is_recovery_row(row, self.now))
+        self.assertTrue(hs.is_active_claim(row, self.now))
+
+    def test_other_instance_does_not_recover_active_claim(self):
+        """A が claim 後に待機 → B（別 Lock）が最新取得 → 期限内の 起票中 は回収しない（作成 0）。"""
+        self.seed(_case())
+        self.assertTrue(asyncio.run(hs.claim_row("1", "11", None, "tokA")))
+        out_b = asyncio.run(hs._process_soufu_locked("1", "tokB"))
+        self.assertEqual((out_b["filed"], out_b["recovered"], out_b["skip"]), (0, 0, "no_target_rows"))
+        self.assertEqual(self.shipping, {})
+        self.assertEqual(hs.claim_owner(self.rows()[0]), "tokA")
+
+    def test_expired_claim_recovered_by_b_then_a_loses_ownership(self):
+        self.seed(_case())
+        self.assertTrue(asyncio.run(hs.claim_row("1", "11", None, "tokA")))
+        self.advance(hs.CLAIM_TTL_SEC + 1)
+        out_b = asyncio.run(hs._process_soufu_locked("1", "tokB"))
+        self.assertEqual((out_b["filed"], out_b["recovered"]), (1, 1))
+        self.assertEqual(self.ship_no(), "100")
+        # A が再開: 作成直前の所有権確認で止まる（作成 0）
+        result = {"filed": 0, "aligned": 0, "review": 0, "pending": 0, "recovered": 0,
+                  "lost": 0, "reverted": 0, "promoted": False, "skip": ""}
+        filed = []
+        asyncio.run(hs._file_claimed_row("1", self.cases["1"], "11", "tokA", result, filed))
+        self.assertEqual((result["lost"], filed, len(self.shipping)), (1, [], 1))
+
+    def test_recovery_rewrites_claim_with_own_token_before_proceeding(self):
+        self.seed(_case(rows=[_row("11", "甲社", state="起票済", ship_no="起票中")]))     # 旧形式
+        claims = []
+        real_update = hub_kintone.update_record
+
+        async def spy(app, rid, fields, revision=None):
+            if app.app_id_env == "APP_HOUKI" and "債権者一覧" in fields:
+                claims.append(fields["債権者一覧"][0]["value"]["送付発送管理No"]["value"])
+            return await real_update(app, rid, fields, revision)
+        with patch.object(hub_kintone, "update_record", spy):
+            out = asyncio.run(hs._process_soufu_locked("1", "tokB"))
+        self.assertEqual(out["recovered"], 1)
+        self.assertTrue(claims[0].startswith("起票中:tokB:"))          # 自分の token・新しい期限
+        self.assertEqual(claims[1], "100")
+
+    def test_both_created_min_id_wins_and_own_draft_is_voided(self):
+        """両方が作成に至った場合（既存検索を fake で「なし」に強制）→ 番号最小を正・自分の 下書き を無効化
+        （下書き→エラー。物理削除は RV-08 の repo 全域 pin により行わない）。"""
+        self.seed(_case())
+        self.shipping["50"] = {"$id": {"value": "50"}, "$revision": {"value": "1"},
+                               "発送ステータス": {"value": "下書き"},
+                               "チャネル固有データ": {"value": json.dumps({"houki_soufu_key": "houki_soufu:1:11"})}}
+        with patch.object(hs, "find_existing_shipping", AsyncMock(return_value=None)):
+            out = self.run_soufu()
+        self.assertEqual((out["filed"], out["aligned"]), (0, 1))
+        self.assertEqual(self.deleted, [])                                   # 物理削除なし
+        self.assertEqual(set(self.shipping), {"50", "100"})
+        self.assertEqual(self.shipping["100"]["発送ステータス"]["value"], "エラー")
+        self.assertEqual(self.shipping["100"]["エラー詳細"]["value"], "二重起票（正: 発送管理 No.50）。本レコードは使用しません。")
+        self.assertEqual(self.shipping["50"]["発送ステータス"]["value"], "下書き")
+        self.assertEqual(self.ship_no(), "50")
+        self.assertEqual([t for t in self.texts() if "二重起票" in t], [])
+
+    def test_both_created_own_not_draft_is_kept_and_reviewed(self):
+        self.seed(_case())
+        self.shipping["50"] = {"$id": {"value": "50"}, "$revision": {"value": "1"},
+                               "発送ステータス": {"value": "下書き"},
+                               "チャネル固有データ": {"value": json.dumps({"houki_soufu_key": "houki_soufu:1:11"})}}
+        self.create_status = "承認待ち"                                 # 自分の分が 下書き でない
+        with patch.object(hs, "find_existing_shipping", AsyncMock(return_value=None)):
+            out = self.run_soufu()
+        self.assertEqual(self.deleted, [])
+        self.assertEqual(set(self.shipping), {"50", "100"})
+        self.assertEqual(self.shipping["100"]["発送ステータス"]["value"], "承認待ち")   # 触らない
+        self.assertEqual(self.ship_no(), "50")
+        review = [t for t in self.texts() if "二重起票の疑い" in t]
+        self.assertEqual(len(review), 1)
+        self.assertIn("No.50", review[0])
+        self.assertIn("No.100", review[0])
+        self.assertNotIn("甲社", review[0])
+
+    def test_own_created_is_min_keeps_it(self):
+        self.seed(_case())
+        self.shipping["200"] = {"$id": {"value": "200"}, "$revision": {"value": "1"},
+                                "発送ステータス": {"value": "下書き"},
+                                "チャネル固有データ": {"value": json.dumps({"houki_soufu_key": "houki_soufu:1:11"})}}
+        with patch.object(hs, "find_existing_shipping", AsyncMock(return_value=None)):
+            out = self.run_soufu()
+        self.assertEqual((out["filed"], self.deleted, self.ship_no()), (1, [], "100"))
+
+    def test_number_write_uses_refetched_revision_and_409_leaves_claiming(self):
+        self.seed(_case())
+        self.conflict_on_nth.add(2)                                  # 番号書込（1 回のみ・再取得なし）
+        out = self.run_soufu()
+        self.assertEqual((out["filed"], out["pending"]), (1, 1))
+        self.assertTrue(self.ship_no().startswith("起票中:"))
+        self.assertEqual(len([u for u in self.updates if u[0] == "APP_HOUKI" and "債権者一覧" in u[2]]), 2)
+
+
+class TestRecoveryEligibility(_Base):
+    """fix2 B: 回収時の新規作成条件。"""
+
+    def _stale(self, **kw):
+        kw.setdefault("state", "起票済")
+        kw.setdefault("ship_no", hs.claim_value("dead0000beef", self.now - timedelta(seconds=hs.CLAIM_TTL_SEC + 5)))
+        return _row("11", "甲社", **kw)
+
+    def test_notify_changed_to_not_required_reverts_row(self):
+        self.seed(_case(rows=[self._stale(notify="不要")]))
+        out = self.run_soufu()
+        self.assertEqual((out["filed"], out["reverted"]), (0, 1))
+        self.assertEqual(self.shipping, {})
+        row = self.rows()[0]["value"]
+        self.assertEqual((row["送付状態"]["value"], row["送付発送管理No"]["value"]), ("未", ""))
+        review = [t for t in self.texts() if "取り消しました" in t]
+        self.assertEqual(len(review), 1)
+        self.assertIn("案件レコードNo.1 行 1: 起票中でしたが通知要否/住所の条件を満たさないため取り消しました", review[0])
+        self.assertNotIn("甲社", review[0])
+
+    def test_address_cleared_reverts_row(self):
+        self.seed(_case(rows=[self._stale(addr="")]))
+        out = self.run_soufu()
+        self.assertEqual((out["filed"], out["reverted"]), (0, 1))
+        self.assertEqual((self.rows()[0]["value"]["送付状態"]["value"], self.ship_no()), ("未", ""))
+
+    def test_eligible_stale_row_is_created(self):
+        self.seed(_case(rows=[self._stale()]))
+        out = self.run_soufu()
+        self.assertEqual((out["filed"], out["recovered"], out["reverted"]), (1, 1, 0))
+        self.assertEqual(self.ship_no(), "100")
+
+    def test_number_recovery_does_not_check_eligibility(self):
+        self.seed(_case(rows=[self._stale(notify="不要")]))
+        self.shipping["100"] = {"$id": {"value": "100"}, "$revision": {"value": "1"},
+                                "チャネル固有データ": {"value": json.dumps({"houki_soufu_key": "houki_soufu:1:11"})}}
+        out = self.run_soufu()
+        self.assertEqual((out["aligned"], out["reverted"]), (1, 0))
+        self.assertEqual(self.ship_no(), "100")
 
 
 class TestNotifyingStatusEntry(_Base):
@@ -590,7 +777,7 @@ class TestWriteBack(_Base):
                 patch.object(hub_notify, "notify_attorney_approval", AsyncMock()):
             asyncio.run(hub_dispatch.process_dispatch("100"))          # 例外は伝播しない
         self.assertEqual(self.shipping["100"]["発送ステータス"]["value"], "完了")
-        review = [t for t in self.texts() if t.startswith(hs.NOTICE_HEAD_REVIEW)]
+        review = [t for t in self.result_texts() if t.startswith(hs.NOTICE_HEAD_REVIEW)]
         self.assertEqual(len(review), 1)
         self.assertIn("案件レコードNo.1", review[0])
         self.assertIn("発送管理 No.100", review[0])
@@ -611,21 +798,65 @@ class TestWriteBack(_Base):
                 patch.object(hub_notify, "notify_attorney_approval", AsyncMock()):
             asyncio.run(hub_dispatch.process_dispatch("100"))
         self.assertEqual(self.shipping["100"]["発送ステータス"]["value"], "完了")
-        self.assertEqual(len([t for t in self.texts() if t.startswith(hs.NOTICE_HEAD_REVIEW)]), 1)
+        self.assertEqual(len([t for t in self.result_texts() if t.startswith(hs.NOTICE_HEAD_REVIEW)]), 1)
 
-    def test_write_back_notify_failure_logs_error_without_raise(self):
+    def test_write_back_notify_exception_logs_error_without_raise(self):
         import logging
         self.seed(_case(rows=[_row("11", "甲社", state="起票済", ship_no="100")]))
         self.shipping["100"] = self._ship()
 
         async def get(app, rid):
             raise asyncio.TimeoutError()
-        self.admin.side_effect = RuntimeError("line down")
+        self.admin_result.side_effect = RuntimeError("line down")
         with patch.object(hub_kintone, "get_record", get), \
                 self.assertLogs("hub.houki_soufu", level=logging.ERROR) as cm:
             self.assertFalse(asyncio.run(hs.write_back_safely(self._ship())))
         self.assertTrue(any("write-back notify failed" in m for m in cm.output))
         self.assertFalse(any("甲社" in m for m in cm.output))
+
+    def _real_result_notify(self, push_ok):
+        push = AsyncMock(return_value=push_ok)
+        for p in (patch.object(hub_notify, "notify_admin_line_result", _REAL_NOTIFY_RESULT),
+                  patch.object(hub_notify, "push_line_message", push),
+                  patch.object(hub_notify, "get_admin_line_user_id", return_value="Uadmin")):
+            p.start()
+            self.addCleanup(p.stop)
+        hub_notify._last_notify_at.clear()
+        hub_notify._notify_in_flight.clear()
+        self.addCleanup(hub_notify._last_notify_at.clear)
+        return push
+
+    def test_write_back_notice_failed_result_logs_error_with_numbers(self):
+        """fix2 C: 実 notify_admin_line_result・push が False → ERROR ログ 1 行（案件番号+発送管理番号）・例外なし。"""
+        import logging
+        self.seed(_case(rows=[_row("11", "甲社", state="起票済", ship_no="100")]))
+        push = self._real_result_notify(False)
+
+        async def get(app, rid):
+            raise asyncio.TimeoutError()
+        with patch.object(hub_kintone, "get_record", get), \
+                self.assertLogs("hub.houki_soufu", level=logging.ERROR) as cm:
+            self.assertFalse(asyncio.run(hs.write_back_safely(self._ship())))
+        lines = [m for m in cm.output if "write-back notice not delivered" in m]
+        self.assertEqual(len(lines), 1)
+        self.assertIn("case=1", lines[0])
+        self.assertIn("shipping=100", lines[0])
+        self.assertEqual(push.await_count, 1)
+
+    def test_write_back_notice_sent_and_throttled_have_no_error(self):
+        import logging
+        self.seed(_case(rows=[_row("11", "甲社", state="起票済", ship_no="100")]))
+        push = self._real_result_notify(True)
+
+        async def get(app, rid):
+            raise asyncio.TimeoutError()
+        with patch.object(hub_kintone, "get_record", get), \
+                self.assertLogs("hub.houki_soufu", level=logging.ERROR) as cm:
+            asyncio.run(hs.write_back_safely(self._ship()))            # sent
+            asyncio.run(hs.write_back_safely(self._ship()))            # throttled（同キー・窓内）
+        self.assertEqual(push.await_count, 1)
+        self.assertFalse(any("not delivered" in m or "notify failed" in m for m in cm.output))
+        self.assertEqual(len([m for m in cm.output if "write-back exception" in m]), 2)
 
     def test_jikou_shipping_never_touches_app40_even_on_exception_paths(self):
         self.seed(_case(rows=[_row("11", "甲社", state="起票済", ship_no="100")]))
@@ -846,6 +1077,8 @@ class TestRegistry(unittest.TestCase):
         self.assertEqual(hs.INCLUDED_DESTINATIONS, 3)
         self.assertEqual(hs.ENCLOSURE_BLOCK_KEY, "受理通知書写し")
         self.assertEqual(hs.soufu_key("1", "11"), "houki_soufu:1:11")
+        self.assertEqual(hs.CLAIM_TTL_SEC, 600)
+        self.assertEqual(hs.SHIP_NO_CLAIMING, "起票中")
 
     def test_constants_pinned(self):
         self.assertEqual((hs.STATUS_ACCEPTED, hs.STATUS_NOTIFYING, hs.STATUS_COMPLETED), ("受理", "債権者通知", "完了"))

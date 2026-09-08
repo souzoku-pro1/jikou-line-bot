@@ -33,6 +33,8 @@ import asyncio
 import json
 import logging
 import os
+import uuid
+from datetime import datetime, timedelta, timezone
 
 from hub import kintone, notify
 from hub import houki_contract as hc
@@ -66,7 +68,9 @@ NOTIFY_REQUIRED = "要"
 STATE_TODO = "未"
 STATE_FILED = "起票済"
 STATE_SENT = "送付済"
-SHIP_NO_CLAIMING = "起票中"                                 # fix1 A: claim 中の 送付発送管理No
+SHIP_NO_CLAIMING = "起票中"                                 # fix1 A: claim 中の 送付発送管理No（fix2: 起票中:{token}:{期限}）
+CLAIM_TTL_SEC = 600                                         # fix2 A-1: claim の期限（10 分）
+DUPLICATE_ERROR_DETAIL = "二重起票（正: 発送管理 No.{canonical}）。本レコードは使用しません。"   # fix2 A-4
 TRIGGER_STATUSES = (STATUS_ACCEPTED, STATUS_NOTIFYING)      # fix1 B: 債権者通知 でも回収
 EXTRA_YES = "yes"
 EXTRA_NO = "no"
@@ -115,21 +119,80 @@ def is_triggered(record: dict) -> bool:
             and bool(_v(record, FIELD_ACCEPT_RECEIVED)) and bool(files))
 
 
-def is_recovery_row(row: dict) -> bool:
-    """fix1 A-4: 送付状態=起票済 かつ 送付発送管理No が空または「起票中」（claim 済み・番号未書込）。"""
-    return (row_val(row, COL_STATE) == STATE_FILED
-            and row_val(row, COL_SHIP_NO) in ("", SHIP_NO_CLAIMING))
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc)
 
 
-def classify_rows(record: dict) -> tuple[list[tuple[int, dict]], list[int], list[tuple[int, dict]]]:
-    """(起票対象 [(行番号, row)], 住所未入力の 要 行番号, 回収対象 [(行番号, row)])。行番号は 1 始まり。"""
+def new_owner_token() -> str:
+    """fix2 A-1: 実行ごとの所有者 token（uuid4 先頭 12 桁）。"""
+    return uuid.uuid4().hex[:12]
+
+
+def claim_value(token: str, now: datetime | None = None) -> str:
+    """送付発送管理No の claim 値「起票中:{owner_token}:{expires_at ISO}」（期限 CLAIM_TTL_SEC）。"""
+    exp = (now or _now_utc()) + timedelta(seconds=CLAIM_TTL_SEC)
+    return f"{SHIP_NO_CLAIMING}:{token}:{exp.strftime('%Y-%m-%dT%H:%M:%SZ')}"
+
+
+def parse_claim(value: str) -> tuple[str, datetime | None] | None:
+    """claim 値を (token, expires_at) に分解。claim でなければ None。旧形式「起票中」は ("", None)。"""
+    v = str(value or "").strip()
+    if v == SHIP_NO_CLAIMING:
+        return "", None
+    if not v.startswith(SHIP_NO_CLAIMING + ":"):
+        return None
+    parts = v.split(":", 2)
+    if len(parts) != 3:
+        return "", None
+    try:
+        exp = datetime.strptime(parts[2], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except ValueError:
+        exp = None
+    return parts[1], exp
+
+
+def claim_owner(row: dict) -> str | None:
+    """行の claim token（claim でなければ None）。"""
+    parsed = parse_claim(row_val(row, COL_SHIP_NO))
+    return None if parsed is None else parsed[0]
+
+
+def claim_expired(row: dict, now: datetime | None = None) -> bool:
+    """claim が期限切れ（旧形式・期限不明も期限切れ扱い）。claim でなければ False。"""
+    parsed = parse_claim(row_val(row, COL_SHIP_NO))
+    if parsed is None:
+        return False
+    _token, exp = parsed
+    return exp is None or exp <= (now or _now_utc())
+
+
+def is_recovery_row(row: dict, now: datetime | None = None) -> bool:
+    """fix2 A-2: 回収対象＝送付状態=起票済 かつ（番号空〔旧形式〕または claim が期限切れ）。
+    期限内の claim は稼働中の所有者がいるものとして触らない。"""
+    if row_val(row, COL_STATE) != STATE_FILED:
+        return False
+    ship_no = row_val(row, COL_SHIP_NO)
+    if ship_no == "":
+        return True
+    return parse_claim(ship_no) is not None and claim_expired(row, now)
+
+
+def is_active_claim(row: dict, now: datetime | None = None) -> bool:
+    return (row_val(row, COL_STATE) == STATE_FILED and parse_claim(row_val(row, COL_SHIP_NO)) is not None
+            and not claim_expired(row, now))
+
+
+def classify_rows(record: dict, now: datetime | None = None
+                  ) -> tuple[list[tuple[int, dict]], list[int], list[tuple[int, dict]]]:
+    """(起票対象 [(行番号, row)], 住所未入力の 要 行番号, 回収対象 [(行番号, row)])。行番号は 1 始まり。
+    期限内の 起票中 は分類に入れない（稼働中）。"""
     targets: list[tuple[int, dict]] = []
     no_addr: list[int] = []
     recovery: list[tuple[int, dict]] = []
     for i, row in enumerate(rows_of(record), 1):
         if not row_id(row):
             continue
-        if is_recovery_row(row):
+        if is_recovery_row(row, now):
             recovery.append((i, row))
             continue
         if row_val(row, COL_NOTIFY) != NOTIFY_REQUIRED or row_val(row, COL_STATE) != STATE_TODO:
@@ -262,21 +325,34 @@ async def update_row(record_id: str, target_row_id: str, updates: dict,
     return False
 
 
+async def update_row_once(record_id: str, target_row_id: str, updates: dict, latest: dict) -> bool:
+    """fix2 A-5: 与えられた最新レコードの revision で 1 回だけ CAS 更新（409 は False・再取得しない）。"""
+    rows = rows_of(latest)
+    hit = next((r for r in rows if row_id(r) == target_row_id), None)
+    if hit is None:
+        return False
+    for col, val in updates.items():
+        hit.setdefault("value", {})[col] = {"value": val}
+    try:
+        await kintone.update_record(APP_HOUKI_CASE, record_id, {CREDITOR_TABLE: rows},
+                                    revision=_v(latest, "$revision") or None)
+        return True
+    except kintone.KintoneConflict:
+        return False
+
+
 async def claim_row(record_id: str, target_row_id: str, latest: dict | None,
-                    extra: bool = False) -> bool:
-    """fix1 A-1: 行を 未→起票済・送付発送管理No=起票中 に CAS で claim（1 回のみ・409 は False＝
-    他者が処理中としてスキップ）。追加料金対象 は claim と同時に立てる。"""
+                    token: str, extra: bool = False) -> bool:
+    """fix1 A-1 / fix2 A-1: 行を 未→起票済・送付発送管理No=起票中:{token}:{期限} に CAS で claim
+    （1 回のみ・409 は False＝他者が処理中としてスキップ）。追加料金対象 は claim と同時に立てる。"""
     if latest is None:
         latest = await kintone.get_record(APP_HOUKI_CASE, record_id)
     rows = rows_of(latest)
-    hit = None
-    for row in rows:
-        if row_id(row) == target_row_id:
-            hit = row
+    hit = next((r for r in rows if row_id(r) == target_row_id), None)
     if hit is None or row_val(hit, COL_STATE) != STATE_TODO:
         return False
     hit["value"][COL_STATE] = {"value": STATE_FILED}
-    hit["value"][COL_SHIP_NO] = {"value": SHIP_NO_CLAIMING}
+    hit["value"][COL_SHIP_NO] = {"value": claim_value(token)}
     if extra or row_val(hit, COL_EXTRA) == EXTRA_YES:
         hit["value"][COL_EXTRA] = {"value": EXTRA_YES}
     try:
@@ -289,24 +365,68 @@ async def claim_row(record_id: str, target_row_id: str, latest: dict | None,
         return False
 
 
-async def claim_recovery_row(record_id: str, target_row_id: str, latest: dict | None) -> bool:
-    """fix1 A-4: 番号が空の 起票済 行を 送付発送管理No=起票中 に CAS で claim。既に 起票中 なら
-    そのまま True（Lock で直列化済み）。409 は False。"""
+async def claim_recovery_row(record_id: str, target_row_id: str, latest: dict | None,
+                             token: str) -> bool:
+    """fix2 A-2: 回収対象（番号空〔旧形式〕または期限切れ claim）の行を、自分の token・新しい期限に
+    CAS で書き換えてから進む。期限内の claim（他者稼働中）や対象外は False。409 は False。"""
     if latest is None:
         latest = await kintone.get_record(APP_HOUKI_CASE, record_id)
     rows = rows_of(latest)
     hit = next((r for r in rows if row_id(r) == target_row_id), None)
     if hit is None or not is_recovery_row(hit):
         return False
-    if row_val(hit, COL_SHIP_NO) == SHIP_NO_CLAIMING:
-        return True
-    hit["value"][COL_SHIP_NO] = {"value": SHIP_NO_CLAIMING}
+    hit["value"][COL_SHIP_NO] = {"value": claim_value(token)}
     try:
         await kintone.update_record(APP_HOUKI_CASE, record_id, {CREDITOR_TABLE: rows},
                                     revision=_v(latest, "$revision") or None)
         return True
     except kintone.KintoneConflict:
         return False
+
+
+async def find_all_shipping(key: str) -> list[dict]:
+    """fix2 A-4: 同じ houki_soufu_key を持つ App 30 レコード（$id 昇順・キー完全一致で絞る）。"""
+    records = await kintone.search_records(
+        APP_SHIPPING, f'チャネル固有データ like "{key}" order by $id asc limit 100',
+        fields=["$id", "発送ステータス", "チャネル固有データ"])
+    out = []
+    for r in records:
+        try:
+            data = json.loads(_v(r, "チャネル固有データ") or "{}")
+        except ValueError:
+            data = {}
+        if data.get(CHANNEL_DATA_KEY) == key:
+            out.append(r)
+    return sorted(out, key=lambda r: int(_v(r, "$id") or 0))
+
+
+async def resolve_duplicates(record_id: str, key: str, mine: str) -> str:
+    """fix2 A-4: 作成後に同キーを検索し、2 件以上なら番号最小を正とする。自分の分が最小でなければ
+    自分の分（下書き かつ キー一致）を無効化（下書き→エラー・物理削除は RV-08 pin により不可）。
+    下書き でなければ触らず要確認通知（両番号）。戻り値は正の番号。"""
+    found = await find_all_shipping(key)
+    if len(found) <= 1:
+        return mine
+    canonical = _v(found[0], "$id")
+    if canonical == mine:
+        return mine
+    me = next((r for r in found if _v(r, "$id") == mine), None)
+    if me is not None and _v(me, "発送ステータス") == SHIPPING_STATUS_DRAFT:
+        # 物理削除は RV-08 の repo 全域 pin（test_rv08_soft_merge: delete_record 参照禁止）に反するため
+        # 行わず、自分の 下書き をサーバ許容遷移 下書き→エラー（hub/approval・エラー詳細に正の番号）で
+        # 無効化する（prepare/承認の対象から外れる・人が 完了 に倒せる）。
+        from hub import approval
+        await approval.transition(APP_SHIPPING, mine, SHIPPING_STATUS_DRAFT, "エラー",
+                                  extra_fields={"エラー詳細": DUPLICATE_ERROR_DETAIL.format(canonical=canonical)})
+        logger.info("[HOUKI_SOUFU] duplicate draft voided record_id=%s shipping=%s canonical=%s",
+                    emit(record_id, "record_id", "log", "operator"),
+                    emit(mine, "record_id", "log", "operator"),
+                    emit(canonical, "record_id", "log", "operator"))
+    else:
+        await _notify(NOTIFY_KIND_REVIEW, record_id,
+                      f"{NOTICE_HEAD_REVIEW} 案件レコードNo.{record_id}: 二重起票の疑い（発送管理 No.{canonical} と"
+                      f" No.{mine}）。No.{canonical} を正として行に書きました。No.{mine} を確認してください。")
+    return canonical
 
 
 async def promote_status(record_id: str) -> bool:
@@ -358,46 +478,76 @@ def filed_text(record_id: str, filed: list[str], aligned: int, review_count: int
     return "\n".join(lines)
 
 
-async def _file_claimed_row(record_id: str, record: dict, row: dict, result: dict,
-                            filed_ids: list[str]) -> None:
-    """fix1 A-2/A-3: claim 済みの行について、既存検索 → 無ければ App 30 作成 → 行に番号を CAS で書く。
-    作成失敗は行を 起票中 のまま残す（次回実行で回収）。"""
-    rid_row = row_id(row)
-    key = soufu_key(record_id, rid_row)
+def row_eligible(row: dict) -> bool:
+    """fix2 B-2: 新規作成の前提（通知要否=要 かつ 債権者住所 非空）。"""
+    return row_val(row, COL_NOTIFY) == NOTIFY_REQUIRED and bool(row_val(row, COL_ADDR))
+
+
+async def _file_claimed_row(record_id: str, record: dict, target_row_id: str, token: str,
+                            result: dict, filed_ids: list[str], recovery: bool = False) -> None:
+    """claim 済みの行について（fix2 A-3〜A-5・B）:
+    1. 行を再取得し、送付発送管理No の token が自分のものであることを確認（違えば所有権喪失としてスキップ）
+    2. 既存検索（番号復旧）→ 無ければ、回収時は 通知要否=要 かつ 住所非空 を再確認（満たさなければ
+       行を 未・番号空 に CAS で戻し要確認）→ App 30 作成 → 同キー 2 件以上なら番号最小を正（自分の
+       下書き を削除／下書き でなければ要確認）
+    3. 手順 1 の revision で番号を CAS 書込。409 なら 起票中 のまま（期限切れ後に回収）。"""
+    key = soufu_key(record_id, target_row_id)
+    latest = await kintone.get_record(APP_HOUKI_CASE, record_id)
+    row = next((r for r in rows_of(latest) if row_id(r) == target_row_id), None)
+    if row is None or claim_owner(row) != token:
+        result["lost"] += 1
+        logger.info("[HOUKI_SOUFU] claim ownership lost record_id=%s",
+                    emit(record_id, "record_id", "log", "operator"))
+        return
+    row_no = next((i for i, r in enumerate(rows_of(latest), 1) if row_id(r) == target_row_id), 0)
     existing = await find_existing_shipping(key)
     if existing:
         shipping_id = existing
         result["aligned"] += 1
     else:
+        if recovery and not row_eligible(row):
+            reverted = await update_row_once(record_id, target_row_id,
+                                             {COL_STATE: STATE_TODO, COL_SHIP_NO: ""}, latest)
+            result["reverted"] += 1
+            await _notify(NOTIFY_KIND_REVIEW, record_id,
+                          f"{NOTICE_HEAD_REVIEW} 案件レコードNo.{record_id} 行 {row_no}: 起票中でしたが"
+                          "通知要否/住所の条件を満たさないため取り消しました"
+                          + ("" if reverted else "（行の 送付状態 を手で 未 に戻してください）"))
+            return
         try:
-            shipping_id = str(await kintone.create_record(APP_SHIPPING, build_shipping_fields(record, row, key)))
+            shipping_id = str(await kintone.create_record(APP_SHIPPING, build_shipping_fields(latest, row, key)))
         except Exception as e:
             result["pending"] += 1
             logger.warning("[HOUKI_SOUFU] App30 create failed (row left claiming) record_id=%s cls=%s",
                            emit(record_id, "record_id", "log", "operator"),
                            emit(type(e).__name__, "vendor_raw", "log", "operator"))
             return
-        filed_ids.append(shipping_id)
         logger.info("[HOUKI_SOUFU] filed App30 record_id=%s shipping=%s",
                     emit(record_id, "record_id", "log", "operator"),
                     emit(shipping_id, "record_id", "log", "operator"))
-    if not await update_row(record_id, rid_row, {COL_SHIP_NO: shipping_id}):
-        result["pending"] += 1                            # 起票中 のまま＝次回実行で番号を揃える
+        canonical = await resolve_duplicates(record_id, key, shipping_id)
+        if canonical == shipping_id:
+            filed_ids.append(shipping_id)
+        else:
+            result["aligned"] += 1
+        shipping_id = canonical
+    if not await update_row_once(record_id, target_row_id, {COL_SHIP_NO: shipping_id}, latest):
+        result["pending"] += 1                            # 起票中 のまま＝期限切れ後に回収
         logger.warning("[HOUKI_SOUFU] shipping number write failed (row left claiming) record_id=%s",
                        emit(record_id, "record_id", "log", "operator"))
 
 
 async def process_soufu(record_id: str) -> dict:
     """起票本体（BackgroundTasks から呼ぶ）。fix1 A: record_id ごとの Lock で直列化し、
-    行ごとに claim（CAS）→ App 30 作成 → 番号書込。B: status=債権者通知 でも 未 行の起票と回収を行う。
-    戻り値は件数（テスト用）。"""
+    行ごとに claim（CAS・fix2: 所有者 token＋期限）→ App 30 作成 → 番号書込。
+    B: status=債権者通知 でも 未 行の起票と回収を行う。戻り値は件数（テスト用）。"""
     async with _lock_for(record_id):
-        return await _process_soufu_locked(record_id)
+        return await _process_soufu_locked(record_id, new_owner_token())
 
 
-async def _process_soufu_locked(record_id: str) -> dict:
+async def _process_soufu_locked(record_id: str, token: str) -> dict:
     result = {"filed": 0, "aligned": 0, "review": 0, "pending": 0, "recovered": 0,
-              "promoted": False, "skip": ""}
+              "lost": 0, "reverted": 0, "promoted": False, "skip": ""}
     record = await kintone.get_record(APP_HOUKI_CASE, record_id)
     if not is_triggered(record):
         result["skip"] = "not_triggered"
@@ -422,24 +572,24 @@ async def _process_soufu_locked(record_id: str) -> dict:
     extra = extra_fee_names(group)
     filed_ids: list[str] = []
     latest: dict | None = record
-    # A-4 回収: claim 済み（起票済・番号なし/起票中）の行を先に片付ける
+    # A-4 回収: 番号空（旧形式）または期限切れ claim の行を、自分の token で claim し直してから片付ける
     for _n, row in recovery:
-        if not await claim_recovery_row(record_id, row_id(row), latest):
+        if not await claim_recovery_row(record_id, row_id(row), latest, token):
             latest = None
             continue
         latest = None
         before = (result["aligned"], len(filed_ids))
-        await _file_claimed_row(record_id, record, row, result, filed_ids)
+        await _file_claimed_row(record_id, record, row_id(row), token, result, filed_ids, recovery=True)
         if (result["aligned"], len(filed_ids)) != before:
             result["recovered"] += 1
-    # A-1〜A-3: 未 行は claim → 作成 → 番号
+    # A-1〜A-3: 未 行は claim（所有者 token）→ 所有権確認 → 作成 → 番号
     for _n, row in targets:
         is_extra = hc.normalize_creditor(row_val(row, COL_NAME)) in extra
-        if not await claim_row(record_id, row_id(row), latest, extra=is_extra):
+        if not await claim_row(record_id, row_id(row), latest, token, extra=is_extra):
             latest = None                                # 409: 他者が処理中 → 再取得して次の行へ
             continue
         latest = None
-        await _file_claimed_row(record_id, record, row, result, filed_ids)
+        await _file_claimed_row(record_id, record, row_id(row), token, result, filed_ids)
     result["filed"] = len(filed_ids)
     if filed_ids or result["aligned"]:
         result["promoted"] = await promote_status(record_id)   # 現在が 受理 のときだけ 1 回
@@ -499,11 +649,16 @@ async def write_back_safely(shipping: dict) -> bool:
                      emit(ship_id, "record_id", "log", "operator"),
                      emit(type(e).__name__, "vendor_raw", "log", "operator"))
         try:
-            await notify.notify_admin_line(
+            # fix2 C: 3 値で送達を確認。failed は ERROR ログ（固定文言+案件番号+発送管理番号）。throttled は成功扱い
+            outcome = await notify.notify_admin_line_result(
                 f"{NOTICE_HEAD_REVIEW} 案件レコードNo.{case_id}: 発送管理 No.{ship_id} の発送済を"
                 "債権者一覧へ書き戻せませんでした（通信エラー）。App 40 の債権者一覧 該当行の"
                 " 送付状態 を手で 送付済 にしてください。",
                 throttle_key=f"{NOTIFY_KIND_REVIEW}:{case_id}:{ship_id}")
+            if outcome not in ("sent", "throttled"):
+                logger.error("[HOUKI_SOUFU] write-back notice not delivered case=%s shipping=%s",
+                             emit(case_id, "record_id", "log", "operator"),
+                             emit(ship_id, "record_id", "log", "operator"))
         except Exception:
             logger.error("[HOUKI_SOUFU] write-back notify failed case=%s shipping=%s",
                          emit(case_id, "record_id", "log", "operator"),
