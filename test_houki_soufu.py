@@ -25,6 +25,8 @@
   pending 解除は実物へのマージ＋revision（AST pin）
 - fix4 B: 解除失敗は pending_clear_failed（番号を書かない・該当番号のみ通知）・番号あり pending 残りは実行のたびに再解除・
   通知内訳「起票 / 重複未解決 / 解除再試行待ち」
+- fix5: 再解除の正が行の参照と異なれば、再取得→起票済∧参照不変を確認→CAS で正へ修復（順序: エラー化→行更新）。
+  失敗・状態変化は reference_mismatch（要確認・両番号・行番号）。通知内訳に「参照修復待ち」
 - 送付状の差し込み 15 個と和暦（昭和/平成/令和・非 ISO はそのまま）・凍結 pin・残存プレースホルダ拒否
 - M4 prepare の相続放棄分岐（成果物 3 点・ラベル 1 面・時効側は従来どおり）
 - 通知本文に個人情報なし・kind 登録・config 登録
@@ -598,7 +600,7 @@ class TestOwnerClaim(_Base):
         self.assertIn("No.100", review[0])
         self.assertNotIn("甲社", review[0])
         filed = [t for t in self.texts() if t.startswith(hs.NOTICE_HEAD_FILED)]
-        self.assertIn("起票 0 件 / 重複未解決 1 件 / 解除再試行待ち 0 件", filed[0])
+        self.assertIn("起票 0 件 / 重複未解決 1 件 / 解除再試行待ち 0 件 / 参照修復待ち 0 件", filed[0])
 
     def test_own_created_is_min_keeps_it(self):
         self.seed(_case())
@@ -808,7 +810,7 @@ class TestRealRecordAndPendingClear(_Base):
         self.assertIn("発送管理 No.100 の準備待ち解除に失敗しました。自動で再試行します", review[0])
         self.assertNotIn("二重起票", review[0])
         filed = [t for t in self.texts() if t.startswith(hs.NOTICE_HEAD_FILED)]
-        self.assertIn("起票 0 件 / 重複未解決 0 件 / 解除再試行待ち 1 件", filed[0])
+        self.assertIn("起票 0 件 / 重複未解決 0 件 / 解除再試行待ち 1 件 / 参照修復待ち 0 件", filed[0])
         self.assertEqual(self.cases["1"]["status"]["value"], "受理")            # 起票 0 のため遷移しない
         # 競合解消後（TTL 経過で回収）
         self.advance(hs.CLAIM_TTL_SEC + 1)
@@ -834,6 +836,74 @@ class TestRealRecordAndPendingClear(_Base):
         self.assertEqual((out["pending_recleared"], out["filed"]), (1, 0))
         self.assertFalse(hs.is_pending_dedupe(self.shipping["100"]))
         self.assertTrue(hs.is_pending_dedupe(self.shipping["101"]))               # 送付済 は対象外
+        self.assertEqual(self.ship_no(), "100")
+
+    def test_reclear_repairs_reference_to_canonical(self):
+        """行が No.100 を参照・同キー No.50/No.100 とも pending → 解消で No.50 が正・No.100 エラー →
+        行の番号が 50 に更新・pending_recleared=1。"""
+        self.seed(_case(status="債権者通知", rows=[_row("11", "甲社", state="起票済", ship_no="100")]))
+        self.shipping["50"] = self._dup("50")
+        self.shipping["100"] = self._dup("100")
+        out = self.run_soufu()
+        self.assertEqual((out["pending_recleared"], out["reference_mismatch"], out["filed"]), (1, 0, 0))
+        self.assertEqual(self.ship_no(), "50")
+        self.assertEqual(self.shipping["50"]["発送ステータス"]["value"], "下書き")
+        self.assertFalse(hs.is_pending_dedupe(self.shipping["50"]))
+        self.assertEqual(self.shipping["100"]["発送ステータス"]["value"], "エラー")
+        self.assertEqual([t for t in self.texts() if t.startswith(hs.NOTICE_HEAD_REVIEW)], [])
+        # 順序: エラー 化（App 30）→ 行更新（App 40）
+        seq = [u[0] for u in self.updates]
+        self.assertLess(seq.index("APP_SHIPPING"), len(seq) - 1 - seq[::-1].index("APP_HOUKI"))
+
+    def test_reclear_reference_cas_fails_twice_reports_mismatch(self):
+        self.seed(_case(status="債権者通知", rows=[_row("11", "甲社", state="起票済", ship_no="100")]))
+        self.shipping["50"] = self._dup("50")
+        self.shipping["100"] = self._dup("100")
+        self.conflict_on_nth.update({1, 2})                      # 行更新（初回+再取得後）を 409 に
+        out = self.run_soufu()
+        self.assertEqual((out["pending_recleared"], out["reference_mismatch"]), (0, 1))
+        self.assertEqual(self.ship_no(), "100")                  # 番号は 100 のまま
+        self.assertEqual(self.shipping["100"]["発送ステータス"]["value"], "エラー")   # エラー 化は戻さない
+        review = [t for t in self.texts() if t.startswith(hs.NOTICE_HEAD_REVIEW)]
+        self.assertEqual(len(review), 1)
+        self.assertIn("行 1", review[0])
+        self.assertIn("No.50", review[0])
+        self.assertIn("No.100", review[0])
+        self.assertNotIn("甲社", review[0])
+        filed = [t for t in self.texts() if t.startswith(hs.NOTICE_HEAD_FILED)]
+        self.assertIn("参照修復待ち 1 件", filed[0])
+
+    def test_reclear_row_changed_to_sent_meanwhile_is_not_updated(self):
+        self.seed(_case(status="債権者通知", rows=[_row("11", "甲社", state="起票済", ship_no="100")]))
+        self.shipping["50"] = self._dup("50")
+        self.shipping["100"] = self._dup("100")
+        real_get = hub_kintone.get_record
+        flipped = {"done": False}
+
+        async def get(app, rid):
+            rec = await real_get(app, rid)
+            if app.app_id_env == "APP_HOUKI" and not flipped["done"] and any(
+                    u[0] == "APP_SHIPPING" for u in self.updates):
+                flipped["done"] = True                              # 解消後・再取得の時点で 送付済 に変わった
+                self.cases["1"]["債権者一覧"]["value"][0]["value"]["送付状態"] = {"value": "送付済"}
+                rec = await real_get(app, rid)
+            return rec
+        with patch.object(hub_kintone, "get_record", get):
+            out = self.run_soufu()
+        self.assertEqual((out["pending_recleared"], out["reference_mismatch"]), (0, 1))
+        self.assertEqual(self.ship_no(), "100")
+        self.assertEqual(self.rows()[0]["value"]["送付状態"]["value"], "送付済")
+        review = [t for t in self.texts() if t.startswith(hs.NOTICE_HEAD_REVIEW)]
+        self.assertEqual(len(review), 1)
+        self.assertIn("No.50", review[0])
+        self.assertIn("No.100", review[0])
+
+    def test_reclear_matching_reference_writes_nothing_to_row(self):
+        self.seed(_case(status="債権者通知", rows=[_row("11", "甲社", state="起票済", ship_no="100")]))
+        self.shipping["100"] = self._dup("100")
+        out = self.run_soufu()
+        self.assertEqual((out["pending_recleared"], out["reference_mismatch"]), (1, 0))
+        self.assertEqual([u for u in self.updates if u[0] == "APP_HOUKI"], [])      # 行の書込 0
         self.assertEqual(self.ship_no(), "100")
 
     def test_numbered_row_without_pending_costs_one_get_and_no_write(self):
@@ -879,7 +949,7 @@ class TestRecoveryDedupe(_Base):
         self.assertIn("No.50", review[0])
         self.assertIn("No.60", review[0])
         filed = [t for t in self.texts() if t.startswith(hs.NOTICE_HEAD_FILED)]
-        self.assertIn("起票 0 件 / 重複未解決 1 件 / 解除再試行待ち 0 件", filed[0])
+        self.assertIn("起票 0 件 / 重複未解決 1 件 / 解除再試行待ち 0 件 / 参照修復待ち 0 件", filed[0])
 
     def test_create_then_lost_response_recovered_once_with_pending_cleared(self):
         """作成成功・応答喪失 → 起票中 残留 → 期限切れ後の回収で 1 件のみ・pending 解除・番号確定。"""

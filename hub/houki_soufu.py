@@ -495,10 +495,27 @@ async def _fetch_created(shipping_id: str) -> dict | None:
         return None
 
 
+async def _repair_reference(record_id: str, target_row_id: str, old_no: str, canonical: str) -> bool:
+    """fix5 HSF4-01: 行の 送付発送管理No を正の番号へ修復。App 40 を再取得し、当該行が 起票済 かつ
+    参照が処理開始時と同じ値（old_no）であることを確認してから revision CAS で更新。409 は再取得 1 回で
+    再判定。状態・参照が変わっていた（送付済 になった等）場合や CAS 失敗は False（呼び出し側が要確認通知）。"""
+    for attempt in range(_CAS_RETRIES):
+        latest = await kintone.get_record(APP_HOUKI_CASE, record_id)
+        row = next((r for r in rows_of(latest) if row_id(r) == target_row_id), None)
+        if row is None or row_val(row, COL_STATE) != STATE_FILED or row_val(row, COL_SHIP_NO) != old_no:
+            return False
+        if await update_row_once(record_id, target_row_id, {COL_SHIP_NO: canonical}, latest):
+            return True
+    return False
+
+
 async def reclear_numbered_rows(record_id: str, record: dict, result: dict) -> None:
-    """fix4 B-3（保険）: 送付状態=起票済 かつ 番号あり かつ 送付済 でない行は、その番号で App 30 を 1 回
-    get_record し、pending_dedupe が true なら同キー全件で resolve_duplicates を再実行して解除する。"""
-    for row in rows_of(record):
+    """fix4 B-3（保険）/ fix5 HSF4-01: 送付状態=起票済 かつ 番号あり かつ 送付済 でない行は、その番号で
+    App 30 を 1 回 get_record し、pending_dedupe が true なら同キー全件で resolve_duplicates を再実行して
+    解除する。順序は固定＝正以外の エラー 化 → 行の参照修復（行更新に失敗しても エラー 化は戻さない）。
+    pending_recleared は「解除成功 かつ 行の参照が正と一致」のときだけ。参照修復に失敗すれば
+    reference_mismatch として別計上し要確認通知（正旧の両番号・行番号・値なし）。"""
+    for i, row in enumerate(rows_of(record), 1):
         ship_no = row_val(row, COL_SHIP_NO)
         if row_val(row, COL_STATE) != STATE_FILED or not ship_no.isdigit():
             continue
@@ -510,11 +527,21 @@ async def reclear_numbered_rows(record_id: str, record: dict, result: dict) -> N
             continue
         key = soufu_key(record_id, row_id(row))
         found = await find_all_shipping(key) or [rec]
-        _canonical, _unresolved, cleared = await resolve_duplicates(record_id, key, found)
-        if cleared:
+        canonical, _unresolved, cleared = await resolve_duplicates(record_id, key, found)
+        if not cleared:
+            result["pending_clear_failed"] += 1
+            continue
+        if canonical == ship_no:
+            result["pending_recleared"] += 1               # 参照は正と一致＝書込 0
+            continue
+        if await _repair_reference(record_id, row_id(row), ship_no, canonical):
             result["pending_recleared"] += 1
         else:
-            result["pending_clear_failed"] += 1
+            result["reference_mismatch"] += 1
+            await _notify(NOTIFY_KIND_REVIEW, record_id,
+                          f"{NOTICE_HEAD_REVIEW} 案件レコードNo.{record_id} 行 {i}: 発送管理の正は No.{canonical} ですが"
+                          f"行の参照 No.{ship_no} を更新できませんでした（行の状態・参照が変わった、または競合）。"
+                          f"行の 送付発送管理No を確認してください。")
 
 
 async def promote_status(record_id: str) -> bool:
@@ -554,15 +581,17 @@ def review_text(record_id: str, missing: list[str], no_addr: list[int], enclosur
 
 
 def filed_text(record_id: str, filed: list[str], aligned: int, review_count: int, promoted: bool,
-               duplicates_unresolved: int = 0, pending_clear_failed: int = 0) -> str:
+               duplicates_unresolved: int = 0, pending_clear_failed: int = 0,
+               reference_mismatch: int = 0) -> str:
     lines = [f"{NOTICE_HEAD_FILED} 案件レコードNo.{record_id}"]
-    lines.append(f"起票 {len(filed)} 件 / 重複未解決 {duplicates_unresolved} 件 / 解除再試行待ち {pending_clear_failed} 件")
+    lines.append(f"起票 {len(filed)} 件 / 重複未解決 {duplicates_unresolved} 件 / 解除再試行待ち {pending_clear_failed} 件"
+                 f" / 参照修復待ち {reference_mismatch} 件")
     if filed:
         lines.append(f"発送管理 No.{'、'.join(filed)}")
     if aligned:
         lines.append(f"既存起票に揃えた行 {aligned} 件")
-    if duplicates_unresolved or pending_clear_failed:
-        lines.append("未解決・再試行待ちの内容は別途通知")
+    if duplicates_unresolved or pending_clear_failed or reference_mismatch:
+        lines.append("未解決・再試行待ち・参照修復待ちの内容は別途通知")
     if review_count:
         lines.append(f"要確認 {review_count} 件（別途通知）")
     if promoted:
@@ -666,7 +695,7 @@ async def process_soufu(record_id: str) -> dict:
 async def _process_soufu_locked(record_id: str, token: str) -> dict:
     result = {"filed": 0, "aligned": 0, "review": 0, "pending": 0, "recovered": 0,
               "lost": 0, "reverted": 0, "duplicates_unresolved": 0, "pending_clear_failed": 0,
-              "pending_recleared": 0, "deferred": 0, "promoted": False, "skip": ""}
+              "pending_recleared": 0, "reference_mismatch": 0, "deferred": 0, "promoted": False, "skip": ""}
     record = await kintone.get_record(APP_HOUKI_CASE, record_id)
     if not is_triggered(record):
         result["skip"] = "not_triggered"
@@ -686,6 +715,11 @@ async def _process_soufu_locked(record_id: str, token: str) -> dict:
         if no_addr:
             result["review"] = 1
             await _notify(NOTIFY_KIND_REVIEW, record_id, review_text(record_id, [], no_addr, None))
+        if result["pending_clear_failed"] or result["reference_mismatch"]:
+            await _notify(NOTIFY_KIND_FILED, record_id,
+                          filed_text(record_id, [], 0, result["review"], False,
+                                     result["duplicates_unresolved"], result["pending_clear_failed"],
+                                     result["reference_mismatch"]))
         return result
 
     group = await fetch_group(record)
@@ -725,10 +759,11 @@ async def _process_soufu_locked(record_id: str, token: str) -> dict:
                       f"{NOTICE_HEAD_REVIEW} 案件レコードNo.{record_id}: 発送管理の作成または番号書込に失敗した行が"
                       f" {result['pending']} 件あります（次回の保存時に自動で回収します）")
     if (filed_ids or result["aligned"] or result["recovered"] or result["duplicates_unresolved"]
-            or result["pending_clear_failed"]):
+            or result["pending_clear_failed"] or result["reference_mismatch"]):
         await _notify(NOTIFY_KIND_FILED, record_id,
                       filed_text(record_id, filed_ids, result["aligned"], result["review"], result["promoted"],
-                                 result["duplicates_unresolved"], result["pending_clear_failed"]))
+                                 result["duplicates_unresolved"], result["pending_clear_failed"],
+                                 result["reference_mismatch"]))
     return result
 
 
