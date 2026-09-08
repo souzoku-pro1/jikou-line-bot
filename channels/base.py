@@ -39,7 +39,14 @@ class PrepareDeferred(Exception):
     メッセージを LINE 警報として送る。人がマスタ登録後にレコードを
     下書きのまま再保存すれば Webhook 再発火で自動再処理される。
     （例: App 31 の住所未登録・手数料未登録。設計: 申述パッケージ 09 §2.2 と同思想）
+
+    silent=True（HOUKI-SOUFU-1-fix3・既定 False＝従来どおり）: 機械的な待ち（重複確認前）で
+    人の対応が不要なとき、ディスパッチャは警報を送らずログ 1 行で戻る。
     """
+
+    def __init__(self, message: str = "", silent: bool = False):
+        super().__init__(message)
+        self.silent = silent
 
 
 class ChannelAdapter:

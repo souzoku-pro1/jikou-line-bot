@@ -185,6 +185,8 @@ async def _handle_prepare(record: dict) -> None:
         logger.info("prepare deferred record=%s cls=%s: %s",
                     emit(record_id, "record_id", "log", "operator"),
                     type(e).__name__, emit(str(e), "vendor_raw", "log", "operator"))
+        if getattr(e, "silent", False):
+            return          # HOUKI-SOUFU-1-fix3: 機械的な待ち（重複確認前）は警報なし・既定 False は従来どおり
         await notify.notify_admin_line(
             "【発送管理: 対応依頼（エラーではありません）】\n"
             f"レコードNo: {record_id}\n{_summary(record)}\n"
@@ -293,6 +295,22 @@ async def _handle_shipped(record: dict) -> None:
         await approval.transition(APP_SHIPPING, record_id, "発送済", "完了")
         logger.info("shipped record=%s -> 完了 (返送想定なし)",
                     emit(record_id, "record_id", "log", "operator"))
+    # HOUKI-SOUFU-1: 案件アプリID=App 40 のレコードだけ 債権者一覧 の該当行を 送付済 に
+    # 書き戻す（時効側=App 21 のレコードは対象外・状態遷移後の best-effort・失敗は要確認通知）
+    await _houki_write_back(record)
+
+
+async def _houki_write_back(record: dict) -> None:
+    """App 40 のレコードだけ（時効側は分岐に入らない）。fix1 D: 例外は houki_soufu 側で
+    要確認通知へ変換し、ここではさらに防御的に握って dispatch 本体を落とさない。"""
+    from hub import houki_soufu
+    if not houki_soufu.is_houki_shipping(record):
+        return
+    try:
+        await houki_soufu.write_back_safely(record)
+    except Exception:
+        logger.error("houki write-back failed record=%s",
+                     emit(_rid(record), "record_id", "log", "operator"))
 
 
 async def _handle_reprocess(record: dict) -> None:
