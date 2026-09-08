@@ -16,14 +16,20 @@ App 30（発送管理）へ **下書き** で 1 件起票し、以後は既存�
 - D5 status: 1 件でも起票できたら 受理→債権者通知 を一方向 CAS で 1 回だけ。完了 は人。
 - 送付状の必須値（10 欄）が 1 つでも空なら起票 0 ＋要確認通知（欠けている欄名のみ）。
 
-冪等: キー houki_soufu:{record_id}:{row_id} を App 30 チャネル固有データ に持ち、起票前に
-既存検索（存在すれば起票せず行を 起票済 に揃える）。行の 送付状態≠未 はスキップ。
+冪等（fix1 A・Codex HS-01）: 行ごとに App 40 の $revision CAS で 未→起票済・送付発送管理No=起票中 を
+claim → 既存検索（キー houki_soufu:{record_id}:{row_id}・App 30 チャネル固有データ）→ 無ければ
+App 30 作成 → 番号を CAS で書く。claim の 409 は他者が処理中としてスキップ。作成/番号書込に失敗した
+行は 起票中 のまま残り、次回実行で回収（既存があれば番号、無ければ作成）。record_id ごとの
+asyncio.Lock（in-memory・単一 worker）で同一レコードの並行処理を直列化。
+起点（fix1 B・HS-02）: status ∈ {受理, 債権者通知}（債権者通知 でも未 行の起票と回収を行う）。
+受理→債権者通知 の遷移は現在が 受理 のときだけ 1 回。
 書き戻し: App 30 が 発送済/完了 になったとき（hub/dispatch）、案件アプリID=App 40 の
 レコードだけ 債権者一覧 の該当行を 送付状態=送付済 に更新（CAS・409 は再取得 1 回）。
 App 40 で書くのは 債権者一覧（送付状態／送付発送管理No／追加料金対象）と status の
 一方向遷移のみ。通知本文に個人情報は載せない（レコード番号・行番号・欄名のみ）。
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -60,6 +66,8 @@ NOTIFY_REQUIRED = "要"
 STATE_TODO = "未"
 STATE_FILED = "起票済"
 STATE_SENT = "送付済"
+SHIP_NO_CLAIMING = "起票中"                                 # fix1 A: claim 中の 送付発送管理No
+TRIGGER_STATUSES = (STATUS_ACCEPTED, STATUS_NOTIFYING)      # fix1 B: 債権者通知 でも回収
 EXTRA_YES = "yes"
 EXTRA_NO = "no"
 INCLUDED_DESTINATIONS = hc.INCLUDED_DESTINATIONS          # 3（契約書と同じ規則）
@@ -100,26 +108,51 @@ def row_id(row: dict) -> str:
 
 
 def is_triggered(record: dict) -> bool:
-    """起点条件（凍結）: status=受理 かつ 受理通知受領日 非空 かつ 受理通知書 添付あり。"""
+    """起点条件: status ∈ {受理, 債権者通知}（fix1 B・債権者通知 は未 行の起票と回収のため）
+    かつ 受理通知受領日 非空 かつ 受理通知書 添付あり（後 2 条件は凍結どおり）。"""
     files = (record.get(FIELD_ACCEPT_FILE) or {}).get("value") or []
-    return (_v(record, FIELD_STATUS) == STATUS_ACCEPTED
+    return (_v(record, FIELD_STATUS) in TRIGGER_STATUSES
             and bool(_v(record, FIELD_ACCEPT_RECEIVED)) and bool(files))
 
 
-def classify_rows(record: dict) -> tuple[list[tuple[int, dict]], list[int]]:
-    """(起票対象 [(行番号, row)], 住所未入力の 要 行番号)。行番号は 1 始まり。"""
+def is_recovery_row(row: dict) -> bool:
+    """fix1 A-4: 送付状態=起票済 かつ 送付発送管理No が空または「起票中」（claim 済み・番号未書込）。"""
+    return (row_val(row, COL_STATE) == STATE_FILED
+            and row_val(row, COL_SHIP_NO) in ("", SHIP_NO_CLAIMING))
+
+
+def classify_rows(record: dict) -> tuple[list[tuple[int, dict]], list[int], list[tuple[int, dict]]]:
+    """(起票対象 [(行番号, row)], 住所未入力の 要 行番号, 回収対象 [(行番号, row)])。行番号は 1 始まり。"""
     targets: list[tuple[int, dict]] = []
     no_addr: list[int] = []
+    recovery: list[tuple[int, dict]] = []
     for i, row in enumerate(rows_of(record), 1):
-        if row_val(row, COL_NOTIFY) != NOTIFY_REQUIRED or row_val(row, COL_STATE) != STATE_TODO:
-            continue
         if not row_id(row):
+            continue
+        if is_recovery_row(row):
+            recovery.append((i, row))
+            continue
+        if row_val(row, COL_NOTIFY) != NOTIFY_REQUIRED or row_val(row, COL_STATE) != STATE_TODO:
             continue
         if not row_val(row, COL_ADDR):
             no_addr.append(i)
             continue
         targets.append((i, row))
-    return targets, no_addr
+    return targets, no_addr, recovery
+
+
+_locks: dict[str, tuple[object, asyncio.Lock]] = {}
+
+
+def _lock_for(record_id: str) -> asyncio.Lock:
+    """fix1 A-5: record_id ごとの asyncio.Lock（in-memory・単一 worker・永続 claim の補助）。
+    ループが変わったら作り直す（テスト・再起動）。"""
+    loop = asyncio.get_running_loop()
+    entry = _locks.get(record_id)
+    if entry is None or entry[0] is not loop:
+        entry = (loop, asyncio.Lock())
+        _locks[record_id] = entry
+    return entry[1]
 
 
 def extra_fee_names(group: list[dict]) -> set[str]:
@@ -229,6 +262,53 @@ async def update_row(record_id: str, target_row_id: str, updates: dict,
     return False
 
 
+async def claim_row(record_id: str, target_row_id: str, latest: dict | None,
+                    extra: bool = False) -> bool:
+    """fix1 A-1: 行を 未→起票済・送付発送管理No=起票中 に CAS で claim（1 回のみ・409 は False＝
+    他者が処理中としてスキップ）。追加料金対象 は claim と同時に立てる。"""
+    if latest is None:
+        latest = await kintone.get_record(APP_HOUKI_CASE, record_id)
+    rows = rows_of(latest)
+    hit = None
+    for row in rows:
+        if row_id(row) == target_row_id:
+            hit = row
+    if hit is None or row_val(hit, COL_STATE) != STATE_TODO:
+        return False
+    hit["value"][COL_STATE] = {"value": STATE_FILED}
+    hit["value"][COL_SHIP_NO] = {"value": SHIP_NO_CLAIMING}
+    if extra or row_val(hit, COL_EXTRA) == EXTRA_YES:
+        hit["value"][COL_EXTRA] = {"value": EXTRA_YES}
+    try:
+        await kintone.update_record(APP_HOUKI_CASE, record_id, {CREDITOR_TABLE: rows},
+                                    revision=_v(latest, "$revision") or None)
+        return True
+    except kintone.KintoneConflict:
+        logger.info("[HOUKI_SOUFU] claim lost record_id=%s",
+                    emit(record_id, "record_id", "log", "operator"))
+        return False
+
+
+async def claim_recovery_row(record_id: str, target_row_id: str, latest: dict | None) -> bool:
+    """fix1 A-4: 番号が空の 起票済 行を 送付発送管理No=起票中 に CAS で claim。既に 起票中 なら
+    そのまま True（Lock で直列化済み）。409 は False。"""
+    if latest is None:
+        latest = await kintone.get_record(APP_HOUKI_CASE, record_id)
+    rows = rows_of(latest)
+    hit = next((r for r in rows if row_id(r) == target_row_id), None)
+    if hit is None or not is_recovery_row(hit):
+        return False
+    if row_val(hit, COL_SHIP_NO) == SHIP_NO_CLAIMING:
+        return True
+    hit["value"][COL_SHIP_NO] = {"value": SHIP_NO_CLAIMING}
+    try:
+        await kintone.update_record(APP_HOUKI_CASE, record_id, {CREDITOR_TABLE: rows},
+                                    revision=_v(latest, "$revision") or None)
+        return True
+    except kintone.KintoneConflict:
+        return False
+
+
 async def promote_status(record_id: str) -> bool:
     """受理 → 債権者通知 を一方向 CAS で 1 回だけ。既に 債権者通知 以降なら触らない。"""
     for attempt in range(_CAS_RETRIES):
@@ -261,7 +341,7 @@ def review_text(record_id: str, missing: list[str], no_addr: list[int], enclosur
         lines.append(f"同封物ブロック「{ENCLOSURE_BLOCK_KEY}」が App 32 に未登録（対象ユニット {UNIT}・有効=yes）")
     elif enclosure == "option_missing":
         lines.append(f"App 30 同封物選択 の選択肢に「{ENCLOSURE_BLOCK_KEY}」がありません")
-    lines.append("入力・登録後に status を「受理」のまま再保存すると再判定されます。")
+    lines.append("住所を入力して保存すれば起票されます（status は変更不要）。")
     return "\n".join(lines)
 
 
@@ -278,23 +358,60 @@ def filed_text(record_id: str, filed: list[str], aligned: int, review_count: int
     return "\n".join(lines)
 
 
+async def _file_claimed_row(record_id: str, record: dict, row: dict, result: dict,
+                            filed_ids: list[str]) -> None:
+    """fix1 A-2/A-3: claim 済みの行について、既存検索 → 無ければ App 30 作成 → 行に番号を CAS で書く。
+    作成失敗は行を 起票中 のまま残す（次回実行で回収）。"""
+    rid_row = row_id(row)
+    key = soufu_key(record_id, rid_row)
+    existing = await find_existing_shipping(key)
+    if existing:
+        shipping_id = existing
+        result["aligned"] += 1
+    else:
+        try:
+            shipping_id = str(await kintone.create_record(APP_SHIPPING, build_shipping_fields(record, row, key)))
+        except Exception as e:
+            result["pending"] += 1
+            logger.warning("[HOUKI_SOUFU] App30 create failed (row left claiming) record_id=%s cls=%s",
+                           emit(record_id, "record_id", "log", "operator"),
+                           emit(type(e).__name__, "vendor_raw", "log", "operator"))
+            return
+        filed_ids.append(shipping_id)
+        logger.info("[HOUKI_SOUFU] filed App30 record_id=%s shipping=%s",
+                    emit(record_id, "record_id", "log", "operator"),
+                    emit(shipping_id, "record_id", "log", "operator"))
+    if not await update_row(record_id, rid_row, {COL_SHIP_NO: shipping_id}):
+        result["pending"] += 1                            # 起票中 のまま＝次回実行で番号を揃える
+        logger.warning("[HOUKI_SOUFU] shipping number write failed (row left claiming) record_id=%s",
+                       emit(record_id, "record_id", "log", "operator"))
+
+
 async def process_soufu(record_id: str) -> dict:
-    """起票本体（BackgroundTasks から呼ぶ）。戻り値は件数（テスト用）。"""
-    result = {"filed": 0, "aligned": 0, "review": 0, "promoted": False, "skip": ""}
+    """起票本体（BackgroundTasks から呼ぶ）。fix1 A: record_id ごとの Lock で直列化し、
+    行ごとに claim（CAS）→ App 30 作成 → 番号書込。B: status=債権者通知 でも 未 行の起票と回収を行う。
+    戻り値は件数（テスト用）。"""
+    async with _lock_for(record_id):
+        return await _process_soufu_locked(record_id)
+
+
+async def _process_soufu_locked(record_id: str) -> dict:
+    result = {"filed": 0, "aligned": 0, "review": 0, "pending": 0, "recovered": 0,
+              "promoted": False, "skip": ""}
     record = await kintone.get_record(APP_HOUKI_CASE, record_id)
     if not is_triggered(record):
         result["skip"] = "not_triggered"
         return result
     missing = letter.missing_case_fields(record)
-    targets, no_addr = classify_rows(record)
-    enclosure = await enclosure_problem() if targets else None
+    targets, no_addr, recovery = classify_rows(record)
+    enclosure = await enclosure_problem() if (targets or recovery) else None
     if missing or enclosure:
         result["review"] = 1
         await _notify(NOTIFY_KIND_REVIEW, record_id, review_text(record_id, missing, no_addr, enclosure))
         logger.info("[HOUKI_SOUFU] needs review record_id=%s",
                     emit(record_id, "record_id", "log", "operator"))
         return result
-    if not targets:
+    if not targets and not recovery:
         result["skip"] = "no_target_rows"
         if no_addr:
             result["review"] = 1
@@ -304,38 +421,39 @@ async def process_soufu(record_id: str) -> dict:
     group = await fetch_group(record)
     extra = extra_fee_names(group)
     filed_ids: list[str] = []
-    latest = record
+    latest: dict | None = record
+    # A-4 回収: claim 済み（起票済・番号なし/起票中）の行を先に片付ける
+    for _n, row in recovery:
+        if not await claim_recovery_row(record_id, row_id(row), latest):
+            latest = None
+            continue
+        latest = None
+        before = (result["aligned"], len(filed_ids))
+        await _file_claimed_row(record_id, record, row, result, filed_ids)
+        if (result["aligned"], len(filed_ids)) != before:
+            result["recovered"] += 1
+    # A-1〜A-3: 未 行は claim → 作成 → 番号
     for _n, row in targets:
-        rid_row = row_id(row)
-        key = soufu_key(record_id, rid_row)
-        existing = await find_existing_shipping(key)
-        if existing:
-            shipping_id = existing
-            result["aligned"] += 1
-        else:
-            shipping_id = str(await kintone.create_record(APP_SHIPPING, build_shipping_fields(record, row, key)))
-            filed_ids.append(shipping_id)
-            logger.info("[HOUKI_SOUFU] filed App30 record_id=%s shipping=%s",
-                        emit(record_id, "record_id", "log", "operator"),
-                        emit(shipping_id, "record_id", "log", "operator"))
-        updates = {COL_STATE: STATE_FILED, COL_SHIP_NO: shipping_id}
-        if hc.normalize_creditor(row_val(row, COL_NAME)) in extra or row_val(row, COL_EXTRA) == EXTRA_YES:
-            updates[COL_EXTRA] = EXTRA_YES
-        ok = await update_row(record_id, rid_row, updates, latest)
-        latest = None                                    # 次行は最新を再取得
-        if not ok:
-            result["review"] += 1
-            await _notify(NOTIFY_KIND_REVIEW, record_id,
-                          f"{NOTICE_HEAD_REVIEW} 案件レコードNo.{record_id}: 債権者一覧の行更新に失敗"
-                          f"（発送管理 No.{shipping_id} は起票済み。行の 送付状態 を手で 起票済 にしてください）")
+        is_extra = hc.normalize_creditor(row_val(row, COL_NAME)) in extra
+        if not await claim_row(record_id, row_id(row), latest, extra=is_extra):
+            latest = None                                # 409: 他者が処理中 → 再取得して次の行へ
+            continue
+        latest = None
+        await _file_claimed_row(record_id, record, row, result, filed_ids)
     result["filed"] = len(filed_ids)
     if filed_ids or result["aligned"]:
-        result["promoted"] = await promote_status(record_id)
+        result["promoted"] = await promote_status(record_id)   # 現在が 受理 のときだけ 1 回
     if no_addr:
         result["review"] += 1
         await _notify(NOTIFY_KIND_REVIEW, record_id, review_text(record_id, [], no_addr, None))
-    await _notify(NOTIFY_KIND_FILED, record_id,
-                  filed_text(record_id, filed_ids, result["aligned"], result["review"], result["promoted"]))
+    if result["pending"]:
+        result["review"] += 1
+        await _notify(NOTIFY_KIND_REVIEW, record_id,
+                      f"{NOTICE_HEAD_REVIEW} 案件レコードNo.{record_id}: 発送管理の作成または番号書込に失敗した行が"
+                      f" {result['pending']} 件あります（次回の保存時に自動で回収します）")
+    if filed_ids or result["aligned"] or result["recovered"]:
+        await _notify(NOTIFY_KIND_FILED, record_id,
+                      filed_text(record_id, filed_ids, result["aligned"], result["review"], result["promoted"]))
     return result
 
 
@@ -363,6 +481,34 @@ async def mark_row_sent(shipping: dict) -> bool:
                       f"{NOTICE_HEAD_REVIEW} 案件レコードNo.{case_id}: 発送管理 No.{_v(shipping, '$id')} の"
                       "発送済を 債権者一覧 へ書き戻せませんでした（送付状態 を手で 送付済 にしてください）")
     return ok
+
+
+async def write_back_safely(shipping: dict) -> bool:
+    """fix1 D: hub/dispatch から呼ぶ書き戻し。取得・更新のタイムアウト/通信例外/409 再取得失敗の
+    いずれでも要確認通知（案件番号・発送管理番号・手順のみ）。通知失敗は ERROR ログ（固定文言+番号）。
+    例外は外へ出さない（dispatch 本体を落とさない・時効側は呼び出し側で除外）。"""
+    if not is_houki_shipping(shipping):
+        return False
+    case_id = _v(shipping, "案件レコードID")
+    ship_id = _v(shipping, "$id")
+    try:
+        return await mark_row_sent(shipping)
+    except Exception as e:
+        logger.error("[HOUKI_SOUFU] write-back exception case=%s shipping=%s cls=%s",
+                     emit(case_id, "record_id", "log", "operator"),
+                     emit(ship_id, "record_id", "log", "operator"),
+                     emit(type(e).__name__, "vendor_raw", "log", "operator"))
+        try:
+            await notify.notify_admin_line(
+                f"{NOTICE_HEAD_REVIEW} 案件レコードNo.{case_id}: 発送管理 No.{ship_id} の発送済を"
+                "債権者一覧へ書き戻せませんでした（通信エラー）。App 40 の債権者一覧 該当行の"
+                " 送付状態 を手で 送付済 にしてください。",
+                throttle_key=f"{NOTIFY_KIND_REVIEW}:{case_id}:{ship_id}")
+        except Exception:
+            logger.error("[HOUKI_SOUFU] write-back notify failed case=%s shipping=%s",
+                         emit(case_id, "record_id", "log", "operator"),
+                         emit(ship_id, "record_id", "log", "operator"))
+        return False
 
 
 def shipping_app_env_ready() -> bool:

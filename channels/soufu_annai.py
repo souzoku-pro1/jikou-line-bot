@@ -25,7 +25,8 @@ from datetime import date
 
 import anthropic
 
-from channels.base import DOCX_MIME, PDF_MIME, Artifact, ChannelAdapter, DispatchResult, PrepareResult
+from channels.base import (DOCX_MIME, PDF_MIME, Artifact, ChannelAdapter, DispatchResult,
+                           PrepareDeferred, PrepareResult)
 from claude_gateway import create_message_with_fallback
 from config import get_office_info
 from hub import kintone
@@ -251,9 +252,20 @@ async def _prepare_houki_soufu(record: dict, blocks: list[dict]) -> PrepareResul
     files = (case.get(soufu.FIELD_ACCEPT_FILE) or {}).get("value") or []
     if not files:
         raise SoufuAnnaiError("受理通知書（写し）が案件に添付されていません")
-    letter_data = letter.build_letter_data(
-        case, soufu.row_val(row, soufu.COL_NAME), soufu.row_val(row, soufu.COL_ZIP),
-        soufu.row_val(row, soufu.COL_ADDR), _office_signature())
+    # fix1 C: 宛先は App 30（承認対象のスナップショット）から。App 40 の行の現在値と 1 つでも
+    # 異なれば成果物を生成せず要確認（PrepareDeferred＝下書きのまま・値は載せない）
+    ship_name = (record.get("宛先名", {}).get("value") or "").strip()
+    ship_zip = (record.get("宛先郵便番号", {}).get("value") or "").strip()
+    ship_addr = (record.get("宛先住所", {}).get("value") or "").strip()
+    row_no = next((i for i, r in enumerate(soufu.rows_of(case), 1) if soufu.row_id(r) == row_id), 0)
+    if (ship_name, ship_zip, ship_addr) != (soufu.row_val(row, soufu.COL_NAME),
+                                             soufu.row_val(row, soufu.COL_ZIP),
+                                             soufu.row_val(row, soufu.COL_ADDR)):
+        msg = (f"{soufu.NOTICE_HEAD_REVIEW} 案件レコードNo.{case_id} 行 {row_no}: 起票後に宛先が"
+               "変更されています。App 30 の宛先を直すか、行を 未 に戻して再起票してください。")
+        await soufu._notify(soufu.NOTIFY_KIND_REVIEW, case_id, msg)
+        raise PrepareDeferred("宛先不一致（App 40 の債権者一覧と App 30 の宛先が異なります・別途通知済み）")
+    letter_data = letter.build_letter_data(case, ship_name, ship_zip, ship_addr, _office_signature())
     docx_bytes = letter.render_letter(letter_data)
     copy_file = files[0]
     copy_bytes = await kintone.download_file(APP_HOUKI_CASE, copy_file["fileKey"])

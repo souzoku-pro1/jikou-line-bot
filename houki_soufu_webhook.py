@@ -8,7 +8,7 @@ App 30（発送管理）へ 下書き で起票する（以後は既存の M4 �
 - HOUKI_WEBHOOK_TOKEN 未設定=404 / 時効側トークンと同値=404 / 不一致=403
 
 ゲート順: token → JSON → body の app.id が App 40 と完全一致（不在・不一致は
-skip=app_mismatch）→ record id → 本文 status が 受理 でなければ skip=not_triggered
+skip=app_mismatch）→ record id → 本文 status が 受理/債権者通知 でなければ skip=not_triggered
 （作用 0）→ 本体は BackgroundTasks（最新レコードを再取得して起点条件を再判定・
 冪等キーで二重起票を防ぐ）。
 """
@@ -76,7 +76,7 @@ async def houki_soufu_webhook(secret: str, request: Request, background: Backgro
         status_in_body = body["record"][soufu.FIELD_STATUS]["value"]
     except (KeyError, TypeError):
         status_in_body = None
-    if status_in_body != soufu.STATUS_ACCEPTED:
+    if status_in_body not in soufu.TRIGGER_STATUSES:
         logger.info("[HOUKI_SOUFU] not triggered record_id=%s",
                     emit(record_id, "record_id", "log", "operator"))
         return JSONResponse(status_code=200, content={"ok": True, "skip": "not_triggered"})

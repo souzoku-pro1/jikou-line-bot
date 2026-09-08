@@ -299,14 +299,16 @@ async def _handle_shipped(record: dict) -> None:
 
 
 async def _houki_write_back(record: dict) -> None:
+    """App 40 のレコードだけ（時効側は分岐に入らない）。fix1 D: 例外は houki_soufu 側で
+    要確認通知へ変換し、ここではさらに防御的に握って dispatch 本体を落とさない。"""
     from hub import houki_soufu
     if not houki_soufu.is_houki_shipping(record):
         return
     try:
-        await houki_soufu.mark_row_sent(record)
+        await houki_soufu.write_back_safely(record)
     except Exception:
-        logger.warning("houki write-back failed record=%s",
-                       emit(_rid(record), "record_id", "log", "operator"))
+        logger.error("houki write-back failed record=%s",
+                     emit(_rid(record), "record_id", "log", "operator"))
 
 
 async def _handle_reprocess(record: dict) -> None:
