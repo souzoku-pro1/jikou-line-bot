@@ -124,6 +124,9 @@ async def _on_startup():
                        "(rotation cleanup pending; owner=大野)")
     from hub.return_deadline import register_return_deadline_job
     register_return_deadline_job()
+    # HOUKI-JUKURYO-CRON-1: 相続放棄 熟慮期間の日次監視（8:00 JST・判定のみ・履歴欄だけ書く）
+    from hub.houki_jukuryo import register_houki_jukuryo_job
+    register_houki_jukuryo_job()
     start_healthcheck_scheduler()
     # RV-05-13: flag ON のみ、放置 receipt の可視化 reconciliation を1回実行（再処理しない）。
     # M-06: flag OFF は hub.durable_inbound を import せず（env 直読み）一切実行しない。

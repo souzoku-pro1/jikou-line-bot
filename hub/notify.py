@@ -222,6 +222,8 @@ def _log_throttled(throttle_key: str) -> None:
         logger.info("admin LINE notify throttled kind=houki_contract_failed")
     elif head == "houki_contract_recovery":
         logger.info("admin LINE notify throttled kind=houki_contract_recovery")
+    elif head == "houki_jukuryo_daily":
+        logger.info("admin LINE notify throttled kind=houki_jukuryo_daily")
     else:
         logger.info("admin LINE notify throttled kind=unknown_kind")
 
