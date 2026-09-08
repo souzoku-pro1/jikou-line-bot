@@ -269,7 +269,7 @@ EXPECTED_KINTONE_SCHEMA = {
         "token_env": "TOKEN_SHIPPING",
         "fields": {
             # 共通・案件参照
-            "ユニット種別": {"type": "DROP_DOWN", "required_options": ["時効援用"]},
+            "ユニット種別": {"type": "DROP_DOWN", "required_options": ["時効援用", "相続放棄"]},
             "チャネル": {
                 "type": "DROP_DOWN",
                 "required_options": ["職務上請求", "e内容証明", "FAX", "送付案内", "スキャン受領"],
@@ -710,6 +710,51 @@ EXPECTED_KINTONE_SCHEMA = {
             "登録日": {"type": "DATE"},
         },
     },
+    # ── 相続放棄案件（HOUKI-SOUFU-1 D9 で登録・2026-09-08 フォーム設計 API 実測 103 欄のうち
+    #    コードが読み書きする欄。SUBTABLE の内部列は healthcheck の検査対象外）──
+    "App 40 (相続放棄案件)": {
+        "app_id_env": "APP_HOUKI",
+        "token_env": "TOKEN_HOUKI",
+        "optional": True,
+        "fields": {
+            "status": {
+                "type": "DROP_DOWN",
+                "required_options": ["問い合わせ", "電話判断待ち", "受任", "受理", "債権者通知", "完了"],
+            },
+            "LINEユーザーID": {"type": "SINGLE_LINE_TEXT"},
+            "顧客名": {"type": "SINGLE_LINE_TEXT"},
+            "住所": {"type": "SINGLE_LINE_TEXT"},
+            "生年月日": {"type": "SINGLE_LINE_TEXT"},
+            "メールアドレス": {"type": "SINGLE_LINE_TEXT"},
+            "被相続人氏名": {"type": "SINGLE_LINE_TEXT"},
+            "被相続人最後の住所": {"type": "SINGLE_LINE_TEXT"},
+            "被相続人生年月日": {"type": "SINGLE_LINE_TEXT"},
+            "被相続人グループID": {"type": "SINGLE_LINE_TEXT"},
+            "死亡日": {"type": "DATE"},
+            "死亡日_申告": {"type": "DATE"},
+            "死亡を知った日_申告": {"type": "DATE"},
+            "相続人と知った日_申告": {"type": "DATE"},
+            "法定満了日": {"type": "DATE"},
+            "社内締切日": {"type": "DATE"},
+            "熟慮期間通知履歴": {"type": "MULTI_LINE_TEXT"},
+            "申述提出日": {"type": "DATE"},
+            "管轄家庭裁判所": {"type": "SINGLE_LINE_TEXT"},
+            "事件番号": {"type": "SINGLE_LINE_TEXT"},
+            "受理日": {"type": "DATE"},
+            "受理通知受領日": {"type": "DATE"},
+            "受理通知書": {"type": "FILE"},
+            "契約書ステータス": {"type": "DROP_DOWN"},
+            "契約書回収メモ": {"type": "MULTI_LINE_TEXT"},
+            "cloudsign_document_id": {"type": "SINGLE_LINE_TEXT"},
+            "委任契約書": {"type": "FILE"},
+            "申述書": {"type": "FILE"},
+            "相談カード": {"type": "FILE"},
+            "相談カード読取": {"type": "DROP_DOWN"},
+            "特約": {"type": "MULTI_LINE_TEXT"},
+            "債権者一覧": {"type": "SUBTABLE"},
+            "書類チェック": {"type": "SUBTABLE"},
+        },
+    },
 }
 
 
@@ -732,6 +777,16 @@ UNIT_CONFIG = {
         # S3（財産目録）時点では docx テンプレート規約のみ。
         # 案件アプリ（App 26 昇格）・channels 等は S1 以降で追加する（souzoku-shorui/05）
         "template_dir": "souzoku",        # docx_templates/souzoku/<種別>.docx（規約配置）
+    },
+    # HOUKI-SOUFU-1: 相続放棄（App 40）。受理通知書写しの発送を M4 送付案内で流す
+    # （channels/soufu_annai が ユニット種別=相続放棄 のとき 受理通知送付状 を生成）。
+    # 返送想定なし（return_deadline_days は既定 21 日のまま・返送待ちへは遷移しない）
+    "相続放棄": {
+        "case_app_env": ("APP_HOUKI", "TOKEN_HOUKI"),   # App 40
+        "customer_name_field": "顧客名",
+        "customer_addr_field": "住所",
+        "channels": ["送付案内"],
+        "template_dir": "houki",          # docx_templates/houki/<種別>.docx
     },
 }
 
@@ -763,6 +818,14 @@ EXPECTED_DOCX_TEMPLATES = {
         "{{被相続人氏名}}", "{{申述人数}}", "{{報酬合計}}", "{{追加送付件数}}",
         "{{追加送付料合計}}", "{{実費合計}}", "{{支払総額}}", "{{特約}}",
         "{{契約年}}", "{{契約月}}", "{{契約日}}", "{{申述人一覧}}",
+    ],
+    # hub/houki_soufu_letter.py（HOUKI-SOUFU-1 相続放棄 受理通知送付状）が差し込む 15 キー
+    # （弁護士確定文・scripts/make_houki_soufu_letter.py で生成・SHA pin・各キー単一 run）
+    "docx_templates/houki/受理通知送付状.docx": [
+        "{{日付}}", "{{宛先郵便番号}}", "{{宛先住所}}", "{{宛先名}}", "{{事務所署名ブロック}}",
+        "{{申述人氏名}}", "{{被相続人氏名}}", "{{家庭裁判所名}}", "{{事件番号}}", "{{受理日}}",
+        "{{被相続人最後の住所}}", "{{被相続人生年月日}}", "{{死亡日}}", "{{申述人住所}}",
+        "{{申述人生年月日}}",
     ],
     # channels/soufu_annai.py（M4 送付案内）が差し込むキー（事務所正式書式・2026-07-03 差替）
     "docx_templates/jikou/送付案内.docx": [

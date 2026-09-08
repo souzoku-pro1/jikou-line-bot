@@ -40,6 +40,7 @@ APP_ENCLOSURE = kintone.KintoneApp(
 APP_SHIPPING = kintone.KintoneApp("App 30 (発送管理)", "APP_SHIPPING", "TOKEN_SHIPPING")
 
 DOC_TYPE = "送付案内"
+HOUKI_UNIT = "相続放棄"                       # HOUKI-SOUFU-1: 受理通知送付状（債権者宛）
 
 
 class SoufuAnnaiError(Exception):
@@ -213,6 +214,63 @@ def _needs_return(blocks: list[dict]) -> bool:
     return any((b.get("返送要否", {}).get("value") or "") == "要" for b in blocks)
 
 
+def _build_houki_labels_pdf(record: dict) -> bytes:
+    """相続放棄 受理通知送付: 宛名ラベルは宛先面 1 面のみ（返信用面なし・敬称=御中）"""
+    return render_label_sheet([{
+        "宛先名": record.get("宛先名", {}).get("value", ""),
+        "郵便番号": record.get("宛先郵便番号", {}).get("value", ""),
+        "住所": record.get("宛先住所", {}).get("value", ""),
+        "敬称": "御中",
+    }])
+
+
+async def _prepare_houki_soufu(record: dict, blocks: list[dict]) -> PrepareResult:
+    """HOUKI-SOUFU-1: ユニット種別=相続放棄 の prepare。App 40（案件レコードID）の値と
+    債権者一覧 の行（チャネル固有データ.row_id）で 受理通知送付状 を生成し、
+    受理通知書（FILE）の写しを同梱、宛名ラベルは宛先面のみ。AI 特記事項は使わない。
+    時効側（他ユニット）の経路は本関数を通らない。"""
+    from hub import houki_soufu as soufu
+    from hub import houki_soufu_letter as letter
+    from hub.houki_case_store import APP_HOUKI_CASE
+
+    try:
+        data = json.loads(record.get("チャネル固有データ", {}).get("value") or "{}")
+    except ValueError:
+        data = {}
+    case_id = str(data.get("case_record_id") or record.get("案件レコードID", {}).get("value") or "")
+    row_id = str(data.get("row_id") or "")
+    if not (case_id and row_id):
+        raise SoufuAnnaiError("相続放棄の起票メタ（案件レコードID/row_id）がありません")
+    case = await kintone.get_record(APP_HOUKI_CASE, case_id)
+    row = next((r for r in soufu.rows_of(case) if soufu.row_id(r) == row_id), None)
+    if row is None:
+        raise SoufuAnnaiError("債権者一覧に該当行がありません（削除された可能性）")
+    missing = letter.missing_case_fields(case)
+    if missing:
+        raise SoufuAnnaiError(f"送付状の必須欄が未入力です: {'・'.join(missing)}")
+    files = (case.get(soufu.FIELD_ACCEPT_FILE) or {}).get("value") or []
+    if not files:
+        raise SoufuAnnaiError("受理通知書（写し）が案件に添付されていません")
+    letter_data = letter.build_letter_data(
+        case, soufu.row_val(row, soufu.COL_NAME), soufu.row_val(row, soufu.COL_ZIP),
+        soufu.row_val(row, soufu.COL_ADDR), _office_signature())
+    docx_bytes = letter.render_letter(letter_data)
+    copy_file = files[0]
+    copy_bytes = await kintone.download_file(APP_HOUKI_CASE, copy_file["fileKey"])
+    artifacts = [
+        Artifact("受理通知送付状.docx", docx_bytes, DOCX_MIME),
+        Artifact(f"受理通知書写し_{copy_file.get('name') or 'file'}", copy_bytes,
+                 copy_file.get("contentType") or PDF_MIME),
+        Artifact("宛名ラベル.pdf", _build_houki_labels_pdf(record), PDF_MIME),
+    ]
+    fields = {"チャネル固有データ": json.dumps({
+        "blocks": [b.get("ブロックキー", {}).get("value", "") for b in blocks],
+        "needs_return": False,
+        "ai_note": {"generated": False},
+    }, ensure_ascii=False)}
+    return PrepareResult(artifacts=artifacts, fields=fields)
+
+
 def _build_labels_pdf(record: dict) -> bytes:
     """宛名ラベル PDF（宛先面＋返信用の事務所宛面・07 §1）"""
     office = get_office_info()
@@ -270,6 +328,8 @@ class SoufuAnnaiAdapter(ChannelAdapter):
             raise SoufuAnnaiError("ユニット種別が未設定です")
         selected = list(record.get("同封物選択", {}).get("value") or [])
         blocks = await fetch_blocks(unit, selected)
+        if unit == HOUKI_UNIT:
+            return await _prepare_houki_soufu(record, blocks)
 
         # 特記事項: 人が書いた値を優先。空なら AI 下書き（失敗は空欄で続行）。
         # 生成結果は kintone にも書き戻し、承認前に弁護士が編集できるようにする（07 §1）

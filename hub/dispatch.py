@@ -293,6 +293,20 @@ async def _handle_shipped(record: dict) -> None:
         await approval.transition(APP_SHIPPING, record_id, "発送済", "完了")
         logger.info("shipped record=%s -> 完了 (返送想定なし)",
                     emit(record_id, "record_id", "log", "operator"))
+    # HOUKI-SOUFU-1: 案件アプリID=App 40 のレコードだけ 債権者一覧 の該当行を 送付済 に
+    # 書き戻す（時効側=App 21 のレコードは対象外・状態遷移後の best-effort・失敗は要確認通知）
+    await _houki_write_back(record)
+
+
+async def _houki_write_back(record: dict) -> None:
+    from hub import houki_soufu
+    if not houki_soufu.is_houki_shipping(record):
+        return
+    try:
+        await houki_soufu.mark_row_sent(record)
+    except Exception:
+        logger.warning("houki write-back failed record=%s",
+                       emit(_rid(record), "record_id", "log", "operator"))
 
 
 async def _handle_reprocess(record: dict) -> None:
