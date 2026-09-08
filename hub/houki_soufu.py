@@ -71,6 +71,7 @@ STATE_SENT = "送付済"
 SHIP_NO_CLAIMING = "起票中"                                 # fix1 A: claim 中の 送付発送管理No（fix2: 起票中:{token}:{期限}）
 CLAIM_TTL_SEC = 600                                         # fix2 A-1: claim の期限（10 分）
 DUPLICATE_ERROR_DETAIL = "二重起票（正: 発送管理 No.{canonical}）。本レコードは使用しません。"   # fix2 A-4
+PENDING_DEDUPE_KEY = "pending_dedupe"                       # fix3 A-1: App 30 チャネル固有データ のフラグ
 TRIGGER_STATUSES = (STATUS_ACCEPTED, STATUS_NOTIFYING)      # fix1 B: 債権者通知 でも回収
 EXTRA_YES = "yes"
 EXTRA_NO = "no"
@@ -268,11 +269,6 @@ async def enclosure_problem() -> str | None:
     return None
 
 
-async def find_existing_shipping(key: str) -> str | None:
-    records = await kintone.search_records(
-        APP_SHIPPING, f'チャネル固有データ like "{key}"', fields=["$id"])
-    return _v(records[0], "$id") if records else None
-
 
 def build_shipping_fields(case: dict, row: dict, key: str) -> dict:
     name = row_val(row, COL_NAME)
@@ -292,6 +288,7 @@ def build_shipping_fields(case: dict, row: dict, key: str) -> dict:
         "同封物選択": [ENCLOSURE_BLOCK_KEY],
         "チャネル固有データ": json.dumps({
             CHANNEL_DATA_KEY: key, "row_id": row_id(row), "case_record_id": _v(case, "$id"),
+            PENDING_DEDUPE_KEY: True,                       # fix3 A-1: 重複確認が済むまで prepare に入らない
         }, ensure_ascii=False),
     }
 
@@ -384,49 +381,95 @@ async def claim_recovery_row(record_id: str, target_row_id: str, latest: dict | 
         return False
 
 
+def channel_data(shipping: dict) -> dict:
+    try:
+        data = json.loads(_v(shipping, "チャネル固有データ") or "{}")
+    except ValueError:
+        data = {}
+    return data if isinstance(data, dict) else {}
+
+
+def is_pending_dedupe(shipping: dict) -> bool:
+    """fix3 A-1/A-2: 起票直後（重複確認前）のレコード。prepare はこれが true の間は入らない。"""
+    return channel_data(shipping).get(PENDING_DEDUPE_KEY) is True
+
+
 async def find_all_shipping(key: str) -> list[dict]:
-    """fix2 A-4: 同じ houki_soufu_key を持つ App 30 レコード（$id 昇順・キー完全一致で絞る）。"""
+    """fix2 A-4 / fix3 B-1: 同じ houki_soufu_key を持つ App 30 レコード全件（$id 昇順・キー完全一致）。
+    番号復旧・作成後のどちらもこれを通す（先頭 1 件だけ見る経路は無い）。"""
     records = await kintone.search_records(
         APP_SHIPPING, f'チャネル固有データ like "{key}" order by $id asc limit 100',
-        fields=["$id", "発送ステータス", "チャネル固有データ"])
-    out = []
-    for r in records:
-        try:
-            data = json.loads(_v(r, "チャネル固有データ") or "{}")
-        except ValueError:
-            data = {}
-        if data.get(CHANNEL_DATA_KEY) == key:
-            out.append(r)
+        fields=["$id", "$revision", "発送ステータス", "チャネル固有データ"])
+    out = [r for r in records if channel_data(r).get(CHANNEL_DATA_KEY) == key]
     return sorted(out, key=lambda r: int(_v(r, "$id") or 0))
 
 
-async def resolve_duplicates(record_id: str, key: str, mine: str) -> str:
-    """fix2 A-4: 作成後に同キーを検索し、2 件以上なら番号最小を正とする。自分の分が最小でなければ
-    自分の分（下書き かつ キー一致）を無効化（下書き→エラー・物理削除は RV-08 pin により不可）。
-    下書き でなければ触らず要確認通知（両番号）。戻り値は正の番号。"""
-    found = await find_all_shipping(key)
-    if len(found) <= 1:
-        return mine
+async def _clear_pending_cas(shipping: dict) -> bool:
+    """正のレコードの pending_dedupe を false に CAS 更新（この編集が App 30 の webhook を発火させ
+    dispatcher が prepare を始める）。409 は再取得 1 回で再判定。"""
+    rec = shipping
+    for attempt in range(_CAS_RETRIES):
+        data = channel_data(rec)
+        if data.get(PENDING_DEDUPE_KEY) is not True:
+            return True
+        data[PENDING_DEDUPE_KEY] = False
+        try:
+            await kintone.update_record(APP_SHIPPING, _v(rec, "$id"),
+                                        {"チャネル固有データ": json.dumps(data, ensure_ascii=False)},
+                                        revision=_v(rec, "$revision") or None)
+            return True
+        except kintone.KintoneConflict:
+            rec = await kintone.get_record(APP_SHIPPING, _v(rec, "$id"))
+    return False
+
+
+async def _void_duplicate_cas(record_id: str, shipping: dict, canonical: str) -> bool:
+    """正以外のレコード: 再取得した現在状態が 下書き かつ pending_dedupe=true のものだけ
+    下書き→エラー（エラー詳細に正の番号）を revision つき CAS で書く。物理削除は RV-08 pin により行わない。
+    hub/approval.transition は revision を受け取らない（凍結）ため、同じ遷移表（SERVER_TRANSITIONS）で
+    許容を確認したうえで本 module が CAS 書込を行う。409 は再取得 1 回で再判定。対象外・失敗は False。"""
+    from hub import approval
+    assert (SHIPPING_STATUS_DRAFT, "エラー") in approval.SERVER_TRANSITIONS
+    rec = shipping
+    for attempt in range(_CAS_RETRIES):
+        if _v(rec, "発送ステータス") != SHIPPING_STATUS_DRAFT or not is_pending_dedupe(rec):
+            return False
+        data = channel_data(rec)
+        data[PENDING_DEDUPE_KEY] = False
+        try:
+            await kintone.update_record(
+                APP_SHIPPING, _v(rec, "$id"),
+                {"発送ステータス": "エラー",
+                 "エラー詳細": DUPLICATE_ERROR_DETAIL.format(canonical=canonical),
+                 "チャネル固有データ": json.dumps(data, ensure_ascii=False)},
+                revision=_v(rec, "$revision") or None)
+            logger.info("[HOUKI_SOUFU] duplicate draft voided record_id=%s shipping=%s canonical=%s",
+                        emit(record_id, "record_id", "log", "operator"),
+                        emit(_v(rec, "$id"), "record_id", "log", "operator"),
+                        emit(canonical, "record_id", "log", "operator"))
+            return True
+        except kintone.KintoneConflict:
+            rec = await kintone.get_record(APP_SHIPPING, _v(rec, "$id"))
+    return False
+
+
+async def resolve_duplicates(record_id: str, key: str, found: list[dict]) -> tuple[str, bool]:
+    """fix3 A-3: 同キー全件（$id 昇順）から番号最小を正とし、正は pending_dedupe を外す。正以外は
+    下書き∧pending のものだけ エラー 化。エラー 化できないもの（既に 下書き でない・pending 済み・CAS 失敗）が
+    残れば要確認通知（両番号）。戻り値 (正の番号, 未解決あり)。"""
     canonical = _v(found[0], "$id")
-    if canonical == mine:
-        return mine
-    me = next((r for r in found if _v(r, "$id") == mine), None)
-    if me is not None and _v(me, "発送ステータス") == SHIPPING_STATUS_DRAFT:
-        # 物理削除は RV-08 の repo 全域 pin（test_rv08_soft_merge: delete_record 参照禁止）に反するため
-        # 行わず、自分の 下書き をサーバ許容遷移 下書き→エラー（hub/approval・エラー詳細に正の番号）で
-        # 無効化する（prepare/承認の対象から外れる・人が 完了 に倒せる）。
-        from hub import approval
-        await approval.transition(APP_SHIPPING, mine, SHIPPING_STATUS_DRAFT, "エラー",
-                                  extra_fields={"エラー詳細": DUPLICATE_ERROR_DETAIL.format(canonical=canonical)})
-        logger.info("[HOUKI_SOUFU] duplicate draft voided record_id=%s shipping=%s canonical=%s",
-                    emit(record_id, "record_id", "log", "operator"),
-                    emit(mine, "record_id", "log", "operator"),
-                    emit(canonical, "record_id", "log", "operator"))
-    else:
+    unresolved: list[str] = []
+    for other in found[1:]:
+        if not await _void_duplicate_cas(record_id, other, canonical):
+            unresolved.append(_v(other, "$id"))
+    if not await _clear_pending_cas(found[0]):
+        unresolved.append(canonical)
+    if unresolved:
         await _notify(NOTIFY_KIND_REVIEW, record_id,
-                      f"{NOTICE_HEAD_REVIEW} 案件レコードNo.{record_id}: 二重起票の疑い（発送管理 No.{canonical} と"
-                      f" No.{mine}）。No.{canonical} を正として行に書きました。No.{mine} を確認してください。")
-    return canonical
+                      f"{NOTICE_HEAD_REVIEW} 案件レコードNo.{record_id}: 二重起票の疑い（正: 発送管理 No.{canonical}・"
+                      f"未解決: No.{'、No.'.join(unresolved)}）。No.{canonical} を正として行に書きました。"
+                      "未解決のレコードを確認してください。")
+    return canonical, bool(unresolved)
 
 
 async def promote_status(record_id: str) -> bool:
@@ -465,11 +508,14 @@ def review_text(record_id: str, missing: list[str], no_addr: list[int], enclosur
     return "\n".join(lines)
 
 
-def filed_text(record_id: str, filed: list[str], aligned: int, review_count: int, promoted: bool) -> str:
+def filed_text(record_id: str, filed: list[str], aligned: int, review_count: int, promoted: bool,
+               duplicates_unresolved: int = 0) -> str:
     lines = [f"{NOTICE_HEAD_FILED} 案件レコードNo.{record_id}"]
     lines.append(f"起票 {len(filed)} 件（発送管理 No.{'、'.join(filed) if filed else 'なし'}）")
     if aligned:
         lines.append(f"既存起票に揃えた行 {aligned} 件")
+    if duplicates_unresolved:
+        lines.append(f"重複未解決 {duplicates_unresolved} 件（別途通知）")
     if review_count:
         lines.append(f"要確認 {review_count} 件（別途通知）")
     if promoted:
@@ -500,10 +546,14 @@ async def _file_claimed_row(record_id: str, record: dict, target_row_id: str, to
                     emit(record_id, "record_id", "log", "operator"))
         return
     row_no = next((i for i, r in enumerate(rows_of(latest), 1) if row_id(r) == target_row_id), 0)
-    existing = await find_existing_shipping(key)
-    if existing:
-        shipping_id = existing
-        result["aligned"] += 1
+    found = await find_all_shipping(key)
+    if found:
+        # fix3 B-1: 番号復旧でも全件検索→重複確認（pending 解除）を必ず通す
+        shipping_id, unresolved = await resolve_duplicates(record_id, key, found)
+        if unresolved:
+            result["duplicates_unresolved"] += 1
+        else:
+            result["aligned"] += 1
     else:
         if recovery and not row_eligible(row):
             reverted = await update_row_once(record_id, target_row_id,
@@ -525,8 +575,16 @@ async def _file_claimed_row(record_id: str, record: dict, target_row_id: str, to
         logger.info("[HOUKI_SOUFU] filed App30 record_id=%s shipping=%s",
                     emit(record_id, "record_id", "log", "operator"),
                     emit(shipping_id, "record_id", "log", "operator"))
-        canonical = await resolve_duplicates(record_id, key, shipping_id)
-        if canonical == shipping_id:
+        # fix3 A-3: 作成直後に同キー全件を取得して重複確認（正の pending 解除・他は エラー 化）
+        found = await find_all_shipping(key)
+        if not found:
+            found = [{"$id": {"value": shipping_id}, "$revision": {"value": ""},
+                      "発送ステータス": {"value": SHIPPING_STATUS_DRAFT},
+                      "チャネル固有データ": {"value": json.dumps({CHANNEL_DATA_KEY: key, PENDING_DEDUPE_KEY: True})}}]
+        canonical, unresolved = await resolve_duplicates(record_id, key, found)
+        if unresolved:
+            result["duplicates_unresolved"] += 1
+        elif canonical == shipping_id:
             filed_ids.append(shipping_id)
         else:
             result["aligned"] += 1
@@ -547,7 +605,7 @@ async def process_soufu(record_id: str) -> dict:
 
 async def _process_soufu_locked(record_id: str, token: str) -> dict:
     result = {"filed": 0, "aligned": 0, "review": 0, "pending": 0, "recovered": 0,
-              "lost": 0, "reverted": 0, "promoted": False, "skip": ""}
+              "lost": 0, "reverted": 0, "duplicates_unresolved": 0, "promoted": False, "skip": ""}
     record = await kintone.get_record(APP_HOUKI_CASE, record_id)
     if not is_triggered(record):
         result["skip"] = "not_triggered"
@@ -591,7 +649,7 @@ async def _process_soufu_locked(record_id: str, token: str) -> dict:
         latest = None
         await _file_claimed_row(record_id, record, row_id(row), token, result, filed_ids)
     result["filed"] = len(filed_ids)
-    if filed_ids or result["aligned"]:
+    if filed_ids or result["aligned"] or result["duplicates_unresolved"]:
         result["promoted"] = await promote_status(record_id)   # 現在が 受理 のときだけ 1 回
     if no_addr:
         result["review"] += 1
@@ -601,9 +659,10 @@ async def _process_soufu_locked(record_id: str, token: str) -> dict:
         await _notify(NOTIFY_KIND_REVIEW, record_id,
                       f"{NOTICE_HEAD_REVIEW} 案件レコードNo.{record_id}: 発送管理の作成または番号書込に失敗した行が"
                       f" {result['pending']} 件あります（次回の保存時に自動で回収します）")
-    if filed_ids or result["aligned"] or result["recovered"]:
+    if filed_ids or result["aligned"] or result["recovered"] or result["duplicates_unresolved"]:
         await _notify(NOTIFY_KIND_FILED, record_id,
-                      filed_text(record_id, filed_ids, result["aligned"], result["review"], result["promoted"]))
+                      filed_text(record_id, filed_ids, result["aligned"], result["review"], result["promoted"],
+                                 result["duplicates_unresolved"]))
     return result
 
 

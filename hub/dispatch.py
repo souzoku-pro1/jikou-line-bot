@@ -185,6 +185,8 @@ async def _handle_prepare(record: dict) -> None:
         logger.info("prepare deferred record=%s cls=%s: %s",
                     emit(record_id, "record_id", "log", "operator"),
                     type(e).__name__, emit(str(e), "vendor_raw", "log", "operator"))
+        if getattr(e, "silent", False):
+            return          # HOUKI-SOUFU-1-fix3: 機械的な待ち（重複確認前）は警報なし・既定 False は従来どおり
         await notify.notify_admin_line(
             "【発送管理: 対応依頼（エラーではありません）】\n"
             f"レコードNo: {record_id}\n{_summary(record)}\n"

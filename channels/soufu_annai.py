@@ -32,6 +32,7 @@ from config import get_office_info
 from hub import kintone
 from hub.address_label import render_label_sheet
 from hub.docx_builder import fill_template_with_table, resolve_template, to_wareki
+from hub.redact import emit
 
 logger = logging.getLogger("channels.soufu_annai")
 
@@ -242,6 +243,11 @@ async def _prepare_houki_soufu(record: dict, blocks: list[dict]) -> PrepareResul
     row_id = str(data.get("row_id") or "")
     if not (case_id and row_id):
         raise SoufuAnnaiError("相続放棄の起票メタ（案件レコードID/row_id）がありません")
+    # fix3 A-2: 重複確認が済むまで prepare に入らない（成果物なし・下書きのまま・通知なし・ログ 1 行）
+    if data.get(soufu.PENDING_DEDUPE_KEY) is True:
+        logger.info("[HOUKI_SOUFU] prepare skipped (pending dedupe) shipping=%s",
+                    emit(str(record.get("$id", {}).get("value") or ""), "record_id", "log", "operator"))
+        raise PrepareDeferred("重複確認中（自動で解除されます）", silent=True)
     case = await kintone.get_record(APP_HOUKI_CASE, case_id)
     row = next((r for r in soufu.rows_of(case) if soufu.row_id(r) == row_id), None)
     if row is None:
