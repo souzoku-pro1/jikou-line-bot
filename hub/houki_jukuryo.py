@@ -18,8 +18,10 @@ App 40（相続放棄案件）の受任案件について熟慮期間（3 か月
 fix2（Codex HJC-01〜04）:
  A. 通知は案件行の集合として組み立て、1 通 NOTICE_MAX_CHARS 字以内に案件単位で分割
     （1 案件で超える行は要点へ縮約し「（縮約）」を明記・黙った切り捨てなし）。各通に
-    「(n/N)」。送信キーは houki_jukuryo_daily:{日付}:{digest}（digest=その通の
-    (record_id, マイルストーン名) 列の sha256 先頭 16 桁）＝同一内容の再送だけが
+    「(n/N)」。送信キーは houki_jukuryo_daily:{日付}:{digest}（fix4: digest=その通の
+    案件×マイルストーンの構造化データ {record_id, milestone_name, due_date, legal_deadline,
+    internal_deadline, start_basis, delayed} を並べ替えた正規化 JSON の sha256 先頭 16 桁）
+    ＝同一内容の再送だけが
     throttled=成功扱い。履歴追記は sent/throttled になった通の案件だけ。
  B. App 40 の全件取得（$id asc・500 件ごとに $id > 最後の id で継続）。
  C. マイルストーンを単発 ONE_SHOT（社内締切 7 日前／当日・法定満了 3 日前）と毎日 DAILY
@@ -40,6 +42,7 @@ fix2（Codex HJC-01〜04）:
 import calendar
 import functools
 import hashlib
+import json
 import logging
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
@@ -282,12 +285,35 @@ class Entry:
     record: dict
     record_id: str
     lines: list[str]                       # 本文行（1 マイルストーン 1 行）
-    keys: list[tuple[str, str]]            # (record_id, マイルストーン名)＝digest の材料
+    keys: list[tuple[str, str]]            # (record_id, マイルストーン名)
     history_lines: list[str]               # 送信成功後に追記する履歴行
     compact: str = ""                      # 上限超過時の縮約行（空なら不要）
+    facts: list[dict] = field(default_factory=list)   # fix4: digest の材料（構造化・案件×マイルストーン）
 
     def text(self) -> str:
         return "\n".join(self.lines)
+
+
+def start_basis(dl: Deadlines) -> str:
+    """digest 用の起算日根拠: 使用欄名／弁護士設定（起算日空で 法定満了日 が弁護士設定）／起算日未設定。"""
+    if dl.start is not None:
+        return dl.start_source
+    if dl.legal_source == SOURCE_ATTORNEY:
+        return SOURCE_ATTORNEY
+    return START_UNSET
+
+
+def milestone_fact(record_id: str, name: str, due: date | None, dl: Deadlines, today: date) -> dict:
+    """fix4 HJCF2-01: 案件×マイルストーンの構造化データ（該当日・期日・根拠・遅延を含む）。"""
+    return {
+        "record_id": record_id,
+        "milestone_name": name,
+        "due_date": due.isoformat() if due else None,
+        "legal_deadline": dl.legal.isoformat() if dl.legal else None,
+        "internal_deadline": dl.internal.isoformat() if dl.internal else None,
+        "start_basis": start_basis(dl),
+        "delayed": bool(due is not None and due < today),
+    }
 
 
 def plan_today(records: list[dict], today: date, include_unset: bool = True) -> list[Entry]:
@@ -303,7 +329,8 @@ def plan_today(records: list[dict], today: date, include_unset: bool = True) -> 
         if not dl.determinable:
             if include_unset and not history_has(history, today, START_UNSET):
                 entries.append(Entry(rec, rid, [f"{START_UNSET}: No.{rid}"], [(rid, START_UNSET)],
-                                     [history_line(today, START_UNSET)]))
+                                     [history_line(today, START_UNSET)],
+                                     facts=[milestone_fact(rid, START_UNSET, None, dl, today)]))
             continue
         pending = []
         for ms in milestones_for(today, dl):
@@ -318,7 +345,8 @@ def plan_today(records: list[dict], today: date, include_unset: bool = True) -> 
             [format_item(rid, ms, dl, today) for ms in pending],
             [(rid, ms.name) for ms in pending],
             [history_line(today, ms.name, ms.due if ms.name in ONE_SHOT else None) for ms in pending],
-            compact=format_item_compact(rid, [ms.name for ms in pending], dl)))
+            compact=format_item_compact(rid, [ms.name for ms in pending], dl),
+            facts=[milestone_fact(rid, ms.name, ms.due, dl, today) for ms in pending]))
     return entries
 
 
@@ -329,9 +357,18 @@ class Notice:
     digest: str = ""
 
 
+def digest_material(entries: list[Entry]) -> str:
+    """fix4 HJCF2-01: 通に含まれる案件×マイルストーンの構造化データを record_id・milestone_name で
+    並べ替え、正規化 JSON にする（文字列連結は使わない・HCG-03 と同方針）。"""
+    facts = sorted((f for e in entries for f in e.facts),
+                   key=lambda f: (f["record_id"], f["milestone_name"]))
+    return json.dumps(facts, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+
+
 def digest_of(entries: list[Entry]) -> str:
-    material = "|".join(f"{rid}:{name}" for e in entries for rid, name in e.keys)
-    return hashlib.sha256(material.encode("utf-8")).hexdigest()[:DIGEST_HEX_LEN]
+    """該当日・法定満了日・社内締切日・根拠・遅延のいずれかが変われば別値（履歴で未送信と
+    判定される変更は必ず digest も変わる）。案件順の入替では同値。"""
+    return hashlib.sha256(digest_material(entries).encode("utf-8")).hexdigest()[:DIGEST_HEX_LEN]
 
 
 def notify_key(today: date, digest: str) -> str:

@@ -13,6 +13,8 @@
 """
 
 import asyncio
+import hashlib
+import json
 import logging
 import re
 import unittest
@@ -296,6 +298,56 @@ class TestNoticeBody(unittest.TestCase):
         self.assertNotEqual(hj.digest_of(a), hj.digest_of(ab))
         self.assertEqual(hj.digest_of(a), hj.digest_of(hj.plan_today([_due(rid="1")], TODAY)))
         self.assertTrue(KEY_RE.match(hj.notify_key(TODAY, hj.digest_of(a))))
+
+    def test_digest_material_is_structured_json(self):
+        """fix4 HJCF2-01: 材料は record_id・milestone_name で並べた正規化 JSON（文字列連結ではない）。"""
+        entries = hj.plan_today([_due(rid="1")], TODAY)
+        material = hj.digest_material(entries)
+        self.assertEqual(json.loads(material), [{
+            "record_id": "1", "milestone_name": "社内締切当日", "due_date": "2026-09-08",
+            "legal_deadline": "2026-09-18", "internal_deadline": "2026-09-08",
+            "start_basis": "相続人と知った日_申告", "delayed": False}])
+        self.assertEqual(material, json.dumps(json.loads(material), sort_keys=True, ensure_ascii=False,
+                                              separators=(",", ":")))
+        self.assertEqual(hj.digest_of(entries),
+                         hashlib.sha256(material.encode("utf-8")).hexdigest()[:16])
+
+    def test_digest_is_deterministic_and_order_independent(self):
+        r1, r2 = _due(rid="1"), _rec(rid="2", knew="2026-06-25")           # 当日 / 7 日前
+        self.assertEqual(hj.digest_of(hj.plan_today([r1, r2], TODAY)),
+                         hj.digest_of(hj.plan_today([r2, r1], TODAY)))
+        # 通の中の entries 順が違っても同値
+        e = hj.plan_today([r1, r2], TODAY)
+        self.assertEqual(hj.digest_of(e), hj.digest_of(list(reversed(e))))
+
+    def test_digest_changes_when_any_fact_changes(self):
+        base = hj.digest_of(hj.plan_today([_rec(rid="1", legal="2026-09-16", history="")], TODAY))   # 社内 9/6・遅延
+        variants = {
+            "due/legal": _rec(rid="1", legal="2026-09-17", history=""),                              # 該当日 9/7・法定 9/17
+            "internal(attorney)": _rec(rid="1", legal="2026-09-16", internal="2026-09-08", history=""),  # 社内締切 9/8
+            "basis": _rec(rid="1", knew="2026-06-16", history=""),                                    # 計算で同じ期日・根拠が欄名
+            "milestone set": _rec(rid="1", legal="2026-09-11", internal="2026-09-08", history=""),  # 当日+法定3日前
+        }
+        seen = {base}
+        for label, rec in variants.items():
+            d = hj.digest_of(hj.plan_today([rec], TODAY))
+            self.assertNotIn(d, seen, label)
+            seen.add(d)
+        # 遅延フラグだけが違う場合（同じ該当日を定刻に送る日と遅延で送る日）
+        rec = _rec(rid="1", internal="2026-09-08", legal="2026-10-31", history="")
+        on_time = hj.digest_of(hj.plan_today([rec], TODAY))
+        late = hj.digest_of(hj.plan_today([rec], date(2026, 9, 9)))
+        self.assertNotEqual(on_time, late)
+        facts = hj.plan_today([rec], date(2026, 9, 9))[0].facts
+        self.assertEqual((facts[0]["due_date"], facts[0]["delayed"]), ("2026-09-08", True))
+
+    def test_unset_entry_fact(self):
+        facts = hj.plan_today([_rec(rid="9")], TODAY)[0].facts
+        self.assertEqual(facts, [{"record_id": "9", "milestone_name": "起算日未設定", "due_date": None,
+                                  "legal_deadline": None, "internal_deadline": None,
+                                  "start_basis": "起算日未設定", "delayed": False}])
+        atty = hj.plan_today([_rec(rid="8", legal="2026-09-18")], TODAY)[0].facts   # 起算日空・弁護士設定
+        self.assertEqual(atty[0]["start_basis"], "弁護士設定")
 
 
 # ── ジョブ（kintone・LINE は mock） ──────────────────────────────────────────
@@ -625,6 +677,40 @@ class TestDigestKeys(_Base):
         out3 = self.run_job()
         self.assertEqual((out3["sent"], push.await_count), (1, 2))
         self.assertEqual(self.history("2"), "2026-09-08 社内締切当日@2026-09-08 通知済")
+
+
+    def _use_real_notify(self):
+        push = AsyncMock(return_value=True)
+        for p in (patch.object(hub_notify, "notify_admin_line_result", _REAL_NOTIFY_RESULT),
+                  patch.object(hub_notify, "push_line_message", push),
+                  patch.object(hub_notify, "get_admin_line_user_id", return_value="Uadmin")):
+            p.start()
+            self.addCleanup(p.stop)
+        hub_notify._last_notify_at.clear()
+        hub_notify._notify_in_flight.clear()
+        self.addCleanup(hub_notify._last_notify_at.clear)
+        return push
+
+    def test_codex_repro_deadline_change_within_window_is_sent_not_throttled(self):
+        """HJCF2-01 再現: 9/8 に 法定満了 9/16（弁護士設定）・社内締切 9/6（計算値）の案件を遅延通知
+        → 法定満了 を 9/17 に変更 → 300 秒以内に再実行 → 新該当日 9/7 の通知は sent（throttled でない）。"""
+        push = self._use_real_notify()
+        rec = _rec(rid="1", legal="2026-09-16", history="")
+        self.seed(rec)
+        out = self.run_job()
+        self.assertEqual((out["sent"], push.await_count), (1, 1))
+        self.assertIn("No.1 社内締切当日（遅延・本来 2026-09-06） /", push.await_args_list[0].args[1])
+        self.assertEqual(self.history("1"), "2026-09-08 社内締切当日@2026-09-06 通知済")
+        rec["法定満了日"] = {"value": "2026-09-17"}                                 # 社内締切 9/7 へ
+        out2 = self.run_job()
+        self.assertEqual((out2["items"], out2["sent"], out2["failed"], push.await_count), (1, 1, 0, 2))
+        self.assertIn("No.1 社内締切当日（遅延・本来 2026-09-07） /", push.await_args_list[1].args[1])
+        self.assertEqual(self.raw_history("1").splitlines()[-1], "2026-09-08 社内締切当日@2026-09-07 通知済")
+        # 同一内容の再実行（履歴が書けなかった想定）は従来どおり throttled=成功扱い
+        self.records["1"]["熟慮期間通知履歴"] = {"value": "2026-09-08 社内締切当日@2026-09-06 通知済"}
+        out3 = self.run_job()
+        self.assertEqual((out3["sent"], out3["failed"], push.await_count), (1, 0, 2))
+        self.assertEqual(self.raw_history("1").splitlines()[-1], "2026-09-08 社内締切当日@2026-09-07 通知済")
 
 
 class TestPaging(_Base):
