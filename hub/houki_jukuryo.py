@@ -303,15 +303,36 @@ def start_basis(dl: Deadlines) -> str:
     return START_UNSET
 
 
+# 原則（fix5 HJCF4-01）: 通知本文に表示する値は、すべて facts に含める（digest が本文の差分を必ず識別する）。
+# 本文組立（format_item / format_item_compact）が参照する値 → facts のキー。テストが両側から生成して一致を pin。
+BODY_TO_FACT_KEYS = {
+    "record_id": "record_id",
+    "ms.name": "milestone_name",
+    "ms.due": "due_date",
+    "ms.delayed": "delayed",
+    "dl.start": "start_date",
+    "dl.start_source": "start_basis",
+    "dl.legal": "legal_deadline",
+    "dl.legal_source": "legal_source",
+    "dl.internal": "internal_deadline",
+    "dl.internal_source": "internal_source",
+}
+FACT_KEYS = frozenset(BODY_TO_FACT_KEYS.values())
+
+
 def milestone_fact(record_id: str, name: str, due: date | None, dl: Deadlines, today: date) -> dict:
-    """fix4 HJCF2-01: 案件×マイルストーンの構造化データ（該当日・期日・根拠・遅延を含む）。"""
+    """fix4 HJCF2-01 / fix5 HJCF4-01: 案件×マイルストーンの構造化データ（該当日・期日・
+    起算日の実日付・根拠・弁護士設定/計算値・遅延を含む＝本文に出る値は全て含める）。"""
     return {
         "record_id": record_id,
         "milestone_name": name,
         "due_date": due.isoformat() if due else None,
-        "legal_deadline": dl.legal.isoformat() if dl.legal else None,
-        "internal_deadline": dl.internal.isoformat() if dl.internal else None,
+        "start_date": dl.start.isoformat() if dl.start else None,
         "start_basis": start_basis(dl),
+        "legal_deadline": dl.legal.isoformat() if dl.legal else None,
+        "legal_source": dl.legal_source,
+        "internal_deadline": dl.internal.isoformat() if dl.internal else None,
+        "internal_source": dl.internal_source,
         "delayed": bool(due is not None and due < today),
     }
 

@@ -305,8 +305,9 @@ class TestNoticeBody(unittest.TestCase):
         material = hj.digest_material(entries)
         self.assertEqual(json.loads(material), [{
             "record_id": "1", "milestone_name": "社内締切当日", "due_date": "2026-09-08",
-            "legal_deadline": "2026-09-18", "internal_deadline": "2026-09-08",
-            "start_basis": "相続人と知った日_申告", "delayed": False}])
+            "start_date": "2026-06-18", "start_basis": "相続人と知った日_申告",
+            "legal_deadline": "2026-09-18", "legal_source": "計算値",
+            "internal_deadline": "2026-09-08", "internal_source": "計算値", "delayed": False}])
         self.assertEqual(material, json.dumps(json.loads(material), sort_keys=True, ensure_ascii=False,
                                               separators=(",", ":")))
         self.assertEqual(hj.digest_of(entries),
@@ -344,10 +345,53 @@ class TestNoticeBody(unittest.TestCase):
     def test_unset_entry_fact(self):
         facts = hj.plan_today([_rec(rid="9")], TODAY)[0].facts
         self.assertEqual(facts, [{"record_id": "9", "milestone_name": "起算日未設定", "due_date": None,
-                                  "legal_deadline": None, "internal_deadline": None,
-                                  "start_basis": "起算日未設定", "delayed": False}])
+                                  "start_date": None, "start_basis": "起算日未設定",
+                                  "legal_deadline": None, "legal_source": "起算日未設定",
+                                  "internal_deadline": None, "internal_source": "起算日未設定",
+                                  "delayed": False}])
         atty = hj.plan_today([_rec(rid="8", legal="2026-09-18")], TODAY)[0].facts   # 起算日空・弁護士設定
-        self.assertEqual(atty[0]["start_basis"], "弁護士設定")
+        self.assertEqual((atty[0]["start_basis"], atty[0]["start_date"], atty[0]["legal_source"],
+                          atty[0]["internal_source"]), ("弁護士設定", None, "弁護士設定", "計算値"))
+
+    def test_digest_changes_for_start_date_legal_source_internal_source_alone(self):
+        """fix5 HJCF4-01: 起算日の実日付・法定満了日/社内締切日の 弁護士設定/計算値 が単独で変わっても別値。"""
+        def d(**kw):
+            kw.setdefault("history", "")
+            return hj.digest_of(hj.plan_today([_rec(rid="1", **kw)], TODAY))
+        # start_date のみ（法定満了日は弁護士設定 9/16 で固定・根拠欄名は同じ）
+        self.assertNotEqual(d(legal="2026-09-16", knew="2026-06-01"), d(legal="2026-09-16", knew="2026-06-02"))
+        # legal_source のみ（同じ 9/16 を計算値で得る場合と弁護士設定で得る場合）
+        self.assertNotEqual(d(knew="2026-06-16"), d(knew="2026-06-16", legal="2026-09-16"))
+        # internal_source のみ（同じ 9/6 を計算値で得る場合と弁護士設定で得る場合）
+        self.assertNotEqual(d(knew="2026-06-16"), d(knew="2026-06-16", internal="2026-09-06"))
+        # 同一内容は同値
+        self.assertEqual(d(legal="2026-09-16", knew="2026-06-01"), d(legal="2026-09-16", knew="2026-06-01"))
+
+    def test_body_values_are_all_in_facts(self):
+        """原則「通知本文に表示する値は、すべて facts に含める」を両側から生成して pin:
+        (a) 本文組立関数が参照する dl./ms./record_id の集合 ⊆ 対応表のキー、
+        (b) 対応表の値 == 実 fact のキー集合。"""
+        import ast as _ast
+        tree = _ast.parse(Path(hj.__file__).read_text(encoding="utf-8"))
+        used = set()
+        for node in tree.body:
+            if isinstance(node, _ast.FunctionDef) and node.name in ("format_item", "format_item_compact"):
+                for sub in _ast.walk(node):
+                    if isinstance(sub, _ast.Attribute) and isinstance(sub.value, _ast.Name) \
+                            and sub.value.id in ("dl", "ms"):
+                        used.add(f"{sub.value.id}.{sub.attr}")
+                    if isinstance(sub, _ast.Name) and sub.id == "record_id":
+                        used.add("record_id")
+        self.assertTrue(used)
+        self.assertLessEqual(used, set(hj.BODY_TO_FACT_KEYS))                          # (a)
+        self.assertIn("dl.start", used)
+        self.assertIn("dl.legal_source", used)
+        fact = hj.milestone_fact("1", hj.MS_INTERNAL_DAY, TODAY, hj.compute_deadlines(_due()), TODAY)
+        self.assertEqual(set(fact), set(hj.BODY_TO_FACT_KEYS.values()))                # (b)
+        self.assertEqual(set(fact), set(hj.FACT_KEYS))
+        for e in hj.plan_today([_due(rid="1"), _rec(rid="9")], TODAY):                 # 実 entry も同じキー集合
+            for f in e.facts:
+                self.assertEqual(set(f), set(hj.FACT_KEYS))
 
 
 # ── ジョブ（kintone・LINE は mock） ──────────────────────────────────────────
@@ -711,6 +755,43 @@ class TestDigestKeys(_Base):
         out3 = self.run_job()
         self.assertEqual((out3["sent"], out3["failed"], push.await_count), (1, 0, 2))
         self.assertEqual(self.raw_history("1").splitlines()[-1], "2026-09-08 社内締切当日@2026-09-07 通知済")
+
+
+    def test_codex_repro_start_date_correction_after_cas_failure_is_sent(self):
+        """HJCF4-01 再現: 通知成功後に履歴 CAS 失敗 → 弁護士設定の法定満了日は維持したまま申告起算日を
+        訂正（6/1→6/2）→ 300 秒以内に再実行 → sent（throttled でない）・履歴追記。"""
+        push = self._use_real_notify()
+        rec = _rec(rid="1", legal="2026-09-16", knew="2026-06-01", history="")   # 社内 9/6（計算値）・遅延
+        self.seed(rec)
+        self.conflict_on.add("1")
+        out = self.run_job()
+        self.assertEqual((out["sent"], out["history_failed"], push.await_count), (1, 1, 1))
+        self.assertEqual(self.history("1"), "")
+        self.conflict_on.discard("1")
+        rec["相続人と知った日_申告"] = {"value": "2026-06-02"}                    # 起算日の訂正のみ
+        out2 = self.run_job()
+        self.assertEqual((out2["sent"], out2["failed"], push.await_count), (1, 0, 2))
+        self.assertIn("起算日 2026-06-02（相続人と知った日_申告・申告ベース・要確認）", push.await_args_list[1].args[1])
+        self.assertEqual(self.history("1"), "2026-09-08 社内締切当日@2026-09-06 通知済")
+
+    def test_explicit_internal_same_date_changes_digest_and_is_sent(self):
+        """社内締切を同じ日付で明示設定（計算値 → 弁護士設定）→ 別 digest で sent。"""
+        push = self._use_real_notify()
+        rec = _rec(rid="1", legal="2026-09-16", knew="2026-06-01", history="")
+        self.seed(rec)
+        self.conflict_on.add("1")
+        self.run_job()
+        self.assertEqual(push.await_count, 1)
+        self.conflict_on.discard("1")
+        rec["社内締切日"] = {"value": "2026-09-06"}
+        out2 = self.run_job()
+        self.assertEqual((out2["sent"], push.await_count), (1, 2))
+        self.assertIn("社内締切 2026-09-06（弁護士設定）", push.await_args_list[1].args[1])
+        # 同一内容の再実行は throttled=成功扱い（不変）
+        self.records["1"]["熟慮期間通知履歴"] = {"value": ""}
+        out3 = self.run_job()
+        self.assertEqual((out3["sent"], out3["failed"], push.await_count), (1, 0, 2))
+        self.assertEqual(self.history("1"), "2026-09-08 社内締切当日@2026-09-06 通知済")
 
 
 class TestPaging(_Base):
