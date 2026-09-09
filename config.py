@@ -73,6 +73,10 @@ EXPECTED_KINTONE_SCHEMA = {
             "信用情報確認": {"type": "SINGLE_LINE_TEXT"},
             "顧客名": {"type": "SINGLE_LINE_TEXT"},
             "住所": {"type": "SINGLE_LINE_TEXT"},
+            # LABEL-PRINT-1 D9: 宛名ラベルの 〒 に使う（label_print_task が読む・
+            # 空なら 〒 なしで印字）。2026-09-09 の form fields 実測では App 21 に
+            # 未作成——CU（大野）で追加されるまで daily_healthcheck が日次警告する
+            "郵便番号": {"type": "SINGLE_LINE_TEXT"},
             "生年月日": {"type": "SINGLE_LINE_TEXT"},
             "電話番号": {"type": "SINGLE_LINE_TEXT"},
             "メールアドレス": {"type": "SINGLE_LINE_TEXT"},
@@ -107,6 +111,8 @@ EXPECTED_KINTONE_SCHEMA = {
             "furigana": {"type": "SINGLE_LINE_TEXT"},      # ラベル: ふりがな
             "old_address": {"type": "SINGLE_LINE_TEXT"},   # ラベル: 旧住所
             "notice_file": {"type": "FILE"},               # ラベル: 時効援用通知書
+            # LABEL-PRINT-1 D5: 宛名ラベル PDF の添付先（CU 済み・2026-09-09 実測 FILE）
+            "宛名ラベル": {"type": "FILE"},
             # ── JIKOU-FORM-1: 時効診断フォーム（shindan_form.py が書く。
             # 受付番号は kintone 側「値の重複を禁止する」ON が前提=CU 実測済み。
             # 受信書類写真 FILE は FORM-3 で書くようになった時点で追加する）
