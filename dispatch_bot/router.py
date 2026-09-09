@@ -92,7 +92,8 @@ async def _alert_unauthorized(user_id: str, text: str) -> None:
     )
 
 
-async def process_dispatch_bot_event(reply_token: str, user_id: str, user_text: str) -> None:
+async def process_dispatch_bot_event(reply_token: str, user_id: str, user_text: str,
+                                     event_id: str = "") -> None:
     """メッセージイベントの本処理（BackgroundTasks で実行）"""
     try:
         if not is_allowed(user_id):
@@ -107,7 +108,7 @@ async def process_dispatch_bot_event(reply_token: str, user_id: str, user_text: 
                     emit(user_text[:50], "freetext", "log", "operator"))
         # D2: 解析→案件検索→解釈結果の提示（復唱確認・起票は D3）
         from dispatch_bot.handler import handle_message
-        reply_text = await handle_message(user_id, user_text)
+        reply_text = await handle_message(user_id, user_text, event_id=event_id)
         if reply_text:
             await _send_reply(reply_token, user_id, reply_text)
     except Exception:
@@ -147,5 +148,6 @@ async def dispatch_bot_webhook(request: Request, background_tasks: BackgroundTas
         background_tasks.add_task(
             process_dispatch_bot_event,
             event.get("replyToken", ""), user_id, event["message"].get("text", ""),
+            str(event.get("webhookEventId") or ""),   # LABEL-PRINT-1-fix1: 再配送の無効化用
         )
     return {"status": "ok"}

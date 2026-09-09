@@ -9,9 +9,11 @@
   「もう一度確認される」方向に倒れる（安全側・06 §3.2）
 """
 
+import contextvars
 import logging
 import re
 import time
+import uuid
 from dataclasses import dataclass, field
 
 from claude_gateway import ClaudeUnavailableError
@@ -24,6 +26,11 @@ logger = logging.getLogger("dispatch_bot.handler")
 
 
 _SESSION_TTL_SEC = 30 * 60
+
+# LABEL-PRINT-1-fix1: 処理中の LINE イベント ID（webhookEventId）。再配送の無効化（冪等）に使う。
+# LINE 由来でない呼び出し（テスト・将来の別入口）は local:UUID＝毎回別イベント扱い
+current_event_id: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "dispatch_bot_event_id", default="")
 _MAX_CLARIFY = 2  # 聞き返しは2往復まで（03 §7）
 
 MSG_UNSUPPORTED = ("未対応のタスクです。現在対応: "
@@ -181,12 +188,16 @@ def _ask(session_user: str, base_text: str, topic: str, question: str,
     return question
 
 
-async def handle_message(user_id: str, text: str) -> str:
-    """許可済みユーザーのメッセージ → 応答テキスト（router から呼ばれる）"""
+async def handle_message(user_id: str, text: str, event_id: str = "") -> str:
+    """許可済みユーザーのメッセージ → 応答テキスト（router から呼ばれる）。
+    event_id は LINE の webhookEventId（空なら local:UUID）。タスク側は current_event_id で参照する"""
+    token = current_event_id.set(event_id or f"local:{uuid.uuid4()}")
     try:
         return await _handle(user_id, text)
     except ClaudeUnavailableError:
         return MSG_AI_DOWN
+    finally:
+        current_event_id.reset(token)
 
 
 async def _handle(user_id: str, text: str) -> str:
