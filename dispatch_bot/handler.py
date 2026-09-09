@@ -130,6 +130,17 @@ async def _execute_confirmed(user_id: str) -> str:
             f"この後の生成・承認はkintone側で行われます\n{url}")
 
 
+def _direct_match(text: str) -> dict | None:
+    """LABEL-PRINT-1: レジストリの direct_match_fn に一致する指示は Claude 解析を経ずに
+    その task_type の task として扱う（構文はタスク側で決定論に解析する。フックの有無だけを見る）"""
+    for spec in registry.TASK_REGISTRY.values():
+        if spec.direct_match_fn and spec.direct_match_fn(text):
+            return {"intent": "task", "task_type": spec.task_type, "customer_name": None,
+                    "task_params": {}, "confidence": "high", "missing_fields": [],
+                    "clarification": None}
+    return None
+
+
 # 選択肢をマスタから動的取得して番号選択式で聞く項目（field_questions では扱わない）
 _DYNAMIC_FIELDS = {"enclosures"}
 
@@ -241,7 +252,9 @@ async def _handle(user_id: str, text: str) -> str:
     # ── 解析（聞き返し中なら元指示に回答を結合して再解析・03 §7） ─────────
     base_text = f"{session.base_text}\n（追加回答）{text}" if session and session.base_text \
                 else text
-    parsed = await parser.parse_instruction(base_text)
+    parsed = _direct_match(text) if not (session and session.base_text) else None
+    if parsed is None:
+        parsed = await parser.parse_instruction(base_text)
     intent = parsed["intent"]
 
     if intent == "confirm":
