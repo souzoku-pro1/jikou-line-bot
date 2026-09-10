@@ -13,11 +13,14 @@
 - 生成 PDF は案件レコードの FILE 欄「宛名ラベル」へ添付（既存添付は残す・D5）。追記は最新
   $revision の CAS で行い、409 は再取得→既存添付に自分の fileKey をマージして再試行（最大 3 回・
   LP-03）。役所・発送宛は指示に併記した案件番号のレコードへ添付する。
-- ジョブ状態機械（hub/label_sheet・LP-01/02/04）: OK 受信時に 1 トランザクションで面を予約
-  （event_id 一意＝再配送の無効化・シート行ロック・提案面が埋まっていれば予約せず再指示）→
-  トランザクション外で PDF 生成・アップロード・添付 → attached。添付失敗は reserved のまま残し、
-  同一宛先・同一面の別イベントで「回収」（再予約しない・アップロード済み fileKey を再利用）。
+- ジョブ状態機械（hub/label_sheet・LP-01/02/04・LPF1-01〜04）: OK 受信時に 1 トランザクションで
+  面を予約（event_id 一意＝再配送の無効化・シート管理行ロック・提案面が埋まっていれば予約せず再指示）→
+  トランザクション外で PDF 生成・アップロード・添付 → attached。予約は所有者（owner_token）と期限
+  （10 分）を持ち、fileKey 保存・attached 化は所有者条件つき UPDATE（0 行＝所有権喪失で中断・状態は
+  触らない）。添付処理の例外・タイムアウトは status=failed を試みる。回収は failed か期限切れ reserved
+  のときだけ（同一宛先・同一面の別イベント・fileKey 再利用）。期限内の reserved は「処理中」を返す。
 - 操作コマンド（印刷済／戻す／新しいシート）は event_id 冪等（LP-06）。「残量」は読取のみ。
+  「戻す」は直前バッチの prior_used でない面だけ空きに戻す（再印字面は used のまま）。
 - **RV-10（D8）/ LP-05**: 復唱・返信・通知・ログに氏名/住所を載せない。構文エラーの返信は固定文言と
   書式案内のみ（入力原文・未解釈トークンを含めない）。ログは長さと分類のみ。
 """
@@ -93,6 +96,9 @@ MSG_FACE_TAKEN = "面が埋まりました。再指示してください"
 MSG_MUNI_NOT_FOUND = "市区町村マスタ（App 31）に該当する有効な市区町村がありません（市区町村名の表記を確認してください）"
 MSG_MUNI_NO_ADDRESS = "市区町村マスタ（App 31）の該当レコードに住所が未登録です"
 MSG_ATTACH_CONFLICT = "案件レコードの更新が競合し続けたため添付できませんでした。もう一度同じ指示を送ると回収します"
+MSG_IN_PROGRESS = "処理中です。しばらく待ってから再指示してください"
+MSG_OWNERSHIP_LOST = ("この処理は別の実行に引き継がれたため中断しました（状態は変更していません）。"
+                      "「ラベル 残量」で確認し、必要なら再指示してください")
 QUESTION_UNIT = "どのアプリの案件ですか？「時効」「相続」「放棄」のいずれかで答えてください"
 _STAGE_UNIT = "unit"
 
@@ -356,10 +362,14 @@ async def _sheet_op(req: LabelRequest, user_id: str) -> str:
         outcome, state, undone = await label_sheet.undo_last(event_id, user_id)
         if outcome == "duplicate_event":
             return MSG_DUPLICATE_EVENT
-        if not undone:
+        if undone is None:
             return MSG_NO_UNDO
-        faces = "・".join(str(f) for f in undone)
-        return f"直前の消費（面 {faces}）を取り消しました。{label_sheet.status_text(state, per_page)}"
+        faces = "・".join(str(f) for f in undone.faces)
+        note = ""
+        if undone.kept_used:
+            kept = "・".join(str(f) for f in undone.kept_used)
+            note = f"（面 {kept} は再印字のため使用済みのまま）"
+        return f"直前の消費（面 {faces}）を取り消しました{note}。{label_sheet.status_text(state, per_page)}"
     if req.kind == "new_sheet":
         outcome, state = await label_sheet.new_sheet(event_id, user_id)
         if outcome == "duplicate_event":
@@ -382,7 +392,7 @@ def _confirmation_text(target: Target, state: label_sheet.SheetState, face: int,
         if same_job.status == label_sheet.JOB_ATTACHED:
             notes.append(f"面 {face} は同じ宛先で添付済み（再添付はしません）")
         else:
-            notes.append(f"面 {face} は同じ宛先で添付未完了（OK で回収します）")
+            notes.append(f"面 {face} は同じ宛先で添付未完了（OK で回収します）")   # failed／期限切れ reserved
     elif face in state.used:
         notes.append(f"面 {face} は使用済み（再印字）")
     if honorific_override is not None:
@@ -426,6 +436,8 @@ async def _confirm(user_id: str, parsed: dict, base_text: str, req: LabelRequest
             same_job = same[0]
         elif on_face:
             return f"面 {face} は別の宛先で印刷待ちです。別の面を指定するか「ラベル 印刷済」の後に指示してください"
+    if same_job is not None and same_job.lease_active():
+        return MSG_IN_PROGRESS          # LPF1-01: 期限内の reserved は回収しない（復唱も作らない）
     params = {**asdict(req), "face": face, "sheet_id": state.sheet_id,
               "unit_label": target.unit_label, "role_label": target.role_label,
               "role_key": target.role_key, "explicit": req.face is not None}
@@ -519,10 +531,19 @@ async def attach_with_cas(app: kintone.KintoneApp, record_id: str, file_key: str
     raise AttachConflict()
 
 
+async def _try_mark_failed(job) -> None:
+    """LPF1-01 A4: 添付処理の途中で例外 → status=failed を試みる（失敗しても期限切れで回収される）"""
+    try:
+        await label_sheet.mark_job_failed(job.job_id, job.owner_token)
+    except Exception:   # noqa: BLE001 — 失敗確定そのものの失敗は握る（元の例外を優先して再送出する）
+        logger.info("[LABEL] mark failed skipped face=%s", emit(job.face, "count", "log", "operator"))
+
+
 async def execute(pending) -> tuple[str, str, str]:
-    """OK 後（LP-01〜04）: 宛先を再解決 → 1 トランザクションで面を予約（event_id 冪等・行ロック・
-    提案面が埋まっていれば再指示）→ PDF → アップロード（fileKey を保存）→ CAS 添付 → attached。
-    添付失敗は reserved のまま残し、同一宛先・同一面の別イベントで回収する。全終端で pending invalidate。"""
+    """OK 後（LP-01〜04・LPF1-01）: 宛先を再解決 → 1 トランザクションで面を予約（event_id 冪等・
+    管理行ロック・提案面が埋まっていれば再指示・所有者と期限を付与）→ PDF → アップロード（fileKey を
+    所有者条件つきで保存）→ CAS 添付 → attached（所有者条件つき）。例外・タイムアウトは failed を試みて
+    再送出。所有権喪失（UPDATE 0 行）は外部処理を中断し状態を触らない。全終端で pending invalidate。"""
     from dispatch_bot import confirm  # 遅延 import（循環回避）
     user_id = getattr(pending, "user_id", "")
     try:
@@ -548,6 +569,8 @@ async def execute(pending) -> tuple[str, str, str]:
             return (f"シートが {params.get('sheet_id')} から変わりました。もう一度指示してください", "", "")
         if res.outcome == "face_taken":
             return MSG_FACE_TAKEN, "", ""
+        if res.outcome == "in_progress":
+            return MSG_IN_PROGRESS, "", ""
         job = res.job
         if res.outcome == "attached":
             return (f"添付済みです（No.{req.case_no}・{target.role_label}・面 {face}・{job.filename}）。"
@@ -555,27 +578,39 @@ async def execute(pending) -> tuple[str, str, str]:
 
         # ── トランザクション外: PDF → アップロード → CAS 添付（回収時は保存済み fileKey を再利用）──
         recovering = res.outcome == "recover"
-        file_key, filename = job.file_key, job.filename
-        if not file_key:
-            pdf = render_label_sheet(
-                [{"宛先名": target.name, "郵便番号": target.zip_code, "住所": target.address,
-                  "敬称": target.honorific}],
-                layout=LAYOUT, faces=[face])
-            filename = build_filename(job.sheet_id, face, target.role_key)
-            file_key = await kintone.upload_file(target.case_app, filename, pdf, "application/pdf")
-            await label_sheet.set_job_file_key(job.job_id, file_key, filename)
         try:
-            await attach_with_cas(target.case_app, req.case_no, file_key)
-        except AttachConflict:
-            logger.info("[LABEL] attach conflict record=%s face=%s",
+            file_key, filename = job.file_key, job.filename
+            if not file_key:
+                pdf = render_label_sheet(
+                    [{"宛先名": target.name, "郵便番号": target.zip_code, "住所": target.address,
+                      "敬称": target.honorific}],
+                    layout=LAYOUT, faces=[face])
+                filename = build_filename(job.sheet_id, face, target.role_key)
+                file_key = await kintone.upload_file(target.case_app, filename, pdf, "application/pdf")
+                await label_sheet.set_job_file_key(job.job_id, job.owner_token, file_key, filename)
+            try:
+                await attach_with_cas(target.case_app, req.case_no, file_key)
+            except AttachConflict:
+                logger.info("[LABEL] attach conflict record=%s face=%s",
+                            emit(req.case_no, "record_id", "log", "operator"),
+                            emit(face, "count", "log", "operator"))
+                await _try_mark_failed(job)
+                return MSG_ATTACH_CONFLICT, "", ""
+            except kintone.KintoneError:
+                if recovering:
+                    # 期限切れ等: 次の回収で再アップロード
+                    await label_sheet.clear_job_file_key(job.job_id, job.owner_token)
+                raise
+            await label_sheet.mark_job_attached(job.job_id, job.owner_token, file_key, filename)
+        except label_sheet.OwnershipLost:
+            # 所有権喪失: 外部処理を中断（添付済みならそのまま残す・状態は触らない・failed にもしない）
+            logger.info("[LABEL] ownership lost record=%s face=%s",
                         emit(req.case_no, "record_id", "log", "operator"),
                         emit(face, "count", "log", "operator"))
-            return MSG_ATTACH_CONFLICT, "", ""
-        except kintone.KintoneError:
-            if recovering:
-                await label_sheet.clear_job_file_key(job.job_id)   # 期限切れ等: 次の回収で再アップロード
+            return MSG_OWNERSHIP_LOST, "", ""
+        except Exception:
+            await _try_mark_failed(job)       # A4: 例外・タイムアウト → failed を試みて再送出
             raise
-        await label_sheet.mark_job_attached(job.job_id, file_key, filename)
         state = await label_sheet.ensure_state(user_id)
         logger.info("[LABEL] attached record=%s face=%s",
                     emit(req.case_no, "record_id", "log", "operator"),

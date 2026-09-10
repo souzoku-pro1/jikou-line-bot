@@ -6,6 +6,10 @@
   既存 A4_2x6 不変（仕様値・面原点・13 件 2 頁・PRINT_OFFSET 系）
 - ジョブ状態機械（sqlite 実 DB）: 予約（event_id 冪等・面の占有・回収・添付済み）・印刷済／戻す／
   新しいシート（event_id 冪等・状態更新と同一トランザクション）・満杯時の提案なし
+- fix2（Codex LPF1-01〜04）: 所有者と期限（期限内 reserved は処理中・failed／期限切れのみ回収・所有者条件つき
+  更新の 0 行＝中断）・イベント履歴の分離（E1 予約→E2 回収→E1 再配送 no-op・job.event_id 不変）・
+  シート管理行ロック（切替と予約の並行・初期作成の並行で 1 行・(layout, sheet_no) 一意）・
+  「戻す」の正確化（prior_used の面は used のまま・最初の printed は printed のまま）
 - 指示の構文（各書式・未対応宛先の返答・敬称上書き・全角・固定文言のみ＝LP-05）
 - 宛先解決（依頼者・債権者 n・役所・発送の 4 種・郵便番号なし・未対応/不足の返答）
 - 添付先の FILE 欄「宛名ラベル」（既存添付を残す・$revision CAS・409 再取得マージ＝LP-03）
@@ -233,6 +237,46 @@ def reserve(event, face, *, record="17", role="依頼者", app="40", sheet="S-1"
                                         face=face, explicit=explicit, user_id=user))
 
 
+def attach(job_id, file_key="fk", filename="f.pdf"):
+    """添付成功（所有者＝現在のジョブ所有者）"""
+    job = run(label_sheet.get_job(job_id))
+    run(label_sheet.mark_job_attached(job_id, job.owner_token, file_key, filename))
+
+
+def fail(job_id):
+    """添付処理の失敗確定（所有者＝現在のジョブ所有者）"""
+    job = run(label_sheet.get_job(job_id))
+    return run(label_sheet.mark_job_failed(job_id, job.owner_token))
+
+
+async def aexpire_leases():
+    """全ジョブの期限を過去にする（期限切れの再現・async 文脈用）"""
+    import sqlalchemy as sa
+    from datetime import datetime, timedelta, timezone
+    async with label_sheet.session_scope() as s:
+        await s.execute(sa.update(label_sheet.label_print_job).values(
+            lease_expires_at=datetime.now(timezone.utc) - timedelta(seconds=1)))
+
+
+def expire_leases():
+    run(aexpire_leases())
+
+
+def hist(st):
+    return tuple(b.faces for b in st.history)
+
+
+def events_all():
+    import sqlalchemy as sa
+
+    async def _q():
+        async with label_sheet.session_scope() as s:
+            rows = (await s.execute(sa.select(label_sheet.label_event)
+                                    .order_by(label_sheet.label_event.c.id))).fetchall()
+            return [(r.event_id, r.kind, r.job_id) for r in rows]
+    return run(_q())
+
+
 def jobs_all():
     import sqlalchemy as sa
 
@@ -289,27 +333,96 @@ class TestSheetState(_DbMixin):
         res = reserve("ev-2", 1, record="18")
         self.assertEqual(res.outcome, "face_taken")
         self.assertEqual(len(jobs_all()), 1)
-        run(label_sheet.mark_job_attached(1, "fk", "f.pdf"))
+        attach(1, "fk", "f.pdf")
         self.assertEqual(reserve("ev-3", 1, record="18").outcome, "face_taken")
 
     def test_reserve_same_target_recover_and_attached(self):
-        """LP-02/04: 同一宛先・同一面の reserved は回収（再予約せず event_id を更新）、attached は添付済み"""
+        """LP-02/04・LPF1-01: 同一宛先・同一面の reserved は期限内なら処理中（回収しない）、failed なら回収
+        （再予約せず・job.event_id は作成時のまま・所有者は更新）、attached は添付済み"""
         run(label_sheet.ensure_state("U1"))
-        reserve("ev-1", 1)
+        first = reserve("ev-1", 1)
+        self.assertEqual(len(first.job.owner_token), 12)
+        self.assertIsNotNone(first.job.lease_expires_at)
         res = reserve("ev-2", 1)
-        self.assertEqual((res.outcome, res.job.job_id, res.job.event_id), ("recover", 1, "ev-2"))
-        self.assertEqual(len(jobs_all()), 1)
-        run(label_sheet.mark_job_attached(1, "fk", "f.pdf"))
+        self.assertEqual((res.outcome, res.job.job_id), ("in_progress", 1))
+        self.assertEqual(events_all(), [("ev-1", "ok", 1)])             # in_progress はイベントを残さない
+        self.assertTrue(fail(1))
+        res = reserve("ev-2", 1)
+        self.assertEqual((res.outcome, res.job.job_id, res.job.event_id, res.job.status),
+                         ("recover", 1, "ev-1", "reserved"))
+        self.assertNotEqual(res.job.owner_token, first.job.owner_token)
+        self.assertEqual(jobs_all(), [(1, "ev-1", 1, "reserved", "")])
+        self.assertEqual(events_all(), [("ev-1", "ok", 1), ("ev-2", "ok", 1)])
+        attach(1, "fk", "f.pdf")
         res = reserve("ev-3", 1)
         self.assertEqual((res.outcome, res.job.status, res.job.file_key), ("attached", "attached", "fk"))
         self.assertEqual(len(jobs_all()), 1)
+
+    def test_lpf1_01_expired_lease_is_recoverable_and_recover_cas(self):
+        """LPF1-01: 期限切れ reserved は回収できる（所有者・期限を CAS で自分に）。期限内は回収しない"""
+        run(label_sheet.ensure_state("U1"))
+        reserve("ev-1", 1)
+        self.assertEqual(reserve("ev-2", 1).outcome, "in_progress")
+        expire_leases()
+        job = run(label_sheet.get_job(1))
+        self.assertTrue(job.recoverable)
+        res = reserve("ev-2", 1)
+        self.assertEqual((res.outcome, res.job.job_id, res.job.event_id), ("recover", 1, "ev-1"))
+        self.assertNotEqual(res.job.owner_token, job.owner_token)
+        self.assertTrue(run(label_sheet.get_job(1)).lease_active())      # 期限が自分のものに更新された
+        # LABEL_JOB_LEASE_SEC は実行時参照（期限 -1 秒 → 直後の同一指示で回収できる）
+        with patch.object(label_sheet, "LABEL_JOB_LEASE_SEC", -1):
+            reserve("ev-3", 2, record="18")
+        self.assertEqual(reserve("ev-4", 2, record="18").outcome, "recover")
+
+    def test_lpf1_01_owned_updates_require_owner_and_reserved(self):
+        """LPF1-01 A3: fileKey 保存・attached 化・failed 化は「owner_token が自分 かつ reserved」の UPDATE。
+        0 行＝OwnershipLost（状態は変わらない）。printed/undone から attached へ戻す経路はない"""
+        run(label_sheet.ensure_state("U1"))
+        res = reserve("ev-1", 1)
+        owner = res.job.owner_token
+        with self.assertRaises(label_sheet.OwnershipLost):
+            run(label_sheet.set_job_file_key(1, "other-owner", "fk", "f.pdf"))
+        with self.assertRaises(label_sheet.OwnershipLost):
+            run(label_sheet.mark_job_attached(1, "other-owner", "fk", "f.pdf"))
+        self.assertFalse(run(label_sheet.mark_job_failed(1, "other-owner")))
+        self.assertEqual(jobs_all(), [(1, "ev-1", 1, "reserved", "")])
+        run(label_sheet.set_job_file_key(1, owner, "fk", "f.pdf"))
+        run(label_sheet.mark_job_attached(1, owner, "fk", "f.pdf"))
+        self.assertEqual(jobs_all(), [(1, "ev-1", 1, "attached", "fk")])
+        # attached 以降は所有者でも reserved 条件を満たさない（attached→failed／printed→attached を作らない）
+        self.assertFalse(run(label_sheet.mark_job_failed(1, owner)))
+        run(label_sheet.consume_printed("op-1", "U1"))
+        with self.assertRaises(label_sheet.OwnershipLost):
+            run(label_sheet.mark_job_attached(1, owner, "fk2", "g.pdf"))
+        run(label_sheet.undo_last("op-u", "U1"))
+        with self.assertRaises(label_sheet.OwnershipLost):
+            run(label_sheet.mark_job_attached(1, owner, "fk2", "g.pdf"))
+        self.assertEqual(jobs_all(), [(1, "ev-1", 1, "undone", "fk")])
+
+    def test_lpf1_02_event_replay_after_recovery_is_noop(self):
+        """LPF1-02: E1 で予約 → E2 で回収 → E1 の再配送は no-op（新規予約・別面の予約を作らない）"""
+        run(label_sheet.ensure_state("U1"))
+        reserve("ev-1", 1)
+        fail(1)
+        self.assertEqual(reserve("ev-2", 1).outcome, "recover")
+        res = reserve("ev-1", 2)                                   # E1 再配送（別面を指定しても）
+        self.assertEqual((res.outcome, res.job.job_id, res.job.face), ("duplicate_event", 1, 1))
+        self.assertEqual(jobs_all(), [(1, "ev-1", 1, "reserved", "")])
+        self.assertEqual(run(label_sheet.get_state()).pending, (1,))
+        self.assertEqual(events_all(), [("ev-1", "ok", 1), ("ev-2", "ok", 1)])
+        # 全 kind で event_id は一意（操作イベントの id を OK に使っても no-op・逆も）
+        run(label_sheet.consume_printed("op-1", "U1"))
+        self.assertEqual(reserve("op-1", 3, record="18").outcome, "duplicate_event")
+        self.assertEqual(run(label_sheet.new_sheet("ev-2", "U1"))[0], "duplicate_event")
+        self.assertEqual(sheets_all(), ["S-1"])
 
     def test_reserve_sheet_changed_and_used_face(self):
         run(label_sheet.ensure_state("U1"))
         self.assertEqual(reserve("ev-1", 1, sheet="S-9").outcome, "sheet_changed")
         self.assertEqual(jobs_all(), [])
         reserve("ev-2", 1)
-        run(label_sheet.mark_job_attached(1, "fk", "f.pdf"))
+        attach(1, "fk", "f.pdf")
         run(label_sheet.consume_printed("op-1", "U1"))
         self.assertEqual(reserve("ev-3", 1).outcome, "face_taken")             # 提案面が used → 予約しない
         self.assertEqual(reserve("ev-4", 1, explicit=True).outcome, "reserved")  # 明示のみ再印字
@@ -332,23 +445,29 @@ class TestSheetState(_DbMixin):
 
         async def boom(*a, **k):
             raise RuntimeError("simulated failure inside the transaction")
-        # recover 経路（event_id 更新→同一 txn）で例外 → 何も変わらない（rollback）
-        with patch.object(label_sheet, "_update_job", boom):
+        # ジョブ挿入後のイベント記録で例外 → ジョブも残らない（同一 txn・rollback）。回収経路も同様
+        with patch.object(label_sheet, "_record_event", boom):
             with self.assertRaises(RuntimeError):
-                reserve("ev-2", 1)
-        self.assertEqual([j[1] for j in jobs_all()], ["ev-1"])
+                reserve("ev-2", 2, record="18")
+            fail(1)
+            with self.assertRaises(RuntimeError):
+                reserve("ev-3", 1)
+        self.assertEqual(jobs_all(), [(1, "ev-1", 1, "failed", "")])
+        self.assertEqual(events_all(), [("ev-1", "ok", 1)])
 
     def test_printed_consumes_attached_only_and_is_idempotent(self):
         """LP-06: 印刷済は attached の面だけ消費・ジョブは printed・同 event_id 再配送は無変化"""
         run(label_sheet.ensure_state("U1"))
         reserve("ev-1", 1)
         reserve("ev-2", 2, record="18")
-        run(label_sheet.mark_job_attached(1, "fk1", "a.pdf"))
+        attach(1, "fk1", "a.pdf")
         outcome, st, consumed = run(label_sheet.consume_printed("op-1", "U1"))
-        self.assertEqual((outcome, consumed, st.used, st.pending, st.history), ("applied", [1], (1,), (2,), ((1,),)))
+        self.assertEqual((outcome, consumed, st.used, st.pending, hist(st)), ("applied", [1], (1,), (2,), ((1,),)))
+        self.assertEqual(st.history[-1], label_sheet.Batch(faces=(1,), job_ids=(1,), prior_used=()))
         self.assertEqual([j[3] for j in jobs_all()], ["printed", "reserved"])
+        self.assertEqual(events_all()[-1], ("op-1", "printed", None))
         outcome, st, consumed = run(label_sheet.consume_printed("op-1", "U1"))
-        self.assertEqual((outcome, consumed, st.used, st.history), ("duplicate_event", [1], (1,), ((1,),)))
+        self.assertEqual((outcome, consumed, st.used, hist(st)), ("duplicate_event", [1], (1,), ((1,),)))
         outcome, st, consumed = run(label_sheet.consume_printed("op-2", "U1"))
         self.assertEqual((outcome, consumed), ("nothing", []))
 
@@ -356,8 +475,8 @@ class TestSheetState(_DbMixin):
         run(label_sheet.ensure_state("U1"))
         reserve("ev-1", 3)
         reserve("ev-2", 4, record="18")
-        run(label_sheet.mark_job_attached(1, "fk", "a.pdf"))
-        run(label_sheet.mark_job_attached(2, "fk", "b.pdf"))
+        attach(1, "fk", "a.pdf")
+        attach(2, "fk", "b.pdf")
         outcome, st, consumed = run(label_sheet.consume_printed("op-1", "U1", 4))
         self.assertEqual((consumed, st.used, st.pending), ([4], (4,), (3,)))
         outcome, st, consumed = run(label_sheet.consume_printed("op-2", "U1", 9))
@@ -367,26 +486,68 @@ class TestSheetState(_DbMixin):
         """LP-06: 消費履歴 2 バッチで「戻す」の同 event_id 再配送 → 1 バッチだけ戻る"""
         run(label_sheet.ensure_state("U1"))
         reserve("ev-1", 1)
-        run(label_sheet.mark_job_attached(1, "fk", "a.pdf"))
+        attach(1, "fk", "a.pdf")
         run(label_sheet.consume_printed("op-1", "U1"))
         reserve("ev-2", 2, record="18")
-        run(label_sheet.mark_job_attached(2, "fk", "b.pdf"))
+        attach(2, "fk", "b.pdf")
         run(label_sheet.consume_printed("op-2", "U1"))
         outcome, st, undone = run(label_sheet.undo_last("op-u", "U1"))
-        self.assertEqual((outcome, undone, st.used, st.history), ("applied", [2], (1,), ((1,),)))
+        self.assertEqual((outcome, undone.faces, undone.freed, undone.kept_used, undone.job_ids),
+                         ("applied", (2,), (2,), (), (2,)))
+        self.assertEqual((st.used, hist(st)), ((1,), ((1,),)))
         self.assertEqual([j[3] for j in jobs_all()], ["printed", "undone"])
         self.assertEqual(st.next_free(10), 2)
         outcome, st, undone = run(label_sheet.undo_last("op-u", "U1"))
-        self.assertEqual((outcome, undone, st.used, st.history), ("duplicate_event", [2], (1,), ((1,),)))
+        self.assertEqual((outcome, undone.faces, st.used, hist(st)), ("duplicate_event", (2,), (1,), ((1,),)))
         outcome, st, undone = run(label_sheet.undo_last("op-u2", "U1"))
-        self.assertEqual((outcome, undone, st.used, st.history), ("applied", [1], (), ()))
-        self.assertEqual(run(label_sheet.undo_last("op-u3", "U1"))[0], "nothing")
+        self.assertEqual((outcome, undone.faces, st.used, hist(st)), ("applied", (1,), (), ()))
+        outcome, st, undone = run(label_sheet.undo_last("op-u3", "U1"))
+        self.assertEqual((outcome, undone), ("nothing", None))
+
+    def test_lpf1_04_undo_keeps_reprinted_face_used(self):
+        """LPF1-04: 面 1 印刷済 → 面 1 明示で再印字 → 印刷済 → 戻す → 面 1 は used のまま・
+        最初の printed ジョブは printed のまま・再印字ジョブは undone"""
+        run(label_sheet.ensure_state("U1"))
+        reserve("ev-1", 1)
+        attach(1)
+        run(label_sheet.consume_printed("op-1", "U1"))
+        self.assertEqual(reserve("ev-2", 1, explicit=True).outcome, "reserved")     # 再印字
+        attach(2)
+        outcome, st, consumed = run(label_sheet.consume_printed("op-2", "U1"))
+        self.assertEqual((consumed, st.used), ([1], (1,)))
+        self.assertEqual(st.history[-1], label_sheet.Batch(faces=(1,), job_ids=(2,), prior_used=(1,)))
+        outcome, st, undone = run(label_sheet.undo_last("op-u", "U1"))
+        self.assertEqual((outcome, undone.faces, undone.freed, undone.kept_used, undone.job_ids),
+                         ("applied", (1,), (), (1,), (2,)))
+        self.assertEqual((st.used, hist(st), st.pending), ((1,), ((1,),), ()))
+        self.assertEqual([j[3] for j in jobs_all()], ["printed", "undone"])
+        self.assertEqual(st.next_free(10), 2)                      # 面 1 は空きに戻らない
+        # もう一段戻すと最初のバッチ（prior_used なし）→ 面 1 が空き・最初のジョブが undone
+        outcome, st, undone = run(label_sheet.undo_last("op-u2", "U1"))
+        self.assertEqual((undone.freed, undone.kept_used, st.used), ((1,), (), ()))
+        self.assertEqual([j[3] for j in jobs_all()], ["undone", "undone"])
+
+    def test_lpf1_04_undo_mixed_batch(self):
+        """再印字面と初回面が同じバッチ → 再印字面だけ used のまま"""
+        run(label_sheet.ensure_state("U1"))
+        reserve("ev-1", 1)
+        attach(1)
+        run(label_sheet.consume_printed("op-1", "U1"))
+        reserve("ev-2", 1, explicit=True)
+        reserve("ev-3", 2, record="18")
+        attach(2)
+        attach(3)
+        run(label_sheet.consume_printed("op-2", "U1"))
+        outcome, st, undone = run(label_sheet.undo_last("op-u", "U1"))
+        self.assertEqual((undone.faces, undone.freed, undone.kept_used, undone.job_ids), ((1, 2), (2,), (1,), (2, 3)))
+        self.assertEqual((st.used, st.next_free(10)), ((1,), 2))
+        self.assertEqual([j[3] for j in jobs_all()], ["printed", "undone", "undone"])
 
     def test_new_sheet_starts_empty_keeps_old_row_and_is_idempotent(self):
         """LP-06: 「新しいシート」再配送でシートが増えない"""
         run(label_sheet.ensure_state("U1"))
         reserve("ev-1", 1)
-        run(label_sheet.mark_job_attached(1, "fk", "a.pdf"))
+        attach(1, "fk", "a.pdf")
         run(label_sheet.consume_printed("op-1", "U1"))
         outcome, st = run(label_sheet.new_sheet("op-n", "U1"))
         self.assertEqual((outcome, st.sheet_id, st.used, st.pending), ("applied", "S-2", (), ()))
@@ -399,7 +560,7 @@ class TestSheetState(_DbMixin):
         run(label_sheet.ensure_state("U1"))
         for f in range(1, 11):
             reserve(f"ev-{f}", f, record=str(f))
-            run(label_sheet.mark_job_attached(f, "fk", "a.pdf"))
+            attach(f, "fk", "a.pdf")
         run(label_sheet.consume_printed("op-1", "U1"))
         st = run(label_sheet.get_state())
         self.assertEqual(len(st.used), 10)
@@ -408,13 +569,87 @@ class TestSheetState(_DbMixin):
 
     def test_file_key_roundtrip(self):
         run(label_sheet.ensure_state("U1"))
-        reserve("ev-1", 1)
-        run(label_sheet.set_job_file_key(1, "fk-up", "f.pdf"))
+        owner = reserve("ev-1", 1).job.owner_token
+        run(label_sheet.set_job_file_key(1, owner, "fk-up", "f.pdf"))
         job = run(label_sheet.get_job(1))
         self.assertEqual((job.file_key, job.status), ("fk-up", "reserved"))
-        run(label_sheet.clear_job_file_key(1))
+        run(label_sheet.clear_job_file_key(1, owner))
         self.assertEqual(run(label_sheet.get_job(1)).file_key, "")
+        with self.assertRaises(label_sheet.OwnershipLost):
+            run(label_sheet.clear_job_file_key(1, "other"))
         self.assertIsNone(run(label_sheet.get_job(99)))
+
+    # ── LPF1-03: シート管理行のロック ──────────────────────────────
+    def test_lpf1_03_control_row_is_single_source_and_unique_sheet_no(self):
+        """現在シートは label_sheet_control.current_sheet_id が指す行。(layout, sheet_no) は DB で一意"""
+        import sqlalchemy as sa
+        from sqlalchemy.exc import IntegrityError
+        run(label_sheet.ensure_state("U1"))
+        run(label_sheet.new_sheet("op-n", "U1"))
+
+        async def _control():
+            async with label_sheet.session_scope() as s:
+                return [(r.layout, r.current_sheet_id) for r in (await s.execute(
+                    sa.select(label_sheet.label_sheet_control))).fetchall()]
+        self.assertEqual(run(_control()), [(LAYOUT, "S-2")])
+        self.assertEqual(run(label_sheet.get_state()).sheet_id, "S-2")
+        uq = [i for i in label_sheet.label_sheet_state.indexes if i.unique]
+        self.assertEqual([tuple(c.name for c in i.columns) for i in uq], [("layout", "sheet_no")])
+
+        async def _dup():
+            async with label_sheet.session_scope() as s:
+                await s.execute(sa.insert(label_sheet.label_sheet_state).values(
+                    sheet_id="S-2", layout=LAYOUT, sheet_no=2, used_faces=[], history=[], updated_by="x"))
+        with self.assertRaises(IntegrityError):
+            run(_dup())
+        self.assertEqual(sheets_all(), ["S-1", "S-2"])
+        # 「最新行」を探すロックは無い（全操作の入口は管理行ロック）
+        src = inspect.getsource(label_sheet)
+        self.assertNotIn("_latest(", src)
+        for fn in (label_sheet.reserve_face, label_sheet.consume_printed, label_sheet.undo_last,
+                   label_sheet.new_sheet, label_sheet.ensure_state, label_sheet.get_state):
+            self.assertIn("_lock_control(", inspect.getsource(fn), fn.__name__)
+        self.assertIn("with_for_update()", inspect.getsource(label_sheet._lock_control))
+
+    def _interleave(self, coro_factory):
+        """管理行ロック取得の直前に別の操作（別セッション）を完了させる＝順序を強制する fake"""
+        real = label_sheet._lock_control
+        fired = []
+
+        async def hooked(session, layout):
+            if not fired:
+                fired.append(1)
+                await coro_factory()
+            return await real(session, layout)
+        return patch.object(label_sheet, "_lock_control", hooked)
+
+    def test_lpf1_03_switch_during_reserve_does_not_reserve_on_old_sheet(self):
+        """切替と予約の並行: 予約がロックを取る直前に「新しいシート」が完了 → 旧シートへの予約は通らない"""
+        run(label_sheet.ensure_state("U1"))
+        with self._interleave(lambda: label_sheet.new_sheet("op-switch", "U9")):
+            res = reserve("ev-1", 1, sheet="S-1")
+        self.assertEqual(res.outcome, "sheet_changed")
+        self.assertEqual(jobs_all(), [])
+        self.assertEqual(events_all(), [("op-switch", "new_sheet", None)])
+        self.assertEqual(run(label_sheet.get_state()).sheet_id, "S-2")
+        # 逆順（予約が先に完了）: 切替後の現在シートは S-2・旧 S-1 のジョブは S-2 の占有にならない
+        self.assertEqual(reserve("ev-2", 1, sheet="S-2").outcome, "reserved")
+        with self._interleave(lambda: label_sheet.new_sheet("op-switch2", "U9")):
+            self.assertEqual(reserve("ev-3", 2, sheet="S-2").outcome, "sheet_changed")
+        st = run(label_sheet.get_state())
+        self.assertEqual((st.sheet_id, st.pending), ("S-3", ()))
+
+    def test_lpf1_03_concurrent_initial_creation_makes_one_row(self):
+        """初期作成の並行: ensure_state がロックを取る直前に別の ensure_state が S-1 を作る → 行は 1 件"""
+        with self._interleave(lambda: label_sheet.ensure_state("U2")):
+            st = run(label_sheet.ensure_state("U1"))
+        self.assertEqual(st.sheet_id, "S-1")
+        self.assertEqual(sheets_all(), ["S-1"])
+        # 「新しいシート」の並行も S-2/S-3 と直列化される（同じ sheet_no にならない）
+        with self._interleave(lambda: label_sheet.new_sheet("op-a", "U2")):
+            run(label_sheet.new_sheet("op-b", "U1"))
+        self.assertEqual(sheets_all(), ["S-1", "S-2", "S-3"])
+        self.assertEqual(run(label_sheet.get_state()).sheet_id, "S-3")
 
     def test_status_text_has_no_pii_fields(self):
         run(label_sheet.ensure_state("U1"))
@@ -700,7 +935,7 @@ class TestFlow(_KintoneMixin, _DbMixin):
         run(label_sheet.ensure_state("U1"))
         for f in faces:
             reserve(f"fill-{f}", f, record=f"fill{f}", explicit=True)
-            run(label_sheet.mark_job_attached(len(jobs_all()), "fk-fill", "fill.pdf"))
+            attach(len(jobs_all()), "fk-fill", "fill.pdf")
         run(label_sheet.consume_printed("fill-op", "U1"))
 
     # ── 登録・復唱 ─────────────────────────────────────────────
@@ -851,7 +1086,7 @@ class TestFlow(_KintoneMixin, _DbMixin):
             reply = self.msg("OK", event="ok-1")
         self.assertEqual(reply, handler.MSG_FILE_FAILED)
         self.assert_no_pii(self.notify.call_args.args[0])
-        self.assertEqual(jobs_all(), [(1, "ok-1", 1, "reserved", "fk-new-1")])   # fileKey は保存済み
+        self.assertEqual(jobs_all(), [(1, "ok-1", 1, "failed", "fk-new-1")])   # failed 確定・fileKey は保存済み
         # 同一指示（別 event_id）: 同じ宛先の占有面が提案され、OK で回収
         reply = self.msg("ラベル 放棄 No.17 依頼者")
         self.assertEqual(reply, "No.17（相続放棄）・依頼者・面 1/10 に印字。残り 9 面。OK?\n"
@@ -861,7 +1096,8 @@ class TestFlow(_KintoneMixin, _DbMixin):
         self.assertIn("回収して添付しました（No.17・依頼者・面 1/10・", reply)
         self.assertEqual(len(self.uploads), 1)                                    # fileKey 再利用
         self.assertEqual(self.attached_keys(), ["old-1", "fk-new-1"])
-        self.assertEqual(jobs_all(), [(1, "ok-2", 1, "attached", "fk-new-1")])   # 再予約なし・event_id 更新
+        self.assertEqual(jobs_all(), [(1, "ok-1", 1, "attached", "fk-new-1")])   # 再予約なし・作成 event_id 不変
+        self.assertEqual(events_all(), [("ok-1", "ok", 1), ("ok-2", "ok", 1)])
         # attached 後の同一指示 → 添付済み（再添付しない）
         reply = self.msg("ラベル 放棄 No.17 依頼者")
         self.assertIn("面 1 は同じ宛先で添付済み（再添付はしません）", reply)
@@ -877,11 +1113,110 @@ class TestFlow(_KintoneMixin, _DbMixin):
             self.msg("OK", event="ok-1")
             self.msg("ラベル 放棄 No.17 依頼者")
             self.msg("OK", event="ok-2")                       # 回収でも失敗（保存済み fileKey は破棄）
-        self.assertEqual(jobs_all(), [(1, "ok-2", 1, "reserved", "")])
+        self.assertEqual(jobs_all(), [(1, "ok-1", 1, "failed", "")])
         self.msg("ラベル 放棄 No.17 依頼者")
         self.assertIn("回収して添付しました", self.msg("OK", event="ok-3"))
         self.assertEqual(len(self.uploads), 2)
-        self.assertEqual(jobs_all(), [(1, "ok-3", 1, "attached", "fk-new-2")])
+        self.assertEqual(jobs_all(), [(1, "ok-1", 1, "attached", "fk-new-2")])
+
+    def test_lpf1_01_in_progress_reserved_is_not_recovered_until_lease_expires(self):
+        """期限内の reserved（失敗確定できずに途絶＝クラッシュ相当）→ 同一指示は「処理中」・外部処理なし。
+        期限切れ後は回収できる"""
+        self.msg("ラベル 放棄 No.17 依頼者")
+
+        async def boom(app, rid, fields, revision=None):
+            raise kintone.KintoneError(500, "GAIA_XX", "boom")
+        with patch.object(kintone, "update_record", boom), \
+                patch.object(label_sheet, "mark_job_failed", AsyncMock(return_value=False)):
+            self.assertEqual(self.msg("OK", event="ok-1"), handler.MSG_FILE_FAILED)
+        self.assertEqual(jobs_all(), [(1, "ok-1", 1, "reserved", "fk-new-1")])
+        self.assertEqual(self.msg("ラベル 放棄 No.17 依頼者"), lp.MSG_IN_PROGRESS)     # 復唱を作らない
+        self.assertEqual(self.msg("OK"), handler.MSG_NO_PENDING)
+        self.assertEqual((len(self.uploads), len(self.updates)), (1, 0))
+        # 他宛先からは占有中の面として見える（復唱せず案内）
+        self.assertIn("面 1 は別の宛先で印刷待ちです", self.msg("ラベル 放棄 No.18 依頼者 面 1"))
+        # 復唱済みの pending に対する OK でも予約側が処理中を返す（外部処理なし）
+        from dispatch_bot import confirm
+        self.msg("ラベル 放棄 No.17 依頼者 面 2")          # 別面で復唱 → pending の面を 1 に差し替えて処理中を踏む
+        state, pending = confirm.peek("U1")
+        pending.parsed["task_params"]["face"] = 1
+        self.assertEqual(self.msg("OK", event="ok-y"), lp.MSG_IN_PROGRESS)
+        self.assertEqual((len(self.uploads), len(self.updates)), (1, 0))
+        self.assertEqual(jobs_all(), [(1, "ok-1", 1, "reserved", "fk-new-1")])
+        expire_leases()
+        reply = self.msg("ラベル 放棄 No.17 依頼者")
+        self.assertIn("面 1 は同じ宛先で添付未完了（OK で回収します）", reply)
+        self.assertIn("回収して添付しました（No.17・依頼者・面 1/10", self.msg("OK", event="ok-2"))
+        self.assertEqual(len(self.uploads), 1)                                    # fileKey 再利用
+        self.assertEqual(jobs_all(), [(1, "ok-1", 1, "attached", "fk-new-1")])
+
+    def test_lpf1_01_ownership_lost_aborts_without_touching_state(self):
+        """所有権喪失: アップロード中に期限切れ→別実行が回収 → fileKey 保存が 0 行 → 中断・状態は触らない"""
+        self.msg("ラベル 放棄 No.17 依頼者")
+        real_upload = kintone.upload_file
+
+        async def other_run_recovers(event):
+            await aexpire_leases()
+            res = await label_sheet.reserve_face(event, app="40", record="17", role="依頼者", sheet_id="S-1",
+                                                 face=1, explicit=False, user_id="U9")
+            self.assertEqual(res.outcome, "recover")                           # 別実行が回収＝所有者が変わる
+
+        async def upload_then_lose(app, filename, content, mime):
+            fk = await real_upload(app, filename, content, mime)
+            await other_run_recovers("ok-other")
+            return fk
+        with patch.object(kintone, "upload_file", upload_then_lose):
+            reply = self.msg("OK", event="ok-1")
+        self.assertEqual(reply, lp.MSG_OWNERSHIP_LOST)
+        self.assertEqual(self.updates, [])                                        # 添付していない
+        job = run(label_sheet.get_job(1))
+        self.assertEqual((job.status, job.file_key, job.event_id), ("reserved", "", "ok-1"))   # 別実行の reserved のまま
+        self.assertTrue(job.lease_active())
+        self.notify.assert_not_called()
+        # 添付後の attached 化で所有権喪失 → 添付はそのまま残す・状態は触らない
+        expire_leases()
+        self.msg("ラベル 放棄 No.17 依頼者")
+        real_attach = lp.attach_with_cas
+
+        async def attach_then_lose(app, rid, fk):
+            await real_attach(app, rid, fk)
+            await other_run_recovers("ok-other2")
+        with patch.object(lp, "attach_with_cas", attach_then_lose):
+            self.assertEqual(self.msg("OK", event="ok-2"), lp.MSG_OWNERSHIP_LOST)
+        self.assertEqual(self.attached_keys(), ["old-1", "fk-new-2"])           # 添付は残す
+        job = run(label_sheet.get_job(1))
+        self.assertEqual((job.status, job.file_key), ("reserved", "fk-new-2"))  # 回収側が再利用できる
+        self.assertEqual(len(jobs_all()), 1)
+
+    def test_lpf1_02_ok_redelivery_after_recovery_is_noop_via_line(self):
+        """E1 で予約（添付失敗）→ E2 で回収 → E1 の再配送は no-op（新規予約・別面の予約を作らない）"""
+        self.msg("ラベル 放棄 No.17 依頼者")
+
+        async def boom(app, rid, fields, revision=None):
+            raise kintone.KintoneError(500, "GAIA_XX", "boom")
+        with patch.object(kintone, "update_record", boom):
+            self.msg("OK", event="ok-1")
+        self.msg("ラベル 放棄 No.17 依頼者")
+        self.assertIn("回収して添付しました", self.msg("OK", event="ok-2"))
+        self.msg("ラベル 放棄 No.18 依頼者")                  # 面 2 の pending を張って E1 を再配送
+        self.assertEqual(self.msg("OK", event="ok-1"), lp.MSG_DUPLICATE_EVENT)
+        self.assertEqual(jobs_all(), [(1, "ok-1", 1, "attached", "fk-new-1")])
+        self.assertEqual(len(self.uploads), 1)
+        self.assertEqual(run(label_sheet.get_state()).pending, (1,))
+
+    def test_lpf1_04_undo_after_reprint_via_line(self):
+        """面 1 印刷済 → 面 1 明示で再印字 → 印刷済 → 戻す → 面 1 は used のまま・最初の printed は printed のまま"""
+        self.msg("ラベル 放棄 No.17 依頼者")
+        self.msg("OK", event="ok-1")
+        self.msg("ラベル 印刷済", event="op-1")
+        self.assertIn("面 1 は使用済み（再印字）", self.msg("ラベル 放棄 No.17 依頼者 面 1"))
+        self.msg("OK", event="ok-2")
+        self.assertIn("面 1 を使用済みにしました", self.msg("ラベル 印刷済", event="op-2"))
+        self.assertEqual(self.msg("ラベル 戻す", event="op-u"),
+                         "直前の消費（面 1）を取り消しました（面 1 は再印字のため使用済みのまま）。"
+                         "シート S-1（10 面）: 使用済み 1 面（1）・印刷待ち 0 面（なし）・残り 9 面")
+        self.assertEqual([(j[1], j[3]) for j in jobs_all()], [("ok-1", "printed"), ("ok-2", "undone")])
+        self.assertTrue(self.msg("ラベル 放棄 No.18 依頼者").startswith("No.18（相続放棄）・依頼者・面 2/10"))
 
     # ── LP-03 ────────────────────────────────────────────────
     def test_lp03_concurrent_attach_merges_both_pdfs(self):
@@ -901,7 +1236,7 @@ class TestFlow(_KintoneMixin, _DbMixin):
         self.msg("ラベル 放棄 No.17 依頼者")
         self.conflict_inject = ["e1", "e2", "e3"]
         self.assertEqual(self.msg("OK", event="ok-1"), lp.MSG_ATTACH_CONFLICT)
-        self.assertEqual(jobs_all(), [(1, "ok-1", 1, "reserved", "fk-new-1")])
+        self.assertEqual(jobs_all(), [(1, "ok-1", 1, "failed", "fk-new-1")])
         self.msg("ラベル 放棄 No.17 依頼者")
         self.assertIn("回収して添付しました", self.msg("OK", event="ok-2"))
         self.assertEqual(len(self.uploads), 1)
@@ -1021,7 +1356,7 @@ class TestFlow(_KintoneMixin, _DbMixin):
         self.assert_no_pii(self.notify.call_args.args[0])
         self.assertIn("案件No.17", self.notify.call_args.args[0])
         self.assertEqual(self.updates, [])
-        self.assertEqual(jobs_all(), [(1, "ok-1", 1, "reserved", "")])
+        self.assertEqual(jobs_all(), [(1, "ok-1", 1, "failed", "")])            # A4: 例外 → failed を確定
 
     def test_other_instructions_still_go_through_parser(self):
         reply = self.msg("鈴木さんに送付案内を作って")
