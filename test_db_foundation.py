@@ -250,6 +250,43 @@ class TestAlembicScaffold(unittest.TestCase):
         finally:
             shutil.rmtree(d, ignore_errors=True)
 
+
+    def test_shindan_link_migration_round_trip(self):
+        """SHINDAN-LINE-LINK-1 T9: shindan_link（a7d3f1c9e2b4・Revises e7a9c4d1f6b3）が
+        空 DB で up→down 往復できること（alembic 起動が許可された本ファイルに置く・D2）。"""
+        import sqlite3
+        import tempfile
+        d = tempfile.mkdtemp(prefix="shindan_link_mig_")
+        dbfile = f"{d}/mig.db"
+        env = {**os.environ, "DATABASE_URL": f"sqlite:///{dbfile}",
+               "PYTHONIOENCODING": "utf-8"}
+
+        def alembic(*args):
+            return subprocess.run(
+                [sys.executable, "-m", "alembic", *args],
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                cwd=REPO, env=env, timeout=180)
+
+        def tables():
+            con = sqlite3.connect(dbfile)
+            try:
+                return {r[0] for r in con.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'")}
+            finally:
+                con.close()
+
+        try:
+            up = alembic("upgrade", "head")
+            self.assertEqual(up.returncode, 0, f"stderr={up.stderr[-500:]}")
+            self.assertIn("shindan_link", tables())
+            self.assertIn("a7d3f1c9e2b4", alembic("current").stdout)
+            down = alembic("downgrade", "e7a9c4d1f6b3")
+            self.assertEqual(down.returncode, 0, f"stderr={down.stderr[-500:]}")
+            self.assertNotIn("shindan_link", tables())
+            self.assertIn("e7a9c4d1f6b3", alembic("current").stdout)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
     def test_ini_has_no_url(self):
         """接続URLを ini に書かない（secret を ini に置かない・D4）"""
         text = (REPO / "alembic.ini").read_text(encoding="ascii")

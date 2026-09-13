@@ -69,9 +69,27 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from hub import image_store
 from hub import kintone as hub_kintone
 from hub import notify
+from hub import shindan_link
 from hub.redact import emit
 
 logger = logging.getLogger("shindan")
+
+# ── SHINDAN-LINE-LINK-1: 本人専用リンク（k=token）で開いたフォーム ──────────────────
+# D. GET /shindan?k=: token 有効なら通常どおりフォーム（HTML 不変）を表示し、POST が
+#    同じ token を運べるよう cookie（HttpOnly・Secure・SameSite=Lax・path=/shindan）に載せる。
+#    無効・期限切れ・使用済み・k なしは k なしのフォームとして扱う（エラー画面なし）
+# E. POST（k 有効）: 判定は不変。書込は line_user_id の App 21 レコードへ空欄のみ CAS、
+#    無ければ現状と同じレコード+LINEユーザーID で作成（受付番号は発行しない）。
+#    書込成功後に used_at。失敗は used_at 未打刻・判定結果のみ表示・ERROR 1 行
+# F. k なしの POST は完全に現状維持
+LINK_COOKIE = "shindan_k"
+LINKED_DONE_TEXT = "診断結果を承りました。LINE のトーク画面にお戻りください。"
+LINK_WRITE_FAILED_REASON = "shindan_link_write_failed"
+# 既存レコードへ空欄のみ書く欄（診断パターン+4 問の回答欄。RADIO は常に値があるため対象外）
+_LINKED_UPDATE_FIELDS = ("診断パターン", "問い合わせ業者名", "借入時期_テキスト",
+                         "最終返済日_テキスト", "裁判所書類")
+_LINKED_CAS_REFETCH = 1
+_NUMBER_LINE = "\n受付番号：{受付番号}"
 
 router = APIRouter()
 
@@ -410,6 +428,15 @@ def result_text(pattern: str, number: str) -> str:
     return FROZEN_RESULTS[pattern].replace("{受付番号}", number)
 
 
+def result_text_linked(pattern: str) -> str:
+    """SHINDAN-LINE-LINK-1 E-4: 受付番号を発行・表示しないため、凍結文言の末尾
+    「受付番号：…」行だけを外した本文（残りは凍結文言の逐語・prefix であることを
+    test が pin）。"""
+    text = FROZEN_RESULTS[pattern]
+    assert text.endswith(_NUMBER_LINE)
+    return text[: -len(_NUMBER_LINE)]
+
+
 # ── HTML（外部アセットなし・JS 必須にしない・モバイルファースト） ─────────────────
 _PAGE_STYLE = """
   body{margin:0;padding:16px;background:#f7f5f0;color:#333;
@@ -517,6 +544,19 @@ def _result_html(pattern: str, number: str, line_url: str,
     return _page("診断結果", body)
 
 
+def _result_html_linked(pattern: str, upload_token: str = "") -> str:
+    """SHINDAN-LINE-LINK-1 E-4: 受付番号なし・LINE 登録案内なし。固定文言
+    LINKED_DONE_TEXT と写真送信（任意）の導線のみ。書込失敗時（upload_token 空）は
+    判定結果のみ。"""
+    text_html = html.escape(result_text_linked(pattern)).replace("\n", "<br>")
+    body = f"<h1>診断結果</h1><p class=\"num\">{text_html}</p>"
+    if upload_token:
+        body += (f"<p>{LINKED_DONE_TEXT}</p>"
+                 + _photo_section_html(upload_token))
+    body += f"<p class=\"note\">{FROZEN_NOTE}</p>"
+    return _page("診断結果", body)
+
+
 def _photo_done_html(count: int, line_url: str) -> str:
     """完了画面（固定文言+枚数のみ・入力値は反射しない）。"""
     body = (
@@ -551,7 +591,16 @@ async def shindan_entry(request: Request):
     # ② メソッド: GET/HEAD=フォーム表示・POST=送信・他=404
     method = request.method.upper()
     if method in ("GET", "HEAD"):
-        return HTMLResponse(_form_html())
+        # SHINDAN-LINE-LINK-1 D: k 有効なら同じフォーム HTML + token を cookie へ
+        link = await _link_from_request(request, use_cookie=False)
+        resp = HTMLResponse(_form_html())
+        if link is not None:
+            remaining = max(1, int((link["expires_at"]
+                                    - shindan_link._now()).total_seconds()))
+            resp.set_cookie(LINK_COOKIE, link["token"], max_age=remaining,
+                            path=shindan_link.FORM_PATH, httponly=True,
+                            secure=True, samesite="lax")
+        return resp
     if method != "POST":
         return _not_found()
     # ③ Content-Type/Content-Length（urlencoded のみ・上限超過/欠落は 404）
@@ -574,7 +623,29 @@ async def shindan_entry(request: Request):
         return _fixed_page(
             "入力内容をご確認ください",
             "入力内容を確認して、もう一度お試しください。", 400)
-    return await _handle_submit(form)
+    # SHINDAN-LINE-LINK-1: k（クエリ or cookie）が有効なときだけ紐付け経路
+    link = await _link_from_request(request, use_cookie=True)
+    return await _handle_submit(form, link)
+
+
+async def _link_from_request(request: Request, *, use_cookie: bool) -> dict | None:
+    """クエリ k（POST は cookie も可）の token を照合。無効・期限切れ・使用済み・
+    照合失敗は None（=k なしと同じ扱い）。ログは固定語彙+token 先頭 4 文字。"""
+    token = str(request.query_params.get(shindan_link.QUERY_KEY, "") or "").strip()
+    if not token and use_cookie:
+        token = str(request.cookies.get(LINK_COOKIE, "") or "").strip()
+    if not token:
+        return None
+    try:
+        link = await shindan_link.lookup(token)
+    except Exception:
+        logger.warning("[SHINDAN] link lookup failed (treated as no link)")
+        return None
+    if link is None:
+        logger.info("[SHINDAN] link invalid head=%s",
+                    emit(shindan_link.token_head(token), "record_id", "log",
+                         "operator"))
+    return link
 
 
 async def shindan_alias_not_found(request: Request, _rest: str = ""):
@@ -821,7 +892,7 @@ router.add_api_route("/shindan/{_rest:path}", shindan_alias_not_found,
                      methods=_ENTRY_METHODS, include_in_schema=False)
 
 
-async def _handle_submit(form: dict[str, str]):
+async def _handle_submit(form: dict[str, str], link: dict | None = None):
     creditor = str(form.get("creditor", "") or "").strip()
     borrow = form.get("borrow", "")
     last_pay = form.get("last_pay", "")
@@ -863,6 +934,9 @@ async def _handle_submit(form: dict[str, str]):
         "ラジオボタン_3": "不明",                          # 業者への電話有無
         "ラジオボタン_4": "不明",                          # アンケート・書面送付有無
     }
+    if link is not None:
+        # SHINDAN-LINE-LINK-1 E: 本人専用リンク経由（k なしの経路は以下不変）
+        return await _handle_submit_linked(pattern, fields_base, link)
     number = ""
     record_id = ""
     outcome = "duplicate"
@@ -906,3 +980,75 @@ async def _handle_submit(form: dict[str, str]):
     return HTMLResponse(_result_html(
         pattern, number, os.environ.get(_LINE_URL_ENV, "").strip(),
         upload_token))
+
+
+# ── SHINDAN-LINE-LINK-1 E: 本人専用リンク経由の書込（受付番号なし・二重レコードなし） ──
+def _v(record: dict, code: str) -> str:
+    return str(((record or {}).get(code) or {}).get("value") or "").strip()
+
+
+async def _update_existing_linked(record: dict, values: dict) -> tuple[str, str]:
+    """E-1: 空欄のみ・$revision CAS・409 は再取得 1 回。戻り値 (outcome, record_id)。
+    outcome: updated / noop / unconverged / failed。"""
+    rid = _v(record, "$id")
+    latest = record
+    for _attempt in range(_LINKED_CAS_REFETCH + 1):
+        to_write = {c: v for c, v in values.items()
+                    if c in _LINKED_UPDATE_FIELDS and str(v or "").strip()
+                    and not _v(latest, c)}
+        if not to_write:
+            return "noop", rid
+        try:
+            await hub_kintone.update_record(
+                APP_JIKOU_CASE, rid, to_write, revision=_v(latest, "$revision") or None)
+            return "updated", rid
+        except hub_kintone.KintoneConflict:
+            try:
+                latest = await hub_kintone.get_record(APP_JIKOU_CASE, rid)
+            except hub_kintone.KintoneError:
+                return "failed", rid
+        except hub_kintone.KintoneError:
+            return "failed", rid
+    return "unconverged", rid
+
+
+async def _handle_submit_linked(pattern: str, fields_base: dict, link: dict):
+    line_user_id = str(link.get("line_user_id") or "")
+    token = str(link.get("token") or "")
+    # 本人のレコード特定は hub 側（LINEユーザーID 検索 limit 2・ちょうど 1 件）
+    record, method = await shindan_link.find_user_record(APP_JIKOU_CASE, line_user_id)
+    outcome, record_id = "failed", ""
+    if method == "found":
+        outcome, record_id = await _update_existing_linked(record, fields_base)
+    elif method == "none":
+        # E-2: 現状のフォーム保存と同じレコード + LINEユーザーID（受付番号は発行しない）
+        try:
+            record_id = await hub_kintone.create_record(
+                APP_JIKOU_CASE, {**fields_base, "LINEユーザーID": line_user_id})
+            outcome = "created"
+        except hub_kintone.KintoneError as e:
+            logger.warning("[SHINDAN] linked create failed code=%s",
+                           emit(e.code, "vendor_raw", "log", "operator"))
+            outcome = "failed"
+    if outcome not in ("updated", "noop", "created"):
+        # E-3: used_at は打たない・判定結果のみ・ERROR 1 行（固定理由+token 先頭 4 文字）
+        logger.error("[SHINDAN] shindan_link_write_failed head=%s",
+                     emit(shindan_link.token_head(token), "record_id", "log",
+                          "operator"))
+        return HTMLResponse(_result_html_linked(pattern))
+    try:
+        await shindan_link.mark_used(token)
+    except Exception:
+        logger.warning("[SHINDAN] link used_at not recorded (write done)")
+    logger.info("[SHINDAN] linked write ok record_id=%s pattern=%s",
+                emit(record_id, "record_id", "log", "operator"),
+                emit(pattern, "freetext", "log", "operator"))
+    attorney_id = os.environ.get("ATTORNEY_LINE_USER_ID", "")
+    if attorney_id:
+        sent = await notify.notify_business(
+            attorney_id,
+            f"【時効診断フォーム受付】案件レコードNo:{record_id} 診断パターン:{pattern}")
+        if not sent:
+            logger.warning("[SHINDAN] attorney notify failed (record saved)")
+    upload_token = issue_upload_token(record_id, f"L{record_id}", time.time())
+    return HTMLResponse(_result_html_linked(pattern, upload_token))
