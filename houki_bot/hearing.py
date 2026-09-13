@@ -26,7 +26,9 @@ import logging
 
 from hub import houki_case_store
 from hub import houki_phone_triage
+from hub import human_reply_intake
 from hub import image_intake
+from hub import notify
 from hub import reply_sanitizer
 from hub.houki_profile import (
     HEARING_TEMPLATE_BLOCKS_HOUKI,
@@ -217,8 +219,10 @@ async def _converse(user_id: str, record: dict | None,
 
 
 async def handle_houki_hearing(reply_token: str, user_id: str,
-                               user_text: str) -> None:
-    """相続放棄ヒアリングのメインエントリ（router から BackgroundTasks で実行）。"""
+                               user_text: str, event_id: str = "") -> None:
+    """相続放棄ヒアリングのメインエントリ（router から BackgroundTasks で実行）。
+    event_id（HUMAN-REPLY-INTAKE-1）: LINE の webhookEventId（router が渡す・
+    返答取込の冪等キー。空=取込は実行しない）。"""
     if autoreply_paused():
         logger.info("[HOUKI_HEARING] paused (global brake) userId=%s...",
                     emit(user_id[:10], "record_id", "log", "operator"))
@@ -232,13 +236,41 @@ async def handle_houki_hearing(reply_token: str, user_id: str,
     # 次のテキスト受信時に回収（内部で例外を握る・会話を道連れにしない）
     await image_intake.heal_unreplied("houki", HOUKI_CHANNEL, user_id)
 
+    try:
+        await _hearing_turn(reply_token, user_id, user_text)
+    finally:
+        # HUMAN-REPLY-INTAKE-1: 返答単独判定の取込（人対応ゲートの影響を受けず、
+        # ヒアリング側の書込の**後**に走る=取込は空欄のみで譲る。例外は module
+        # 内で握る）
+        await human_reply_intake.run_houki(user_id, user_text, event_id)
+
+
+async def _hearing_turn(reply_token: str, user_id: str, user_text: str) -> None:
+    record = await houki_case_store.fetch_case(user_id)
+
+    # HUMAN-REPLY-INTAKE-1 裁定 3: 人対応ゲート（App 40 response_mode=人対応）。
+    # 時効（main.py の HUMAN_MODE）と同じ挙動: 顧客へは一切送信せず、App 28 に
+    # 受信を記録（category 空・auto_sent=no）し、管理者へ通知（氏名・本文は
+    # emit で抑止・レコード No のみ可視）。フィールド無し・空は「自動」
+    if record is not None and str(
+            (record.get("response_mode") or {}).get("value") or "") == "人対応":
+        logger.info("[HOUKI_HEARING] human mode → silent (record only) userId=%s...",
+                    emit(user_id[:10], "record_id", "log", "operator"))
+        await save_to_chatlog(user_id, "user", user_text, "", "no")
+        display_name = str((record.get("顧客名") or {}).get("value") or "") or user_id
+        await notify.notify_admin_line(
+            "【人対応中】"
+            f"{emit(display_name, 'name', 'line_business', 'attorney')}"
+            f"：{emit(user_text, 'freetext', 'line_business', 'attorney')}\n"
+            "相続放棄案件レコードNo: "
+            f"{emit(str((record.get('$id') or {}).get('value') or ''), 'record_id', 'line_business', 'attorney')}")
+        return
+
     history = conversation_histories.setdefault(user_id, [])
     if not history:
         history.extend(await get_recent_chat_history(user_id))
     history.append({"role": "user", "content": user_text})
     del history[:-_MAX_HISTORY_TURNS * 2]
-
-    record = await houki_case_store.fetch_case(user_id)
 
     # H-4 自己修復発火: 遷移済み（電話判断待ち）なのに判定未了（電話推奨度が
     # 空）＝通知前クラッシュ等の取りこぼしを次の受信で拾う（冪等キーは判定側）

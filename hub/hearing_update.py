@@ -94,12 +94,15 @@ async def resolve_record_id(user_id: str, memory_id) -> tuple[str, str]:
     return rid, METHOD_SEARCH
 
 
-async def apply_update(record_id: str, fields: dict) -> dict:
+async def apply_update(record_id: str, fields: dict,
+                       allowed: frozenset = UPDATE_FIELDS) -> dict:
     """許可集合内・非空の値を、最新レコードで空欄の欄にだけ $revision CAS で書く。
-    戻り値: {"outcome", "written", "preexisting", "dropped"}（欄コードのみ・値なし）。"""
+    戻り値: {"outcome", "written", "preexisting", "dropped"}（欄コードのみ・値なし）。
+    allowed（HUMAN-REPLY-INTAKE-1）: 許可集合の差し替え。既定=UPDATE_FIELDS
+    （KINTONE_UPDATE 経路の挙動不変）。"""
     candidate = {k: str(v).strip() for k, v in (fields or {}).items()
-                 if k in UPDATE_FIELDS and str(v or "").strip()}
-    dropped = sorted(k for k in (fields or {}) if k not in UPDATE_FIELDS)
+                 if k in allowed and str(v or "").strip()}
+    dropped = sorted(k for k in (fields or {}) if k not in allowed)
     written: list[str] = []
     preexisting: list[str] = []
     outcome = OUTCOME_UNCONVERGED

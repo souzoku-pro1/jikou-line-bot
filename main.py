@@ -206,6 +206,7 @@ from hub import image_intake  # noqa: E402
 from hub import image_store  # noqa: E402  JIKOU-FORM-3: 受信書類写真の取得+添付
 from hub import form_link  # noqa: E402  JIKOU-FORM-2: 受付番号による LINE 紐付け
 from hub import hearing_update  # noqa: E402  JIKOU-HEARING-HOTFIX-1: 第 2 段階の書込
+from hub import human_reply_intake  # noqa: E402  HUMAN-REPLY-INTAKE-1: 返答単独判定の取込
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 KINTONE_SUBDOMAIN = os.environ["KINTONE_SUBDOMAIN"]
 KINTONE_APP_ID = os.environ["KINTONE_APP_ID"]
@@ -1049,6 +1050,14 @@ async def _process_line_event(reply_token: str, user_id: str, user_text: str) ->
                      emit(user_id, "external_ref", "log", "operator"))
         logger.error("[ERROR] traceback: %s",
                      emit(traceback.format_exc(), "vendor_raw", "log", "operator"))
+    finally:
+        # HUMAN-REPLY-INTAKE-1: 返答単独判定の取込（ヒアリング中／人対応／完了後の
+        # いずれでも。全体停止・停止リストは上の早期 return で本 try に入らない）。
+        # ヒアリング側の書込の**後**に走らせ、取込は「空欄のみ」で譲る。冪等キーは
+        # durable lane の event id（非 durable 文脈=None は実行しない）。例外は
+        # module 内で握る=顧客への返信を道連れにしない
+        await human_reply_intake.run_jikou(user_id, user_text,
+                                           _durable_event_id.get())
 
 
 class ImageChatlogConfigError(RuntimeError):
