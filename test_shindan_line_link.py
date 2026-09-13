@@ -234,13 +234,17 @@ class TestFrozenTexts(unittest.TestCase):
         self.assertEqual(sl.FORM_PATH, "/shindan")
         self.assertEqual(sf.LINK_WRITE_FAILED_REASON, "shindan_link_write_failed")
 
-    def test_public_base_url(self):
+    def test_public_base_url_env_only(self):
+        # fix1 SLL-01: RAILWAY_PUBLIC_DOMAIN のみ・未設定/空/不正形は空文字（fail-closed）
         with patch.dict(os.environ, {"RAILWAY_PUBLIC_DOMAIN": PUBLIC_DOMAIN}):
-            self.assertEqual(sl.public_base_url("other.host"), "https://" + PUBLIC_DOMAIN)
+            self.assertEqual(sl.public_base_url(), "https://" + PUBLIC_DOMAIN)
         with patch.dict(os.environ, {"RAILWAY_PUBLIC_DOMAIN": ""}):
-            self.assertEqual(sl.public_base_url("host.example"), "https://host.example")
-            self.assertEqual(sl.public_base_url(""), "")
-            self.assertEqual(sl.public_base_url("bad/host"), "")
+            self.assertEqual(sl.public_base_url(), "")
+        with patch.dict(os.environ, {"RAILWAY_PUBLIC_DOMAIN": "bad/host"}):
+            self.assertEqual(sl.public_base_url(), "")
+        os.environ.pop("RAILWAY_PUBLIC_DOMAIN", None)
+        self.assertEqual(sl.public_base_url(), "")
+        self.assertEqual(sl.NO_PUBLIC_HOST_REASON, "shindan_link_no_public_host")
 
 
 # ── T2/T3: follow → 1 回送信・再配送 0・unfollow 0・token は不透明 ─────────────────
@@ -310,12 +314,32 @@ class TestFollow(_DbBase):
         self.send.assert_not_awaited()
         self.assertEqual(self.rows(), [])                          # token も発行しない
 
-    def test_no_public_host_no_send(self):
-        with patch.dict(os.environ, {"RAILWAY_PUBLIC_DOMAIN": ""}):
-            body, sig = _event_body("follow", "01FOLLOWH")
-            self.client.post("/webhook", content=body,
-                             headers={"X-Line-Signature": sig, "host": ""})
+    def test_no_public_host_no_send_no_token_info_line(self):
+        # fix1 SLL-01: env 未設定は Host ヘッダがあっても送らない・token も発行しない
+        os.environ.pop("RAILWAY_PUBLIC_DOMAIN", None)
+        body, sig = _event_body("follow", "01FOLLOWH")
+        resp = self.client.post("/webhook", content=body,
+                                headers={"X-Line-Signature": sig,
+                                         "host": "evil.example", "x-forwarded-host": "evil.example"})
+        self.assertEqual(resp.status_code, 200)
         self.send.assert_not_awaited()
+        self.assertEqual([r for r in self.rows()], [])            # DB 行 0
+        infos = [r.getMessage() for r in self.cap.records
+                 if "shindan_link_no_public_host" in r.getMessage()]
+        self.assertEqual(len(infos), 1)
+        self.assertEqual(self.cap.records[[r.getMessage() for r in self.cap.records].index(infos[0])].levelno,
+                         logging.INFO)
+        self.assertNotIn(USER, self.cap.text())
+        # 設定済みなら従来どおり（Host ヘッダの別ドメインは URL に現れない）
+        with patch.dict(os.environ, {"RAILWAY_PUBLIC_DOMAIN": PUBLIC_DOMAIN}):
+            body2, sig2 = _event_body("follow", "01FOLLOWH2")
+            self.client.post("/webhook", content=body2,
+                             headers={"X-Line-Signature": sig2, "host": "evil.example",
+                                      "x-forwarded-host": "evil.example"})
+        self.assertEqual(self.send.await_count, 1)
+        url = self.send.await_args.args[2].splitlines()[1]
+        self.assertTrue(url.startswith(f"https://{PUBLIC_DOMAIN}/shindan?k="))
+        self.assertNotIn("evil.example", url)
 
     def test_non_durable_still_sends(self):
         with patch.dict(os.environ, {"INBOUND_EVENT_DURABLE_ENABLED": "0"}):

@@ -9,7 +9,7 @@
  C. URL は既存 /shindan にクエリ k=token を付けるだけ
  G. 管理者通知は出さない。ログは固定語彙のみ（token は先頭 4 文字まで・userId 全文は出さない）
  H. 新規 env なし。公開ホストは Railway が注入する RAILWAY_PUBLIC_DOMAIN（既存の platform 変数）
-    を優先し、無ければ webhook リクエストの Host ヘッダ（LINE→Railway edge 経由=公開ホスト）
+    のみ（fix1 SLL-01: リクエスト由来の Host 等は使わない・未設定は fail-closed で送らない）
 """
 
 import datetime
@@ -67,10 +67,14 @@ def _aware(dt) -> datetime.datetime | None:
     return dt
 
 
-def public_base_url(host_header: str = "") -> str:
-    """リンクの基底 URL（https 固定）。RAILWAY_PUBLIC_DOMAIN → Host ヘッダの順。
-    どちらも無ければ空文字（呼び出し側は送信しない）。"""
-    domain = os.environ.get(_PUBLIC_DOMAIN_ENV, "").strip() or str(host_header or "").strip()
+NO_PUBLIC_HOST_REASON = "shindan_link_no_public_host"
+
+
+def public_base_url() -> str:
+    """リンクの基底 URL（https 固定）。fix1（SLL-01）: RAILWAY_PUBLIC_DOMAIN **のみ**。
+    未設定・空・不正形は空文字＝呼び出し側は token を発行せず送らない（fail-closed）。
+    Host / X-Forwarded-Host 等のリクエスト由来の値は一切使わない。"""
+    domain = os.environ.get(_PUBLIC_DOMAIN_ENV, "").strip()
     if not domain or "/" in domain or " " in domain:
         return ""
     return f"https://{domain}"

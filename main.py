@@ -1306,7 +1306,7 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
 
     for event in data.get("events", []):
         if event.get("type") != "message":
-            await _queue_follow_event(event, body, background_tasks, _durable, request.headers.get("host", "")); continue  # SHINDAN-LINE-LINK-1（follow のみ・他は無視）
+            await _queue_follow_event(event, body, background_tasks, _durable); continue  # SHINDAN-LINE-LINK-1（follow のみ・他は無視）
         if event["message"].get("type") == "image":
             # AUTOREPLY-GEN2 要件4: 画像は固定受領応答+弁護士通知のみ
             # （AI に画像内容の判断はさせない・画像読解は別票。durable lane
@@ -2172,11 +2172,12 @@ app.include_router(webapp_router)
 #     同じく非 durable（冪等キーなし）
 #   - 全体停止・停止リストは送らない（顧客 Bot の自動送信の規律を共用）
 #   - 管理者通知なし・ログは固定語彙のみ（token 先頭 4 文字・userId は emit 抑止）
+#   - fix1 SLL-01: 公開ホストは RAILWAY_PUBLIC_DOMAIN のみ（Host ヘッダ等は使わない・未設定=送らない）
 #   ※ 本節は main.py 末尾に置く（sink allowlist の file:line 番地を動かさない）
 # ══════════════════════════════════════════════════════════════
 
 async def _queue_follow_event(event: dict, body: bytes, background_tasks: BackgroundTasks,
-                              durable: bool, host_header: str) -> None:
+                              durable: bool) -> None:
     if event.get("type") != "follow":
         return
     user_id = str((event.get("source") or {}).get("userId", "") or "")
@@ -2188,7 +2189,7 @@ async def _queue_follow_event(event: dict, body: bytes, background_tasks: Backgr
         "evt-" + hashlib.sha256(
             json.dumps(event, sort_keys=True, ensure_ascii=False).encode()
         ).hexdigest()[:32])
-    base_url = shindan_link.public_base_url(host_header)
+    base_url = shindan_link.public_base_url()          # fix1 SLL-01: env のみ（fail-closed）
     if durable:
         from hub.durable_inbound import record_line_event
         try:
@@ -2224,7 +2225,8 @@ async def _process_follow_event(reply_token: str, user_id: str, event_id: str,
         elif await autoreply_stoplist.is_suppressed(user_id):
             logger.info("[FOLLOW] suppressed (stoplist・no send)")
         elif not base_url:
-            logger.warning("[FOLLOW] public base url unavailable (no send)")
+            # fix1 SLL-01: 公開ホスト未設定は token を発行せず送らない（固定語彙 1 行）
+            logger.info("[FOLLOW] shindan_link_no_public_host (no send)")
         else:
             token = await shindan_link.issue(user_id)
             await _line_reply_with_fallback(
