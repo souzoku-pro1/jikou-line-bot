@@ -46,6 +46,9 @@ class TaskSpec:
                                            # (message, record_id, record_url) を返す）
     # ── P3-003-CMD 追加: 語彙一覧の可視条件（flag 連動。None=常に掲載＝既存不変）──
     visible_fn: Callable | None = None     # False を返す間は catalog に載せない
+    # ── LABEL-PRINT-1 追加: 決定論の直接一致（指示文がこの関数で True なら Claude 解析を
+    #    経ずに intent=task/この task_type として扱う。None=従来どおり解析・既存不変）──
+    direct_match_fn: Callable | None = None
 
 
 TASK_REGISTRY: dict[str, TaskSpec] = {}
@@ -351,4 +354,33 @@ register(TaskSpec(
     flow_reply_fn=heir_cancel_task.flow_reply,
     execute_fn=heir_cancel_task.execute,
     visible_fn=heir_cancel_enabled,   # flag OFF の間は語彙一覧に載せない（P3-003-CMD の型）
+))
+
+
+# ── 宛名ラベル印字（LABEL-PRINT-1。フローは dispatch_bot/label_print_task.py に隔離）──
+from dispatch_bot import label_print_task  # noqa: E402（循環回避のため末尾 import）
+
+register(TaskSpec(
+    task_type="label_print",
+    display_name="宛名ラベルの印字",
+    answer_only=False,
+    destination="case_attachment",  # 案件レコードの FILE 欄「宛名ラベル」へ添付（App 30 起票なし）
+    run_at="railway",
+    risk="低",  # kintone 内部のみ（案件レコードへの PDF 添付と DB の残量更新。対外送信なし）
+    auto_scope="宛名ラベル PDF（1 面）の生成と案件レコード「宛名ラベル」欄への添付まで",
+    approval_scope="なし（印刷は人。面の消費は「ラベル 印刷済」の人の操作のみ）",
+    required_fields=[],  # 構文（案件No・宛先種類・面）はタスク側で決定論に解析
+    search_apps=[],
+    artifacts="案件レコード（App 21/26/40）宛名ラベル 欄の PDF＋DB label_sheet_state",
+    adapter="LabelPrint",
+    on_failure="失敗は固定文言で LINE 返信（氏名・住所は載せない・RV-10）",
+    hint_for_parser=("使いかけのラベルシート（A-one 31514・10 面）の指定面に宛名ラベル 1 面を"
+                     "印字する PDF を作り案件レコードへ添付する。「ラベル」で始まる指示のみ該当"
+                     "（例:「ラベル 放棄 No.17 依頼者」「ラベル 印刷済」「ラベル 残量」）。"
+                     "task_params は不要（構文はタスク側で解析する）"),
+    required_desc="なし（「ラベル 時効/相続/放棄 No.案件番号 依頼者|債権者 n|役所 市区町村名」の書式）",
+    flow_fn=label_print_task.flow,
+    flow_reply_fn=label_print_task.flow_reply,
+    execute_fn=label_print_task.execute,
+    direct_match_fn=label_print_task.is_label_instruction,
 ))

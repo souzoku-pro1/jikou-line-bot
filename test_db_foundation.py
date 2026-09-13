@@ -250,6 +250,105 @@ class TestAlembicScaffold(unittest.TestCase):
         finally:
             shutil.rmtree(d, ignore_errors=True)
 
+    def test_label_print_fix2_migration_from_partial_and_empty_states(self):
+        """LABEL-PRINT-1-fix2（c3d4e5f6a7b8）: 前リビジョン b2c3d4e5f6a7 が適用済み（運用データあり）でも
+        未適用（空 DB）でも安全に通る。inspector で存在確認・seed は無ければ挿入・再実行は no-op。
+        downgrade で label_sheet_op と旧 CHECK に戻る。"""
+        import sqlite3
+        import tempfile
+        d = tempfile.mkdtemp(prefix="label_fix2_mig_")
+        dbfile = f"{d}/mig.db"
+        env = {**os.environ, "DATABASE_URL": f"sqlite:///{dbfile}",
+               "PYTHONIOENCODING": "utf-8"}
+
+        def alembic(*args):
+            return subprocess.run(
+                [sys.executable, "-m", "alembic", *args],
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                cwd=REPO, env=env, timeout=120)
+
+        def q(sql):
+            con = sqlite3.connect(dbfile)
+            try:
+                return con.execute(sql).fetchall()
+            finally:
+                con.close()
+
+        def tables():
+            return {r[0] for r in q("SELECT name FROM sqlite_master WHERE type='table'")}
+
+        try:
+            # (1) 前リビジョン適用済み＋運用データあり
+            up = alembic("upgrade", "b2c3d4e5f6a7")
+            self.assertEqual(up.returncode, 0, f"stderr={up.stderr[-500:]}")
+            con = sqlite3.connect(dbfile)
+            con.execute("INSERT INTO label_sheet_state (sheet_id, layout, used_faces, history, updated_by) "
+                        "VALUES ('S-1','A4_2x5_aone31514','[]','[]','u')")
+            con.execute("INSERT INTO label_sheet_state (sheet_id, layout, used_faces, history, updated_by) "
+                        "VALUES ('S-2','A4_2x5_aone31514','[1]','[[1]]','u')")
+            con.execute("INSERT INTO label_sheet_op (event_id, kind, payload, result, sheet_id, created_by) "
+                        "VALUES ('e1','printed','{}','{\"faces\":[1]}','S-2','u')")
+            con.execute("INSERT INTO label_print_job (event_id, app, record, role, sheet_id, face, status) "
+                        "VALUES ('ok1','40','17','r','S-2',2,'reserved')")
+            con.commit()
+            con.close()
+            up = alembic("upgrade", "head")
+            self.assertEqual(up.returncode, 0, f"stderr={up.stderr[-500:]}")
+            self.assertIn("label_event", tables())
+            self.assertIn("label_sheet_control", tables())
+            self.assertNotIn("label_sheet_op", tables())
+            self.assertEqual(q("SELECT layout, current_sheet_id FROM label_sheet_control"),
+                             [("A4_2x5_aone31514", "S-2")])                       # 最新行を current に
+            self.assertEqual(q("SELECT sheet_id, sheet_no FROM label_sheet_state ORDER BY id"),
+                             [("S-1", 1), ("S-2", 2)])                            # sheet_no を backfill
+            self.assertEqual(q("SELECT event_id, kind, job_id FROM label_event"), [("e1", "printed", None)])
+            self.assertEqual(q("SELECT event_id, status, owner_token, lease_expires_at FROM label_print_job"),
+                             [("ok1", "reserved", "", None)])
+            ddl = q("SELECT sql FROM sqlite_master WHERE name='label_print_job'")[0][0]
+            self.assertIn("'failed'", ddl)
+            self.assertEqual(len(q("SELECT name FROM sqlite_master WHERE type='index' "
+                                   "AND name='uq_label_sheet_state_layout_sheet_no'")), 1)
+            con = sqlite3.connect(dbfile)
+            with self.assertRaises(sqlite3.IntegrityError):                      # (layout, sheet_no) 一意
+                con.execute("INSERT INTO label_sheet_state (sheet_id, layout, sheet_no, used_faces, history, updated_by) "
+                            "VALUES ('S-2','A4_2x5_aone31514',2,'[]','[]','u')")
+            con.execute("INSERT INTO label_print_job (event_id, app, record, role, sheet_id, face, status) "
+                        "VALUES ('ok2','40','17','r','S-2',3,'failed')")       # 新 CHECK で failed が通る
+            con.commit()
+            con.close()
+            # 再実行（head のまま）は no-op・seed が増えない
+            up = alembic("upgrade", "head")
+            self.assertEqual(up.returncode, 0, f"stderr={up.stderr[-500:]}")
+            self.assertEqual(len(q("SELECT * FROM label_sheet_control")), 1)
+            # downgrade → label_sheet_op 復元・イベント復写・failed は reserved へ・旧 CHECK
+            down = alembic("downgrade", "b2c3d4e5f6a7")
+            self.assertEqual(down.returncode, 0, f"stderr={down.stderr[-500:]}")
+            self.assertIn("label_sheet_op", tables())
+            self.assertNotIn("label_event", tables())
+            self.assertNotIn("label_sheet_control", tables())
+            self.assertEqual(q("SELECT event_id, kind FROM label_sheet_op"), [("e1", "printed")])
+            self.assertEqual(q("SELECT event_id, status FROM label_print_job ORDER BY id"),
+                             [("ok1", "reserved"), ("ok2", "reserved")])
+            cols = {r[1] for r in q("PRAGMA table_info(label_print_job)")}
+            self.assertFalse({"owner_token", "lease_expires_at"} & cols)
+            self.assertNotIn("'failed'", q("SELECT sql FROM sqlite_master WHERE name='label_print_job'")[0][0])
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+        # (2) 空 DB から head（前リビジョン未適用＝連鎖で適用）→ seed は current 空
+        d = tempfile.mkdtemp(prefix="label_fix2_mig_empty_")
+        dbfile = f"{d}/mig.db"
+        env["DATABASE_URL"] = f"sqlite:///{dbfile}"
+        try:
+            up = alembic("upgrade", "head")
+            self.assertEqual(up.returncode, 0, f"stderr={up.stderr[-500:]}")
+            self.assertEqual(q("SELECT layout, current_sheet_id FROM label_sheet_control"),
+                             [("A4_2x5_aone31514", "")])
+            self.assertEqual(q("SELECT count(*) FROM label_sheet_state"), [(0,)])
+            cur = alembic("current")
+            self.assertIn("c3d4e5f6a7b8 (head)", cur.stdout + cur.stderr)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
     def test_ini_has_no_url(self):
         """接続URLを ini に書かない（secret を ini に置かない・D4）"""
         text = (REPO / "alembic.ini").read_text(encoding="ascii")

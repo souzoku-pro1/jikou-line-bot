@@ -25,6 +25,7 @@ from hub.ingestion_receipt import metadata as ingestion_receipt_metadata  # noqa
 from hub.derivation_models import DerivationBase  # noqa: E402（P3-001・app-state 別 metadata）
 from hub.person_merge_journal import PersonMergeJournalBase  # noqa: E402（RV-08・操作台帳）
 from hub.qa_store import metadata as qa_store_metadata  # noqa: E402（Q-BATCH-1・Q&A台帳）
+from hub.label_sheet import metadata as label_sheet_metadata  # noqa: E402（LABEL-PRINT-1・ラベル残量）
 
 config = context.config
 
@@ -35,7 +36,8 @@ if config.config_file_name is not None:
 # 新しい app-state モデル群はそれぞれの metadata をこの list に加えること。
 target_metadata = [Base.metadata, heartbeat_metadata, service_auth_metadata,
                    ingestion_receipt_metadata, DerivationBase.metadata,
-                   PersonMergeJournalBase.metadata, qa_store_metadata]
+                   PersonMergeJournalBase.metadata, qa_store_metadata,
+                   label_sheet_metadata]
 
 
 def run_migrations_offline() -> None:
