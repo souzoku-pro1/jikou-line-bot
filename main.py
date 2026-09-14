@@ -205,6 +205,7 @@ from hub import line_channel as hub_line_channel  # noqa: E402
 from hub import image_intake  # noqa: E402
 from hub import image_store  # noqa: E402  JIKOU-FORM-3: 受信書類写真の取得+添付
 from hub import form_link  # noqa: E402  JIKOU-FORM-2: 受付番号による LINE 紐付け
+from hub import hearing_update  # noqa: E402  JIKOU-HEARING-HOTFIX-1: 第 2 段階の書込
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 KINTONE_SUBDOMAIN = os.environ["KINTONE_SUBDOMAIN"]
 KINTONE_APP_ID = os.environ["KINTONE_APP_ID"]
@@ -929,7 +930,15 @@ async def _process_line_event(reply_token: str, user_id: str, user_text: str) ->
 
         # 第1段階：レコード新規作成
         clean_reply, kintone_record = extract_marker(claude_reply, "KINTONE_RECORD")
-        if kintone_record:
+        # JIKOU-HEARING-HOTFIX-1 [3]: マーカーは書込の成否にかかわらず送信前に
+        # 必ず除去する（閉じタグ不整合等で除去できない場合は従来どおり
+        # 送信ゲートの「内部マーカー残存」で降格=安全側は維持）
+        if clean_reply != claude_reply:
+            claude_reply = clean_reply
+            if not (isinstance(kintone_record, dict) and kintone_record):
+                # マーカーはあったが JSON として読めない=登録 0・通知のみ
+                await hearing_update.handle_update(user_id, None, kintone_record)
+        if isinstance(kintone_record, dict) and kintone_record:
             kintone_record["LINEユーザーID"] = user_id
             kintone_record["status"] = "問い合わせ"
             user_business_names[user_id] = kintone_record.get("問い合わせ業者名", "")
@@ -979,24 +988,28 @@ async def _process_line_event(reply_token: str, user_id: str, user_text: str) ->
                 logger.info("[KINTONE] RECORD created record_id=%s",
                             emit(record_id, "record_id", "log", "operator"))
             kintone_record_ids[user_id] = record_id
-            claude_reply = clean_reply
 
         # 第2段階：既存レコードを更新
+        # JIKOU-HEARING-HOTFIX-1: 書込先の解決は「in-memory 台帳にあれば使う →
+        # 無ければ LINEユーザーID で App 21 を検索（1 件のみ採用・0 件/複数件は
+        # 書かない）」（hub.hearing_update.resolve_record_id）。書込は空欄のみ・
+        # $revision CAS・409 は再取得 1 回（apply_update）。マーカーは書込の
+        # 成否にかかわらず送信前に除去し、結果は業務 LINE へ通知（値は載せない）
         clean_reply2, update_fields = extract_marker(claude_reply, "KINTONE_UPDATE")
-        if update_fields:
-            logger.info("[DEBUG] KINTONE_UPDATE detected (redacted)")
-            logger.info("[DEBUG] stored record_id for user: %s",
-                        emit(kintone_record_ids.get(user_id), "record_id", "log", "operator"))
-        if update_fields and user_id in kintone_record_ids:
-            await update_kintone_record(kintone_record_ids[user_id], update_fields)
+        if clean_reply2 != claude_reply:
             claude_reply = clean_reply2
-            hearing_completed.add(user_id)
+            logger.info("[DEBUG] KINTONE_UPDATE detected (redacted)")
+            record_id, _method = await hearing_update.handle_update(
+                user_id, kintone_record_ids.get(user_id), update_fields)
+            if record_id:
+                kintone_record_ids[user_id] = record_id
+                hearing_completed.add(user_id)
 
         # AUTOREPLY-GEN2 要件1/2: ヒアリング返信もサニタイズ+構成検証して
         # から送信。fatal（マーカー残存）・上限超過（定型テンプレブロックは
         # 免除）は自動送信せず承認キュー+現行定型で応答（切り詰めはしない）
         cleaned, _issues, _fatal = reply_sanitizer.sanitize_reply(
-            claude_reply, allowed_emoji=ALLOWED_CANONICAL_EMOJI)
+            claude_reply, allowed_emoji=ALLOWED_CANONICAL_EMOJI, exempt_blocks=HEARING_TEMPLATE_BLOCKS)  # GATE-EXEMPT-FIX-1
         # AUTOREPLY-STYLE-1-fix1 [B]: 弁護士本人の名乗り・見本の匿名化記号・
         # 旧見本由来の無根拠表現もヒアリング経路で承認降格（顧客対応と同一関数）
         violations = ((["プレースホルダ/内部マーカー残存"] if _fatal else [])
