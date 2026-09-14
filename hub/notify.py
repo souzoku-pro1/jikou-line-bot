@@ -228,6 +228,10 @@ def _log_throttled(throttle_key: str) -> None:
         logger.info("admin LINE notify throttled kind=houki_soufu_filed")
     elif head == "houki_soufu_needs_review":
         logger.info("admin LINE notify throttled kind=houki_soufu_needs_review")
+    elif head == "hearing_update_ok":
+        logger.info("admin LINE notify throttled kind=hearing_update_ok")
+    elif head == "hearing_update_review":
+        logger.info("admin LINE notify throttled kind=hearing_update_review")
     else:
         logger.info("admin LINE notify throttled kind=unknown_kind")
 
