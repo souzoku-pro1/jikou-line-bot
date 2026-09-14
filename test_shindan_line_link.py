@@ -84,6 +84,7 @@ class _FakeApp21:
         self._id = 100
         self.create_calls: list[dict] = []
         self.update_calls: list[tuple] = []
+        self.get_calls: list[str] = []
         self.conflict_next = 0
         self.create_fail_next = 0
 
@@ -112,6 +113,7 @@ class _FakeApp21:
         return [{"$id": r["$id"]} for r in out[:limit]]
 
     async def get_record(self, app, rid):
+        self.get_calls.append(str(rid))
         row = self.rows.get(str(rid))
         if row is None:
             raise hub_kintone.KintoneError(404, "GAIA_RE01", "not found")
@@ -341,10 +343,26 @@ class TestFollow(_DbBase):
         self.assertTrue(url.startswith(f"https://{PUBLIC_DOMAIN}/shindan?k="))
         self.assertNotIn("evil.example", url)
 
-    def test_non_durable_still_sends(self):
+    def test_non_durable_skipped_no_send_no_token(self):
+        # fix2 SLL-01: durable 無効は冪等キーを作れない=送らない・token も発行しない
         with patch.dict(os.environ, {"INBOUND_EVENT_DURABLE_ENABLED": "0"}):
-            self._post(*_event_body("follow", "01FOLLOWN"))
-        self.assertEqual(self.send.await_count, 1)
+            self.assertEqual(self._post(*_event_body("follow", "01FOLLOWN")).status_code, 200)
+        self.send.assert_not_awaited()
+        self.assertEqual(self.rows(), [])
+        infos = [r for r in self.cap.records
+                 if "shindan_link_skipped_non_durable" in r.getMessage()]
+        self.assertEqual(len(infos), 1)
+        self.assertEqual(infos[0].levelno, logging.INFO)
+
+    def test_missing_webhook_event_id_skipped(self):
+        # fix2 SLL-01: webhookEventId 欠落は代替 ID を生成せず送らない（durable ON でも）
+        body = json.dumps({"events": [{"type": "follow", "replyToken": "rt-x",
+                                       "source": {"userId": USER}}]}).encode()
+        self.assertEqual(self._post(body, _sign(body)).status_code, 200)
+        self.send.assert_not_awaited()
+        self.assertEqual(self.rows(), [])
+        self.assertEqual(len([r for r in self.cap.records
+                              if "shindan_link_skipped_non_durable" in r.getMessage()]), 1)
 
 
 # ── T4〜T8: フォーム側 ───────────────────────────────────────────────────────────
@@ -374,6 +392,12 @@ class _FormLinkBase(_DbBase):
 
     def used_at(self, token):
         return [r["used_at"] for r in self.rows() if r["token"] == token][0]
+
+    def claimed_at(self, token):
+        return [r["claimed_at"] for r in self.rows() if r["token"] == token][0]
+
+    def busy_lines(self):
+        return [r for r in self.cap.records if "shindan_link_claim_busy" in r.getMessage()]
 
     def post_linked(self, token, **over):
         data = dict(VALID)
@@ -407,7 +431,9 @@ class TestFormGet(_FormLinkBase):
         self.assertIsNone(r.cookies.get(sf.LINK_COOKIE))
         # 使用済み
         used = self.issue()
-        self.assertTrue(self.q(sl.mark_used(used)))
+        claimed = self.q(sl.claim(used))
+        self.assertIsNotNone(claimed)
+        self.assertTrue(self.q(sl.mark_used(used, claimed)))       # fix2: 自分の予約で確定
         r = self.client.get("/shindan", params={"k": used})
         self.assertEqual((r.status_code, r.text), (200, plain))
         self.assertIsNone(r.cookies.get(sf.LINK_COOKIE))
@@ -482,9 +508,21 @@ class TestFormPostLinked(_FormLinkBase):
         resp = self.post_linked(token)
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(len(self.fake.update_calls), 2)            # 初回+再取得後 1 回
+        # fix2 SLL-05: GET は find_user_record の 1 回 + 409 後の再取得 1 回のみ（2 回目の
+        # 409 では再取得しない=旧実装なら 3 回）
+        self.assertEqual(self.fake.get_calls, ["10", "10"])
+        self.fake.get_calls.clear()
+        self.fake.conflict_next = 2
+        outcome, _rid = _run(sf._update_existing_linked(
+            self.fake.rows["10"] and {k: dict(v) for k, v in self.fake.rows["10"].items()},
+            {"診断パターン": "B", "借入時期_テキスト": "x"}))
+        self.assertEqual(outcome, "unconverged")
+        self.assertEqual(self.fake.get_calls, ["10"])                # 単体でも再取得は 1 回
         self.assertIsNone(self.used_at(token))
-        self.assertNotIn(sf.LINKED_DONE_TEXT, resp.text)             # 判定結果のみ
-        self.assertNotIn(sf.PHOTO_ROUTE, resp.text)
+        self.assertIsNone(self.claimed_at(token))                    # fix2 SLL-02: 予約は解放
+        self.assertIn(sf.LINKED_DONE_TEXT, resp.text)                # fix2 SLL-04: 固定文言は常に表示
+        self.assertNotIn(sf.PHOTO_ROUTE, resp.text)                  # 写真導線なし（レコード未確定）
+        self.assertNotIn("受付番号", resp.text)
         self.assertIn("診断結果", resp.text)
         errs = self.cap.errors()
         self.assertEqual(len(errs), 1)
@@ -493,6 +531,13 @@ class TestFormPostLinked(_FormLinkBase):
         self.assertNotIn(token, errs[0])
         self.assertNotIn(USER, errs[0])
         self.notify_admin.assert_not_awaited()
+        # 解放済み=再 POST で再試行でき、今度は成功して used_at が入る
+        self.fake.conflict_next = 0
+        resp_retry = self.post_linked(token)
+        self.assertEqual(resp_retry.status_code, 200)
+        self.assertIsNotNone(self.used_at(token))
+        self.assertEqual(self.fake.val("10", "顧客名") if "顧客名" in self.fake.rows["10"] else "", "")
+        self.assertEqual(self.fake.val("10", "診断パターン"), "A")
         # 5xx（作成失敗）
         self.cap.records.clear()
         self.fake.rows.clear()
@@ -500,6 +545,7 @@ class TestFormPostLinked(_FormLinkBase):
         token2 = self.issue()
         self.post_linked(token2)
         self.assertIsNone(self.used_at(token2))
+        self.assertIsNone(self.claimed_at(token2))
         self.assertEqual(len(self.cap.errors()), 1)
         # 未使用のまま=再送可能
         self.assertIsNotNone(self.q(sl.lookup(token2)))
@@ -524,6 +570,127 @@ class TestFormPostLinked(_FormLinkBase):
         self.assertIn("受付番号：012345", resp.text)
         self.assertIn("友だち追加", resp.text)
         self.assertEqual(self.rows(), [])
+
+    # ── fix2 SLL-02: 同一 token の同時 POST は 1 本だけ書く ──────────────────────
+    def test_SLL02_concurrent_same_token_single_create(self):
+        token = self.issue()
+        link = self.q(sl.lookup(token, include_claimed=True))
+        self.assertIsNotNone(link)
+
+        async def _two():
+            return await asyncio.gather(sf._handle_submit(dict(VALID), link),
+                                        sf._handle_submit(dict(VALID), link))
+        r1, r2 = _run(_two())
+        db.reset_for_tests()
+        bodies = [r.body.decode("utf-8") for r in (r1, r2)]
+        self.assertEqual([r.status_code for r in (r1, r2)], [200, 200])
+        self.assertEqual(len(self.fake.create_calls), 1)            # App 21 作成 1 件
+        self.assertIsNotNone(self.used_at(token))                   # used_at 1 回
+        self.assertEqual(len(self.busy_lines()), 1)                 # busy INFO 1 行
+        self.assertEqual(self.busy_lines()[0].levelno, logging.INFO)
+        self.assertEqual(sorted(sf.PHOTO_ROUTE in b for b in bodies), [False, True])
+        for b in bodies:
+            self.assertIn(sf.LINKED_DONE_TEXT, b)
+            self.assertNotIn("受付番号", b)
+        self.assertNotIn(token, self.cap.text())
+
+    def test_SLL02_claimed_token_post_is_busy_not_plain(self):
+        # 予約中の token での POST は k なし経路へ落ちない（受付番号を発行しない）
+        token = self.issue()
+        self.assertIsNotNone(self.q(sl.claim(token)))
+        resp = self.post_linked(token)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(self.fake.create_calls, [])
+        self.assertEqual(self.fake.update_calls, [])
+        self.assertNotIn("受付番号", resp.text)
+        self.assertIn(sf.LINKED_DONE_TEXT, resp.text)
+        self.assertEqual(len(self.busy_lines()), 1)
+        self.assertIsNone(self.used_at(token))
+
+    def test_SLL02_claim_semantics(self):
+        token = self.issue()
+        c1 = self.q(sl.claim(token))
+        self.assertIsNotNone(c1)
+        self.assertIsNone(self.q(sl.claim(token)))                  # 予約中は取れない
+        self.assertIsNone(self.q(sl.lookup(token)))                 # GET 判定では無効
+        self.assertIsNotNone(self.q(sl.lookup(token, include_claimed=True)))
+        self.assertFalse(self.q(sl.mark_used(token, c1 + datetime.timedelta(seconds=1))))  # 他者の予約では確定不可
+        self.assertTrue(self.q(sl.release(token)))
+        self.assertIsNone(self.claimed_at(token))
+        c2 = self.q(sl.claim(token))
+        self.assertIsNotNone(c2)
+        self.assertTrue(self.q(sl.mark_used(token, c2)))
+        self.assertIsNone(self.q(sl.lookup(token, include_claimed=True)))   # 使用済み
+        self.assertEqual(sl.CLAIM_TTL_SEC, 120)
+        # TTL 超過の予約は取り直せる
+        token3 = self.issue()
+        old = sl._now() - datetime.timedelta(seconds=sl.CLAIM_TTL_SEC + 5)
+        self.assertIsNotNone(self.q(sl.claim(token3, now=old)))
+        self.assertIsNotNone(self.q(sl.claim(token3)))
+
+    # ── fix2 SLL-03: cookie の衛生 ───────────────────────────────────────────────
+    def _assert_cookie_deleted(self, resp):
+        sc = resp.headers.get("set-cookie", "")
+        self.assertIn(sf.LINK_COOKIE + "=", sc)
+        self.assertIn("Max-Age=0", sc)
+        self.assertIn("Path=/shindan", sc)
+        self.assertIsNone(self.client.cookies.get(sf.LINK_COOKIE))
+
+    def test_SLL03_invalid_k_deletes_previous_cookie_then_post_is_plain(self):
+        self.fake.add("10")                                          # A の既存レコード
+        token_a = self.issue()
+        self.client.get("/shindan", params={"k": token_a})
+        self.assertEqual(self.client.cookies.get(sf.LINK_COOKIE), token_a)
+        resp = self.client.get("/shindan", params={"k": "nosuchtokenB"})
+        self._assert_cookie_deleted(resp)
+        with patch.object(sf, "_draw_number", return_value="012345"):
+            post = self.client.post("/shindan", data=VALID)         # cookie なし=k なし経路
+        self.assertEqual(post.status_code, 200)
+        self.assertIn("受付番号：012345", post.text)
+        self.assertEqual(self.fake.update_calls, [])                 # A のレコードに書かない
+        self.assertEqual(self.fake.create_calls[0]["LINEユーザーID"], "")
+        self.assertIsNone(self.used_at(token_a))
+
+    def test_SLL03_no_k_get_deletes_previous_cookie(self):
+        self.fake.add("10")
+        token_a = self.issue()
+        self.client.get("/shindan", params={"k": token_a})
+        resp = self.client.get("/shindan")
+        self._assert_cookie_deleted(resp)
+        with patch.object(sf, "_draw_number", return_value="012345"):
+            post = self.client.post("/shindan", data=VALID)
+        self.assertIn("受付番号：012345", post.text)
+        self.assertEqual(self.fake.update_calls, [])
+        self.assertIsNone(self.used_at(token_a))
+
+    def test_SLL03_claimed_k_get_is_invalid_and_deletes_cookie(self):
+        token = self.issue()
+        self.assertIsNotNone(self.q(sl.claim(token)))
+        resp = self.client.get("/shindan", params={"k": token})
+        self._assert_cookie_deleted(resp)
+
+    # ── fix2 SLL-04: 結果ページの差分は 3 点のみ ─────────────────────────────────
+    def test_SLL04_linked_result_diff_is_exactly_three_points(self):
+        for pattern in "ABCD":
+            with self.subTest(pattern=pattern):
+                plain = sf._result_html(pattern, "654321", LINE_URL, "uptok")
+                linked = sf._result_html_linked(pattern, "uptok")
+                expected = plain
+                # (1) 受付番号行を出さない
+                self.assertIn("<br>受付番号：654321", expected)
+                expected = expected.replace("<br>受付番号：654321", "", 1)
+                # (2) 友だち追加ボタン+受付番号案内段落を出さない
+                button = (f"<a class=\"btn\" href=\"{LINE_URL}\">"
+                          "LINEで無料相談する（友だち追加）</a>")
+                guide = ("<p>LINEで上記の受付番号をお送りいただくと、ご回答内容を引き継いで"
+                         "スムーズにご案内できます。</p>")
+                self.assertIn(button + guide, expected)
+                # (3) 固定文言を同じ位置に追加
+                expected = expected.replace(button + guide, f"<p>{sf.LINKED_DONE_TEXT}</p>", 1)
+                self.assertEqual(linked, expected)
+        # upload_token 無し（失敗/busy）でも固定文言は表示・写真導線だけ無い
+        self.assertIn(sf.LINKED_DONE_TEXT, sf._result_html_linked("A"))
+        self.assertNotIn(sf.PHOTO_ROUTE, sf._result_html_linked("A"))
 
     def test_judgement_unchanged_for_linked(self):
         token = self.issue()

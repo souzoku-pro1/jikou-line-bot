@@ -35,7 +35,12 @@ shindan_link = sa.Table(
               server_default=sa.func.now()),
     sa.Column("expires_at", sa.DateTime(timezone=True), nullable=False),
     sa.Column("used_at", sa.DateTime(timezone=True), nullable=True),
+    # fix2 SLL-02: 書込前の予約（同一 token の同時 POST による二重作成の防止）。
+    # 予約は CLAIM_TTL_SEC で自然解放（書込失敗時は release で即時解放）
+    sa.Column("claimed_at", sa.DateTime(timezone=True), nullable=True),
 )
+
+CLAIM_TTL_SEC = 120
 
 # ── 凍結文言（逐語・改変禁止・sha256 pin は test_shindan_line_link） ────────────
 FROZEN_GREETING = (
@@ -102,26 +107,62 @@ async def issue(line_user_id: str, now: datetime.datetime | None = None) -> str:
     return token
 
 
-async def lookup(token: str, now: datetime.datetime | None = None) -> dict | None:
+async def lookup(token: str, now: datetime.datetime | None = None,
+                 include_claimed: bool = False) -> dict | None:
     """有効（存在・期限内・未使用）なら {"token","line_user_id","expires_at"}。
-    それ以外は None。"""
+    それ以外は None。fix2: 予約中（claimed_at が CLAIM_TTL_SEC 以内）は既定で無効
+    （GET の cookie 付与を防ぐ）。POST は include_claimed=True で予約中も返し、
+    claim の結果（busy）で扱う＝k なし経路へ落ちない。"""
     if not token:
         return None
     now = now or _now()
     async with session_scope() as s:
         row = (await s.execute(
             sa.select(shindan_link.c.line_user_id, shindan_link.c.expires_at,
-                      shindan_link.c.used_at)
+                      shindan_link.c.used_at, shindan_link.c.claimed_at)
             .where(shindan_link.c.token == token))).first()
     if row is None:
         return None
-    line_user_id, expires_at, used_at = row
+    line_user_id, expires_at, used_at, claimed_at = row
     if used_at is not None:
         return None
     expires_at = _aware(expires_at)
     if expires_at is None or expires_at <= now:
         return None
+    claimed_at = _aware(claimed_at)
+    if (not include_claimed and claimed_at is not None
+            and claimed_at > now - datetime.timedelta(seconds=CLAIM_TTL_SEC)):
+        return None
     return {"token": token, "line_user_id": line_user_id, "expires_at": expires_at}
+
+
+async def claim(token: str, now: datetime.datetime | None = None
+                ) -> datetime.datetime | None:
+    """fix2 SLL-02: 書込前の予約。未使用・期限内・未予約（または予約が
+    CLAIM_TTL_SEC 超過）のときだけ claimed_at=now を書き、rowcount=1 なら now
+    （自分の予約の印）を返す。取れなければ None（呼び出し側は busy）。"""
+    now = now or _now()
+    stale = now - datetime.timedelta(seconds=CLAIM_TTL_SEC)
+    async with session_scope() as s:
+        res = await s.execute(
+            sa.update(shindan_link)
+            .where(shindan_link.c.token == token,
+                   shindan_link.c.used_at.is_(None),
+                   shindan_link.c.expires_at > now,
+                   sa.or_(shindan_link.c.claimed_at.is_(None),
+                          shindan_link.c.claimed_at < stale))
+            .values(claimed_at=now))
+        return now if (res.rowcount or 0) == 1 else None
+
+
+async def release(token: str) -> bool:
+    """fix2 SLL-02: 書込失敗時の解放（claimed_at を NULL に戻す・未使用のときだけ）。"""
+    async with session_scope() as s:
+        res = await s.execute(
+            sa.update(shindan_link)
+            .where(shindan_link.c.token == token, shindan_link.c.used_at.is_(None))
+            .values(claimed_at=None))
+        return (res.rowcount or 0) == 1
 
 
 async def find_user_record(app, line_user_id: str) -> tuple[dict | None, str]:
@@ -145,12 +186,15 @@ async def find_user_record(app, line_user_id: str) -> tuple[dict | None, str]:
         return None, "failed"
 
 
-async def mark_used(token: str, now: datetime.datetime | None = None) -> bool:
-    """used_at を打つ（未使用のときだけ・rowcount 1 で True）。"""
+async def mark_used(token: str, claimed_at: datetime.datetime,
+                    now: datetime.datetime | None = None) -> bool:
+    """used_at を打つ（未使用かつ claimed_at が自分の予約のときだけ・rowcount 1 で
+    True）。fix2 SLL-02: 他者の予約や解放後の再予約を確定させない。"""
     now = now or _now()
     async with session_scope() as s:
         res = await s.execute(
             sa.update(shindan_link)
-            .where(shindan_link.c.token == token, shindan_link.c.used_at.is_(None))
+            .where(shindan_link.c.token == token, shindan_link.c.used_at.is_(None),
+                   shindan_link.c.claimed_at == claimed_at)
             .values(used_at=now))
         return (res.rowcount or 0) == 1

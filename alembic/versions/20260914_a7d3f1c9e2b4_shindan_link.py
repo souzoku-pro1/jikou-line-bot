@@ -1,6 +1,7 @@
 """SHINDAN-LINE-LINK-1: shindan_link（友だち追加時に送る本人専用の診断フォームリンク）
 
-token（不透明値・主キー）・line_user_id・created_at・expires_at（30 日）・used_at。
+token（不透明値・主キー）・line_user_id・created_at・expires_at（30 日）・used_at・
+claimed_at（fix2 SLL-02: 書込前の予約・nullable）。
 down_revision は origin/main の head（e7a9c4d1f6b3）。
 
 Revision ID: a7d3f1c9e2b4
@@ -27,6 +28,8 @@ def upgrade() -> None:
                   server_default=sa.func.now()),
         sa.Column("expires_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("used_at", sa.DateTime(timezone=True), nullable=True),
+        # fix2 SLL-02: 書込前の予約（未 merge・未適用のため本 revision を直接修正）
+        sa.Column("claimed_at", sa.DateTime(timezone=True), nullable=True),
     )
 
 

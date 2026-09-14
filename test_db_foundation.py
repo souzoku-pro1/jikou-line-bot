@@ -279,6 +279,14 @@ class TestAlembicScaffold(unittest.TestCase):
             up = alembic("upgrade", "head")
             self.assertEqual(up.returncode, 0, f"stderr={up.stderr[-500:]}")
             self.assertIn("shindan_link", tables())
+            con = sqlite3.connect(dbfile)
+            try:
+                cols = {r[1] for r in con.execute("PRAGMA table_info(shindan_link)")}
+            finally:
+                con.close()
+            # fix2 SLL-02: claimed_at（nullable）を同 revision に追加
+            self.assertEqual(cols, {"token", "line_user_id", "created_at",
+                                    "expires_at", "used_at", "claimed_at"})
             self.assertIn("a7d3f1c9e2b4", alembic("current").stdout)
             down = alembic("downgrade", "e7a9c4d1f6b3")
             self.assertEqual(down.returncode, 0, f"stderr={down.stderr[-500:]}")
