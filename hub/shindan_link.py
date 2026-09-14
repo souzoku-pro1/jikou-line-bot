@@ -155,12 +155,16 @@ async def claim(token: str, now: datetime.datetime | None = None
         return now if (res.rowcount or 0) == 1 else None
 
 
-async def release(token: str) -> bool:
-    """fix2 SLL-02: 書込失敗時の解放（claimed_at を NULL に戻す・未使用のときだけ）。"""
+async def release(token: str, claimed_at: datetime.datetime) -> bool:
+    """fix2 SLL-02: 書込失敗時の解放（claimed_at を NULL に戻す）。
+    fix3 SLL-06: 解放できるのは**自分の予約**だけ（token 一致 AND used_at IS NULL AND
+    claimed_at = 自分の予約時刻）。TTL 超過後に他者が再予約していれば rowcount 0 で
+    False（例外にしない）＝旧予約者が新予約者の予約を壊せない。"""
     async with session_scope() as s:
         res = await s.execute(
             sa.update(shindan_link)
-            .where(shindan_link.c.token == token, shindan_link.c.used_at.is_(None))
+            .where(shindan_link.c.token == token, shindan_link.c.used_at.is_(None),
+                   shindan_link.c.claimed_at == claimed_at)
             .values(claimed_at=None))
         return (res.rowcount or 0) == 1
 

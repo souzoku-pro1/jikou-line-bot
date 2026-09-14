@@ -615,7 +615,7 @@ class TestFormPostLinked(_FormLinkBase):
         self.assertIsNone(self.q(sl.lookup(token)))                 # GET 判定では無効
         self.assertIsNotNone(self.q(sl.lookup(token, include_claimed=True)))
         self.assertFalse(self.q(sl.mark_used(token, c1 + datetime.timedelta(seconds=1))))  # 他者の予約では確定不可
-        self.assertTrue(self.q(sl.release(token)))
+        self.assertTrue(self.q(sl.release(token, c1)))               # fix3: 自予約の解放
         self.assertIsNone(self.claimed_at(token))
         c2 = self.q(sl.claim(token))
         self.assertIsNotNone(c2)
@@ -627,6 +627,82 @@ class TestFormPostLinked(_FormLinkBase):
         old = sl._now() - datetime.timedelta(seconds=sl.CLAIM_TTL_SEC + 5)
         self.assertIsNotNone(self.q(sl.claim(token3, now=old)))
         self.assertIsNotNone(self.q(sl.claim(token3)))
+
+    # ── fix3 SLL-06: 旧予約者は新予約者の予約を解除できない ─────────────────────────
+    def test_SLL06_release_only_own_claim(self):
+        token = self.issue()
+        old = sl._now() - datetime.timedelta(seconds=sl.CLAIM_TTL_SEC + 5)
+        a = self.q(sl.claim(token, now=old))                         # A が予約（後に TTL 超過）
+        self.assertIsNotNone(a)
+        b = self.q(sl.claim(token))                                  # B が再予約
+        self.assertIsNotNone(b)
+        self.assertFalse(self.q(sl.release(token, a)))               # A の解放=更新 0 件
+        self.assertEqual(sl._aware(self.claimed_at(token)), b)       # B の予約は維持
+        self.assertIsNone(self.q(sl.claim(token)))                   # C は予約できない
+        self.assertTrue(self.q(sl.release(token, b)))                # B の解放は成功
+        self.assertIsNone(self.claimed_at(token))
+
+    # ── fix3 SLL-07: 書込途中の例外でも必ず自予約を解放し、例外は伝播しない ──────────
+    def _post_with_create_raising(self, exc):
+        token = self.issue()
+        real_release = sl.release
+        release_calls = []
+
+        async def _release(t, c):
+            release_calls.append((t, c))
+            return await real_release(t, c)
+
+        async def _create(app, fields):
+            raise exc
+        with patch.object(sl, "release", _release), \
+             patch.object(sf.hub_kintone, "create_record", _create):
+            resp = self.post_linked(token)
+        return token, resp, release_calls
+
+    def _assert_failure_page_and_release(self, token, resp, release_calls, exc_text):
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("診断結果", resp.text)
+        self.assertIn(sf.LINKED_DONE_TEXT, resp.text)                # 固定文言あり
+        self.assertNotIn("受付番号", resp.text)
+        self.assertNotIn(sf.PHOTO_ROUTE, resp.text)                  # 写真導線なし
+        self.assertEqual(len(release_calls), 1)                      # release 呼出し 1 回
+        self.assertEqual(release_calls[0][0], token)
+        self.assertIsNone(self.claimed_at(token))
+        self.assertIsNone(self.used_at(token))
+        errs = self.cap.errors()
+        self.assertEqual(len(errs), 1)
+        self.assertIn("shindan_link_write_failed", errs[0])
+        self.assertIn("head=" + token[:4], errs[0])
+        for leak in (token, USER, NAME, exc_text, "Traceback"):
+            self.assertNotIn(leak, errs[0])
+            self.assertNotIn(leak, self.cap.text())
+        self.notify_admin.assert_not_awaited()
+        self.notify_biz.assert_not_awaited()
+        # 解放済み=再 POST で再試行できる
+        self.assertIsNotNone(self.q(sl.lookup(token)))
+
+    def test_SLL07_json_decode_error_in_create_is_contained(self):
+        exc = json.JSONDecodeError("Expecting value SECRET_MARK", "doc", 0)
+        token, resp, calls = self._post_with_create_raising(exc)
+        self._assert_failure_page_and_release(token, resp, calls, "SECRET_MARK")
+
+    def test_SLL07_key_error_in_create_is_contained(self):
+        token, resp, calls = self._post_with_create_raising(KeyError("id_SECRET_KEY"))
+        self._assert_failure_page_and_release(token, resp, calls, "id_SECRET_KEY")
+
+    def test_SLL07_success_path_does_not_release(self):
+        token = self.issue()
+        release_calls = []
+        real_release = sl.release
+
+        async def _release(t, c):
+            release_calls.append(t)
+            return await real_release(t, c)
+        with patch.object(sl, "release", _release):
+            resp = self.post_linked(token)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(release_calls, [])
+        self.assertIsNotNone(self.used_at(token))
 
     # ── fix2 SLL-03: cookie の衛生 ───────────────────────────────────────────────
     def _assert_cookie_deleted(self, resp):

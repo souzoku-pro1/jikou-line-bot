@@ -1043,36 +1043,45 @@ async def _handle_submit_linked(pattern: str, fields_base: dict, link: dict):
                     emit(shindan_link.token_head(token), "record_id", "log",
                          "operator"))
         return HTMLResponse(_result_html_linked(pattern))
-    # 本人のレコード特定は hub 側（LINEユーザーID 検索 limit 2・ちょうど 1 件）
-    record, method = await shindan_link.find_user_record(APP_JIKOU_CASE, line_user_id)
+    # fix3 SLL-07: 予約取得後の「本人レコード検索→書込/作成→used_at 確定」は
+    # try/except/finally で囲み、KintoneError 以外（JSON 解析失敗・KeyError・TypeError
+    # 等）も含めて例外を上位へ伝播させない。used_at を確定できなかった経路は finally で
+    # 必ず自分の予約を解放する（SLL-06: release は自予約時刻を渡す）
     outcome, record_id = "failed", ""
-    if method == "found":
-        outcome, record_id = await _update_existing_linked(record, fields_base)
-    elif method == "none":
-        # E-2: 現状のフォーム保存と同じレコード + LINEユーザーID（受付番号は発行しない）
-        try:
-            record_id = await hub_kintone.create_record(
-                APP_JIKOU_CASE, {**fields_base, "LINEユーザーID": line_user_id})
-            outcome = "created"
-        except hub_kintone.KintoneError as e:
-            logger.warning("[SHINDAN] linked create failed code=%s",
-                           emit(e.code, "vendor_raw", "log", "operator"))
-            outcome = "failed"
-    if outcome not in ("updated", "noop", "created"):
-        # E-3: used_at は打たない・判定結果のみ・ERROR 1 行（固定理由+token 先頭 4 文字）。
-        # fix2 SLL-02: 予約を解放（失敗しても例外は上げない=TTL で自然解放）
+    used_marked = False
+    try:
+        # 本人のレコード特定は hub 側（LINEユーザーID 検索 limit 2・ちょうど 1 件）
+        record, method = await shindan_link.find_user_record(APP_JIKOU_CASE, line_user_id)
+        if method == "found":
+            outcome, record_id = await _update_existing_linked(record, fields_base)
+        elif method == "none":
+            # E-2: 現状のフォーム保存と同じレコード + LINEユーザーID（受付番号は発行しない）
+            try:
+                record_id = await hub_kintone.create_record(
+                    APP_JIKOU_CASE, {**fields_base, "LINEユーザーID": line_user_id})
+                outcome = "created"
+            except hub_kintone.KintoneError as e:
+                logger.warning("[SHINDAN] linked create failed code=%s",
+                               emit(e.code, "vendor_raw", "log", "operator"))
+                outcome = "failed"
+        if outcome in ("updated", "noop", "created"):
+            used_marked = bool(await shindan_link.mark_used(token, claimed_at))
+    except Exception:
+        # 例外本文は載せない（固定理由のみ・下の ERROR 1 行に集約）
+        used_marked = False
+    finally:
+        if not used_marked:
+            try:
+                await shindan_link.release(token, claimed_at)
+            except Exception:
+                logger.warning("[SHINDAN] link claim not released (ttl fallback)")
+    if not used_marked:
+        # E-3: used_at は打たない・判定結果のみ（固定文言あり・受付番号なし・写真導線
+        # なし）・ERROR 1 行（固定理由+token 先頭 4 文字・PII なし）
         logger.error("[SHINDAN] shindan_link_write_failed head=%s",
                      emit(shindan_link.token_head(token), "record_id", "log",
                           "operator"))
-        try:
-            await shindan_link.release(token)
-        except Exception:
-            logger.warning("[SHINDAN] link claim not released (ttl fallback)")
         return HTMLResponse(_result_html_linked(pattern))
-    try:
-        await shindan_link.mark_used(token, claimed_at)
-    except Exception:
-        logger.warning("[SHINDAN] link used_at not recorded (write done)")
     logger.info("[SHINDAN] linked write ok record_id=%s pattern=%s",
                 emit(record_id, "record_id", "log", "operator"),
                 emit(pattern, "freetext", "log", "operator"))
