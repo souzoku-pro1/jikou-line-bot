@@ -150,7 +150,9 @@ class TestNormalizedExemption(_Base):
         restored, matched = rs.restore_frozen_blocks(text, JIKOU)
         self.assertEqual(restored, JIKOU[0] + NL + FREE_150)  # 原文（改行込み）へ置換
         self.assertEqual(matched, [1])
-        self.assertEqual(rs.structure_violations(text, exempt_blocks=JIKOU), [])
+        # fix1（A'）: 字数検査は復元後の文面に逐語免除のみ（再照合しない）
+        self.assertEqual(rs.structure_violations(restored, exempt_blocks=JIKOU), [])
+        self.assertEqual(len(rs.structure_violations(text, exempt_blocks=JIKOU)), 1)
         out, issues, _ = rs.sanitize_reply(text, exempt_blocks=JIKOU)
         self.assertEqual(out, JIKOU[0] + NL + FREE_150)
         self.assertIn("凍結テンプレを原文に復元", issues)
@@ -159,7 +161,7 @@ class TestNormalizedExemption(_Base):
         text = mangle_spaces(JIKOU[0]) + NL + FREE_150
         out, issues, _ = rs.sanitize_reply(text, exempt_blocks=JIKOU)
         self.assertEqual(out, JIKOU[0] + NL + FREE_150)
-        self.assertEqual(rs.structure_violations(text, exempt_blocks=JIKOU), [])
+        self.assertEqual(rs.structure_violations(out, exempt_blocks=JIKOU), [])
 
     def test_T4_one_char_diff_not_exempt(self):
         text = mangle_one_char(JIKOU[0]) + NL + FREE_150
@@ -183,8 +185,11 @@ class TestNormalizedExemption(_Base):
         # 本番経路どおり復元後の文面を字数検査に渡す=追加ログなし・違反なし
         self.assertEqual(rs.structure_violations(out, exempt_blocks=JIKOU), [])
         self.assertEqual(len(self.cap.gate()), 2)
-        # 未復元の文面を直接渡しても（呼び出し側が復元しない経路）正規化免除は効く
-        self.assertEqual(rs.structure_violations(text, exempt_blocks=JIKOU), [])
+        # fix1（A'）: structure_violations は再照合しない（照合点は sanitize_reply の 1 か所）
+        # =未復元の 2 ブロックは自由文扱いで文字数超過（質問数超過も併発し得る）
+        v = rs.structure_violations(text, exempt_blocks=JIKOU)
+        self.assertTrue(any("文字数超過" in x for x in v), v)
+        self.assertEqual(len(self.cap.gate()), 2)
 
     def test_T6_log_is_fixed_vocabulary_without_text(self):
         customer = "山田太郎です。至急お願いします"
@@ -214,7 +219,126 @@ class TestNormalizedExemption(_Base):
         mangled = mangle_observed(HOUKI[0])
         out, _, _ = rs.sanitize_reply(mangled + NL + "承知しました。", exempt_blocks=HOUKI)
         self.assertEqual(out, HOUKI[0] + NL + "承知しました。")
-        self.assertEqual(rs.structure_violations(mangled, exempt_blocks=HOUKI), [])
+        self.assertEqual(rs.structure_violations(out, exempt_blocks=HOUKI), [])
+
+
+# ── fix1（Codex GEF-01・裁定 A'）: 除去処理の後の照合・照合点は 1 か所 ────────────
+EMOJI = "\U0001F60A"
+
+
+def insert_emoji(block: str) -> str:
+    """凍結ブロックの本文中に許可外の絵文字を 1 個挿入（除去処理で消える差）。"""
+    i = block.index("①")
+    return block[:i + 1] + EMOJI + block[i + 1:]
+
+
+def insert_markdown(block: str) -> str:
+    """Markdown 装飾（**強調**・行頭 ##）を挿入（除去処理で消える差）。"""
+    lines = block.split(NL)
+    lines[2] = "## " + lines[2]                     # 見出し記号（行頭）
+    word = "債権者名"
+    assert word in lines[1]
+    lines[1] = lines[1].replace(word, "**" + word + "**", 1)
+    out = NL.join(lines)
+    assert out != block
+    return out
+
+
+def insert_word(block: str) -> str:
+    """語を 1 つ追加（除去処理でも 7 種正規化でも消えない差）。2 行目の途中に
+    「全く」を挿入する（時効・相続放棄どちらの凍結ブロックにも適用できる形）。"""
+    lines = block.split(NL)
+    assert len(lines[1]) > 3
+    lines[1] = lines[1][:3] + "全く" + lines[1][3:]
+    out = NL.join(lines)
+    assert rs.normalize_for_match(out) != rs.normalize_for_match(block)
+    return out
+
+
+class TestRulingAPrime(_Base):
+    def test_T8_emoji_in_block_is_exempt_and_restored(self):
+        text = insert_emoji(mangle_observed(JIKOU[0])) + NL + FREE_150
+        out, issues, _ = rs.sanitize_reply(text, exempt_blocks=JIKOU)
+        self.assertEqual(out, JIKOU[0] + NL + FREE_150)      # 原文（改行込み・絵文字なし）
+        self.assertIn("許可外の絵文字を除去", issues)
+        self.assertIn("凍結テンプレを原文に復元", issues)
+        self.assertEqual(rs.structure_violations(out, exempt_blocks=JIKOU), [])
+        self.assertEqual(self.cap.gate(), ["[GATE] template_normalized_match block=1"])
+
+    def test_T9_markdown_in_block_is_exempt_and_restored(self):
+        text = insert_markdown(mangle_observed(JIKOU[0])) + NL + FREE_150
+        out, issues, _ = rs.sanitize_reply(text, exempt_blocks=JIKOU)
+        self.assertEqual(out, JIKOU[0] + NL + FREE_150)
+        self.assertIn("markdown強調記号を除去", issues)
+        self.assertIn("markdown見出し記号を除去", issues)
+        self.assertIn("凍結テンプレを原文に復元", issues)
+        self.assertEqual(rs.structure_violations(out, exempt_blocks=JIKOU), [])
+
+    def test_T10_added_word_not_exempt(self):
+        text = insert_word(mangle_observed(JIKOU[0])) + NL + FREE_150
+        out, issues, _ = rs.sanitize_reply(text, exempt_blocks=JIKOU)
+        self.assertEqual(out, text)                          # 置換されない
+        self.assertNotIn("凍結テンプレを原文に復元", issues)
+        v = rs.structure_violations(out, exempt_blocks=JIKOU)
+        self.assertEqual(len(v), 1)
+        self.assertIn("文字数超過", v[0])                     # 自由文として計上
+        self.assertEqual(self.cap.gate(), [])
+
+    def test_T11_one_char_diff_plus_emoji_not_exempt(self):
+        text = insert_emoji(mangle_one_char(JIKOU[0])) + NL + FREE_150
+        out, issues, _ = rs.sanitize_reply(text, exempt_blocks=JIKOU)
+        self.assertNotIn(EMOJI, out)                         # 絵文字は消える
+        self.assertNotIn(JIKOU[0], out)                      # だが 1 字違いが残り不一致
+        self.assertNotIn("凍結テンプレを原文に復元", issues)
+        self.assertEqual(len(rs.structure_violations(out, exempt_blocks=JIKOU)), 1)
+        self.assertEqual(self.cap.gate(), [])
+
+    def test_T12_pre_match_transforms_pinned_and_single_match_site(self):
+        import ast
+        import inspect
+        self.assertEqual(rs.PRE_MATCH_TRANSFORMS, ("strip_markdown", "strip_emoji"))
+        tree = ast.parse(inspect.getsource(rs))
+        fns = {n.name: n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
+
+        def calls(fn):
+            names, attrs = set(), set()
+            body_nodes = [m for stmt in fns[fn].body for m in ast.walk(stmt)]   # 本体のみ（既定引数は除く）
+            for n in body_nodes:
+                if isinstance(n, ast.Call):
+                    if isinstance(n.func, ast.Name):
+                        names.add(n.func.id)
+                    elif isinstance(n.func, ast.Attribute):
+                        attrs.add(n.func.attr)
+            return names, attrs
+        # sanitize_reply: 照合前の変換は PRE_MATCH_TRANSFORMS の 2 つだけ・照合は
+        # restore_frozen_blocks 1 回・それ以外の関数呼び出しなし
+        names, attrs = calls("sanitize_reply")
+        self.assertEqual(names, set(rs.PRE_MATCH_TRANSFORMS) | {"restore_frozen_blocks", "bool"})
+        self.assertTrue(attrs <= {"search", "append", "extend"}, attrs)
+        # 照合順序: strip_markdown → strip_emoji → restore_frozen_blocks（ソース上の出現順）
+        src = inspect.getsource(rs.sanitize_reply)
+        self.assertLess(src.index("strip_markdown("), src.index("strip_emoji("))
+        self.assertLess(src.index("strip_emoji("), src.index("restore_frozen_blocks("))
+        # structure_violations は再照合しない
+        names, _ = calls("structure_violations")
+        for banned in ("normalize_for_match", "restore_frozen_blocks", "_find_normalized_span"):
+            self.assertNotIn(banned, names)
+        # 呼び出し記録でも 1 か所: sanitize_reply→structure_violations の経路で照合は 1 回
+        calls_seen = []
+        real = rs.restore_frozen_blocks
+
+        def _spy(text, blocks):
+            calls_seen.append(1)
+            return real(text, blocks)
+        with patch.object(rs, "restore_frozen_blocks", _spy):
+            out, _, _ = rs.sanitize_reply(mangle_observed(JIKOU[0]) + NL + FREE_150,
+                                          exempt_blocks=JIKOU)
+            rs.structure_violations(out, exempt_blocks=JIKOU)
+        self.assertEqual(len(calls_seen), 1)
+        # strip_markdown 単体は変換分類名を返す（語句の置換はしない）
+        s, iss = rs.strip_markdown("**a** b")
+        self.assertEqual((s, iss), ("a b", ["markdown強調記号を除去"]))
+        self.assertEqual(rs.strip_markdown(JIKOU[0]), (JIKOU[0], []))   # 凍結原文は不変
 
 
 # ── 配線: 時効ヒアリング（届く文面が原文になる） ────────────────────────────────
@@ -252,6 +376,23 @@ class TestJikouFlow(unittest.TestCase):
         self.assertIn(JIKOU[0], sent)
         self.assertNotEqual(sent, self.mangled_reply)
 
+    def test_T13_emoji_exempt_and_added_word_not_exempt_through_flow(self):
+        # T8 と同結果: 絵文字入り改行落ちブロック → 原文で送信・降格なし
+        main.ask_claude.return_value = "ありがとうございます。" + NL + insert_emoji(
+            mangle_observed(JIKOU[0]))
+        _run(main._process_line_event("tok", USER, "相談です"))
+        self.queue.assert_not_awaited()
+        self.assertEqual(self.reply.await_args.args[2], "ありがとうございます。" + NL + JIKOU[0])
+        # T10 と同結果: 語を追加 → 免除されず承認降格（確認中定型が届く）
+        self.reply.reset_mock()
+        main.hearing_completed.discard(USER)
+        main.ask_claude.return_value = "ありがとうございます。" + NL + insert_word(
+            mangle_observed(JIKOU[0]))
+        _run(main._process_line_event("tok", USER, "相談です"))
+        self.queue.assert_awaited_once()
+        self.assertIn("文字数超過", self.queue.await_args.kwargs["reason"])
+        self.assertEqual(self.reply.await_args.args[2], main.PENDING_REPLY)
+
 
 # ── 配線: 相続放棄ヒアリング ──────────────────────────────────────────────────
 class TestHoukiFlow(unittest.TestCase):
@@ -259,10 +400,10 @@ class TestHoukiFlow(unittest.TestCase):
         hearing.conversation_histories.pop(USER, None)
         self.addCleanup(hearing.conversation_histories.pop, USER, None)
 
-    def test_sent_text_is_verbatim_template(self):
-        mangled = "ありがとうございます。" + NL + mangle_observed(HOUKI[0])
+    def _turn(self, reply_text: str):
+        hearing.conversation_histories.pop(USER, None)
         model = AsyncMock(return_value=SimpleNamespace(
-            content=[SimpleNamespace(type="text", text=mangled)]))
+            content=[SimpleNamespace(type="text", text=reply_text)]))
         send, queue = AsyncMock(), AsyncMock(return_value="q-1")
         with patch.object(hearing, "call_hearing_model", model), \
              patch.object(hearing, "reply_with_push_fallback", send), \
@@ -273,9 +414,29 @@ class TestHoukiFlow(unittest.TestCase):
              patch.object(hearing, "autoreply_paused", lambda: False), \
              patch.object(houki_case_store, "fetch_case", AsyncMock(return_value=None)):
             _run(hearing.handle_houki_hearing("rtok", USER, "相談です"))
+        return send, queue
+
+    def test_sent_text_is_verbatim_template(self):
+        send, queue = self._turn("ありがとうございます。" + NL + mangle_observed(HOUKI[0]))
         queue.assert_not_awaited()
         sent = send.await_args.args[3]
         self.assertEqual(sent, "ありがとうございます。" + NL + HOUKI[0])
+
+    def test_T13_emoji_exempt_and_added_word_not_exempt_through_flow(self):
+        # 相続放棄の凍結ブロックは 171 字のため、自由文 150 字を添えて「免除されれば
+        # 通過・免除されなければ 300 字超で降格」の分岐に到達させる
+        send, queue = self._turn(
+            "ありがとうございます。" + NL + insert_emoji(mangle_observed(HOUKI[0]))
+            + NL + FREE_150)
+        queue.assert_not_awaited()
+        self.assertEqual(send.await_args.args[3],
+                         "ありがとうございます。" + NL + HOUKI[0] + NL + FREE_150)
+        send, queue = self._turn(
+            "ありがとうございます。" + NL + insert_word(mangle_observed(HOUKI[0]))
+            + NL + FREE_150)
+        queue.assert_awaited_once()
+        self.assertIn("文字数超過", queue.await_args.kwargs["reason"])
+        self.assertEqual(send.await_args.args[3], hearing.HOUKI_PROFILE.pending_reply)
 
 
 if __name__ == "__main__":

@@ -25,6 +25,19 @@ GATE-EXEMPT-FIX-1（LINE-QUALITY-DIAG の主因対処・裁定 A〜F）:
   - 字数計上は置換後の文面から凍結区間（各 1 回）を除いた自由文で行う
   - 置換したことは固定語彙 1 行 "[GATE] template_normalized_match block=N"
     （N=集合内の 1 始まり番号・本文は載せない）。類似度しきい値方式は不採用
+
+GATE-EXEMPT-FIX-1-fix1（Codex GEF-01・裁定 A' 逐語）:
+  A'. 凍結ブロックの照合は、既存サニタイザの除去処理（許可外絵文字の除去・Markdown
+      装飾記号の除去。いずれも凍結済みの「顧客に届く文面から必ず除去する」処理）を
+      通した後の文面に対して行う。その文面に 7 種（LF・CR・TAB・半角空白・全角空白・
+      「、」・「。」）の正規化を施して凍結原文と完全一致するときのみ免除し、届く文面は
+      その区間を凍結原文（改行込み）に置換する。除去処理と 7 種以外の一字の差は
+      不一致。類似度方式は不採用。
+  理由: 除去対象文字は顧客に届かないため、除去後に原文と一致する区間は顧客にとって
+  凍結原文そのものである。
+  - 照合は sanitize_reply の「除去処理の後・字数検査の前」の 1 か所のみ
+    （PRE_MATCH_TRANSFORMS に固定した strip_markdown → strip_emoji の直後）。
+    structure_violations は再照合せず、受け取った文面の逐語一致区間だけを免除する
 """
 
 import logging
@@ -81,24 +94,10 @@ def strip_emoji(text: str, allowed: frozenset[str] = frozenset()) -> str:
         ch for ch in text if not _is_emoji(ch) or ch in allowed)
 
 
-def sanitize_reply(text: str,
-                   allowed_emoji: frozenset[str] = frozenset(),
-                   exempt_blocks: tuple[str, ...] = ()
-                   ) -> tuple[str, list[str], bool]:
-    """送信直前サニタイズ。
-
-    Returns
-    -------
-    (sanitized, issues, fatal)
-      sanitized : 平文化済みの本文（送信に使う）
-      issues    : 実施した変換/検出の分類名リスト（ログ・降格理由用）
-      fatal     : True ならプレースホルダ/内部マーカー残存＝送信禁止
-                  （サニタイズで直さない・承認降格）
-    """
+def strip_markdown(text: str) -> tuple[str, list[str]]:
+    """Markdown 装飾記号の除去（要件1・凍結済みの除去処理）。
+    (除去後の本文, 実施した変換の分類名) を返す。"""
     issues: list[str] = []
-    fatal = bool(_PLACEHOLDER_RE.search(text))
-    if fatal:
-        issues.append("プレースホルダ/内部マーカー残存")
     out = text
     if _BOLD_RE.search(out) or _CODE_RE.search(out):
         out = _BOLD_RE.sub(r"\1", out)
@@ -113,12 +112,47 @@ def sanitize_reply(text: str,
     if _BULLET_RE.search(out):
         out = _BULLET_RE.sub("・", out)
         issues.append("markdown箇条書き記号を平文化")
+    return out, issues
+
+
+# GATE-EXEMPT-FIX-1-fix1（裁定 A'）: 凍結ブロックの照合前に走る除去処理の閉集合。
+# この順で適用し、この直後に 1 回だけ照合する。語句の置換・文体変更・トリム以外の
+# 削除など、これ以外の変換を照合前に入れてはならない（test_gate_exempt_fix が pin）
+PRE_MATCH_TRANSFORMS: tuple[str, ...] = ("strip_markdown", "strip_emoji")
+
+
+def sanitize_reply(text: str,
+                   allowed_emoji: frozenset[str] = frozenset(),
+                   exempt_blocks: tuple[str, ...] = ()
+                   ) -> tuple[str, list[str], bool]:
+    """送信直前サニタイズ。
+
+    Returns
+    -------
+    (sanitized, issues, fatal)
+      sanitized : 平文化済みの本文（送信に使う）
+      issues    : 実施した変換/検出の分類名リスト（ログ・降格理由用）
+      fatal     : True ならプレースホルダ/内部マーカー残存＝送信禁止
+                  （サニタイズで直さない・承認降格）
+
+    裁定 A'（GATE-EXEMPT-FIX-1-fix1）: 凍結ブロックの照合は PRE_MATCH_TRANSFORMS
+    （strip_markdown → strip_emoji）の**後**の文面に対して 1 回だけ行う。除去対象
+    文字は顧客に届かないため、除去後に凍結原文と（7 種正規化のうえで）一致する区間は
+    顧客にとって凍結原文そのものである。除去処理と 7 種以外の一字の差は不一致。
+    """
+    issues: list[str] = []
+    fatal = bool(_PLACEHOLDER_RE.search(text))
+    if fatal:
+        issues.append("プレースホルダ/内部マーカー残存")
+    # ── PRE_MATCH_TRANSFORMS（この 2 つ以外の変換を照合前に置かない） ──
+    out, md_issues = strip_markdown(text)
+    issues.extend(md_issues)
     stripped = strip_emoji(out, allowed_emoji)
     if stripped != out:
         out = stripped
         issues.append("許可外の絵文字を除去")
-    # GATE-EXEMPT-FIX-1 裁定 B: 凍結テンプレと正規化一致した区間は原文へ置換
-    # （exempt_blocks を渡さない経路=顧客対応 Bot は従来どおり）
+    # ── 裁定 A'/B: 除去処理の後・字数検査の前の **唯一の照合点**。正規化一致した
+    #    区間は凍結原文へ置換（exempt_blocks を渡さない経路=顧客対応 Bot は従来どおり）
     if exempt_blocks:
         restored, matched = restore_frozen_blocks(out, exempt_blocks)
         if matched:
@@ -185,11 +219,13 @@ def structure_violations(text: str, *, max_chars: int | None = None,
     ——一致したブロックを本文から除いた**自由文部分**に通常上限（文字数・
     質問数とも）を適用する。罫線だけ混ぜた自由文は免除されない。
     exempt_blocks を渡さない経路（顧客対応 Bot）は全文に上限適用（従来
-    どおり）。"""
+    どおり）。
+
+    GATE-EXEMPT-FIX-1-fix1（裁定 A'）: 本関数は**再照合しない**。正規化一致→原文
+    復元は sanitize_reply の 1 か所だけで行い、本関数は受け取った文面（復元済み）の
+    逐語一致区間だけを免除する（免除対象を広げない）。"""
     limit = max_chars if max_chars is not None else max_auto_chars()
-    # GATE-EXEMPT-FIX-1 裁定 A/D: 正規化一致の区間を原文へ戻してから逐語免除
-    # （呼び出し側が sanitize_reply で復元済みなら作用 0）
-    remainder, _ = restore_frozen_blocks(text, exempt_blocks)
+    remainder = text
     for block in exempt_blocks:
         if block:
             # fix2[01]: 各確定ブロックの免除は**最大 1 回**。同一ブロックの
