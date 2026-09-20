@@ -286,6 +286,17 @@ async def fetch_case(user_id: str) -> dict | None:
     return rows[0] if rows else None
 
 
+HUMAN_MODE_VALUE = "人対応"
+
+
+def is_human_mode(record: dict | None) -> bool:
+    """人対応ゲートの単一の判定（HRI-01／HRI-06 で共用）。App 40 の response_mode が
+    「人対応」のときだけ True。レコード無し・欄無し・空は「自動」（False）。
+    照会の失敗（判定不能）は呼び出し側が「送らない」側へ倒す。"""
+    return record is not None and str(
+        (record.get("response_mode") or {}).get("value") or "") == HUMAN_MODE_VALUE
+
+
 def validate_hearing_dates(fields: dict,
                            today: datetime.date | None = None) -> list[str]:
     """日付整合検証（正本 §2.1・02 §6「知った日 < 死亡日 等」）。

@@ -80,6 +80,7 @@ IMAGE_HUMAN_HOLD_MARKER = "（画像・人対応中のため自動返信を保�
 IMAGE_HUMAN_CLOSED_MARKER = "（画像・人対応済として終了＝自動返信なし）"
 # 人対応ゲートを持つチャネル（時効の画像経路は main 側の既存ゲートのまま=対象外）
 _HUMAN_GATED_CHANNELS = frozenset({"houki"})
+_LOOKUP_FAILED = object()            # App 40 の照会失敗（判定不能）の番兵
 
 # 束ね予約: "channel:userId" → 最新受信イベントの冪等キー（単一イベント
 # ループ前提の in-memory。消失時は個別返信へ縮退＝無返信にはならない）
@@ -380,18 +381,24 @@ async def close_held_markers(channel_name: str, user_id: str) -> bool:
     代表経路が扱う。送信 claim を共有し、並行する送信経路との隙間を作らない。"""
     if os.environ.get("IMAGE_HEAL_DISABLED") == "1":
         return False
+    try:
+        # 保留行が 1 行も無いユーザー（大多数）はここで終わる=マーカー照会も claim も
+        # 行わない（通常の受信経路に照会・排他を足さない）
+        hold = await _latest_row_id_by_category(
+            user_id, f"{_HUMAN_HOLD_PREFIX}{channel_name}")
+    except Exception:
+        logger.error("[IMAGE_INTAKE] held marker close failed (fixed reason)")
+        return False
+    if not hold:
+        return False
     key = _key(channel_name, user_id)
     if key in _send_claims:                  # 確認→取得（同期区間・awaitなし）
         return False
     _send_claims.add(key)
     try:
         marker = await _unreplied_marker_id(channel_name, user_id)
-        if not marker:
-            return False
-        hold = await _latest_row_id_by_category(
-            user_id, f"{_HUMAN_HOLD_PREFIX}{channel_name}")
-        if not hold or int(hold) < marker:
-            return False                     # 保留行の無い未回収=通常の未返信
+        if not marker or int(hold) < marker:
+            return False                     # 未回収なし／保留行の無い未回収=通常の未返信
         await _append_human_row(user_id, f"{_HUMAN_CLOSED_PREFIX}{channel_name}",
                                 IMAGE_HUMAN_CLOSED_MARKER)
         logger.info("[IMAGE_INTAKE] held markers closed as human-handled (no send)")
@@ -497,6 +504,16 @@ async def handle_houki_image(user_id: str, event_id: str,
                     emit(user_id[:10], "record_id", "log", "operator"))
         return
 
+    # HRI-06（裁定 G-2）: 解除後の最初の受信が画像だった場合も、保留分を先に閉じる
+    # （新しいマーカーを保存する前。人対応でないと確認できたときだけ。照会の失敗は
+    # 閉じない=次の受信で再試行）
+    try:
+        early = await houki_case_store.fetch_case(user_id)
+    except Exception:
+        early = _LOOKUP_FAILED
+    if early is not _LOOKUP_FAILED and not houki_case_store.is_human_mode(early):
+        await close_held_markers("houki", user_id)
+
     idem_key = marker_category("houki", event_id)
     # 冪等 pre-check（失敗は続行に倒してよい——返信の重複は strict 保存+勝者
     # 決定が防ぐ。時効側 fix1[03] と同型）
@@ -548,6 +565,29 @@ async def handle_houki_image(user_id: str, event_id: str,
 
     if not await debounce_and_elect("houki", user_id, idem_key, _latest):
         logger.info("[IMAGE_INTAKE] bundled (superseded)")
+        return
+
+    # HRI-06（裁定 G・G-2）: 人対応ゲート（送信の直前・束の代表だけが判定する）。
+    # 判定は houki_bot/hearing.py（HRI-01）と同一の houki_case_store.is_human_mode。
+    # - 人対応中: 顧客向け送信 0 件（受領返信・読解結果とも）。抑止した事実を保留行に
+    #   記録し、読解は実行して結果を App 40 へ転記する（人対応者が参照できるように）。
+    #   マーカーは消費しない。ヒアリングの状態は進めない（会話・status に触れない）
+    # - App 40 の照会失敗（判定不能）: 送らない側へ倒す。保留行も書かない=未返信の
+    #   まま残り、次の受信で判定し直される（人対応でなければ heal が回収する）
+    try:
+        record = await houki_case_store.fetch_case(user_id)
+    except Exception:
+        logger.warning("[IMAGE_INTAKE] case lookup failed (no send, stays unreplied)")
+        return
+    if houki_case_store.is_human_mode(record):
+        logger.info("[IMAGE_INTAKE] human mode → silent (hold, store only) userId=%s...",
+                    emit(user_id[:10], "record_id", "log", "operator"))
+        await hold_for_human_mode("houki", user_id)
+        try:
+            await image_analysis.analyze_and_reply(
+                user_id, event_id, image_analysis.HOUKI, no_send=True)
+        except Exception:
+            logger.error("[IMAGE_INTAKE] image analysis hook failed (fixed reason)")
         return
     result = await send_receipt_and_close("houki", HOUKI_CHANNEL, user_id)
     if result is None:
