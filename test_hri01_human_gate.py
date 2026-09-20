@@ -5,9 +5,15 @@ image_intake.heal_unreplied の**後**にあり、人対応中でも未返信の
 あると受領返信が顧客へ送信されていた（裁定 G: 人対応中は画像受領返信を含め顧客向け
 送信を一切発生させない）。
 
-修正: 人対応判定を heal_unreplied より前へ。ゲートは「送信の抑止」であって
-「マーカーの回収」ではない——人対応中は未返信マーカーを消費・削除せず、人対応の
-解除後の次のテキスト受信で heal が受領返信を 1 件送って回収する。
+修正: 人対応判定を heal_unreplied より前へ。
+
+裁定 G-2（大野決定・人対応中に抑止した自動送信の解除後の扱い）:
+- 人対応中に抑止した顧客向け自動送信（受領返信を含む）は、解除後も顧客へ送らない。
+- 抑止した事実は App 28 に「保留」行（画像人対応保留:houki）として記録する。
+- 解除後の最初の受信時に、保留行より古い未回収マーカーを「人対応済」行
+  （画像人対応済:houki）で閉じる。保留行が存在しないマーカーは閉じない
+  （送信失敗等の通常の未返信は従来どおり heal が回収する）。
+- App 40 の編集 webhook は使わない（解除の検知=人対応でない受信が来たこと）。
 
 heal は実物（hub.image_intake.heal_unreplied・send_receipt_and_close）を通し、
 App 28 / App 40 はフェイク、LINE 送信（push_text）だけを差し替える。
@@ -106,6 +112,12 @@ class _FakeStore:
     def receipts(self):
         return [r for r in self.chatlog if r.get("category") == "画像受領済:houki"]
 
+    def holds(self):
+        return [r for r in self.chatlog if r.get("category") == "画像人対応保留:houki"]
+
+    def human_closed(self):
+        return [r for r in self.chatlog if r.get("category") == "画像人対応済:houki"]
+
 
 class TestHumanGateBeforeHeal(unittest.TestCase):
     def setUp(self):
@@ -145,34 +157,115 @@ class TestHumanGateBeforeHeal(unittest.TestCase):
     def customer_sends(self) -> int:
         return self.push.await_count + self.reply.await_count
 
-    # 受入 1: 人対応中+未返信マーカー → 顧客向け送信 0 件・マーカーは残存（未回収）
-    def test_human_mode_with_unreplied_marker_sends_nothing_and_keeps_marker(self):
+    # 受入 1: 人対応中+未返信マーカー → 送信 0 件・保留行あり・マーカー残存
+    def test_human_mode_with_unreplied_marker_holds_and_sends_nothing(self):
         self.store.set_case("人対応")
         self.store.seed_marker()
         self._turn()
         self.assertEqual(self.customer_sends(), 0)
-        self.push.assert_not_awaited()
-        self.assertEqual(len(self.store.markers()), 1)     # 削除されていない
-        self.assertEqual(self.store.receipts(), [])        # 回収（受領済み行）もされていない
+        self.assertEqual(len(self.store.markers()), 1)     # 消費・削除されていない
+        self.assertEqual(self.store.receipts(), [])
+        self.assertEqual(self.store.human_closed(), [])    # 人対応中は閉じない
+        (hold,) = self.store.holds()                       # 抑止した事実の記録
+        self.assertEqual(hold["message"], ii.IMAGE_HUMAN_HOLD_MARKER)
+        self.assertEqual((hold["line_user_id"], hold["role"], hold["auto_sent"]),
+                         (USER, "user", "no"))
         self.notify.assert_awaited_once()                  # 【人対応中】通知は従来どおり
         self.intake.assert_awaited_once_with(USER, "こんにちは", EVT)   # 取込は常時
 
-    # 受入 2: 人対応を解除して再実行 → 受領返信 1 件・マーカー回収
-    def test_release_human_mode_then_heal_sends_once_and_closes(self):
+    def test_hold_row_is_written_once_per_unreplied_bundle(self):
         self.store.set_case("人対応")
         self.store.seed_marker()
         self._turn()
-        self.push.assert_not_awaited()
-        self.store.set_case("自動")                        # 人対応の解除
+        self._turn()                                       # 人対応中の 2 通目
+        self.assertEqual(len(self.store.holds()), 1)
+        self.store.seed_marker("IMG2")                     # 人対応中に新しい未回収
         self._turn()
+        self.assertEqual(len(self.store.holds()), 2)
+        self.assertEqual(self.customer_sends(), 0)
+
+    def test_human_mode_without_marker_writes_no_hold(self):
+        self.store.set_case("人対応")
+        self._turn()
+        self.assertEqual(self.store.holds(), [])
+        self.assertEqual(self.customer_sends(), 0)
+
+    # 受入 2: 解除後の最初のテキスト受信 → 受領返信 0 件・当該マーカーが人対応済で閉じる
+    def test_release_closes_held_marker_without_sending_receipt(self):
+        self.store.set_case("人対応")
+        self.store.seed_marker()
+        self._turn()
+        self.store.set_case("自動")                        # 人対応の解除（kintone の手編集）
+        self._turn()                                       # 解除後の最初の受信
+        self.push.assert_not_awaited()                     # 受領返信の後出しなし
+        self.assertEqual(self.store.receipts(), [])
+        (closed,) = self.store.human_closed()
+        self.assertEqual(closed["message"], ii.IMAGE_HUMAN_CLOSED_MARKER)
+        self.assertGreater(int(closed["$id"]), int(self.store.markers()[-1]["$id"]))
+        self.assertEqual(len(self.store.markers()), 1)     # マーカー自体は残る（追跡可能）
+        # このテキストへの通常のヒアリング応答は従来どおり（抑止した送信ではない）
+        self.assertEqual(self.reply.await_count, 1)
+        self._turn()                                       # 以後の受信でも送らない・二重に閉じない
+        self.push.assert_not_awaited()
+        self.assertEqual(len(self.store.human_closed()), 1)
+
+    def test_close_failure_still_sends_nothing(self):
+        # 人対応済行の保存に失敗しても、保留行のある未回収は送信関門が送らない
+        self.store.set_case("人対応")
+        self.store.seed_marker()
+        self._turn()
+        self.store.set_case("自動")
+        real_create = self.store.create
+
+        async def _create(app, fields):
+            if str(fields.get("category", "")).startswith("画像人対応済:"):
+                raise hub_kintone.KintoneError(520, "GAIA_XX", "down")
+            return await real_create(app, fields)
+        with patch.object(hub_kintone, "create_record", _create):
+            self._turn()
+        self.push.assert_not_awaited()
+        self.assertEqual(self.store.human_closed(), [])
+        self._turn()                                       # 次の受信で再び閉鎖を試みる
+        self.push.assert_not_awaited()
+        self.assertEqual(len(self.store.human_closed()), 1)
+
+    # 受入 3: 保留行の無い未返信マーカー（送信失敗由来）は閉じられず従来どおり扱われる
+    def test_unreplied_marker_without_hold_is_healed_as_before(self):
+        self.store.set_case("自動")
+        self.store.seed_marker()                           # 送信失敗で残った未返信
+        self._turn()
+        self.assertEqual(self.store.human_closed(), [])
         self.assertEqual(self.push.await_count, 1)
         self.assertEqual(self.push.await_args.args[1:], (USER, IMAGE_RECEIPT_REPLY))
-        self.assertEqual(len(self.store.receipts()), 1)    # 回収済み
-        self._turn()                                       # 以後は再送しない
-        self.assertEqual(self.push.await_count, 1)
         self.assertEqual(len(self.store.receipts()), 1)
 
-    # 受入 3（回帰）: 人対応でない+未返信マーカー → 従来どおり送信
+    def test_marker_newer_than_hold_is_not_closed(self):
+        # 保留行より新しい未返信マーカー（解除後に届いて送信に失敗した画像）は通常の未返信
+        self.store.set_case("人対応")
+        self.store.seed_marker()
+        self._turn()                                       # 保留行
+        self.store.set_case("自動")
+        self.store.seed_marker("IMG2")                     # 保留行より新しい
+        self._turn()
+        self.assertEqual(self.store.human_closed(), [])
+        self.assertEqual(self.push.await_count, 1)         # 従来どおり heal が回収
+        self.assertEqual(len(self.store.receipts()), 1)
+
+    def test_hold_save_failure_is_contained(self):
+        self.store.set_case("人対応")
+        self.store.seed_marker()
+        real_create = self.store.create
+
+        async def _create(app, fields):
+            if str(fields.get("category", "")).startswith("画像人対応保留:"):
+                raise hub_kintone.KintoneError(520, "GAIA_XX", "down")
+            return await real_create(app, fields)
+        with patch.object(hub_kintone, "create_record", _create):
+            self._turn()                                   # 例外にならない
+        self.assertEqual(self.customer_sends(), 0)
+        self.notify.assert_awaited_once()
+
+    # 受入 4（回帰）: 人対応でない+未返信マーカー → 従来どおり送信
     def test_auto_mode_with_unreplied_marker_heals_as_before(self):
         for mode in ("", "自動"):
             with self.subTest(response_mode=mode):
@@ -183,6 +276,7 @@ class TestHumanGateBeforeHeal(unittest.TestCase):
                 self._turn()
                 self.assertEqual(self.push.await_count, 1)
                 self.assertEqual(len(self.store.receipts()), 1)
+                self.assertEqual(self.store.holds(), [])
 
     def test_no_case_record_heals_as_before(self):
         self.store.seed_marker()                           # App 40 未作成=自動扱い
@@ -200,13 +294,18 @@ class TestHumanGateBeforeHeal(unittest.TestCase):
             order.append("fetch_case")
             return await real_fetch(uid)
 
+        async def _close(*a):
+            order.append("close_held")
+            return False
+
         async def _heal(*a):
             order.append("heal")
             return False
         with patch.object(hearing.houki_case_store, "fetch_case", _fetch), \
+             patch.object(hearing.image_intake, "close_held_markers", _close), \
              patch.object(hearing.image_intake, "heal_unreplied", _heal):
             self._turn()
-        self.assertEqual(order[:2], ["fetch_case", "heal"])
+        self.assertEqual(order[:3], ["fetch_case", "close_held", "heal"])
 
     # 判定不能（App 40 照会の失敗）は送らない側へ倒す・取込の finally は維持
     def test_case_lookup_failure_sends_nothing(self):
@@ -217,7 +316,43 @@ class TestHumanGateBeforeHeal(unittest.TestCase):
                 self._turn()
         self.assertEqual(self.customer_sends(), 0)
         self.assertEqual(self.store.receipts(), [])
+        self.assertEqual(self.store.holds(), [])           # 判定不能=保留も閉鎖もしない
+        self.assertEqual(self.store.human_closed(), [])
         self.intake.assert_awaited_once()
+
+
+class TestHumanRowsHiddenFromHistory(unittest.TestCase):
+    """保留行・人対応済行（固定文言）は会話履歴の復元に含めない。"""
+
+    def test_hold_and_closed_rows_are_excluded(self):
+        import chat_responder
+        records = [
+            {"role": {"value": "user"}, "message": {"value": ii.IMAGE_HUMAN_CLOSED_MARKER}},
+            {"role": {"value": "user"}, "message": {"value": ii.IMAGE_HUMAN_HOLD_MARKER}},
+            {"role": {"value": "assistant"}, "message": {"value": "返信"}},
+            {"role": {"value": "user"}, "message": {"value": IMAGE_INBOUND_MARKER}},
+        ]
+
+        class _Resp:
+            is_success = True
+
+            def json(self):
+                return {"records": records}
+
+        class _Client:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+            async def get(self, *a, **k):
+                return _Resp()
+        with patch.object(chat_responder.httpx, "AsyncClient", lambda *a, **k: _Client()), \
+             patch.object(chat_responder, "APP_CHATLOG", "28"), \
+             patch.object(chat_responder, "TOKEN_CHATLOG", "d"):
+            history = _run(chat_responder.get_recent_chat_history(USER))
+        self.assertEqual([h["content"] for h in history], [IMAGE_INBOUND_MARKER, "返信"])
 
 
 if __name__ == "__main__":

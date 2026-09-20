@@ -252,6 +252,9 @@ async def _hearing_turn(reply_token: str, user_id: str, user_text: str) -> None:
             (record.get("response_mode") or {}).get("value") or "") == "人対応":
         logger.info("[HOUKI_HEARING] human mode → silent (record only) userId=%s...",
                     emit(user_id[:10], "record_id", "log", "operator"))
+        # 裁定 G-2: 未回収の画像受領マーカーがあれば、受領返信を抑止した事実を App 28 に
+        # 「保留」行として記録する（マーカーは消費しない・失敗は内部で握る）
+        await image_intake.hold_for_human_mode("houki", user_id)
         await save_to_chatlog(user_id, "user", user_text, "", "no")
         display_name = str((record.get("顧客名") or {}).get("value") or "") or user_id
         await notify.notify_admin_line(
@@ -262,13 +265,17 @@ async def _hearing_turn(reply_token: str, user_id: str, user_text: str) -> None:
             f"{emit(str((record.get('$id') or {}).get('value') or ''), 'record_id', 'line_business', 'attorney')}")
         return
 
+    # 裁定 G-2: 解除後の最初の受信。人対応中に抑止した受領返信は後出しで送らない——
+    # 保留行のある未回収マーカーを「人対応済」行で閉じる（送信なし）。保留行の無い
+    # 未返信マーカー（送信失敗 等）は閉じない=下の heal が従来どおり回収する。
+    # 閉鎖に失敗しても、保留行のある未回収は送信関門（image_intake）が送らない
+    await image_intake.close_held_markers("houki", user_id)
+
     # IMAGE-INTAKE-1-fix1[01]: 自己修復発火——未返信の画像受領マーカーを
     # 次のテキスト受信時に回収（内部で例外を握る・会話を道連れにしない）。
     # HRI-01（裁定 G）: 人対応ゲートの**後**に置く——人対応中は受領返信を含め
-    # 顧客向け送信を一切発生させない。ゲートは「送信の抑止」であって「マーカーの
-    # 回収」ではない（heal を呼ばない=未返信マーカーは消費・削除されず、人対応の
-    # 解除後の次のテキスト受信で回収される）。App 40 の照会失敗（判定不能）も
-    # ここへ到達しない=送らない側へ倒れる
+    # 顧客向け送信を一切発生させない。App 40 の照会失敗（判定不能）もここへ
+    # 到達しない=送らない側へ倒れる
     await image_intake.heal_unreplied("houki", HOUKI_CHANNEL, user_id)
 
     history = conversation_histories.setdefault(user_id, [])
