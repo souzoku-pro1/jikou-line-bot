@@ -138,6 +138,14 @@ class _FakeApp21:
 
     async def search(self, app, query, fields=None):
         self.search_calls.append(query)
+        # HRI-07: 紐付けの区間内再検索（hub.jikou_case_create.find_existing）
+        m_user = re.fullmatch(
+            r'LINEユーザーID = "([^"]+)" order by \$id desc limit (\d+)', query)
+        if m_user:
+            hit = sorted((r for r in self.rows.values()
+                          if r["LINEユーザーID"]["value"] == m_user.group(1)),
+                         key=lambda r: int(r["$id"]["value"]), reverse=True)
+            return [{"$id": dict(r["$id"])} for r in hit[:int(m_user.group(2))]]
         m = re.search(r'受付番号 = "([0-9]{6})"', query)
         assert m, query
         number = m.group(1)

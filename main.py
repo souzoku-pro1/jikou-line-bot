@@ -801,6 +801,22 @@ async def _process_line_event(reply_token: str, user_id: str, user_text: str) ->
                     in_hearing_session = False
                     logger.info("[FORM_LINK] linked → re-evaluate routing user_id=%s",
                                 emit(user_id, "external_ref", "log", "operator"))
+                elif outcome == "adopted":
+                    # HRI-07: 本人の案件レコードが別に在る（紐付けていない）。既に
+                    # レコードを持つユーザーが 6 桁を送った場合と同じ扱い=そのレコードの
+                    # 最新状態で人対応・status ルーティングを評価して通常フローへ。
+                    # フォーム回答の引き継ぎ注入はしない。取得できなければ linked と
+                    # 同じく fail-closed（自動返信しない+弁護士通知）
+                    adopted_record = await form_link.fetch_linked_record(linked_id)
+                    if adopted_record is None:
+                        logger.error("[FORM_LINK] post-adopt refetch failed "
+                                     "(fail-closed, no auto reply) record_id=%s",
+                                     emit(linked_id, "record_id", "log", "operator"))
+                        await form_link.notify_fail_closed(linked_id)
+                        await save_to_chatlog(user_id, "user", user_text,
+                                              "ヒアリング", "no")
+                        return
+                    app21_record = adopted_record
                 elif outcome == "not_matched":
                     await _line_reply_with_fallback(
                         reply_token, user_id, form_link.REPLY_NOT_MATCHED)
