@@ -147,12 +147,13 @@ class _FakeApp21:
 class _ModuleBase(unittest.TestCase):
     def setUp(self):
         self.fake = _FakeApp21()
-        self.notify = AsyncMock(return_value=True)
+        self.notify = AsyncMock(return_value="sent")    # fix1: 3 値 API（sent/throttled/failed）
         patches = [
             patch.object(hu.hub_kintone, "search_records", self.fake.search),
             patch.object(hu.hub_kintone, "get_record", self.fake.get_by_id),
             patch.object(hu.hub_kintone, "update_record", self.fake.update),
-            patch.object(hu.notify, "notify_admin_line", self.notify),
+            patch.object(hu.notify, "notify_admin_line_result", self.notify),
+            patch.object(hu, "NOTIFY_RETRY_SLEEP_SEC", 0),
         ]
         for p in patches:
             p.start()
@@ -223,7 +224,8 @@ class TestApplyUpdate(_ModuleBase):
         r = _run(hu.apply_update("10", {"顧客名": NAME, "status": "受任",
                                         "LINEユーザーID": "Uother", "問い合わせ業者名": "X"}))
         self.assertEqual(r["written"], ["顧客名"])
-        self.assertEqual(r["dropped"], ["LINEユーザーID", "status", "問い合わせ業者名"])
+        self.assertEqual(r["dropped_count"], 3)           # fix1: キー名は戻り値にも載せない
+        self.assertNotIn("dropped", r)
         self.assertEqual(self.fake.update_calls[0][1], {"顧客名": NAME})
         self.assertEqual(self.fake.values("10", "status"), "問い合わせ")
 
@@ -299,12 +301,13 @@ class TestNotice(_ModuleBase):
         text = hu.build_notice(USER, "10", hu.METHOD_SEARCH,
                                {"outcome": hu.OUTCOME_UPDATED,
                                 "written": ["顧客名", "生年月日"],
-                                "preexisting": ["電話番号"], "dropped": ["status"]})
+                                "preexisting": ["電話番号"], "dropped_count": 1})
         self.assertIn("案件レコードNo: 10", text)
         self.assertIn("LINEユーザーIDで検索", text)
-        self.assertIn("登録した欄: 顧客名, 生年月日", text)
+        self.assertIn("登録した欄: 氏名, 生年月日", text)          # fix1: 表示名（許可集合）
         self.assertIn("既に値があり登録しなかった欄: 電話番号", text)
-        self.assertIn("対象外のため登録しなかった欄: status", text)
+        self.assertIn("対象外の項目が 1 件あります", text)          # fix1: 件数のみ
+        self.assertNotIn("status", text)
 
     def test_notice_methods(self):
         self.assertIn("メモリ上の台帳", hu.build_notice(USER, "10", hu.METHOD_MEMORY, None))
@@ -331,7 +334,8 @@ class TestNotice(_ModuleBase):
         logger = logging.getLogger("hub.notify")
         logger.addHandler(handler)
         try:
-            hub_notify._log_throttled("hearing_update:10")
+            hub_notify._log_throttled("hearing_update_ok:10:abcdef12")
+            hub_notify._log_throttled("hearing_update_review:10:abcdef12")
         finally:
             logger.removeHandler(handler)
         self.assertNotIn("unknown_kind", stream.getvalue())
@@ -342,9 +346,9 @@ class TestNotice(_ModuleBase):
         self.assertEqual((rid, method), ("10", hu.METHOD_SEARCH))
         text = self.notice()
         self.assert_no_values(text)
-        self.assertIn("登録した欄: 顧客名", text)
-        self.assertEqual(self.notify.await_args.kwargs["throttle_key"], "hearing_update:10")
-        self.assertTrue(self.notify.await_args.kwargs["throttle_on_success_only"])
+        self.assertIn("登録した欄: 氏名", text)
+        self.assertTrue(self.notify.await_args.kwargs["throttle_key"]
+                        .startswith("hearing_update_ok:10:"))
 
     def test_handle_update_parse_failed_notifies_only(self):
         self.fake.add("10")
@@ -364,7 +368,7 @@ class TestNotice(_ModuleBase):
 
     def test_notify_failure_is_contained(self):
         self.fake.add("10")
-        with patch.object(hu.notify, "notify_admin_line",
+        with patch.object(hu.notify, "notify_admin_line_result",
                           AsyncMock(side_effect=RuntimeError("line down"))):
             self.assertEqual(_run(hu.handle_update(USER, None, {"顧客名": NAME})),
                              ("10", hu.METHOD_SEARCH))
@@ -387,7 +391,7 @@ class _FlowBase(unittest.TestCase):
         self.create = AsyncMock(return_value="900")
         self.legacy_update = AsyncMock()
         self.queue = AsyncMock(return_value="29-1")
-        self.notify = AsyncMock(return_value=True)
+        self.notify = AsyncMock(return_value="sent")
         self.business = AsyncMock(return_value=True)
         patches = [
             patch.object(main.autoreply_stoplist, "is_suppressed",
@@ -404,7 +408,8 @@ class _FlowBase(unittest.TestCase):
             patch.object(hu.hub_kintone, "search_records", self.fake.search),
             patch.object(hu.hub_kintone, "get_record", self.fake.get_by_id),
             patch.object(hu.hub_kintone, "update_record", self.fake.update),
-            patch.object(hu.notify, "notify_admin_line", self.notify),
+            patch.object(hu.notify, "notify_admin_line_result", self.notify),
+            patch.object(hu, "NOTIFY_RETRY_SLEEP_SEC", 0),
             patch.object(main.hub_notify, "notify_business", self.business),
             patch.dict(os.environ, {"ATTORNEY_LINE_USER_ID": "U_attorney",
                                     "AUTOREPLY_PAUSED": "0"}),
@@ -488,7 +493,7 @@ class TestFlow(_FlowBase):
         self.assertEqual(self.fake.update_calls[0][1],
                          {"生年月日": BIRTH, "電話番号": PHONE, "メールアドレス": MAIL})
         text = self.notify.await_args.args[0]
-        self.assertIn("既に値があり登録しなかった欄: 住所, 顧客名", text)
+        self.assertIn("既に値があり登録しなかった欄: 氏名, 住所", text)   # fix1: 表示名・固定順
 
     def test_cas_409_refetch_once_in_flow(self):
         self.fake.add("10", revision="5")
@@ -557,6 +562,155 @@ class TestFlow(_FlowBase):
         self.assert_clean_send()
         self.assertIn("失敗", self.notify.await_args.args[0])
         self.assertEqual(main.kintone_record_ids[USER], "10")
+
+# ── fix1（Codex R-JIKOU-HEARING-HOTFIX-1 JHH-01/JHH-02） ────────────────────────
+FOREIGN_KEY = "被相続人氏名"
+FOREIGN_VALUE = "鈴木花子"
+
+
+class _LogCapture(logging.Handler):
+    def __init__(self):
+        super().__init__(level=logging.DEBUG)
+        self.records: list[logging.LogRecord] = []
+
+    def emit(self, record):
+        self.records.append(record)
+
+    def text(self) -> str:
+        return "\n".join(r.getMessage() for r in self.records)
+
+    def errors(self):
+        return [r for r in self.records if r.levelno >= logging.ERROR]
+
+
+class TestFix1ForeignKeysAndNotify(_ModuleBase):
+    def setUp(self):
+        super().setUp()
+        self.cap = _LogCapture()
+        root = logging.getLogger()
+        self._old_level = root.level
+        root.setLevel(logging.DEBUG)
+        root.addHandler(self.cap)
+        self.addCleanup(root.removeHandler, self.cap)
+        self.addCleanup(root.setLevel, self._old_level)
+
+    def test_constants_pinned(self):
+        self.assertEqual(hu.UPDATE_FIELD_LABELS,
+                         {"顧客名": "氏名", "住所": "住所", "生年月日": "生年月日",
+                          "電話番号": "電話番号", "メールアドレス": "メールアドレス"})
+        self.assertEqual(hu.UPDATE_FIELDS, frozenset(hu.UPDATE_FIELD_LABELS))
+        self.assertEqual(hu.NOTIFY_RETRY_MAX, 2)
+        self.assertEqual(hu.NOTIFY_FAILED_REASON, "hearing_notify_failed")
+
+    def test_default_sleep_constant(self):
+        # _ModuleBase が 0 に patch する前の既定値（票: 1.0 秒）
+        import importlib
+        self.assertEqual(hu.__dict__.get("NOTIFY_RETRY_SLEEP_SEC"), 0)   # patch 中
+        src = open(hu.__file__, encoding="utf-8").read()
+        self.assertIn("NOTIFY_RETRY_SLEEP_SEC = 1.0", src)
+
+    def test_T1_foreign_key_never_appears_anywhere(self):
+        self.fake.add("10")
+        rid, method = _run(hu.handle_update(
+            USER, None, {"顧客名": NAME, FOREIGN_KEY: FOREIGN_VALUE}))
+        self.assertEqual((rid, method), ("10", hu.METHOD_SEARCH))
+        text = self.notice()
+        self.assertIn("対象外の項目が 1 件あります", text)
+        self.assertIn("登録した欄: 氏名", text)
+        key = self.notify.await_args.kwargs["throttle_key"]
+        for leak in (FOREIGN_KEY, FOREIGN_VALUE, NAME):
+            self.assertNotIn(leak, text)                           # 通知本文
+            self.assertNotIn(leak, self.cap.text())                # 全ログ出力
+            self.assertNotIn(leak, repr((rid, method)))            # 復唱（戻り値）
+            self.assertNotIn(leak, key)                            # 冪等キー
+        # App 21 へは許可集合の欄だけ書く（対象外キーは PUT にも載らない）
+        self.assertEqual(self.fake.update_calls[0][1], {"顧客名": NAME})
+        self.assertEqual(self.fake.values("10", "顧客名"), NAME)
+
+    def test_T2_no_foreign_keys_no_count_line(self):
+        self.fake.add("10")
+        _run(hu.handle_update(USER, None, {"顧客名": NAME}))
+        text = self.notice()
+        self.assertNotIn("対象外", text)
+        self.assertNotIn("件あります", text)
+
+    def test_T3_failed_failed_ok_retries_without_error(self):
+        self.fake.add("10")
+        self.notify.side_effect = ["failed", "failed", "sent"]
+        rid, method = _run(hu.handle_update(USER, None, {"顧客名": NAME}))
+        self.assertEqual((rid, method), ("10", hu.METHOD_SEARCH))
+        self.assertEqual(self.notify.await_count, 3)               # 送信 3 回
+        self.assertEqual(self.cap.errors(), [])                    # ERROR ログなし
+        self.assertEqual(len(self.fake.update_calls), 1)           # CAS 書込は 1 回
+        keys = {c.kwargs["throttle_key"] for c in self.notify.await_args_list}
+        self.assertEqual(len(keys), 1)                             # 再送は同一キー
+
+    def test_T4_all_failed_one_error_line_no_raise_cas_kept(self):
+        self.fake.add("10")
+        self.notify.side_effect = ["failed", "failed", "failed"]
+        rid, method = _run(hu.handle_update(USER, None, {"顧客名": NAME}))   # 例外なし
+        self.assertEqual((rid, method), ("10", hu.METHOD_SEARCH))
+        self.assertEqual(self.notify.await_count, 3)
+        errs = self.cap.errors()
+        self.assertEqual(len(errs), 1)
+        msg = errs[0].getMessage()
+        self.assertIn("hearing_notify_failed", msg)
+        self.assertIn("10", msg)
+        for leak in (NAME, ADDR, PHONE, MAIL, FOREIGN_VALUE):
+            self.assertNotIn(leak, msg)
+        self.assertEqual(self.fake.values("10", "顧客名"), NAME)   # CAS 結果は維持
+        self.assertEqual(len(self.fake.update_calls), 1)
+
+    def test_T4b_exception_from_notify_counts_as_failed(self):
+        self.fake.add("10")
+        self.notify.side_effect = RuntimeError("line down")
+        rid, method = _run(hu.handle_update(USER, None, {"顧客名": NAME}))
+        self.assertEqual((rid, method), ("10", hu.METHOD_SEARCH))
+        self.assertEqual(self.notify.await_count, 3)
+        self.assertEqual(len(self.cap.errors()), 1)
+
+    def test_T5_skipped_no_retry(self):
+        self.fake.add("10")
+        self.notify.side_effect = ["throttled"]
+        rid, method = _run(hu.handle_update(USER, None, {"顧客名": NAME}))
+        self.assertEqual((rid, method), ("10", hu.METHOD_SEARCH))
+        self.assertEqual(self.notify.await_count, 1)               # 再送 0 回
+        self.assertEqual(self.cap.errors(), [])
+        infos = [r.getMessage() for r in self.cap.records
+                 if "notify skipped" in r.getMessage()]
+        self.assertEqual(len(infos), 1)
+        self.assertIn("10", infos[0])
+        self.assertNotIn(NAME, infos[0])
+
+    def test_T5b_send_notice_returns_three_values(self):
+        for side, expected, calls in (("sent", "ok", 1), ("throttled", "skipped", 1),
+                                      ("failed", "failed", 3)):
+            with self.subTest(side=side):
+                self.notify.reset_mock(side_effect=True)
+                self.notify.return_value = side
+                self.assertEqual(_run(hu.send_notice("t", "k:1:x", "1")), expected)
+                self.assertEqual(self.notify.await_count, calls)
+
+    def test_T6_ok_and_review_keys_differ(self):
+        clean = {"outcome": hu.OUTCOME_UPDATED, "written": ["顧客名"],
+                 "preexisting": [], "dropped_count": 0}
+        conflict = dict(clean, preexisting=["住所"])
+        foreign = dict(clean, dropped_count=1)
+        k_ok = hu.notice_key(USER, "10", hu.METHOD_SEARCH, clean)
+        k_conf = hu.notice_key(USER, "10", hu.METHOD_SEARCH, conflict)
+        k_for = hu.notice_key(USER, "10", hu.METHOD_SEARCH, foreign)
+        self.assertTrue(k_ok.startswith("hearing_update_ok:10:"))
+        self.assertTrue(k_conf.startswith("hearing_update_review:10:"))
+        self.assertTrue(k_for.startswith("hearing_update_review:10:"))
+        self.assertEqual(len({k_ok, k_conf, k_for}), 3)
+        # 同じ record_id・同じ digest でも kind が違えば別文字列
+        d = hu.notice_digest(hu.METHOD_SEARCH, clean)
+        self.assertNotEqual(f"{hu.KIND_OK}:10:{d}", f"{hu.KIND_REVIEW}:10:{d}")
+        self.assertEqual(hu.notice_kind(hu.METHOD_NONE, None), hu.KIND_REVIEW)
+        self.assertEqual(hu.notice_kind(hu.METHOD_SEARCH,
+                                        dict(clean, outcome=hu.OUTCOME_NOOP)),
+                         hu.KIND_REVIEW)
+        self.assertNotIn(NAME, k_ok)
 
 
 if __name__ == "__main__":

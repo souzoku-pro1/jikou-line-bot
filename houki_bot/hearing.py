@@ -320,7 +320,7 @@ async def _hearing_turn(reply_token: str, user_id: str, user_text: str) -> None:
 
     # ── 送信ゲート（第 2 世代ガード機構の共用・route=houki_hearing） ──────────
     cleaned, _issues, fatal = reply_sanitizer.sanitize_reply(
-        reply_text, allowed_emoji=HOUKI_PROFILE.allowed_emoji)
+        reply_text, allowed_emoji=HOUKI_PROFILE.allowed_emoji, exempt_blocks=HEARING_TEMPLATE_BLOCKS_HOUKI)  # GATE-EXEMPT-FIX-1
     violations = ((["プレースホルダ/内部マーカー残存"] if fatal else [])
                   + reply_sanitizer.structure_violations(
                       cleaned, exempt_blocks=HEARING_TEMPLATE_BLOCKS_HOUKI)

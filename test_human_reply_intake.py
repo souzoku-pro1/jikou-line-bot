@@ -524,6 +524,23 @@ class TestJikouFlow(_Base):
         self.assertEqual(self.fake.val("KINTONE_APP_ID", "10", "顧客名"), NAME)
         self.assertEqual(self.fake.val("KINTONE_APP_ID", "10", "住所"), ADDR)
 
+    def test_apply_update_allowed_follows_fix1_contract(self):
+        # hotfix fix1 追随: 戻り値は dropped_count（件数のみ・キー名は返さない）。
+        # allowed 差し替え時の対象外判定は allowed 基準／既定は UPDATE_FIELDS のまま
+        self.fake.add_jikou()
+        r = _run(hearing_update.apply_update(
+            "10", {"furigana": "やまだたろう", "顧客名": NAME},
+            allowed=frozenset({"furigana"})))
+        self.assertNotIn("dropped", r)
+        self.assertEqual(r["dropped_count"], 1)
+        self.assertEqual(r["written"], ["furigana"])
+        self.assertEqual(self.fake.val("KINTONE_APP_ID", "10", "顧客名"), "")
+        r2 = _run(hearing_update.apply_update(
+            "10", {"furigana": "べつ", "顧客名": NAME}))
+        self.assertEqual(r2["dropped_count"], 1)
+        self.assertEqual(r2["written"], ["顧客名"])
+        self.assertEqual(self.fake.val("KINTONE_APP_ID", "10", "furigana"), "やまだたろう")
+
     def test_unexpected_exception_contained(self):
         self.fake.add_jikou()
         with patch.object(hri, "_find_record", AsyncMock(side_effect=RuntimeError("x"))):

@@ -1010,7 +1010,7 @@ async def _process_line_event(reply_token: str, user_id: str, user_text: str) ->
         # から送信。fatal（マーカー残存）・上限超過（定型テンプレブロックは
         # 免除）は自動送信せず承認キュー+現行定型で応答（切り詰めはしない）
         cleaned, _issues, _fatal = reply_sanitizer.sanitize_reply(
-            claude_reply, allowed_emoji=ALLOWED_CANONICAL_EMOJI)
+            claude_reply, allowed_emoji=ALLOWED_CANONICAL_EMOJI, exempt_blocks=HEARING_TEMPLATE_BLOCKS)  # GATE-EXEMPT-FIX-1
         # AUTOREPLY-STYLE-1-fix1 [B]: 弁護士本人の名乗り・見本の匿名化記号・
         # 旧見本由来の無根拠表現もヒアリング経路で承認降格（顧客対応と同一関数）
         violations = ((["プレースホルダ/内部マーカー残存"] if _fatal else [])
@@ -1328,7 +1328,7 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
 
     for event in data.get("events", []):
         if event.get("type") != "message":
-            continue
+            await _queue_follow_event(event, body, background_tasks, _durable); continue  # SHINDAN-LINE-LINK-1（follow のみ・他は無視）
         if event["message"].get("type") == "image":
             # AUTOREPLY-GEN2 要件4: 画像は固定受領応答+弁護士通知のみ
             # （AI に画像内容の判断はさせない・画像読解は別票。durable lane
@@ -2184,3 +2184,79 @@ from hub.webapp_q import router as webapp_q_router  # noqa: E402
 app.include_router(webapp_q_router)
 from hub.webapp_auth import router as webapp_router  # noqa: E402
 app.include_router(webapp_router)
+
+
+# ══════════════════════════════════════════════════════════════
+# SHINDAN-LINE-LINK-1: 友だち追加（follow）→ 本人専用の診断フォームリンクを 1 回送る
+#   - 送信契機は follow のみ（他の非 message イベントは従来どおり無視）
+#   - 冪等キーは webhookEventId（durable lane の record_line_event を event_type="follow"
+#     で共用。duplicate=登録 skip・reattempt=claim 済み）。fix2 SLL-01: flag OFF または
+#     webhookEventId 欠落は送らない（代替 ID を作らない・fail-closed）
+#   - 全体停止・停止リストは送らない（顧客 Bot の自動送信の規律を共用）
+#   - 管理者通知なし・ログは固定語彙のみ（token 先頭 4 文字・userId は emit 抑止）
+#   - fix1 SLL-01: 公開ホストは RAILWAY_PUBLIC_DOMAIN のみ（Host ヘッダ等は使わない・未設定=送らない）
+#   ※ 本節は main.py 末尾に置く（sink allowlist の file:line 番地を動かさない）
+# ══════════════════════════════════════════════════════════════
+
+async def _queue_follow_event(event: dict, body: bytes, background_tasks: BackgroundTasks,
+                              durable: bool) -> None:
+    if event.get("type") != "follow":
+        return
+    user_id = str((event.get("source") or {}).get("userId", "") or "")
+    reply_token = str(event.get("replyToken", "") or "")
+    if not user_id:
+        return
+    # fix2 SLL-01: durable 無効・webhookEventId 欠落は冪等キーを作れないため
+    # token 発行・送信を行わない（代替 ID は生成しない・fail-closed）
+    event_id = str(event.get("webhookEventId") or "")
+    if not durable or not event_id:
+        logger.info("[FOLLOW] shindan_link_skipped_non_durable (no send)")
+        return
+    from hub import shindan_link
+    base_url = shindan_link.public_base_url()          # fix1 SLL-01: env のみ（fail-closed）
+    from hub.durable_inbound import record_line_event
+    try:
+        outcome = await record_line_event(
+            webhook_event_id=event_id, user_id=user_id,
+            signature_result="verified", payload=body, event_type="follow")
+    except Exception:
+        raise HTTPException(status_code=503, detail="event store unavailable")
+    if outcome == "duplicate":
+        return
+    background_tasks.add_task(_process_follow_event, reply_token, user_id,
+                              event_id, base_url, outcome == "reattempt")
+    logger.info("[WEBHOOK] queued follow user_id=%s",
+                emit(user_id, "external_ref", "log", "operator"))
+
+
+async def _process_follow_event(reply_token: str, user_id: str, event_id: str,
+                                base_url: str, already_claimed: bool) -> None:
+    from hub import shindan_link
+    from hub.durable_inbound import (mark_line_processing, mark_line_completed,
+                                     mark_line_failed)
+    try:
+        if not already_claimed and not await mark_line_processing(event_id):
+            logger.info("[FOLLOW] ownership not acquired (claimed by redelivery)")
+            return
+        if _autoreply_paused():
+            logger.info("[FOLLOW] paused (no send)")
+        elif await autoreply_stoplist.is_suppressed(user_id):
+            logger.info("[FOLLOW] suppressed (stoplist・no send)")
+        elif not base_url:
+            # fix1 SLL-01: 公開ホスト未設定は token を発行せず送らない（固定語彙 1 行）
+            logger.info("[FOLLOW] shindan_link_no_public_host (no send)")
+        else:
+            token = await shindan_link.issue(user_id)
+            await _line_reply_with_fallback(
+                reply_token, user_id,
+                shindan_link.build_message(shindan_link.link_url(base_url, token)))
+            logger.info("[FOLLOW] link sent head=%s",
+                        emit(shindan_link.token_head(token), "record_id", "log",
+                             "operator"))
+        await mark_line_completed(event_id)
+    except Exception:
+        logger.error("[FOLLOW] failed (fixed reason)")
+        try:
+            await mark_line_failed(event_id, "follow_failed")
+        except Exception:
+            pass

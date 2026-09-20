@@ -12,15 +12,29 @@ in-memory の kintone_record_ids に依存しており、デプロイ（2026-09-
    0 件=書かない（none）。複数件=最新更新を採用せず書かない（ambiguous・要確認）。
    検索失敗=書かない（search_failed）。
 2. 書込は **空欄のみ・$revision CAS**。409 は再取得 **1 回**（CAS_REFETCH）。
-   既に値がある欄は上書きしない（手入力を守る）。許可集合は UPDATE_FIELDS
-   （SYSTEM_PROMPT の KINTONE_UPDATE 5 項目）の閉集合＝それ以外のキーは落とす。
+   既に値がある欄は上書きしない（手入力を守る）。許可集合は UPDATE_FIELD_LABELS
+   （SYSTEM_PROMPT の KINTONE_UPDATE 5 項目→App 21 欄コード→表示名）の閉集合。
 3. マーカー除去は呼び出し側（main）が書込の成否にかかわらず行う（本 module は
    書込と通知のみ）。
 4. 結果（書いた欄名・書けなかった欄名・record_id の解決方法）を業務 LINE
-   （notify_admin_line=指示Bot チャネル）へ通知。**値は載せない**（欄コードのみ）。
+   （notify_admin_line_result=指示Bot チャネル）へ通知。**値は載せない**。
+
+fix1（Codex R-JIKOU-HEARING-HOTFIX-1）:
+- JHH-01: 許可集合に無いキー（モデルが JSON に混ぜた項目名）は「対象外」。
+  キー名も値も通知・ログ・戻り値のどこにも載せない——件数（dropped_count）のみ。
+  通知に載せる欄名は許可集合の表示名（氏名・住所・生年月日・電話番号・メールアドレス）だけ。
+- JHH-02: 通知は notify_admin_line_result の 3 値をそのまま扱う
+  （sent=ok / throttled=skipped / failed）。failed は NOTIFY_RETRY_MAX 回まで
+  NOTIFY_RETRY_SLEEP_SEC 間隔で再送し、全失敗は ERROR 1 行（レコード番号と固定理由
+  hearing_notify_failed のみ）。skipped は再送せず INFO 1 行。例外は上位へ伝播させず、
+  書込済みの CAS 結果は取り消さない（書込→通知の順は維持）。
+  冪等キーは成功通知 hearing_update_ok:{record_id}:{digest} と要確認通知
+  hearing_update_review:{record_id}:{digest} の 2 種（digest=値を含まない
+  canonical 文字列の sha256 先頭 8 桁・_anon と同じ計算）。
 5. 例外は外へ出さない（handle_update が握る=顧客への返信を道連れにしない）。
 """
 
+import asyncio
 import hashlib
 import logging
 
@@ -35,12 +49,26 @@ APP_JIKOU_CASE = hub_kintone.KintoneApp(
 
 USER_FIELD = "LINEユーザーID"
 
-# KINTONE_UPDATE が書ける欄の閉集合（main._HEARING_PROMPT_FROZEN の第 2 段階 5 項目）
-UPDATE_FIELDS: frozenset = frozenset({
-    "顧客名", "住所", "生年月日", "電話番号", "メールアドレス"})
+# JHH-01: 台帳の項目（KINTONE_UPDATE の JSON キー=App 21 欄コード）→ 通知の表示名。
+# この対応表が許可集合の単一の正。表示順は通知の並び順
+UPDATE_FIELD_LABELS: dict = {
+    "顧客名": "氏名",
+    "住所": "住所",
+    "生年月日": "生年月日",
+    "電話番号": "電話番号",
+    "メールアドレス": "メールアドレス",
+}
+UPDATE_FIELDS: frozenset = frozenset(UPDATE_FIELD_LABELS)
 
 # 409（KintoneConflict）後の再取得回数（票: 再取得 1 回）
 CAS_REFETCH = 1
+
+# JHH-02: 通知の再送（failed のみ・有限回）
+NOTIFY_RETRY_MAX = 2
+NOTIFY_RETRY_SLEEP_SEC = 1.0
+NOTIFY_FAILED_REASON = "hearing_notify_failed"
+KIND_OK = "hearing_update_ok"
+KIND_REVIEW = "hearing_update_review"
 
 # record_id の解決方法（固定語彙・通知/ログにこのまま載せる）
 METHOD_MEMORY = "memory"            # in-memory 台帳にあった
@@ -67,8 +95,18 @@ def _value(record: dict, code: str) -> str:
     return str(((record or {}).get(code) or {}).get("value") or "").strip()
 
 
+def _sha8(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:8]
+
+
 def _anon(user_id: str) -> str:
-    return hashlib.sha256(user_id.encode("utf-8")).hexdigest()[:8]
+    return _sha8(user_id)
+
+
+def _labels(codes) -> str:
+    """許可集合の欄コード列を表示名（固定順）へ。許可集合外は表示しない。"""
+    return ", ".join(UPDATE_FIELD_LABELS[c] for c in UPDATE_FIELD_LABELS
+                     if c in set(codes))
 
 
 async def resolve_record_id(user_id: str, memory_id) -> tuple[str, str]:
@@ -94,15 +132,28 @@ async def resolve_record_id(user_id: str, memory_id) -> tuple[str, str]:
     return rid, METHOD_SEARCH
 
 
+def split_fields(fields: dict,
+                 allowed: frozenset = UPDATE_FIELDS) -> tuple[dict, int]:
+    """JHH-01: (許可集合内で非空の候補 {欄コード: 値}, 対象外キーの件数)。
+    対象外キーの名前・値はここで捨てる（以後どこにも渡らない）。
+    allowed（HUMAN-REPLY-INTAKE-1）: 許可集合の差し替え。既定=UPDATE_FIELDS。"""
+    candidate = {k: str(v).strip() for k, v in (fields or {}).items()
+                 if k in allowed and str(v or "").strip()}
+    dropped_count = sum(1 for k in (fields or {}) if k not in allowed)
+    return candidate, dropped_count
+
+
 async def apply_update(record_id: str, fields: dict,
                        allowed: frozenset = UPDATE_FIELDS) -> dict:
     """許可集合内・非空の値を、最新レコードで空欄の欄にだけ $revision CAS で書く。
-    戻り値: {"outcome", "written", "preexisting", "dropped"}（欄コードのみ・値なし）。
+    戻り値: {"outcome", "written", "preexisting", "dropped_count"}
+    （欄コードは許可集合のもののみ・値なし・対象外キーは件数のみ）。
     allowed（HUMAN-REPLY-INTAKE-1）: 許可集合の差し替え。既定=UPDATE_FIELDS
     （KINTONE_UPDATE 経路の挙動不変）。"""
-    candidate = {k: str(v).strip() for k, v in (fields or {}).items()
-                 if k in allowed and str(v or "").strip()}
-    dropped = sorted(k for k in (fields or {}) if k not in allowed)
+    candidate, dropped_count = split_fields(fields, allowed)
+    if dropped_count:
+        logger.info("[HEARING_UPDATE] foreign keys dropped count=%s",
+                    emit(dropped_count, "count", "log", "operator"))
     written: list[str] = []
     preexisting: list[str] = []
     outcome = OUTCOME_UNCONVERGED
@@ -139,12 +190,13 @@ async def apply_update(record_id: str, fields: dict,
                 emit(len(written), "count", "log", "operator"),
                 emit(len(preexisting), "count", "log", "operator"))
     return {"outcome": outcome, "written": written,
-            "preexisting": preexisting, "dropped": dropped}
+            "preexisting": preexisting, "dropped_count": dropped_count}
 
 
 def build_notice(user_id: str, record_id: str, method: str,
                  result: dict | None) -> str:
-    """業務 LINE 向け通知文（欄コードとレコード No のみ・値なし）。"""
+    """業務 LINE 向け通知文（許可集合の表示名・レコード No・件数のみ。値と
+    対象外キーの原文は載せない）。"""
     lines = ["【ヒアリング登録】お名前等の登録結果"]
     if record_id:
         lines.append(f"案件レコードNo: {record_id}"
@@ -166,13 +218,12 @@ def build_notice(user_id: str, record_id: str, method: str,
         lines.append("・予期しない失敗が起きました。登録の成否は App 21 で確認してください")
     if result:
         if result.get("written"):
-            lines.append("・登録した欄: " + ", ".join(result["written"]))
+            lines.append("・登録した欄: " + _labels(result["written"]))
         if result.get("preexisting"):
-            lines.append("・既に値があり登録しなかった欄: "
-                         + ", ".join(result["preexisting"]))
-        if result.get("dropped"):
-            lines.append("・対象外のため登録しなかった欄: "
-                         + ", ".join(result["dropped"]))
+            lines.append("・既に値があり登録しなかった欄: " + _labels(result["preexisting"]))
+        n = int(result.get("dropped_count") or 0)
+        if n > 0:
+            lines.append(f"・対象外の項目が {n} 件あります（登録していません）")
         if result.get("outcome") == OUTCOME_UNCONVERGED:
             lines.append("・更新が競合し収束できませんでした（上書きせず中止・要確認）")
         elif result.get("outcome") == OUTCOME_FAILED:
@@ -180,15 +231,62 @@ def build_notice(user_id: str, record_id: str, method: str,
     return "\n".join(lines)
 
 
+def notice_kind(method: str, result: dict | None) -> str:
+    """JHH-02(4): 成功通知（ok）と要確認通知（review）を分ける。
+    ok=書込成立かつ既存値との衝突なしかつ対象外 0 件。それ以外は review。"""
+    if method not in (METHOD_MEMORY, METHOD_SEARCH) or not result:
+        return KIND_REVIEW
+    if (result.get("outcome") != OUTCOME_UPDATED or result.get("preexisting")
+            or int(result.get("dropped_count") or 0) > 0):
+        return KIND_REVIEW
+    return KIND_OK
+
+
+def notice_digest(method: str, result: dict | None) -> str:
+    """冪等キーの digest（値を含まない canonical 文字列の sha256 先頭 8 桁）。"""
+    r = result or {}
+    canonical = "|".join([
+        method, str(r.get("outcome") or ""),
+        ",".join(sorted(r.get("written") or [])),
+        ",".join(sorted(r.get("preexisting") or [])),
+        str(int(r.get("dropped_count") or 0)),
+    ])
+    return _sha8(canonical)
+
+
+def notice_key(user_id: str, record_id: str, method: str,
+               result: dict | None) -> str:
+    return (f"{notice_kind(method, result)}:{record_id or _anon(user_id)}:"
+            f"{notice_digest(method, result)}")
+
+
+async def send_notice(text: str, key: str, record_id: str) -> str:
+    """JHH-02: notify_admin_line_result の 3 値をそのまま扱う。
+    戻り値 ok / skipped / failed。例外は外へ出さない。"""
+    rid = record_id or "none"
+    for attempt in range(NOTIFY_RETRY_MAX + 1):
+        try:
+            outcome = await notify.notify_admin_line_result(text, throttle_key=key)
+        except Exception:
+            outcome = "failed"
+        if outcome == "sent":
+            return "ok"
+        if outcome == "throttled":
+            logger.info("[HEARING_UPDATE] notify skipped record_id=%s",
+                        emit(rid, "record_id", "log", "operator"))
+            return "skipped"
+        if attempt < NOTIFY_RETRY_MAX:
+            await asyncio.sleep(NOTIFY_RETRY_SLEEP_SEC)
+    logger.error("[HEARING_UPDATE] hearing_notify_failed record_id=%s",
+                 emit(rid, "record_id", "log", "operator"))
+    return "failed"
+
+
 async def _notify(user_id: str, record_id: str, method: str,
-                  result: dict | None) -> None:
-    key = f"hearing_update:{record_id or _anon(user_id)}"
-    try:
-        await notify.notify_admin_line(
-            build_notice(user_id, record_id, method, result),
-            throttle_key=key, throttle_on_success_only=True)
-    except Exception:
-        logger.error("[HEARING_UPDATE] notify failed (fixed text)")
+                  result: dict | None) -> str:
+    return await send_notice(build_notice(user_id, record_id, method, result),
+                             notice_key(user_id, record_id, method, result),
+                             record_id)
 
 
 async def handle_update(user_id: str, memory_id, fields) -> tuple[str, str]:
