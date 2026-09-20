@@ -207,6 +207,7 @@ from hub import image_store  # noqa: E402  JIKOU-FORM-3: 受信書類写真の�
 from hub import form_link  # noqa: E402  JIKOU-FORM-2: 受付番号による LINE 紐付け
 from hub import hearing_update  # noqa: E402  JIKOU-HEARING-HOTFIX-1: 第 2 段階の書込
 from hub import human_reply_intake  # noqa: E402  HUMAN-REPLY-INTAKE-1: 返答単独判定の取込
+from hub import jikou_case_create  # noqa: E402  HRI-03: 検索→作成の共通入口（返答取込と共有）
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 KINTONE_SUBDOMAIN = os.environ["KINTONE_SUBDOMAIN"]
 KINTONE_APP_ID = os.environ["KINTONE_APP_ID"]
@@ -974,6 +975,16 @@ async def _process_line_event(reply_token: str, user_id: str, user_text: str) ->
                     )
             else:
                 existing_id = known_id
+            record_id = ""
+            if not existing_id:
+                # HRI-03: ターン冒頭の照会結果（_known_rec=None）を AI 呼び出しの await を
+                # 跨いで持ち越さない。返答取込と共通の排他区間の内側で再検索し、既存が
+                # あれば create せず統合へ振り替える。作成失敗（App 21 の一意制約の
+                # 発火）も再検索で既存を採用して継続（hub.jikou_case_create）
+                record_id, how, _count = await jikou_case_create.create_or_adopt(
+                    user_id, lambda: post_to_kintone(kintone_record))
+                if how != jikou_case_create.CREATED:
+                    existing_id, record_id = record_id, ""
             if existing_id:
                 merge_outcome = await form_link.merge_hearing_fields(
                     existing_id,
@@ -985,7 +996,6 @@ async def _process_line_event(reply_token: str, user_id: str, user_text: str) ->
                             emit(record_id, "record_id", "log", "operator"),
                             emit(merge_outcome, "freetext", "log", "operator"))
             else:
-                record_id = await post_to_kintone(kintone_record)
                 logger.info("[KINTONE] RECORD created record_id=%s",
                             emit(record_id, "record_id", "log", "operator"))
             kintone_record_ids[user_id] = record_id
