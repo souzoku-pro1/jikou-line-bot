@@ -232,10 +232,6 @@ async def handle_houki_hearing(reply_token: str, user_id: str,
                     emit(user_id[:10], "record_id", "log", "operator"))
         return
 
-    # IMAGE-INTAKE-1-fix1[01]: 自己修復発火——未返信の画像受領マーカーを
-    # 次のテキスト受信時に回収（内部で例外を握る・会話を道連れにしない）
-    await image_intake.heal_unreplied("houki", HOUKI_CHANNEL, user_id)
-
     try:
         await _hearing_turn(reply_token, user_id, user_text)
     finally:
@@ -265,6 +261,15 @@ async def _hearing_turn(reply_token: str, user_id: str, user_text: str) -> None:
             "相続放棄案件レコードNo: "
             f"{emit(str((record.get('$id') or {}).get('value') or ''), 'record_id', 'line_business', 'attorney')}")
         return
+
+    # IMAGE-INTAKE-1-fix1[01]: 自己修復発火——未返信の画像受領マーカーを
+    # 次のテキスト受信時に回収（内部で例外を握る・会話を道連れにしない）。
+    # HRI-01（裁定 G）: 人対応ゲートの**後**に置く——人対応中は受領返信を含め
+    # 顧客向け送信を一切発生させない。ゲートは「送信の抑止」であって「マーカーの
+    # 回収」ではない（heal を呼ばない=未返信マーカーは消費・削除されず、人対応の
+    # 解除後の次のテキスト受信で回収される）。App 40 の照会失敗（判定不能）も
+    # ここへ到達しない=送らない側へ倒れる
+    await image_intake.heal_unreplied("houki", HOUKI_CHANNEL, user_id)
 
     history = conversation_histories.setdefault(user_id, [])
     if not history:
