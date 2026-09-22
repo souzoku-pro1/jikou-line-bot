@@ -430,7 +430,9 @@ async def upsert_case_fields(user_id: str, fields: dict,
 
 async def apply_hearing_fields(user_id: str, raw_fields: dict,
                                existing: dict | None,
-                               fence: Callable[[], bool] | None = None
+                               fence: Callable[[], bool] | None = None,
+                               *, cas_attempts: int | None = None,
+                               cas_refetches: int | None = None
                                ) -> tuple[str, list[str], list[str]]:
     """record_hearing の生 fields を（検証→CAS upsert→409 収束）まで行う
     （fix2[H3-04]）。(レコード ID, 日付矛盾理由一覧, 選択肢外理由一覧) を返す
@@ -447,25 +449,38 @@ async def apply_hearing_fields(user_id: str, raw_fields: dict,
     再取得の前に呼び、False なら再試行せず write 0（problems に固定語 "fenced" を
     足して返す。戻り値の形は不変）。
 
+    cas_attempts / cas_refetches（HRI-05・裁定 C 要約）: 経路ごとの CAS 上限の注入。
+    既定 None=従来どおり（ヒアリング経路: 更新 _CAS_RETRIES=3 回・409 のたびに再取得）。
+    返答取込は cas_attempts=2・cas_refetches=1（初回+再試行 1 回・再取得 1 回）を渡す。
+    上限到達=write 0（呼び出し側が再取得の実値で unwritten と判定し、HRI-02 の
+    「解放」を記録する=再配送で再処理可能）。
+
     HRI-03: existing=None（呼び出し側のターン冒頭の検索で未作成だった）は、その結果を
     持ち越さない。同一ユーザーの共通の排他区間（hub.user_section・返答取込と
     ヒアリングで同じ鍵）の内側で**再検索**してから作成判断を行う。区間は in-process
     のみ——最終防衛線は下の fix3[H3-06]（App 40 の一意制約の発火→既存へ収束）。
     """
+    attempts = _CAS_RETRIES if cas_attempts is None else int(cas_attempts)
+    refetches = attempts if cas_refetches is None else int(cas_refetches)
     if existing is None:
         async with user_section("houki", user_id):
             return await _apply_hearing_fields(
-                user_id, raw_fields, await fetch_case(user_id), fence)
-    return await _apply_hearing_fields(user_id, raw_fields, existing, fence)
+                user_id, raw_fields, await fetch_case(user_id), fence,
+                attempts, refetches)
+    return await _apply_hearing_fields(user_id, raw_fields, existing, fence,
+                                       attempts, refetches)
 
 
 async def _apply_hearing_fields(user_id: str, raw_fields: dict,
                                 existing: dict | None,
-                                fence: Callable[[], bool] | None
+                                fence: Callable[[], bool] | None,
+                                attempts: int = _CAS_RETRIES,
+                                refetches: int = _CAS_RETRIES
                                 ) -> tuple[str, list[str], list[str]]:
     fields, problems, choice_problems = split_valid_fields(
         raw_fields, existing)
-    for _attempt in range(_CAS_RETRIES):
+    refetched = 0
+    for _attempt in range(attempts):
         if fence is not None and not fence():          # 各試行の前（初回を含む）
             return _v(existing or {}, "$id"), [*problems, "fenced"], choice_problems
         try:
@@ -475,6 +490,9 @@ async def _apply_hearing_fields(user_id: str, raw_fields: dict,
             if fence is not None and not fence():      # 409 後・再取得の前
                 return (_v(existing or {}, "$id"), [*problems, "fenced"],
                         choice_problems)
+            if refetched >= refetches:                 # HRI-05: 再取得の上限（write 0）
+                break
+            refetched += 1
             latest = await fetch_case(user_id)
             if latest is None:
                 logger.warning(
