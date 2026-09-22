@@ -152,7 +152,10 @@ class TestRulingB1(_ChoiceBase):
 
     def test_approved_rows_normalize(self):
         cases = {"続柄": [("長女", "子"), ("奥様", "配偶者"), ("お母様", "直系尊属（父母・祖父母）"),
-                          ("両親", "直系尊属（父母・祖父母）"), ("妹", "兄弟姉妹")],
+                          ("両親", "直系尊属（父母・祖父母）"), ("妹", "兄弟姉妹"),
+                          # 裁定 B-1 補足: 祖父・祖母・祖父母 → 直系尊属（父母・祖父母）
+                          ("祖父", "直系尊属（父母・祖父母）"), ("祖母", "直系尊属（父母・祖父母）"),
+                          ("祖父母", "直系尊属（父母・祖父母）")],
                  "本人区分": [("本人です", "本人"), ("親族（本人が依頼予定）", "親族（本人依頼予定）")],
                  "相続順位": [("第一順位", "子"), ("１", "子"), ("第2順位", "直系尊属"),
                               ("三", "兄弟姉妹")],
@@ -169,7 +172,7 @@ class TestRulingB1(_ChoiceBase):
         # 不承認: 孫・甥・姪・叔父・叔母・いとこ・継子・配偶者の親・その他への寄せ／曖昧な本人区分／
         # 相続順位の続柄からの推測／事実からの推測（処分・督促）
         absent = {"続柄": ["孫娘", "孫息子", "甥", "姪", "甥姪", "叔父", "叔母", "いとこ", "継子",
-                          "義父", "義母", "配偶者の親", "祖父", "祖母", "祖父母"],
+                          "義父", "義母", "配偶者の親"],
                   "本人区分": ["家族", "親族", "代理", "代理人"],
                   "相続順位": ["夫", "妻", "息子", "娘", "父", "母", "甥姪", "わからない"],
                   "同時申述希望": ["希望"],
@@ -261,7 +264,7 @@ class TestSingleSourceOfChoices(unittest.TestCase):
     def test_synonym_table_is_consistent_with_choices(self):
         with open(hri.SYNONYMS_PATH, encoding="utf-8") as f:
             raw = json.load(f)
-        self.assertEqual(raw["_meta"]["status"], "承認済み（裁定B-1・2026-09-22）")
+        self.assertTrue(raw["_meta"]["status"].startswith("承認済み（裁定B-1・2026-09-22"))
         table = hri.CHOICE_SYNONYMS
         self.assertEqual(set(table), set(hri.HOUKI.choices))  # 欄=選択肢を持つ 6 欄と一致
         for code, syn in table.items():
