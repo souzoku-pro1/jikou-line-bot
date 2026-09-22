@@ -1,0 +1,231 @@
+"""webapp_brain_view — BRAIN-A1-LEDGER-1: 案件脳の確認ビュー（PWA・v3 §4-2・§9）
+
+一覧（紐付け待ち・保留〔不一致/出典確認不能〕・競合・再確認・同期状態・案件の事実）
+と操作（確認/却下/撤回・紐付け訂正）のみ。質問回答は載せない（A2）。
+
+規律:
+- 認証は P4-001 の関所 `_gate` のみ（公開例外なし）。応答は no-store, private。
+- 操作は form POST（PRG・303）。操作 ID（クライアント生成 UUID）で冪等、画面が
+  見ていた対象版（seen_version）と現在の版の一致検査。不一致は **409 で最新**を
+  返す（古い画面の操作で現状態を上書きしない）。未認証は関所が 303→login。
+- 台帳（DB）以外へ書かない。kintone を import しない（読取もしない＝台帳経由）。
+  外部送信なし。logging 非 import（PII の反射経路を持たない）。入力値は応答へ
+  反射しない（不正入力は固定 400）。DB 障害は固定 503（既存業務へ伝播しない）。
+"""
+
+import re
+
+from fastapi import APIRouter, Request
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
+
+from hub import brain_ledger as ledger
+from hub import brain_sync
+from hub.webapp_auth import WEBAPP_ROOT, _gate
+
+router = APIRouter()
+
+ACTOR = "owner"                       # 単一利用者（P4-001 の前提）
+PAGE = "/app/brain"
+_UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+                      r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+_DIGITS_RE = re.compile(r"^[0-9]{1,18}$")
+_REASON_MAX = 500
+_LIMIT_MAX = 200
+
+
+def _bad_request() -> Response:
+    return Response(status_code=400)          # 固定応答（入力値を反射しない）
+
+
+def _unavailable() -> Response:
+    return JSONResponse({"error": "ledger_unavailable"}, status_code=503)
+
+
+def _limit(request: Request) -> int | None:
+    raw = request.query_params.get("limit", "100")
+    if not _DIGITS_RE.fullmatch(raw):
+        return None
+    n = int(raw)
+    return n if 1 <= n <= _LIMIT_MAX else None
+
+
+@router.get(PAGE)
+@_gate
+async def brain_page(request: Request):
+    path = WEBAPP_ROOT / "brain.html"
+    if not path.is_file():
+        return Response(status_code=404)
+    return FileResponse(path, media_type="text/html; charset=utf-8")
+
+
+@router.get("/app/api/brain/overview")
+@_gate
+async def api_overview(request: Request):
+    try:
+        overview = await ledger.sync_overview()
+    except Exception:
+        return _unavailable()
+    return {"enabled": brain_sync.brain_sync_enabled(), "sync": overview}
+
+
+@router.get("/app/api/brain/pending")
+@_gate
+async def api_pending(request: Request):
+    limit = _limit(request)
+    if limit is None:
+        return _bad_request()
+    try:
+        return {"records": await ledger.list_pending_links(limit=limit)}
+    except Exception:
+        return _unavailable()
+
+
+@router.get("/app/api/brain/holds")
+@_gate
+async def api_holds(request: Request):
+    limit = _limit(request)
+    if limit is None:
+        return _bad_request()
+    try:
+        return {"records": await ledger.list_holds(limit=limit)}
+    except Exception:
+        return _unavailable()
+
+
+@router.get("/app/api/brain/conflicts")
+@_gate
+async def api_conflicts(request: Request):
+    limit = _limit(request)
+    if limit is None:
+        return _bad_request()
+    try:
+        return {"records": await ledger.list_conflicts(limit=limit)}
+    except Exception:
+        return _unavailable()
+
+
+@router.get("/app/api/brain/recheck")
+@_gate
+async def api_recheck(request: Request):
+    limit = _limit(request)
+    if limit is None:
+        return _bad_request()
+    try:
+        return {"records": await ledger.list_recheck(limit=limit)}
+    except Exception:
+        return _unavailable()
+
+
+@router.get("/app/api/brain/facts")
+@_gate
+async def api_facts(request: Request):
+    """案件の現在の事実（確認操作の対象を選ぶための一覧）。"""
+    q = request.query_params
+    app_id, rid = q.get("app", ""), q.get("record", "")
+    if not _DIGITS_RE.fullmatch(app_id) or not _DIGITS_RE.fullmatch(rid):
+        return _bad_request()
+    try:
+        facts = await ledger.list_case_facts(app_id, rid, current_only=True)
+        events = await ledger.list_case_events(app_id, rid)
+        freshness = await ledger.case_freshness(app_id, rid, brain_sync.TARGET_APP40)
+        for f in facts:
+            f["confirmations"] = await ledger.list_confirmations(f["fact_id"])
+    except Exception:
+        return _unavailable()
+    return {"case_app_id": app_id, "case_record_id": rid, "freshness": freshness,
+            "facts": facts, "events": events}
+
+
+async def brain_confirm(request: Request):
+    """確認/却下/撤回（PRG）。操作 ID 冪等・対象版一致（不一致は 409 で最新）。"""
+    form = await request.form()
+    operation_id = str(form.get("operation_id") or "")
+    fact_id = str(form.get("fact_id") or "")
+    seen_version = str(form.get("seen_version") or "")
+    decision = str(form.get("decision") or "")
+    reason = str(form.get("reason") or "").strip()
+    revoked_of = str(form.get("revoked_of") or "")
+    if (not _UUID_RE.fullmatch(operation_id) or not _DIGITS_RE.fullmatch(fact_id)
+            or not _DIGITS_RE.fullmatch(seen_version)
+            or decision not in ledger.DECISION_VALUES or len(reason) > _REASON_MAX):
+        return _bad_request()
+    if decision == "revoke" and not _DIGITS_RE.fullmatch(revoked_of):
+        return _bad_request()
+    if decision != "revoke" and revoked_of:
+        return _bad_request()
+    try:
+        result = await ledger.record_confirmation(
+            fact_id=int(fact_id), seen_version=int(seen_version), decision=decision,
+            reason=reason, operation_id=operation_id, actor=ACTOR,
+            revoked_of=int(revoked_of) if revoked_of else None)
+    except ledger.VersionConflict as exc:
+        return JSONResponse({"error": "version_conflict", "current": exc.current},
+                            status_code=409)
+    except ledger.LedgerError:
+        return _bad_request()
+    except Exception:
+        return _unavailable()
+    tag = "dup" if result.get("duplicate") else "confirm"
+    return RedirectResponse(f"{PAGE}?done={tag}", status_code=303)
+
+
+async def brain_relink(request: Request):
+    """紐付け訂正（PRG）。履歴追加のみ・操作 ID 冪等。"""
+    form = await request.form()
+    operation_id = str(form.get("operation_id") or "")
+    src_app = str(form.get("source_app_id") or "")
+    src_rec = str(form.get("source_record_id") or "")
+    case_app = str(form.get("case_app_id") or "")
+    case_rec = str(form.get("case_record_id") or "")
+    reason = str(form.get("reason") or "").strip()
+    if (not _UUID_RE.fullmatch(operation_id) or not _DIGITS_RE.fullmatch(src_app)
+            or not _DIGITS_RE.fullmatch(src_rec) or not _DIGITS_RE.fullmatch(case_app)
+            or not _DIGITS_RE.fullmatch(case_rec) or len(reason) > _REASON_MAX):
+        return _bad_request()
+    try:
+        result = await ledger.relink_source(
+            source_app_id=src_app, source_record_id=src_rec,
+            new_case=(case_app, case_rec), reason=reason or "manual_relink",
+            operation_id=operation_id, actor=ACTOR)
+    except ledger.LedgerError:
+        return _bad_request()
+    except Exception:
+        return _unavailable()
+    tag = "dup" if result.get("duplicate") else "relink"
+    return RedirectResponse(f"{PAGE}?done={tag}", status_code=303)
+
+
+# NB: POST は add_api_route 経由（read-only AST 検査の HTTP 動詞 attr 禁止と両立。
+#     関所 _gate は登録時に適用＝機械検査の対象のまま）
+router.add_api_route("/app/brain/confirm", _gate(brain_confirm), methods=["POST"])
+router.add_api_route("/app/brain/relink", _gate(brain_relink), methods=["POST"])
+
+_CATCH_ALL_PATH = "/app/{_rest:path}"
+
+
+def _paths_of(entry) -> list:
+    """app.router.routes の要素（_IncludedRouter / Route / APIRoute）の path 一覧。
+    動的属性アクセス（getattr）を使わず、属性の有無は例外で判定する。"""
+    try:
+        return [r.path for r in entry.original_router.routes]
+    except AttributeError:
+        pass
+    try:
+        return [entry.path]
+    except AttributeError:
+        return []
+
+
+def include_before_catch_all(app, sub_router: APIRouter) -> None:
+    """本 router を app へ結線し、webapp_auth の catch-all（/app/{_rest:path}）より
+    **前**へ並べ替える（FastAPI は登録順にマッチ・main.py 末尾追記の規約と両立）。
+    catch-all が無ければ末尾のまま。"""
+    app.include_router(sub_router)
+    routes = app.router.routes
+    mine = routes.pop()
+    idx = None
+    for i, entry in enumerate(routes):
+        if _CATCH_ALL_PATH in _paths_of(entry):
+            idx = i
+            break
+    routes.insert(idx if idx is not None else len(routes), mine)

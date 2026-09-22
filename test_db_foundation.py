@@ -276,7 +276,9 @@ class TestAlembicScaffold(unittest.TestCase):
                 con.close()
 
         try:
-            up = alembic("upgrade", "head")
+            # BRAIN-A1: head が b8c1d4e7f2a5 へ進んだため、本 revision までを明示して往復する
+            # （検証内容は不変: shindan_link の生成・列集合・current・downgrade）
+            up = alembic("upgrade", "a7d3f1c9e2b4")
             self.assertEqual(up.returncode, 0, f"stderr={up.stderr[-500:]}")
             self.assertIn("shindan_link", tables())
             con = sqlite3.connect(dbfile)
@@ -292,6 +294,70 @@ class TestAlembicScaffold(unittest.TestCase):
             self.assertEqual(down.returncode, 0, f"stderr={down.stderr[-500:]}")
             self.assertNotIn("shindan_link", tables())
             self.assertIn("e7a9c4d1f6b3", alembic("current").stdout)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_brain_ledger_migration_round_trip(self):
+        """BRAIN-A1-LEDGER-1: b8c1d4e7f2a5（Revises a7d3f1c9e2b4）が空 DB で up→down 往復し、
+        9 表の列集合が hub/brain_ledger.metadata と一致すること（alembic 起動が許可された
+        本ファイルに置く・D2）。一意制約は sqlite の自動 index 名になるため列集合で検証する。"""
+        import sqlite3
+        import tempfile
+        from hub import brain_ledger
+        d = tempfile.mkdtemp(prefix="brain_ledger_mig_")
+        dbfile = f"{d}/mig.db"
+        env = {**os.environ, "DATABASE_URL": f"sqlite:///{dbfile}",
+               "PYTHONIOENCODING": "utf-8"}
+
+        def alembic(*args):
+            return subprocess.run(
+                [sys.executable, "-m", "alembic", *args],
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                cwd=REPO, env=env, timeout=180)
+
+        def tables():
+            con = sqlite3.connect(dbfile)
+            try:
+                return {r[0] for r in con.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'")}
+            finally:
+                con.close()
+
+        def unique_cols(con, table):
+            out = []
+            for r in con.execute(f"PRAGMA index_list({table})"):
+                if r[2] == 1:
+                    out.append(tuple(x[2] for x in con.execute(f"PRAGMA index_info({r[1]})")))
+            return out
+
+        try:
+            up = alembic("upgrade", "head")
+            self.assertEqual(up.returncode, 0, f"stderr={up.stderr[-800:]}")
+            self.assertTrue(set(brain_ledger.TABLE_NAMES) <= tables())
+            con = sqlite3.connect(dbfile)
+            try:
+                for name in brain_ledger.TABLE_NAMES:
+                    cols = {r[1] for r in con.execute(f"PRAGMA table_info({name})")}
+                    self.assertEqual(
+                        cols, {c.name for c in brain_ledger.metadata.tables[name].columns}, name)
+                self.assertIn(("case_app_id", "case_record_id", "subject_id", "item_code",
+                               "source_app_id", "source_record_id", "source_revision",
+                               "locator", "converter_name", "converter_version"),
+                              unique_cols(con, "case_fact"))
+                self.assertIn(("supersedes_fact_id",), unique_cols(con, "case_fact"))
+                self.assertIn(("source_app_id", "source_record_id", "source_revision",
+                               "locator", "converter_name", "converter_version"),
+                              unique_cols(con, "source_ingest"))
+                self.assertIn(("operation_id",), unique_cols(con, "case_confirmation"))
+                self.assertIn(("idem_key",), unique_cols(con, "case_event"))
+            finally:
+                con.close()
+            self.assertIn("b8c1d4e7f2a5", alembic("current").stdout)
+            down = alembic("downgrade", "a7d3f1c9e2b4")
+            self.assertEqual(down.returncode, 0, f"stderr={down.stderr[-800:]}")
+            self.assertFalse(set(brain_ledger.TABLE_NAMES) & tables())
+            self.assertIn("a7d3f1c9e2b4", alembic("current").stdout)
+            self.assertIn("shindan_link", tables())          # 下位 revision の表は残る
         finally:
             shutil.rmtree(d, ignore_errors=True)
 

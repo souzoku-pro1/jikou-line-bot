@@ -10,6 +10,7 @@
     ["/app/q", "質問"],
     ["/app/approvals", "承認"],
     ["/app/kinship", "関係図"],
+    ["/app/brain", "案件脳"],
   ];
   const bar = document.createElement("header");
   bar.style.display = "flex";

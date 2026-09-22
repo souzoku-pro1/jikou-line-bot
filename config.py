@@ -1044,3 +1044,11 @@ def drive_pdf_view_url(file_id):
     if not all(c.isascii() and (c.isalnum() or c in "-_") for c in file_id):
         return None
     return f"https://drive.google.com/file/d/{file_id}/view"
+
+
+# ══════════════════════════════════════════════════════════════
+# BRAIN-A1-LEDGER-1（案件脳）: 同期の有効化 flag の**名前**のみ（R7）。
+# 既定 OFF・値の読み取りは hub/brain_sync.brain_sync_enabled()（既存 flag 群と
+# 同一の値集合 1/true/on/yes）。config.py では値を読まない。
+# ══════════════════════════════════════════════════════════════
+BRAIN_SYNC_ENABLED_ENV = "BRAIN_SYNC_ENABLED"

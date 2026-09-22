@@ -26,6 +26,7 @@ from hub.derivation_models import DerivationBase  # noqa: E402（P3-001・app-st
 from hub.person_merge_journal import PersonMergeJournalBase  # noqa: E402（RV-08・操作台帳）
 from hub.qa_store import metadata as qa_store_metadata  # noqa: E402（Q-BATCH-1・Q&A台帳）
 from hub.shindan_link import metadata as shindan_link_metadata  # noqa: E402（SHINDAN-LINE-LINK-1）
+from hub.brain_ledger import metadata as brain_ledger_metadata  # noqa: E402（BRAIN-A1-LEDGER-1・案件脳台帳）
 
 config = context.config
 
@@ -37,7 +38,7 @@ if config.config_file_name is not None:
 target_metadata = [Base.metadata, heartbeat_metadata, service_auth_metadata,
                    ingestion_receipt_metadata, DerivationBase.metadata,
                    PersonMergeJournalBase.metadata, qa_store_metadata,
-                   shindan_link_metadata]
+                   shindan_link_metadata, brain_ledger_metadata]
 
 
 def run_migrations_offline() -> None:
