@@ -1305,12 +1305,13 @@ async def get_recent_chat_history(user_id: str, limit: int = 10) -> list[dict]:
     records = resp.json().get("records", [])
     # HUMAN-REPLY-INTAKE-1: 返答取込の冪等マーカー行（固定文言）は会話履歴に
     # 含めない（モデルへの注入・既知項目判定の汚染を防ぐ。他の行は従来どおり）
-    from hub.human_reply_intake import INTAKE_MARKER
+    # HRI-04: 逸脱・正規化の記録行も同じく除外（判定は human_reply_intake.is_internal_row）
+    from hub.human_reply_intake import is_internal_row
     # desc で取得しているので reversed で古い順に並べ直す
     return [
         {"role": r["role"]["value"], "content": r["message"]["value"]}
         for r in reversed(records)
-        if r["message"]["value"] != INTAKE_MARKER
+        if not is_internal_row(r["message"]["value"])
     ]
 
 
