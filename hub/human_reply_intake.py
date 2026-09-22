@@ -26,9 +26,21 @@
 - 書込: 空欄のみ・$revision CAS・409 再取得 1 回・上書きなし
   （時効=hearing_update.apply_update／相続放棄=houki_case_store.apply_hearing_fields）。
   書込後に再取得し、欄ごとに 登録した/既に値があった/書けなかった を実値で判定。
-- 冪等: LINE の webhookEventId（時効=durable lane の event id・相続放棄=router が
-  渡す）を App 28 の category `返答取込:{channel}:{event_id}` で 1 回に。
+- 冪等（HRI-02・2 相）: LINE の webhookEventId（時効=durable lane の event id・
+  相続放棄=router が渡す）ごとに App 28 へ追記行を書く。行は 3 種（message は固定文言）:
+    予約 `返答取込:{channel}:{event_id}`／解放 `返答取込解放:…`／完了 `返答取込済:…`
+  副作用（通知・AI・書込）の前に予約を取り、**予約が取れなければ書込へ進まない**。
+  書込まで済んだら完了、途中で失敗したら解放を記録する。再配送の判定:
+    完了あり→duplicate／有効な予約あり（処理中）→duplicate／予約が期限切れ・解放済み
+    →予約を取り直して再処理／予約なし→通常処理。
+  予約のリース=行の作成日時（kintone の CREATED_TIME）から LEASE_SEC。書込中の
+  プロセス断で予約だけが残っても、期限後は再処理できる。並行 2 配送は同一キーの
+  有効な予約のうち最小 $id が勝者（画像受領の勝者決定と同型・プロセスを跨いで成立）。
   event id が無い呼び出しは実行しない（冪等キーが作れないため。画像受領と同じ規律）。
+- レコード未作成時の作成（HRI-03）: 時効は hub.jikou_case_create.create_or_adopt
+  （共通の排他区間の内側で再検索→無ければ作成→作成失敗は再検索して既存を採用）。
+  相続放棄は houki_case_store.apply_hearing_fields（existing=None は同じく区間内で
+  再検索・App 40 の一意制約の発火は既存レコードへ収束）。
 - 停止条件: 判定不能（スキーマ逸脱）・複数人混在・形式不正・確信度不足・AI 失敗・
   MAX_TEXT_CHARS 超 → 書かず通知のみ（理由を欄名単位で）。項目が 1 つも含まれない
   通常の会話文は通知しない（ログのみ）。
@@ -53,6 +65,7 @@ from claude_gateway import create_message_with_fallback
 from hub import hearing_update
 from hub import houki_card_read
 from hub import houki_case_store
+from hub import jikou_case_create
 from hub import kintone as hub_kintone
 from hub import notify
 from hub.redact import emit
@@ -62,7 +75,16 @@ logger = logging.getLogger("hub.human_reply_intake")
 # App 28 の冪等マーカー行（category=返答取込:{channel}:{event_id}・message は固定文言。
 # 会話履歴の復元では除外する=chat_responder.get_recent_chat_history）
 INTAKE_MARKER = "（返答取込）"
-INTAKE_PREFIX = "返答取込"
+INTAKE_PREFIX = "返答取込"            # 予約（処理中）
+DONE_PREFIX = "返答取込済"            # 完了
+RELEASE_PREFIX = "返答取込解放"        # 解放（失敗・再配送で再処理可）
+
+# HRI-02: 予約のリース。1 受信の処理は AI 60 秒×再試行+kintone 数往復=数分以内。
+# kintone の CREATED_TIME は分単位（秒は切り捨て）なので、期限判定は切り捨て分の
+# 60 秒を足して「早すぎる期限切れ」を防ぐ
+LEASE_SEC = 600
+LEASE_CLOCK_MARGIN_SEC = 60
+_SCAN_LIMIT = 100
 
 MAX_TEXT_CHARS = 2000
 MAX_TEXT_VALUE = 100
@@ -320,34 +342,136 @@ def extract_candidates(cfg: IntakeConfig, report: dict, codes: list,
     return candidates, {k: v for k, v in rejected.items() if v}
 
 
-# ── 冪等（App 28 マーカー）・ユーザー別直列化 ────────────────────────────────────
+# ── 冪等（App 28 の追記行・2 相: 予約→完了／解放）・ユーザー別直列化 ────────────────
 def marker_category(channel: str, event_id: str) -> str:
+    """予約行の category。"""
     return f"{INTAKE_PREFIX}:{channel}:{event_id}"
 
 
-async def _already_done(key: str) -> bool:
-    if not (_APP_CHATLOG.app_id() and _APP_CHATLOG.token()):
-        return False
+def done_category(channel: str, event_id: str) -> str:
+    return f"{DONE_PREFIX}:{channel}:{event_id}"
+
+
+def release_category(channel: str, event_id: str) -> str:
+    return f"{RELEASE_PREFIX}:{channel}:{event_id}"
+
+
+# 予約の結果（固定語彙）
+RESERVED = "reserved"            # 予約を取得した（処理してよい）
+RESERVE_DUPLICATE = "duplicate"  # 完了済み／処理中（有効な予約が他にある）／勝者でない
+RESERVE_FAILED = "failed"        # 予約を確約できない（書込へ進まない）
+
+
+def _now() -> datetime.datetime:
+    return datetime.datetime.now(datetime.timezone.utc)
+
+
+def _created_at(row: dict) -> datetime.datetime | None:
+    """行の作成日時（CREATED_TIME 型の欄を型で探す=欄コードに依存しない）。"""
+    cell = next((c for c in (row or {}).values()
+                 if isinstance(c, dict) and c.get("type") == "CREATED_TIME"), None)
+    if cell is None:
+        cell = (row or {}).get("作成日時")
+    raw = str((cell or {}).get("value") or "") if isinstance(cell, dict) else ""
     try:
-        rows = await hub_kintone.search_records(
-            _APP_CHATLOG, f'category = "{key}" order by $id asc limit 1',
-            fields=["$id"])
+        dt = datetime.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=datetime.timezone.utc)
+
+
+def _row_id(row: dict) -> int:
+    try:
+        return int(_v(row, "$id"))
+    except ValueError:
+        return 0
+
+
+def _marker_state(rows: list, channel: str, event_id: str,
+                  now: datetime.datetime) -> tuple[bool, list[int]]:
+    """(完了あり, 有効な予約行の $id 昇順)。有効=最後の解放行より後に作られ、かつ
+    リース期限内。作成日時を読めない予約行は有効扱い（fail-closed=二重処理しない）。"""
+    done_cat = done_category(channel, event_id)
+    release_cat = release_category(channel, event_id)
+    reserve_cat = marker_category(channel, event_id)
+    done = any(_v(r, "category") == done_cat for r in rows)
+    last_release = max((_row_id(r) for r in rows
+                        if _v(r, "category") == release_cat), default=0)
+    limit = datetime.timedelta(seconds=LEASE_SEC + LEASE_CLOCK_MARGIN_SEC)
+    live: list[int] = []
+    for r in rows:
+        if _v(r, "category") != reserve_cat or _row_id(r) <= last_release:
+            continue
+        created = _created_at(r)
+        if created is not None and now - created >= limit:
+            continue                                  # リース期限切れ
+        live.append(_row_id(r))
+    return done, sorted(live)
+
+
+async def _scan_markers(channel: str, event_id: str) -> list:
+    cats = ", ".join(f'"{c}"' for c in (marker_category(channel, event_id),
+                                        done_category(channel, event_id),
+                                        release_category(channel, event_id)))
+    return await hub_kintone.search_records(
+        _APP_CHATLOG, f"category in ({cats}) order by $id asc limit {_SCAN_LIMIT}")
+
+
+async def _append_marker(user_id: str, category: str) -> str:
+    return str(await hub_kintone.create_record(_APP_CHATLOG, {
+        "line_user_id": user_id, "role": "user", "message": INTAKE_MARKER,
+        "category": category, "auto_sent": "no"}))
+
+
+async def _reserve(user_id: str, channel: str, event_id: str) -> str:
+    """予約の取得（HRI-02）。RESERVED のときだけ呼び出し側は先へ進む。
+    照会・保存のいずれかを確約できなければ RESERVE_FAILED（書込へ進まない）。"""
+    if not (_APP_CHATLOG.app_id() and _APP_CHATLOG.token()):
+        logger.warning("[INTAKE] reservation unavailable (chatlog not configured)")
+        return RESERVE_FAILED
+    try:
+        done, live = _marker_state(await _scan_markers(channel, event_id),
+                                   channel, event_id, _now())
     except Exception:
-        logger.info("[INTAKE] idempotency pre-check failed (continue)")
-        return False
-    return bool(rows)
-
-
-async def _mark(user_id: str, key: str) -> bool:
-    if not (_APP_CHATLOG.app_id() and _APP_CHATLOG.token()):
-        return False
+        logger.warning("[INTAKE] reservation pre-check failed (no write)")
+        return RESERVE_FAILED
+    if done:
+        logger.info("[INTAKE] duplicate delivery skipped (completed)")
+        return RESERVE_DUPLICATE
+    if live:
+        logger.info("[INTAKE] duplicate delivery skipped (in flight)")
+        return RESERVE_DUPLICATE
     try:
-        await hub_kintone.create_record(_APP_CHATLOG, {
-            "line_user_id": user_id, "role": "user", "message": INTAKE_MARKER,
-            "category": key, "auto_sent": "no"})
+        mine = int(await _append_marker(user_id, marker_category(channel, event_id)))
+    except Exception:
+        logger.warning("[INTAKE] reservation save failed (no write)")
+        return RESERVE_FAILED
+    # 並行 2 配送の勝者決定: 有効な予約のうち最小 $id（プロセスを跨いで成立）
+    try:
+        done, live = _marker_state(await _scan_markers(channel, event_id),
+                                   channel, event_id, _now())
+    except Exception:
+        logger.warning("[INTAKE] reservation winner query failed (no write)")
+        await _finish(user_id, channel, event_id, complete=False)
+        return RESERVE_FAILED
+    if done or (live and live[0] != mine):
+        logger.info("[INTAKE] concurrent duplicate lost")
+        return RESERVE_DUPLICATE
+    if not live:
+        logger.warning("[INTAKE] own reservation not visible (no write)")
+        return RESERVE_FAILED
+    return RESERVED
+
+
+async def _finish(user_id: str, channel: str, event_id: str, complete: bool) -> bool:
+    """完了（complete=True）または解放を記録する。保存に失敗しても送出しない——
+    予約だけが残った状態はリース期限後に再処理できる。"""
+    category = (done_category if complete else release_category)(channel, event_id)
+    try:
+        await _append_marker(user_id, category)
         return True
     except Exception:
-        logger.warning("[INTAKE] marker save failed (continue without marker)")
+        logger.warning("[INTAKE] marker finish save failed (lease will expire)")
         return False
 
 
@@ -386,6 +510,10 @@ async def _find_record(cfg: IntakeConfig, user_id: str) -> tuple[dict | None, st
         return None, "search_failed"
 
 
+class _AmbiguousRecord(Exception):
+    """作成区間の再検索で同一 LINE ユーザーの案件レコードが複数見つかった（書かない）。"""
+
+
 async def _create_jikou_minimal(user_id: str) -> str:
     payload = dict(JIKOU_MINIMAL_RECORD)
     payload[USER_FIELD] = user_id
@@ -407,8 +535,13 @@ async def _write(cfg: IntakeConfig, user_id: str, record: dict | None,
     else:
         rid = _v(record, "$id") if record is not None else ""
         if not rid:
-            rid = await _create_jikou_minimal(user_id)
-            record = await hub_kintone.get_record(cfg.app, rid)   # 作成直後の実欄集合
+            # HRI-03: 冒頭の検索結果（record=None）を持ち越さない。共通の排他区間の
+            # 内側で再検索→無ければ作成→作成失敗（一意制約の発火）は既存を採用
+            rid, _how, count = await jikou_case_create.create_or_adopt(
+                user_id, lambda: _create_jikou_minimal(user_id))
+            if count >= 2:
+                raise _AmbiguousRecord()
+            record = await hub_kintone.get_record(cfg.app, rid)   # 実欄集合・既存値
         # 欄が未作成（郵便番号 等・レコードのキーに無い）は PUT に含めない
         # （含めると更新全体が拒否される）
         to_apply = {c: v for c, v in candidates.items() if c in record}
@@ -489,6 +622,10 @@ async def run(cfg: IntakeConfig, user_id: str, text: str, event_id: str) -> str:
         return "error"
 
 
+_AMBIGUOUS_NOTICE = ("同一 LINE ユーザーの案件レコードが複数あるため登録して"
+                     "いません（要確認: App 21 で重複を整理してください）")
+
+
 async def _run(cfg: IntakeConfig, user_id: str, text: str, event_id: str) -> str:
     if not event_id:
         logger.info("[INTAKE] skipped (no event id)")
@@ -496,63 +633,79 @@ async def _run(cfg: IntakeConfig, user_id: str, text: str, event_id: str) -> str
     if not str(text or "").strip():
         return "empty"
     async with _lock(cfg, user_id):
-        key = marker_category(cfg.name, event_id)
-        if await _already_done(key):
-            logger.info("[INTAKE] duplicate delivery skipped")
-            return "duplicate"
         record, method = await _find_record(cfg, user_id)
-        if method == "ambiguous":
-            await _mark(user_id, key)
-            await _notify(cfg, user_id, "", None,
-                          [("同一 LINE ユーザーの案件レコードが複数あるため登録して"
-                            "いません（要確認: App 21 で重複を整理してください）", None)])
-            return "ambiguous"
         if method == "search_failed":
             logger.warning("[INTAKE] record lookup failed (skip)")
             return "search_failed"
-        # コスト制御: 対象欄（レコードに実在する欄）のうち空欄だけを判定にかける
-        if record is None:
-            codes = list(cfg.fields)
-        else:
-            codes = [c for c in cfg.fields if c in record and not _v(record, c)]
-        if not codes:
-            logger.info("[INTAKE] all target fields filled (no ai call)")
-            return "all_filled"
-        record_id = _v(record, "$id") if record is not None else ""
-        if len(text) > MAX_TEXT_CHARS:
-            await _mark(user_id, key)
-            await _notify(cfg, user_id, record_id, None,
-                          [("メッセージが長すぎるため判定していません", None)])
-            return "too_long"
-        await _mark(user_id, key)
+        codes: list = []
+        if method != "ambiguous":
+            # コスト制御: 対象欄（レコードに実在する欄）のうち空欄だけを判定にかける
+            if record is None:
+                codes = list(cfg.fields)
+            else:
+                codes = [c for c in cfg.fields if c in record and not _v(record, c)]
+            if not codes:
+                logger.info("[INTAKE] all target fields filled (no ai call)")
+                return "all_filled"
+        # HRI-02: 副作用（通知・AI・書込）の前に予約。取れなければ先へ進まない
+        state = await _reserve(user_id, cfg.name, event_id)
+        if state == RESERVE_DUPLICATE:
+            return "duplicate"
+        if state != RESERVED:
+            return "reserve_failed"
+        complete = False
         try:
-            report = await _call_ai(cfg, codes, text)
-        except Exception:
-            logger.warning("[INTAKE] ai call failed (fixed reason)")
-            report = None
-        if report is None:
-            await _notify(cfg, user_id, record_id, None,
-                          [("AI の判定に失敗しました（登録していません）", None)])
-            return "ai_failed"
-        candidates, rejected = extract_candidates(cfg, report, codes)
-        reasons = [(f"{k}のため登録しなかった欄", v) for k, v in rejected.items()]
-        if report["mixed_persons"]:
-            reasons.insert(0, ("複数人の情報が混在するため登録していません",
-                               sorted(candidates) or None))
+            outcome, complete = await _process(cfg, user_id, text, record, method, codes)
+            return outcome
+        finally:
+            # 完了=再配送は duplicate／解放=再配送で再処理（例外もここで解放される）
+            await _finish(user_id, cfg.name, event_id, complete)
+
+
+async def _process(cfg: IntakeConfig, user_id: str, text: str, record: dict | None,
+                   method: str, codes: list) -> tuple[str, bool]:
+    """予約取得後の本体。(結果, 完了か)。完了=False は解放（再配送で再処理可）:
+    AI 失敗・書けなかった欄が残った（CAS 収束不能 等）・例外。"""
+    if method == "ambiguous":
+        await _notify(cfg, user_id, "", None, [(_AMBIGUOUS_NOTICE, None)])
+        return "ambiguous", True
+    record_id = _v(record, "$id") if record is not None else ""
+    if len(text) > MAX_TEXT_CHARS:
+        await _notify(cfg, user_id, record_id, None,
+                      [("メッセージが長すぎるため判定していません", None)])
+        return "too_long", True
+    try:
+        report = await _call_ai(cfg, codes, text)
+    except Exception:
+        logger.warning("[INTAKE] ai call failed (fixed reason)")
+        report = None
+    if report is None:
+        await _notify(cfg, user_id, record_id, None,
+                      [("AI の判定に失敗しました（登録していません）", None)])
+        return "ai_failed", False
+    candidates, rejected = extract_candidates(cfg, report, codes)
+    reasons = [(f"{k}のため登録しなかった欄", v) for k, v in rejected.items()]
+    if report["mixed_persons"]:
+        reasons.insert(0, ("複数人の情報が混在するため登録していません",
+                           sorted(candidates) or None))
+        await _notify(cfg, user_id, record_id, None, reasons)
+        return "mixed_persons", True
+    if not candidates:
+        if reasons:
             await _notify(cfg, user_id, record_id, None, reasons)
-            return "mixed_persons"
-        if not candidates:
-            if reasons:
-                await _notify(cfg, user_id, record_id, None, reasons)
-                return "rejected_only"
-            logger.info("[INTAKE] nothing to record")
-            return "nothing"
+            return "rejected_only", True
+        logger.info("[INTAKE] nothing to record")
+        return "nothing", True
+    try:
         rid, result = await _write(cfg, user_id, record, candidates)
-        logger.info("[INTAKE] done record_id=%s written=%s",
-                    emit(rid, "record_id", "log", "operator"),
-                    emit(len(result["written"]), "count", "log", "operator"))
-        await _notify(cfg, user_id, rid, result, reasons)
-        return "written" if result["written"] else "no_write"
+    except _AmbiguousRecord:
+        await _notify(cfg, user_id, "", None, [(_AMBIGUOUS_NOTICE, None)])
+        return "ambiguous", True
+    logger.info("[INTAKE] done record_id=%s written=%s",
+                emit(rid, "record_id", "log", "operator"),
+                emit(len(result["written"]), "count", "log", "operator"))
+    await _notify(cfg, user_id, rid, result, reasons)
+    return ("written" if result["written"] else "no_write"), not result["unwritten"]
 
 
 async def run_jikou(user_id: str, text: str, event_id: str | None) -> str:

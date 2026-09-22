@@ -86,6 +86,13 @@ class _FakeKintone:
         self.update_calls: list[tuple] = []
         self.search_calls: list[tuple] = []
         self.conflict_next = 0
+        # HRI-02/03: 時計（App 28 行の 作成日時 と hri._now の共通の正）・障害注入
+        self.now = datetime.datetime(2026, 9, 20, 3, 0, 30, tzinfo=datetime.timezone.utc)
+        self.fail_create_envs: set = set()       # この env の create は KintoneError
+        self.fail_marker_scan = 0                # App 28 の category in 照会を N 回失敗
+        self.fail_categories: set = set()        # この接頭辞の category の create は失敗
+        self.unique_envs: set = {"APP_HOUKI"}    # LINEユーザーID の一意制約が有効な env
+        self.on_search = None                    # async hook(env, query)（割り込み再現用）
 
     def add(self, env: str, rid: str, fields: dict, revision: str = "3"):
         rec = {"$id": {"value": rid}, "$revision": {"value": revision}}
@@ -122,10 +129,21 @@ class _FakeKintone:
     async def search_records(self, app, query, fields=None):
         env = app.app_id_env
         self.search_calls.append((env, query))
+        if self.on_search is not None:
+            await self.on_search(env, query)
         rows = list(self.rows[env].values())
-        m = re.search(r'(LINEユーザーID|category) = "([^"]+)"', query)
-        assert m, query
-        rows = [r for r in rows if (r.get(m.group(1)) or {}).get("value") == m.group(2)]
+        m_in = re.search(r"category in \(([^)]*)\)", query)
+        if m_in:
+            if self.fail_marker_scan > 0:
+                self.fail_marker_scan -= 1
+                raise hub_kintone.KintoneError(520, "GAIA_XX", "scan down")
+            wanted = set(re.findall(r'"([^"]+)"', m_in.group(1)))
+            rows = [r for r in rows if (r.get("category") or {}).get("value") in wanted]
+        else:
+            m = re.search(r'(LINEユーザーID|category) = "([^"]+)"', query)
+            assert m, query
+            rows = [r for r in rows
+                    if (r.get(m.group(1)) or {}).get("value") == m.group(2)]
         desc = "desc" in query
         rows.sort(key=lambda r: int(r["$id"]["value"]), reverse=desc)
         lim = re.search(r"limit (\d+)", query)
@@ -139,7 +157,11 @@ class _FakeKintone:
         self._reject_double_wrap(fields)
         env = app.app_id_env
         self.create_calls.append((env, dict(fields)))
-        if env == "APP_HOUKI":
+        if env in self.fail_create_envs or any(
+                str(fields.get("category") or "").startswith(p)
+                for p in self.fail_categories):
+            raise hub_kintone.KintoneError(520, "GAIA_XX", "create down")
+        if env in self.unique_envs:
             uid = fields.get("LINEユーザーID")
             if uid and any((r.get("LINEユーザーID") or {}).get("value") == uid
                            for r in self.rows[env].values()):
@@ -154,6 +176,9 @@ class _FakeKintone:
             rec.setdefault(c, {"value": ""})
         rec["$id"] = {"value": rid}
         rec["$revision"] = {"value": "1"}
+        # 実 kintone の CREATED_TIME は分単位（秒は切り捨て）
+        rec["作成日時"] = {"type": "CREATED_TIME", "value": self.now.replace(
+            second=0, microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")}
         self.rows[env][rid] = rec
         return rid
 
@@ -197,6 +222,7 @@ class _Base(unittest.TestCase):
             patch.object(hub_kintone, "get_record", self.fake.get_record),
             patch.object(hub_kintone, "update_record", self.fake.update_record),
             patch.object(hri, "create_message_with_fallback", self.ai),
+            patch.object(hri, "_now", lambda: self.fake.now, create=True),
             patch.object(hri.notify, "notify_admin_line", self.notify),   # hub.notify（store と同一 module）
             patch.dict(os.environ, {"KINTONE_SUBDOMAIN": "testsub"}),
         ]
@@ -361,7 +387,8 @@ class TestJikouFlow(_Base):
         self.assertEqual(fields, {"顧客名": NAME, "furigana": "やまだ たろう",
                                   "住所": ADDR, "生年月日": BIRTH, "メールアドレス": MAIL})
         self.assertEqual(self.fake.val("KINTONE_APP_ID", "10", "電話番号"), "手入力の番号")
-        self.assertEqual(self.fake.markers(), [f"返答取込:jikou:{EVT}"])
+        self.assertEqual(self.fake.markers(), [f"返答取込:jikou:{EVT}",
+                                               f"返答取込済:jikou:{EVT}"])
         row = next(iter(self.fake.rows["APP_CHATLOG"].values()))
         self.assertEqual(row["message"]["value"], hri.INTAKE_MARKER)
         self.assertEqual(row["role"]["value"], "user")
@@ -378,7 +405,7 @@ class TestJikouFlow(_Base):
         self.ai.return_value = _ai(dict(self.FULL, 郵便番号=(True, "123-4567", "high")))
         self.assertEqual(_run(hri.run_jikou(USER, "山田太郎、〒123-4567…", EVT)), "written")
         self.assertEqual(self.ai_codes(), list(hri.JIKOU_FIELDS))   # 未作成=全欄が対象
-        self.assertEqual(len(self.fake.create_calls), 2)   # App 28 マーカー + App 21 最小
+        self.assertEqual(len(self.fake.create_calls), 3)   # App 28 予約+完了 + App 21 最小
         env, payload = [c for c in self.fake.create_calls if c[0] == "KINTONE_APP_ID"][0]
         self.assertEqual(payload, {"LINEユーザーID": USER, "受付チャネル": "LINE",
                                    "status": "問い合わせ", "ラジオボタン": "不明",
@@ -452,7 +479,8 @@ class TestJikouFlow(_Base):
         self.assertEqual(_run(hri.run_jikou(USER, "あ" * 2001, EVT)), "too_long")
         self.ai.assert_not_awaited()
         self.assertIn("長すぎる", self.notice())
-        self.assertEqual(self.fake.markers(), [f"返答取込:jikou:{EVT}"])
+        self.assertEqual(self.fake.markers(), [f"返答取込:jikou:{EVT}",
+                                               f"返答取込済:jikou:{EVT}"])
 
     def test_ai_exception_and_schema_violation(self):
         self.fake.add_jikou()
@@ -485,7 +513,8 @@ class TestJikouFlow(_Base):
         self.assertEqual(_run(hri.run_jikou(USER, "こんにちは", EVT)), "nothing")
         self.notify.assert_not_awaited()
         self.assertEqual(self.fake.update_calls, [])
-        self.assertEqual(self.fake.markers(), [f"返答取込:jikou:{EVT}"])   # 1 受信 1 回
+        self.assertEqual(self.fake.markers(), [f"返答取込:jikou:{EVT}",
+                                               f"返答取込済:jikou:{EVT}"])   # 1 受信 1 回
 
     def test_cas_409_refetch_once(self):
         self.fake.add_jikou(revision="5")
@@ -605,7 +634,8 @@ class TestHoukiFlow(_Base):
         for v in ("山田花子", NAME):
             self.assertNotIn(v, text)
         self.assertIn("https://testsub.cybozu.com/k/40/show#record=", text)
-        self.assertEqual(self.fake.markers(), [f"返答取込:houki:{EVT}"])
+        self.assertEqual(self.fake.markers(), [f"返答取込:houki:{EVT}",
+                                               f"返答取込済:houki:{EVT}"])
 
     def test_existing_record_only_empty_and_choice_enum(self):
         self.fake.add_houki(被相続人氏名="既存", 続柄="子")

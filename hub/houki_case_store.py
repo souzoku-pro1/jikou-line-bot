@@ -27,6 +27,7 @@ from typing import Callable
 from hub import kintone
 from hub import notify
 from hub.redact import emit
+from hub.user_section import user_section
 
 logger = logging.getLogger("hub.houki_case_store")
 
@@ -445,7 +446,23 @@ async def apply_hearing_fields(user_id: str, raw_fields: dict,
     完全に同一挙動。与えられたときは各 CAS 試行の前（初回を含む）と 409 後の
     再取得の前に呼び、False なら再試行せず write 0（problems に固定語 "fenced" を
     足して返す。戻り値の形は不変）。
+
+    HRI-03: existing=None（呼び出し側のターン冒頭の検索で未作成だった）は、その結果を
+    持ち越さない。同一ユーザーの共通の排他区間（hub.user_section・返答取込と
+    ヒアリングで同じ鍵）の内側で**再検索**してから作成判断を行う。区間は in-process
+    のみ——最終防衛線は下の fix3[H3-06]（App 40 の一意制約の発火→既存へ収束）。
     """
+    if existing is None:
+        async with user_section("houki", user_id):
+            return await _apply_hearing_fields(
+                user_id, raw_fields, await fetch_case(user_id), fence)
+    return await _apply_hearing_fields(user_id, raw_fields, existing, fence)
+
+
+async def _apply_hearing_fields(user_id: str, raw_fields: dict,
+                                existing: dict | None,
+                                fence: Callable[[], bool] | None
+                                ) -> tuple[str, list[str], list[str]]:
     fields, problems, choice_problems = split_valid_fields(
         raw_fields, existing)
     for _attempt in range(_CAS_RETRIES):
