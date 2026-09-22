@@ -248,8 +248,7 @@ async def _hearing_turn(reply_token: str, user_id: str, user_text: str) -> None:
     # 時効（main.py の HUMAN_MODE）と同じ挙動: 顧客へは一切送信せず、App 28 に
     # 受信を記録（category 空・auto_sent=no）し、管理者へ通知（氏名・本文は
     # emit で抑止・レコード No のみ可視）。フィールド無し・空は「自動」
-    if record is not None and str(
-            (record.get("response_mode") or {}).get("value") or "") == "人対応":
+    if houki_case_store.is_human_mode(record):   # HRI-06: 画像直接経路と共用の判定
         logger.info("[HOUKI_HEARING] human mode → silent (record only) userId=%s...",
                     emit(user_id[:10], "record_id", "log", "operator"))
         # 裁定 G-2: 未回収の画像受領マーカーがあれば、受領返信を抑止した事実を App 28 に
