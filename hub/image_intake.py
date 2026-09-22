@@ -64,6 +64,23 @@ _APP_CHATLOG = kintone.KintoneApp(
 _MARKER_PREFIX = "画像受領:"          # 実カテゴリ= 画像受領:{channel}:{event_id}
 _RECEIPT_PREFIX = "画像受領済:"       # 実カテゴリ= 画像受領済:{channel}
 
+# ── 裁定 G-2（人対応中に抑止した自動送信の解除後の扱い） ─────────────────────────
+# 人対応中に抑止した顧客向け自動送信（受領返信・読解結果）は、解除後も送らない。
+# - 抑止した事実は App 28 に「保留」行として追記する（実カテゴリ= 画像人対応保留:{channel}）
+# - 解除後の最初の受信で、保留行より古い未回収マーカーを「人対応済」行で閉じる
+#   （実カテゴリ= 画像人対応済:{channel}・送信なし）。受領済み行と同じく「最新マーカーより
+#   新しい閉鎖行がある=返信不要」として heal・代表経路の両方を止める
+# - 保留行が無い未返信マーカー（送信失敗 等）は閉じない=従来どおり heal が回収する
+# - App 40 の編集 webhook は使わない（response_mode の変化を検知する点は無い。
+#   解除の検知=「人対応でない受信が来た」こと）
+# どちらの行も message は固定文言（会話履歴の復元からは除外=chat_responder）。
+_HUMAN_HOLD_PREFIX = "画像人対応保留:"
+_HUMAN_CLOSED_PREFIX = "画像人対応済:"
+IMAGE_HUMAN_HOLD_MARKER = "（画像・人対応中のため自動返信を保留）"
+IMAGE_HUMAN_CLOSED_MARKER = "（画像・人対応済として終了＝自動返信なし）"
+# 人対応ゲートを持つチャネル（時効の画像経路は main 側の既存ゲートのまま=対象外）
+_HUMAN_GATED_CHANNELS = frozenset({"houki"})
+
 # 束ね予約: "channel:userId" → 最新受信イベントの冪等キー（単一イベント
 # ループ前提の in-memory。消失時は個別返信へ縮退＝無返信にはならない）
 _pending: dict[str, str] = {}
@@ -122,16 +139,28 @@ async def latest_marker_category(channel_name: str, user_id: str) -> str:
     return cat
 
 
-async def _latest_receipt_row_id(channel_name: str, user_id: str) -> str:
+async def _latest_row_id_by_category(user_id: str, category: str) -> str:
     rows = await kintone.search_records(
         _APP_CHATLOG,
         f'line_user_id = "{user_id}" and '
-        f'category = "{_receipt_category(channel_name)}" '
+        f'category = "{category}" '
         "order by $id desc limit 1",
         fields=["$id"])
     if not rows:
         return ""
     return str(((rows[0].get("$id") or {}).get("value")) or "")
+
+
+async def _latest_receipt_row_id(channel_name: str, user_id: str) -> str:
+    """最新の閉鎖行（受領済み行。人対応ゲートを持つチャネルは 人対応済 行も含む）。
+    時効チャネルの照会は従来と同一（追加の照会なし）。"""
+    receipt = await _latest_row_id_by_category(
+        user_id, _receipt_category(channel_name))
+    if channel_name not in _HUMAN_GATED_CHANNELS:
+        return receipt
+    closed = await _latest_row_id_by_category(
+        user_id, f"{_HUMAN_CLOSED_PREFIX}{channel_name}")
+    return max((receipt, closed), key=lambda x: int(x or 0))
 
 
 async def debounce_and_elect(channel_name: str, user_id: str,
@@ -227,6 +256,14 @@ async def _send_receipt_and_close(channel_name: str, channel,
         receipt = await _latest_receipt_row_id(channel_name, user_id)
         if receipt and int(receipt) > int(marker):
             return None                      # 既に閉鎖済み（重複送信の遮断）
+        if channel_name in _HUMAN_GATED_CHANNELS:
+            # 裁定 G-2: 保留行で覆われた未回収（人対応中に抑止した分）は解除後も
+            # 送らない。送信関門で止める=heal・代表経路のどちらから来ても送信 0
+            hold = await _latest_row_id_by_category(
+                user_id, f"{_HUMAN_HOLD_PREFIX}{channel_name}")
+            if hold and int(hold) > int(marker):
+                logger.info("[IMAGE_INTAKE] held by human mode (no send)")
+                return None
         try:
             sent = await push_text(channel, user_id, IMAGE_RECEIPT_REPLY)
         except Exception:
@@ -291,6 +328,83 @@ async def heal_unreplied(channel_name: str, channel, user_id: str) -> bool:
 
 
 # ── 相続放棄チャネルの画像受信（受領返信の新設・IMAGE-INTAKE-1） ─────────────────
+# ── 裁定 G-2: 人対応中の保留・解除後の閉鎖（送信しない） ──────────────────────────
+async def _append_human_row(user_id: str, category: str, message: str) -> None:
+    await kintone.create_record(_APP_CHATLOG, {
+        "line_user_id": user_id,
+        "role": "user",
+        "message": message,
+        "category": category,
+        "auto_sent": "no",
+    })
+
+
+async def _unreplied_marker_id(channel_name: str, user_id: str) -> int:
+    """未回収（最新マーカー行 > 最新閉鎖行）なら最新マーカー行の $id、なければ 0。"""
+    marker = await latest_marker_row_id(channel_name, user_id)
+    if not marker:
+        return 0
+    closed = await _latest_receipt_row_id(channel_name, user_id)
+    if closed and int(closed) > int(marker):
+        return 0
+    return int(marker)
+
+
+async def hold_for_human_mode(channel_name: str, user_id: str) -> bool:
+    """人対応ゲートが顧客向け自動送信を抑止したときに呼ぶ。未回収マーカーがあり、
+    それより新しい保留行がまだ無ければ保留行を 1 行追記する（追記したら True）。
+    マーカーは消費・削除しない。照会・保存の失敗は握る（送信は既に抑止されている）。"""
+    if os.environ.get("IMAGE_HEAL_DISABLED") == "1":
+        return False                         # heal と同じテスト既定無効の env ゲート
+    try:
+        marker = await _unreplied_marker_id(channel_name, user_id)
+        if not marker:
+            return False
+        hold = await _latest_row_id_by_category(
+            user_id, f"{_HUMAN_HOLD_PREFIX}{channel_name}")
+        if hold and int(hold) > marker:
+            return False                     # この未回収分は保留済み（重複行を作らない）
+        await _append_human_row(user_id, f"{_HUMAN_HOLD_PREFIX}{channel_name}",
+                                IMAGE_HUMAN_HOLD_MARKER)
+        logger.info("[IMAGE_INTAKE] human mode hold recorded (no send)")
+        return True
+    except Exception:
+        logger.error("[IMAGE_INTAKE] human mode hold save failed (fixed reason)")
+        return False
+
+
+async def close_held_markers(channel_name: str, user_id: str) -> bool:
+    """解除後の最初の受信で呼ぶ（人対応でないと判定した後・heal の前）。最新の未回収
+    マーカーより新しい保留行があれば、人対応済 行で閉じる（送信なし・閉じたら True）。
+    保留行が無い／保留行より新しいマーカーがある場合は閉じない=従来どおり heal・
+    代表経路が扱う。送信 claim を共有し、並行する送信経路との隙間を作らない。"""
+    if os.environ.get("IMAGE_HEAL_DISABLED") == "1":
+        return False
+    key = _key(channel_name, user_id)
+    if key in _send_claims:                  # 確認→取得（同期区間・awaitなし）
+        return False
+    _send_claims.add(key)
+    try:
+        marker = await _unreplied_marker_id(channel_name, user_id)
+        if not marker:
+            return False
+        hold = await _latest_row_id_by_category(
+            user_id, f"{_HUMAN_HOLD_PREFIX}{channel_name}")
+        if not hold or int(hold) < marker:
+            return False                     # 保留行の無い未回収=通常の未返信
+        await _append_human_row(user_id, f"{_HUMAN_CLOSED_PREFIX}{channel_name}",
+                                IMAGE_HUMAN_CLOSED_MARKER)
+        logger.info("[IMAGE_INTAKE] held markers closed as human-handled (no send)")
+        return True
+    except Exception:
+        # 閉じられなくても送信はされない（保留行のある未回収は送信関門
+        # _send_receipt_and_close が送らない）。次の受信で再び閉鎖を試みる
+        logger.error("[IMAGE_INTAKE] held marker close failed (fixed reason)")
+        return False
+    finally:
+        _send_claims.discard(key)
+
+
 async def _notify_send_failure(channel_name: str, user_id: str) -> None:
     """fix3[fix2-01]: 受領返信の失敗通知を**関門（send_receipt_and_close）内**へ
     一元化——保持者が代表でも heal でも、False 確定のその場で必ず 1 回発火する
