@@ -541,10 +541,12 @@ class TestHoukiImageFlow(_Base):
 # ── 自己修復発火の配線（両チャネルの入口から呼ばれること） ────────────────────────
 class TestHealWiring(_Base):
     def test_jikou_text_worker_calls_heal(self):
+        # HRI-08: App 21 の人対応判定が heal の前（照会失敗は heal も含めて送らない側）。
+        # 照会は「レコード無し」で通し、heal の後（ask_claude）で停止させる
         spy = AsyncMock(return_value=False)
         stop = AsyncMock(side_effect=RuntimeError("halt after heal"))
         with patch.object(main, "_autoreply_paused", lambda: False),                 patch.object(main.autoreply_stoplist, "is_suppressed",
-                             AsyncMock(return_value=False)),                 patch("hub.image_intake.heal_unreplied", spy),                 patch.object(main, "get_app21_record", stop):
+                             AsyncMock(return_value=False)),                 patch("hub.image_intake.heal_unreplied", spy),                 patch.object(main, "get_app21_record", AsyncMock(return_value=None)),                 patch.object(main, "get_recent_chat_history", AsyncMock(return_value=[])),                 patch.object(main, "ask_claude", stop):
             _run(main._process_line_event("t", "U_wire", "こんにちは"))
         spy.assert_awaited_once()
         self.assertEqual(spy.await_args.args[0], "jikou")
