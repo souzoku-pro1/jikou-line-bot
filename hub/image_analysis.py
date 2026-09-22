@@ -45,7 +45,7 @@ from typing import Any, Callable
 
 import anthropic
 
-from chat_responder import build_known_items
+from chat_responder import build_known_items, is_human_mode
 from claude_gateway import create_message_with_fallback
 from hub import houki_case_store
 from hub import kintone
@@ -417,7 +417,7 @@ def _blocked(record: dict | None, user_id: str) -> bool:
     """送信直前の抑止判定（IMG-1 の受領返信と同じ判定関数・同じ env）。"""
     if os.environ.get("AUTOREPLY_PAUSED") == "1":
         return True
-    if (_v(record, "response_mode") or "自動") == "人対応":
+    if is_human_mode(record):                 # HRI-08: 時効側の単一の判定関数
         return True
     return False
 

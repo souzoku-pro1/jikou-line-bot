@@ -78,8 +78,10 @@ _HUMAN_HOLD_PREFIX = "画像人対応保留:"
 _HUMAN_CLOSED_PREFIX = "画像人対応済:"
 IMAGE_HUMAN_HOLD_MARKER = "（画像・人対応中のため自動返信を保留）"
 IMAGE_HUMAN_CLOSED_MARKER = "（画像・人対応済として終了＝自動返信なし）"
-# 人対応ゲートを持つチャネル（時効の画像経路は main 側の既存ゲートのまま=対象外）
-_HUMAN_GATED_CHANNELS = frozenset({"houki"})
+# 人対応ゲートを持つチャネル（HRI-08: 時効=main 側 chat_responder.is_human_mode・
+# HRI-01/06: 相続放棄=houki_case_store.is_human_mode）。保留/閉鎖の行は
+# 画像人対応保留:{channel}／画像人対応済:{channel}
+_HUMAN_GATED_CHANNELS = frozenset({"jikou", "houki"})
 _LOOKUP_FAILED = object()            # App 40 の照会失敗（判定不能）の番兵
 
 # 束ね予約: "channel:userId" → 最新受信イベントの冪等キー（単一イベント
