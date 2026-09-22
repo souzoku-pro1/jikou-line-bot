@@ -86,6 +86,12 @@ LEASE_SEC = 600
 LEASE_CLOCK_MARGIN_SEC = 60
 _SCAN_LIMIT = 100
 
+# HRI-05（裁定 C 要約）: 取込経路の 409 上限=「初回+再試行 1 回、再取得 1 回」。
+# 時効=hearing_update.apply_update（CAS_REFETCH=1: 更新 2 回・再取得 1 回=同じ上限）、
+# 相続放棄=apply_hearing_fields に注入（ヒアリング経路の _CAS_RETRIES=3 は不変）
+INTAKE_CAS_ATTEMPTS = 2
+INTAKE_CAS_REFETCHES = 1
+
 MAX_TEXT_CHARS = 2000
 MAX_TEXT_VALUE = 100
 API_TIMEOUT_SEC = 60.0
@@ -528,8 +534,11 @@ async def _write(cfg: IntakeConfig, user_id: str, record: dict | None,
     """空欄のみ・CAS で書き、再取得の実値で (record_id, 判定) を返す。
     判定: written / preexisting / unwritten（欄コードのみ）。"""
     if cfg.name == "houki":
+        # HRI-05（裁定 C 要約）: 取込経路の CAS 上限=初回+再試行 1 回・再取得 1 回。
+        # 上限到達は write 0→下の再取得で unwritten→HRI-02 の「解放」（再配送で再処理）
         rid, problems, choice_problems = await houki_case_store.apply_hearing_fields(
-            user_id, candidates, record)
+            user_id, candidates, record,
+            cas_attempts=INTAKE_CAS_ATTEMPTS, cas_refetches=INTAKE_CAS_REFETCHES)
         if problems or choice_problems:
             logger.info("[INTAKE] houki store rejected some fields (write 0 for them)")
     else:
