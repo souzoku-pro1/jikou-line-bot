@@ -41,6 +41,12 @@
   （共通の排他区間の内側で再検索→無ければ作成→作成失敗は再検索して既存を採用）。
   相続放棄は houki_case_store.apply_hearing_fields（existing=None は同じく区間内で
   再検索・App 40 の一意制約の発火は既存レコードへ収束）。
+- 選択肢欄（HRI-04・裁定 B）: AI 応答の値は、正規化表 hub/intake_choice_synonyms.json
+  （コードから分離した 1 ファイル・追加は大野の裁定事項）で同義表記を選択肢の値へ寄せた
+  うえで、AI に渡したのと同じ選択肢定義（cfg.choices）に対して検証する。1 項目でも
+  選択肢外なら**応答全体をスキーマ逸脱=AI 失敗として停止**（項目単位の部分採用はしない・
+  HRI-02 の「解放」）。逸脱した項目と値、正規化した項目と前後の値は App 28 に記録する
+  （ログには出さない=sink 規律）。選択肢を持たない自由記述欄は対象外（従来どおり）。
 - 停止条件: 判定不能（スキーマ逸脱）・複数人混在・形式不正・確信度不足・AI 失敗・
   MAX_TEXT_CHARS 超 → 書かず通知のみ（理由を欄名単位で）。項目が 1 つも含まれない
   通常の会話文は通知しない（ログのみ）。
@@ -52,6 +58,7 @@
 import asyncio
 import datetime
 import hashlib
+import json
 import logging
 import os
 import re
@@ -75,6 +82,11 @@ logger = logging.getLogger("hub.human_reply_intake")
 # App 28 の冪等マーカー行（category=返答取込:{channel}:{event_id}・message は固定文言。
 # 会話履歴の復元では除外する=chat_responder.get_recent_chat_history）
 INTAKE_MARKER = "（返答取込）"
+# HRI-04: 逸脱・正規化の記録行（message はこの接頭辞で始まる固定書式・会話履歴の復元
+# からは INTAKE_MARKER と同じく除外=is_internal_row）
+INTERNAL_ROW_PREFIX = "（返答取込・"
+DEVIATION_PREFIX = "返答取込逸脱"        # category= 返答取込逸脱:{channel}:{event_id}
+NORMALIZED_PREFIX = "返答取込正規化"      # category= 返答取込正規化:{channel}:{event_id}
 INTAKE_PREFIX = "返答取込"            # 予約（処理中）
 DONE_PREFIX = "返答取込済"            # 完了
 RELEASE_PREFIX = "返答取込解放"        # 解放（失敗・再配送で再処理可）
@@ -106,6 +118,106 @@ _ZIP_RE = re.compile(r"^[0-9]{7}$")
 _PHONE_RE = re.compile(r"^[0-9\-]{8,15}$")
 _ISO_DATE_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
 _URL_MARKERS = ("http", "://", "www.")
+
+def is_internal_row(message: str) -> bool:
+    """App 28 の内部行（冪等マーカー・逸脱/正規化の記録）か。会話履歴の復元・既知項目
+    判定から除外するための単一の判定（chat_responder.get_recent_chat_history が使う）。"""
+    m = str(message or "")
+    return m == INTAKE_MARKER or m.startswith(INTERNAL_ROW_PREFIX)
+
+
+# ── 正規化表（HRI-04・裁定 B）: コードから分離した 1 ファイル ─────────────────────
+SYNONYMS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             "intake_choice_synonyms.json")
+
+
+def load_choice_synonyms(path: str = SYNONYMS_PATH) -> dict:
+    """{欄コード: {同義表記: 選択肢の値}}。_meta は除く。形が崩れていれば起動時に落とす
+    （表の誤りを黙って通さない）。"""
+    with open(path, encoding="utf-8") as f:
+        raw = json.load(f)
+    out: dict = {}
+    for code, table in raw.items():
+        if code == "_meta":
+            continue
+        if not isinstance(table, dict) or not all(
+                isinstance(k, str) and isinstance(v, str) for k, v in table.items()):
+            raise ValueError(f"synonym table malformed: {code}")
+        out[code] = {k.strip(): v for k, v in table.items()}
+    return out
+
+
+CHOICE_SYNONYMS: dict = load_choice_synonyms()
+
+
+def normalize_choice(cfg: "IntakeConfig", code: str, value: str) -> str:
+    """選択肢欄の値を正規化表で選択肢の値へ寄せる（表に無ければそのまま返す）。"""
+    s = str(value or "").strip()
+    if code not in cfg.choices:
+        return s
+    return CHOICE_SYNONYMS.get(code, {}).get(s, s)
+
+
+# 裁定 B-1（2026-09-22）: 続柄と相続順位の法定の対応（両方が埋まっている応答のみ検査）。
+# 子→第1順位（App 40 では「子」）・親→第2順位（「直系尊属」）・兄弟姉妹→第3順位・
+# 配偶者→順位なし（App 40 では「配偶者」）。表に無い続柄（孫・おいめい・その他）や
+# 相続順位「甥姪（代襲）」「不明」は検査しない
+RANK_BY_RELATION: dict = {
+    "子": "子",
+    "直系尊属（父母・祖父母）": "直系尊属",
+    "兄弟姉妹": "兄弟姉妹",
+    "配偶者": "配偶者",
+}
+RANK_MISMATCH_LABEL = "法定の対応と不一致"
+
+
+def _rank_mismatch(items: dict) -> tuple[str, str] | None:
+    """(続柄, 相続順位) が法定の対応と食い違えばその組、そうでなければ None。"""
+    rel = str(((items.get("続柄") or {}).get("value")) or "").strip()
+    rank = str(((items.get("相続順位") or {}).get("value")) or "").strip()
+    if not (rel and rank and (items.get("続柄") or {}).get("answered")
+            and (items.get("相続順位") or {}).get("answered")):
+        return None
+    expected = RANK_BY_RELATION.get(rel)
+    if expected is None or rank not in RANK_BY_RELATION.values():
+        return None
+    return None if rank == expected else (rel, rank)
+
+
+def apply_choice_policy(cfg: "IntakeConfig", report: dict, codes: list
+                        ) -> tuple[dict, list, list]:
+    """裁定 B: AI 応答 → 正規化 → 項目別の選択肢検証。
+    戻り値 (正規化後の report, 正規化の記録 [(code, before, after)…],
+            逸脱 [(code, value)…])。逸脱が 1 つでもあれば応答全体を停止する（呼び出し側）。
+    選択肢を持たない欄は触らない。answered=false・空の値は対象外。
+    裁定 B-1: 選択肢検証をすべて通ったうえで、続柄と相続順位の両方が埋まっていれば法定の
+    対応と照合し、食い違いは逸脱として扱う（(続柄, 相続順位) の組を記録）。"""
+    items = dict(report["items"])
+    normalized: list = []
+    deviations: list = []
+    for code in codes:
+        if code not in cfg.choices:
+            continue
+        entry = items.get(code) or {}
+        if not entry.get("answered"):
+            continue
+        raw = str(entry.get("value") or "").strip()
+        if not raw:
+            continue
+        value = normalize_choice(cfg, code, raw)
+        if value != raw:
+            normalized.append((code, raw, value))
+        if value not in cfg.choices[code]:
+            deviations.append((code, raw))
+            continue
+        items[code] = {**entry, "value": value}
+    if not deviations and "続柄" in cfg.choices and "相続順位" in cfg.choices:
+        mismatch = _rank_mismatch(items)
+        if mismatch is not None:
+            rel, rank = mismatch
+            deviations.append(("続柄／相続順位", f"{rel}／{rank}（{RANK_MISMATCH_LABEL}）"))
+    return {**report, "items": items}, normalized, deviations
+
 
 # ── 対象欄（閉集合） ───────────────────────────────────────────────────────────
 JIKOU_FIELDS: tuple = (
@@ -664,15 +776,37 @@ async def _run(cfg: IntakeConfig, user_id: str, text: str, event_id: str) -> str
             return "reserve_failed"
         complete = False
         try:
-            outcome, complete = await _process(cfg, user_id, text, record, method, codes)
+            outcome, complete = await _process(cfg, user_id, text, record, method, codes,
+                                               event_id)
             return outcome
         finally:
             # 完了=再配送は duplicate／解放=再配送で再処理（例外もここで解放される）
             await _finish(user_id, cfg.name, event_id, complete)
 
 
+def deviation_category(channel: str, event_id: str) -> str:
+    return f"{DEVIATION_PREFIX}:{channel}:{event_id}"
+
+
+def normalized_category(channel: str, event_id: str) -> str:
+    return f"{NORMALIZED_PREFIX}:{channel}:{event_id}"
+
+
+async def _record_internal_rows(user_id: str, category: str, messages: list) -> None:
+    """App 28 への内部行（逸脱・正規化の記録）。失敗は固定理由のログのみ（値は出さない）。"""
+    if not (_APP_CHATLOG.app_id() and _APP_CHATLOG.token()):
+        return
+    for message in messages:
+        try:
+            await hub_kintone.create_record(_APP_CHATLOG, {
+                "line_user_id": user_id, "role": "user", "message": message,
+                "category": category, "auto_sent": "no"})
+        except Exception:
+            logger.warning("[INTAKE] internal row save failed (fixed reason)")
+
+
 async def _process(cfg: IntakeConfig, user_id: str, text: str, record: dict | None,
-                   method: str, codes: list) -> tuple[str, bool]:
+                   method: str, codes: list, event_id: str = "") -> tuple[str, bool]:
     """予約取得後の本体。(結果, 完了か)。完了=False は解放（再配送で再処理可）:
     AI 失敗・書けなかった欄が残った（CAS 収束不能 等）・例外。"""
     if method == "ambiguous":
@@ -691,6 +825,25 @@ async def _process(cfg: IntakeConfig, user_id: str, text: str, record: dict | No
     if report is None:
         await _notify(cfg, user_id, record_id, None,
                       [("AI の判定に失敗しました（登録していません）", None)])
+        return "ai_failed", False
+    # HRI-04（裁定 B）: 正規化表で同義表記を寄せ、項目別に選択肢を検証。1 項目でも
+    # 選択肢外なら応答全体を AI 失敗として停止（部分採用なし・HRI-02 の「解放」）。
+    # 逸脱の項目と値は App 28 に記録（人が確認できる）。ログには件数のみ
+    report, normalized, deviations = apply_choice_policy(cfg, report, codes)
+    if normalized:
+        await _record_internal_rows(
+            user_id, normalized_category(cfg.name, event_id),
+            [f"{INTERNAL_ROW_PREFIX}正規化）{c}: {before} → {after}"
+             for c, before, after in normalized])
+    if deviations:
+        logger.info("[INTAKE] choice deviation → ai_failed count=%s",
+                    emit(len(deviations), "count", "log", "operator"))
+        await _record_internal_rows(
+            user_id, deviation_category(cfg.name, event_id),
+            [f"{INTERNAL_ROW_PREFIX}逸脱）" + "／".join(f"{c}={v}" for c, v in deviations)])
+        await _notify(cfg, user_id, record_id, None,
+                      [("選択肢にない値があったため、AI の判定を無効として登録していません"
+                        "（App 28 の逸脱行を確認してください）", sorted(c for c, _ in deviations))])
         return "ai_failed", False
     candidates, rejected = extract_candidates(cfg, report, codes)
     reasons = [(f"{k}のため登録しなかった欄", v) for k, v in rejected.items()]

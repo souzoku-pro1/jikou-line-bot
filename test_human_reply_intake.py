@@ -666,12 +666,18 @@ class TestHoukiFlow(_Base):
         self.assertIn("書けなかった欄（検証落ち・競合）: 死亡を知った日_申告", text)
         self.assertIn("登録した欄: 顧客名", text)
 
-    def test_choice_out_of_set_rejected_before_write(self):
+    def test_choice_out_of_set_stops_whole_response(self):
+        # HRI-04（裁定 B）で書き換え: 旧「選択肢外=その欄だけ形式不正で却下（rejected_only）」
+        # → 正規化表に無い選択肢外の値はスキーマ逸脱=応答全体を AI 失敗として停止
+        # （他の項目も書かない・解放=再配送で再処理）。詳細は test_hri04_choice_policy
         self.fake.add_houki()
-        self.ai.return_value = self._ai_for(list(hri.HOUKI.fields), 続柄="息子")
-        self.assertEqual(_run(hri.run_houki(USER, "…", EVT)), "rejected_only")
-        self.assertIn("形式不正のため登録しなかった欄: 続柄", self.notice())
+        self.ai.return_value = self._ai_for(list(hri.HOUKI.fields), 続柄="東京都", 顧客名=NAME)
+        self.assertEqual(_run(hri.run_houki(USER, "…", EVT)), "ai_failed")
         self.assertEqual(self.fake.update_calls, [])
+        self.assertEqual(self.fake.val("APP_HOUKI", "50", "顧客名"), "")
+        self.assertIn("選択肢にない値", self.notice())
+        self.assertIn("続柄", self.notice())
+        self.assertNotIn("東京都", self.notice())              # 通知に値は載せない
 
     def test_all_filled_no_ai(self):
         self.fake.add_houki(**{c: "x" for c in hri.HOUKI.fields})
