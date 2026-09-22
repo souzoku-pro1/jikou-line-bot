@@ -131,7 +131,12 @@ class Item8ChatResponderErrorPaths(unittest.IsolatedAsyncioTestCase):
         return "\n".join(cm.output)
 
     async def test_app21_search(self):
-        out = await self._run_case(lambda: chat_responder.get_app21_record("U1"))
+        # HRI-08: 非 2xx は None ではなく App21LookupError（呼び出し側で fail-closed）。
+        # ログの redaction（生ボディ非表示・status 残存）は従来どおり
+        async def _go():
+            with self.assertRaises(chat_responder.App21LookupError):
+                await chat_responder.get_app21_record("U1")
+        out = await self._run_case(_go)
         self._assert_redacted(out, "get_app21_record")
 
     async def test_save_to_chatlog(self):

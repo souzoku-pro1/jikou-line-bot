@@ -57,6 +57,8 @@ app.include_router(shindan_router)
 
 from chat_responder import (
     get_app21_record,
+    is_human_mode,
+    App21LookupError,
     classify_routing,
     handle_customer_message,
     handle_claude_outage,
@@ -720,6 +722,64 @@ async def _handle_suppressed_inbound(user_id: str, user_text: str,
                                  idem_prefix="stoplist")
 
 
+async def _handle_human_mode_inbound(user_id: str, user_text: str,
+                                     app21_record: dict) -> None:
+    """対応モード「人対応」（App 21 response_mode）の受信処理。顧客へは一切送信せず
+    （自動応答・定型文・承認キュー投入を含め完全無言）、App28 へ受信ログ+弁護士へ
+    LINE 通知のみ行い、既存経路（受付ヒアリング／顧客対応 Claude）には進めない。
+    HRI-08: メモリ上のヒアリング中でもここへ来る。会話履歴・hearing_completed には
+    触れない（セッションは維持。従来の人対応ブロックと同じ=状態遷移なし）。
+    裁定 G-2: 未回収の画像受領マーカーがあれば、受領返信を抑止した事実を App 28 に
+    「保留」行として記録する（マーカーは消費しない・失敗は module 内で握る）。"""
+    display_name = (
+        app21_record.get("顧客名", {}).get("value", "") or user_id
+    )
+    logger.info(
+        "[HUMAN_MODE] user_id=%s mode=人対応 → silent early-return",
+        emit(user_id, "external_ref", "log", "operator"),
+    )
+    await image_intake.hold_for_human_mode("jikou", user_id)
+    # (b) App28（チャットログ）に受信内容を記録（顧客へは送信しない）
+    #     方向=user / 本文=user_text / userId=user_id / timestamp はApp28側で自動付与。
+    #     category は App28 に新たな選択肢要件を持ち込まないよう空で記録する。
+    await save_to_chatlog(user_id, "user", user_text, "", "no")
+    # (c) 弁護士へ通知（P1-102・RV-10 S1）: 顧客Bot ではなく
+    #     業務チャネル（DISPATCHBOT）へ・氏名/本文は emit で redact
+    #     （既定=完全抑止）。弁護士は App28 で実体を確認する。
+    if ATTORNEY_LINE_USER_ID:
+        from hub.notify import notify_business
+        await notify_business(
+            ATTORNEY_LINE_USER_ID,
+            f"【人対応中】"
+            f"{emit(display_name, 'name', 'line_business', 'attorney')}"
+            f"：{emit(user_text, 'freetext', 'line_business', 'attorney')}",
+        )
+    else:
+        logger.info(
+            "[HUMAN_MODE] ATTORNEY_LINE_USER_ID not set, admin notify skipped"
+        )
+
+
+async def _handle_app21_lookup_failure(user_id: str, user_text: str) -> None:
+    """HRI-08: App 21 の照会が確定しない（HTTP 非 2xx・通信例外）=人対応かどうか判定
+    不能。「送らない」側へ倒す: 顧客へは無言・App28 へ受信を記録・弁護士へ要確認通知
+    （スロットル）。記録/通知の失敗は握る（本関数は無言で終わることが契約）。"""
+    logger.error("[HUMAN_MODE] app21_lookup_failed (fail-closed, no auto reply) user_id=%s",
+                 emit(user_id, "external_ref", "log", "operator"))
+    try:
+        await save_to_chatlog(user_id, "user", user_text, "", "no")
+    except Exception:
+        logger.error("[HUMAN_MODE] chatlog save failed after lookup failure (fixed reason)")
+    try:
+        await hub_notify.notify_admin_line(
+            "【要確認】案件レコード（App 21）の照会に失敗したため、お客様への自動応答を"
+            "止めました（人対応の判定ができないため）。LINE アプリで受信を確認し、"
+            f"必要なら手動でご返信ください。\nuserId: {user_id[:10]}...",
+            throttle_key="app21_lookup_failed")
+    except Exception:
+        logger.error("[HUMAN_MODE] notify failed after lookup failure (fixed reason)")
+
+
 async def _process_line_event(reply_token: str, user_id: str, user_text: str) -> None:
     """LINEイベントの重い処理（BackgroundTasksで非同期実行）"""
     logger.info("[PROCESS] start user_id=%s text=%s",
@@ -746,11 +806,6 @@ async def _process_line_event(reply_token: str, user_id: str, user_text: str) ->
         await _handle_suppressed_inbound(user_id, user_text,
                                          _durable_event_id.get())
         return
-    # IMAGE-INTAKE-1-fix1[01]: 自己修復発火——再起動等でデバウンス待機タスク
-    # ごと消えた未返信の画像受領マーカーを、次のテキスト受信時に回収する
-    # （heal は内部で例外を握る=会話を道連れにしない）
-    await image_intake.heal_unreplied("jikou", hub_line_channel.JIKOU_CHANNEL,
-                                      user_id)
     try:
         # ── ルーティング判定 ──────────────────────────────────────────────
         in_hearing_session = (
@@ -758,21 +813,39 @@ async def _process_line_event(reply_token: str, user_id: str, user_text: str) ->
             and user_id not in hearing_completed
         )
 
-        app21_record = None
-        if not in_hearing_session:
+        # ── HRI-08（裁定 G・G-2）: 人対応判定を経路に関わらず先に行う ────────────
+        #    メモリ上のヒアリング中でも App 21 を照会する（従来は照会もゲートも
+        #    飛ばしていた=ヒアリング途中で人対応へ切り替えても AI 返信が続いた）。
+        #    照会の失敗（判定不能）は「送らない」側へ倒す（記録+弁護士通知・無言）。
+        #    自己修復発火（heal）はゲートの後に置く=人対応中は画像受領返信も出ない
+        try:
             app21_record = await get_app21_record(user_id)
+        except Exception:
+            await _handle_app21_lookup_failure(user_id, user_text)
+            return
+        if is_human_mode(app21_record):
+            await _handle_human_mode_inbound(user_id, user_text, app21_record)
+            return
+        # 裁定 G-2: 解除後の最初の受信。人対応中に抑止した受領返信は後出しで
+        # 送らない——保留行のある未回収マーカーを「人対応済」行で閉じる（送信なし）。
+        # 保留行の無い未返信マーカー（送信失敗 等）は閉じない=下の heal が回収する
+        await image_intake.close_held_markers("jikou", user_id)
+        # IMAGE-INTAKE-1-fix1[01]: 自己修復発火——再起動等でデバウンス待機タスク
+        # ごと消えた未返信の画像受領マーカーを、次のテキスト受信時に回収する
+        # （heal は内部で例外を握る=会話を道連れにしない）
+        await image_intake.heal_unreplied("jikou", hub_line_channel.JIKOU_CHANNEL,
+                                          user_id)
 
         # ── JIKOU-FORM-2: 受付番号による紐付け（pause/停止リスト判定の後・
         #    App 21 に未紐付けのユーザーからの「6 桁の数字のみ」に限る。
-        #    メモリ上のヒアリング中でも未紐付けなら対象=台帳を 1 照会して確認。
-        #    紐付け成功は同一ターンで通常ヒアリングへ流す（既知項目台帳が
-        #    フォーム回答を既知として注入）。不該当=固定文言 B・上限超過=無言）──
+        #    メモリ上のヒアリング中でも未紐付けなら対象（HRI-08 以降は経路に
+        #    関わらず上で照会済み）。紐付け成功は同一ターンで通常ヒアリングへ
+        #    流す（既知項目台帳がフォーム回答を既知として注入）。不該当=固定文言 B・
+        #    上限超過=無言）──
         form_handover = False
         linked_id_this_turn = ""      # fix2: 同ターンで確定した紐付け先（bind 結果）
         receipt_number = form_link.detect_receipt_number(user_text)
         if receipt_number is not None:
-            if in_hearing_session:
-                app21_record = await get_app21_record(user_id)
             if app21_record is None:
                 outcome, linked_id = await form_link.try_link(
                     user_id, receipt_number)
@@ -799,6 +872,12 @@ async def _process_line_event(reply_token: str, user_id: str, user_text: str) ->
                     in_hearing_session = False
                     logger.info("[FORM_LINK] linked → re-evaluate routing user_id=%s",
                                 emit(user_id, "external_ref", "log", "operator"))
+                    # fix1-01 の人対応再評価は HRI-08 で関数化した同じ処理へ
+                    # （紐付け先が人対応なら顧客へは無言・記録+通知のみ）
+                    if is_human_mode(app21_record):
+                        await _handle_human_mode_inbound(user_id, user_text,
+                                                         app21_record)
+                        return
                 elif outcome == "not_matched":
                     await _line_reply_with_fallback(
                         reply_token, user_id, form_link.REPLY_NOT_MATCHED)
@@ -813,44 +892,7 @@ async def _process_line_event(reply_token: str, user_id: str, user_text: str) ->
 
         if not in_hearing_session:
             if app21_record is not None:
-                # ── 対応モード「人対応」判定 ────────────────────────────────
-                # App21参照後・既存ルーティング分岐の手前で早期return する。
-                # 「人対応」の場合は顧客へ一切送信せず（自動応答・定型文・承認
-                # キュー投入を含め完全無言）、App28へ受信ログ＋管理者へLINE通知
-                # のみ行い、既存経路（受付ヒアリング／顧客対応Claude）には進めない。
-                # フィールド無し・空は「自動」とみなす（後方互換）。
-                response_mode = (
-                    app21_record.get("response_mode", {}).get("value", "") or "自動"
-                )
-                if response_mode == "人対応":
-                    display_name = (
-                        app21_record.get("顧客名", {}).get("value", "") or user_id
-                    )
-                    logger.info(
-                        "[HUMAN_MODE] user_id=%s mode=人対応 → silent early-return",
-                        emit(user_id, "external_ref", "log", "operator"),
-                    )
-                    # (b) App28（チャットログ）に受信内容を記録（顧客へは送信しない）
-                    #     方向=user / 本文=user_text / userId=user_id / timestamp はApp28側で自動付与。
-                    #     category は App28 に新たな選択肢要件を持ち込まないよう空で記録する。
-                    await save_to_chatlog(user_id, "user", user_text, "", "no")
-                    # (c) 弁護士へ通知（P1-102・RV-10 S1）: 顧客Bot ではなく
-                    #     業務チャネル（DISPATCHBOT）へ・氏名/本文は emit で redact
-                    #     （既定=完全抑止）。弁護士は App28 で実体を確認する。
-                    if ATTORNEY_LINE_USER_ID:
-                        from hub.notify import notify_business
-                        await notify_business(
-                            ATTORNEY_LINE_USER_ID,
-                            f"【人対応中】"
-                            f"{emit(display_name, 'name', 'line_business', 'attorney')}"
-                            f"：{emit(user_text, 'freetext', 'line_business', 'attorney')}",
-                        )
-                    else:
-                        logger.info(
-                            "[HUMAN_MODE] ATTORNEY_LINE_USER_ID not set, admin notify skipped"
-                        )
-                    return
-
+                # 人対応判定は上（HRI-08）で経路に関わらず済み。ここは status ルーティングのみ
                 status = app21_record.get("status", {}).get("value", "")
                 routing = classify_routing(status)
                 logger.info("[ROUTING] user_id=%s App21 (status/routing redacted)",
@@ -1186,10 +1228,14 @@ async def _process_line_image_event(reply_token: str, user_id: str,
             logger.info("[IMAGE] duplicate delivery skipped user_id=%s",
                         emit(user_id, "external_ref", "log", "operator"))
             return
+        # HRI-08: 照会失敗（App21LookupError／通信例外）は下の except で通知+再送出=
+        # 送らない側（未返信マーカーも作らない）。判定は単一関数 is_human_mode
         record = await get_app21_record(user_id)
-        human = record is not None and (
-            (record.get("response_mode", {}).get("value", "") or "自動")
-            == "人対応")
+        human = is_human_mode(record)
+        if not human:
+            # 裁定 G-2: 解除後の最初の受信が画像でも、新しいマーカーを保存する前に
+            # 保留分を「人対応済」行で閉じる（送信なし）
+            await image_intake.close_held_markers("jikou", user_id)
         my_id = await _save_image_inbound(user_id, idem_key)
         if not await _image_claim_winner(idem_key, my_id):
             logger.info("[IMAGE] concurrent duplicate lost user_id=%s",
@@ -1199,7 +1245,10 @@ async def _process_line_image_event(reply_token: str, user_id: str,
         # 受領返信の成否と独立・不成立でも以降の返信経路は不変）
         await _store_jikou_image(user_id, record, message_id)
         if human:
-            # 人対応: 顧客へは完全無言・弁護士通知のみ（受信行は保存済み）
+            # 人対応: 顧客へは完全無言・弁護士通知のみ（受信行は保存済み）。
+            # 裁定 G-2: 抑止した事実を保留行に記録（マーカーは消費しない=解除後に
+            # 人対応済で閉じる。後出し送信はしない）
+            await image_intake.hold_for_human_mode("jikou", user_id)
             if ATTORNEY_LINE_USER_ID:
                 from hub.notify import notify_business
                 await notify_business(
@@ -1217,6 +1266,25 @@ async def _process_line_image_event(reply_token: str, user_id: str,
                                                             user_id)):
             logger.info("[IMAGE] bundled (superseded) user_id=%s",
                         emit(user_id, "external_ref", "log", "operator"))
+            return
+        # HRI-08（裁定 G）: デバウンス（最長 DEBOUNCE_SEC）の後・送信の直前に束の代表が
+        # 人対応を判定し直す（待機中に人対応へ切り替わった束を送らない）。照会失敗は
+        # 送らない側（未返信のまま=次の受信で判定し直す・保留行も書かない）
+        try:
+            latest = await get_app21_record(user_id)
+        except Exception:
+            logger.warning("[IMAGE] app21 recheck failed before send (no send, stays unreplied)")
+            return
+        if is_human_mode(latest):
+            logger.info("[IMAGE] human mode at send time → hold (no send) user_id=%s",
+                        emit(user_id, "external_ref", "log", "operator"))
+            await image_intake.hold_for_human_mode("jikou", user_id)
+            if ATTORNEY_LINE_USER_ID:
+                from hub.notify import notify_business
+                await notify_business(
+                    ATTORNEY_LINE_USER_ID,
+                    "【人対応中】お客様から書類のお写真が届きました。"
+                    "LINE アプリでご確認ください")
             return
         # fix1[03]: push 成功を確認できたときだけ受領済み行で閉鎖（App 28 が
         # 正本）。失敗=未返信のまま（自己修復発火が回収）+要確認通知。

@@ -1215,8 +1215,31 @@ def apply_server_guards(
 
 # ── kintone App 21 ─────────────────────────────────────────────────────────────
 
+HUMAN_MODE_VALUE = "人対応"
+
+
+def is_human_mode(record: Optional[dict]) -> bool:
+    """時効の人対応ゲートの単一の判定（HRI-08）: App 21 の response_mode が「人対応」の
+    ときだけ True。レコード無し・欄無し・空は「自動」（False・後方互換）。
+    照会の失敗（判定不能）は呼び出し側が「送らない」側へ倒す（App21LookupError）。
+    テキスト受信（main._process_line_event）・画像受信（main._process_line_image_event）・
+    読解結果の送信直前（hub.image_analysis._blocked）はすべてこの関数を通す
+    （直書きの判定を置かない=test_hri08 が固定）。"""
+    return record is not None and (
+        str((record.get("response_mode") or {}).get("value") or "") or "自動"
+    ) == HUMAN_MODE_VALUE
+
+
+class App21LookupError(Exception):
+    """App 21 の照会が確定しなかった（HTTP 非 2xx）。HRI-08: 人対応ゲートの判定不能を
+    呼び出し側が「送らない」側へ倒せるよう、None（レコード無し=自動）と区別する。
+    通信例外は従来どおりそのまま伝播する（同じく判定不能）。"""
+
+
 async def get_app21_record(user_id: str) -> Optional[dict]:
-    """App 21 から LINEユーザーID でレコードを検索して返す（なければ None）"""
+    """App 21 から LINEユーザーID でレコードを検索して返す（なければ None）。
+    HRI-08: HTTP 非 2xx は None ではなく App21LookupError（呼び出し側で fail-closed）。
+    env 未設定は従来どおり None。"""
     if not (_SUBDOMAIN and _APP21_TOKEN and _APP21_ID):
         logger.warning("App21 env vars not configured")
         return None
@@ -1235,7 +1258,7 @@ async def get_app21_record(user_id: str) -> Optional[dict]:
         logger.error("App21 search failed: status=%s body=%s",
                      emit(resp.status_code, "count", "log", "operator"),
                      emit(resp.text, "vendor_raw", "log", "operator"))
-        return None
+        raise App21LookupError(f"status={resp.status_code}")
     records = resp.json().get("records", [])
     return records[0] if records else None
 
@@ -1303,10 +1326,15 @@ async def get_recent_chat_history(user_id: str, limit: int = 10) -> list[dict]:
                        emit(resp.text, "vendor_raw", "log", "operator"))
         return []
     records = resp.json().get("records", [])
+    # HRI-08（裁定 G-2）: 画像の保留行・人対応済行（固定文言の内部行）は会話履歴に
+    # 含めない（モデルへの注入・既知項目判定の汚染を防ぐ。他の行は従来どおり）
+    from hub.image_intake import IMAGE_HUMAN_CLOSED_MARKER, IMAGE_HUMAN_HOLD_MARKER
     # desc で取得しているので reversed で古い順に並べ直す
     return [
         {"role": r["role"]["value"], "content": r["message"]["value"]}
         for r in reversed(records)
+        if r["message"]["value"] not in (IMAGE_HUMAN_HOLD_MARKER,
+                                         IMAGE_HUMAN_CLOSED_MARKER)
     ]
 
 
