@@ -1290,6 +1290,14 @@ async def _process_line_image_event(reply_token: str, user_id: str,
             # 裁定 G-2: 抑止した事実を保留行に記録（マーカーは消費しない=解除後に
             # 人対応済で閉じる。後出し送信はしない）
             await image_intake.hold_for_human_mode("jikou", user_id)
+            # HRI-09（裁定 G-2 の時効への適用）: 人対応中でも読解は実行し、結果を App 21 に
+            # 転記して解析済みの印を付ける（顧客へは送らない）。解除後の次の束で当該画像が
+            # 再読解→後出し送信されることを無くす。失敗は握る（受信の記録は済んでいる）
+            try:
+                await image_intake.image_analysis.analyze_and_reply(
+                    user_id, event_id, no_send=True)
+            except Exception:
+                logger.error("[IMAGE] hold-time analysis failed (fixed reason)")
             if ATTORNEY_LINE_USER_ID:
                 from hub.notify import notify_business
                 await notify_business(
@@ -1320,6 +1328,14 @@ async def _process_line_image_event(reply_token: str, user_id: str,
             logger.info("[IMAGE] human mode at send time → hold (no send) user_id=%s",
                         emit(user_id, "external_ref", "log", "operator"))
             await image_intake.hold_for_human_mode("jikou", user_id)
+            # HRI-09（裁定 G-2 の時効への適用）: 人対応中でも読解は実行し、結果を App 21 に
+            # 転記して解析済みの印を付ける（顧客へは送らない）。解除後の次の束で当該画像が
+            # 再読解→後出し送信されることを無くす。失敗は握る（受信の記録は済んでいる）
+            try:
+                await image_intake.image_analysis.analyze_and_reply(
+                    user_id, event_id, no_send=True)
+            except Exception:
+                logger.error("[IMAGE] hold-time analysis failed (fixed reason)")
             if ATTORNEY_LINE_USER_ID:
                 from hub.notify import notify_business
                 await notify_business(

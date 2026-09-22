@@ -734,6 +734,7 @@ JIKOU = ChannelConfig(
     notify_fn=_jikou_notify, notify_timing="after_send",
     send_failure_kind="image_analysis_send_failure",
     store_kind="image_analysis_store",
+    store_when_human=True,                 # HRI-09（裁定 G-2）: 人対応中は転記のみ（送らない）
     too_long_text=("【書類写真・要確認】お写真への自動返信が文字数上限を超えたため"
                    "送信していません（レコード番号: {record_id}）。App 21 と App 28 を"
                    "確認し、必要なら手動でご返信ください。"),

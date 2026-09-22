@@ -245,19 +245,22 @@ class TestSharedGateAndDefenceInDepth(unittest.TestCase):
         self.assertTrue(ia._blocked({"response_mode": {"value": "人対応"}}, UID))
         self.assertFalse(ia._blocked({"response_mode": {"value": "自動"}}, UID))
         self.assertTrue(ia.HOUKI.store_when_human)
-        self.assertFalse(ia.JIKOU.store_when_human)        # 時効は従来どおり blocked で終了
+        self.assertTrue(ia.JIKOU.store_when_human)         # HRI-09: 時効も転記のみ（裁定 G-2 の適用）
 
 
-class TestJikouUnchanged(t_hia._Base):
-    def test_jikou_human_mode_still_blocks_without_store(self):
-        # 時効の読解は無変更: 人対応なら blocked（転記も解析済みマーカーも書かない）
+class TestJikouHoldsToo(t_hia._Base):
+    def test_jikou_human_mode_holds_with_store(self):
+        # HRI-09（裁定 G-2 の時効への適用）: 時効も人対応なら held（転記+解析済みマーカー・
+        # 送信なし）。#260 時点の「時効は blocked のまま」から更新
+        self.assertTrue(ia.JIKOU.store_when_human)
         self.store.seed_case({"LINEユーザーID": UID, "response_mode": "人対応"}, ["k1"])
         with patch.object(ia, "_call_ai", AsyncMock(return_value=None)):
             out = _run(ia.analyze_and_reply(UID, "evt-j", ia.JIKOU))
-        self.assertEqual(out, "blocked")
+        self.assertEqual(out, "held")
         self.push.assert_not_awaited()
-        self.assertEqual([r for r in self.store.chatlog
-                          if str(r.get("category", "")).startswith(ia.ANALYZED_PREFIX)], [])
+        self.assertEqual([r["category"] for r in self.store.chatlog
+                          if str(r.get("category", "")).startswith(ia.ANALYZED_PREFIX)],
+                         [ia.analyzed_category("k1")])
 
 
 if __name__ == "__main__":
