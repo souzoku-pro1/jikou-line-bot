@@ -147,6 +147,103 @@ class TestChoicePolicy(_ChoiceBase):
         self.assertIn("internal row save failed", joined)
 
 
+class TestRulingB1(_ChoiceBase):
+    """裁定 B-1（2026-09-22）: 承認範囲の表と、続柄×相続順位の法定対応の検査。"""
+
+    def test_approved_rows_normalize(self):
+        cases = {"続柄": [("長女", "子"), ("奥様", "配偶者"), ("お母様", "直系尊属（父母・祖父母）"),
+                          ("両親", "直系尊属（父母・祖父母）"), ("妹", "兄弟姉妹")],
+                 "本人区分": [("本人です", "本人"), ("親族（本人が依頼予定）", "親族（本人依頼予定）")],
+                 "相続順位": [("第一順位", "子"), ("１", "子"), ("第2順位", "直系尊属"),
+                              ("三", "兄弟姉妹")],
+                 "同時申述希望": [("希望します", "あり"), ("お願いします", "あり"),
+                                  ("不要です", "なし"), ("いいえ", "なし")],
+                 "財産処分有無": [("有", "あり"), ("無", "なし")],
+                 "訴訟督促有無": [("有り", "あり"), ("無し", "なし")]}
+        for code, pairs in cases.items():
+            for raw, expected in pairs:
+                with self.subTest(code=code, raw=raw):
+                    self.assertEqual(hri.normalize_choice(hri.HOUKI, code, raw), expected)
+
+    def test_disapproved_rows_are_absent_and_stop(self):
+        # 不承認: 孫・甥・姪・叔父・叔母・いとこ・継子・配偶者の親・その他への寄せ／曖昧な本人区分／
+        # 相続順位の続柄からの推測／事実からの推測（処分・督促）
+        absent = {"続柄": ["孫娘", "孫息子", "甥", "姪", "甥姪", "叔父", "叔母", "いとこ", "継子",
+                          "義父", "義母", "配偶者の親", "祖父", "祖母", "祖父母"],
+                  "本人区分": ["家族", "親族", "代理", "代理人"],
+                  "相続順位": ["夫", "妻", "息子", "娘", "父", "母", "甥姪", "わからない"],
+                  "同時申述希望": ["希望"],
+                  "財産処分有無": ["した", "していない", "使った", "解約した", "わからない"],
+                  "訴訟督促有無": ["届いた", "届いていない", "催告書が来た", "通知が来た", "わからない"]}
+        for code, values in absent.items():
+            for raw in values:
+                with self.subTest(code=code, raw=raw):
+                    self.assertNotIn(raw, hri.CHOICE_SYNONYMS[code])
+                    self.assertNotIn(hri.normalize_choice(hri.HOUKI, code, raw), hri.HOUKI.choices[code])
+        # 実行時: 不承認の言い換えは停止（人が見る）
+        self.assertEqual(self.go(続柄="孫娘", 顧客名=NAME), "ai_failed")
+        self.assertEqual(self.fake.update_calls, [])
+        self.assertEqual([r["message"]["value"] for r in self.rows(DEVIATION)],
+                         ["（返答取込・逸脱）続柄=孫娘"])
+
+    def test_rank_mismatch_stops_whole_response(self):
+        self.assertEqual(self.go(続柄="息子", 相続順位="第2順位", 顧客名=NAME), "ai_failed")
+        self.assertEqual(self.fake.update_calls, [])
+        self.assertEqual(self.fake.val("APP_HOUKI", "50", "顧客名"), "")
+        (row,) = self.rows(DEVIATION)
+        self.assertEqual(row["message"]["value"],
+                         "（返答取込・逸脱）続柄／相続順位=子／直系尊属（法定の対応と不一致）")
+        # 正規化は起きた（息子→子・第2順位→直系尊属）ので、その記録は残る
+        self.assertEqual(sorted(r["message"]["value"] for r in self.rows(NORMALIZED)),
+                         ["（返答取込・正規化）相続順位: 第2順位 → 直系尊属",
+                          "（返答取込・正規化）続柄: 息子 → 子"])
+        text = self.notice()
+        self.assertIn("続柄／相続順位", text)
+        self.assertNotIn("直系尊属", text)                   # 通知に値は載せない
+        self.assertEqual(self.idem(), [RESERVE, RELEASE])   # 解放=再配送で再処理
+
+    def test_rank_consistent_pairs_pass(self):
+        pairs = [("子", "子"), ("父", "直系尊属"), ("兄弟姉妹", "第3順位"), ("妻", "配偶者")]
+        for i, (rel, rank) in enumerate(pairs):
+            with self.subTest(rel=rel, rank=rank):
+                self.setUp()
+                self.assertEqual(self.go(event_id=EVT + str(i), 続柄=rel, 相続順位=rank), "written")
+                self.assertEqual(self.rows(DEVIATION), [])
+
+    def test_rank_check_skipped_when_only_one_side(self):
+        self.assertEqual(self.go(続柄="息子", 顧客名=NAME), "written")
+        self.assertEqual(self.rows(DEVIATION), [])
+        self.setUp()
+        self.assertEqual(self.go(相続順位="第3順位", 顧客名=NAME), "written")
+        self.assertEqual(self.rows(DEVIATION), [])
+        # 既存レコードに続柄があり、応答には相続順位だけ → 応答内で両方でないので検査しない
+        self.setUp()
+        self.fake.rows["APP_HOUKI"]["50"]["続柄"] = {"value": "子"}
+        self.assertEqual(self.go(相続順位="第3順位", 顧客名=NAME), "written")
+        self.assertEqual(self.rows(DEVIATION), [])
+
+    def test_rank_check_skipped_for_unmapped_values(self):
+        # 続柄「その他」「孫」や相続順位「不明」「甥姪（代襲）」は法定対応の表に無い=検査しない
+        self.assertEqual(self.go(続柄="その他", 相続順位="不明"), "written")
+        self.setUp()
+        self.assertEqual(self.go(続柄="孫", 相続順位="子"), "written")
+        self.setUp()
+        self.assertEqual(self.go(続柄="子", 相続順位="不明"), "written")
+        self.assertEqual(self.rows(DEVIATION), [])
+
+    def test_rank_mismatch_unit(self):
+        f = hri._rank_mismatch
+        mk = lambda rel, rank, a=True: {"続柄": {"answered": a, "value": rel},
+                                        "相続順位": {"answered": a, "value": rank}}
+        self.assertIsNone(f(mk("子", "子")))
+        self.assertEqual(f(mk("配偶者", "子")), ("配偶者", "子"))
+        self.assertEqual(f(mk("子", "配偶者")), ("子", "配偶者"))
+        self.assertIsNone(f(mk("子", "子", a=False)))
+        self.assertIsNone(f({"続柄": {"answered": True, "value": "子"}}))
+        self.assertEqual(hri.RANK_BY_RELATION, {"子": "子", "直系尊属（父母・祖父母）": "直系尊属",
+                                                "兄弟姉妹": "兄弟姉妹", "配偶者": "配偶者"})
+
+
 class TestSingleSourceOfChoices(unittest.TestCase):
     def test_choice_fields_enumerated_from_one_definition(self):
         # AI に渡す選択肢（tool スキーマの enum）と検証の選択肢は同じ cfg.choices
@@ -164,7 +261,7 @@ class TestSingleSourceOfChoices(unittest.TestCase):
     def test_synonym_table_is_consistent_with_choices(self):
         with open(hri.SYNONYMS_PATH, encoding="utf-8") as f:
             raw = json.load(f)
-        self.assertTrue(raw["_meta"]["status"].startswith("初期案・要承認"))
+        self.assertEqual(raw["_meta"]["status"], "承認済み（裁定B-1・2026-09-22）")
         table = hri.CHOICE_SYNONYMS
         self.assertEqual(set(table), set(hri.HOUKI.choices))  # 欄=選択肢を持つ 6 欄と一致
         for code, syn in table.items():

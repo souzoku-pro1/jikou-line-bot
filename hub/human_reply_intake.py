@@ -158,12 +158,40 @@ def normalize_choice(cfg: "IntakeConfig", code: str, value: str) -> str:
     return CHOICE_SYNONYMS.get(code, {}).get(s, s)
 
 
+# 裁定 B-1（2026-09-22）: 続柄と相続順位の法定の対応（両方が埋まっている応答のみ検査）。
+# 子→第1順位（App 40 では「子」）・親→第2順位（「直系尊属」）・兄弟姉妹→第3順位・
+# 配偶者→順位なし（App 40 では「配偶者」）。表に無い続柄（孫・おいめい・その他）や
+# 相続順位「甥姪（代襲）」「不明」は検査しない
+RANK_BY_RELATION: dict = {
+    "子": "子",
+    "直系尊属（父母・祖父母）": "直系尊属",
+    "兄弟姉妹": "兄弟姉妹",
+    "配偶者": "配偶者",
+}
+RANK_MISMATCH_LABEL = "法定の対応と不一致"
+
+
+def _rank_mismatch(items: dict) -> tuple[str, str] | None:
+    """(続柄, 相続順位) が法定の対応と食い違えばその組、そうでなければ None。"""
+    rel = str(((items.get("続柄") or {}).get("value")) or "").strip()
+    rank = str(((items.get("相続順位") or {}).get("value")) or "").strip()
+    if not (rel and rank and (items.get("続柄") or {}).get("answered")
+            and (items.get("相続順位") or {}).get("answered")):
+        return None
+    expected = RANK_BY_RELATION.get(rel)
+    if expected is None or rank not in RANK_BY_RELATION.values():
+        return None
+    return None if rank == expected else (rel, rank)
+
+
 def apply_choice_policy(cfg: "IntakeConfig", report: dict, codes: list
                         ) -> tuple[dict, list, list]:
     """裁定 B: AI 応答 → 正規化 → 項目別の選択肢検証。
     戻り値 (正規化後の report, 正規化の記録 [(code, before, after)…],
             逸脱 [(code, value)…])。逸脱が 1 つでもあれば応答全体を停止する（呼び出し側）。
-    選択肢を持たない欄は触らない。answered=false・空の値は対象外。"""
+    選択肢を持たない欄は触らない。answered=false・空の値は対象外。
+    裁定 B-1: 選択肢検証をすべて通ったうえで、続柄と相続順位の両方が埋まっていれば法定の
+    対応と照合し、食い違いは逸脱として扱う（(続柄, 相続順位) の組を記録）。"""
     items = dict(report["items"])
     normalized: list = []
     deviations: list = []
@@ -183,6 +211,11 @@ def apply_choice_policy(cfg: "IntakeConfig", report: dict, codes: list
             deviations.append((code, raw))
             continue
         items[code] = {**entry, "value": value}
+    if not deviations and "続柄" in cfg.choices and "相続順位" in cfg.choices:
+        mismatch = _rank_mismatch(items)
+        if mismatch is not None:
+            rel, rank = mismatch
+            deviations.append(("続柄／相続順位", f"{rel}／{rank}（{RANK_MISMATCH_LABEL}）"))
     return {**report, "items": items}, normalized, deviations
 
 
