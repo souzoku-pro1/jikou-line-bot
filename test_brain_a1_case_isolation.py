@@ -187,11 +187,11 @@ class TestCaseIsolation(BrainDbMixin):
             self.assertEqual(await ledger.list_holds(), [])
             q = [q for a, q in self.fake.calls if a == "40" and "LINEユーザーID" in q][-1]
             self.assertEqual(q, f'LINEユーザーID = "{LINE_A}" limit 2')
-            # 検索失敗も採用しない（fail-closed・run 自体は失敗にしない）
+            # 検索失敗も採用しない（fail-closed）。R12: 処理不要と区別し partial・pending_recheck
             self.fake.data["40"] = [app40(1, 1)]
             self.fake.fail_at = {len(self.fake.calls) + 2}       # 1 回目=App 28 ページ・2 回目=LINE 検索
             r = await sync.sync_target(sync.TARGET_APP28)
-            self.assertEqual(r["status"], "ok")
+            self.assertEqual((r["status"], r["pending_recheck"]), ("partial", 1))
             self.assertIsNone(await ledger.latest_known_revision("28", "100"))
             # 正本でちょうど 1 件なら採用（fact ではなく会話の出来事・R9）
             self.fake.fail_at = set()

@@ -367,6 +367,86 @@ class TestSyncRecovery(BrainDbMixin):
         run(body())
 
 
+class TestUndecidable(BrainDbMixin):
+    """fix2 BA-12 / R12: 判定不能は「処理不要」と区別し pending_recheck として記録する。"""
+
+    def test_undecidable_is_pending_recheck_not_ok(self):
+        self.fake.data["40"] = [app40(1, 1)]
+        self.fake.data["28"] = [app28(100, 1)]
+
+        async def fresh():
+            return await ledger.case_freshness_detail("40", "1", "app40", sync.source_targets())
+
+        async def body():
+            await sync.sync_target(sync.TARGET_APP40)
+            await sync.sync_target(sync.TARGET_APP28)
+            # 出典を確認不能にしてから復活させ、LINE 検索だけ失敗させる
+            self.fake.data["28"] = []
+            self.assertEqual((await sync.recheck_target(sync.TARGET_APP28))["unavailable"], 1)
+            self.assertEqual([(h["source_record_id"], h["state"]) for h in await ledger.list_holds()],
+                             [("100", "unavailable")])
+            prev_done = (await ledger.get_cursor("app28", kind="recheck"))["recheck_completed_at"]
+            self.fake.data["28"] = [app28(100, 1)]
+            self.fake.fail_at = {len(self.fake.calls) + 2}         # 1=$id in・2=LINE 検索
+            rc = await sync.recheck_target(sync.TARGET_APP28)
+            self.assertEqual((rc["status"], rc["complete"], rc["pending_recheck"]),
+                             ("partial", False, 1))
+            holds = await ledger.list_holds()
+            self.assertEqual([(h["source_record_id"], h["state"], h["pending_recheck"]) for h in holds],
+                             [("100", "unavailable", True)])          # unavailable は解除されない
+            self.assertEqual(await ledger.count_pending_recheck("28"), 1)
+            fd = await fresh()
+            self.assertEqual(fd["state"], "partial")
+            self.assertEqual(fd["reasons"], ["app28:100:pending_recheck"])
+            # 関連は保持（案件 1 の出来事は現在値のまま）
+            self.assertEqual(await ledger.current_case_of_source("28", "100"), ("40", "1"))
+            self.assertTrue([e for e in await ledger.list_case_events("40", "1")
+                             if e["source_app_id"] == "28"])
+            # 一巡完了にならない（完了時刻は前回のまま進まない）・次の job で続きが回る
+            rcur = await ledger.get_cursor("app28", kind="recheck")
+            self.assertEqual((rcur["state"], rcur["recheck_completed_at"]), ("incomplete", prev_done))
+            self.assertTrue(await sync._recheck_due(
+                "app28", await ledger.get_cursor("app28") or {}, sync._now()))
+            self.assertEqual((await ledger.sync_overview())["pending_recheck"], 1)
+            # 次回に検索成功で復旧: unavailable 解除・pending 解除・一巡完了・鮮度 synced
+            self.fake.fail_at = set()
+            rc = await sync.recheck_target(sync.TARGET_APP28)
+            self.assertEqual((rc["status"], rc["complete"], rc["pending_recheck"], rc["pending_left"]),
+                             ("ok", True, 0, 0))
+            self.assertEqual(await ledger.list_holds(), [])
+            self.assertEqual(await fresh(), {"state": "synced", "reasons": []})
+            done = (await ledger.get_cursor("app28", kind="recheck"))["recheck_completed_at"]
+            self.assertTrue(done and done > prev_done)                 # 一巡完了が進んだ
+            # 通常同期でも判定不能は partial（新規行は行が無いので記録せず、窓・照合で再試行）
+            self.fake.data["28"].append(app28(101, 1, "2026-09-21T01:00:00Z"))
+            self.fake.fail_at = {len(self.fake.calls) + 3}         # 1=ページ・2=100 の検索・3=101 の検索
+            r = await sync.sync_target(sync.TARGET_APP28)
+            self.assertEqual((r["status"], r["pending_recheck"]), ("partial", 1))
+            self.assertIsNone(await ledger.latest_known_revision("28", "101"))
+            self.assertEqual(await ledger.count_pending_recheck("28"), 0)
+            self.fake.fail_at = set()
+            self.assertEqual((await sync.sync_target(sync.TARGET_APP28))["status"], "ok")
+            self.assertEqual(await ledger.latest_known_revision("28", "101"), 1)
+            # App 30: 参照先の実在確認が失敗しても関連を外さない（pending のまま・moved 0）
+            self.fake.data["40"] = [app40(1, 1), app40(2, 1)]     # No.2 は台帳未同期
+            self.fake.data["30"] = [app30(5, 1, 案件レコードID="2")]
+            await sync.sync_target(sync.TARGET_APP30)
+            self.assertEqual(await ledger.current_case_of_source("30", "5"), ("40", "2"))
+            self.fake.fail_at = {len(self.fake.calls) + 2}         # 1=$id in・2=App 40 実在確認
+            rc = await sync.recheck_target(sync.TARGET_APP30)
+            self.assertEqual((rc["status"], rc["moved"], rc["pending_recheck"]), ("partial", 0, 1))
+            self.assertEqual(await ledger.current_case_of_source("30", "5"), ("40", "2"))
+            self.assertTrue([f for f in await ledger.list_case_facts("40", "2")
+                             if f["source_app_id"] == "30"])
+            self.assertEqual([(h["source_app_id"], h["source_record_id"], h["pending_recheck"])
+                              for h in await ledger.list_holds()], [("30", "5", True)])
+            self.assertEqual(await ledger.count_pending_recheck("30"), 1)
+            self.fake.fail_at = set()
+            rc = await sync.recheck_target(sync.TARGET_APP30)
+            self.assertEqual((rc["status"], rc["complete"], rc["pending_left"]), ("ok", True, 0))
+        run(body())
+
+
 class _App:
     def __init__(self, app_id):
         self._id = app_id

@@ -203,7 +203,8 @@ button.sub{background:#fff;color:#3a4a63;border-color:#9aa7bd}
     if (!d.records.length) { box.appendChild(el("span", "empty", "なし")); return; }
     for (const r of d.records) {
       const c = el("div", "card bad");
-      const label = r.state === "unavailable" ? "出典確認不能（利用停止中）"
+      const label = r.pending_recheck ? "判定不能（正本の確認待ち・関連は保持・次回再照合）"
+        : r.state === "unavailable" ? "出典確認不能（利用停止中）"
         : r.state === "detached" ? "関連喪失（利用停止・紐付け待ちにしない）"
         : "抽出結果の不一致（保留）";
       c.appendChild(el("div", "", "出典 App " + r.source_app_id + " No." + r.source_record_id +

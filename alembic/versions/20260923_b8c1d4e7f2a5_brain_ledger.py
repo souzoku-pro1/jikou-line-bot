@@ -6,6 +6,7 @@ v3.2 R8〜R10）。表定義は hub/brain_ledger.py の metadata と同一（テ
 制約名を突合）。fix1（未 merge・未適用のため本 revision を直接修正）:
 - source_ingest.latest_seen_revision（R8）・state に detached（R10/R5）・案件 index
 - case_event.is_current / invalid_reason / invalidated_at（R10）・出典 index
+- source_ingest.pending_recheck（fix2 R12: 判定不能＝次回の再照合対象）
 - sync_cursor: kind（sync/recheck・複合 PK）・scan_upper_bound / page_position（BA-09）・
   recheck_started_at / recheck_completed_at（BA-05）
 アプリ起動時には走らせない（D2: alembic CLI のみ）。
@@ -144,6 +145,7 @@ def upgrade() -> None:
         sa.Column("hold_reason", sa.Text, nullable=True),
         sa.Column("source_updated_at", sa.Text, nullable=True),
         sa.Column("latest_seen_revision", _BIG, nullable=True),
+        sa.Column("pending_recheck", sa.Boolean, nullable=False, server_default=sa.false()),
         sa.Column("last_checked_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("registered_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()),
         sa.CheckConstraint("locator <> ''",

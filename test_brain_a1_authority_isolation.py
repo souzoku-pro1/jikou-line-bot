@@ -23,7 +23,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 from brain_test_support import (BRAIN_ENV, LINE_A, BrainDbMixin, app28, app30, app40,
-                                run)
+                                run, subrow)
 
 for _k, _v in {
     "KINTONE_SUBDOMAIN": "testsub", "LINE_CHANNEL_SECRET": "dummy_secret",
@@ -212,7 +212,7 @@ class TestOperations(BrainDbMixin):
             run(sync.sync_target(sync.TARGET_APP30))
             r = post({**base, **seen, "operation_id": OP1})
             self.assertEqual(r.status_code, 409)
-            self.assertEqual(r.json(), {"error": "version_conflict",
+            self.assertEqual(r.json(), {"error": "version_conflict", "reason": "version_mismatch",
                                         "current": {"link_version": int(seen["seen_link_version"]),
                                                     "source_revision": 2}})
             self.assertIsNone(run(ledger.current_case_of_source("30", "61")))
@@ -298,6 +298,66 @@ class TestOperations(BrainDbMixin):
             d = facts()
             self.assertEqual((d["freshness"], d["freshness_reasons"]), ("synced", []))
             self.assertTrue(all(f["flag"] is None for f in d["facts"]))
+
+
+    def test_confirm_requires_live_head(self):
+        # BA-13: link_lost / row_removed / superseded の fact に古い画面の ID・版で確認/却下 →
+        # 409（理由付き）・確認行が増えない。撤回は従来どおり可
+        self.fake.data["40"] = [app40(1, 1)]
+        self.fake.data["30"] = [app30(5, 1)]
+        run(sync.sync_target(sync.TARGET_APP40))
+        run(sync.sync_target(sync.TARGET_APP30))
+
+        def facts():
+            return _client.get("/app/api/brain/facts?app=40&record=1", headers=_auth(),
+                               follow_redirects=False).json()["facts"]
+
+        def op(n):
+            return f"11111111-2222-4333-8444-{n:012d}"
+
+        def confirm(n, f, decision, version=None, **extra):
+            return _client.post("/app/brain/confirm", headers=_auth(), follow_redirects=False,
+                                data={"operation_id": op(n), "fact_id": str(f["fact_id"]),
+                                      "seen_version": str(version or f["version"]),
+                                      "decision": decision, **extra})
+        with patch.dict(os.environ, _ENV):
+            before = facts()
+            ship = [f for f in before if f["item_code"] == "app30.件名"][0]
+            cred = [f for f in before if f["subject_id"] == "creditor:12"
+                    and f["item_code"] == "app40.債権者一覧.債権者名"][0]
+            status = [f for f in before if f["item_code"] == "app40.status"][0]
+            # link_lost（参照が App 26 へ）・row_removed（債権者 12 消去）・superseded（status 受理）
+            self.fake.data["30"] = [app30(5, 2, "2026-09-21T01:00:00Z", 案件アプリID="26")]
+            run(sync.recheck_target(sync.TARGET_APP30))
+            self.fake.data["40"] = [app40(1, 2, "2026-09-20T02:00:00Z", status="受理",
+                                          債権者一覧=[subrow(11, 債権者名="甲社", 通知要否="要")])]
+            run(sync.sync_target(sync.TARGET_APP40))
+            n = 100
+            for f, reason in ((ship, "fact_not_current"), (cred, "fact_not_current"),
+                              (status, "version_mismatch")):
+                for decision in ("confirm", "reject"):
+                    n += 1
+                    r = confirm(n, f, decision)
+                    self.assertEqual(r.status_code, 409, (f["item_code"], decision))
+                    self.assertEqual((r.json()["error"], r.json()["reason"]),
+                                     ("version_conflict", reason), f["item_code"])
+                self.assertEqual(run(ledger.list_confirmations(f["fact_id"])), [])
+            # superseded の旧 fact に現在版（2）を添えても旧 ID には付かない
+            r = confirm(200, status, "confirm", version=2)
+            self.assertEqual((r.status_code, r.json()["reason"]), (409, "fact_not_current"))
+            self.assertEqual(run(ledger.list_confirmations(status["fact_id"])), [])
+            # 生きている現在 fact には付く → その後 superseded になっても撤回は可
+            live = [f for f in facts() if f["item_code"] == "app40.status"][0]
+            self.assertEqual(confirm(201, live, "confirm").status_code, 303)
+            cid = run(ledger.list_confirmations(live["fact_id"]))[0]["confirmation_id"]
+            self.fake.data["40"] = [app40(1, 3, "2026-09-20T03:00:00Z", status="完了",
+                                          債権者一覧=[subrow(11, 債権者名="甲社", 通知要否="要")])]
+            run(sync.sync_target(sync.TARGET_APP40))
+            self.assertEqual(confirm(202, live, "confirm", version=3).status_code, 409)
+            r = confirm(203, live, "revoke", version=3, revoked_of=str(cid))
+            self.assertEqual(r.status_code, 303)
+            self.assertEqual([c["decision"] for c in run(ledger.list_confirmations(live["fact_id"]))],
+                             ["confirm", "revoke"])
 
 
 def brain_sync_targets():

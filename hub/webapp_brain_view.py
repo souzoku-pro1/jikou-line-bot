@@ -169,8 +169,8 @@ async def brain_confirm(request: Request):
             reason=reason, operation_id=operation_id, actor=ACTOR,
             revoked_of=int(revoked_of) if revoked_of else None)
     except ledger.VersionConflict as exc:
-        return JSONResponse({"error": "version_conflict", "current": exc.current},
-                            status_code=409)
+        return JSONResponse({"error": "version_conflict", "reason": exc.reason,
+                             "current": exc.current}, status_code=409)
     except ledger.SourceUnavailable:
         return _source_unavailable(409)
     except ledger.LedgerError:
@@ -219,8 +219,8 @@ async def brain_relink(request: Request):
             operation_id=operation_id, actor=ACTOR,
             seen_link_version=int(seen_link), seen_source_revision=int(seen_rev))
     except ledger.VersionConflict as exc:
-        return JSONResponse({"error": "version_conflict", "current": exc.current},
-                            status_code=409)
+        return JSONResponse({"error": "version_conflict", "reason": exc.reason,
+                             "current": exc.current}, status_code=409)
     except ledger.LedgerError:
         return _bad_request()
     except Exception:

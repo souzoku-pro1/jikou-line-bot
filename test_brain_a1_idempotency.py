@@ -294,6 +294,20 @@ class TestIdempotency(BrainDbMixin):
             self.assertIn(needle, src)
         self.assertEqual(src.count("Revises: a7d3f1c9e2b4"), 1)                    # 単一線形チェーン
 
+    def test_fix2_columns_and_vocabulary_pinned(self):
+        self.assertIn("pending_recheck", ledger.source_ingest.c)                  # R12
+        self.assertFalse(ledger.source_ingest.c.pending_recheck.nullable)
+        src = (REPO / "alembic" / "versions" / "20260923_b8c1d4e7f2a5_brain_ledger.py"
+               ).read_text(encoding="utf-8")
+        self.assertIn('"pending_recheck", sa.Boolean, nullable=False', src)
+        self.assertEqual(ledger.FLAG_PENDING_RECHECK, "pending_recheck")
+        self.assertEqual(ledger.REASON_RELINK_PENDING, "relink_pending")            # BA-11
+        self.assertEqual((ledger.CONFLICT_VERSION, ledger.CONFLICT_NOT_CURRENT,        # BA-13
+                          ledger.CONFLICT_SOURCE_DETACHED),
+                         ("version_mismatch", "fact_not_current", "source_detached"))
+        self.assertEqual(ledger.STALE_STATE, "stale")                                # R11
+        self.assertIs(sync.PENDING_RECHECK, ledger.FLAG_PENDING_RECHECK)
+
 
 class TestMigrationRoundTrip(unittest.TestCase):
     """alembic b8c1d4e7f2a5 の revision 接続と表・制約の pin。up→down 往復の実行は

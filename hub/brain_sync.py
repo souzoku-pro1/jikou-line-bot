@@ -102,6 +102,8 @@ FAIL_KINTONE = "kintone_fetch_failed"
 FAIL_DB = "db_write_failed"
 FAIL_MISMATCH = "mismatch_hold"
 FAIL_PAGE_LIMIT = "page_limit_reached"
+# R12: _prepare_ingest の戻り値「判定不能」（処理不要 None と区別する番兵）
+PENDING_RECHECK = ledger.FLAG_PENDING_RECHECK
 
 
 def brain_sync_enabled() -> bool:
@@ -205,15 +207,24 @@ def convert_app40(record: dict) -> tuple:
     return src, (app_id, rid), facts, events
 
 
+def _app30_source(record: dict) -> ledger.SourceRef:
+    return ledger.SourceRef(APP_SHIPPING.app_id(), _s(record, "$id"), _revision(record),
+                            *CONVERTER[TARGET_APP30], updated_at=_s(record, "更新日時"))
+
+
 def convert_app30(record: dict, decision: brain_link.LinkDecision) -> tuple:
     """App 30 レコード → (SourceRef, case_key|None, facts, events)。
     subject は shipping:{レコード番号}（R9: 同じ発送の同じ項目だけを競合判定する）。"""
-    rid = _s(record, "$id")
-    app_id = APP_SHIPPING.app_id()
-    src = ledger.SourceRef(app_id, rid, _revision(record), *CONVERTER[TARGET_APP30],
-                           updated_at=_s(record, "更新日時"))
+    src = _app30_source(record)
     if not decision.auto:
         return src, None, [], []
+    facts, events = _app30_facts_events(record)
+    return src, decision.case_key, facts, events
+
+
+def _app30_facts_events(record: dict) -> tuple:
+    """案件に依らない App 30 の fact/event（stale 保存でも同じ形・R11）。"""
+    rid = _s(record, "$id")
     subject = ledger.SUBJECT_SHIPPING_PREFIX + rid
     facts = []
     for field, vtype in ledger.app30_fields().items():
@@ -232,7 +243,7 @@ def convert_app30(record: dict, decision: brain_link.LinkDecision) -> tuple:
         # §4-3: 現在状態から過去の発送日時は復元できない＝「同期時点で発送済を確認」
         events.append(ledger.EventIn(EVENT_SHIPPED_AT_SYNC, "shipping:confirmed_at_sync",
                                      ledger.make_locator("発送日時"), occurred_at=None))
-    return src, decision.case_key, facts, events
+    return facts, events
 
 
 def houki_chat_category(category: str) -> bool:
@@ -325,14 +336,17 @@ async def _app40_exists(record_id: str) -> bool | None:
     return await app40_exists_in_source(record_id)
 
 
-async def _decide_app30(record: dict) -> brain_link.LinkDecision:
+async def _decide_app30(record: dict) -> tuple:
+    """戻り値 (decision, ok)。ok=False は参照先の実在確認が失敗（判定不能・R12）。"""
     houki = APP_HOUKI.app_id()
     ref_rec = brain_link._v(record, brain_link.FIELD_CASE_RECORD)
     exists = None
+    ok = True
     if (brain_link._v(record, brain_link.FIELD_CASE_APP) == houki
             and _DIGITS_RE.fullmatch(ref_rec)):
         exists = await _app40_exists(ref_rec)
-    return brain_link.decide_app30_reference(record, houki, exists)
+        ok = exists is not None
+    return brain_link.decide_app30_reference(record, houki, exists), ok
 
 
 async def _decide_app28(record: dict) -> tuple:
@@ -355,16 +369,40 @@ async def _decide_app28(record: dict) -> tuple:
     return decision, brain_link.REASON_AUTO, True
 
 
-async def _prepare_ingest(target: str, record: dict) -> tuple | None:
-    """レコード → 取込タプル (src, case_key, facts, events, extras)（None = 対象外・
-    スキップ）。関連の移動／喪失（R10）は extras["link_change"] として同一
-    トランザクションで適用される。紐付け履歴（変化なし）はここで積む。"""
+async def _stale_input(target: str, record: dict) -> tuple | None:
+    """R11: 系列で見た最大 revision より小さい入力は履歴保存のみ（判定も履歴も変えない）。
+    戻り値: None（stale でない）／()（stale だが既知＝何もしない）／取込タプル。"""
+    app_id = _app_of(target).app_id()
+    rid, rev = _s(record, "$id"), _revision(record)
+    known = await ledger.latest_known_revision(app_id, rid)
+    if known is None or rev >= known:
+        return None
+    src = ledger.SourceRef(app_id, rid, rev, *CONVERTER[target],
+                           updated_at=_s(record, "更新日時"))
+    if await ledger.known_revision(src):
+        return ()
+    facts = _app30_facts_events(record)[0] if target == TARGET_APP30 else []
+    return src, None, facts, [], {"stale": True}
+
+
+async def _prepare_ingest(target: str, record: dict):
+    """レコード → 取込タプル (src, case_key, facts, events, extras)。None = 対象外・
+    処理不要。PENDING_RECHECK = 判定不能（正本の検索/実在確認の失敗・R12。関連は
+    保持し pending_recheck として記録・次回の再照合対象）。関連の移動／喪失（R10）は
+    extras["link_change"] として同一トランザクションで適用される。遅着の旧 revision は
+    履歴保存のみ（R11）。紐付け履歴（変化なし）はここで積む。"""
     extras: dict = {}
+    if target != TARGET_APP40:
+        stale = await _stale_input(target, record)
+        if stale is not None:
+            return stale or None
     if target == TARGET_APP40:
         src, case_key, facts, events = convert_app40(record)
         extras["subjects_seen"] = app40_subjects_seen(record)
     elif target == TARGET_APP30:
-        decision = await _decide_app30(record)
+        decision, ok = await _decide_app30(record)
+        if not ok:
+            return PENDING_RECHECK
         rid, rev = _s(record, "$id"), _revision(record)
         last = await ledger.latest_link(APP_SHIPPING.app_id(), rid)
         if (last is not None and last.get("actor") != "system" and last.get("new_case")
@@ -385,7 +423,7 @@ async def _prepare_ingest(target: str, record: dict) -> tuple | None:
         rid = _s(record, "$id")
         decision, reason, ok = await _decide_app28(record)
         if not ok:
-            return None                      # 判定不能＝採用しない・既存の関連も変えない
+            return PENDING_RECHECK           # 判定不能＝採用しない・既存の関連も変えない
         prev = await ledger.current_case_of_source(APP_CHATLOG.app_id(), rid)
         if decision is None:
             change = brain_link.link_change_for(None, prev, lost_reason=reason,
@@ -404,6 +442,9 @@ async def _prepare_ingest(target: str, record: dict) -> tuple | None:
         status = await ledger.ingest_status(src, case_key)
         if status["known"] and status["same_case"] and (
                 case_key is None or status["has_current_facts"]):
+            if target != TARGET_APP40:
+                # 判定が成功した＝pending_recheck を解除（処理不要と判定不能を区別・R12）
+                await ledger.set_pending_recheck(src.app_id, src.record_id, False)
             return None                      # revision 既知＝再処理しない
     return src, case_key, facts, events, extras
 
@@ -452,6 +493,11 @@ def _log_run_failed(target: str, failure: str) -> None:
         logger.warning("[BRAIN_SYNC] run failed (page_limit_reached)")
 
 
+def _log_pending(count: int) -> None:
+    logger.warning("[BRAIN_SYNC] run partial (pending_recheck) count=%s",
+                   emit(count, "count", "log", "operator"))
+
+
 def _resume_position(cur: dict | None) -> tuple | None:
     """未完了走査（ページ上限で止まった run）の再開位置と上限（BA-09）。"""
     if not cur or cur.get("state") != "incomplete":
@@ -485,7 +531,8 @@ async def sync_target(target: str, *, now=None) -> dict:
     inserted = 0
     result = {"target": target, "run_id": run_id, "status": "ok", "pages": 0,
               "records": 0, "inserted": 0, "held": 0, "resumed": resume is not None,
-              "scan_upper_bound": scan_upper}
+              "scan_upper_bound": scan_upper, "pending_recheck": 0}
+    pending = 0
     while pages < MAX_PAGES_PER_RUN:
         query = _page_query(base, cursor, start, scan_upper)
         try:
@@ -503,6 +550,12 @@ async def sync_target(target: str, *, now=None) -> dict:
             last = (ts, rid)
             try:
                 prepared = await _prepare_ingest(target, record)
+                if prepared is PENDING_RECHECK:
+                    # R12: 判定不能。関連は保持し pending_recheck を記録（行が無ければ
+                    # 窓の再取得・定期照合で再試行）
+                    await ledger.set_pending_recheck(app.app_id(), rid, True, now=now)
+                    pending += 1
+                    continue
             except Exception:
                 await _fail(target, run_id, FAIL_DB, cursor, pages, records_seen, now)
                 result.update(status="failed", failure=FAIL_DB)
@@ -542,8 +595,11 @@ async def sync_target(target: str, *, now=None) -> dict:
                                   last_ok_at=now, last_run_id=run_id)
     await ledger.finish_run(run_id, "ok", pages_done=pages, records_seen=records_seen,
                             confirmed_range={"until": scan_upper}, now=now)
-    result.update(pages=pages, records=records_seen, inserted=inserted)
+    result.update(pages=pages, records=records_seen, inserted=inserted,
+                  pending_recheck=pending, status="partial" if pending else "ok")
     _log_run_ok(target, pages, records_seen, inserted)
+    if pending:
+        _log_pending(pending)
     return result
 
 
@@ -622,6 +678,9 @@ async def _ingest_single(target: str, record_id: str) -> bool:
         await ledger.mark_source_unavailable(app.app_id(), record_id)
         return False
     prepared = await _prepare_ingest(target, found[0])
+    if prepared is PENDING_RECHECK:
+        await ledger.set_pending_recheck(app.app_id(), record_id, True)
+        return False
     if prepared is None:
         return False
     src, case_key, facts, events, extras = prepared
@@ -637,19 +696,26 @@ def _recheck_in_progress(rc: dict | None) -> bool:
 
 
 async def _recheck_one(target: str, app, rid: str, record: dict | None, now) -> dict:
-    out = {"unavailable": 0, "moved": 0}
+    out = {"unavailable": 0, "moved": 0, "pending": 0}
     if record is None:
         await ledger.mark_source_unavailable(app.app_id(), rid, now=now)
         out["unavailable"] = 1
         return out
-    await ledger.mark_source_checked(app.app_id(), rid, now=now)
     prev = await ledger.current_case_of_source(app.app_id(), rid)
     prepared = await _prepare_ingest(target, record)
+    if prepared is PENDING_RECHECK:
+        # R12: 判定不能。既存の状態（unavailable 等）は復旧させない
+        await ledger.set_pending_recheck(app.app_id(), rid, True, now=now)
+        out["pending"] = 1
+        return out
+    await ledger.mark_source_checked(app.app_id(), rid, now=now)     # 判定の後に復旧
     if prepared is None:
         return out
     src, case_key, facts, events, extras = prepared
     summary = await ledger.ingest_source(src, case_key, facts, events, extras=extras,
                                          now=now)
+    if summary.get("stale"):
+        return out                           # R11: 履歴保存のみ・関連は変えていない
     if prev is not None and (case_key is None or tuple(prev) != tuple(case_key)):
         out["moved"] = 1                     # 移動または関連喪失（R10 の共通処理を通過）
     elif summary.get("moved"):
@@ -671,52 +737,71 @@ async def recheck_target(target: str, *, now=None, batch: int = RECHECK_BATCH) -
     else:
         after = "0"
         started_at = now
-    sources = await ledger.list_sources(app.app_id(), after=after, limit=batch)
-    unavailable = 0
-    moved = 0
-    checked = 0
+    # R12: 判定不能（pending_recheck）の出典は毎回先に再照合し、その後に位置順の batch
+    pending_first = await ledger.list_sources(app.app_id(), pending_only=True, limit=batch)
+    positional = await ledger.list_sources(app.app_id(), after=after, limit=batch)
+    pending_ids = {s["record_id"] for s in pending_first}
+    counts = {"unavailable": 0, "moved": 0, "checked": 0, "pending": 0}
     position = after
-    for i in range(0, len(sources), _IN_CHUNK):
-        chunk = sources[i:i + _IN_CHUNK]
-        ids = [s["record_id"] for s in chunk if _DIGITS_RE.fullmatch(s["record_id"])]
-        if not ids:
-            position = chunk[-1]["record_id"]
-            continue
-        try:
-            found = await kintone.search_records(
-                app, "$id in (" + ",".join(f'"{x}"' for x in ids) + f") limit {len(ids)}")
-        except Exception:
-            await ledger.set_cursor_state(
-                target, "error", kind=ledger.CURSOR_KIND_RECHECK, now=now,
-                cursor_record_id=position, recheck_started_at=started_at)
-            logger.warning("[BRAIN_SYNC] recheck failed (kintone_fetch_failed)")
-            return {"status": "failed", "unavailable": unavailable, "moved": moved,
-                    "checked": checked, "complete": False, "position": position}
-        present = {_s(r, "$id"): r for r in found}
-        for rid in ids:
-            one = await _recheck_one(target, app, rid, present.get(rid), now)
-            unavailable += one["unavailable"]
-            moved += one["moved"]
-            checked += 1
-        position = chunk[-1]["record_id"]
+
+    async def _persist(state: str) -> None:
         await ledger.set_cursor_state(
-            target, "incomplete", kind=ledger.CURSOR_KIND_RECHECK, now=now,
+            target, state, kind=ledger.CURSOR_KIND_RECHECK, now=now,
             cursor_record_id=position, recheck_started_at=started_at)
-    complete = len(sources) < batch
+
+    async def _run_chunks(sources: list, advance: bool) -> bool:
+        nonlocal position
+        for i in range(0, len(sources), _IN_CHUNK):
+            chunk = sources[i:i + _IN_CHUNK]
+            ids = [s["record_id"] for s in chunk if _DIGITS_RE.fullmatch(s["record_id"])]
+            if ids:
+                try:
+                    found = await kintone.search_records(
+                        app, "$id in (" + ",".join(f'"{x}"' for x in ids)
+                        + f") limit {len(ids)}")
+                except Exception:
+                    await _persist("error")
+                    logger.warning("[BRAIN_SYNC] recheck failed (kintone_fetch_failed)")
+                    return False
+                present = {_s(r, "$id"): r for r in found}
+                for rid in ids:
+                    one = await _recheck_one(target, app, rid, present.get(rid), now)
+                    for k in ("unavailable", "moved", "pending"):
+                        counts[k] += one[k]
+                    counts["checked"] += 1
+            if advance:
+                position = chunk[-1]["record_id"]
+                await _persist("incomplete")
+        return True
+
+    ok = await _run_chunks(pending_first, advance=False)
+    if ok:
+        ok = await _run_chunks([s for s in positional if s["record_id"] not in pending_ids],
+                               advance=True)
+    if not ok:
+        return {"status": "failed", "complete": False, "position": position, **counts,
+                "pending_recheck": counts["pending"]}
+    pending_left = await ledger.count_pending_recheck(app.app_id())
+    complete = len(positional) < batch and pending_left == 0
     if complete:
         await ledger.set_cursor_state(
             target, "synced", kind=ledger.CURSOR_KIND_RECHECK, now=now,
             cursor_record_id="", recheck_started_at=started_at,
             recheck_completed_at=now)
         logger.info("[BRAIN_SYNC] recheck pass complete checked=%s",
-                    emit(checked, "count", "log", "operator"))
+                    emit(counts["checked"], "count", "log", "operator"))
+    else:
+        await _persist("incomplete")          # pending が残る間は一巡完了にしない
     await ledger.set_cursor_state(target, (await ledger.get_cursor(target) or {}).get(
         "state", "incomplete"), now=now, last_recheck_at=now)
     logger.info("[BRAIN_SYNC] recheck ok unavailable=%s moved=%s",
-                emit(unavailable, "count", "log", "operator"),
-                emit(moved, "count", "log", "operator"))
-    return {"status": "ok", "unavailable": unavailable, "moved": moved,
-            "checked": checked, "complete": complete, "position": position}
+                emit(counts["unavailable"], "count", "log", "operator"),
+                emit(counts["moved"], "count", "log", "operator"))
+    if counts["pending"]:
+        _log_pending(counts["pending"])
+    return {"status": "partial" if counts["pending"] else "ok", "complete": complete,
+            "position": position, **counts, "pending_recheck": counts["pending"],
+            "pending_left": pending_left}
 
 
 # ── ジョブ ────────────────────────────────────────────────────────────────────
