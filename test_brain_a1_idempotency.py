@@ -234,6 +234,66 @@ class TestIdempotency(BrainDbMixin):
             self.assertEqual(len(await ledger.list_case_events("40", "1")), 1)
         run(body())
 
+    # ── fix1: BA-01 / R8（系列の latest_seen_revision） ──
+
+    def test_latest_seen_revision_blocks_late_older_revision(self):
+        # rev1=受任 → rev3=受任（同値: fact を増やさず latest_seen だけ進む）→ 遅着 rev2=受理
+        async def body():
+            await ledger.ingest_source(_src(rev=1), ("40", "1"), [_fact(value="受任")])
+            s3 = await ledger.ingest_source(_src(rev=3), ("40", "1"), [_fact(value="受任")])
+            self.assertEqual(s3["inserted"], 0)
+            self.assertEqual(await ledger.latest_known_revision("40", "1"), 3)
+            async with session_scope() as session:
+                rows = (await session.execute(sa.select(
+                    ledger.source_ingest.c.source_revision,
+                    ledger.source_ingest.c.latest_seen_revision).where(
+                    ledger.source_ingest.c.source_record_id == "1"))).fetchall()
+            self.assertEqual(sorted((int(a), int(b)) for a, b in rows), [(1, 3), (3, 3)])
+            s2 = await ledger.ingest_source(_src(rev=2), ("40", "1"), [_fact(value="受理")])
+            self.assertEqual(s2["inserted"], 1)                          # 保存はする
+            cur = [(f["value_text"], f["version"]) for f in await ledger.list_case_facts("40", "1")
+                   if f["item_code"] == "app40.status"]
+            self.assertEqual(cur, [("受任", 1)])                          # 現在値は受任のまま
+            late = [f for f in await ledger.list_case_facts("40", "1", current_only=False)
+                    if f["version"] == 2][0]
+            self.assertEqual((late["is_current"], late["invalid_reason"]), (False, "stale_revision"))
+            self.assertEqual(await ledger.latest_known_revision("40", "1"), 3)
+            # 同期経路でも同じ（App 40 が rev1 → rev3 → rev2 の順に見えた）
+            self.fake.data["40"] = [app40(7, 1)]
+            await sync.sync_target(sync.TARGET_APP40)
+            self.fake.data["40"] = [app40(7, 3, "2026-09-20T03:00:00Z")]
+            await sync.sync_target(sync.TARGET_APP40)
+            self.fake.data["40"] = [app40(7, 2, "2026-09-20T04:00:00Z", status="受理")]
+            self.assertEqual((await sync.sync_target(sync.TARGET_APP40))["status"], "ok")
+            st = [(f["value_text"], f["version"]) for f in await ledger.list_case_facts("40", "7")
+                  if f["item_code"] == "app40.status"]
+            self.assertEqual(st, [("受任", 1)])
+            self.assertEqual(await ledger.latest_known_revision("40", "7"), 3)
+        run(body())
+
+    def test_fix1_columns_and_constraints_pinned(self):
+        self.assertIn("latest_seen_revision", ledger.source_ingest.c)            # R8
+        self.assertEqual(ledger.INGEST_STATES,
+                         ("ingested", "mismatch_hold", "unavailable", "held", "detached"))
+        for c in ("is_current", "invalid_reason", "invalidated_at"):               # R10
+            self.assertIn(c, ledger.case_event.c)
+        self.assertEqual([c.name for c in ledger.sync_cursor.primary_key.columns],
+                         ["target_app", "kind"])                                  # BA-05
+        for c in ("scan_upper_bound", "page_position",                            # BA-09
+                  "recheck_started_at", "recheck_completed_at"):                  # BA-05
+            self.assertIn(c, ledger.sync_cursor.c)
+        self.assertEqual(ledger.CURSOR_KINDS, ("sync", "recheck"))
+        self.assertEqual(ledger.RETIRED_REASONS, ("link_moved", "link_lost", "row_removed"))
+        self.assertEqual(ledger.DETACH_REASONS, ("category_out_of_set", "line_id_not_unique"))
+        self.assertEqual(ledger.SUBJECT_SHIPPING_PREFIX, "shipping:")               # R9
+        src = (REPO / "alembic" / "versions" / "20260923_b8c1d4e7f2a5_brain_ledger.py"
+               ).read_text(encoding="utf-8")
+        for needle in ("latest_seen_revision", "'detached'", '"kind"', "ck_sync_cursor_kind",
+                       "scan_upper_bound", "page_position", "recheck_completed_at",
+                       "ix_case_event_source", "ix_source_ingest_case"):
+            self.assertIn(needle, src)
+        self.assertEqual(src.count("Revises: a7d3f1c9e2b4"), 1)                    # 単一線形チェーン
+
 
 class TestMigrationRoundTrip(unittest.TestCase):
     """alembic b8c1d4e7f2a5 の revision 接続と表・制約の pin。up→down 往復の実行は

@@ -60,8 +60,13 @@ class TestCaseIsolation(BrainDbMixin):
                               if f["source_app_id"] == "28"], [])
             self.assertEqual([f for f in await ledger.list_case_facts("40", "2")
                               if f["source_app_id"] == "28"], [])
+            for case in (("40", "1"), ("40", "2")):
+                self.assertEqual(await ledger.list_case_events(*case, current_only=False), [
+                    e for e in await ledger.list_case_events(*case, current_only=False)
+                    if e["source_app_id"] != "28"])
             self.assertEqual(await ledger.latest_known_revision("28", "100"), None)
             self.assertEqual(await ledger.list_pending_links(), [])   # 保留にもしない
+            self.assertEqual(await ledger.list_holds(), [])           # detached にもしない
         run(body())
 
     def test_chat_links_by_line_id_only_and_ignores_numbers_in_body(self):
@@ -78,14 +83,21 @@ class TestCaseIsolation(BrainDbMixin):
         async def body():
             await sync.sync_target(sync.TARGET_APP40)
             await sync.sync_target(sync.TARGET_APP28)
-            c1 = {f["source_record_id"] for f in await ledger.list_case_facts("40", "1")
-                  if f["source_app_id"] == "28"}
-            c2 = {f["source_record_id"] for f in await ledger.list_case_facts("40", "2")
-                  if f["source_app_id"] == "28"}
+            # R9: App 28 の行は fact ではなく case_event（種別=会話）
+            c1 = {e["source_record_id"] for e in await ledger.list_case_events("40", "1")
+                  if e["source_app_id"] == "28"}
+            c2 = {e["source_record_id"] for e in await ledger.list_case_events("40", "2")
+                  if e["source_app_id"] == "28"}
             self.assertEqual(c1, {"100", "104"})
             self.assertEqual(c2, {"101"})
+            for case in (("40", "1"), ("40", "2")):
+                self.assertEqual([f for f in await ledger.list_case_facts(*case)
+                                  if f["source_app_id"] == "28"], [])
             for rid in ("102", "103", "105"):
                 self.assertIsNone(await ledger.latest_known_revision("28", rid))
+            # 一意判定は正本（App 40 を LINEユーザーID で limit 2 検索）で行う（BA-04）
+            q = [q for a, q in self.fake.calls if a == "40" and "LINEユーザーID" in q]
+            self.assertTrue(q and all(q_.endswith("limit 2") for q_ in q))
         run(body())
 
     def test_contradictory_and_missing_references_are_held(self):
@@ -145,6 +157,95 @@ class TestCaseIsolation(BrainDbMixin):
             self.assertEqual(len(await ledger.list_case_facts("40", "3")), 1)
             self.assertEqual(await ledger.list_case_facts("26", "3"), [])
             self.assertEqual(await ledger.list_case_facts("40", "30"), [])
+        run(body())
+
+    # ── fix1: BA-04（R5 の一意判定は正本・fail-closed）/ R10（App 28 の関連喪失） ──
+
+    def test_line_id_uniqueness_is_decided_by_source_of_truth(self):
+        # BA-04: 台帳には App 40 No.1 だけ・正本には同じ LINE ID の No.2 もある・
+        # App 40 の同期は失敗中（台帳が正本に追いつけない）→ App 28 の採用は 0
+        self.fake.data["40"] = [app40(1, 1)]
+        self.fake.data["28"] = [app28(100, 1)]
+
+        async def chats(case):
+            return [e for e in await ledger.list_case_events(*case) if e["source_app_id"] == "28"]
+
+        async def body():
+            await sync.sync_target(sync.TARGET_APP40)
+            self.fake.data["40"].append(app40(2, 1, "2026-09-20T02:00:00Z"))
+            self.fake.fail_at = {len(self.fake.calls) + 1}
+            self.assertEqual((await sync.sync_target(sync.TARGET_APP40))["status"], "failed")
+            # 台帳だけを見れば 1 件（＝台帳基準なら誤って採用してしまう状態）
+            self.assertEqual(await ledger.find_case_by_item_value(sync.APP40_LINE_ID_ITEM, LINE_A),
+                             [("40", "1")])
+            r = await sync.sync_target(sync.TARGET_APP28)
+            self.assertEqual(r["status"], "ok")
+            self.assertEqual(await chats(("40", "1")), [])
+            self.assertEqual(await chats(("40", "2")), [])
+            self.assertIsNone(await ledger.latest_known_revision("28", "100"))
+            self.assertEqual(await ledger.list_pending_links(), [])
+            self.assertEqual(await ledger.list_holds(), [])
+            q = [q for a, q in self.fake.calls if a == "40" and "LINEユーザーID" in q][-1]
+            self.assertEqual(q, f'LINEユーザーID = "{LINE_A}" limit 2')
+            # 検索失敗も採用しない（fail-closed・run 自体は失敗にしない）
+            self.fake.data["40"] = [app40(1, 1)]
+            self.fake.fail_at = {len(self.fake.calls) + 2}       # 1 回目=App 28 ページ・2 回目=LINE 検索
+            r = await sync.sync_target(sync.TARGET_APP28)
+            self.assertEqual(r["status"], "ok")
+            self.assertIsNone(await ledger.latest_known_revision("28", "100"))
+            # 正本でちょうど 1 件なら採用（fact ではなく会話の出来事・R9）
+            self.fake.fail_at = set()
+            await sync.sync_target(sync.TARGET_APP28)
+            self.assertEqual([e["source_record_id"] for e in await chats(("40", "1"))], ["100"])
+        run(body())
+
+    def test_lost_uniqueness_or_category_detaches_ingested_chat(self):
+        # BA-04/R10: 取込済み App 28 行が再照合で一意不成立／閉集合外になったら利用停止
+        # （return None で放置しない・保留にもしない＝detached）
+        self.fake.data["40"] = [app40(1, 1)]
+        self.fake.data["28"] = [app28(100, 1), app28(101, 1)]
+
+        async def chats(current_only=True):
+            return [e for e in await ledger.list_case_events("40", "1", current_only=current_only)
+                    if e["source_app_id"] == "28"]
+
+        async def body():
+            await sync.sync_target(sync.TARGET_APP40)
+            await sync.sync_target(sync.TARGET_APP28)
+            self.assertEqual(len(await chats()), 2)
+            n_events = len(await chats(current_only=False))
+            # 正本に同じ LINE ID の 2 件目（台帳は未同期）→ 再照合で一意不成立
+            self.fake.data["40"].append(app40(2, 1, "2026-09-20T02:00:00Z"))
+            rc = await sync.recheck_target(sync.TARGET_APP28)
+            self.assertEqual((rc["status"], rc["moved"]), ("ok", 2))
+            self.assertEqual(await chats(), [])
+            self.assertEqual({e["invalid_reason"] for e in await chats(current_only=False)},
+                             {"link_lost"})
+            self.assertEqual(len(await chats(current_only=False)), n_events)     # 削除なし
+            last = await ledger.latest_link("28", "100")
+            self.assertEqual((last["trust_level"], last["reason"], last["prev_case"], last["new_case"]),
+                             ("hold", "line_id_not_unique", ("40", "1"), None))
+            self.assertEqual(await ledger.list_pending_links(), [])          # R5: 保留にしない
+            self.assertEqual({(h["source_record_id"], h["state"], h["hold_reason"])
+                              for h in await ledger.list_holds()},
+                             {("100", "detached", "line_id_not_unique"),
+                              ("101", "detached", "line_id_not_unique")})
+            self.assertIsNone(await ledger.current_case_of_source("28", "100"))
+            # 一意に戻れば同じ出来事が同じ案件へ復帰（行は増えない）
+            self.fake.data["40"] = [app40(1, 1)]
+            await sync.recheck_target(sync.TARGET_APP28)
+            self.assertEqual(len(await chats()), 2)
+            self.assertEqual(len(await chats(current_only=False)), n_events)
+            self.assertEqual(await ledger.list_holds(), [])
+            # category が閉集合外に編集された新 revision → 通常同期の経路でも利用停止
+            self.fake.data["28"][0] = app28(100, 2, "2026-09-21T01:00:00Z", category="その他判断系")
+            self.assertEqual((await sync.sync_target(sync.TARGET_APP28))["status"], "ok")
+            self.assertEqual({e["source_record_id"] for e in await chats()}, {"101"})
+            self.assertEqual((await ledger.latest_link("28", "100"))["reason"], "category_out_of_set")
+            # 検索失敗の再照合は既存の関連を変えない
+            self.fake.raise_all = True
+            self.assertEqual((await sync.recheck_target(sync.TARGET_APP28))["status"], "failed")
+            self.assertEqual({e["source_record_id"] for e in await chats()}, {"101"})
         run(body())
 
 

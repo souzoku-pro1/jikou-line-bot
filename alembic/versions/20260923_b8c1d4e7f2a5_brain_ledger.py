@@ -1,8 +1,13 @@
 """BRAIN-A1-LEDGER-1: 案件脳の台帳（case_fact / case_confirmation / case_event /
 case_derivation / case_usage / source_ingest / link_history / sync_run / sync_cursor）
 
-正本: 案件脳_設計_v3.md §4-1〜4-6（＋司令塔裁定 v3.1 R6: 現 head a7d3f1c9e2b4 に接続）。
-表定義は hub/brain_ledger.py の metadata と同一（テストで列集合・制約名を突合）。
+正本: 案件脳_設計_v3.md §4-1〜4-6（＋司令塔裁定 v3.1 R6: 現 head a7d3f1c9e2b4 に接続・
+v3.2 R8〜R10）。表定義は hub/brain_ledger.py の metadata と同一（テストで列集合・
+制約名を突合）。fix1（未 merge・未適用のため本 revision を直接修正）:
+- source_ingest.latest_seen_revision（R8）・state に detached（R10/R5）・案件 index
+- case_event.is_current / invalid_reason / invalidated_at（R10）・出典 index
+- sync_cursor: kind（sync/recheck・複合 PK）・scan_upper_bound / page_position（BA-09）・
+  recheck_started_at / recheck_completed_at（BA-05）
 アプリ起動時には走らせない（D2: alembic CLI のみ）。
 
 Revision ID: b8c1d4e7f2a5
@@ -95,8 +100,12 @@ def upgrade() -> None:
         sa.Column("locator", sa.Text, nullable=False, server_default='-'),
         sa.Column("summary", sa.Text, nullable=False),
         sa.Column("registered_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()),
+        sa.Column("is_current", sa.Boolean, nullable=False, server_default=sa.true()),
+        sa.Column("invalid_reason", sa.Text, nullable=True),
+        sa.Column("invalidated_at", sa.DateTime(timezone=True), nullable=True),
     )
     op.create_index("ix_case_event_case", "case_event", ["case_app_id", "case_record_id"])
+    op.create_index("ix_case_event_source", "case_event", ["source_app_id", "source_record_id"])
     op.create_table(
         "case_derivation",
         sa.Column("derivation_id", _BIG, primary_key=True, autoincrement=True),
@@ -134,16 +143,18 @@ def upgrade() -> None:
         sa.Column("case_record_id", sa.Text, nullable=True),
         sa.Column("hold_reason", sa.Text, nullable=True),
         sa.Column("source_updated_at", sa.Text, nullable=True),
+        sa.Column("latest_seen_revision", _BIG, nullable=True),
         sa.Column("last_checked_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("registered_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()),
         sa.CheckConstraint("locator <> ''",
                            name="ck_source_ingest_locator_nonempty"),
         sa.UniqueConstraint("source_app_id", "source_record_id", "source_revision", "locator", "converter_name", "converter_version",
                             name="uq_source_ingest_key"),
-        sa.CheckConstraint("state IN ('ingested', 'mismatch_hold', 'unavailable', 'held')",
+        sa.CheckConstraint("state IN ('ingested', 'mismatch_hold', 'unavailable', 'held', 'detached')",
                            name="ck_source_ingest_state"),
     )
     op.create_index("ix_source_ingest_source", "source_ingest", ["source_app_id", "source_record_id"])
+    op.create_index("ix_source_ingest_case", "source_ingest", ["case_app_id", "case_record_id"])
     op.create_table(
         "link_history",
         sa.Column("link_id", _BIG, primary_key=True, autoincrement=True),
@@ -184,17 +195,24 @@ def upgrade() -> None:
     op.create_table(
         "sync_cursor",
         sa.Column("target_app", sa.Text, primary_key=True),
+        sa.Column("kind", sa.Text, primary_key=True, server_default='sync'),
         sa.Column("cursor_updated_at", sa.Text, nullable=True),
         sa.Column("cursor_record_id", sa.Text, nullable=True),
         sa.Column("confirmed_until", sa.Text, nullable=True),
+        sa.Column("scan_upper_bound", sa.Text, nullable=True),
+        sa.Column("page_position", _JSON, nullable=True),
         sa.Column("last_run_id", _BIG, nullable=True),
         sa.Column("last_ok_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("last_reconcile_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("last_recheck_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("recheck_started_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("recheck_completed_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("state", sa.Text, nullable=False),
         sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
         sa.CheckConstraint("state IN ('synced', 'incomplete', 'error', 'stopped')",
                            name="ck_sync_cursor_state"),
+        sa.CheckConstraint("kind IN ('sync', 'recheck')",
+                           name="ck_sync_cursor_kind"),
     )
 
 

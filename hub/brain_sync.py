@@ -3,27 +3,34 @@
 対象:
 - App 40 全レコード（案件そのもの・converter app40_record/1）
 - App 30 のうち 案件アプリID = APP_HOUKI の値 の行（判定は brain_link: 案件レコードID
-  が数字で App 40 に実在し ユニット種別=相続放棄 のみ auto。他は保留＝紐付け待ち）
-- App 28 のうち R5 の行（category が相続放棄の閉集合、line_user_id が App 40 の
-  LINEユーザーID に完全一致・ちょうど 1 件）。それ以外は取り込まない
+  が数字で App 40 に実在し ユニット種別=相続放棄 のみ auto。他は保留＝紐付け待ち）。
+  fact の subject は shipping:{App 30 レコード番号}（R9・発送ごとに別 subject）
+- App 28 のうち R5 の行（category が相続放棄の閉集合、line_user_id が**正本** App 40
+  の LINEユーザーID にちょうど 1 件一致・BA-04）。case_event（種別=会話）として
+  登録し fact にはしない（R9）。それ以外は取り込まない
 
-カーソル（§5）: 更新日時 + レコード番号で並べ（page_order 固定）、次回は
-「前回の走査上限時点 − 重複窓（10 分）」から取り直す。ページ単位で
-台帳書込とカーソル前進を同一トランザクションで行い（brain_ledger.
-advance_cursor_with_page）、失敗したページを飛び越えてカーソルを進めない。
-走査が最後まで終わったときだけ confirmed_until（確認済み範囲）を走査上限時点へ。
+カーソル（§5・BA-09）: 更新日時 + レコード番号で並べ（page_order 固定）、走査上限
+（scan_upper_bound）を取得条件 更新日時 <= 上限 に含める。ページ単位で台帳書込と
+カーソル前進（page_position）を同一トランザクションで行い、失敗したページを飛び越えて
+進めない。ページ上限で未完了になった走査は次回 page_position から同じ上限で再開し、
+完了したときだけ confirmed_until（確認済み範囲）を上限へ進め、次回は
+「前回位置 − 重複窓（10 分）」から新しい上限で取り直す。kintone/DB 障害で終わった
+走査は再開位置を捨てて窓から取り直す（取りこぼしより重複を選ぶ）。
 
-冪等: 取込の冪等キー既知（同じ案件・現在 fact あり）なら再処理しない。
+冪等: 取込の冪等キー既知（同じ案件・現在 fact/event あり）なら再処理しない。
 欄の消去は新 fact（空値）+ supersedes。取得失敗は「値なし」に変換しない。
-追跡再照合（1 日 1 回・上限件数）: source_ingest の出典を再取得し、
-(a) 案件参照の変化 → link_history + 旧案件ビューから除外（brain_ledger 側）
-(b) 取得不能 → 出典確認不能（unavailable）として利用停止（削除と推定しない）
-定期照合（1 日 1 回）: revision 一覧を取り直して差分を検出し取り込む。
+サブテーブル行の消去（BA-03）は完全取得した新版でのみ判定（brain_ledger 側）。
+関連喪失（R10）: 参照消去・別アプリへの移動・不正参照・R5 不成立は
+brain_link.link_change_for → brain_ledger の共通処理へ（通常同期・再照合とも）。
+追跡再照合（BA-05）: source_ingest の出典を record 番号順に上限件数ずつ再取得し、
+継続位置を sync_cursor(kind=recheck) に持って全件を巡回する。一巡完了で
+recheck_completed_at。App 28 も対象。
+定期照合（1 日 1 回）: revision 一覧を取り直して差分を検出し取り込む（3 対象）。
 
 実行管理: 外部 API 待機中に DB トランザクションを持たない（ページを取り切って
 から 1 トランザクション）。DB 障害は本 module 内で握り、既存業務へ伝播させない。
 有効化: BRAIN_SYNC_ENABLED（既定 OFF・R7）。scheduler へは常に登録し、coro の
-先頭で検査（OFF なら即 return・ログ 1 行）。kintone への書込ゼロ。
+先頭で検査（OFF なら即 return・ログ 1 行）。kintone への書込ゼロ（読取のみ）。
 
 ログ規律: 固定語彙・件数・レコード番号のみ（hub.redact.emit 経由）。
 氏名・値・locator の中身は出さない。
@@ -57,9 +64,10 @@ _IN_CHUNK = 50
 TARGET_APP40 = "app40"
 TARGET_APP30 = "app30"
 TARGET_APP28 = "app28"
+TARGETS = (TARGET_APP40, TARGET_APP30, TARGET_APP28)
 CONVERTER = {TARGET_APP40: ("app40_record", "1"),
              TARGET_APP30: ("app30_record", "1"),
-             TARGET_APP28: ("app28_row", "1")}
+             TARGET_APP28: ("app28_row", "2")}
 
 APP_HOUKI = kintone.KintoneApp("App 40 (相続放棄案件)", "APP_HOUKI", "TOKEN_HOUKI")
 APP_SHIPPING = kintone.KintoneApp("App 30 (発送管理)", "APP_SHIPPING", "TOKEN_SHIPPING")
@@ -68,7 +76,8 @@ APP_CHATLOG = kintone.KintoneApp("App 28 (チャットログ)", "APP_CHATLOG", "
 # R5: App 28 の相続放棄カテゴリ閉集合（定数化）。会話行のみ（マーカー行は対象外）
 HOUKI_CHAT_CATEGORIES = frozenset({"相続放棄ヒアリング", "相続放棄ヒアリング・要確認"})
 HOUKI_CHAT_CATEGORY_PREFIXES = ("画像解析:houki:",)
-APP40_LINE_ID_ITEM = ledger.APP40_PREFIX + "LINEユーザーID"
+APP40_LINE_ID_FIELD = "LINEユーザーID"
+APP40_LINE_ID_ITEM = ledger.APP40_PREFIX + APP40_LINE_ID_FIELD
 
 # case_event の要約に使う閉集合（値は非 PII の選択肢のみ・閉集合外は other）
 APP40_STATUS_OPTIONS = frozenset({
@@ -79,9 +88,11 @@ APP30_STATUS_OPTIONS = frozenset({
     "下書き", "承認待ち", "承認済", "発送処理中", "発送済", "返送待ち", "完了",
     "エラー", "却下", "要確認"})
 APP30_SHIPPED_STATES = frozenset({"発送済", "返送待ち", "完了"})
+CHAT_ROLES = frozenset({"user", "assistant", "staff", "system"})
 EVENT_CASE_STATUS = "case_status_observed"
 EVENT_SHIPPING_STATUS = "shipping_status_observed"
 EVENT_SHIPPED_AT_SYNC = "shipping_confirmed_at_sync"
+EVENT_CHAT = "chat_message"                      # R9: 会話（App 28 レコード 1 件＝1 出来事）
 
 _KINTONE_DT_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 _DIGITS_RE = re.compile(r"^[0-9]{1,10}$")
@@ -96,6 +107,12 @@ FAIL_PAGE_LIMIT = "page_limit_reached"
 def brain_sync_enabled() -> bool:
     """flag BRAIN_SYNC_ENABLED（既定 OFF・値集合は既存 flag 群と同一・R7）。"""
     return os.environ.get(config.BRAIN_SYNC_ENABLED_ENV, "").strip().lower() in _FLAG_TRUE
+
+
+def source_targets() -> dict:
+    """出典アプリ ID → カーソル対象名（鮮度集約・BA-07 で使う）。"""
+    return {APP_HOUKI.app_id(): TARGET_APP40, APP_SHIPPING.app_id(): TARGET_APP30,
+            APP_CHATLOG.app_id(): TARGET_APP28}
 
 
 # ── 変換器（record → facts / events） ───────────────────────────────────────
@@ -130,6 +147,31 @@ def _now() -> datetime.datetime:
     return datetime.datetime.now(datetime.timezone.utc)
 
 
+_APP40_TABLES = ((ledger.APP40_CREDITOR_TABLE, ledger.APP40_CREDITOR_COLUMNS,
+                  ledger.SUBJECT_CREDITOR_PREFIX),
+                 (ledger.APP40_DOCUMENT_TABLE, ledger.APP40_DOCUMENT_COLUMNS,
+                  ledger.SUBJECT_DOCUMENT_PREFIX))
+
+
+def _row_ids(record: dict, table: str) -> set | None:
+    """サブテーブルの行 ID 集合。表の欄がレコードに無い（fields 絞り込み・部分取得）
+    ときは None＝「完全に取得できていない」として消去判定に使わない（BA-03）。"""
+    if table not in record:
+        return None
+    ids = set()
+    for row in (_v(record, table) or []):
+        row_id = str((row or {}).get("id") or "").strip()
+        if not _DIGITS_RE.fullmatch(row_id):
+            return None                      # 行 ID の無い行がある＝比較できない
+        ids.add(row_id)
+    return ids
+
+
+def app40_subjects_seen(record: dict) -> dict:
+    """BA-03: 新版に存在するサブテーブル subject（接頭辞 → 行 ID 集合／None）。"""
+    return {prefix: _row_ids(record, table) for table, _cols, prefix in _APP40_TABLES}
+
+
 def convert_app40(record: dict) -> tuple:
     """App 40 レコード → (SourceRef, case_key, facts, events)。案件キー = 自分自身。"""
     rid = _s(record, "$id")
@@ -138,15 +180,13 @@ def convert_app40(record: dict) -> tuple:
                            updated_at=_s(record, "更新日時"))
     facts = []
     for field, vtype in ledger.app40_fields().items():
+        if field not in record:
+            continue                         # 欄が無い＝部分取得。消去とは判断しない（BA-03）
         facts.append(ledger.FactIn(
             ledger.app40_field_subject(field), ledger.APP40_PREFIX + field, vtype,
             _v(record, field), ledger.make_locator(field),
             ledger.app40_field_confidence(field)))
-    for table, columns, prefix in (
-            (ledger.APP40_CREDITOR_TABLE, ledger.APP40_CREDITOR_COLUMNS,
-             ledger.SUBJECT_CREDITOR_PREFIX),
-            (ledger.APP40_DOCUMENT_TABLE, ledger.APP40_DOCUMENT_COLUMNS,
-             ledger.SUBJECT_DOCUMENT_PREFIX)):
+    for table, columns, prefix in _APP40_TABLES:
         for row in (_v(record, table) or []):
             row_id = str((row or {}).get("id") or "").strip()
             if not _DIGITS_RE.fullmatch(row_id):
@@ -166,17 +206,21 @@ def convert_app40(record: dict) -> tuple:
 
 
 def convert_app30(record: dict, decision: brain_link.LinkDecision) -> tuple:
-    """App 30 レコード → (SourceRef, case_key|None, facts, events)。"""
+    """App 30 レコード → (SourceRef, case_key|None, facts, events)。
+    subject は shipping:{レコード番号}（R9: 同じ発送の同じ項目だけを競合判定する）。"""
     rid = _s(record, "$id")
     app_id = APP_SHIPPING.app_id()
     src = ledger.SourceRef(app_id, rid, _revision(record), *CONVERTER[TARGET_APP30],
                            updated_at=_s(record, "更新日時"))
     if not decision.auto:
         return src, None, [], []
+    subject = ledger.SUBJECT_SHIPPING_PREFIX + rid
     facts = []
     for field, vtype in ledger.app30_fields().items():
+        if field not in record:
+            continue                         # 欄が無い＝部分取得。消去とは判断しない
         facts.append(ledger.FactIn(
-            ledger.SUBJECT_CASE, ledger.APP30_PREFIX + field, vtype, _v(record, field),
+            subject, ledger.APP30_PREFIX + field, vtype, _v(record, field),
             ledger.make_locator(field), "high"))
     status = _s(record, "発送ステータス")
     events = [ledger.EventIn(
@@ -197,26 +241,47 @@ def houki_chat_category(category: str) -> bool:
     return any(category.startswith(p) for p in HOUKI_CHAT_CATEGORY_PREFIXES)
 
 
+def _chat_summary(record: dict) -> str:
+    """固定語彙のみ（本文・LINE ID は載せない）: chat:{role}:{category 区分}。"""
+    role = _s(record, "role")
+    role = role if role in CHAT_ROLES else "other"
+    cat = _s(record, "category")
+    if cat == "相続放棄ヒアリング":
+        kind = "hearing"
+    elif cat == "相続放棄ヒアリング・要確認":
+        kind = "hearing_confirm"
+    else:
+        kind = "image"
+    return f"chat:{role}:{kind}"
+
+
 def convert_app28(record: dict, case_key: tuple) -> tuple:
+    """App 28 レコード → (SourceRef, case_key, [], events)。R9: fact ではなく
+    case_event（種別=会話・冪等キーは App 28 レコード番号で 1 件・版更新で増やさない）。"""
     rid = _s(record, "$id")
     app_id = APP_CHATLOG.app_id()
     src = ledger.SourceRef(app_id, rid, _revision(record), *CONVERTER[TARGET_APP28],
                            updated_at=_s(record, "更新日時"))
     occurred = _parse_dt(_s(record, "作成日時"))
-    facts = [ledger.FactIn(ledger.SUBJECT_CASE, ledger.APP28_PREFIX + field, vtype,
-                           _v(record, field), ledger.make_locator(field), "high",
-                           occurred_at=occurred)
-             for field, vtype in ledger.app28_fields().items()]
-    return src, case_key, facts, []
+    events = [ledger.EventIn(EVENT_CHAT, _chat_summary(record),
+                             ledger.make_locator("message"), occurred_at=occurred,
+                             per_record=True)]
+    return src, case_key, [], events
 
 
 # ── kintone 取得（読取のみ・query は検証済み値だけを埋める） ─────────────────
 
-def _page_query(base: str, cursor: tuple | None, start: str | None) -> str:
-    """keyset ページング。cursor=(更新日時, $id) の次から。start は窓の始点。"""
+def _page_query(base: str, cursor: tuple | None, start: str | None,
+                upper: str | None = None) -> str:
+    """keyset ページング。cursor=(更新日時, $id) の次から。start は窓の始点。
+    upper は走査上限（更新日時 <= 上限・BA-09）。"""
     conds = []
     if base:
         conds.append(f"({base})")
+    if upper:
+        if not _KINTONE_DT_RE.fullmatch(upper):
+            raise ValueError("upper_malformed")
+        conds.append(f'更新日時 <= "{upper}"')
     if cursor is not None:
         ts, rid = cursor
         if not _KINTONE_DT_RE.fullmatch(ts) or not _DIGITS_RE.fullmatch(rid):
@@ -237,6 +302,19 @@ def _window_start(cursor_updated_at: str) -> str | None:
     return _fmt_dt(dt - datetime.timedelta(minutes=WINDOW_MINUTES))
 
 
+async def app40_exists_in_source(record_id: str) -> bool | None:
+    """参照先 App 40 の実在を**正本**で確認する（読取のみ・失敗は None）。
+    紐付け訂正の訂正先検査（BA-06）に使う。"""
+    if not _DIGITS_RE.fullmatch(str(record_id)):
+        return False
+    try:
+        found = await kintone.search_records(APP_HOUKI, f'$id = "{record_id}" limit 1',
+                                             fields=["$id"])
+    except Exception:
+        return None
+    return bool(found)
+
+
 async def _app40_exists(record_id: str) -> bool | None:
     """参照先 App 40 の実在確認: 台帳（既知の出典）→ kintone。失敗は None。"""
     try:
@@ -244,12 +322,7 @@ async def _app40_exists(record_id: str) -> bool | None:
             return True
     except Exception:
         return None
-    try:
-        found = await kintone.search_records(APP_HOUKI, f'$id = "{record_id}" limit 1',
-                                             fields=["$id"])
-    except Exception:
-        return None
-    return bool(found)
+    return await app40_exists_in_source(record_id)
 
 
 async def _decide_app30(record: dict) -> brain_link.LinkDecision:
@@ -262,10 +335,34 @@ async def _decide_app30(record: dict) -> brain_link.LinkDecision:
     return brain_link.decide_app30_reference(record, houki, exists)
 
 
+async def _decide_app28(record: dict) -> tuple:
+    """R5 の判定を**正本**で行う（BA-04）。戻り値 (decision|None, reason, ok)。
+    ok=False は検索失敗＝判定不能（採用しない・既存の関連も変えない＝fail-closed）。"""
+    if not houki_chat_category(_s(record, "category")):
+        return None, brain_link.REASON_CATEGORY_OUT, True
+    luid = _s(record, "line_user_id")
+    if not _LINE_ID_RE.fullmatch(luid):
+        return None, brain_link.REASON_LINE_NOT_UNIQUE, True
+    try:
+        found = await kintone.search_records(
+            APP_HOUKI, f'{APP40_LINE_ID_FIELD} = "{luid}" limit 2', fields=["$id"])
+    except Exception:
+        return None, None, False
+    ids = [_s(r, "$id") for r in found if _DIGITS_RE.fullmatch(_s(r, "$id"))]
+    if len(ids) != 1:
+        return None, brain_link.REASON_LINE_NOT_UNIQUE, True
+    decision = brain_link.decide_app28_row(record, [(APP_HOUKI.app_id(), ids[0])])
+    return decision, brain_link.REASON_AUTO, True
+
+
 async def _prepare_ingest(target: str, record: dict) -> tuple | None:
-    """レコード → 取込タプル（None = 対象外・スキップ）。紐付け履歴もここで積む。"""
+    """レコード → 取込タプル (src, case_key, facts, events, extras)（None = 対象外・
+    スキップ）。関連の移動／喪失（R10）は extras["link_change"] として同一
+    トランザクションで適用される。紐付け履歴（変化なし）はここで積む。"""
+    extras: dict = {}
     if target == TARGET_APP40:
         src, case_key, facts, events = convert_app40(record)
+        extras["subjects_seen"] = app40_subjects_seen(record)
     elif target == TARGET_APP30:
         decision = await _decide_app30(record)
         rid, rev = _s(record, "$id"), _revision(record)
@@ -276,27 +373,39 @@ async def _prepare_ingest(target: str, record: dict) -> tuple | None:
             # 人の紐付け訂正は、出典の revision が変わるまで自動判定より優先する
             decision = brain_link.LinkDecision("auto", tuple(last["new_case"]),
                                                brain_link.REASON_MANUAL_PINNED)
-            src, case_key, facts, events = convert_app30(record, decision)
-        else:
-            src, case_key, facts, events = convert_app30(record, decision)
-            prev = await ledger.current_case_of_source(src.app_id, src.record_id)
+        src, case_key, facts, events = convert_app30(record, decision)
+        prev = await ledger.current_case_of_source(src.app_id, src.record_id)
+        change = brain_link.link_change_for(decision, prev)
+        if change is not None:
+            extras["link_change"] = change
+        elif decision.reason != brain_link.REASON_MANUAL_PINNED:
             await brain_link.record_decision(src.app_id, src.record_id, decision, prev)
+        extras["hold_reason"] = decision.reason
     else:
-        if not houki_chat_category(_s(record, "category")):
-            return None
-        luid = _s(record, "line_user_id")
-        if not _LINE_ID_RE.fullmatch(luid):
-            return None
-        matches = await ledger.find_case_by_item_value(APP40_LINE_ID_ITEM, luid)
-        decision = brain_link.decide_app28_row(record, matches)
+        rid = _s(record, "$id")
+        decision, reason, ok = await _decide_app28(record)
+        if not ok:
+            return None                      # 判定不能＝採用しない・既存の関連も変えない
+        prev = await ledger.current_case_of_source(APP_CHATLOG.app_id(), rid)
         if decision is None:
-            return None                      # R5: 取り込まない・保留にもしない
+            change = brain_link.link_change_for(None, prev, lost_reason=reason,
+                                                ingest_state="detached")
+            if change is None:
+                return None                  # R5: 取り込まない・保留にもしない
+            src = ledger.SourceRef(APP_CHATLOG.app_id(), rid, _revision(record),
+                                   *CONVERTER[TARGET_APP28], updated_at=_s(record, "更新日時"))
+            return src, None, [], [], {"link_change": change, "ingest_state": "detached",
+                                       "hold_reason": reason}
         src, case_key, facts, events = convert_app28(record, decision.case_key)
-    status = await ledger.ingest_status(src, case_key)
-    if status["known"] and status["same_case"] and (
-            case_key is None or status["has_current_facts"]):
-        return None                          # revision 既知＝再処理しない
-    return src, case_key, facts, events
+        change = brain_link.link_change_for(decision, prev)
+        if change is not None:
+            extras["link_change"] = change
+    if "link_change" not in extras:
+        status = await ledger.ingest_status(src, case_key)
+        if status["known"] and status["same_case"] and (
+                case_key is None or status["has_current_facts"]):
+            return None                      # revision 既知＝再処理しない
+    return src, case_key, facts, events, extras
 
 
 def _base_query(target: str) -> str:
@@ -343,23 +452,42 @@ def _log_run_failed(target: str, failure: str) -> None:
         logger.warning("[BRAIN_SYNC] run failed (page_limit_reached)")
 
 
+def _resume_position(cur: dict | None) -> tuple | None:
+    """未完了走査（ページ上限で止まった run）の再開位置と上限（BA-09）。"""
+    if not cur or cur.get("state") != "incomplete":
+        return None
+    pos = cur.get("page_position") or {}
+    upper = cur.get("scan_upper_bound") or ""
+    ts, rid = str(pos.get("after_updated_at") or ""), str(pos.get("after_record_id") or "")
+    if not (_KINTONE_DT_RE.fullmatch(upper) and _KINTONE_DT_RE.fullmatch(ts)
+            and _DIGITS_RE.fullmatch(rid)):
+        return None
+    return upper, (ts, rid)
+
+
 async def sync_target(target: str, *, now=None) -> dict:
     """1 対象アプリの同期を 1 回実行する（ページ単位の原子的前進）。"""
     now = now or _now()
     app = _app_of(target)
     cur = await ledger.get_cursor(target)
-    start = _window_start(cur["cursor_updated_at"]) if cur else None
-    scan_upper = _fmt_dt(now)
+    resume = _resume_position(cur)
+    if resume is not None:
+        scan_upper, cursor = resume          # 未完了走査を同じ上限で再開
+        start = None
+    else:
+        scan_upper = _fmt_dt(now)
+        cursor = None
+        start = _window_start(cur["cursor_updated_at"]) if cur else None
     run_id = await ledger.start_run(target, scan_upper, now=now)
     base = _base_query(target)
-    cursor = None
     pages = 0
     records_seen = 0
     inserted = 0
     result = {"target": target, "run_id": run_id, "status": "ok", "pages": 0,
-              "records": 0, "inserted": 0, "held": 0}
+              "records": 0, "inserted": 0, "held": 0, "resumed": resume is not None,
+              "scan_upper_bound": scan_upper}
     while pages < MAX_PAGES_PER_RUN:
-        query = _page_query(base, cursor, start)
+        query = _page_query(base, cursor, start, scan_upper)
         try:
             page = await kintone.search_records(app, query)       # DB を持たず待つ
         except Exception:
@@ -389,7 +517,7 @@ async def sync_target(target: str, *, now=None) -> dict:
             summaries = await ledger.advance_cursor_with_page(
                 target, run_id, ingests=ingests, cursor_updated_at=last[0],
                 cursor_record_id=last[1], pages_done=pages,
-                records_seen=records_seen, now=now)
+                records_seen=records_seen, scan_upper_bound=scan_upper, now=now)
         except ledger.MismatchError:
             await _fail(target, run_id, FAIL_MISMATCH, cursor, pages - 1, records_seen, now)
             result.update(status="failed", failure=FAIL_MISMATCH)
@@ -404,10 +532,13 @@ async def sync_target(target: str, *, now=None) -> dict:
         if len(page) < PAGE_SIZE:
             break
     else:
-        await _fail(target, run_id, FAIL_PAGE_LIMIT, cursor, pages, records_seen, now)
+        # ページ上限: 走査は未完了のまま（再開位置と上限を残す・完了扱いにしない）
+        await _fail(target, run_id, FAIL_PAGE_LIMIT, cursor, pages, records_seen, now,
+                    keep_position=True)
         result.update(status="failed", failure=FAIL_PAGE_LIMIT)
         return result
     await ledger.set_cursor_state(target, "synced", now=now, confirmed_until=scan_upper,
+                                  scan_upper_bound=scan_upper, page_position=None,
                                   last_ok_at=now, last_run_id=run_id)
     await ledger.finish_run(run_id, "ok", pages_done=pages, records_seen=records_seen,
                             confirmed_range={"until": scan_upper}, now=now)
@@ -417,16 +548,17 @@ async def sync_target(target: str, *, now=None) -> dict:
 
 
 async def _fail(target: str, run_id: int, failure: str, cursor, pages: int,
-                records: int, now) -> None:
+                records: int, now, *, keep_position: bool = False) -> None:
     incomplete = ({"after_updated_at": cursor[0], "after_record_id": cursor[1]}
                   if cursor else {"after_updated_at": None, "after_record_id": None})
     try:
         await ledger.finish_run(run_id, "failed", failure=failure,
                                 incomplete_page=incomplete, pages_done=pages,
                                 records_seen=records, now=now)
+        extra = {} if keep_position else {"page_position": None}
         await ledger.set_cursor_state(
             target, "error" if failure in (FAIL_KINTONE, FAIL_DB) else "incomplete",
-            now=now, last_run_id=run_id)
+            now=now, last_run_id=run_id, **extra)
     except Exception:
         pass                                  # DB 障害は brain 内で握る
     _log_run_failed(target, failure)
@@ -435,10 +567,14 @@ async def _fail(target: str, run_id: int, failure: str, cursor, pages: int,
 # ── 定期照合（revision 一覧の差分） ──────────────────────────────────────────
 
 async def reconcile_target(target: str, *, now=None) -> dict:
-    """対象レコードの revision 一覧を取り直し、台帳より新しいものを取り込む。"""
+    """対象レコードの revision 一覧を取り直し、台帳より新しいものを取り込む。
+    App 28 は category が閉集合の行だけを見る（他は対象外・DB にも触れない）。"""
     now = now or _now()
     app = _app_of(target)
     base = _base_query(target)
+    fields = ["$id", "$revision", "更新日時"]
+    if target == TARGET_APP28:
+        fields.append("category")
     after = "0"
     changed = 0
     seen = 0
@@ -446,8 +582,7 @@ async def reconcile_target(target: str, *, now=None) -> dict:
         where = (f"({base}) and " if base else "") + f"$id > {after}"
         try:
             page = await kintone.search_records(
-                app, f"{where} order by $id asc limit {PAGE_SIZE}",
-                fields=["$id", "$revision", "更新日時"])
+                app, f"{where} order by $id asc limit {PAGE_SIZE}", fields=fields)
         except Exception:
             logger.warning("[BRAIN_SYNC] reconcile failed (kintone_fetch_failed)")
             return {"status": "failed", "changed": changed}
@@ -458,6 +593,8 @@ async def reconcile_target(target: str, *, now=None) -> dict:
             if not _DIGITS_RE.fullmatch(rid):
                 continue
             after = rid
+            if target == TARGET_APP28 and not houki_chat_category(_s(r, "category")):
+                continue
             seen += 1
             known = await ledger.latest_known_revision(app.app_id(), rid)
             if known is not None and _revision(r) <= known:
@@ -487,56 +624,99 @@ async def _ingest_single(target: str, record_id: str) -> bool:
     prepared = await _prepare_ingest(target, found[0])
     if prepared is None:
         return False
-    src, case_key, facts, events = prepared
-    await ledger.ingest_source(src, case_key, facts, events)
+    src, case_key, facts, events, extras = prepared
+    await ledger.ingest_source(src, case_key, facts, events, extras=extras)
     return True
 
 
-# ── 追跡再照合（既取込の出典の再取得） ──────────────────────────────────────
+# ── 追跡再照合（既取込の出典の再取得・BA-05） ───────────────────────────────
+
+def _recheck_in_progress(rc: dict | None) -> bool:
+    return bool(rc) and rc.get("state") in ("incomplete", "error") \
+        and bool(rc.get("recheck_started_at"))
+
+
+async def _recheck_one(target: str, app, rid: str, record: dict | None, now) -> dict:
+    out = {"unavailable": 0, "moved": 0}
+    if record is None:
+        await ledger.mark_source_unavailable(app.app_id(), rid, now=now)
+        out["unavailable"] = 1
+        return out
+    await ledger.mark_source_checked(app.app_id(), rid, now=now)
+    prev = await ledger.current_case_of_source(app.app_id(), rid)
+    prepared = await _prepare_ingest(target, record)
+    if prepared is None:
+        return out
+    src, case_key, facts, events, extras = prepared
+    summary = await ledger.ingest_source(src, case_key, facts, events, extras=extras,
+                                         now=now)
+    if prev is not None and (case_key is None or tuple(prev) != tuple(case_key)):
+        out["moved"] = 1                     # 移動または関連喪失（R10 の共通処理を通過）
+    elif summary.get("moved"):
+        out["moved"] = 1
+    return out
+
 
 async def recheck_target(target: str, *, now=None, batch: int = RECHECK_BATCH) -> dict:
-    """source_ingest の出典を再取得し、(a) 案件参照の移動 → 訂正履歴＋旧案件除外、
-    (b) 取得不能 → 出典確認不能、を反映する。上限 batch 件/回。"""
+    """source_ingest の出典をレコード番号順に batch 件ずつ再取得し、(a) 案件参照の
+    移動／喪失 → R10 の共通処理、(b) 取得不能 → 出典確認不能、を反映する。
+    継続位置は sync_cursor(kind=recheck) に持ち、途中失敗でも保持。一巡完了で
+    recheck_completed_at（「全件照合済み」は一巡完了後のみ）。"""
     now = now or _now()
     app = _app_of(target)
-    sources = (await ledger.list_sources(app.app_id()))[:batch]
+    rc = await ledger.get_cursor(target, kind=ledger.CURSOR_KIND_RECHECK)
+    if _recheck_in_progress(rc):
+        after = rc["cursor_record_id"] or "0"
+        started_at = datetime.datetime.fromisoformat(rc["recheck_started_at"])
+    else:
+        after = "0"
+        started_at = now
+    sources = await ledger.list_sources(app.app_id(), after=after, limit=batch)
     unavailable = 0
     moved = 0
+    checked = 0
+    position = after
     for i in range(0, len(sources), _IN_CHUNK):
         chunk = sources[i:i + _IN_CHUNK]
         ids = [s["record_id"] for s in chunk if _DIGITS_RE.fullmatch(s["record_id"])]
         if not ids:
+            position = chunk[-1]["record_id"]
             continue
         try:
             found = await kintone.search_records(
                 app, "$id in (" + ",".join(f'"{x}"' for x in ids) + f") limit {len(ids)}")
         except Exception:
+            await ledger.set_cursor_state(
+                target, "error", kind=ledger.CURSOR_KIND_RECHECK, now=now,
+                cursor_record_id=position, recheck_started_at=started_at)
             logger.warning("[BRAIN_SYNC] recheck failed (kintone_fetch_failed)")
-            return {"status": "failed", "unavailable": unavailable, "moved": moved}
+            return {"status": "failed", "unavailable": unavailable, "moved": moved,
+                    "checked": checked, "complete": False, "position": position}
         present = {_s(r, "$id"): r for r in found}
         for rid in ids:
-            record = present.get(rid)
-            if record is None:
-                await ledger.mark_source_unavailable(app.app_id(), rid, now=now)
-                unavailable += 1
-                continue
-            await ledger.mark_source_checked(app.app_id(), rid, now=now)
-            prev = await ledger.current_case_of_source(app.app_id(), rid)
-            prepared = await _prepare_ingest(target, record)
-            if prepared is None:
-                continue
-            src, case_key, facts, events = prepared
-            summary = await ledger.ingest_source(src, case_key, facts, events, now=now)
-            if prev is not None and case_key is not None and tuple(prev) != tuple(case_key):
-                moved += 1
-            elif summary.get("moved"):
-                moved += 1
+            one = await _recheck_one(target, app, rid, present.get(rid), now)
+            unavailable += one["unavailable"]
+            moved += one["moved"]
+            checked += 1
+        position = chunk[-1]["record_id"]
+        await ledger.set_cursor_state(
+            target, "incomplete", kind=ledger.CURSOR_KIND_RECHECK, now=now,
+            cursor_record_id=position, recheck_started_at=started_at)
+    complete = len(sources) < batch
+    if complete:
+        await ledger.set_cursor_state(
+            target, "synced", kind=ledger.CURSOR_KIND_RECHECK, now=now,
+            cursor_record_id="", recheck_started_at=started_at,
+            recheck_completed_at=now)
+        logger.info("[BRAIN_SYNC] recheck pass complete checked=%s",
+                    emit(checked, "count", "log", "operator"))
     await ledger.set_cursor_state(target, (await ledger.get_cursor(target) or {}).get(
         "state", "incomplete"), now=now, last_recheck_at=now)
     logger.info("[BRAIN_SYNC] recheck ok unavailable=%s moved=%s",
                 emit(unavailable, "count", "log", "operator"),
                 emit(moved, "count", "log", "operator"))
-    return {"status": "ok", "unavailable": unavailable, "moved": moved}
+    return {"status": "ok", "unavailable": unavailable, "moved": moved,
+            "checked": checked, "complete": complete, "position": position}
 
 
 # ── ジョブ ────────────────────────────────────────────────────────────────────
@@ -556,6 +736,14 @@ def _due(last_iso: str, interval: datetime.timedelta, now) -> bool:
     return now - last >= interval
 
 
+async def _recheck_due(target: str, cur: dict, now) -> bool:
+    """一巡の途中（未完了・失敗）なら毎回続きを回し、完了後は 24h ごと。"""
+    rc = await ledger.get_cursor(target, kind=ledger.CURSOR_KIND_RECHECK)
+    if _recheck_in_progress(rc):
+        return True
+    return _due(cur.get("last_recheck_at", ""), RECHECK_INTERVAL, now)
+
+
 async def run_brain_sync_job() -> dict:
     """scheduler から 5 分ごとに呼ばれる。OFF なら即 return（ログ 1 行）。
     DB 障害・kintone 障害は本関数内で握り、例外を scheduler へ返さない。"""
@@ -566,18 +754,18 @@ async def run_brain_sync_job() -> dict:
         return {"status": "disabled"}
     now = _now()
     out = {"status": "ok", "targets": {}}
-    for target in (TARGET_APP40, TARGET_APP30, TARGET_APP28):
+    for target in TARGETS:
         try:
             out["targets"][target] = await sync_target(target, now=now)
         except Exception:
             logger.error("[BRAIN_SYNC] job stage failed (db_or_runtime_error)")
             out["status"] = "degraded"
     try:
-        for target in (TARGET_APP40, TARGET_APP30):
+        for target in TARGETS:
             cur = await ledger.get_cursor(target) or {}
             if _due(cur.get("last_reconcile_at", ""), RECONCILE_INTERVAL, now):
                 await reconcile_target(target, now=now)
-            if _due(cur.get("last_recheck_at", ""), RECHECK_INTERVAL, now):
+            if await _recheck_due(target, cur, now):
                 await recheck_target(target, now=now)
     except Exception:
         logger.error("[BRAIN_SYNC] periodic stage failed (db_or_runtime_error)")

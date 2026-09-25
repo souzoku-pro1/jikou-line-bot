@@ -14,7 +14,7 @@
 
 import unittest
 
-from brain_test_support import BrainDbMixin, app30, app40, run
+from brain_test_support import BrainDbMixin, app28, app30, app40, run, subrow
 from hub import brain_ledger as ledger
 from hub import brain_sync as sync
 from hub.db import session_scope
@@ -178,15 +178,18 @@ class TestCorrectionHistory(BrainDbMixin):
             await sync.sync_target(sync.TARGET_APP40)
             await sync.sync_target(sync.TARGET_APP30)
             n_links = await _count(ledger.link_history)
+            # BA-06: 画面が見ていた紐付け版・出典 revision を添える（期待値は不変）
+            seen = dict(seen_link_version=await ledger.link_version("30", "5"),
+                        seen_source_revision=1)
             r = await ledger.relink_source(source_app_id="30", source_record_id="5",
                                            new_case=("40", "2"), reason="誤紐付け",
-                                           operation_id="op-r1", actor="owner")
+                                           operation_id="op-r1", actor="owner", **seen)
             self.assertEqual((r["duplicate"], r["prev"]), (False, ("40", "1")))
             self.assertEqual(await _count(ledger.link_history), n_links + 1)
             # 同じ操作 ID は無視（履歴が増えない）
             r2 = await ledger.relink_source(source_app_id="30", source_record_id="5",
                                             new_case=("40", "2"), reason="誤紐付け",
-                                            operation_id="op-r1", actor="owner")
+                                            operation_id="op-r1", actor="owner", **seen)
             self.assertTrue(r2["duplicate"])
             self.assertEqual(await _count(ledger.link_history), n_links + 1)
             # 旧案件の現在ビューから除外・次回同期で新案件側へ積まれる（手動が優先）
@@ -228,6 +231,181 @@ class TestCorrectionHistory(BrainDbMixin):
                                            "case", "app40.顧客名", "text", "乙",
                                            ledger.make_locator("顧客名"))])
             self.assertEqual(await ledger.list_conflicts(), [])
+        run(body())
+
+    # ── fix1: BA-02（R10 関連喪失の共通処理）/ BA-03（行消去）/ BA-08（R9） ──
+
+    async def _facts30(self, case=("40", "1"), current_only=True):
+        return [f for f in await ledger.list_case_facts(*case, current_only=current_only)
+                if f["source_app_id"] == "30"]
+
+    def test_lost_reference_detaches_facts_and_flags_confirmations(self):
+        # 参照が別アプリへ／消去／不正になったら: link_history（理由付き）→ 旧案件の fact/event を
+        # 現在ビューから外す（link_lost）→ 確認は再確認一覧へ。通常同期と追跡再照合の両経路
+        self.fake.data["40"] = [app40(1, 1)]
+        self.fake.data["30"] = [app30(5, 1)]
+
+        async def body():
+            await sync.sync_target(sync.TARGET_APP40)
+            await sync.sync_target(sync.TARGET_APP30)
+            fact = [f for f in await self._facts30() if f["item_code"] == "app30.件名"][0]
+            await ledger.record_confirmation(fact_id=fact["fact_id"], seen_version=1,
+                                             decision="confirm", reason="", operation_id="op-l1",
+                                             actor="owner")
+            n_facts, n_events = await _count(ledger.case_fact), await _count(ledger.case_event)
+            # (a) App 40/No.1 → App 26 へ（追跡再照合の経路）
+            self.fake.data["30"] = [app30(5, 2, "2026-09-21T01:00:00Z", 案件アプリID="26")]
+            rc = await sync.recheck_target(sync.TARGET_APP30)
+            self.assertEqual((rc["status"], rc["moved"]), ("ok", 1))
+            self.assertEqual(await self._facts30(), [])
+            old = await self._facts30(current_only=False)
+            self.assertTrue(old and all(f["invalid_reason"] == "link_lost" for f in old))
+            self.assertEqual([e for e in await ledger.list_case_events("40", "1")
+                              if e["source_app_id"] == "30"], [])
+            self.assertEqual({e["invalid_reason"] for e in
+                              await ledger.list_case_events("40", "1", current_only=False)
+                              if e["source_app_id"] == "30"}, {"link_lost"})
+            self.assertEqual((await _count(ledger.case_fact), await _count(ledger.case_event)),
+                             (n_facts, n_events))                                  # 削除なし
+            self.assertEqual([x["reasons"] for x in await ledger.list_recheck()], [["link_lost"]])
+            last = await ledger.latest_link("30", "5")
+            self.assertEqual((last["trust_level"], last["reason"], last["prev_case"], last["new_case"]),
+                             ("hold", "ref_other_app", ("40", "1"), None))
+            self.assertIsNone(await ledger.current_case_of_source("30", "5"))
+            self.assertEqual([(p["source_record_id"], p["hold_reason"], p["source_revision"])
+                              for p in await ledger.list_pending_links()], [("5", "ref_other_app", 2)])
+            self.assertEqual(await ledger.list_case_facts("26", "1"), [])
+            # 参照が戻れば履歴を繋いで復帰（新 revision）。旧版への確認は再確認のまま
+            self.fake.data["30"] = [app30(5, 3, "2026-09-21T02:00:00Z")]
+            await sync.recheck_target(sync.TARGET_APP30)
+            cur = [f for f in await self._facts30() if f["item_code"] == "app30.件名"]
+            self.assertEqual([(f["value_text"], f["version"]) for f in cur], [("受理通知送付状", 3)])
+            async with session_scope() as session:
+                row = (await session.execute(sa.select(ledger.case_fact).where(
+                    ledger.case_fact.c.fact_id == cur[0]["fact_id"]))).first()
+            self.assertEqual(row.supersedes_fact_id, fact["fact_id"])
+            self.assertEqual(await ledger.list_pending_links(), [])
+            self.assertEqual(await ledger.current_case_of_source("30", "5"), ("40", "1"))
+            self.assertEqual([x["reasons"] for x in await ledger.list_recheck()], [["link_lost"]])
+            self.assertTrue([e for e in await ledger.list_case_events("40", "1")
+                             if e["source_app_id"] == "30"])
+            # (b) 参照消去（通常同期の経路）
+            self.fake.data["30"] = [app30(5, 4, "2026-09-21T03:00:00Z", 案件レコードID="")]
+            self.assertEqual((await sync.sync_target(sync.TARGET_APP30))["status"], "ok")
+            self.assertEqual(await self._facts30(), [])
+            self.assertEqual((await ledger.latest_link("30", "5"))["reason"], "ref_not_digits")
+            self.assertEqual([p["hold_reason"] for p in await ledger.list_pending_links()],
+                             ["ref_not_digits"])
+            # (c) 不正参照（存在しない No.999・追跡再照合の経路）
+            self.fake.data["30"] = [app30(5, 5, "2026-09-21T04:00:00Z")]
+            await sync.recheck_target(sync.TARGET_APP30)
+            self.assertTrue(await self._facts30())
+            self.fake.data["30"] = [app30(5, 6, "2026-09-21T05:00:00Z", 案件レコードID="999")]
+            await sync.recheck_target(sync.TARGET_APP30)
+            self.assertEqual(await self._facts30(), [])
+            last = await ledger.latest_link("30", "5")
+            self.assertEqual((last["reason"], last["candidates"][0]["case_record_id"],
+                              last["candidates"][0]["trust"]), ("ref_missing", "999", "candidate"))
+            self.assertEqual(await ledger.list_case_facts("40", "999"), [])
+            self.assertEqual((await _count(ledger.case_fact)) >= n_facts, True)
+        run(body())
+
+    def test_removed_subtable_rows_are_retired_only_on_full_fetch(self):
+        # BA-03: 完全取得した新版でだけ行 ID 集合を比較し、消えた行を row_removed で利用停止。
+        # 取得失敗・部分取得（欄なし）・遅着の旧 revision では判断しない
+        self.fake.data["40"] = [app40(1, 1)]
+
+        async def creditors(current_only=True):
+            return {f["subject_id"] for f in await ledger.list_case_facts("40", "1", current_only)
+                    if f["subject_id"].startswith("creditor:")}
+
+        async def body():
+            await sync.sync_target(sync.TARGET_APP40)
+            self.assertEqual(await creditors(), {"creditor:11", "creditor:12"})
+            n = await _count(ledger.case_fact)
+            # 取得失敗 → 消去と判断しない
+            self.fake.data["40"] = [app40(1, 2, "2026-09-20T02:00:00Z", 債権者一覧=[])]
+            self.fake.fail_at = {len(self.fake.calls) + 1}
+            self.assertEqual((await sync.sync_target(sync.TARGET_APP40))["status"], "failed")
+            self.assertEqual(await creditors(), {"creditor:11", "creditor:12"})
+            self.fake.fail_at = set()
+            # 部分取得（サブテーブル欄が無い＝fields 絞り込み相当）→ 判断しない
+            from brain_test_support import rec
+            partial = rec(1, 2, "2026-09-20T02:00:00Z", status="受任", 顧客名="テスト太郎")
+            self.assertEqual(sync.app40_subjects_seen(partial), {"creditor:": None, "document:": None})
+            src, key, facts, events = sync.convert_app40(partial)
+            self.assertFalse(any(f.item_code == "app40.LINEユーザーID" for f in facts))  # 欄なし≠消去
+            await ledger.ingest_source(src, key, facts, events,
+                                       extras={"subjects_seen": sync.app40_subjects_seen(partial)})
+            self.assertEqual(await creditors(), {"creditor:11", "creditor:12"})
+            self.assertTrue([f for f in await ledger.list_case_facts("40", "1")
+                             if f["item_code"] == "app40.LINEユーザーID" and f["value_text"]])
+            # 完全取得した新版（rev3）で一覧が空 → 行の fact を row_removed（削除なし）
+            self.fake.data["40"] = [app40(1, 3, "2026-09-20T03:00:00Z", 債権者一覧=[])]
+            self.assertEqual((await sync.sync_target(sync.TARGET_APP40))["status"], "ok")
+            self.assertEqual(await creditors(), set())
+            retired = [f for f in await ledger.list_case_facts("40", "1", current_only=False)
+                       if f["subject_id"].startswith("creditor:")]
+            self.assertTrue(retired and all(
+                f["invalid_reason"] == "row_removed" and not f["is_current"] for f in retired))
+            self.assertGreaterEqual(await _count(ledger.case_fact), n)
+            # 遅着の旧 revision（rev2・行あり）は消去判定も復帰もしない（R8）
+            late = app40(1, 2, "2026-09-20T02:00:00Z")
+            src2, key2, facts2, ev2 = sync.convert_app40(late)
+            await ledger.ingest_source(src2, key2, facts2, ev2,
+                                       extras={"subjects_seen": sync.app40_subjects_seen(late)})
+            self.assertEqual(await creditors(), set())
+            # 行 11 が戻った rev4 → 履歴を繋いで復帰（12 は利用停止のまま）
+            self.fake.data["40"] = [app40(1, 4, "2026-09-20T04:00:00Z",
+                                          債権者一覧=[subrow(11, 債権者名="甲社", 通知要否="要")])]
+            await sync.sync_target(sync.TARGET_APP40)
+            self.assertEqual(await creditors(), {"creditor:11"})
+            name = [f for f in await ledger.list_case_facts("40", "1")
+                    if f["subject_id"] == "creditor:11"
+                    and f["item_code"] == "app40.債権者一覧.債権者名"][0]
+            async with session_scope() as session:
+                row = (await session.execute(sa.select(ledger.case_fact).where(
+                    ledger.case_fact.c.fact_id == name["fact_id"]))).first()
+                prev = (await session.execute(sa.select(ledger.case_fact).where(
+                    ledger.case_fact.c.fact_id == row.supersedes_fact_id))).first()
+            self.assertEqual((prev.invalid_reason, int(prev.source_revision)), ("row_removed", 1))
+        run(body())
+
+    def test_chat_events_and_shipping_subjects_do_not_conflict(self):
+        # BA-08/R9: 会話は case_event（競合判定の対象外・冪等キー=App 28 レコード番号）、
+        # 発送は subject=shipping:{No}（同一発送の同一項目の別観測だけが競合）
+        self.fake.data["40"] = [app40(1, 1)]
+        self.fake.data["28"] = [app28(100, 1, message="口座は A 銀行です"),
+                                app28(101, 1, role="assistant", message="口座は B 銀行です")]
+        self.fake.data["30"] = [app30(5, 1, 件名="受理通知送付状"), app30(6, 1, 件名="債権者通知")]
+
+        async def chats():
+            return [e for e in await ledger.list_case_events("40", "1") if e["source_app_id"] == "28"]
+
+        async def body():
+            for target in sync.TARGETS:
+                await sync.sync_target(target)
+            self.assertEqual(await ledger.list_conflicts(), [])
+            self.assertEqual([(e["source_record_id"], e["kind"], e["summary"]) for e in await chats()],
+                             [("100", "chat_message", "chat:user:hearing"),
+                              ("101", "chat_message", "chat:assistant:hearing")])
+            self.assertEqual([f for f in await ledger.list_case_facts("40", "1")
+                              if f["source_app_id"] == "28"], [])          # 会話は fact にしない
+            self.assertEqual({f["subject_id"] for f in await self._facts30()},
+                             {"shipping:5", "shipping:6"})
+            # 会話の版更新で出来事は増えない
+            self.fake.data["28"][0] = app28(100, 2, "2026-09-21T01:00:00Z", message="訂正")
+            await sync.sync_target(sync.TARGET_APP28)
+            self.assertEqual(len(await chats()), 2)
+            self.assertEqual(await ledger.latest_known_revision("28", "100"), 2)
+            # 同一発送の同一項目の別観測（変換器版違い）だけが競合
+            other = ledger.SourceRef("30", "5", 1, "app30_record", "9")
+            await ledger.ingest_source(other, ("40", "1"), [ledger.FactIn(
+                "shipping:5", "app30.件名", "text", "別の件名", ledger.make_locator("件名"))])
+            c = await ledger.list_conflicts()
+            self.assertEqual([(x["subject_id"], x["item_code"]) for x in c],
+                             [("shipping:5", "app30.件名")])
+            self.assertEqual({f["value_text"] for f in c[0]["facts"]}, {"受理通知送付状", "別の件名"})
         run(body())
 
 

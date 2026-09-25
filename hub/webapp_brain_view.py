@@ -1,16 +1,19 @@
 """webapp_brain_view — BRAIN-A1-LEDGER-1: 案件脳の確認ビュー（PWA・v3 §4-2・§9）
 
-一覧（紐付け待ち・保留〔不一致/出典確認不能〕・競合・再確認・同期状態・案件の事実）
-と操作（確認/却下/撤回・紐付け訂正）のみ。質問回答は載せない（A2）。
+一覧（紐付け待ち・保留〔不一致/出典確認不能/関連喪失〕・競合・再確認・同期状態・
+案件の事実）と操作（確認/却下/撤回・紐付け訂正）のみ。質問回答は載せない（A2）。
 
 規律:
 - 認証は P4-001 の関所 `_gate` のみ（公開例外なし）。応答は no-store, private。
 - 操作は form POST（PRG・303）。操作 ID（クライアント生成 UUID）で冪等、画面が
-  見ていた対象版（seen_version）と現在の版の一致検査。不一致は **409 で最新**を
-  返す（古い画面の操作で現状態を上書きしない）。未認証は関所が 303→login。
-- 台帳（DB）以外へ書かない。kintone を import しない（読取もしない＝台帳経由）。
-  外部送信なし。logging 非 import（PII の反射経路を持たない）。入力値は応答へ
-  反射しない（不正入力は固定 400）。DB 障害は固定 503（既存業務へ伝播しない）。
+  見ていた対象版（seen_version／seen_link_version＋seen_source_revision）と現在の
+  版の一致検査。不一致は **409 で最新**を返す（古い画面の操作で現状態を上書き
+  しない）。未認証は関所が 303→login。
+- 紐付け訂正の訂正先は App 40 の実在レコード（台帳に存在 かつ 正本に実在・BA-06）。
+  正本の確認は brain_sync の読取 helper 経由（本 module は kintone を import しない）。
+- 台帳（DB）以外へ書かない。外部送信なし。logging 非 import（PII の反射経路を
+  持たない）。入力値は応答へ反射しない（不正入力は固定 400）。DB 障害は固定 503
+  （既存業務へ伝播しない）。
 """
 
 import re
@@ -39,6 +42,10 @@ def _bad_request() -> Response:
 
 def _unavailable() -> Response:
     return JSONResponse({"error": "ledger_unavailable"}, status_code=503)
+
+
+def _source_unavailable(status: int) -> Response:
+    return JSONResponse({"error": ledger.FLAG_SOURCE_UNAVAILABLE}, status_code=status)
 
 
 def _limit(request: Request) -> int | None:
@@ -119,7 +126,8 @@ async def api_recheck(request: Request):
 @router.get("/app/api/brain/facts")
 @_gate
 async def api_facts(request: Request):
-    """案件の現在の事実（確認操作の対象を選ぶための一覧）。"""
+    """案件の現在の事実（確認操作の対象を選ぶための一覧）。鮮度は案件に紐づく全出典の
+    集約（BA-07）。出典確認不能の fact は flag 付きで返す（確認対象外）。"""
     q = request.query_params
     app_id, rid = q.get("app", ""), q.get("record", "")
     if not _DIGITS_RE.fullmatch(app_id) or not _DIGITS_RE.fullmatch(rid):
@@ -127,17 +135,19 @@ async def api_facts(request: Request):
     try:
         facts = await ledger.list_case_facts(app_id, rid, current_only=True)
         events = await ledger.list_case_events(app_id, rid)
-        freshness = await ledger.case_freshness(app_id, rid, brain_sync.TARGET_APP40)
+        fresh = await ledger.case_freshness_detail(
+            app_id, rid, brain_sync.TARGET_APP40, brain_sync.source_targets())
         for f in facts:
             f["confirmations"] = await ledger.list_confirmations(f["fact_id"])
     except Exception:
         return _unavailable()
-    return {"case_app_id": app_id, "case_record_id": rid, "freshness": freshness,
-            "facts": facts, "events": events}
+    return {"case_app_id": app_id, "case_record_id": rid, "freshness": fresh["state"],
+            "freshness_reasons": fresh["reasons"], "facts": facts, "events": events}
 
 
 async def brain_confirm(request: Request):
-    """確認/却下/撤回（PRG）。操作 ID 冪等・対象版一致（不一致は 409 で最新）。"""
+    """確認/却下/撤回（PRG）。操作 ID 冪等・対象版一致（不一致は 409 で最新）。
+    出典確認不能の fact への確認/却下は 409（source_unavailable・BA-07）。"""
     form = await request.form()
     operation_id = str(form.get("operation_id") or "")
     fact_id = str(form.get("fact_id") or "")
@@ -161,6 +171,8 @@ async def brain_confirm(request: Request):
     except ledger.VersionConflict as exc:
         return JSONResponse({"error": "version_conflict", "current": exc.current},
                             status_code=409)
+    except ledger.SourceUnavailable:
+        return _source_unavailable(409)
     except ledger.LedgerError:
         return _bad_request()
     except Exception:
@@ -170,23 +182,45 @@ async def brain_confirm(request: Request):
 
 
 async def brain_relink(request: Request):
-    """紐付け訂正（PRG）。履歴追加のみ・操作 ID 冪等。"""
+    """紐付け訂正（PRG・BA-06）。履歴追加のみ・操作 ID 冪等。
+    seen_link_version と seen_source_revision は必須（現在値と不一致は 409 で最新）。
+    訂正先は App 40 の実在レコード（台帳に存在 かつ 正本に実在）。不正は固定 400。
+    正本の確認ができない（読取失敗）ときは 503（訂正を通さない＝fail-closed）。"""
     form = await request.form()
     operation_id = str(form.get("operation_id") or "")
     src_app = str(form.get("source_app_id") or "")
     src_rec = str(form.get("source_record_id") or "")
     case_app = str(form.get("case_app_id") or "")
     case_rec = str(form.get("case_record_id") or "")
+    seen_link = str(form.get("seen_link_version") or "")
+    seen_rev = str(form.get("seen_source_revision") or "")
     reason = str(form.get("reason") or "").strip()
     if (not _UUID_RE.fullmatch(operation_id) or not _DIGITS_RE.fullmatch(src_app)
             or not _DIGITS_RE.fullmatch(src_rec) or not _DIGITS_RE.fullmatch(case_app)
-            or not _DIGITS_RE.fullmatch(case_rec) or len(reason) > _REASON_MAX):
+            or not _DIGITS_RE.fullmatch(case_rec) or not _DIGITS_RE.fullmatch(seen_link)
+            or not _DIGITS_RE.fullmatch(seen_rev) or len(reason) > _REASON_MAX):
+        return _bad_request()
+    if case_app != brain_sync.APP_HOUKI.app_id():
+        return _bad_request()                 # 訂正先は App 40 のみ
+    try:
+        if not await ledger.case_exists(case_app, case_rec):
+            return _bad_request()             # 台帳に無い案件へは訂正できない
+    except Exception:
+        return _unavailable()
+    exists = await brain_sync.app40_exists_in_source(case_rec)
+    if exists is None:
+        return _source_unavailable(503)
+    if exists is False:
         return _bad_request()
     try:
         result = await ledger.relink_source(
             source_app_id=src_app, source_record_id=src_rec,
             new_case=(case_app, case_rec), reason=reason or "manual_relink",
-            operation_id=operation_id, actor=ACTOR)
+            operation_id=operation_id, actor=ACTOR,
+            seen_link_version=int(seen_link), seen_source_revision=int(seen_rev))
+    except ledger.VersionConflict as exc:
+        return JSONResponse({"error": "version_conflict", "current": exc.current},
+                            status_code=409)
     except ledger.LedgerError:
         return _bad_request()
     except Exception:

@@ -49,7 +49,7 @@ button.sub{background:#fff;color:#3a4a63;border-color:#9aa7bd}
 <div id="sync" class="card"><span class="empty">読み込み中…</span></div>
 <h2>紐付け待ち（案件キーの無い出典）</h2>
 <div id="pending"><span class="empty">読み込み中…</span></div>
-<h2>保留（抽出結果の不一致・出典確認不能）</h2>
+<h2>保留（抽出結果の不一致・出典確認不能・関連喪失）</h2>
 <div id="holds"><span class="empty">読み込み中…</span></div>
 <h2>競合（有効な別出典間で値が異なる）</h2>
 <div id="conflicts"><span class="empty">読み込み中…</span></div>
@@ -132,14 +132,20 @@ button.sub{background:#fff;color:#3a4a63;border-color:#9aa7bd}
       d.enabled ? "同期: 有効" : "同期: 停止中（BRAIN_SYNC_ENABLED 未設定）"));
     const t = document.createElement("table");
     const h = t.insertRow();
-    for (const x of ["対象", "状態", "確認済み範囲", "カーソル", "最終成功", "定期照合", "追跡再照合"]) {
+    for (const x of ["対象", "種別", "状態", "確認済み範囲", "カーソル／継続位置", "走査上限", "最終成功", "定期照合", "追跡再照合（一巡完了）"]) {
       h.appendChild(el("th", "", x));
     }
     const cursors = (d.sync && d.sync.cursors) || [];
     for (const c of cursors) {
       const r = t.insertRow();
-      for (const x of [c.target_app, c.state, c.confirmed_until, c.cursor_updated_at,
-                       c.last_ok_at, c.last_reconcile_at, c.last_recheck_at]) {
+      const isRecheck = c.kind === "recheck";
+      const pos = isRecheck ? (c.cursor_record_id ? "No." + c.cursor_record_id + " まで" : "")
+                            : c.cursor_updated_at;
+      for (const x of [c.target_app, isRecheck ? "追跡再照合" : "同期", c.state,
+                       isRecheck ? "" : c.confirmed_until, pos,
+                       isRecheck ? "" : (c.page_position ? c.scan_upper_bound + "（再開待ち）" : c.scan_upper_bound),
+                       c.last_ok_at, c.last_reconcile_at,
+                       isRecheck ? (c.recheck_completed_at || "未完了") : c.last_recheck_at]) {
         r.appendChild(el("td", "", x || "−"));
       }
     }
@@ -171,8 +177,10 @@ button.sub{background:#fff;color:#3a4a63;border-color:#9aa7bd}
         c.appendChild(el("div", "meta", "候補: " + caseKey(cand.case_app_id, cand.case_record_id) +
           "（" + cand.trust + "・自動確定しない）"));
       }
+      // 画面が見ていた紐付け版・出典 revision を送る（サーバが現在値と照合・不一致は 409）
       const f = opForm(RELINK_PATH,
-        {source_app_id: r.source_app_id, source_record_id: r.source_record_id},
+        {source_app_id: r.source_app_id, source_record_id: r.source_record_id,
+         seen_link_version: r.link_version, seen_source_revision: r.source_revision},
         "この案件へ紐付ける", (form) => {
           const a = document.createElement("input");
           a.type = "text"; a.name = "case_app_id"; a.placeholder = "案件アプリID";
@@ -195,10 +203,13 @@ button.sub{background:#fff;color:#3a4a63;border-color:#9aa7bd}
     if (!d.records.length) { box.appendChild(el("span", "empty", "なし")); return; }
     for (const r of d.records) {
       const c = el("div", "card bad");
+      const label = r.state === "unavailable" ? "出典確認不能（利用停止中）"
+        : r.state === "detached" ? "関連喪失（利用停止・紐付け待ちにしない）"
+        : "抽出結果の不一致（保留）";
       c.appendChild(el("div", "", "出典 App " + r.source_app_id + " No." + r.source_record_id +
-        "（rev " + r.revision + "）: " +
-        (r.state === "unavailable" ? "出典確認不能（利用停止中）" : "抽出結果の不一致（保留）")));
+        "（rev " + r.revision + "）: " + label));
       if (r.case_app_id) { c.appendChild(el("div", "meta", caseKey(r.case_app_id, r.case_record_id))); }
+      if (r.hold_reason) { c.appendChild(el("div", "meta", "理由: " + r.hold_reason)); }
       box.appendChild(c);
     }
   }
@@ -264,18 +275,22 @@ button.sub{background:#fff;color:#3a4a63;border-color:#9aa7bd}
     const d = await getJson("/app/api/brain/facts?app=" + app + "&record=" + rec, "facts");
     if (!d) { return; }
     box.replaceChildren();
-    box.appendChild(el("div", "meta", caseKey(d.case_app_id, d.case_record_id) + "・鮮度: " + d.freshness));
+    box.appendChild(el("div", "meta", caseKey(d.case_app_id, d.case_record_id) + "・鮮度: " + d.freshness +
+      ((d.freshness_reasons || []).length ? "（" + d.freshness_reasons.join(", ") + "）" : "")));
     if (!d.facts.length) { box.appendChild(el("span", "empty", "現在の事実はありません（同期未完了か案件なし）。")); return; }
     for (const f of d.facts) {
-      const c = el("div", "card");
+      const c = el("div", f.flag ? "card bad" : "card");
       c.appendChild(el("div", "", factLine(f)));
+      if (f.flag) { c.appendChild(el("span", "tag ng", "出典確認不能（確認・採用の対象外）")); }
       const active = (f.confirmations || []).filter((x) => x.decision !== "revoke");
       for (const x of (f.confirmations || [])) {
         c.appendChild(el("div", "meta", "確認 #" + x.confirmation_id + " " + x.decision +
           "（版 " + x.fact_version + "・" + x.decided_at + "）" + (x.reason ? " " + x.reason : "")));
       }
-      c.appendChild(confirmForm(f));
-      c.appendChild(rejectForm(f));
+      if (!f.flag) {
+        c.appendChild(confirmForm(f));
+        c.appendChild(rejectForm(f));
+      }
       for (const x of active) {
         const revoked = (f.confirmations || []).some((y) => y.revoked_of === x.confirmation_id);
         if (!revoked) { c.appendChild(revokeForm(f, x.confirmation_id, f.version)); }
