@@ -308,6 +308,17 @@ class TestIdempotency(BrainDbMixin):
         self.assertEqual(ledger.STALE_STATE, "stale")                                # R11
         self.assertIs(sync.PENDING_RECHECK, ledger.FLAG_PENDING_RECHECK)
 
+    def test_fix3_columns_and_vocabulary_pinned(self):
+        for table in (ledger.sync_run, ledger.sync_cursor):                          # BA-17
+            self.assertIn("pending_unregistered", table.c)
+            self.assertFalse(table.c.pending_unregistered.nullable)
+        self.assertEqual(ledger.RUN_STATES, ("running", "ok", "failed", "stopped", "partial"))
+        src = (REPO / "alembic" / "versions" / "20260923_b8c1d4e7f2a5_brain_ledger.py"
+               ).read_text(encoding="utf-8")
+        self.assertEqual(src.count('"pending_unregistered", sa.Integer, nullable=False'), 2)
+        self.assertIn("'partial'", src)
+        self.assertEqual(sync.STALE_KNOWN, "stale_known")                            # R13
+
 
 class TestMigrationRoundTrip(unittest.TestCase):
     """alembic b8c1d4e7f2a5 の revision 接続と表・制約の pin。up→down 往復の実行は

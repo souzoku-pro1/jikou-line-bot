@@ -154,6 +154,12 @@ button.sub{background:#fff;color:#3a4a63;border-color:#9aa7bd}
     const counts = (d.sync && d.sync.ingest_counts) || {};
     const m = el("div", "meta", "取込: " + Object.keys(counts).map((k) => k + "=" + counts[k]).join(" / "));
     box.appendChild(m);
+    const pend = (d.sync && d.sync.pending_recheck) || 0;
+    const unreg = (d.sync && d.sync.pending_unregistered) || 0;
+    if (pend || unreg) {
+      box.appendChild(el("div", "sys err", "未解決: 判定不能（再照合待ち）" + pend +
+        " 件 / 初見で判定不能（未登録・次回同期で再試行）" + unreg + " 件"));
+    }
     const runs = (d.sync && d.sync.runs) || [];
     for (const run of runs.slice(0, 5)) {
       box.appendChild(el("div", "meta",

@@ -62,7 +62,7 @@ CONFIDENCE_VALUES = ("high", "medium", "low")
 DECISION_VALUES = ("confirm", "reject", "revoke")
 INGEST_STATES = ("ingested", "mismatch_hold", "unavailable", "held", "detached")
 TRUST_LEVELS = ("auto", "candidate", "hold")
-RUN_STATES = ("running", "ok", "failed", "stopped")
+RUN_STATES = ("running", "ok", "failed", "stopped", "partial")   # partial: 未解決あり（R12/BA-17）
 CURSOR_STATES = ("synced", "incomplete", "error", "stopped")
 CURSOR_KIND_SYNC = "sync"
 CURSOR_KIND_RECHECK = "recheck"
@@ -412,7 +412,9 @@ sync_run = sa.Table(
     sa.Column("pages_done", sa.Integer, nullable=False, server_default="0"),
     sa.Column("records_seen", sa.Integer, nullable=False, server_default="0"),
     sa.Column("confirmed_range", _JSON, nullable=True),
-    sa.CheckConstraint("status IN ('running', 'ok', 'failed', 'stopped')",
+    # BA-17: 初見の出典で判定不能になった件数（出典行が無いため run に永続化）
+    sa.Column("pending_unregistered", sa.Integer, nullable=False, server_default="0"),
+    sa.CheckConstraint("status IN ('running', 'ok', 'failed', 'stopped', 'partial')",
                        name="ck_sync_run_status"),
 )
 
@@ -434,6 +436,8 @@ sync_cursor = sa.Table(
     # BA-05: 追跡再照合の一巡（開始・完了）。「全件照合済み」は完了時刻でのみ判定
     sa.Column("recheck_started_at", sa.DateTime(timezone=True), nullable=True),
     sa.Column("recheck_completed_at", sa.DateTime(timezone=True), nullable=True),
+    # BA-17: 直近の走査で未登録のまま判定不能だった件数（0 になるまで synced にしない）
+    sa.Column("pending_unregistered", sa.Integer, nullable=False, server_default="0"),
     sa.Column("state", sa.Text, nullable=False),
     sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
     sa.CheckConstraint("state IN ('synced', 'incomplete', 'error', 'stopped')",
@@ -760,8 +764,11 @@ async def _ingest_stale_tx(session, src: SourceRef, facts: list, now, s: dict) -
     if case is not None:
         for f in facts:
             await _ingest_one(session, src, case[0], case[1], f, now, s, False)
-    await _upsert_ingest(session, src, state=cur.state if cur is not None else "held",
-                         case_key=case,
+    # mismatch_hold は revision 単位の保留なので旧版の行には写さない（他は出典単位の状態）
+    state = cur.state if cur is not None else "held"
+    if state == "mismatch_hold":
+        state = "ingested"
+    await _upsert_ingest(session, src, state=state, case_key=case,
                          hold_reason=cur.hold_reason if cur is not None else "pending_link",
                          now=now)
     if cur is not None and cur.pending_recheck:
@@ -785,13 +792,23 @@ async def _ingest_record_tx(session, src: SourceRef, case_key, facts: list,
         await _detach_source_tx(session, src.app_id, src.record_id, now=now,
                                 source_revision=src.revision, **change)
         s["detached"] += 1
+    # R13/BA-15: ここに来た＝有効な最新版の判定に成功（採用・不採用を問わず）。
+    # 当該出典の全取込行の pending_recheck を同一トランザクションで解除する
+    await session.execute(sa.update(source_ingest).where(
+        _source_where(source_ingest, src.app_id, src.record_id),
+        source_ingest.c.pending_recheck.is_(True)).values(pending_recheck=False))
     if case_key is None:
         state = extras.get("ingest_state") or "held"
         if state not in ("held", "detached"):
             raise LedgerError("ingest_state_not_in_closed_set")
+        hold_reason = extras.get("hold_reason") or "pending_link"
         await _upsert_ingest(session, src, state=state, case_key=None,
-                             hold_reason=extras.get("hold_reason") or "pending_link",
-                             now=now)
+                             hold_reason=hold_reason, now=now)
+        # R13: 有効な最新版の判定に成功した＝unavailable だった行も同じ状態へ復旧
+        await session.execute(sa.update(source_ingest).where(
+            _source_where(source_ingest, src.app_id, src.record_id),
+            source_ingest.c.state == "unavailable").values(
+            state=state, hold_reason=hold_reason, last_checked_at=now))
         s["state"] = state
         return
     case_app, case_rec = str(case_key[0]), str(case_key[1])
@@ -803,16 +820,13 @@ async def _ingest_record_tx(session, src: SourceRef, case_key, facts: list,
         await _ingest_event(session, src, case_app, case_rec, ev, s)
     await _upsert_ingest(session, src, state="ingested", case_key=(case_app, case_rec),
                          hold_reason=None, now=now)
-    # 案件紐付けの現在値は出典単位: 以前 held/detached だった旧 revision の行も追随
+    # 案件紐付けの現在値は出典単位: 以前 held/detached だった旧 revision の行も追随。
+    # R13/BA-14: 有効な最新版の取込に成功した＝unavailable もここで ingested へ復旧する
     await session.execute(sa.update(source_ingest).where(
         _source_where(source_ingest, src.app_id, src.record_id),
-        source_ingest.c.state.in_(("held", "detached"))).values(
+        source_ingest.c.state.in_(("held", "detached", "unavailable"))).values(
         state="ingested", case_app_id=case_app, case_record_id=case_rec,
         hold_reason=None, last_checked_at=now))
-    # 判定が成功して取り込めた＝pending_recheck を解除（R12）
-    await session.execute(sa.update(source_ingest).where(
-        _source_where(source_ingest, src.app_id, src.record_id),
-        source_ingest.c.pending_recheck.is_(True)).values(pending_recheck=False))
     s["state"] = "ingested"
 
 
@@ -854,19 +868,26 @@ def _series_fact_where(src: SourceRef, f: FactIn):
                    case_fact.c.item_code == f.item_code)
 
 
-async def _retired_predecessor(session, src: SourceRef, f: FactIn):
-    """関連喪失・行消去で外れた系列の最後の fact（後継の無いもの）。復帰時の
-    supersedes 元にする（履歴を切らない）。"""
+async def _retired_predecessor(session, src: SourceRef, f: FactIn, case_app: str,
+                               case_rec: str) -> tuple:
+    """関連喪失・行消去で外れた系列の最後の fact。戻り値 (same_case_pred, other_case_pred)。
+    supersedes は**同じ案件**の系列にだけ張る（BA-16: 案件間の往復で UNIQUE(supersedes)
+    に触れない・履歴は案件ごとに一直線）。別案件の直前行は prev_case の情報にだけ使う。"""
     rows = (await session.execute(sa.select(case_fact).where(
         _series_fact_where(src, f), case_fact.c.is_current.is_(False),
         case_fact.c.invalid_reason.in_(RETIRED_REASONS))
         .order_by(case_fact.c.fact_id.desc()))).fetchall()
+    same = other = None
     for row in rows:
-        has_successor = (await session.execute(sa.select(case_fact.c.fact_id).where(
-            case_fact.c.supersedes_fact_id == row.fact_id))).first()
-        if has_successor is None:
-            return row
-    return None
+        if (row.case_app_id, row.case_record_id) == (case_app, case_rec):
+            if same is None:
+                has_successor = (await session.execute(sa.select(case_fact.c.fact_id).where(
+                    case_fact.c.supersedes_fact_id == row.fact_id))).first()
+                if has_successor is None:
+                    same = row
+        elif other is None:
+            other = row
+    return same, other
 
 
 async def _ingest_one(session, src: SourceRef, case_app: str, case_rec: str,
@@ -916,8 +937,8 @@ async def _ingest_one(session, src: SourceRef, case_app: str, case_rec: str,
                 invalid_reason=INVALID_STALE, **base))
             summary["inserted"] += 1
             return
-        pred = await _retired_predecessor(session, src, f)
-        if pred is None:
+        same, other = await _retired_predecessor(session, src, f, case_app, case_rec)
+        if same is None and other is None:
             if empty:
                 summary["skipped"] += 1          # 値なし・履歴も無し＝積まない
                 return
@@ -925,16 +946,18 @@ async def _ingest_one(session, src: SourceRef, case_app: str, case_rec: str,
                 case_app_id=case_app, case_record_id=case_rec, is_current=True, **base))
             summary["inserted"] += 1
             return
-        # 関連喪失・行消去の後の復帰: 履歴を繋ぐ（旧案件と違えば prev_case を残す）
-        await _assert_no_cycle(session, None, int(pred.fact_id))
-        moved = (pred.case_app_id, pred.case_record_id) != (case_app, case_rec)
+        # 関連喪失・行消去の後の復帰: 同じ案件の直前行にだけ supersedes を張る（一直線）。
+        # 別案件から戻ってきた場合は prev_case を残す（supersedes は張らない・BA-16）
+        if same is not None:
+            await _assert_no_cycle(session, None, int(same.fact_id))
         await session.execute(sa.insert(case_fact).values(
             case_app_id=case_app, case_record_id=case_rec, is_current=True,
-            supersedes_fact_id=int(pred.fact_id),
-            prev_case_app_id=pred.case_app_id if moved else None,
-            prev_case_record_id=pred.case_record_id if moved else None, **base))
+            supersedes_fact_id=int(same.fact_id) if same is not None else None,
+            prev_case_app_id=other.case_app_id if (same is None and other is not None) else None,
+            prev_case_record_id=other.case_record_id if (same is None and other is not None) else None,
+            **base))
         summary["inserted"] += 1
-        if moved:
+        if same is None:
             summary["moved"] += 1
         return
     moved = (head.case_app_id, head.case_record_id) != (case_app, case_rec)
@@ -943,14 +966,16 @@ async def _ingest_one(session, src: SourceRef, case_app: str, case_rec: str,
         if not changed:
             summary["skipped"] += 1
             return
-        await _assert_no_cycle(session, None, int(head.fact_id))
+        if not moved:
+            await _assert_no_cycle(session, None, int(head.fact_id))
         await session.execute(sa.update(case_fact).where(
             case_fact.c.fact_id == head.fact_id).values(
             is_current=False, invalidated_at=now,
             invalid_reason=(INVALID_LINK_MOVED if moved else INVALID_SUPERSEDED)))
+        # 案件をまたぐ移動は supersedes を張らない（案件ごとの履歴を一直線に保つ・BA-16）
         await session.execute(sa.insert(case_fact).values(
             case_app_id=case_app, case_record_id=case_rec, is_current=True,
-            supersedes_fact_id=int(head.fact_id),
+            supersedes_fact_id=None if moved else int(head.fact_id),
             prev_case_app_id=head.case_app_id if moved else None,
             prev_case_record_id=head.case_record_id if moved else None, **base))
         summary["inserted"] += 1
@@ -1042,11 +1067,15 @@ async def _detach_source_tx(session, source_app_id: str, source_record_id: str, 
         _source_where(case_event, source_app_id, source_record_id),
         case_event.c.is_current.is_(True)).values(
         is_current=False, invalid_reason=reason_code, invalidated_at=now))
+    # 取込行の現在値を移す。mismatch_hold（revision 単位の保留）と unavailable（復旧は
+    # 有効な最新版の照合成功時だけ・R13）は状態を保ったまま案件だけ移す
     await session.execute(sa.update(source_ingest).where(
         _source_where(source_ingest, source_app_id, source_record_id)).values(
         case_app_id=new_case[0] if new_case else None,
         case_record_id=new_case[1] if new_case else None,
-        state="ingested" if new_case else ingest_state,
+        state=sa.case((source_ingest.c.state.in_(("mismatch_hold", "unavailable")),
+                       source_ingest.c.state),
+                      else_="ingested" if new_case else ingest_state),
         hold_reason=None if new_case else reason, last_checked_at=now))
     return {"link_id": int(link.inserted_primary_key[0]), "prev": prev,
             "moved_facts": int(facts.rowcount or 0),
@@ -1267,8 +1296,10 @@ async def relink_source(*, source_app_id: str, source_record_id: str,
 
 async def _reproject_tx(session, live_facts: list, live_events: list, new_case: tuple,
                         now) -> tuple:
-    """訂正先へ fact/event を積み直す（BA-11）。同じ一意キーの行が移動先に既にあれば
-    復帰（is_current=True）、無ければ旧行を supersedes 元とする新行を作る。"""
+    """訂正先へ fact/event を積み直す（BA-11/BA-16）。案件をまたぐ移動は supersedes を
+    張らず prev_case で出所を残す（案件ごとの供述は一直線・UNIQUE(supersedes) に触れない）。
+    同じ一意キー（同じ観測×同じ案件×同じ revision）の行が移動先に既にあるときは、
+    uq_case_fact_key により新行を作れないため、その行を現在値へ戻す（供述の重複は作らない）。"""
     case_app, case_rec = new_case
     n_facts = 0
     for f in live_facts:
@@ -1281,15 +1312,17 @@ async def _reproject_tx(session, live_facts: list, live_events: list, new_case: 
             case_fact.c.locator == f.locator,
             case_fact.c.converter_name == f.converter_name,
             case_fact.c.converter_version == f.converter_version))).first()
+        moved = (f.case_app_id, f.case_record_id) != (case_app, case_rec)
         if existing is not None:
             if not existing.is_current:
                 await session.execute(sa.update(case_fact).where(
                     case_fact.c.fact_id == existing.fact_id).values(
-                    is_current=True, invalid_reason=None, invalidated_at=None))
+                    is_current=True, invalid_reason=None, invalidated_at=None,
+                    prev_case_app_id=f.case_app_id if moved else existing.prev_case_app_id,
+                    prev_case_record_id=(f.case_record_id if moved
+                                         else existing.prev_case_record_id)))
                 n_facts += 1
             continue
-        moved = (f.case_app_id, f.case_record_id) != (case_app, case_rec)
-        await _assert_no_cycle(session, None, int(f.fact_id))
         await session.execute(sa.insert(case_fact).values(
             case_app_id=case_app, case_record_id=case_rec, subject_id=f.subject_id,
             item_code=f.item_code, value_type=f.value_type, value_text=f.value_text,
@@ -1299,7 +1332,7 @@ async def _reproject_tx(session, live_facts: list, live_events: list, new_case: 
             converter_name=f.converter_name, converter_version=f.converter_version,
             observation_id=f.observation_id, occurred_at=f.occurred_at,
             observed_at=now, confidence=f.confidence, is_current=True,
-            supersedes_fact_id=int(f.fact_id),
+            supersedes_fact_id=None,
             prev_case_app_id=f.case_app_id if moved else None,
             prev_case_record_id=f.case_record_id if moved else None))
         n_facts += 1
@@ -1466,14 +1499,25 @@ async def list_holds(limit: int = 100) -> list[dict]:
             sa.select(source_ingest).where(sa.or_(
                 source_ingest.c.state.in_(("mismatch_hold", "unavailable", "detached")),
                 source_ingest.c.pending_recheck.is_(True)))
-            .order_by(source_ingest.c.ingest_id.desc()).limit(limit))).fetchall()
-        return [{"source_app_id": r.source_app_id,
-                 "source_record_id": r.source_record_id,
-                 "revision": int(r.source_revision), "state": r.state,
-                 "case_app_id": r.case_app_id, "case_record_id": r.case_record_id,
-                 "hold_reason": r.hold_reason or "",
-                 "pending_recheck": bool(r.pending_recheck),
-                 "last_checked_at": _iso(r.last_checked_at)} for r in rows]
+            .order_by(source_ingest.c.source_revision.desc(),
+                      source_ingest.c.ingest_id.desc()))).fetchall()
+        out = []
+        seen = set()
+        for r in rows:                       # 出典レコードごとに 1 行（最新 revision）
+            key = (r.source_app_id, r.source_record_id)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append({"source_app_id": r.source_app_id,
+                        "source_record_id": r.source_record_id,
+                        "revision": int(r.source_revision), "state": r.state,
+                        "case_app_id": r.case_app_id, "case_record_id": r.case_record_id,
+                        "hold_reason": r.hold_reason or "",
+                        "pending_recheck": bool(r.pending_recheck),
+                        "last_checked_at": _iso(r.last_checked_at)})
+            if len(out) >= limit:
+                break
+        return out
 
 
 async def list_conflicts(limit: int = 100) -> list[dict]:
@@ -1616,6 +1660,7 @@ def _cursor_view(row) -> dict:
             "last_recheck_at": _iso(row.last_recheck_at),
             "recheck_started_at": _iso(row.recheck_started_at),
             "recheck_completed_at": _iso(row.recheck_completed_at),
+            "pending_unregistered": int(row.pending_unregistered or 0),
             "updated_at": _iso(row.updated_at)}
 
 
@@ -1667,7 +1712,8 @@ async def start_run(target_app: str, scan_upper_bound: str, *, now=None) -> int:
 
 async def finish_run(run_id: int, status: str, *, failure: str | None = None,
                      incomplete_page=None, pages_done: int = 0,
-                     records_seen: int = 0, confirmed_range=None, now=None) -> None:
+                     records_seen: int = 0, confirmed_range=None,
+                     pending_unregistered: int = 0, now=None) -> None:
     if status not in RUN_STATES:
         raise LedgerError("run_state_not_in_closed_set")
     now = now or _now()
@@ -1676,7 +1722,9 @@ async def finish_run(run_id: int, status: str, *, failure: str | None = None,
                               .values(status=status, failure=failure,
                                       incomplete_page=incomplete_page,
                                       pages_done=pages_done, records_seen=records_seen,
-                                      confirmed_range=confirmed_range, finished_at=now))
+                                      confirmed_range=confirmed_range,
+                                      pending_unregistered=int(pending_unregistered),
+                                      finished_at=now))
 
 
 async def advance_cursor_with_page(target_app: str, run_id: int, *,
@@ -1739,12 +1787,16 @@ async def sync_overview() -> dict:
             .where(source_ingest.c.pending_recheck.is_(True)))).first()
         return {
             "pending_recheck": int(pending[0] or 0),
+            # BA-17: 出典行の無い未解決（初見で判定不能）の件数＝同期カーソルの合計
+            "pending_unregistered": sum(int(c.pending_unregistered or 0) for c in cursors
+                                        if c.kind == CURSOR_KIND_SYNC),
             "cursors": [_cursor_view(c) for c in cursors],
             "runs": [{"run_id": int(r.run_id), "target_app": r.target_app,
                       "status": r.status, "failure": r.failure,
                       "started_at": _iso(r.started_at), "finished_at": _iso(r.finished_at),
                       "pages_done": int(r.pages_done or 0),
                       "records_seen": int(r.records_seen or 0),
+                      "pending_unregistered": int(r.pending_unregistered or 0),
                       "incomplete_page": r.incomplete_page} for r in runs],
             "ingest_counts": {str(k): int(v) for k, v in counts},
         }
@@ -1797,10 +1849,11 @@ async def case_freshness_detail(case_app_id: str, case_record_id: str,
         if own_cursor is not None and own_cursor.state == "stopped":
             return {"state": "stopped", "reasons": ["sync_stopped"]}
         if own is None:
-            return {"state": "incomplete", "reasons": ["no_source"]}
-        state, reason = _source_state_eval(own, own_cursor, check_cursor=True)
-        if state != "synced":
-            return {"state": state, "reasons": [reason] if reason else []}
+            own_state, own_reasons = "incomplete", ["no_source"]
+        else:
+            state, reason = _source_state_eval(own, own_cursor, check_cursor=True)
+            own_state, own_reasons = state, ([reason] if reason else [])
+        # 紐付いた出典の理由は案件自身の状態に関わらず併記する（何が未解決かを隠さない）
         linked = (await session.execute(sa.select(source_ingest).where(
             source_ingest.c.case_app_id == case_app_id,
             source_ingest.c.case_record_id == case_record_id)
@@ -1827,6 +1880,8 @@ async def case_freshness_detail(case_app_id: str, case_record_id: str,
                 worst = "partial"
             elif worst != "partial":
                 worst = "incomplete"
+        if own_state != "synced":
+            return {"state": own_state, "reasons": own_reasons + reasons}
         return {"state": worst, "reasons": reasons}
 
 

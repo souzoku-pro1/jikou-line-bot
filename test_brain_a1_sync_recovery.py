@@ -447,6 +447,91 @@ class TestUndecidable(BrainDbMixin):
         run(body())
 
 
+class TestFix3Pending(BrainDbMixin):
+    """fix3 BA-15（判定成功による不採用でも pending 解除）/ BA-17（初見の判定不能を永続化）。"""
+
+    def test_decided_non_adopt_clears_pending(self):
+        self.fake.data["40"] = [app40(1, 1)]
+        self.fake.data["28"] = [app28(100, 1)]
+
+        async def body():
+            await sync.sync_target(sync.TARGET_APP40)
+            await sync.sync_target(sync.TARGET_APP28)
+            # LINE 検索失敗で pending（検索失敗時は保持）
+            self.fake.fail_at = {len(self.fake.calls) + 2}
+            rc = await sync.recheck_target(sync.TARGET_APP28)
+            self.assertEqual((rc["status"], rc["pending_recheck"], rc["complete"]), ("partial", 1, False))
+            self.assertEqual(await ledger.count_pending_recheck("28"), 1)
+            self.fake.raise_all = True
+            rc = await sync.recheck_target(sync.TARGET_APP28)
+            self.assertEqual(rc["status"], "failed")
+            self.assertEqual(await ledger.count_pending_recheck("28"), 1)     # 失敗では保持
+            self.fake.raise_all = False
+            # 対象外 category の新版 → 判定成功による不採用（関連解除 R10）＋pending 解除（同一 tx）
+            self.fake.data["28"] = [app28(100, 2, "2026-09-21T01:00:00Z", category="その他判断系")]
+            rc = await sync.recheck_target(sync.TARGET_APP28)
+            self.assertEqual((rc["status"], rc["pending_left"], rc["complete"]), ("ok", 0, True))
+            self.assertEqual([(h["source_record_id"], h["state"], h["pending_recheck"])
+                              for h in await ledger.list_holds()], [("100", "detached", False)])
+            self.assertEqual((await ledger.latest_link("28", "100"))["reason"], "category_out_of_set")
+            # detached のまま再び pending → 対象外のまま（変化なし）でも判定成功なら解除
+            await ledger.set_pending_recheck("28", "100", True)
+            rc = await sync.recheck_target(sync.TARGET_APP28)
+            self.assertEqual((rc["pending_left"], rc["complete"]), (0, True))
+            # 一意不成立・参照消去でも同じ（App 30: 参照消去）
+            self.fake.data["30"] = [app30(5, 1, 案件レコードID="1")]
+            await sync.sync_target(sync.TARGET_APP30)
+            await ledger.set_pending_recheck("30", "5", True)
+            self.fake.data["30"] = [app30(5, 2, "2026-09-21T01:00:00Z", 案件レコードID="")]
+            rc = await sync.recheck_target(sync.TARGET_APP30)
+            self.assertEqual((rc["pending_left"], rc["complete"]), (0, True))
+            self.assertEqual([p["hold_reason"] for p in await ledger.list_pending_links()],
+                             ["ref_not_digits"])
+        run(body())
+
+    def test_unregistered_undecidable_is_persisted_and_retried(self):
+        # BA-17: 初見の App 28 行の LINE 検索失敗 → run ok にならない・cursor synced にならない・
+        # overview に 1・再起動後（新しい run）も再試行・次回成功で解消
+        self.fake.data["40"] = [app40(1, 1)]
+        self.fake.data["28"] = [app28(100, 1)]
+
+        async def body():
+            await sync.sync_target(sync.TARGET_APP40)
+            self.fake.fail_at = {len(self.fake.calls) + 2}          # 1=ページ・2=LINE 検索
+            r = await sync.sync_target(sync.TARGET_APP28)
+            self.assertEqual((r["status"], r["pending_recheck"], r["pending_unregistered"]),
+                             ("partial", 1, 1))
+            self.assertIsNone(await ledger.latest_known_revision("28", "100"))   # 出典行は作らない
+            run_row = (await ledger.sync_overview())["runs"][0]
+            self.assertEqual((run_row["status"], run_row["failure"], run_row["pending_unregistered"]),
+                             ("partial", "pending_unregistered", 1))
+            cur = await ledger.get_cursor("app28")
+            self.assertEqual((cur["state"], cur["confirmed_until"], cur["pending_unregistered"],
+                              cur["cursor_updated_at"], cur["cursor_record_id"]),
+                             ("incomplete", "", 1, "2026-09-21T00:00:00Z", "100"))
+            self.assertEqual((await ledger.sync_overview())["pending_unregistered"], 1)
+            self.assertEqual(await ledger.case_freshness("28", "100", "app28"), "incomplete")
+            # 再起動（新しい run）でも再試行され、失敗が続く間は未完了表示が維持される
+            self.fake.fail_at = {len(self.fake.calls) + 2}
+            r = await sync.sync_target(sync.TARGET_APP28)
+            self.assertEqual((r["status"], r["pending_unregistered"]), ("partial", 1))
+            cur = await ledger.get_cursor("app28")
+            self.assertEqual((cur["state"], cur["confirmed_until"], cur["pending_unregistered"]),
+                             ("incomplete", "", 1))
+            self.assertEqual((await ledger.sync_overview())["pending_unregistered"], 1)
+            # 次回成功で解消
+            self.fake.fail_at = set()
+            r = await sync.sync_target(sync.TARGET_APP28)
+            self.assertEqual((r["status"], r["pending_unregistered"]), ("ok", 0))
+            self.assertEqual(await ledger.latest_known_revision("28", "100"), 1)
+            cur = await ledger.get_cursor("app28")
+            self.assertEqual((cur["state"], cur["pending_unregistered"]), ("synced", 0))
+            self.assertTrue(cur["confirmed_until"])
+            ov = await ledger.sync_overview()
+            self.assertEqual((ov["pending_unregistered"], ov["runs"][0]["status"]), (0, "ok"))
+        run(body())
+
+
 class _App:
     def __init__(self, app_id):
         self._id = app_id

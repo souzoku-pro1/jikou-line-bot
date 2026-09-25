@@ -492,8 +492,7 @@ class TestCorrectionHistory(BrainDbMixin):
                 row = (await session.execute(sa.select(ledger.case_fact).where(
                     ledger.case_fact.c.fact_id == subj["fact_id"]))).first()
             self.assertEqual((row.prev_case_app_id, row.prev_case_record_id), ("40", "1"))
-            self.assertEqual(row.supersedes_fact_id,
-                             [f for f in src_facts if f["item_code"] == "app30.件名"][0]["fact_id"])
+            self.assertIsNone(row.supersedes_fact_id)      # BA-16: 案件をまたぐ移動は supersedes を張らない
             self.assertEqual(await ledger.case_freshness_detail(
                 "40", "2", "app40", sync.source_targets()), {"state": "synced", "reasons": []})
             # 次回同期で重複は積まれない（訂正は手動優先のまま）
@@ -516,6 +515,100 @@ class TestCorrectionHistory(BrainDbMixin):
             self.assertTrue([f for f in await self._facts30(("40", "2")) if f["source_record_id"] == "6"])
             self.assertEqual(await ledger.case_freshness_detail(
                 "40", "2", "app40", sync.source_targets()), {"state": "synced", "reasons": []})
+        run(body())
+
+    # ── fix3: BA-14（復旧は有効な最新版の成功時だけ）/ BA-16（往復訂正の履歴は一直線） ──
+
+    def test_recovery_only_after_live_latest_success(self):
+        # rev3 まで取込済み → unavailable → 再照合で rev2（旧版）が返る → unavailable のまま・
+        # 鮮度は synced に戻らない。その後 rev3 以上が返って復旧
+        self.fake.data["40"] = [app40(1, 1)]
+        self.fake.data["30"] = [app30(5, 1)]
+
+        async def src_reason():
+            fd = await ledger.case_freshness_detail("40", "1", "app40", sync.source_targets())
+            return fd["state"], [r for r in fd["reasons"] if r.startswith("app30:5:")]
+
+        async def body():
+            await sync.sync_target(sync.TARGET_APP40)
+            await sync.sync_target(sync.TARGET_APP30)
+            self.fake.data["30"] = [app30(5, 3, "2026-09-21T02:00:00Z", 件名="第3版")]
+            await sync.sync_target(sync.TARGET_APP30)
+            self.fake.data["30"] = []
+            self.assertEqual((await sync.recheck_target(sync.TARGET_APP30))["unavailable"], 1)
+            self.assertEqual(await src_reason(), ("partial", ["app30:5:source_unavailable"]))
+            # 再照合で旧版 rev2 が返る（正本が巻き戻った・遅延複製など）→ 復旧しない
+            self.fake.data["30"] = [app30(5, 2, "2026-09-21T03:00:00Z", 件名="第2版")]
+            rc = await sync.recheck_target(sync.TARGET_APP30)
+            self.assertEqual((rc["status"], rc["unavailable"], rc["moved"]), ("ok", 0, 0))
+            self.assertEqual([(h["source_record_id"], h["state"]) for h in await ledger.list_holds()],
+                             [("5", "unavailable")])
+            self.assertEqual(await src_reason(), ("partial", ["app30:5:source_unavailable"]))
+            cur = [f for f in await self._facts30() if f["item_code"] == "app30.件名"]
+            self.assertEqual([(f["value_text"], f["version"]) for f in cur], [("第3版", 3)])
+            # 通常同期で旧版が見えても同じ（復旧しない）
+            self.assertEqual((await sync.sync_target(sync.TARGET_APP30))["status"], "ok")
+            self.assertEqual([h["state"] for h in await ledger.list_holds()], ["unavailable"])
+            # rev3（既知の最新版）が返る → 照合成功＝復旧（取込は不要）
+            self.fake.data["30"] = [app30(5, 3, "2026-09-21T02:00:00Z", 件名="第3版")]
+            await sync.recheck_target(sync.TARGET_APP30)
+            self.assertEqual(await ledger.list_holds(), [])
+            self.assertEqual(await src_reason(), ("synced", []))
+            # 再び unavailable → 新版 rev4 が返る → 取込成功と同じトランザクションで復旧
+            self.fake.data["30"] = []
+            await sync.recheck_target(sync.TARGET_APP30)
+            self.fake.data["30"] = [app30(5, 4, "2026-09-21T04:00:00Z", 件名="第4版")]
+            await sync.sync_target(sync.TARGET_APP30)
+            self.assertEqual(await ledger.list_holds(), [])
+            self.assertEqual([(f["value_text"], f["version"]) for f in await self._facts30()
+                              if f["item_code"] == "app30.件名"], [("第4版", 4)])
+        run(body())
+
+    def test_relink_round_trip_keeps_history_linear(self):
+        # BA-16: 案件1→案件2→案件1→案件3 の往復訂正が全部成功し、各案件の現在 fact が正しく、
+        # supersedes の一意制約に触れず、その後の再同期で重複しない
+        self.fake.data["40"] = [app40(1, 1), app40(2, 1), app40(3, 1)]
+        self.fake.data["30"] = [app30(5, 1)]
+
+        async def relink(to, op):
+            return await ledger.relink_source(
+                source_app_id="30", source_record_id="5", new_case=("40", to), reason="訂正",
+                operation_id=op, actor="owner",
+                seen_link_version=await ledger.link_version("30", "5"), seen_source_revision=1)
+
+        async def body():
+            await sync.sync_target(sync.TARGET_APP40)
+            await sync.sync_target(sync.TARGET_APP30)
+            n_facts = len(await self._facts30())
+            for to, op in (("2", "op-rt1"), ("1", "op-rt2"), ("3", "op-rt3")):
+                r = await relink(to, op)
+                self.assertFalse(r["duplicate"])
+                self.assertEqual(r["reprojected_facts"], n_facts)
+                for case in ("1", "2", "3"):
+                    self.assertEqual(len(await self._facts30(("40", case))),
+                                     n_facts if case == to else 0, (to, case))
+                self.assertEqual(await ledger.current_case_of_source("30", "5"), ("40", to))
+            # 履歴: 案件をまたぐ行は supersedes を持たず prev_case で出所を残す。UNIQUE 違反なし
+            async with session_scope() as session:
+                rows = (await session.execute(sa.select(ledger.case_fact).where(
+                    ledger.case_fact.c.source_app_id == "30",
+                    ledger.case_fact.c.item_code == "app30.件名")
+                    .order_by(ledger.case_fact.c.fact_id))).fetchall()
+            # 案件 1 の行は 2 手目で案件 2 から戻り（prev_case=2）、3 手目で再び link_moved
+            # （同じ観測×同じ案件×同じ revision は 1 行＝uq_case_fact_key）
+            self.assertEqual([(r.case_record_id, bool(r.is_current), r.prev_case_record_id) for r in rows],
+                             [("1", False, "2"), ("2", False, "1"), ("3", True, "1")])
+            self.assertTrue(all(r.supersedes_fact_id is None for r in rows))
+            self.assertEqual({r.invalid_reason for r in rows if not r.is_current}, {"link_moved"})
+            # 再同期で重複しない（手動優先のまま）
+            r = await sync.sync_target(sync.TARGET_APP30)
+            self.assertEqual((r["status"], r["inserted"]), ("ok", 0))
+            self.assertEqual(len(await self._facts30(("40", "3"))), n_facts)
+            # 4 手目: 案件3→案件2（案件2 には非現在の同一キー行がある）も成功
+            r = await relink("2", "op-rt4")
+            self.assertEqual(r["reprojected_facts"], n_facts)
+            self.assertEqual(len(await self._facts30(("40", "2"))), n_facts)
+            self.assertEqual(len(await self._facts30(("40", "3"))), 0)
         run(body())
 
 

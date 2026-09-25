@@ -290,7 +290,9 @@ class TestOperations(BrainDbMixin):
             # 案件自身のカーソルが error なら旧 confirmed_until で synced を返さない
             run(ledger.set_cursor_state("app40", "error"))
             d = facts()
-            self.assertEqual((d["freshness"], d["freshness_reasons"]), ("incomplete", ["cursor_error"]))
+            # fix3: 案件自身が未同期でも紐付いた出典の理由は隠さず併記する
+            self.assertEqual((d["freshness"], d["freshness_reasons"]),
+                             ("incomplete", ["cursor_error", "app30:5:source_unavailable"]))
             # 復帰
             run(ledger.set_cursor_state("app40", "synced"))
             self.fake.data["30"] = [app30(5, 1)]

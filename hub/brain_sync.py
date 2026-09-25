@@ -104,6 +104,8 @@ FAIL_MISMATCH = "mismatch_hold"
 FAIL_PAGE_LIMIT = "page_limit_reached"
 # R12: _prepare_ingest の戻り値「判定不能」（処理不要 None と区別する番兵）
 PENDING_RECHECK = ledger.FLAG_PENDING_RECHECK
+# R13: 既知の旧 revision による処理省略（復旧の契機にしない・None と区別する番兵）
+STALE_KNOWN = "stale_known"
 
 
 def brain_sync_enabled() -> bool:
@@ -395,7 +397,7 @@ async def _prepare_ingest(target: str, record: dict):
     if target != TARGET_APP40:
         stale = await _stale_input(target, record)
         if stale is not None:
-            return stale or None
+            return stale or STALE_KNOWN      # R11/R13: 旧版は履歴のみ・復旧の契機にしない
     if target == TARGET_APP40:
         src, case_key, facts, events = convert_app40(record)
         extras["subjects_seen"] = app40_subjects_seen(record)
@@ -429,7 +431,9 @@ async def _prepare_ingest(target: str, record: dict):
             change = brain_link.link_change_for(None, prev, lost_reason=reason,
                                                 ingest_state="detached")
             if change is None:
-                return None                  # R5: 取り込まない・保留にもしない
+                # R5: 取り込まない・保留にもしない。判定は成功したので pending は解除（BA-15）
+                await ledger.set_pending_recheck(APP_CHATLOG.app_id(), rid, False)
+                return None
             src = ledger.SourceRef(APP_CHATLOG.app_id(), rid, _revision(record),
                                    *CONVERTER[TARGET_APP28], updated_at=_s(record, "更新日時"))
             return src, None, [], [], {"link_change": change, "ingest_state": "detached",
@@ -445,6 +449,9 @@ async def _prepare_ingest(target: str, record: dict):
             if target != TARGET_APP40:
                 # 判定が成功した＝pending_recheck を解除（処理不要と判定不能を区別・R12）
                 await ledger.set_pending_recheck(src.app_id, src.record_id, False)
+            if status["state"] == "unavailable":
+                # R13: 有効な最新版の照合に成功（取込は不要）＝unavailable を復旧
+                await ledger.mark_source_checked(src.app_id, src.record_id)
             return None                      # revision 既知＝再処理しない
     return src, case_key, facts, events, extras
 
@@ -531,8 +538,11 @@ async def sync_target(target: str, *, now=None) -> dict:
     inserted = 0
     result = {"target": target, "run_id": run_id, "status": "ok", "pages": 0,
               "records": 0, "inserted": 0, "held": 0, "resumed": resume is not None,
-              "scan_upper_bound": scan_upper, "pending_recheck": 0}
+              "scan_upper_bound": scan_upper, "pending_recheck": 0,
+              "pending_unregistered": 0}
     pending = 0
+    unregistered = 0
+    first_unregistered = None                # 未登録で判定不能だった最初の (更新日時, $id)
     while pages < MAX_PAGES_PER_RUN:
         query = _page_query(base, cursor, start, scan_upper)
         try:
@@ -551,10 +561,18 @@ async def sync_target(target: str, *, now=None) -> dict:
             try:
                 prepared = await _prepare_ingest(target, record)
                 if prepared is PENDING_RECHECK:
-                    # R12: 判定不能。関連は保持し pending_recheck を記録（行が無ければ
-                    # 窓の再取得・定期照合で再試行）
-                    await ledger.set_pending_recheck(app.app_id(), rid, True, now=now)
+                    # R12: 判定不能。関連は保持し pending_recheck を記録。BA-17: 出典行が
+                    # 無い（初見）ときは run/cursor に件数と未完了を永続化し、次回は
+                    # その位置から取り直す（再起動後も再試行される）
+                    flagged = await ledger.set_pending_recheck(app.app_id(), rid, True, now=now)
+                    if flagged == 0 and await ledger.latest_known_revision(
+                            app.app_id(), rid) is None:
+                        unregistered += 1
+                        if first_unregistered is None:
+                            first_unregistered = (ts, rid)
                     pending += 1
+                    continue
+                if prepared is STALE_KNOWN:
                     continue
             except Exception:
                 await _fail(target, run_id, FAIL_DB, cursor, pages, records_seen, now)
@@ -590,13 +608,27 @@ async def sync_target(target: str, *, now=None) -> dict:
                     keep_position=True)
         result.update(status="failed", failure=FAIL_PAGE_LIMIT)
         return result
-    await ledger.set_cursor_state(target, "synced", now=now, confirmed_until=scan_upper,
-                                  scan_upper_bound=scan_upper, page_position=None,
-                                  last_ok_at=now, last_run_id=run_id)
-    await ledger.finish_run(run_id, "ok", pages_done=pages, records_seen=records_seen,
-                            confirmed_range={"until": scan_upper}, now=now)
+    if unregistered:
+        # BA-17: 走査は終えたが未登録の未解決が残る＝synced にせず confirmed_until も進めない。
+        # カーソルは最初の未解決レコードの位置へ戻し、次回はその 10 分前から取り直す
+        await ledger.set_cursor_state(
+            target, "incomplete", now=now, scan_upper_bound=scan_upper, page_position=None,
+            cursor_updated_at=first_unregistered[0], cursor_record_id=first_unregistered[1],
+            pending_unregistered=unregistered, last_run_id=run_id)
+        await ledger.finish_run(run_id, "partial", failure="pending_unregistered",
+                                pages_done=pages, records_seen=records_seen,
+                                pending_unregistered=unregistered, now=now)
+    else:
+        await ledger.set_cursor_state(target, "synced", now=now, confirmed_until=scan_upper,
+                                      scan_upper_bound=scan_upper, page_position=None,
+                                      pending_unregistered=0, last_ok_at=now,
+                                      last_run_id=run_id)
+        await ledger.finish_run(run_id, "partial" if pending else "ok", pages_done=pages,
+                                records_seen=records_seen,
+                                confirmed_range={"until": scan_upper}, now=now)
     result.update(pages=pages, records=records_seen, inserted=inserted,
-                  pending_recheck=pending, status="partial" if pending else "ok")
+                  pending_recheck=pending, pending_unregistered=unregistered,
+                  status="partial" if pending else "ok")
     _log_run_ok(target, pages, records_seen, inserted)
     if pending:
         _log_pending(pending)
@@ -681,7 +713,7 @@ async def _ingest_single(target: str, record_id: str) -> bool:
     if prepared is PENDING_RECHECK:
         await ledger.set_pending_recheck(app.app_id(), record_id, True)
         return False
-    if prepared is None:
+    if prepared is None or prepared is STALE_KNOWN:
         return False
     src, case_key, facts, events, extras = prepared
     await ledger.ingest_source(src, case_key, facts, events, extras=extras)
@@ -708,14 +740,20 @@ async def _recheck_one(target: str, app, rid: str, record: dict | None, now) -> 
         await ledger.set_pending_recheck(app.app_id(), rid, True, now=now)
         out["pending"] = 1
         return out
-    await ledger.mark_source_checked(app.app_id(), rid, now=now)     # 判定の後に復旧
+    if prepared is STALE_KNOWN:
+        return out                           # R13: 既知旧版による省略は復旧の契機にしない
     if prepared is None:
+        # 有効な最新版の判定に成功し取込は不要（同じ案件・現在値あり）＝復旧してよい
+        await ledger.mark_source_checked(app.app_id(), rid, now=now)
         return out
     src, case_key, facts, events, extras = prepared
     summary = await ledger.ingest_source(src, case_key, facts, events, extras=extras,
                                          now=now)
     if summary.get("stale"):
-        return out                           # R11: 履歴保存のみ・関連は変えていない
+        return out                           # R11/R13: 履歴保存のみ・関連も状態も変えない
+    # R13/BA-14: 有効な最新版の照合・取込が成功した後にだけ復旧（取込側で ingested へ
+    # 戻した行以外＝held/detached の出典の unavailable 行もここで戻す）
+    await ledger.mark_source_checked(app.app_id(), rid, now=now)
     if prev is not None and (case_key is None or tuple(prev) != tuple(case_key)):
         out["moved"] = 1                     # 移動または関連喪失（R10 の共通処理を通過）
     elif summary.get("moved"):
