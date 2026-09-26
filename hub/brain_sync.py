@@ -436,8 +436,10 @@ async def _prepare_ingest(target: str, record: dict):
             change = brain_link.link_change_for(None, prev, lost_reason=reason,
                                                 ingest_state="detached")
             if change is None:
-                # R5: 取り込まない・保留にもしない。判定は成功したので復旧（BA-15/BA-19）
-                await ledger.mark_source_verified(APP_CHATLOG.app_id(), rid)
+                # R5: 取り込まない・保留にもしない。判定は成功したので復旧（BA-15/BA-19）。
+                # BA-24: 照合した最新 revision を同一 tx で latest_seen へ前進（解除状態は維持）
+                await ledger.mark_source_verified(APP_CHATLOG.app_id(), rid,
+                                                  revision=_revision(record))
                 return None
             src = ledger.SourceRef(APP_CHATLOG.app_id(), rid, _revision(record),
                                    *CONVERTER[TARGET_APP28], updated_at=_s(record, "更新日時"))
@@ -453,7 +455,8 @@ async def _prepare_ingest(target: str, record: dict):
                 case_key is None or status["has_current_facts"]):
             # R13/BA-19: 有効な最新版の照合に成功（取込は不要）＝pending 解除と unavailable
             # 復旧を同一トランザクションの台帳関数 1 本で行う（片方だけ変わらない）
-            await ledger.mark_source_verified(src.app_id, src.record_id)
+            await ledger.mark_source_verified(src.app_id, src.record_id,
+                                              revision=src.revision)
             return None                      # revision 既知＝再処理しない
     return src, case_key, facts, events, extras
 

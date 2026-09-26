@@ -436,6 +436,39 @@ class TestOperations(BrainDbMixin):
         self.assertEqual(run(ledger.current_case_of_source("40", "1")), ("40", "1"))
         self.assertIsNone(run(ledger.latest_link("40", "1")))
 
+    def test_relink_closed_set_is_one_constant_used_by_api_and_ledger(self):
+        # fix5 BA-25: 許可集合は brain_ledger.RELINKABLE_APPS の 1 か所。台帳関数を直接呼んでも
+        # 許可集合外（App 99・App 40）は NotRelinkable で拒否され、何も変わらない
+        self.assertEqual(ledger.RELINKABLE_APPS, frozenset({"28", "30"}))
+        view_src = (REPO / "hub" / "webapp_brain_view.py").read_text(encoding="utf-8")
+        self.assertIn("src_app not in ledger.RELINKABLE_APPS", view_src)
+        ledger_src = (REPO / "hub" / "brain_ledger.py").read_text(encoding="utf-8")
+        self.assertIn("if source_app_id not in RELINKABLE_APPS:\n        raise NotRelinkable()", ledger_src)
+        self.fake.data["40"] = [app40(1, 1), app40(2, 1)]
+        run(sync.sync_target(sync.TARGET_APP40))
+        # テスト DB に App 99 の出典を登録（案件 1 に紐付き・fact と event あり）
+        src99 = ledger.SourceRef("99", "7", 1, "app30_record", "1")
+        run(ledger.ingest_source(src99, ("40", "1"), [ledger.FactIn(
+            "shipping:7", "app30.件名", "text", "外部", ledger.make_locator("件名"))],
+            [ledger.EventIn("shipping_status_observed", "shipping:下書き",
+                            ledger.make_locator("発送ステータス"))]))
+
+        def snapshot():
+            return (run(ledger.list_case_facts("40", "1", current_only=False)),
+                    run(ledger.list_case_facts("40", "2", current_only=False)),
+                    run(ledger.list_case_events("40", "1", current_only=False)),
+                    run(ledger.list_case_events("40", "2", current_only=False)),
+                    run(ledger.latest_link("99", "7")), run(ledger.link_version("99", "7")),
+                    run(ledger.current_case_of_source("99", "7")), run(ledger.list_holds()))
+        before = snapshot()
+        self.assertEqual(before[6], ("40", "1"))
+        for app_id, rid in (("99", "7"), ("40", "1")):
+            with self.assertRaises(ledger.NotRelinkable):
+                run(ledger.relink_source(source_app_id=app_id, source_record_id=rid,
+                                         new_case=("40", "2"), reason="x", operation_id=f"op-{app_id}",
+                                         actor="owner", seen_link_version=0, seen_source_revision=1))
+        self.assertEqual(snapshot(), before)
+
 
 def brain_sync_targets():
     return sync.source_targets()

@@ -351,6 +351,23 @@ MATRICES = (("App 30（発送管理・出典 30/5）", EXPECT30), ("App 28（チ
             ("App 40（相続放棄案件・出典 40/1＝案件自身）", EXPECT40))
 
 
+# ── 連続遷移（fix5 BA-24）: 既知出典の処理不要経路でも latest_seen が進み、解除は維持、
+#    遅着の旧 revision は履歴のみ。期待＝観測タプル＋latest_known_revision。
+#    通常同期・追跡再照合の両経路で同じ（初手の採用だけは同期）
+SEQUENCE_APP28 = (
+    ("rev1 対象 category", 1, "2026-09-21T00:00:00Z", "相続放棄ヒアリング",
+     ("ingested", False, "1", True, 0, None), 1),
+    ("rev2 対象外", 2, "2026-09-21T01:00:00Z", "その他判断系",
+     ("detached", False, None, False, 1, "-"), 2),
+    ("rev4 対象外", 4, "2026-09-21T02:00:00Z", "その他判断系",
+     ("detached", False, None, False, 0, "-"), 4),
+    ("遅着 rev3 対象 category", 3, "2026-09-21T03:00:00Z", "相続放棄ヒアリング",
+     ("detached", False, None, False, 0, "-"), 4),
+)
+SEQUENCE_PATHS = ("sync", "recheck")
+SEQUENCES = (("App 28 連続遷移（BA-24）", SEQUENCE_APP28),)
+
+
 def matrix_counts() -> dict:
     total = na = tested = 0
     for _name, table in MATRICES:
@@ -361,7 +378,8 @@ def matrix_counts() -> dict:
                     na += 1
                 else:
                     tested += 1
-    return {"total": total, "tested": tested, "n_a": na}
+    seq = sum(len(steps) for _n, steps in SEQUENCES) * len(SEQUENCE_PATHS)
+    return {"total": total + seq, "tested": tested + seq, "n_a": na, "sequence": seq}
 
 
 # ── 実行器 ───────────────────────────────────────────────────────────────────
@@ -751,6 +769,35 @@ class TestMatrixApp40(_Matrix):
 
     def test_unavailable(self):
         self.check_row(EXPECT40, "unavailable", self.setup, self.apply)
+
+
+class TestSequenceApp28(_Matrix):
+    SOURCE = "app28-sequence"
+
+    def _run(self, path):
+        async def body():
+            self.fake.data["40"] = [app40(1, 1)]
+            await sync.sync_target(sync.TARGET_APP40)
+            hist_before = await _count(ledger.link_history)
+            for i, (label, rev, updated, category, expect, latest) in enumerate(SEQUENCE_APP28):
+                with self.subTest(path=path, step=label):
+                    self.fake.data["28"] = [app28(100, rev, updated, category=category)]
+                    if i == 0 or path == "sync":
+                        await sync.sync_target(sync.TARGET_APP28)
+                    else:
+                        await sync.recheck_target(sync.TARGET_APP28)
+                    got = await self.observe("28", "100", hist_before, "1")
+                    hist_before += got[4]
+                    self.assertEqual(got, expect, (path, label))
+                    self.assertEqual(await ledger.latest_known_revision("28", "100"), latest,
+                                     (path, label))
+        run(body())
+
+    def test_sequence_sync(self):
+        self._run("sync")
+
+    def test_sequence_recheck(self):
+        self._run("recheck")
 
 
 class TestMatrixShape(unittest.TestCase):

@@ -249,5 +249,76 @@ class TestCaseIsolation(BrainDbMixin):
         run(body())
 
 
+class TestDetachedLatestSeen(BrainDbMixin):
+    """fix5 BA-24（R11・R13 の適用漏れ）: 既知出典の「処理不要」経路（判定 None かつ関連解除済み）
+    でも照合した最新 revision を latest_seen_revision に同一 tx で前進させる。解除は維持し、
+    遅着の旧 revision は履歴のみ（会話イベントは無効のまま・latest は進まない）。"""
+
+    async def _chats(self, current_only=True):
+        return [e for e in await ledger.list_case_events("40", "1", current_only=current_only)
+                if e["source_app_id"] == "28"]
+
+    async def _hist(self):
+        from hub.db import session_scope
+        import sqlalchemy as sa
+        async with session_scope() as session:
+            return int((await session.execute(
+                sa.select(sa.func.count()).select_from(ledger.link_history))).scalar())
+
+    async def _run_path(self, path):
+        async def step(record):
+            self.fake.data["28"] = [record]
+            if path == "sync":
+                return await sync.sync_target(sync.TARGET_APP28)
+            return await sync.recheck_target(sync.TARGET_APP28)
+        self.fake.data["40"] = [app40(1, 1)]
+        await sync.sync_target(sync.TARGET_APP40)
+        # rev1 対象 category → 案件 1 に関連（初回は同期でしか起きない）
+        self.fake.data["28"] = [app28(100, 1, "2026-09-21T00:00:00Z")]
+        await sync.sync_target(sync.TARGET_APP28)
+        self.assertEqual(await ledger.current_case_of_source("28", "100"), ("40", "1"))
+        self.assertEqual(len(await self._chats()), 1)
+        self.assertEqual(await ledger.latest_known_revision("28", "100"), 1)
+        h0 = await self._hist()
+        # rev2 対象外 → 解除・latest 2
+        await step(app28(100, 2, "2026-09-21T01:00:00Z", category="その他判断系"))
+        self.assertIsNone(await ledger.current_case_of_source("28", "100"))
+        self.assertEqual(await self._chats(), [])
+        self.assertEqual({e["invalid_reason"] for e in await self._chats(current_only=False)},
+                         {"link_lost"})
+        self.assertEqual(await ledger.latest_known_revision("28", "100"), 2)
+        self.assertEqual(await self._hist(), h0 + 1)
+        # rev4 対象外 → 解除維持・latest 4（処理不要経路でも同一 tx で前進・復活させない）
+        r = await step(app28(100, 4, "2026-09-21T02:00:00Z", category="その他判断系"))
+        self.assertEqual(r["status"], "ok")
+        self.assertIsNone(await ledger.current_case_of_source("28", "100"))
+        self.assertEqual(await self._chats(), [])
+        self.assertEqual(await ledger.latest_known_revision("28", "100"), 4)
+        self.assertEqual(await self._hist(), h0 + 1)
+        self.assertEqual([(h["source_record_id"], h["state"]) for h in await ledger.list_holds()],
+                         [("100", "detached")])
+        # 遅着 rev3 対象 category → 履歴のみ・関連は解除のまま・会話は無効のまま・latest 4 のまま
+        r = await step(app28(100, 3, "2026-09-21T03:00:00Z"))
+        self.assertEqual(r["status"], "ok")
+        self.assertEqual(r.get("inserted", 0), 0)
+        self.assertIsNone(await ledger.current_case_of_source("28", "100"))
+        self.assertEqual(await self._chats(), [])
+        self.assertEqual({e["invalid_reason"] for e in await self._chats(current_only=False)},
+                         {"link_lost"})
+        self.assertEqual(await ledger.latest_known_revision("28", "100"), 4)
+        self.assertEqual(await self._hist(), h0 + 1)
+        st = await ledger.ingest_status(
+            ledger.SourceRef("28", "100", 3, *sync.CONVERTER[sync.TARGET_APP28]), None)
+        self.assertEqual((st["known"], st["state"]), (True, "detached"))   # 履歴として保存
+        self.assertEqual([(h["source_record_id"], h["state"]) for h in await ledger.list_holds()],
+                         [("100", "detached")])
+
+    def test_detached_source_advances_latest_seen_without_reattach_sync(self):
+        run(self._run_path("sync"))
+
+    def test_detached_source_advances_latest_seen_without_reattach_recheck(self):
+        run(self._run_path("recheck"))
+
+
 if __name__ == "__main__":
     unittest.main()

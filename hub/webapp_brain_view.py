@@ -231,8 +231,8 @@ async def brain_relink(request: Request):
         return _bad_request()
     if case_app != brain_sync.APP_HOUKI.app_id():
         return _bad_request()                 # 訂正先は App 40 のみ
-    if src_app not in (brain_sync.APP_SHIPPING.app_id(), brain_sync.APP_CHATLOG.app_id()):
-        # R15: 訂正対象は App 28・App 30 のみ（App 40 は案件本体）
+    if src_app not in ledger.RELINKABLE_APPS:
+        # R15/BA-25: 訂正対象は台帳の許可集合（App 28・App 30）のみ（App 40 は案件本体）
         return JSONResponse({"error": "app_not_relinkable", "reason": "app_not_relinkable"},
                             status_code=409)
     try:

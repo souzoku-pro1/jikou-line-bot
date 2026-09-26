@@ -90,6 +90,8 @@ CONFLICT_VERSION = "version_mismatch"
 CONFLICT_NOT_CURRENT = "fact_not_current"
 CONFLICT_SOURCE_DETACHED = "source_detached"
 STALE_STATE = "stale"                          # R11: 遅着旧版は履歴として保存するだけ
+# R15/BA-25: 紐付け訂正の対象閉集合（App 28 チャットログ・App 30 発送管理）。API・台帳関数が参照
+RELINKABLE_APPS = frozenset({"28", "30"})
 
 SUBJECT_CASE = "case"
 SUBJECT_APPLICANT = "applicant"
@@ -1127,10 +1129,12 @@ async def _restore_unavailable_tx(session, source_app_id: str, source_record_id:
 
 
 async def mark_source_verified(source_app_id: str, source_record_id: str,
-                               *, now=None) -> dict:
+                               *, revision: int | None = None, now=None) -> dict:
     """R13/BA-19: 有効な最新版の照合が成功した（取込は不要）ときの復旧を**1 トランザクション**で:
     pending_recheck の解除と unavailable の解除（復帰先は _restore_unavailable_tx）。
-    途中で失敗すれば両方とも元のまま（片方だけ変わらない）。"""
+    BA-24: revision を渡すと、照合した最新 revision へ latest_seen_revision を同じ
+    トランザクションで前進させる（下がることはない・関連解除の状態は変えない＝復活させない）。
+    途中で失敗すればすべて元のまま（一部だけ変わらない）。"""
     now = now or _now()
     async with session_scope() as session:
         cleared = await session.execute(sa.update(source_ingest).where(
@@ -1138,7 +1142,16 @@ async def mark_source_verified(source_app_id: str, source_record_id: str,
             source_ingest.c.pending_recheck.is_(True)).values(
             pending_recheck=False, last_checked_at=now))
         restored = await _restore_unavailable_tx(session, source_app_id, source_record_id, now)
-        return {"pending_cleared": int(cleared.rowcount or 0), "restored": restored}
+        advanced = 0
+        if revision is not None:
+            adv = await session.execute(sa.update(source_ingest).where(
+                _source_where(source_ingest, source_app_id, source_record_id),
+                sa.or_(source_ingest.c.latest_seen_revision.is_(None),
+                       source_ingest.c.latest_seen_revision < int(revision))).values(
+                latest_seen_revision=int(revision), last_checked_at=now))
+            advanced = int(adv.rowcount or 0)
+        return {"pending_cleared": int(cleared.rowcount or 0), "restored": restored,
+                "advanced": advanced}
 
 
 async def mark_source_checked(source_app_id: str, source_record_id: str,
@@ -1295,8 +1308,11 @@ async def relink_source(*, source_app_id: str, source_record_id: str,
     now = now or _now()
     new_case = (str(new_case[0]), str(new_case[1]))
     source_app_id, source_record_id = str(source_app_id), str(source_record_id)
-    # R15: 訂正対象は紐付く側の出典（App 28・App 30）だけ。案件アプリ（訂正先と同じアプリ）
-    # の出典＝案件本体は拒否する。台帳に案件アプリとして現れているアプリも同様
+    # R15/BA-25: 訂正対象は許可集合 RELINKABLE_APPS（App 28・App 30）だけ。許可集合外は
+    # ここで拒否。案件アプリ（訂正先と同じアプリ）・台帳に案件アプリとして現れているアプリの
+    # 判定は二重の安全として残す
+    if source_app_id not in RELINKABLE_APPS:
+        raise NotRelinkable()
     if source_app_id == new_case[0]:
         raise NotRelinkable()
     async with session_scope() as session:
