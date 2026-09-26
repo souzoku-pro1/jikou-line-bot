@@ -2319,3 +2319,16 @@ async def _process_follow_event(reply_token: str, user_id: str, event_id: str,
             await mark_line_failed(event_id, "follow_failed")
         except Exception:
             pass
+
+# ── BRAIN-A1-LEDGER-1（案件脳 A1）: 確認ビューの結線と同期ジョブの登録。
+#    末尾追記（sink allowlist の行番号 pin を壊さない規約・他行に触れない）。
+#    FastAPI は登録順にマッチするため、/app/brain* の GET が webapp_auth の
+#    catch-all（/app/{_rest:path}）に食われないよう、include 後に catch-all の
+#    前へ並べ替える（include_before_catch_all）。認証は全 route が _gate。
+#    同期ジョブは常に登録し、実行可否は coro 先頭の BRAIN_SYNC_ENABLED 検査
+#    （既定 OFF＝merge しただけでは動かない）。start_all は既存 startup 経路が呼ぶ。
+from hub.webapp_brain_view import router as brain_view_router  # noqa: E402
+from hub.webapp_brain_view import include_before_catch_all  # noqa: E402
+include_before_catch_all(app, brain_view_router)
+from hub.brain_sync import register_brain_sync_job  # noqa: E402
+register_brain_sync_job()

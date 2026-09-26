@@ -11,6 +11,9 @@
     ["/app/approvals", "承認"],
     ["/app/kinship", "関係図"],
   ];
+  // BRAIN-A1 fix4 (R14): 案件脳リンクは BRAIN_SYNC_ENABLED が ON のときだけ表示する。
+  // 判定はサーバ側の共通ガード（/app/api/brain/enabled は OFF なら 404）に委ねる。
+  const gatedNav = [["/app/brain", "案件脳", "/app/api/brain/enabled"]];
   const bar = document.createElement("header");
   bar.style.display = "flex";
   bar.style.flexWrap = "wrap";
@@ -21,7 +24,7 @@
   bar.style.borderRadius = "12px";
   bar.style.marginBottom = "0.8rem";
   const here = location.pathname;
-  for (const pair of nav) {
+  function navLink(pair) {
     const a = document.createElement("a");
     a.href = pair[0];
     a.textContent = pair[1];
@@ -34,7 +37,10 @@
       a.style.background = "rgba(255,255,255,0.18)";
       a.style.fontWeight = "bold";
     }
-    bar.appendChild(a);
+    return a;
+  }
+  for (const pair of nav) {
+    bar.appendChild(navLink(pair));
   }
   const form = document.createElement("form");
   form.method = "post";
@@ -52,4 +58,12 @@
   form.appendChild(btn);
   bar.appendChild(form);
   document.body.insertBefore(bar, document.body.firstChild);
+  // 有効なときだけ案件脳リンクを追加（app_fetch は app.js の閉集合ラッパー・GET のみ）
+  if (typeof app_fetch === "function") {
+    app_fetch("/app/api/brain/enabled").then((resp) => {
+      if (resp && resp.ok && !resp.redirected) {
+        bar.insertBefore(navLink(gatedNav[0]), form);
+      }
+    }).catch(() => {});
+  }
 })();

@@ -1,0 +1,318 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>案件脳 - 案件管理（仮）</title>
+<style>
+body{font-family:sans-serif;max-width:960px;margin:0 auto;padding:.6rem 1rem;
+  background:#eef1f5}
+a{color:#1a3c6e}
+h2{font-size:1.05rem;margin:1rem 0 .4rem;color:#1a3c6e}
+.card{background:#fff;border:1px solid #d8dde5;border-radius:10px;
+  padding:.6rem .8rem;margin:.4rem 0;font-size:.92rem}
+.card.warn{background:#fff7e0;border-color:#e0c060}
+.card.bad{background:#fdecec;border-color:#d08080}
+.meta{color:#8a8f98;font-size:.78rem;margin-top:.2rem}
+.sys{background:#dfe4ec;color:#444;font-size:.85rem;border-radius:10px;
+  padding:.3rem .8rem;margin:.3rem 0;display:inline-block}
+.sys.err{background:#f7d9d9;color:#7a1f1f}
+table{border-collapse:collapse;width:100%;font-size:.86rem}
+th,td{border-bottom:1px solid #e3e7ee;padding:.3rem .35rem;text-align:left;
+  vertical-align:top;word-break:break-word}
+th{background:#f3f5f9;font-weight:600}
+form.op{display:flex;flex-wrap:wrap;gap:.35rem;align-items:center;margin:.2rem 0}
+form.op input[type=text]{font-size:.85rem;padding:.25rem .4rem;
+  border:1px solid #c8cdd5;border-radius:6px;min-width:8rem}
+form.op select{font-size:.85rem;padding:.25rem}
+button{font-size:.85rem;padding:.3rem .8rem;border-radius:8px;
+  border:1px solid #1a3c6e;background:#1a3c6e;color:#fff}
+button.sub{background:#fff;color:#3a4a63;border-color:#9aa7bd}
+.tag{display:inline-block;border-radius:6px;padding:.05rem .4rem;font-size:.75rem;
+  background:#dfe4ec;color:#333;margin-right:.3rem}
+.tag.ok{background:#d9f2d0}
+.tag.ng{background:#f7d9d9}
+.empty{color:#7a8494;font-size:.85rem}
+#casebox{display:flex;gap:.4rem;flex-wrap:wrap;align-items:center}
+#casebox input{font-size:.9rem;padding:.3rem .4rem;border:1px solid #c8cdd5;
+  border-radius:6px;width:7rem}
+</style>
+</head>
+<body>
+<!-- BRAIN-A1: 確認ビュー（一覧と操作のみ・質問回答は A2）。
+     読込は app_fetch の GET（/app/api/brain/*）のみ。操作は native form POST
+     （PRG・303）。操作 ID はクライアント生成 UUID（送信直前に hidden へ）。
+     画面が見ていた版（seen_version）を hidden で送り、サーバが現在版と照合
+     （不一致は 409 で最新を返す）。DOM は createElement/textContent のみで構築。 -->
+<div id="flash"></div>
+<h2>同期状態</h2>
+<div id="sync" class="card"><span class="empty">読み込み中…</span></div>
+<h2>紐付け待ち（案件キーの無い出典）</h2>
+<div id="pending"><span class="empty">読み込み中…</span></div>
+<h2>保留（抽出結果の不一致・出典確認不能・関連喪失）</h2>
+<div id="holds"><span class="empty">読み込み中…</span></div>
+<h2>競合（有効な別出典間で値が異なる）</h2>
+<div id="conflicts"><span class="empty">読み込み中…</span></div>
+<h2>再確認が必要（確認した版が現在値でなくなった）</h2>
+<div id="recheck"><span class="empty">読み込み中…</span></div>
+<h2>案件の事実（確認/却下/撤回）</h2>
+<div id="casebox" class="card">
+  <label>案件アプリID <input id="case_app" type="text" inputmode="numeric" pattern="[0-9]*"></label>
+  <label>レコード番号 <input id="case_rec" type="text" inputmode="numeric" pattern="[0-9]*"></label>
+  <button id="case_load" type="button">表示</button>
+  <span class="meta">kintone の値は置き換えません（台帳への注記のみ）。</span>
+</div>
+<div id="facts"><span class="empty">案件を指定してください。</span></div>
+<script src="/app/app.js"></script>
+<script src="/app/shell.js"></script>
+<script>
+(function () {
+  const RELINK_PATH = "/app/brain/relink";
+  const CONFIRM_PATH = "/app/brain/confirm";
+  function el(tag, cls, text) {
+    const e = document.createElement(tag);
+    if (cls) { e.className = cls; }
+    if (text !== undefined && text !== null) { e.textContent = String(text); }
+    return e;
+  }
+  function hidden(form, name, value) {
+    const i = document.createElement("input");
+    i.type = "hidden"; i.name = name; i.value = String(value);
+    form.appendChild(i);
+    return i;
+  }
+  function opForm(action, fields, buttonLabel, extra) {
+    const f = document.createElement("form");
+    f.className = "op"; f.method = "post"; f.action = action;
+    const op = hidden(f, "operation_id", "");
+    for (const k of Object.keys(fields)) { hidden(f, k, fields[k]); }
+    if (extra) { extra(f); }
+    const b = el("button", "", buttonLabel);
+    b.type = "submit";
+    f.appendChild(b);
+    f.addEventListener("submit", () => {
+      op.value = crypto.randomUUID();   // 操作 ID（冪等キー）は送信直前に生成
+      b.disabled = true;
+    });
+    return f;
+  }
+  function reasonInput(f) {
+    const r = document.createElement("input");
+    r.type = "text"; r.name = "reason"; r.placeholder = "理由（任意）";
+    r.maxLength = 500;
+    f.appendChild(r);
+  }
+  function caseKey(app, rec) { return "案件 " + app + "/" + rec; }
+  function renderFlash() {
+    const p = new URLSearchParams(location.search);
+    const box = document.getElementById("flash");
+    box.replaceChildren();
+    const done = p.get("done");
+    if (done === "confirm") { box.appendChild(el("div", "sys", "確認を記録しました。")); }
+    else if (done === "relink") { box.appendChild(el("div", "sys", "紐付け訂正を記録しました。")); }
+    else if (done === "dup") { box.appendChild(el("div", "sys", "同じ操作は既に記録済みです（再送は無視）。")); }
+  }
+  function fail(id, msg) {
+    const box = document.getElementById(id);
+    box.replaceChildren(el("span", "sys err", msg));
+  }
+  async function getJson(path, id) {
+    const resp = await app_fetch(path);
+    if (resp.redirected) { location.href = "/app/login"; return null; }
+    if (resp.status === 503) { fail(id, "台帳（DB）に接続できません（同期停止中）。"); return null; }
+    if (!resp.ok) { fail(id, "読み込みに失敗しました。"); return null; }
+    return resp.json();
+  }
+  async function loadSync() {
+    const d = await getJson("/app/api/brain/overview", "sync");
+    if (!d) { return; }
+    const box = document.getElementById("sync");
+    box.replaceChildren();
+    box.appendChild(el("span", d.enabled ? "tag ok" : "tag ng",
+      d.enabled ? "同期: 有効" : "同期: 停止中（BRAIN_SYNC_ENABLED 未設定）"));
+    const t = document.createElement("table");
+    const h = t.insertRow();
+    for (const x of ["対象", "種別", "状態", "確認済み範囲", "カーソル／継続位置", "走査上限", "最終成功", "定期照合", "追跡再照合（一巡完了）"]) {
+      h.appendChild(el("th", "", x));
+    }
+    const cursors = (d.sync && d.sync.cursors) || [];
+    for (const c of cursors) {
+      const r = t.insertRow();
+      const isRecheck = c.kind === "recheck";
+      const pos = isRecheck ? (c.cursor_record_id ? "No." + c.cursor_record_id + " まで" : "")
+                            : c.cursor_updated_at;
+      for (const x of [c.target_app, isRecheck ? "追跡再照合" : "同期", c.state,
+                       isRecheck ? "" : c.confirmed_until, pos,
+                       isRecheck ? "" : (c.page_position ? c.scan_upper_bound + "（再開待ち）" : c.scan_upper_bound),
+                       c.last_ok_at, c.last_reconcile_at,
+                       isRecheck ? (c.recheck_completed_at || "未完了") : c.last_recheck_at]) {
+        r.appendChild(el("td", "", x || "−"));
+      }
+    }
+    if (!cursors.length) { box.appendChild(el("div", "empty", "同期はまだ実行されていません。")); }
+    box.appendChild(t);
+    const counts = (d.sync && d.sync.ingest_counts) || {};
+    const m = el("div", "meta", "取込: " + Object.keys(counts).map((k) => k + "=" + counts[k]).join(" / "));
+    box.appendChild(m);
+    const pend = (d.sync && d.sync.pending_recheck) || 0;
+    const unreg = (d.sync && d.sync.pending_unregistered) || 0;
+    if (pend || unreg) {
+      box.appendChild(el("div", "sys err", "未解決: 判定不能（再照合待ち）" + pend +
+        " 件 / 初見で判定不能（未登録・次回同期で再試行）" + unreg + " 件"));
+    }
+    const runs = (d.sync && d.sync.runs) || [];
+    for (const run of runs.slice(0, 5)) {
+      box.appendChild(el("div", "meta",
+        "run " + run.run_id + " " + run.target_app + " " + run.status +
+        (run.failure ? " (" + run.failure + ")" : "") + " pages=" + run.pages_done +
+        " records=" + run.records_seen));
+    }
+  }
+  async function loadPending() {
+    const d = await getJson("/app/api/brain/pending?limit=100", "pending");
+    if (!d) { return; }
+    const box = document.getElementById("pending");
+    box.replaceChildren();
+    if (!d.records.length) { box.appendChild(el("span", "empty", "なし")); return; }
+    for (const r of d.records) {
+      const c = el("div", "card warn");
+      c.appendChild(el("div", "", "出典 App " + r.source_app_id + " No." + r.source_record_id +
+        "（rev " + r.revision + "）"));
+      c.appendChild(el("div", "meta", "保留理由: " + r.hold_reason));
+      for (const cand of (r.candidates || [])) {
+        c.appendChild(el("div", "meta", "候補: " + caseKey(cand.case_app_id, cand.case_record_id) +
+          "（" + cand.trust + "・自動確定しない）"));
+      }
+      // 画面が見ていた紐付け版・出典 revision を送る（サーバが現在値と照合・不一致は 409）
+      const f = opForm(RELINK_PATH,
+        {source_app_id: r.source_app_id, source_record_id: r.source_record_id,
+         seen_link_version: r.link_version, seen_source_revision: r.source_revision},
+        "この案件へ紐付ける", (form) => {
+          const a = document.createElement("input");
+          a.type = "text"; a.name = "case_app_id"; a.placeholder = "案件アプリID";
+          a.inputMode = "numeric"; a.required = true; a.pattern = "[0-9]+";
+          const b = document.createElement("input");
+          b.type = "text"; b.name = "case_record_id"; b.placeholder = "レコード番号";
+          b.inputMode = "numeric"; b.required = true; b.pattern = "[0-9]+";
+          form.appendChild(a); form.appendChild(b);
+          reasonInput(form);
+        });
+      c.appendChild(f);
+      box.appendChild(c);
+    }
+  }
+  async function loadHolds() {
+    const d = await getJson("/app/api/brain/holds?limit=100", "holds");
+    if (!d) { return; }
+    const box = document.getElementById("holds");
+    box.replaceChildren();
+    if (!d.records.length) { box.appendChild(el("span", "empty", "なし")); return; }
+    for (const r of d.records) {
+      const c = el("div", "card bad");
+      const label = r.pending_recheck ? "判定不能（正本の確認待ち・関連は保持・次回再照合）"
+        : r.state === "unavailable" ? "出典確認不能（利用停止中）"
+        : r.state === "detached" ? "関連喪失（利用停止・紐付け待ちにしない）"
+        : "抽出結果の不一致（保留）";
+      c.appendChild(el("div", "", "出典 App " + r.source_app_id + " No." + r.source_record_id +
+        "（rev " + r.revision + "）: " + label));
+      if (r.case_app_id) { c.appendChild(el("div", "meta", caseKey(r.case_app_id, r.case_record_id))); }
+      if (r.hold_reason) { c.appendChild(el("div", "meta", "理由: " + r.hold_reason)); }
+      box.appendChild(c);
+    }
+  }
+  function factLine(f) {
+    return f.subject_id + " / " + f.item_code + " = " + (f.value_text || "（空）") +
+      "（出典 App " + f.source_app_id + " No." + f.source_record_id + " rev " + f.version +
+      "・" + f.confidence + "）";
+  }
+  async function loadConflicts() {
+    const d = await getJson("/app/api/brain/conflicts?limit=100", "conflicts");
+    if (!d) { return; }
+    const box = document.getElementById("conflicts");
+    box.replaceChildren();
+    if (!d.records.length) { box.appendChild(el("span", "empty", "なし")); return; }
+    for (const g of d.records) {
+      const c = el("div", "card warn");
+      c.appendChild(el("div", "", caseKey(g.case_app_id, g.case_record_id) + " / " + g.subject_id + " / " + g.item_code));
+      for (const f of g.facts) {
+        c.appendChild(el("div", "meta", factLine(f)));
+        c.appendChild(confirmForm(f));
+      }
+      box.appendChild(c);
+    }
+  }
+  function confirmForm(f) {
+    return opForm(CONFIRM_PATH, {fact_id: f.fact_id, seen_version: f.version, decision: "confirm"},
+      "この値を確認", reasonInput);
+  }
+  function rejectForm(f) {
+    return opForm(CONFIRM_PATH, {fact_id: f.fact_id, seen_version: f.version, decision: "reject"},
+      "却下", reasonInput);
+  }
+  function revokeForm(f, confId, version) {
+    return opForm(CONFIRM_PATH,
+      {fact_id: f.fact_id, seen_version: version, decision: "revoke", revoked_of: confId},
+      "撤回", reasonInput);
+  }
+  async function loadRecheck() {
+    const d = await getJson("/app/api/brain/recheck?limit=100", "recheck");
+    if (!d) { return; }
+    const box = document.getElementById("recheck");
+    box.replaceChildren();
+    if (!d.records.length) { box.appendChild(el("span", "empty", "なし")); return; }
+    for (const r of d.records) {
+      const c = el("div", "card warn");
+      c.appendChild(el("div", "", "確認 #" + r.confirmation_id + "（" + r.decision + "・" + r.decided_at + "）"));
+      c.appendChild(el("div", "meta", "対象: " + factLine(r.fact)));
+      c.appendChild(el("div", "meta", "理由: " + r.reasons.join(", ") +
+        "／現在の版: fact " + r.current.fact_id + " rev " + r.current.version +
+        (r.current.is_current ? "" : "（現在値なし）")));
+      c.appendChild(revokeForm(r.fact, r.confirmation_id, r.current.version));
+      box.appendChild(c);
+    }
+  }
+  async function loadFacts() {
+    const app = document.getElementById("case_app").value.trim();
+    const rec = document.getElementById("case_rec").value.trim();
+    const box = document.getElementById("facts");
+    if (!/^[0-9]+$/.test(app) || !/^[0-9]+$/.test(rec)) {
+      box.replaceChildren(el("span", "sys err", "数字で指定してください。"));
+      return;
+    }
+    const d = await getJson("/app/api/brain/facts?app=" + app + "&record=" + rec, "facts");
+    if (!d) { return; }
+    box.replaceChildren();
+    box.appendChild(el("div", "meta", caseKey(d.case_app_id, d.case_record_id) + "・鮮度: " + d.freshness +
+      ((d.freshness_reasons || []).length ? "（" + d.freshness_reasons.join(", ") + "）" : "")));
+    if (!d.facts.length) { box.appendChild(el("span", "empty", "現在の事実はありません（同期未完了か案件なし）。")); return; }
+    for (const f of d.facts) {
+      const c = el("div", f.flag ? "card bad" : "card");
+      c.appendChild(el("div", "", factLine(f)));
+      if (f.flag) { c.appendChild(el("span", "tag ng", "出典確認不能（確認・採用の対象外）")); }
+      const active = (f.confirmations || []).filter((x) => x.decision !== "revoke");
+      for (const x of (f.confirmations || [])) {
+        c.appendChild(el("div", "meta", "確認 #" + x.confirmation_id + " " + x.decision +
+          "（版 " + x.fact_version + "・" + x.decided_at + "）" + (x.reason ? " " + x.reason : "")));
+      }
+      if (!f.flag) {
+        c.appendChild(confirmForm(f));
+        c.appendChild(rejectForm(f));
+      }
+      for (const x of active) {
+        const revoked = (f.confirmations || []).some((y) => y.revoked_of === x.confirmation_id);
+        if (!revoked) { c.appendChild(revokeForm(f, x.confirmation_id, f.version)); }
+      }
+      box.appendChild(c);
+    }
+    for (const ev of d.events) {
+      box.appendChild(el("div", "meta", "出来事: " + ev.kind + " " + ev.summary +
+        "（出典 App " + ev.source_app_id + " No." + ev.source_record_id + " rev " + ev.version + "）"));
+    }
+  }
+  document.getElementById("case_load").addEventListener("click", loadFacts);
+  renderFlash();
+  loadSync(); loadPending(); loadHolds(); loadConflicts(); loadRecheck();
+})();
+</script>
+</body>
+</html>
