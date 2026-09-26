@@ -120,10 +120,15 @@ async def houki_webhook(request: Request, background_tasks: BackgroundTasks):
         # 画像・友だち追加・その他メッセージは H-1 の記録+管理者通知のまま
         # （画像 AI 判断はさせない・時効の要件4と同じ原則）
         if kind == _KIND_TEXT:
+            # HUMAN-REPLY-INTAKE-1: 返答取込の冪等キー（webhookEventId 優先・
+            # 無ければ message id=画像経路と同じ導出。どちらも無ければ空=取込なし。
+            # houki_bot の import 閉集合（json/logging）を広げない）
+            text_event_id = event.get("webhookEventId") or str(
+                (event.get("message") or {}).get("id", "") or "")
             background_tasks.add_task(
                 handle_houki_hearing,
                 event.get("replyToken", ""), user_id,
-                (event.get("message") or {}).get("text", ""))
+                (event.get("message") or {}).get("text", ""), text_event_id)
             continue
         background_tasks.add_task(_record_inbound, user_id, kind)
         if kind == _KIND_IMAGE:

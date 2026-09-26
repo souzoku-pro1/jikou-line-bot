@@ -1326,15 +1326,17 @@ async def get_recent_chat_history(user_id: str, limit: int = 10) -> list[dict]:
                        emit(resp.text, "vendor_raw", "log", "operator"))
         return []
     records = resp.json().get("records", [])
-    # HRI-08（裁定 G-2）: 画像の保留行・人対応済行（固定文言の内部行）は会話履歴に
-    # 含めない（モデルへの注入・既知項目判定の汚染を防ぐ。他の行は従来どおり）
+    # HUMAN-REPLY-INTAKE-1 / HRI-04: 返答取込の内部行（冪等マーカー・逸脱・正規化の記録）と
+    # 裁定 G-2 の画像の保留行・人対応済行（固定文言）は会話履歴に含めない
+    from hub.human_reply_intake import is_internal_row
     from hub.image_intake import IMAGE_HUMAN_CLOSED_MARKER, IMAGE_HUMAN_HOLD_MARKER
     # desc で取得しているので reversed で古い順に並べ直す
     return [
         {"role": r["role"]["value"], "content": r["message"]["value"]}
         for r in reversed(records)
-        if r["message"]["value"] not in (IMAGE_HUMAN_HOLD_MARKER,
-                                         IMAGE_HUMAN_CLOSED_MARKER)
+        if not is_internal_row(r["message"]["value"])
+        and r["message"]["value"] not in (IMAGE_HUMAN_HOLD_MARKER,
+                                          IMAGE_HUMAN_CLOSED_MARKER)
     ]
 
 

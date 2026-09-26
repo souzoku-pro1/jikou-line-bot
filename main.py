@@ -208,6 +208,8 @@ from hub import image_intake  # noqa: E402
 from hub import image_store  # noqa: E402  JIKOU-FORM-3: 受信書類写真の取得+添付
 from hub import form_link  # noqa: E402  JIKOU-FORM-2: 受付番号による LINE 紐付け
 from hub import hearing_update  # noqa: E402  JIKOU-HEARING-HOTFIX-1: 第 2 段階の書込
+from hub import human_reply_intake  # noqa: E402  HUMAN-REPLY-INTAKE-1: 返答単独判定の取込
+from hub import jikou_case_create  # noqa: E402  HRI-03: 検索→作成の共通入口（返答取込と共有）
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 KINTONE_SUBDOMAIN = os.environ["KINTONE_SUBDOMAIN"]
 KINTONE_APP_ID = os.environ["KINTONE_APP_ID"]
@@ -878,6 +880,28 @@ async def _process_line_event(reply_token: str, user_id: str, user_text: str) ->
                         await _handle_human_mode_inbound(user_id, user_text,
                                                          app21_record)
                         return
+                elif outcome == "adopted":
+                    # HRI-07: 本人の案件レコードが別に在る（紐付けていない）。既に
+                    # レコードを持つユーザーが 6 桁を送った場合と同じ扱い=そのレコードの
+                    # 最新状態で人対応・status ルーティングを評価して通常フローへ。
+                    # フォーム回答の引き継ぎ注入はしない。取得できなければ linked と
+                    # 同じく fail-closed（自動返信しない+弁護士通知）
+                    adopted_record = await form_link.fetch_linked_record(linked_id)
+                    if adopted_record is None:
+                        logger.error("[FORM_LINK] post-adopt refetch failed "
+                                     "(fail-closed, no auto reply) record_id=%s",
+                                     emit(linked_id, "record_id", "log", "operator"))
+                        await form_link.notify_fail_closed(linked_id)
+                        await save_to_chatlog(user_id, "user", user_text,
+                                              "ヒアリング", "no")
+                        return
+                    app21_record = adopted_record
+                    # HRI-08/HRI-09: 採用したレコードが人対応なら顧客へは無言
+                    # （旧 843 行のゲートは冒頭へ移動したため、ここで再評価する）
+                    if is_human_mode(app21_record):
+                        await _handle_human_mode_inbound(user_id, user_text,
+                                                         app21_record)
+                        return
                 elif outcome == "not_matched":
                     await _line_reply_with_fallback(
                         reply_token, user_id, form_link.REPLY_NOT_MATCHED)
@@ -1015,6 +1039,16 @@ async def _process_line_event(reply_token: str, user_id: str, user_text: str) ->
                     )
             else:
                 existing_id = known_id
+            record_id = ""
+            if not existing_id:
+                # HRI-03: ターン冒頭の照会結果（_known_rec=None）を AI 呼び出しの await を
+                # 跨いで持ち越さない。返答取込と共通の排他区間の内側で再検索し、既存が
+                # あれば create せず統合へ振り替える。作成失敗（App 21 の一意制約の
+                # 発火）も再検索で既存を採用して継続（hub.jikou_case_create）
+                record_id, how, _count = await jikou_case_create.create_or_adopt(
+                    user_id, lambda: post_to_kintone(kintone_record))
+                if how != jikou_case_create.CREATED:
+                    existing_id, record_id = record_id, ""
             if existing_id:
                 merge_outcome = await form_link.merge_hearing_fields(
                     existing_id,
@@ -1026,7 +1060,6 @@ async def _process_line_event(reply_token: str, user_id: str, user_text: str) ->
                             emit(record_id, "record_id", "log", "operator"),
                             emit(merge_outcome, "freetext", "log", "operator"))
             else:
-                record_id = await post_to_kintone(kintone_record)
                 logger.info("[KINTONE] RECORD created record_id=%s",
                             emit(record_id, "record_id", "log", "operator"))
             kintone_record_ids[user_id] = record_id
@@ -1091,6 +1124,14 @@ async def _process_line_event(reply_token: str, user_id: str, user_text: str) ->
                      emit(user_id, "external_ref", "log", "operator"))
         logger.error("[ERROR] traceback: %s",
                      emit(traceback.format_exc(), "vendor_raw", "log", "operator"))
+    finally:
+        # HUMAN-REPLY-INTAKE-1: 返答単独判定の取込（ヒアリング中／人対応／完了後の
+        # いずれでも。全体停止・停止リストは上の早期 return で本 try に入らない）。
+        # ヒアリング側の書込の**後**に走らせ、取込は「空欄のみ」で譲る。冪等キーは
+        # durable lane の event id（非 durable 文脈=None は実行しない）。例外は
+        # module 内で握る=顧客への返信を道連れにしない
+        await human_reply_intake.run_jikou(user_id, user_text,
+                                           _durable_event_id.get())
 
 
 class ImageChatlogConfigError(RuntimeError):
@@ -1249,6 +1290,14 @@ async def _process_line_image_event(reply_token: str, user_id: str,
             # 裁定 G-2: 抑止した事実を保留行に記録（マーカーは消費しない=解除後に
             # 人対応済で閉じる。後出し送信はしない）
             await image_intake.hold_for_human_mode("jikou", user_id)
+            # HRI-09（裁定 G-2 の時効への適用）: 人対応中でも読解は実行し、結果を App 21 に
+            # 転記して解析済みの印を付ける（顧客へは送らない）。解除後の次の束で当該画像が
+            # 再読解→後出し送信されることを無くす。失敗は握る（受信の記録は済んでいる）
+            try:
+                await image_intake.image_analysis.analyze_and_reply(
+                    user_id, event_id, no_send=True)
+            except Exception:
+                logger.error("[IMAGE] hold-time analysis failed (fixed reason)")
             if ATTORNEY_LINE_USER_ID:
                 from hub.notify import notify_business
                 await notify_business(
@@ -1279,6 +1328,14 @@ async def _process_line_image_event(reply_token: str, user_id: str,
             logger.info("[IMAGE] human mode at send time → hold (no send) user_id=%s",
                         emit(user_id, "external_ref", "log", "operator"))
             await image_intake.hold_for_human_mode("jikou", user_id)
+            # HRI-09（裁定 G-2 の時効への適用）: 人対応中でも読解は実行し、結果を App 21 に
+            # 転記して解析済みの印を付ける（顧客へは送らない）。解除後の次の束で当該画像が
+            # 再読解→後出し送信されることを無くす。失敗は握る（受信の記録は済んでいる）
+            try:
+                await image_intake.image_analysis.analyze_and_reply(
+                    user_id, event_id, no_send=True)
+            except Exception:
+                logger.error("[IMAGE] hold-time analysis failed (fixed reason)")
             if ATTORNEY_LINE_USER_ID:
                 from hub.notify import notify_business
                 await notify_business(
