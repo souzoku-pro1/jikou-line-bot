@@ -48,6 +48,20 @@ def _source_unavailable(status: int) -> Response:
     return JSONResponse({"error": ledger.FLAG_SOURCE_UNAVAILABLE}, status_code=status)
 
 
+def _when_enabled(fn):
+    """R14: 有効化判定の一元化。BRAIN_SYNC_ENABLED が OFF なら全ルート（GET/POST）を
+    入口で 404 に閉じ、台帳 DB にも kintone にも触れない（同期・再照合も同じ
+    brain_sync_enabled() で閉じる）。認証関所 _gate の内側に置く（未認証は従来どおり 303）。"""
+    async def wrapper(request: Request):
+        if not brain_sync.brain_sync_enabled():
+            return Response(status_code=404)
+        return await fn(request)
+    wrapper.__name__ = fn.__name__
+    wrapper.__doc__ = fn.__doc__
+    wrapper.__brain_enabled_gate__ = True
+    return wrapper
+
+
 def _limit(request: Request) -> int | None:
     raw = request.query_params.get("limit", "100")
     if not _DIGITS_RE.fullmatch(raw):
@@ -58,6 +72,7 @@ def _limit(request: Request) -> int | None:
 
 @router.get(PAGE)
 @_gate
+@_when_enabled
 async def brain_page(request: Request):
     path = WEBAPP_ROOT / "brain.html"
     if not path.is_file():
@@ -65,8 +80,17 @@ async def brain_page(request: Request):
     return FileResponse(path, media_type="text/html; charset=utf-8")
 
 
+@router.get("/app/api/brain/enabled")
+@_gate
+@_when_enabled
+async def api_enabled(request: Request):
+    """ON のときだけ 200（OFF は共通ガードで 404）。PWA のナビはこれで案件脳リンクの表示を決める。"""
+    return {"enabled": True}
+
+
 @router.get("/app/api/brain/overview")
 @_gate
+@_when_enabled
 async def api_overview(request: Request):
     try:
         overview = await ledger.sync_overview()
@@ -77,6 +101,7 @@ async def api_overview(request: Request):
 
 @router.get("/app/api/brain/pending")
 @_gate
+@_when_enabled
 async def api_pending(request: Request):
     limit = _limit(request)
     if limit is None:
@@ -89,6 +114,7 @@ async def api_pending(request: Request):
 
 @router.get("/app/api/brain/holds")
 @_gate
+@_when_enabled
 async def api_holds(request: Request):
     limit = _limit(request)
     if limit is None:
@@ -101,6 +127,7 @@ async def api_holds(request: Request):
 
 @router.get("/app/api/brain/conflicts")
 @_gate
+@_when_enabled
 async def api_conflicts(request: Request):
     limit = _limit(request)
     if limit is None:
@@ -113,6 +140,7 @@ async def api_conflicts(request: Request):
 
 @router.get("/app/api/brain/recheck")
 @_gate
+@_when_enabled
 async def api_recheck(request: Request):
     limit = _limit(request)
     if limit is None:
@@ -125,6 +153,7 @@ async def api_recheck(request: Request):
 
 @router.get("/app/api/brain/facts")
 @_gate
+@_when_enabled
 async def api_facts(request: Request):
     """案件の現在の事実（確認操作の対象を選ぶための一覧）。鮮度は案件に紐づく全出典の
     集約（BA-07）。出典確認不能の fact は flag 付きで返す（確認対象外）。"""
@@ -202,6 +231,10 @@ async def brain_relink(request: Request):
         return _bad_request()
     if case_app != brain_sync.APP_HOUKI.app_id():
         return _bad_request()                 # 訂正先は App 40 のみ
+    if src_app not in (brain_sync.APP_SHIPPING.app_id(), brain_sync.APP_CHATLOG.app_id()):
+        # R15: 訂正対象は App 28・App 30 のみ（App 40 は案件本体）
+        return JSONResponse({"error": "app_not_relinkable", "reason": "app_not_relinkable"},
+                            status_code=409)
     try:
         if not await ledger.case_exists(case_app, case_rec):
             return _bad_request()             # 台帳に無い案件へは訂正できない
@@ -218,6 +251,9 @@ async def brain_relink(request: Request):
             new_case=(case_app, case_rec), reason=reason or "manual_relink",
             operation_id=operation_id, actor=ACTOR,
             seen_link_version=int(seen_link), seen_source_revision=int(seen_rev))
+    except ledger.NotRelinkable as exc:
+        return JSONResponse({"error": "app_not_relinkable", "reason": exc.reason},
+                            status_code=409)
     except ledger.VersionConflict as exc:
         return JSONResponse({"error": "version_conflict", "reason": exc.reason,
                              "current": exc.current}, status_code=409)
@@ -231,8 +267,8 @@ async def brain_relink(request: Request):
 
 # NB: POST は add_api_route 経由（read-only AST 検査の HTTP 動詞 attr 禁止と両立。
 #     関所 _gate は登録時に適用＝機械検査の対象のまま）
-router.add_api_route("/app/brain/confirm", _gate(brain_confirm), methods=["POST"])
-router.add_api_route("/app/brain/relink", _gate(brain_relink), methods=["POST"])
+router.add_api_route("/app/brain/confirm", _gate(_when_enabled(brain_confirm)), methods=["POST"])
+router.add_api_route("/app/brain/relink", _gate(_when_enabled(brain_relink)), methods=["POST"])
 
 _CATCH_ALL_PATH = "/app/{_rest:path}"
 

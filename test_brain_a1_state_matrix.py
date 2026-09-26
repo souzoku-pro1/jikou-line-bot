@@ -60,6 +60,8 @@ NA_NO_FACT = ("n/a", "確認対象の fact が無い")
 NA_SAME_AS_NEW = ("n/a", "未登録では新版と同じ（初回取込）")
 NA_APP40 = ("n/a", "案件そのもの（紐付け・参照の操作は無い）")
 NA_UNAVAIL_FETCH = ("n/a", "unavailable と同時に取得が成功する組合せは行の状態で表現済み")
+REJECT_CASE_APP = ("op", "reject:app_not_relinkable")      # R15: 案件本体は訂正対象外（実際に拒否を検証）
+REJECT_NO_ROWS = ("op", "reject:version_mismatch")         # 行の無い出典の訂正は版照合で拒否
 
 # ── App 30（出典 30/5・紐付け先 40/2＝正本にのみ存在させ、実在確認が kintone を通る） ──
 EXPECT30 = {
@@ -73,7 +75,7 @@ EXPECT30 = {
         **{k: NA_NO_ROWS for k in ("R_new", "R_same", "R_old", "R_fail", "R_refchange",
                                    "R_refclear", "R_undecidable")},
         "R_catout": NA_APP28_ONLY, "R_nonunique": NA_APP28_ONLY,
-        "relink": NA_NO_ROWS, "confirm": NA_NO_FACT, "reject": NA_NO_FACT, "revoke": NA_NO_FACT,
+        "relink": REJECT_NO_ROWS, "confirm": NA_NO_FACT, "reject": NA_NO_FACT, "revoke": NA_NO_FACT,
     },
     "ingested": {
         "S_new": ("ingested", False, "2", True, 0, None), "S_same": ("ingested", False, "2", True, 0, None),
@@ -210,7 +212,7 @@ EXPECT28 = {
         **{k: NA_NO_ROWS for k in ("R_new", "R_same", "R_old", "R_fail", "R_catout", "R_nonunique",
                                    "R_undecidable")},
         "R_refchange": NA_APP30_ONLY, "R_refclear": NA_APP30_ONLY,
-        "relink": NA_NO_ROWS, "confirm": NA_NO_FACT, "reject": NA_NO_FACT, "revoke": NA_NO_FACT,
+        "relink": REJECT_NO_ROWS, "confirm": NA_NO_FACT, "reject": NA_NO_FACT, "revoke": NA_NO_FACT,
     },
     "ingested": {
         "S_new": ("ingested", False, "1", True, 0, None), "S_same": ("ingested", False, "1", True, 0, None),
@@ -307,11 +309,11 @@ EXPECT28 = {
 # ── App 40（案件そのもの＝出典 40/1。参照・category の操作は無い） ──
 _NA40 = {k: NA_APP40 for k in ("S_refchange", "S_refclear", "S_catout", "S_nonunique",
                                 "S_undecidable", "R_refchange", "R_refclear", "R_catout",
-                                "R_nonunique", "R_undecidable", "relink")}
+                                "R_nonunique", "R_undecidable")}
 EXPECT40 = {
     "unregistered": {
         "S_new": ("ingested", False, "1", True, 0, None), "S_same": NA_SAME_AS_NEW, "S_old": NA_SAME_AS_NEW,
-        "S_fail": ("none", False, None, False, 0, "-"), **_NA40,
+        "S_fail": ("none", False, None, False, 0, "-"), **_NA40, "relink": REJECT_CASE_APP,
         **{k: NA_NO_ROWS for k in ("R_new", "R_same", "R_old", "R_fail")},
         "confirm": NA_NO_FACT, "reject": NA_NO_FACT, "revoke": NA_NO_FACT,
     },
@@ -320,7 +322,8 @@ EXPECT40 = {
         "S_old": ("ingested", False, "1", True, 0, None), "S_fail": ("ingested", False, "1", True, 0, "cursor_error"),
         "R_new": ("ingested", False, "1", True, 0, None), "R_same": ("ingested", False, "1", True, 0, None),
         "R_old": ("ingested", False, "1", True, 0, None), "R_fail": ("ingested", False, "1", True, 0, None),
-        **_NA40, "confirm": ("op", "ok"), "reject": ("op", "ok"), "revoke": ("op", "ok"),
+        **_NA40, "relink": REJECT_CASE_APP,
+        "confirm": ("op", "ok"), "reject": ("op", "ok"), "revoke": ("op", "ok"),
     },
     "mismatch_hold": {
         "S_new": ("ingested", False, "1", True, 0, None), "S_same": ("ingested", False, "1", True, 0, None),
@@ -329,7 +332,8 @@ EXPECT40 = {
         "R_new": ("ingested", False, "1", True, 0, None), "R_same": ("ingested", False, "1", True, 0, None),
         "R_old": ("mismatch_hold", False, "1", True, 0, "source_mismatch_hold"),
         "R_fail": ("mismatch_hold", False, "1", True, 0, "source_mismatch_hold"),
-        **_NA40, "confirm": ("op", "ok"), "reject": ("op", "ok"), "revoke": ("op", "ok"),
+        **_NA40, "relink": REJECT_CASE_APP,
+        "confirm": ("op", "ok"), "reject": ("op", "ok"), "revoke": ("op", "ok"),
     },
     "unavailable": {
         "S_new": ("ingested", False, "1", True, 0, None), "S_same": ("ingested", False, "1", True, 0, None),
@@ -338,7 +342,7 @@ EXPECT40 = {
         "R_new": ("ingested", False, "1", True, 0, None), "R_same": ("ingested", False, "1", True, 0, None),
         "R_old": ("unavailable", False, "1", True, 0, "source_unavailable"),
         "R_fail": ("unavailable", False, "1", True, 0, "source_unavailable"),
-        **_NA40, "confirm": ("op", "409:source_unavailable"),
+        **_NA40, "relink": REJECT_CASE_APP, "confirm": ("op", "409:source_unavailable"),
         "reject": ("op", "409:source_unavailable"), "revoke": ("op", "ok"),
     },
 }
@@ -405,6 +409,47 @@ class _Matrix(BrainDbMixin):
             src_fresh = hits[0] if hits else None
         return (state, pending, case[1] if case else None, await _has_current(app_id, rid),
                 await _count(ledger.link_history) - hist_before, src_fresh)
+
+    async def relink(self, app_id, rid, new_case, rev):
+        """手動訂正。拒否（R15 の案件本体・行の無い出典の版照合）は文字列で返す。"""
+        try:
+            await ledger.relink_source(source_app_id=app_id, source_record_id=rid, new_case=new_case,
+                                       reason="手動", operation_id="m-relink", actor="owner",
+                                       seen_link_version=await ledger.link_version(app_id, rid),
+                                       seen_source_revision=rev)
+            return "ok"
+        except ledger.NotRelinkable as exc:
+            return "reject:" + exc.reason
+        except ledger.VersionConflict as exc:
+            return "reject:" + exc.reason
+
+    @staticmethod
+    def same_as(last: dict, new_rev: int, updated: str) -> dict:
+        """BA-23: 同値新版＝直前レコードを保持して revision と更新日時だけ変える。"""
+        import copy
+        rec = copy.deepcopy(last)
+        rec["$revision"] = {"value": str(new_rev)}
+        rec["更新日時"] = {"value": updated}
+        return rec
+
+    async def facts_snapshot(self, app_id, rid):
+        """出典由来の fact（ID・値・現在値）。更新日時は閉集合に含まれる系統欄で、同値新版でも
+        値が変わる（＝その 1 件だけは正しく増える）ため比較から除く。"""
+        async with session_scope() as session:
+            rows = (await session.execute(sa.select(
+                ledger.case_fact.c.fact_id, ledger.case_fact.c.value_text,
+                ledger.case_fact.c.is_current).where(
+                ledger.case_fact.c.source_app_id == app_id,
+                ledger.case_fact.c.source_record_id == rid,
+                ~ledger.case_fact.c.item_code.endswith(".更新日時")))).fetchall()
+        return sorted((int(r[0]), r[1], bool(r[2])) for r in rows)
+
+    async def assert_same_path(self, app_id, rid, before, new_rev):
+        """BA-23: 同値新版で fact を増やさない経路を踏んだことを固定
+        （更新日時以外の fact の ID・値・件数が不変・latest_seen_revision だけ前進）。"""
+        after = await self.facts_snapshot(app_id, rid)
+        assert [x[:2] for x in after] == [x[:2] for x in before], (before, after)
+        assert await ledger.latest_known_revision(app_id, rid) == new_rev
 
     async def op_result(self, fact_id, op, version):
         try:
@@ -477,10 +522,12 @@ class TestMatrixApp30(_Matrix):
             rc = await sync.recheck_target(sync.TARGET_APP30)
             assert rc["pending_recheck"] == 1, rc
             self.fake.fail_at = set()
+        ctx["last"] = self.fake.data["30"][0]                   # 直前レコード（BA-23）
         return ctx
 
     async def apply(self, op, ctx):
         rid, ref, rev = ctx["rid"], ctx["ref"], ctx["rev"]
+        before = await self.facts_snapshot("30", rid)
         if op in ("confirm", "reject", "revoke"):
             facts = [f for f in await ledger.list_case_facts("40", ctx["case"], current_only=False)
                      if f["source_app_id"] == "30" and f["item_code"] == "app30.件名"]
@@ -493,16 +540,15 @@ class TestMatrixApp30(_Matrix):
                         decision="confirm", reason="", operation_id="m-pre", seen_version=fact["version"]))
             return await self.op_result(fact["fact_id"], op, fact["version"])
         if op == "relink":
-            await ledger.relink_source(source_app_id="30", source_record_id=rid, new_case=("40", "1"),
-                                       reason="手動", operation_id="m-relink", actor="owner",
-                                       seen_link_version=await ledger.link_version("30", rid),
-                                       seen_source_revision=rev)
-            return
+            return await self.relink("30", rid, ("40", "1"), rev)
         kind, what = op.split("_", 1)
         if what == "fail":
             self.fake.raise_all = True
         elif what == "old":
             self.fake.data["30"] = [app30(5, 2, T5, 案件レコードID=ref, 件名="旧版")]
+        elif what == "same":
+            # BA-23: 直前レコードを保持して revision・更新日時だけ変える
+            self.fake.data["30"] = [self.same_as(ctx["last"], rev + 1, T4)]
         else:
             new_rev = rev + 1
             fields = {"案件レコードID": ref}
@@ -521,6 +567,8 @@ class TestMatrixApp30(_Matrix):
             await sync.recheck_target(sync.TARGET_APP30)
         self.fake.raise_all = False
         self.fake.fail_at = set()
+        if what == "same":
+            await self.assert_same_path("30", rid, before, rev + 1)
 
     def test_unregistered(self):
         self.check_row(EXPECT30, "unregistered", self.setup, self.apply)
@@ -577,21 +625,21 @@ class TestMatrixApp28(_Matrix):
             rc = await sync.recheck_target(sync.TARGET_APP28)
             assert rc["pending_recheck"] == 1, rc
             self.fake.fail_at = set()
+        ctx["last"] = self.fake.data["28"][0]                   # 直前レコード（BA-23）
         return ctx
 
     async def apply(self, op, ctx):
         rid, rev = ctx["rid"], ctx["rev"]
+        before = await self.facts_snapshot("28", rid)
         if op == "relink":
-            await ledger.relink_source(source_app_id="28", source_record_id=rid, new_case=("40", "2"),
-                                       reason="手動", operation_id="m-relink", actor="owner",
-                                       seen_link_version=await ledger.link_version("28", rid),
-                                       seen_source_revision=rev)
-            return
+            return await self.relink("28", rid, ("40", "2"), rev)
         kind, what = op.split("_", 1)
         if what == "fail":
             self.fake.raise_all = True
         elif what == "old":
             self.fake.data["28"] = [app28(100, 2, T5, message="旧版")]
+        elif what == "same":
+            self.fake.data["28"] = [self.same_as(ctx["last"], rev + 1, T4)]
         else:
             new_rev = rev + 1
             fields = {}
@@ -610,6 +658,8 @@ class TestMatrixApp28(_Matrix):
             await sync.recheck_target(sync.TARGET_APP28)
         self.fake.raise_all = False
         self.fake.fail_at = set()
+        if what == "same":
+            await self.assert_same_path("28", rid, before, rev + 1)
 
     def test_unregistered(self):
         self.check_row(EXPECT28, "unregistered", self.setup, self.apply)
@@ -655,10 +705,14 @@ class TestMatrixApp40(_Matrix):
             self.fake.data["40"] = []
             assert (await sync.recheck_target(sync.TARGET_APP40))["unavailable"] == 1
             self.fake.data["40"] = saved
+        ctx["last"] = self.fake.data["40"][0]                   # 直前レコード（BA-23）
         return ctx
 
     async def apply(self, op, ctx):
         rev = ctx["rev"]
+        before = await self.facts_snapshot("40", "1")
+        if op == "relink":
+            return await self.relink("40", "1", ("40", "2"), rev)
         if op in ("confirm", "reject", "revoke"):
             facts = [f for f in await ledger.list_case_facts("40", "1", current_only=False)
                      if f["item_code"] == "app40.status"]
@@ -674,14 +728,17 @@ class TestMatrixApp40(_Matrix):
             self.fake.raise_all = True
         elif what == "old":
             self.fake.data["40"] = [app40(1, 2, T5, status="書類収集中")]
+        elif what == "same":
+            self.fake.data["40"] = [self.same_as(ctx["last"], rev + 1, T4)]
         else:
-            fields = {"status": "完了"} if what == "new" else {"status": "受理"}
-            self.fake.data["40"] = [app40(1, rev + 1, T4, **fields)]
+            self.fake.data["40"] = [app40(1, rev + 1, T4, status="完了")]
         if kind == "S":
             await sync.sync_target(sync.TARGET_APP40)
         else:
             await sync.recheck_target(sync.TARGET_APP40)
         self.fake.raise_all = False
+        if what == "same":
+            await self.assert_same_path("40", "1", before, rev + 1)
 
     def test_unregistered(self):
         self.check_row(EXPECT40, "unregistered", self.setup, self.apply)

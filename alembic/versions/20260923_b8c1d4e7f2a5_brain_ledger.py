@@ -9,6 +9,8 @@ v3.2 R8〜R10）。表定義は hub/brain_ledger.py の metadata と同一（テ
 - source_ingest.pending_recheck（fix2 R12: 判定不能＝次回の再照合対象）
 - sync_run.pending_unregistered / sync_cursor.pending_unregistered・sync_run.status に
   partial（fix3 BA-17: 初見の出典で判定不能＝出典行を作らず run/cursor に永続化）
+- sync_run.first_unresolved_position / sync_cursor.first_unresolved_position
+  （fix4 BA-20: 最初の未解決位置をページ確定時に永続化・downgrade は drop_table で対称）
 - sync_cursor: kind（sync/recheck・複合 PK）・scan_upper_bound / page_position（BA-09）・
   recheck_started_at / recheck_completed_at（BA-05）
 アプリ起動時には走らせない（D2: alembic CLI のみ）。
@@ -194,6 +196,7 @@ def upgrade() -> None:
         sa.Column("records_seen", sa.Integer, nullable=False, server_default='0'),
         sa.Column("confirmed_range", _JSON, nullable=True),
         sa.Column("pending_unregistered", sa.Integer, nullable=False, server_default='0'),
+        sa.Column("first_unresolved_position", _JSON, nullable=True),
         sa.CheckConstraint("status IN ('running', 'ok', 'failed', 'stopped', 'partial')",
                            name="ck_sync_run_status"),
     )
@@ -213,6 +216,7 @@ def upgrade() -> None:
         sa.Column("recheck_started_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("recheck_completed_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("pending_unregistered", sa.Integer, nullable=False, server_default='0'),
+        sa.Column("first_unresolved_position", _JSON, nullable=True),
         sa.Column("state", sa.Text, nullable=False),
         sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
         sa.CheckConstraint("state IN ('synced', 'incomplete', 'error', 'stopped')",

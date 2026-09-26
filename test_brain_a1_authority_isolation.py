@@ -56,7 +56,8 @@ from test_sink_ast_policy import scan_source  # noqa: E402
 REPO = Path(__file__).parent
 _client = TestClient(main.app)
 _ENV = {"WEBAPP_PASSWORD_HASH": hash_password("pw", iterations=MIN_ITERATIONS),
-        "WEBAPP_SESSION_SECRET": "s" * 32}
+        "WEBAPP_SESSION_SECRET": "s" * 32,
+        "BRAIN_SYNC_ENABLED": "1"}            # fix4 R14: OFF なら全ルート 404（下の専用テスト）
 BRAIN_FILES = ("hub/brain_ledger.py", "hub/brain_link.py", "hub/brain_sync.py",
                "hub/webapp_brain_view.py")
 OP1 = "11111111-2222-4333-8444-555555555555"
@@ -360,6 +361,80 @@ class TestOperations(BrainDbMixin):
             self.assertEqual(r.status_code, 303)
             self.assertEqual([c["decision"] for c in run(ledger.list_confirmations(live["fact_id"]))],
                              ["confirm", "revoke"])
+
+
+    # ── fix4: BA-21（R14 有効化判定の一元化）/ BA-22（R15 訂正対象の閉集合） ──
+
+    def test_disabled_closes_every_route_without_touching_db_or_kintone(self):
+        self.fake.data["40"] = [app40(1, 1)]
+        run(sync.sync_target(sync.TARGET_APP40))
+        from hub import db
+        n_calls = len(self.fake.calls)
+        with patch.dict(os.environ, {**_ENV, "BRAIN_SYNC_ENABLED": ""}), \
+                patch.object(db, "get_async_session_factory", wraps=db.get_async_session_factory) as sf:
+            for path in ("/app/brain", "/app/api/brain/enabled", "/app/api/brain/overview",
+                         "/app/api/brain/pending", "/app/api/brain/holds", "/app/api/brain/conflicts",
+                         "/app/api/brain/recheck", "/app/api/brain/facts?app=40&record=1"):
+                r = _client.get(path, headers=_auth(), follow_redirects=False)
+                self.assertEqual((r.status_code, r.text), (404, ""), path)
+            for path, body in (("/app/brain/confirm", {"operation_id": OP1, "fact_id": "1",
+                                                      "seen_version": "1", "decision": "confirm"}),
+                               ("/app/brain/relink", {"operation_id": OP2, "source_app_id": "30",
+                                                     "source_record_id": "5", "case_app_id": "40",
+                                                     "case_record_id": "1", "seen_link_version": "0",
+                                                     "seen_source_revision": "1"})):
+                r = _client.post(path, data=body, headers=_auth(), follow_redirects=False)
+                self.assertEqual((r.status_code, r.text), (404, ""), path)
+            # 同期・再照合・定期照合も同じ判定で入口で閉じる
+            self.assertEqual(run(sync.sync_target(sync.TARGET_APP40))["status"], "disabled")
+            self.assertEqual(run(sync.recheck_target(sync.TARGET_APP40))["status"], "disabled")
+            self.assertEqual(run(sync.reconcile_target(sync.TARGET_APP40))["status"], "disabled")
+            self.assertEqual(run(sync.run_brain_sync_job())["status"], "disabled")
+            sf.assert_not_called()                         # 台帳 DB に触れない
+        self.assertEqual(len(self.fake.calls), n_calls)    # kintone に触れない
+        # 未認証は従来どおり 303（判定は関所の内側）
+        with patch.dict(os.environ, {**_ENV, "BRAIN_SYNC_ENABLED": ""}):
+            r = _client.get("/app/brain", follow_redirects=False)
+            self.assertEqual((r.status_code, r.headers["location"]), (303, "/app/login"))
+        # 全ルートに共通ガードが 1 か所で付いている
+        for route in _routes():
+            self.assertTrue(getattr(route.endpoint, "__brain_enabled_gate__", False)
+                            or getattr(route.endpoint, "__wrapped__", None) is not None, route.path)
+        # ON に戻せば通常どおり
+        with patch.dict(os.environ, _ENV):
+            self.assertEqual(_client.get("/app/api/brain/enabled", headers=_auth(),
+                                         follow_redirects=False).json(), {"enabled": True})
+        # PWA のナビ: 案件脳リンクは /app/api/brain/enabled が 200 のときだけ追加される
+        src = (REPO / "webapp" / "shell.js").read_text(encoding="utf-8")
+        head = src[:src.index("const gatedNav")]
+        self.assertNotIn('"/app/brain"', head)                          # 常設ナビには無い
+        self.assertIn('["/app/brain", "案件脳", "/app/api/brain/enabled"]', src)
+        self.assertIn('app_fetch("/app/api/brain/enabled")', src)
+        self.assertIn("resp.ok && !resp.redirected", src)
+
+    def test_relink_of_case_app_source_is_rejected(self):
+        # R15: App 40（案件本体）の出典は訂正対象外。API は 409 app_not_relinkable・台帳関数は例外・
+        # 案件 1／案件 2 の fact 件数はともに不変
+        self.fake.data["40"] = [app40(1, 1), app40(2, 1)]
+        run(sync.sync_target(sync.TARGET_APP40))
+        n1 = len(run(ledger.list_case_facts("40", "1", current_only=False)))
+        n2 = len(run(ledger.list_case_facts("40", "2", current_only=False)))
+        with patch.dict(os.environ, _ENV):
+            r = _client.post("/app/brain/relink", headers=_auth(), follow_redirects=False,
+                             data={"operation_id": OP1, "source_app_id": "40", "source_record_id": "1",
+                                   "case_app_id": "40", "case_record_id": "2",
+                                   "seen_link_version": str(run(ledger.link_version("40", "1"))),
+                                   "seen_source_revision": "1"})
+            self.assertEqual((r.status_code, r.json()),
+                             (409, {"error": "app_not_relinkable", "reason": "app_not_relinkable"}))
+        with self.assertRaises(ledger.NotRelinkable):
+            run(ledger.relink_source(source_app_id="40", source_record_id="1", new_case=("40", "2"),
+                                     reason="", operation_id=OP2, actor="owner",
+                                     seen_link_version=0, seen_source_revision=1))
+        self.assertEqual(len(run(ledger.list_case_facts("40", "1", current_only=False))), n1)
+        self.assertEqual(len(run(ledger.list_case_facts("40", "2", current_only=False))), n2)
+        self.assertEqual(run(ledger.current_case_of_source("40", "1")), ("40", "1"))
+        self.assertIsNone(run(ledger.latest_link("40", "1")))
 
 
 def brain_sync_targets():

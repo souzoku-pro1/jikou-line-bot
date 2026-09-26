@@ -414,6 +414,8 @@ sync_run = sa.Table(
     sa.Column("confirmed_range", _JSON, nullable=True),
     # BA-17: 初見の出典で判定不能になった件数（出典行が無いため run に永続化）
     sa.Column("pending_unregistered", sa.Integer, nullable=False, server_default="0"),
+    # BA-20: 最初の未解決位置（更新日時・$id）。ページ確定ごとに永続化
+    sa.Column("first_unresolved_position", _JSON, nullable=True),
     sa.CheckConstraint("status IN ('running', 'ok', 'failed', 'stopped', 'partial')",
                        name="ck_sync_run_status"),
 )
@@ -438,6 +440,8 @@ sync_cursor = sa.Table(
     sa.Column("recheck_completed_at", sa.DateTime(timezone=True), nullable=True),
     # BA-17: 直近の走査で未登録のまま判定不能だった件数（0 になるまで synced にしない）
     sa.Column("pending_unregistered", sa.Integer, nullable=False, server_default="0"),
+    # BA-20: 最初の未解決位置。確認済み範囲（再開位置）はこれを越えて進めない
+    sa.Column("first_unresolved_position", _JSON, nullable=True),
     sa.Column("state", sa.Text, nullable=False),
     sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
     sa.CheckConstraint("state IN ('synced', 'incomplete', 'error', 'stopped')",
@@ -471,6 +475,14 @@ class VersionConflict(LedgerError):
 
 class SourceUnavailable(LedgerError):
     """出典確認不能の fact は確認・採用の対象にしない（BA-07）。"""
+
+
+class NotRelinkable(LedgerError):
+    """R15: 紐付け訂正の対象は App 28・App 30 のみ。案件本体（案件アプリの出典）は拒否。"""
+
+    def __init__(self):
+        super().__init__("app_not_relinkable")
+        self.reason = "app_not_relinkable"
 
 
 def make_locator(field: str = LOCATOR_UNKNOWN, row_id: str = LOCATOR_UNKNOWN,
@@ -1095,26 +1107,47 @@ async def mark_source_unavailable(source_app_id: str, source_record_id: str,
         return int(result.rowcount or 0)
 
 
+async def _restore_unavailable_tx(session, source_app_id: str, source_record_id: str, now) -> int:
+    """unavailable の解除。復帰先は案件付きなら ingested、案件なしは held（R5 不成立の
+    理由なら detached）。"""
+    rows = (await session.execute(sa.select(source_ingest).where(
+        _source_where(source_ingest, source_app_id, source_record_id),
+        source_ingest.c.state == "unavailable"))).fetchall()
+    for r in rows:
+        if r.case_app_id is not None:
+            state = "ingested"
+        elif r.hold_reason in DETACH_REASONS:
+            state = "detached"
+        else:
+            state = "held"
+        await session.execute(sa.update(source_ingest).where(
+            source_ingest.c.ingest_id == r.ingest_id).values(
+            state=state, last_checked_at=now))
+    return len(rows)
+
+
+async def mark_source_verified(source_app_id: str, source_record_id: str,
+                               *, now=None) -> dict:
+    """R13/BA-19: 有効な最新版の照合が成功した（取込は不要）ときの復旧を**1 トランザクション**で:
+    pending_recheck の解除と unavailable の解除（復帰先は _restore_unavailable_tx）。
+    途中で失敗すれば両方とも元のまま（片方だけ変わらない）。"""
+    now = now or _now()
+    async with session_scope() as session:
+        cleared = await session.execute(sa.update(source_ingest).where(
+            _source_where(source_ingest, source_app_id, source_record_id),
+            source_ingest.c.pending_recheck.is_(True)).values(
+            pending_recheck=False, last_checked_at=now))
+        restored = await _restore_unavailable_tx(session, source_app_id, source_record_id, now)
+        return {"pending_cleared": int(cleared.rowcount or 0), "restored": restored}
+
+
 async def mark_source_checked(source_app_id: str, source_record_id: str,
                               *, now=None) -> int:
     """再照合で出典が健在だったときの最終確認日時の更新（unavailable の解除）。
-    復帰先は案件付きなら ingested、案件なしは held（R5 不成立の理由なら detached）。"""
+    BA-19 以降は mark_source_verified が正（本関数は unavailable の解除だけ）。"""
     now = now or _now()
     async with session_scope() as session:
-        rows = (await session.execute(sa.select(source_ingest).where(
-            _source_where(source_ingest, source_app_id, source_record_id),
-            source_ingest.c.state == "unavailable"))).fetchall()
-        for r in rows:
-            if r.case_app_id is not None:
-                state = "ingested"
-            elif r.hold_reason in DETACH_REASONS:
-                state = "detached"
-            else:
-                state = "held"
-            await session.execute(sa.update(source_ingest).where(
-                source_ingest.c.ingest_id == r.ingest_id).values(
-                state=state, last_checked_at=now))
-        return len(rows)
+        return await _restore_unavailable_tx(session, source_app_id, source_record_id, now)
 
 
 async def list_sources(source_app_id: str, *, after: str = "0",
@@ -1261,7 +1294,16 @@ async def relink_source(*, source_app_id: str, source_record_id: str,
     （LedgerError: relink_target_unknown）。次回同期で新案件側の fact が積まれる。"""
     now = now or _now()
     new_case = (str(new_case[0]), str(new_case[1]))
+    source_app_id, source_record_id = str(source_app_id), str(source_record_id)
+    # R15: 訂正対象は紐付く側の出典（App 28・App 30）だけ。案件アプリ（訂正先と同じアプリ）
+    # の出典＝案件本体は拒否する。台帳に案件アプリとして現れているアプリも同様
+    if source_app_id == new_case[0]:
+        raise NotRelinkable()
     async with session_scope() as session:
+        is_case_app = (await session.execute(sa.select(source_ingest.c.ingest_id).where(
+            source_ingest.c.case_app_id == source_app_id).limit(1))).first()
+        if is_case_app is not None:
+            raise NotRelinkable()
         dup = (await session.execute(sa.select(link_history.c.link_id).where(
             link_history.c.operation_id == operation_id))).first()
         if dup:
@@ -1661,6 +1703,7 @@ def _cursor_view(row) -> dict:
             "recheck_started_at": _iso(row.recheck_started_at),
             "recheck_completed_at": _iso(row.recheck_completed_at),
             "pending_unregistered": int(row.pending_unregistered or 0),
+            "first_unresolved_position": row.first_unresolved_position,
             "updated_at": _iso(row.updated_at)}
 
 
@@ -1713,7 +1756,8 @@ async def start_run(target_app: str, scan_upper_bound: str, *, now=None) -> int:
 async def finish_run(run_id: int, status: str, *, failure: str | None = None,
                      incomplete_page=None, pages_done: int = 0,
                      records_seen: int = 0, confirmed_range=None,
-                     pending_unregistered: int = 0, now=None) -> None:
+                     pending_unregistered: int = 0, first_unresolved=None,
+                     now=None) -> None:
     if status not in RUN_STATES:
         raise LedgerError("run_state_not_in_closed_set")
     now = now or _now()
@@ -1724,6 +1768,7 @@ async def finish_run(run_id: int, status: str, *, failure: str | None = None,
                                       pages_done=pages_done, records_seen=records_seen,
                                       confirmed_range=confirmed_range,
                                       pending_unregistered=int(pending_unregistered),
+                                      first_unresolved_position=first_unresolved,
                                       finished_at=now))
 
 
@@ -1731,11 +1776,14 @@ async def advance_cursor_with_page(target_app: str, run_id: int, *,
                                    ingests: list, cursor_updated_at: str,
                                    cursor_record_id: str, pages_done: int,
                                    records_seen: int, scan_upper_bound: str | None = None,
+                                   pending_unregistered: int = 0, first_unresolved=None,
                                    now=None) -> list:
     """ページ単位の台帳書込とカーソル前進を**同一トランザクション**で行う。
     ingests は (SourceRef, case_key|None, facts, events[, extras]) のタプル列。
     失敗時はページ全体が巻き戻り、カーソルも進まない。page_position（再開位置・
-    BA-09）と scan_upper_bound を同時に保持する。戻り値は各取込の summary。"""
+    BA-09）と scan_upper_bound を同時に保持する。BA-20: 未解決件数と最初の未解決位置
+    （{"updated_at","record_id"}）もページ確定時に cursor と run へ永続化する。
+    戻り値は各取込の summary。"""
     now = now or _now()
     summaries = []
     try:
@@ -1751,12 +1799,16 @@ async def advance_cursor_with_page(target_app: str, run_id: int, *,
                           cursor_record_id=cursor_record_id, last_run_id=run_id,
                           state="incomplete",
                           page_position={"after_updated_at": cursor_updated_at,
-                                         "after_record_id": cursor_record_id})
+                                         "after_record_id": cursor_record_id},
+                          pending_unregistered=int(pending_unregistered),
+                          first_unresolved_position=first_unresolved)
             if scan_upper_bound is not None:
                 values["scan_upper_bound"] = scan_upper_bound
             await _set_cursor(session, target_app, now=now, **values)
             await session.execute(sa.update(sync_run).where(sync_run.c.run_id == run_id)
-                                  .values(pages_done=pages_done, records_seen=records_seen))
+                                  .values(pages_done=pages_done, records_seen=records_seen,
+                                          pending_unregistered=int(pending_unregistered),
+                                          first_unresolved_position=first_unresolved))
     except MismatchError:
         # ページ全体を巻き戻したうえで、不一致の出典だけ保留として記録する
         # （どの出典かは summaries の長さで特定＝黙って捨てない）
@@ -1797,6 +1849,7 @@ async def sync_overview() -> dict:
                       "pages_done": int(r.pages_done or 0),
                       "records_seen": int(r.records_seen or 0),
                       "pending_unregistered": int(r.pending_unregistered or 0),
+                      "first_unresolved_position": r.first_unresolved_position,
                       "incomplete_page": r.incomplete_page} for r in runs],
             "ingest_counts": {str(k): int(v) for k, v in counts},
         }

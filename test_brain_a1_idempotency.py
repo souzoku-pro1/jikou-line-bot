@@ -319,6 +319,15 @@ class TestIdempotency(BrainDbMixin):
         self.assertIn("'partial'", src)
         self.assertEqual(sync.STALE_KNOWN, "stale_known")                            # R13
 
+    def test_fix4_columns_and_vocabulary_pinned(self):
+        for table in (ledger.sync_run, ledger.sync_cursor):                          # BA-20
+            self.assertIn("first_unresolved_position", table.c)
+        src = (REPO / "alembic" / "versions" / "20260923_b8c1d4e7f2a5_brain_ledger.py"
+               ).read_text(encoding="utf-8")
+        self.assertEqual(src.count('"first_unresolved_position", _JSON, nullable=True'), 2)
+        self.assertTrue(issubclass(ledger.NotRelinkable, ledger.LedgerError))        # R15
+        self.assertEqual(ledger.NotRelinkable().reason, "app_not_relinkable")
+
 
 class TestMigrationRoundTrip(unittest.TestCase):
     """alembic b8c1d4e7f2a5 の revision 接続と表・制約の pin。up→down 往復の実行は
