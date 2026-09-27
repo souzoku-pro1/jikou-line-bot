@@ -1,5 +1,8 @@
 """BRAIN-A1 状態遷移表（fix3 自己点検・データ駆動）
 
+ID-1a（R29）: 案件は case_id（観測は case_info で kintone のレコード番号に戻して表と突合）。
+App 28 の判定は case_identity のみ（判定不能のセルは n/a・一意不成立は識別子 2 件で表現）。
+App 30 の判定不能は「参照先が台帳に無い App 40 レコード」の実在確認失敗でのみ起きる。
 行＝出典の状態（未登録／ingested／mismatch_hold／unavailable／detached／held と pending_recheck
 の組合せ）、列＝操作（通常同期・追跡再照合それぞれの 新版／同値新版／旧版／取得失敗／参照変更／
 参照消去／対象外化／一意不成立／判定不能、手動訂正、確認／却下／撤回）。
@@ -59,6 +62,8 @@ NA_NO_ROWS = ("n/a", "行が無い出典には再照合・訂正が起きない"
 NA_NO_FACT = ("n/a", "確認対象の fact が無い")
 NA_SAME_AS_NEW = ("n/a", "未登録では新版と同じ（初回取込）")
 NA_APP40 = ("n/a", "案件そのもの（紐付け・参照の操作は無い）")
+# ID-1a/R29: App 28 の判定は case_identity のみ（kintone を検索しない）＝外部確認が無く判定不能は起きない
+NA_APP28_IDENTITY = ("n/a", "R29: App 28 の判定は identity のみ（外部確認が無く判定不能は起きない）")
 NA_UNAVAIL_FETCH = ("n/a", "unavailable と同時に取得が成功する組合せは行の状態で表現済み")
 REJECT_CASE_APP = ("op", "reject:app_not_relinkable")      # R15: 案件本体は訂正対象外（実際に拒否を検証）
 REJECT_NO_ROWS = ("op", "reject:version_mismatch")         # 行の無い出典の訂正は版照合で拒否
@@ -208,7 +213,7 @@ EXPECT28 = {
         "S_fail": ("none", False, None, False, 0, "-"),
         "S_refchange": NA_APP30_ONLY, "S_refclear": NA_APP30_ONLY,
         "S_catout": ("none", False, None, False, 0, "-"), "S_nonunique": ("none", False, None, False, 0, "-"),
-        "S_undecidable": ("none", False, None, False, 0, "-"),
+        "S_undecidable": NA_APP28_IDENTITY,
         **{k: NA_NO_ROWS for k in ("R_new", "R_same", "R_old", "R_fail", "R_catout", "R_nonunique",
                                    "R_undecidable")},
         "R_refchange": NA_APP30_ONLY, "R_refclear": NA_APP30_ONLY,
@@ -219,12 +224,12 @@ EXPECT28 = {
         "S_old": ("ingested", False, "1", True, 0, None), "S_fail": ("ingested", False, "1", True, 0, "cursor_error"),
         "S_refchange": NA_APP30_ONLY, "S_refclear": NA_APP30_ONLY,
         "S_catout": ("detached", False, None, False, 1, "-"), "S_nonunique": ("detached", False, None, False, 1, "-"),
-        "S_undecidable": ("ingested", True, "1", True, 0, "pending_recheck"),
+        "S_undecidable": NA_APP28_IDENTITY,
         "R_new": ("ingested", False, "1", True, 0, None), "R_same": ("ingested", False, "1", True, 0, None),
         "R_old": ("ingested", False, "1", True, 0, None), "R_fail": ("ingested", False, "1", True, 0, None),
         "R_refchange": NA_APP30_ONLY, "R_refclear": NA_APP30_ONLY,
         "R_catout": ("detached", False, None, False, 1, "-"), "R_nonunique": ("detached", False, None, False, 1, "-"),
-        "R_undecidable": ("ingested", True, "1", True, 0, "pending_recheck"),
+        "R_undecidable": NA_APP28_IDENTITY,
         "relink": ("ingested", False, "2", True, 1, None),
         "confirm": NA_NO_FACT, "reject": NA_NO_FACT, "revoke": NA_NO_FACT,
     },
@@ -234,13 +239,13 @@ EXPECT28 = {
         "S_fail": ("ingested", True, "1", True, 0, "pending_recheck"),
         "S_refchange": NA_APP30_ONLY, "S_refclear": NA_APP30_ONLY,
         "S_catout": ("detached", False, None, False, 1, "-"), "S_nonunique": ("detached", False, None, False, 1, "-"),
-        "S_undecidable": ("ingested", True, "1", True, 0, "pending_recheck"),
+        "S_undecidable": NA_APP28_IDENTITY,
         "R_new": ("ingested", False, "1", True, 0, None), "R_same": ("ingested", False, "1", True, 0, None),
         "R_old": ("ingested", True, "1", True, 0, "pending_recheck"),
         "R_fail": ("ingested", True, "1", True, 0, "pending_recheck"),
         "R_refchange": NA_APP30_ONLY, "R_refclear": NA_APP30_ONLY,
         "R_catout": ("detached", False, None, False, 1, "-"), "R_nonunique": ("detached", False, None, False, 1, "-"),
-        "R_undecidable": ("ingested", True, "1", True, 0, "pending_recheck"),
+        "R_undecidable": NA_APP28_IDENTITY,
         "relink": ("ingested", True, "2", True, 1, "pending_recheck"),
         "confirm": NA_NO_FACT, "reject": NA_NO_FACT, "revoke": NA_NO_FACT,
     },
@@ -250,13 +255,13 @@ EXPECT28 = {
         "S_fail": ("unavailable", False, "1", True, 0, "source_unavailable"),
         "S_refchange": NA_APP30_ONLY, "S_refclear": NA_APP30_ONLY,
         "S_catout": ("detached", False, None, False, 1, "-"), "S_nonunique": ("detached", False, None, False, 1, "-"),
-        "S_undecidable": ("unavailable", True, "1", True, 0, "pending_recheck"),
+        "S_undecidable": NA_APP28_IDENTITY,
         "R_new": ("ingested", False, "1", True, 0, None), "R_same": ("ingested", False, "1", True, 0, None),
         "R_old": ("unavailable", False, "1", True, 0, "source_unavailable"),
         "R_fail": ("unavailable", False, "1", True, 0, "source_unavailable"),
         "R_refchange": NA_APP30_ONLY, "R_refclear": NA_APP30_ONLY,
         "R_catout": ("detached", False, None, False, 1, "-"), "R_nonunique": ("detached", False, None, False, 1, "-"),
-        "R_undecidable": ("unavailable", True, "1", True, 0, "pending_recheck"),
+        "R_undecidable": NA_APP28_IDENTITY,
         "relink": ("unavailable", False, "2", True, 1, "source_unavailable"),
         "confirm": NA_NO_FACT, "reject": NA_NO_FACT, "revoke": NA_NO_FACT,
     },
@@ -266,13 +271,13 @@ EXPECT28 = {
         "S_fail": ("unavailable", True, "1", True, 0, "pending_recheck"),
         "S_refchange": NA_APP30_ONLY, "S_refclear": NA_APP30_ONLY,
         "S_catout": ("detached", False, None, False, 1, "-"), "S_nonunique": ("detached", False, None, False, 1, "-"),
-        "S_undecidable": ("unavailable", True, "1", True, 0, "pending_recheck"),
+        "S_undecidable": NA_APP28_IDENTITY,
         "R_new": ("ingested", False, "1", True, 0, None), "R_same": ("ingested", False, "1", True, 0, None),
         "R_old": ("unavailable", True, "1", True, 0, "pending_recheck"),
         "R_fail": ("unavailable", True, "1", True, 0, "pending_recheck"),
         "R_refchange": NA_APP30_ONLY, "R_refclear": NA_APP30_ONLY,
         "R_catout": ("detached", False, None, False, 1, "-"), "R_nonunique": ("detached", False, None, False, 1, "-"),
-        "R_undecidable": ("unavailable", True, "1", True, 0, "pending_recheck"),
+        "R_undecidable": NA_APP28_IDENTITY,
         "relink": ("unavailable", True, "2", True, 1, "pending_recheck"),
         "confirm": NA_NO_FACT, "reject": NA_NO_FACT, "revoke": NA_NO_FACT,
     },
@@ -281,12 +286,12 @@ EXPECT28 = {
         "S_old": ("detached", False, None, False, 0, "-"), "S_fail": ("detached", False, None, False, 0, "-"),
         "S_refchange": NA_APP30_ONLY, "S_refclear": NA_APP30_ONLY,
         "S_catout": ("detached", False, None, False, 0, "-"), "S_nonunique": ("detached", False, None, False, 0, "-"),
-        "S_undecidable": ("detached", True, None, False, 0, "-"),
+        "S_undecidable": NA_APP28_IDENTITY,
         "R_new": ("ingested", False, "1", True, 0, None), "R_same": ("ingested", False, "1", True, 0, None),
         "R_old": ("detached", False, None, False, 0, "-"), "R_fail": ("detached", False, None, False, 0, "-"),
         "R_refchange": NA_APP30_ONLY, "R_refclear": NA_APP30_ONLY,
         "R_catout": ("detached", False, None, False, 0, "-"), "R_nonunique": ("detached", False, None, False, 0, "-"),
-        "R_undecidable": ("detached", True, None, False, 0, "-"),
+        "R_undecidable": NA_APP28_IDENTITY,
         "relink": ("ingested", False, "2", False, 1, "relink_pending"),
         "confirm": NA_NO_FACT, "reject": NA_NO_FACT, "revoke": NA_NO_FACT,
     },
@@ -295,12 +300,12 @@ EXPECT28 = {
         "S_old": ("detached", True, None, False, 0, "-"), "S_fail": ("detached", True, None, False, 0, "-"),
         "S_refchange": NA_APP30_ONLY, "S_refclear": NA_APP30_ONLY,
         "S_catout": ("detached", False, None, False, 0, "-"), "S_nonunique": ("detached", False, None, False, 0, "-"),
-        "S_undecidable": ("detached", True, None, False, 0, "-"),
+        "S_undecidable": NA_APP28_IDENTITY,
         "R_new": ("ingested", False, "1", True, 0, None), "R_same": ("ingested", False, "1", True, 0, None),
         "R_old": ("detached", True, None, False, 0, "-"), "R_fail": ("detached", True, None, False, 0, "-"),
         "R_refchange": NA_APP30_ONLY, "R_refclear": NA_APP30_ONLY,
         "R_catout": ("detached", False, None, False, 0, "-"), "R_nonunique": ("detached", False, None, False, 0, "-"),
-        "R_undecidable": ("detached", True, None, False, 0, "-"),
+        "R_undecidable": NA_APP28_IDENTITY,
         "relink": ("ingested", True, "2", False, 1, "pending_recheck"),
         "confirm": NA_NO_FACT, "reject": NA_NO_FACT, "revoke": NA_NO_FACT,
     },
@@ -417,15 +422,18 @@ class _Matrix(BrainDbMixin):
 
     async def observe(self, app_id, rid, hist_before, case_hint):
         state, pending = await _latest_state(app_id, rid)
-        case = await ledger.current_case_of_source(app_id, rid)
+        case_id = await ledger.current_case_of_source(app_id, rid)      # ID-1a: case_id
         src_fresh = "-"
-        if case is not None:
-            fd = await ledger.case_freshness_detail(case[0], case[1], "app40", sync.source_targets())
+        key = None
+        if case_id is not None:
+            info = await ledger.case_info(case_id)
+            key = (info["case_app_id"], info["case_record_id"])          # 表は kintone のレコード番号で読む
+            fd = await ledger.case_freshness_detail(case_id, "app40", sync.source_targets())
             hits = [r.split(":", 2)[2] for r in fd["reasons"] if r.startswith(f"app{app_id}:{rid}:")]
-            if (app_id, rid) == (case[0], case[1]):        # 案件自身: 全体の理由
+            if (app_id, rid) == key:                        # 案件自身: 全体の理由
                 hits = fd["reasons"]
             src_fresh = hits[0] if hits else None
-        return (state, pending, case[1] if case else None, await _has_current(app_id, rid),
+        return (state, pending, key[1] if key else None, await _has_current(app_id, rid),
                 await _count(ledger.link_history) - hist_before, src_fresh)
 
     async def relink(self, app_id, rid, new_case, rev):
@@ -536,10 +544,9 @@ class TestMatrixApp30(_Matrix):
             assert (await sync.recheck_target(sync.TARGET_APP30))["unavailable"] == 1
             self.fake.data["30"] = saved
         if state.endswith("_pending"):
-            self.fake.fail_at = {len(self.fake.calls) + 2}      # 1=$id in・2=App 40 実在確認
-            rc = await sync.recheck_target(sync.TARGET_APP30)
-            assert rc["pending_recheck"] == 1, rc
-            self.fake.fail_at = set()
+            # ID-1a: 参照先 No.2 は初回の実在確認で案件（識別子）が起こされるため、以後の再照合は
+            # kintone に触れない。判定不能の記録（R12）は台帳 API で置く（意味は同じ）
+            assert await ledger.set_pending_recheck("30", "5", True) >= 1
         ctx["last"] = self.fake.data["30"][0]                   # 直前レコード（BA-23）
         return ctx
 
@@ -547,7 +554,7 @@ class TestMatrixApp30(_Matrix):
         rid, ref, rev = ctx["rid"], ctx["ref"], ctx["rev"]
         before = await self.facts_snapshot("30", rid)
         if op in ("confirm", "reject", "revoke"):
-            facts = [f for f in await ledger.list_case_facts("40", ctx["case"], current_only=False)
+            facts = [f for f in await ledger.list_case_facts(("40", ctx["case"]), current_only=False)
                      if f["source_app_id"] == "30" and f["item_code"] == "app30.件名"]
             fact = sorted(facts, key=lambda f: f["fact_id"])[-1]
             if op == "revoke":
@@ -576,6 +583,9 @@ class TestMatrixApp30(_Matrix):
                 fields["案件レコードID"] = "1"
             elif what == "refclear":
                 fields["案件レコードID"] = ""
+            elif what == "undecidable":
+                # R29: 判定不能＝参照先が台帳に無い App 40（No.3）の実在確認が失敗する
+                fields["案件レコードID"] = "3"
             self.fake.data["30"] = [app30(5, new_rev, T4, **fields)]
             if what == "undecidable":
                 self.fake.fail_at = {len(self.fake.calls) + 2}
@@ -639,10 +649,9 @@ class TestMatrixApp28(_Matrix):
             assert (await sync.recheck_target(sync.TARGET_APP28))["unavailable"] == 1
             self.fake.data["28"] = saved
         if state.endswith("_pending"):
-            self.fake.fail_at = {len(self.fake.calls) + 2}      # 1=$id in・2=LINE 検索
-            rc = await sync.recheck_target(sync.TARGET_APP28)
-            assert rc["pending_recheck"] == 1, rc
-            self.fake.fail_at = set()
+            # ID-1a/R29: App 28 の判定は identity のみ（外部確認なし）。判定不能の記録（R12）は
+            # 台帳 API で置く（意味は同じ: 次回の再照合対象）
+            assert await ledger.set_pending_recheck("28", "100", True) >= 1
         ctx["last"] = self.fake.data["28"][0]                   # 直前レコード（BA-23）
         return ctx
 
@@ -666,10 +675,10 @@ class TestMatrixApp28(_Matrix):
             elif what == "catout":
                 fields["category"] = "その他判断系"
             elif what == "nonunique":
-                self.fake.data["40"].append(app40(3, 1, T4))    # 正本にだけ同じ LINE_A の No.3
+                # R29: 同じ LINE_A の No.3 が同期され line_user 識別子が 2 件（正本だけでは不成立にならない）
+                self.fake.data["40"].append(app40(3, 1, T4))
+                await sync.sync_target(sync.TARGET_APP40)
             self.fake.data["28"] = [app28(100, new_rev, T4, **fields)]
-            if what == "undecidable":
-                self.fake.fail_at = {len(self.fake.calls) + 2}
         if kind == "S":
             await sync.sync_target(sync.TARGET_APP28)
         else:
@@ -732,7 +741,7 @@ class TestMatrixApp40(_Matrix):
         if op == "relink":
             return await self.relink("40", "1", ("40", "2"), rev)
         if op in ("confirm", "reject", "revoke"):
-            facts = [f for f in await ledger.list_case_facts("40", "1", current_only=False)
+            facts = [f for f in await ledger.list_case_facts(("40", "1"), current_only=False)
                      if f["item_code"] == "app40.status"]
             fact = sorted(facts, key=lambda f: f["fact_id"])[-1]
             if op == "revoke":

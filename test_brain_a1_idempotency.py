@@ -17,7 +17,7 @@ from pathlib import Path
 
 import sqlalchemy as sa
 
-from brain_test_support import BrainDbMixin, app30, app40, run, subrow
+from brain_test_support import BrainDbMixin, app30, app40, cid, run, subrow
 from hub import brain_ledger as ledger
 from hub import brain_sync as sync
 from hub.db import session_scope
@@ -96,13 +96,13 @@ class TestIdempotency(BrainDbMixin):
         async def body():
             await sync.sync_target(sync.TARGET_APP40)
             await sync.sync_target(sync.TARGET_APP30)
-            n1 = len(await ledger.list_case_facts("40", "1", current_only=False))
+            n1 = len(await ledger.list_case_facts(("40", "1"), current_only=False))
             for _ in range(3):
                 r = await sync.sync_target(sync.TARGET_APP40)
                 self.assertEqual(r["inserted"], 0)
                 r = await sync.sync_target(sync.TARGET_APP30)
                 self.assertEqual(r["inserted"], 0)
-            self.assertEqual(len(await ledger.list_case_facts("40", "1", current_only=False)), n1)
+            self.assertEqual(len(await ledger.list_case_facts(("40", "1"), current_only=False)), n1)
             # 同じ SourceRef を直接再投入しても増えない
             src, key, facts, events = sync.convert_app40(app40(1, 1))
             s = await ledger.ingest_source(src, key, facts, events)
@@ -116,7 +116,7 @@ class TestIdempotency(BrainDbMixin):
         async def body():
             await sync.sync_target(sync.TARGET_APP40)
             before = {(f["subject_id"], f["item_code"]): f["value_text"]
-                      for f in await ledger.list_case_facts("40", "1")}
+                      for f in await ledger.list_case_facts(("40", "1"))}
             self.assertEqual(before[("creditor:11", "app40.債権者一覧.債権者名")], "甲社")
             self.assertEqual(before[("creditor:12", "app40.債権者一覧.債権者名")], "乙社")
             self.assertEqual(before[("applicant", "app40.顧客名")], "テスト太郎")
@@ -127,7 +127,7 @@ class TestIdempotency(BrainDbMixin):
             r = await sync.sync_target(sync.TARGET_APP40)
             self.assertEqual(r["inserted"], 2)          # 更新日時・作成日時の 2 事実のみ
             after = {(f["subject_id"], f["item_code"]): f["value_text"]
-                     for f in await ledger.list_case_facts("40", "1")}
+                     for f in await ledger.list_case_facts(("40", "1"))}
             changed = {k for k in after if after[k] != before.get(k)}
             self.assertEqual(changed, {("case", "app40.更新日時"), ("case", "app40.作成日時")})
             self.assertEqual(set(before), set(after))   # subject×項目の集合は不変
@@ -135,7 +135,7 @@ class TestIdempotency(BrainDbMixin):
             self.fake.data["40"] = [app40(1, 3, "2026-09-20T03:00:00Z",
                                           債権者一覧=[{"value": {"債権者名": {"value": "丙社"}}}])]
             await sync.sync_target(sync.TARGET_APP40)
-            subs = {f["subject_id"] for f in await ledger.list_case_facts("40", "1")}
+            subs = {f["subject_id"] for f in await ledger.list_case_facts(("40", "1"))}
             self.assertFalse(any(s.startswith("creditor:-") or s == "creditor:" for s in subs))
         run(body())
 
@@ -144,11 +144,11 @@ class TestIdempotency(BrainDbMixin):
             await ledger.ingest_source(_src(rev=5), ("40", "1"), [_fact(value="受理")])
             s = await ledger.ingest_source(_src(rev=4), ("40", "1"), [_fact(value="受任")])
             self.assertEqual(s["inserted"], 1)
-            facts = await ledger.list_case_facts("40", "1", current_only=False)
+            facts = await ledger.list_case_facts(("40", "1"), current_only=False)
             by_rev = {f["version"]: f for f in facts if f["item_code"] == "app40.status"}
             self.assertTrue(by_rev[5]["is_current"])
             self.assertFalse(by_rev[4]["is_current"])
-            self.assertEqual([f["value_text"] for f in await ledger.list_case_facts("40", "1")],
+            self.assertEqual([f["value_text"] for f in await ledger.list_case_facts(("40", "1"))],
                              ["受理"])
             # 同じ旧 revision を再投入しても増えない
             s = await ledger.ingest_source(_src(rev=4), ("40", "1"), [_fact(value="受任")])
@@ -160,7 +160,7 @@ class TestIdempotency(BrainDbMixin):
             await ledger.ingest_source(_src(rev=1), ("40", "1"), [_fact(value="受任")])
             s = await ledger.ingest_source(_src(rev=1), ("40", "1"), [_fact(value="受理")])
             self.assertEqual(s["state"], "mismatch_hold")
-            self.assertEqual([f["value_text"] for f in await ledger.list_case_facts("40", "1")],
+            self.assertEqual([f["value_text"] for f in await ledger.list_case_facts(("40", "1"))],
                              ["受任"])                       # 元の値は残り、上書きされない
             holds = await ledger.list_holds()
             self.assertEqual([(h["source_record_id"], h["state"]) for h in holds],
@@ -179,7 +179,7 @@ class TestIdempotency(BrainDbMixin):
         async def body():
             await ledger.ingest_source(_src(rev=1), ("40", "1"), [_fact(value="受任")])
             await ledger.ingest_source(_src(rev=2), ("40", "1"), [_fact(value="受理")])
-            facts = {f["version"]: f for f in await ledger.list_case_facts("40", "1", False)}
+            facts = {f["version"]: f for f in await ledger.list_case_facts(("40", "1"), False)}
             old, new = facts[1]["fact_id"], facts[2]["fact_id"]
             async with session_scope() as session:
                 row = (await session.execute(sa.select(ledger.case_fact).where(
@@ -219,7 +219,7 @@ class TestIdempotency(BrainDbMixin):
             s = await ledger.ingest_source(_src(rev=3), ("40", "1"),
                                            [_fact("app40.事件番号", value="")])
             self.assertEqual(s["inserted"], 1)
-            cur = [f for f in await ledger.list_case_facts("40", "1")
+            cur = [f for f in await ledger.list_case_facts(("40", "1"))
                    if f["item_code"] == "app40.事件番号"]
             self.assertEqual([(f["value_text"], f["version"]) for f in cur], [("", 3)])
         run(body())
@@ -231,7 +231,7 @@ class TestIdempotency(BrainDbMixin):
             s1 = await ledger.ingest_source(_src(rev=1), ("40", "1"), [_fact()], ev)
             s2 = await ledger.ingest_source(_src(rev=1), ("40", "1"), [_fact()], ev)
             self.assertEqual((s1["events"], s2["events"]), (1, 0))
-            self.assertEqual(len(await ledger.list_case_events("40", "1")), 1)
+            self.assertEqual(len(await ledger.list_case_events(("40", "1"))), 1)
         run(body())
 
     # ── fix1: BA-01 / R8（系列の latest_seen_revision） ──
@@ -251,10 +251,10 @@ class TestIdempotency(BrainDbMixin):
             self.assertEqual(sorted((int(a), int(b)) for a, b in rows), [(1, 3), (3, 3)])
             s2 = await ledger.ingest_source(_src(rev=2), ("40", "1"), [_fact(value="受理")])
             self.assertEqual(s2["inserted"], 1)                          # 保存はする
-            cur = [(f["value_text"], f["version"]) for f in await ledger.list_case_facts("40", "1")
+            cur = [(f["value_text"], f["version"]) for f in await ledger.list_case_facts(("40", "1"))
                    if f["item_code"] == "app40.status"]
             self.assertEqual(cur, [("受任", 1)])                          # 現在値は受任のまま
-            late = [f for f in await ledger.list_case_facts("40", "1", current_only=False)
+            late = [f for f in await ledger.list_case_facts(("40", "1"), current_only=False)
                     if f["version"] == 2][0]
             self.assertEqual((late["is_current"], late["invalid_reason"]), (False, "stale_revision"))
             self.assertEqual(await ledger.latest_known_revision("40", "1"), 3)
@@ -265,7 +265,7 @@ class TestIdempotency(BrainDbMixin):
             await sync.sync_target(sync.TARGET_APP40)
             self.fake.data["40"] = [app40(7, 2, "2026-09-20T04:00:00Z", status="受理")]
             self.assertEqual((await sync.sync_target(sync.TARGET_APP40))["status"], "ok")
-            st = [(f["value_text"], f["version"]) for f in await ledger.list_case_facts("40", "7")
+            st = [(f["value_text"], f["version"]) for f in await ledger.list_case_facts(("40", "7"))
                   if f["item_code"] == "app40.status"]
             self.assertEqual(st, [("受任", 1)])
             self.assertEqual(await ledger.latest_known_revision("40", "7"), 3)
@@ -312,7 +312,8 @@ class TestIdempotency(BrainDbMixin):
         for table in (ledger.sync_run, ledger.sync_cursor):                          # BA-17
             self.assertIn("pending_unregistered", table.c)
             self.assertFalse(table.c.pending_unregistered.nullable)
-        self.assertEqual(ledger.RUN_STATES, ("running", "ok", "failed", "stopped", "partial"))
+        self.assertEqual(ledger.RUN_STATES,
+                         ("running", "ok", "failed", "stopped", "partial", "stopped_stale"))  # R28
         src = (REPO / "alembic" / "versions" / "20260923_b8c1d4e7f2a5_brain_ledger.py"
                ).read_text(encoding="utf-8")
         self.assertEqual(src.count('"pending_unregistered", sa.Integer, nullable=False'), 2)
@@ -345,18 +346,22 @@ class TestMigrationRoundTrip(unittest.TestCase):
         self.assertIn("brain_ledger_metadata", env)
 
     def test_tables_and_constraints_pinned(self):
-        self.assertEqual(ledger.TABLE_NAMES, (
+        self.assertEqual(ledger.A1_TABLE_NAMES, (
             "case_fact", "case_confirmation", "case_event", "case_derivation",
             "case_usage", "source_ingest", "link_history", "sync_run", "sync_cursor"))
+        self.assertEqual(ledger.TABLE_NAMES, (                                    # ID-1a
+            "case", "case_identity", "merge_history", "subject_merge_history") + ledger.A1_TABLE_NAMES)
         names = {c.name for c in ledger.case_fact.constraints if c.name}
         self.assertTrue({"uq_case_fact_key", "ck_case_fact_no_self_supersede",
                          "ck_case_fact_locator_nonempty", "ck_case_fact_confidence"} <= names)
         uq = [c for c in ledger.case_fact.constraints
               if isinstance(c, sa.UniqueConstraint) and c.name == "uq_case_fact_key"][0]
-        self.assertEqual([c.name for c in uq.columns], [
-            "case_app_id", "case_record_id", "subject_id", "item_code", "source_app_id",
+        self.assertEqual([c.name for c in uq.columns], [                        # ID-1a: case_id 基準
+            "case_id", "subject_id", "item_code", "source_app_id",
             "source_record_id", "source_revision", "locator", "converter_name",
             "converter_version"])
+        self.assertFalse(ledger.case_fact.c.case_id.nullable)
+        self.assertTrue(ledger.case_fact.c.case_app_id.nullable)                 # 互換・履歴用
         self.assertFalse(ledger.case_fact.c.locator.nullable)
         self.assertTrue(ledger.case_fact.c.supersedes_fact_id.unique)
         self.assertTrue(ledger.case_confirmation.c.operation_id.unique)

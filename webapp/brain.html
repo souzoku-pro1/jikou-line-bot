@@ -57,9 +57,11 @@ button.sub{background:#fff;color:#3a4a63;border-color:#9aa7bd}
 <div id="recheck"><span class="empty">読み込み中…</span></div>
 <h2>案件の事実（確認/却下/撤回）</h2>
 <div id="casebox" class="card">
-  <label>案件アプリID <input id="case_app" type="text" inputmode="numeric" pattern="[0-9]*"></label>
-  <label>レコード番号 <input id="case_rec" type="text" inputmode="numeric" pattern="[0-9]*"></label>
+  <label>案件ID <input id="case_id" type="text" inputmode="numeric" pattern="[0-9]*"></label>
   <button id="case_load" type="button">表示</button>
+  <span class="meta">または App 40 のレコード番号で検索:</span>
+  <label>レコード番号 <input id="case_rec" type="text" inputmode="numeric" pattern="[0-9]*"></label>
+  <button id="case_find" type="button" class="sub">案件IDを引く</button>
   <span class="meta">kintone の値は置き換えません（台帳への注記のみ）。</span>
 </div>
 <div id="facts"><span class="empty">案件を指定してください。</span></div>
@@ -69,6 +71,7 @@ button.sub{background:#fff;color:#3a4a63;border-color:#9aa7bd}
 (function () {
   const RELINK_PATH = "/app/brain/relink";
   const CONFIRM_PATH = "/app/brain/confirm";
+  const HOUKI_APP = "40";                 // 識別子検索（レコード番号→案件ID）に使う案件アプリ
   function el(tag, cls, text) {
     const e = document.createElement(tag);
     if (cls) { e.className = cls; }
@@ -103,6 +106,18 @@ button.sub{background:#fff;color:#3a4a63;border-color:#9aa7bd}
     f.appendChild(r);
   }
   function caseKey(app, rec) { return "案件 " + app + "/" + rec; }
+  function caseLabel(id, app, rec) {
+    // 案件は case_id で識別（ID-1a）。登録済み案件は kintone のレコード番号を添える
+    return "案件#" + id + (app ? "（" + app + "/" + rec + "）" : "（未登録）");
+  }
+  async function lookupCase(rec) {
+    // 識別子検索: App 40 のレコード番号 → case_id（無ければ null・失敗は undefined）
+    const resp = await app_fetch("/app/api/brain/case?app=" + HOUKI_APP + "&record=" + rec);
+    if (resp.redirected) { location.href = "/app/login"; return null; }
+    if (resp.status === 404) { return null; }
+    if (!resp.ok) { return undefined; }
+    return resp.json();
+  }
   function renderFlash() {
     const p = new URLSearchParams(location.search);
     const box = document.getElementById("flash");
@@ -183,18 +198,29 @@ button.sub{background:#fff;color:#3a4a63;border-color:#9aa7bd}
         c.appendChild(el("div", "meta", "候補: " + caseKey(cand.case_app_id, cand.case_record_id) +
           "（" + cand.trust + "・自動確定しない）"));
       }
-      // 画面が見ていた紐付け版・出典 revision を送る（サーバが現在値と照合・不一致は 409）
+      // 画面が見ていた紐付け版・出典 revision を送る（サーバが現在値と照合・不一致は 409）。
+      // 訂正先は案件ID（case_id・R31）。レコード番号からの識別子検索で埋められる
       const f = opForm(RELINK_PATH,
         {source_app_id: r.source_app_id, source_record_id: r.source_record_id,
          seen_link_version: r.link_version, seen_source_revision: r.source_revision},
         "この案件へ紐付ける", (form) => {
           const a = document.createElement("input");
-          a.type = "text"; a.name = "case_app_id"; a.placeholder = "案件アプリID";
+          a.type = "text"; a.name = "case_id"; a.placeholder = "案件ID";
           a.inputMode = "numeric"; a.required = true; a.pattern = "[0-9]+";
           const b = document.createElement("input");
-          b.type = "text"; b.name = "case_record_id"; b.placeholder = "レコード番号";
-          b.inputMode = "numeric"; b.required = true; b.pattern = "[0-9]+";
-          form.appendChild(a); form.appendChild(b);
+          b.type = "text"; b.placeholder = "App 40 レコード番号→案件ID";
+          b.inputMode = "numeric"; b.pattern = "[0-9]*";
+          const find = document.createElement("button");
+          find.type = "button"; find.className = "sub"; find.textContent = "案件IDを引く";
+          find.addEventListener("click", async () => {
+            const rec = b.value.trim();
+            if (!/^[0-9]+$/.test(rec)) { return; }
+            const found = await lookupCase(rec);
+            if (found === undefined) { fail("pending", "識別子検索に失敗しました。"); return; }
+            a.value = found ? String(found.case_id) : "";
+            if (!found) { a.placeholder = "案件ID（該当なし）"; }
+          });
+          form.appendChild(a); form.appendChild(b); form.appendChild(find);
           reasonInput(form);
         });
       c.appendChild(f);
@@ -215,7 +241,9 @@ button.sub{background:#fff;color:#3a4a63;border-color:#9aa7bd}
         : "抽出結果の不一致（保留）";
       c.appendChild(el("div", "", "出典 App " + r.source_app_id + " No." + r.source_record_id +
         "（rev " + r.revision + "）: " + label));
-      if (r.case_app_id) { c.appendChild(el("div", "meta", caseKey(r.case_app_id, r.case_record_id))); }
+      if (r.case_id !== null && r.case_id !== undefined) {
+        c.appendChild(el("div", "meta", caseLabel(r.case_id, r.case_app_id, r.case_record_id)));
+      } else if (r.case_app_id) { c.appendChild(el("div", "meta", caseKey(r.case_app_id, r.case_record_id))); }
       if (r.hold_reason) { c.appendChild(el("div", "meta", "理由: " + r.hold_reason)); }
       box.appendChild(c);
     }
@@ -233,7 +261,9 @@ button.sub{background:#fff;color:#3a4a63;border-color:#9aa7bd}
     if (!d.records.length) { box.appendChild(el("span", "empty", "なし")); return; }
     for (const g of d.records) {
       const c = el("div", "card warn");
-      c.appendChild(el("div", "", caseKey(g.case_app_id, g.case_record_id) + " / " + g.subject_id + " / " + g.item_code));
+      c.appendChild(el("div", "", (g.case_id !== null && g.case_id !== undefined
+        ? caseLabel(g.case_id, g.case_app_id, g.case_record_id)
+        : caseKey(g.case_app_id, g.case_record_id)) + " / " + g.subject_id + " / " + g.item_code));
       for (const f of g.facts) {
         c.appendChild(el("div", "meta", factLine(f)));
         c.appendChild(confirmForm(f));
@@ -271,18 +301,35 @@ button.sub{background:#fff;color:#3a4a63;border-color:#9aa7bd}
       box.appendChild(c);
     }
   }
-  async function loadFacts() {
-    const app = document.getElementById("case_app").value.trim();
+  async function findCase() {
+    // 案件キー入力は識別子検索として残す（R31）: レコード番号 → 案件ID
     const rec = document.getElementById("case_rec").value.trim();
     const box = document.getElementById("facts");
-    if (!/^[0-9]+$/.test(app) || !/^[0-9]+$/.test(rec)) {
+    if (!/^[0-9]+$/.test(rec)) {
       box.replaceChildren(el("span", "sys err", "数字で指定してください。"));
       return;
     }
-    const d = await getJson("/app/api/brain/facts?app=" + app + "&record=" + rec, "facts");
-    if (!d) { return; }
+    const found = await lookupCase(rec);
+    if (found === undefined) { fail("facts", "識別子検索に失敗しました。"); return; }
+    if (!found) { box.replaceChildren(el("span", "sys err", "そのレコード番号の案件は台帳にありません。")); return; }
+    document.getElementById("case_id").value = String(found.case_id);
+    await loadFacts();
+  }
+  async function loadFacts() {
+    const id = document.getElementById("case_id").value.trim();
+    const box = document.getElementById("facts");
+    if (!/^[0-9]+$/.test(id)) {
+      box.replaceChildren(el("span", "sys err", "案件IDを数字で指定してください。"));
+      return;
+    }
+    const resp = await app_fetch("/app/api/brain/facts?case=" + id);
+    if (resp.redirected) { location.href = "/app/login"; return; }
+    if (resp.status === 404) { box.replaceChildren(el("span", "sys err", "その案件IDは台帳にありません。")); return; }
+    if (resp.status === 503) { fail("facts", "台帳（DB）に接続できません（同期停止中）。"); return; }
+    if (!resp.ok) { fail("facts", "読み込みに失敗しました。"); return; }
+    const d = await resp.json();
     box.replaceChildren();
-    box.appendChild(el("div", "meta", caseKey(d.case_app_id, d.case_record_id) + "・鮮度: " + d.freshness +
+    box.appendChild(el("div", "meta", caseLabel(d.case_id, d.case_app_id, d.case_record_id) + "・鮮度: " + d.freshness +
       ((d.freshness_reasons || []).length ? "（" + d.freshness_reasons.join(", ") + "）" : "")));
     if (!d.facts.length) { box.appendChild(el("span", "empty", "現在の事実はありません（同期未完了か案件なし）。")); return; }
     for (const f of d.facts) {
@@ -310,6 +357,15 @@ button.sub{background:#fff;color:#3a4a63;border-color:#9aa7bd}
     }
   }
   document.getElementById("case_load").addEventListener("click", loadFacts);
+  document.getElementById("case_find").addEventListener("click", findCase);
+  (function () {
+    // ?case= で開いたときはその案件を表示（PWA の案件指定は case_id・R31）
+    const initial = new URLSearchParams(location.search).get("case");
+    if (initial && /^[0-9]+$/.test(initial)) {
+      document.getElementById("case_id").value = initial;
+      loadFacts();
+    }
+  })();
   renderFlash();
   loadSync(); loadPending(); loadHolds(); loadConflicts(); loadRecheck();
 })();

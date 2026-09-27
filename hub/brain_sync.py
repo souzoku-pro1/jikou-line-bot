@@ -5,9 +5,15 @@
 - App 30 のうち 案件アプリID = APP_HOUKI の値 の行（判定は brain_link: 案件レコードID
   が数字で App 40 に実在し ユニット種別=相続放棄 のみ auto。他は保留＝紐付け待ち）。
   fact の subject は shipping:{App 30 レコード番号}（R9・発送ごとに別 subject）
-- App 28 のうち R5 の行（category が相続放棄の閉集合、line_user_id が**正本** App 40
-  の LINEユーザーID にちょうど 1 件一致・BA-04）。case_event（種別=会話）として
-  登録し fact にはしない（R9）。それ以外は取り込まない
+- App 28 のうち R5 の行（category が相続放棄の閉集合、line_user_id の関係者識別子
+  line_user が有効な案件にちょうど 1 件・R29: identity のみを見る・kintone は検索しない）。
+  case_event（種別=会話）として登録し fact にはしない（R9）。それ以外は取り込まない。
+  取込・再照合で source_ingest.line_user_id を埋める（R30・DB 内のみ）
+
+案件の識別（ID-1a・v4.3 §14-3）: 案件は case_id。App 40 のレコードは kintone_record
+識別子（名前空間 "kintone:{KINTONE_SUBDOMAIN}:{app_id}"・本 module が文字列を生成）で
+案件へ解決し、初見のレコードは同期が必ず新しい case を起こす。App 40 の同期は
+LINEユーザーID 欄から関係者識別子（line_user・名前空間 "line:{チャネル名}"）を作成・更新する。
 
 カーソル（§5・BA-09）: 更新日時 + レコード番号で並べ（page_order 固定）、走査上限
 （scan_upper_bound）を取得条件 更新日時 <= 上限 に含める。ページ単位で台帳書込と
@@ -46,6 +52,7 @@ from hub import brain_ledger as ledger
 from hub import brain_link
 from hub import kintone
 from hub import scheduler as hub_scheduler
+from hub.line_channel import HOUKI_CHANNEL
 from hub.redact import emit
 
 logger = logging.getLogger("hub.brain_sync")
@@ -119,6 +126,22 @@ def source_targets() -> dict:
             APP_CHATLOG.app_id(): TARGET_APP28}
 
 
+def kintone_namespace(app_id: str) -> str:
+    """案件識別子 kintone_record の名前空間（R29: 生成責務は本 module）。"""
+    return ledger.kintone_namespace(os.environ.get("KINTONE_SUBDOMAIN", ""), app_id)
+
+
+def line_namespace() -> str:
+    """関係者識別子 line_user の名前空間 "line:{チャネル}"。チャネル ID の env は無いため、
+    相続放棄チャネルの固定名（hub.line_channel.HOUKI_CHANNEL.name）を使う。"""
+    return ledger.line_namespace(HOUKI_CHANNEL.name)
+
+
+def houki_case_key(record_id: str) -> ledger.KintoneCaseKey:
+    return ledger.KintoneCaseKey(kintone_namespace(APP_HOUKI.app_id()), APP_HOUKI.app_id(),
+                                 record_id)
+
+
 # ── 変換器（record → facts / events） ───────────────────────────────────────
 
 def _v(record: dict, code: str):
@@ -176,8 +199,19 @@ def app40_subjects_seen(record: dict) -> dict:
     return {prefix: _row_ids(record, table) for table, _cols, prefix in _APP40_TABLES}
 
 
+def app40_relation_identities(record: dict) -> dict | None:
+    """R29: App 40 の LINEユーザーID 欄 → 関係者識別子（line_user）の目標値。欄が無い
+    （部分取得）ときは None＝識別子を変えない。形式外の値は「無し」（有効終了）。"""
+    if APP40_LINE_ID_FIELD not in record:
+        return None
+    luid = _s(record, APP40_LINE_ID_FIELD)
+    return {"namespace": line_namespace(), "kind": ledger.IDENTITY_LINE_USER,
+            "values": [luid] if _LINE_ID_RE.fullmatch(luid) else []}
+
+
 def convert_app40(record: dict) -> tuple:
-    """App 40 レコード → (SourceRef, case_key, facts, events)。案件キー = 自分自身。"""
+    """App 40 レコード → (SourceRef, KintoneCaseKey, facts, events)。案件 = 自分自身
+    （識別子が無ければ台帳が登録済み案件として case を起こす）。"""
     rid = _s(record, "$id")
     app_id = APP_HOUKI.app_id()
     src = ledger.SourceRef(app_id, rid, _revision(record), *CONVERTER[TARGET_APP40],
@@ -206,7 +240,7 @@ def convert_app40(record: dict) -> tuple:
         EVENT_CASE_STATUS,
         "status:" + (status if status in APP40_STATUS_OPTIONS else "other"),
         ledger.make_locator("status"), occurred_at=_parse_dt(_s(record, "更新日時")))]
-    return src, (app_id, rid), facts, events
+    return src, houki_case_key(rid), facts, events
 
 
 def _app30_source(record: dict) -> ledger.SourceRef:
@@ -221,7 +255,7 @@ def convert_app30(record: dict, decision: brain_link.LinkDecision) -> tuple:
     if not decision.auto:
         return src, None, [], []
     facts, events = _app30_facts_events(record)
-    return src, decision.case_key, facts, events
+    return src, decision.case_id, facts, events
 
 
 def _app30_facts_events(record: dict) -> tuple:
@@ -268,8 +302,8 @@ def _chat_summary(record: dict) -> str:
     return f"chat:{role}:{kind}"
 
 
-def convert_app28(record: dict, case_key: tuple) -> tuple:
-    """App 28 レコード → (SourceRef, case_key, [], events)。R9: fact ではなく
+def convert_app28(record: dict, case_id: int) -> tuple:
+    """App 28 レコード → (SourceRef, case_id, [], events)。R9: fact ではなく
     case_event（種別=会話・冪等キーは App 28 レコード番号で 1 件・版更新で増やさない）。"""
     rid = _s(record, "$id")
     app_id = APP_CHATLOG.app_id()
@@ -279,7 +313,7 @@ def convert_app28(record: dict, case_key: tuple) -> tuple:
     events = [ledger.EventIn(EVENT_CHAT, _chat_summary(record),
                              ledger.make_locator("message"), occurred_at=occurred,
                              per_record=True)]
-    return src, case_key, [], events
+    return src, int(case_id), [], events
 
 
 # ── kintone 取得（読取のみ・query は検証済み値だけを埋める） ─────────────────
@@ -328,47 +362,65 @@ async def app40_exists_in_source(record_id: str) -> bool | None:
     return bool(found)
 
 
-async def _app40_exists(record_id: str) -> bool | None:
-    """参照先 App 40 の実在確認: 台帳（既知の出典）→ kintone。失敗は None。"""
+async def _app40_exists(record_id: str):
+    """参照先 App 40 の案件: 台帳の識別子（kintone_record）→ 台帳の既知の出典 → 正本の
+    実在確認。実在すれば案件 case_id（識別子が無ければ登録済み案件として起こす・
+    v4.3 §3-3: 新しい App 40 レコードは必ず新しい case）。不在は False・失敗は None。"""
+    if not _DIGITS_RE.fullmatch(str(record_id)):
+        return False
+    key = houki_case_key(record_id)
     try:
-        if await ledger.latest_known_revision(APP_HOUKI.app_id(), record_id) is not None:
-            return True
+        case_id = await ledger.resolve_case(key)
+        if case_id is not None:
+            return case_id
+        known = await ledger.latest_known_revision(APP_HOUKI.app_id(), record_id) is not None
     except Exception:
         return None
-    return await app40_exists_in_source(record_id)
+    if not known:
+        exists = await app40_exists_in_source(record_id)
+        if exists is not True:
+            return exists                        # False（不在）／None（確認できない）
+    try:
+        return await ledger.ensure_case_for_record(key.namespace, key.app_id, key.record_id,
+                                                  created_via="sync")
+    except Exception:
+        return None
 
 
 async def _decide_app30(record: dict) -> tuple:
     """戻り値 (decision, ok)。ok=False は参照先の実在確認が失敗（判定不能・R12）。"""
     houki = APP_HOUKI.app_id()
     ref_rec = brain_link._v(record, brain_link.FIELD_CASE_RECORD)
-    exists = None
+    target = None
     ok = True
     if (brain_link._v(record, brain_link.FIELD_CASE_APP) == houki
             and _DIGITS_RE.fullmatch(ref_rec)):
-        exists = await _app40_exists(ref_rec)
-        ok = exists is not None
-    return brain_link.decide_app30_reference(record, houki, exists), ok
+        target = await _app40_exists(ref_rec)
+        ok = target is not None
+    return brain_link.decide_app30_reference(record, houki, target), ok
 
 
 async def _decide_app28(record: dict) -> tuple:
-    """R5 の判定を**正本**で行う（BA-04）。戻り値 (decision|None, reason, ok)。
-    ok=False は検索失敗＝判定不能（採用しない・既存の関連も変えない＝fail-closed）。"""
+    """R5 の判定を case_identity で行う（R29: kintone は検索しない）。
+    戻り値 (decision|None, reason, ok)。有効な案件 0 件 = 不採用・1 件 = 自動採用・
+    2 件以上 = 本票では従来どおり不採用（候補提示は 1b・R26）。台帳障害は例外のまま
+    （呼び出し側が db_write_failed で run を失敗させる＝fail-closed）。"""
     if not houki_chat_category(_s(record, "category")):
         return None, brain_link.REASON_CATEGORY_OUT, True
     luid = _s(record, "line_user_id")
     if not _LINE_ID_RE.fullmatch(luid):
         return None, brain_link.REASON_LINE_NOT_UNIQUE, True
-    try:
-        found = await kintone.search_records(
-            APP_HOUKI, f'{APP40_LINE_ID_FIELD} = "{luid}" limit 2', fields=["$id"])
-    except Exception:
-        return None, None, False
-    ids = [_s(r, "$id") for r in found if _DIGITS_RE.fullmatch(_s(r, "$id"))]
-    if len(ids) != 1:
+    cases = await ledger.active_cases_for_relation(line_namespace(), ledger.IDENTITY_LINE_USER,
+                                                  luid)
+    if len(cases) != 1:
         return None, brain_link.REASON_LINE_NOT_UNIQUE, True
-    decision = brain_link.decide_app28_row(record, [(APP_HOUKI.app_id(), ids[0])])
-    return decision, brain_link.REASON_AUTO, True
+    return brain_link.decide_app28_row(record, cases), brain_link.REASON_AUTO, True
+
+
+def _chat_line_user_id(record: dict) -> str | None:
+    """R30: source_ingest.line_user_id に埋める値（形式外は None・DB 内のみ）。"""
+    luid = _s(record, "line_user_id")
+    return luid if _LINE_ID_RE.fullmatch(luid) else None
 
 
 async def _stale_input(target: str, record: dict) -> tuple | None:
@@ -399,24 +451,31 @@ async def _prepare_ingest(target: str, record: dict):
     extras["link_change"] として同一トランザクションで適用される。遅着の旧 revision は
     履歴保存のみ（R11）。紐付け履歴（変化なし）はここで積む。"""
     extras: dict = {}
+    line_user_id = None
     # BA-18: 既知旧版の判定は全アプリ共通・処理省略分岐より前（R11/R13）
     stale = await _stale_input(target, record)
     if stale is not None:
+        if stale and target == TARGET_APP28:
+            stale[4]["line_user_id"] = _chat_line_user_id(record)     # R30
         return stale or STALE_KNOWN          # 旧版は履歴のみ・復旧の契機にしない
     if target == TARGET_APP40:
         src, case_key, facts, events = convert_app40(record)
         extras["subjects_seen"] = app40_subjects_seen(record)
+        rel = app40_relation_identities(record)
+        if rel is not None:
+            extras["relation_identities"] = rel      # R29: 関係者識別子の作成・更新
     elif target == TARGET_APP30:
         decision, ok = await _decide_app30(record)
         if not ok:
             return PENDING_RECHECK
         rid, rev = _s(record, "$id"), _revision(record)
         last = await ledger.latest_link(APP_SHIPPING.app_id(), rid)
-        if (last is not None and last.get("actor") != "system" and last.get("new_case")
+        if (last is not None and last.get("actor") != "system"
+                and last.get("new_case_id") is not None
                 and last.get("source_revision") is not None
                 and rev <= int(last["source_revision"])):
             # 人の紐付け訂正は、出典の revision が変わるまで自動判定より優先する
-            decision = brain_link.LinkDecision("auto", tuple(last["new_case"]),
+            decision = brain_link.LinkDecision("auto", int(last["new_case_id"]),
                                                brain_link.REASON_MANUAL_PINNED)
         src, case_key, facts, events = convert_app30(record, decision)
         prev = await ledger.current_case_of_source(src.app_id, src.record_id)
@@ -428,6 +487,8 @@ async def _prepare_ingest(target: str, record: dict):
         extras["hold_reason"] = decision.reason
     else:
         rid = _s(record, "$id")
+        line_user_id = _chat_line_user_id(record)
+        extras["line_user_id"] = line_user_id        # R30: 取込行に埋める（DB 内のみ）
         decision, reason, ok = await _decide_app28(record)
         if not ok:
             return PENDING_RECHECK           # 判定不能＝採用しない・既存の関連も変えない
@@ -439,13 +500,14 @@ async def _prepare_ingest(target: str, record: dict):
                 # R5: 取り込まない・保留にもしない。判定は成功したので復旧（BA-15/BA-19）。
                 # BA-24: 照合した最新 revision を同一 tx で latest_seen へ前進（解除状態は維持）
                 await ledger.mark_source_verified(APP_CHATLOG.app_id(), rid,
-                                                  revision=_revision(record))
+                                                  revision=_revision(record),
+                                                  line_user_id=line_user_id)
                 return None
             src = ledger.SourceRef(APP_CHATLOG.app_id(), rid, _revision(record),
                                    *CONVERTER[TARGET_APP28], updated_at=_s(record, "更新日時"))
             return src, None, [], [], {"link_change": change, "ingest_state": "detached",
-                                       "hold_reason": reason}
-        src, case_key, facts, events = convert_app28(record, decision.case_key)
+                                       "hold_reason": reason, "line_user_id": line_user_id}
+        src, case_key, facts, events = convert_app28(record, decision.case_id)
         change = brain_link.link_change_for(decision, prev)
         if change is not None:
             extras["link_change"] = change
@@ -456,7 +518,16 @@ async def _prepare_ingest(target: str, record: dict):
             # R13/BA-19: 有効な最新版の照合に成功（取込は不要）＝pending 解除と unavailable
             # 復旧を同一トランザクションの台帳関数 1 本で行う（片方だけ変わらない）
             await ledger.mark_source_verified(src.app_id, src.record_id,
-                                              revision=src.revision)
+                                              revision=src.revision,
+                                              line_user_id=line_user_id)
+            if target == TARGET_APP40 and extras.get("relation_identities") is not None:
+                # R29: 切替後の App 40 追跡再照合の一巡が identity を埋める（revision が
+                # 変わらない既知レコードでも、正本の現在値で関係者識別子を揃える・冪等）
+                case_id = await ledger.resolve_case(case_key)
+                if case_id is not None:
+                    rel = extras["relation_identities"]
+                    await ledger.set_relation_identities(case_id, rel["namespace"], rel["kind"],
+                                                         rel["values"])
             return None                      # revision 既知＝再処理しない
     return src, case_key, facts, events, extras
 
@@ -806,7 +877,8 @@ async def _recheck_one(target: str, app, rid: str, record: dict | None, now) -> 
     # R13/BA-14: 有効な最新版の照合・取込が成功した後にだけ復旧（取込側で ingested へ
     # 戻した行以外＝held/detached の出典の unavailable 行もここで戻す）
     await ledger.mark_source_verified(app.app_id(), rid, now=now)
-    if prev is not None and (case_key is None or tuple(prev) != tuple(case_key)):
+    cur = await ledger.current_case_of_source(app.app_id(), rid)
+    if prev is not None and cur != prev:
         out["moved"] = 1                     # 移動または関連喪失（R10 の共通処理を通過）
     elif summary.get("moved"):
         out["moved"] = 1

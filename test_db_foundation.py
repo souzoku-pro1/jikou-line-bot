@@ -297,17 +297,17 @@ class TestAlembicScaffold(unittest.TestCase):
         finally:
             shutil.rmtree(d, ignore_errors=True)
 
-    def test_brain_ledger_migration_round_trip(self):
-        """BRAIN-A1-LEDGER-1: b8c1d4e7f2a5（Revises a7d3f1c9e2b4）が空 DB で up→down 往復し、
-        9 表の列集合が hub/brain_ledger.metadata と一致すること（alembic 起動が許可された
-        本ファイルに置く・D2）。一意制約は sqlite の自動 index 名になるため列集合で検証する。"""
+    # ── BRAIN-A1 / ID-1a の migration 試験の共通部品（alembic 起動は本ファイルのみ・D2） ──
+
+    BRAIN_M1 = "c9d2e5f8a1b3"
+    BRAIN_M2 = "d1e4f7a0b3c6"
+
+    @staticmethod
+    def _brain_mig_tools(dbfile):
         import sqlite3
-        import tempfile
-        from hub import brain_ledger
-        d = tempfile.mkdtemp(prefix="brain_ledger_mig_")
-        dbfile = f"{d}/mig.db"
+
         env = {**os.environ, "DATABASE_URL": f"sqlite:///{dbfile}",
-               "PYTHONIOENCODING": "utf-8"}
+               "PYTHONIOENCODING": "utf-8", "KINTONE_SUBDOMAIN": "testsub"}
 
         def alembic(*args):
             return subprocess.run(
@@ -325,39 +325,414 @@ class TestAlembicScaffold(unittest.TestCase):
 
         def unique_cols(con, table):
             out = []
-            for r in con.execute(f"PRAGMA index_list({table})"):
+            for r in con.execute(f'PRAGMA index_list("{table}")'):
                 if r[2] == 1:
                     out.append(tuple(x[2] for x in con.execute(f"PRAGMA index_info({r[1]})")))
             return out
 
+        def nullable(con, table):
+            return {r[1]: (r[3] == 0) for r in con.execute(f'PRAGMA table_info("{table}")')}
+
+        return alembic, tables, unique_cols, nullable
+
+    def test_brain_ledger_migration_round_trip(self):
+        """BRAIN-A1-LEDGER-1 → ID-1a: b8c1d4e7f2a5 → M1（c9d2e5f8a1b3）→ M2（d1e4f7a0b3c6）が
+        空 DB で up→down 往復し、head で 13 表の列集合が hub/brain_ledger.metadata と一致すること。
+        一意制約は sqlite の自動 index 名になるため列集合で検証する（uq_case_fact_key は M2 で
+        case_id 基準に置換・A1 形へ戻ると案件キー基準）。"""
+        import sqlite3
+        import tempfile
+        from hub import brain_ledger
+        d = tempfile.mkdtemp(prefix="brain_ledger_mig_")
+        dbfile = f"{d}/mig.db"
+        alembic, tables, unique_cols, nullable = self._brain_mig_tools(dbfile)
+        uq_a1 = ("case_app_id", "case_record_id", "subject_id", "item_code",
+                 "source_app_id", "source_record_id", "source_revision",
+                 "locator", "converter_name", "converter_version")
+        uq_m2 = ("case_id", "subject_id", "item_code",
+                 "source_app_id", "source_record_id", "source_revision",
+                 "locator", "converter_name", "converter_version")
         try:
-            up = alembic("upgrade", "head")
+            # A1 の形（b8c1d4e7f2a5）: 案件キー基準・case 表なし
+            up = alembic("upgrade", "b8c1d4e7f2a5")
+            self.assertEqual(up.returncode, 0, f"stderr={up.stderr[-800:]}")
+            self.assertTrue(set(brain_ledger.A1_TABLE_NAMES) <= tables())
+            self.assertNotIn("case", tables())
+            con = sqlite3.connect(dbfile)
+            try:
+                self.assertIn(uq_a1, unique_cols(con, "case_fact"))
+                self.assertNotIn("case_id", nullable(con, "case_fact"))
+            finally:
+                con.close()
+            # M1: 表と NULL 可の case_id 列（DDL のみ・A1 の一意制約はそのまま）
+            up = alembic("upgrade", self.BRAIN_M1)
             self.assertEqual(up.returncode, 0, f"stderr={up.stderr[-800:]}")
             self.assertTrue(set(brain_ledger.TABLE_NAMES) <= tables())
             con = sqlite3.connect(dbfile)
             try:
+                self.assertIn(uq_a1, unique_cols(con, "case_fact"))
+                for name in ("case_fact", "case_event", "case_derivation", "source_ingest"):
+                    self.assertTrue(nullable(con, name)["case_id"], name)
+                self.assertFalse(nullable(con, "case_fact")["case_app_id"])
+                self.assertTrue(nullable(con, "source_ingest")["line_user_id"])
+                self.assertTrue(nullable(con, "link_history")["prev_case_id"])
+                self.assertIn("'stopped_stale'", con.execute(
+                    "SELECT sql FROM sqlite_master WHERE name='sync_run'").fetchone()[0])
+            finally:
+                con.close()
+            # M2（空 DB の検算は通る）: NOT NULL・case_id 基準の一意制約・旧列は NULL 許容
+            up = alembic("upgrade", "head")
+            self.assertEqual(up.returncode, 0, f"stderr={up.stderr[-800:]}")
+            con = sqlite3.connect(dbfile)
+            try:
                 for name in brain_ledger.TABLE_NAMES:
-                    cols = {r[1] for r in con.execute(f"PRAGMA table_info({name})")}
+                    cols = {r[1] for r in con.execute(f'PRAGMA table_info("{name}")')}
                     self.assertEqual(
                         cols, {c.name for c in brain_ledger.metadata.tables[name].columns}, name)
-                self.assertIn(("case_app_id", "case_record_id", "subject_id", "item_code",
-                               "source_app_id", "source_record_id", "source_revision",
-                               "locator", "converter_name", "converter_version"),
-                              unique_cols(con, "case_fact"))
+                self.assertIn(uq_m2, unique_cols(con, "case_fact"))
+                self.assertNotIn(uq_a1, unique_cols(con, "case_fact"))
                 self.assertIn(("supersedes_fact_id",), unique_cols(con, "case_fact"))
                 self.assertIn(("source_app_id", "source_record_id", "source_revision",
                                "locator", "converter_name", "converter_version"),
                               unique_cols(con, "source_ingest"))
                 self.assertIn(("operation_id",), unique_cols(con, "case_confirmation"))
                 self.assertIn(("idem_key",), unique_cols(con, "case_event"))
+                for name in ("case_fact", "case_event", "case_derivation"):
+                    self.assertFalse(nullable(con, name)["case_id"], name)
+                    self.assertTrue(nullable(con, name)["case_app_id"], name)
+                self.assertTrue(nullable(con, "source_ingest")["case_id"])
+                fks = {(r[2], r[3]) for r in con.execute("PRAGMA foreign_key_list(case_fact)")}
+                self.assertIn(("case", "case_id"), fks)
             finally:
                 con.close()
-            self.assertIn("b8c1d4e7f2a5", alembic("current").stdout)
+            self.assertIn(self.BRAIN_M2, alembic("current").stdout)
+            # 往復: M2 → M1（新形式データゼロなら A1 形へ）→ b8c1 → a7d3
+            down = alembic("downgrade", self.BRAIN_M1)
+            self.assertEqual(down.returncode, 0, f"stderr={down.stderr[-800:]}")
+            con = sqlite3.connect(dbfile)
+            try:
+                self.assertIn(uq_a1, unique_cols(con, "case_fact"))
+                self.assertTrue(nullable(con, "case_fact")["case_id"])
+                self.assertFalse(nullable(con, "case_fact")["case_app_id"])
+            finally:
+                con.close()
+            down = alembic("downgrade", "b8c1d4e7f2a5")
+            self.assertEqual(down.returncode, 0, f"stderr={down.stderr[-800:]}")
+            self.assertNotIn("case", tables())
+            con = sqlite3.connect(dbfile)
+            try:
+                self.assertNotIn("case_id", nullable(con, "case_fact"))
+                self.assertNotIn("line_user_id", nullable(con, "source_ingest"))
+            finally:
+                con.close()
             down = alembic("downgrade", "a7d3f1c9e2b4")
             self.assertEqual(down.returncode, 0, f"stderr={down.stderr[-800:]}")
             self.assertFalse(set(brain_ledger.TABLE_NAMES) & tables())
             self.assertIn("a7d3f1c9e2b4", alembic("current").stdout)
             self.assertIn("shindan_link", tables())          # 下位 revision の表は残る
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_brain_id1a_m2_downgrade_is_refused_for_new_format_data(self):
+        """ID-1a R28: M2 の downgrade は新形式データ（未登録案件・統合済み・識別子の重複・
+        merge_history・案件キー NULL の fact）を 1 件でも検出したら固定語彙で拒否する。
+        ゼロに戻せば downgrade できる。M2 の upgrade も検算失敗（running run）で中止する。"""
+        import sqlite3
+        import tempfile
+        from hub import brain_migration
+        d = tempfile.mkdtemp(prefix="brain_id1a_refuse_")
+        dbfile = f"{d}/mig.db"
+        alembic, tables, unique_cols, nullable = self._brain_mig_tools(dbfile)
+        try:
+            self.assertEqual(alembic("upgrade", self.BRAIN_M1).returncode, 0)
+            con = sqlite3.connect(dbfile)
+            try:
+                # 検算失敗（running の run）→ M2 は例外で中止・revision は M1 のまま
+                con.execute("INSERT INTO sync_run (target_app, started_at, page_order, status) "
+                            "VALUES ('app40', '2026-09-27 00:00:00', 'x', 'running')")
+                con.commit()
+                up = alembic("upgrade", "head")
+                self.assertNotEqual(up.returncode, 0)
+                self.assertIn("brain_case_verify_failed", up.stderr)
+                self.assertIn(brain_migration.PROBLEM_RUNNING, up.stderr)
+                self.assertIn(self.BRAIN_M1, alembic("current").stdout)
+                con.execute("UPDATE sync_run SET status='stopped_stale'")
+                con.commit()
+            finally:
+                con.close()
+            self.assertEqual(alembic("upgrade", "head").returncode, 0)
+            cases = (
+                ("INSERT INTO \"case\" (registration, status, created_via) "
+                 "VALUES ('unregistered', 'active', 'memo')", brain_migration.REFUSE_UNREGISTERED),
+                ("INSERT INTO \"case\" (registration, status, created_via) "
+                 "VALUES ('registered', 'merged', 'sync')", brain_migration.REFUSE_MERGED),
+                ("INSERT INTO merge_history (from_case_id, into_case_id) VALUES (1, 2)",
+                 brain_migration.REFUSE_MERGE_HISTORY),
+                ("INSERT INTO subject_merge_history (case_id, from_subject_id, into_subject_id) "
+                 "VALUES (1, 'a', 'b')", brain_migration.REFUSE_SUBJECT_MERGE),
+            )
+            for sql, reason in cases:
+                con = sqlite3.connect(dbfile)
+                try:
+                    con.execute(sql)
+                    con.commit()
+                    down = alembic("downgrade", self.BRAIN_M1)
+                    self.assertNotEqual(down.returncode, 0, reason)
+                    self.assertIn("brain_case_downgrade_refused", down.stderr, reason)
+                    self.assertIn(reason, down.stderr)
+                    self.assertIn(self.BRAIN_M2, alembic("current").stdout, reason)
+                    for t in ("subject_merge_history", "merge_history", "case_identity"):
+                        con.execute(f"DELETE FROM {t}")
+                    con.execute('DELETE FROM "case"')
+                    con.commit()
+                finally:
+                    con.close()
+            # 識別子の重複（同一 名前空間・種別・値 が 2 行）も拒否
+            con = sqlite3.connect(dbfile)
+            try:
+                con.execute("INSERT INTO \"case\" (case_id, registration, status, created_via) "
+                            "VALUES (1, 'registered', 'active', 'sync')")
+                con.execute("INSERT INTO \"case\" (case_id, registration, status, created_via) "
+                            "VALUES (2, 'registered', 'active', 'sync')")
+                for cid, vt in ((1, "'2026-09-27 01:00:00'"), (2, "NULL")):
+                    con.execute("INSERT INTO case_identity (case_id, namespace, kind, value, valid_from, "
+                                f"valid_to) VALUES ({cid}, 'kintone:testsub:40', 'kintone_record', '7', "
+                                f"'2026-09-27 00:00:00', {vt})")
+                con.commit()
+                down = alembic("downgrade", self.BRAIN_M1)
+                self.assertNotEqual(down.returncode, 0)
+                self.assertIn(brain_migration.REFUSE_IDENTITY_DUP, down.stderr)
+                con.execute("DELETE FROM case_identity WHERE case_id=1")
+                con.execute('DELETE FROM "case"')
+                con.commit()
+            finally:
+                con.close()
+            # ゼロに戻せば downgrade できる
+            down = alembic("downgrade", self.BRAIN_M1)
+            self.assertEqual(down.returncode, 0, f"stderr={down.stderr[-800:]}")
+            self.assertIn(self.BRAIN_M1, alembic("current").stdout)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_brain_id1a_m1_only_parity_backfill_and_switch(self):
+        """ID-1a の移行 3 段を sqlite で一周する（§14-2・§14-7）:
+        (1) M1 だけ適用した DB（新形式データゼロ）で同期・再照合・訂正・確認を回し、head で作った
+            DB と同じ観測になる（挙動不変を pin）
+        (2) A1 のデータ形（case_id NULL・A1 形式の idem_key・case 表なし）に落としても読み書きが
+            同じ（M1 だけ適用した本番の A1 データ＝互換の案件キー一致）
+        (3) scripts/brain_case_backfill.py の --dry-run → --apply → --verify（冪等）
+        (4) M2（検算つき）→ 観測は同じ・idem_key は case_id 内包・downgrade → upgrade の往復"""
+        import asyncio
+        import io as _io
+        import sqlite3
+        import tempfile
+        from unittest.mock import patch
+
+        import brain_test_support as bts
+        from hub import brain_ledger as ledger
+        from hub import brain_migration
+        from hub import brain_sync as sync
+        from hub import kintone
+        from scripts import brain_case_backfill
+
+        d = tempfile.mkdtemp(prefix="brain_id1a_parity_")
+        m1_db = f"{d}/m1.db"
+        head_db = f"{d}/head.db"
+        alembic_m1, _t1, _u1, _n1 = self._brain_mig_tools(m1_db)
+        alembic_head, _t2, _u2, _n2 = self._brain_mig_tools(head_db)
+        drop = {"case_id", "fact_id", "event_id", "observed_at", "last_checked_at", "created_at",
+                "link_id", "confirmation_id", "decided_at", "updated_at", "registered_at",
+                "started_at", "finished_at", "last_ok_at", "last_reconcile_at", "last_recheck_at",
+                "recheck_started_at", "recheck_completed_at", "run_id", "last_run_id",
+                "prev_case_id", "new_case_id", "running_runs"}
+
+        def norm(obj):
+            if isinstance(obj, dict):
+                return {k: norm(v) for k, v in obj.items() if k not in drop}
+            if isinstance(obj, (list, tuple)):
+                return [norm(x) for x in obj]
+            return obj
+
+        def data():
+            return {"40": [bts.app40(1, 1), bts.app40(2, 1, "2026-09-20T02:00:00Z", LINEユーザーID=bts.LINE_B)],
+                    "30": [bts.app30(5, 1), bts.app30(61, 1, 案件レコードID="999")],
+                    "28": [bts.app28(100, 1), bts.app28(101, 1, line_user_id=bts.LINE_B),
+                           bts.app28(102, 1, category="その他判断系")]}
+
+        class Ctx:
+            def __init__(self, dbfile):
+                self.env = patch.dict(os.environ, {**bts.BRAIN_ENV, "BRAIN_SYNC_ENABLED": "1",
+                                                   "DATABASE_URL": f"sqlite+aiosqlite:///{dbfile}"})
+                self.fake = bts.FakeKintone(data())
+                self.kp = patch.object(kintone, "search_records", self.fake.search_records)
+
+            def __enter__(self):
+                from hub import db
+                self.env.start()
+                db.reset_for_tests()
+                self.kp.start()
+                return self
+
+            def __exit__(self, *exc):
+                from hub import db
+                self.kp.stop()
+                db.reset_for_tests()
+                self.env.stop()
+
+        async def round1():
+            for t in (sync.TARGET_APP40, sync.TARGET_APP30, sync.TARGET_APP28):
+                assert (await sync.sync_target(t))["status"] == "ok", t
+            for t in (sync.TARGET_APP30, sync.TARGET_APP28):
+                assert (await sync.recheck_target(t))["status"] == "ok", t
+            case2 = await ledger.resolve_case(("40", "2"))
+            r = await ledger.relink_source(source_app_id="30", source_record_id="5", new_case=case2,
+                                           reason="誤紐付け", operation_id="op-relink-1", actor="owner",
+                                           seen_link_version=await ledger.link_version("30", "5"),
+                                           seen_source_revision=1)
+            assert r["duplicate"] is False
+            fact = [f for f in await ledger.list_case_facts(("40", "1")) if f["item_code"] == "app40.status"][0]
+            await ledger.record_confirmation(fact_id=fact["fact_id"], seen_version=fact["version"],
+                                             decision="confirm", reason="", operation_id="op-confirm-1",
+                                             actor="owner")
+
+        async def round2(fake):
+            # 新版・対象外 category・LINE ID の変更（識別子の有効終了）・同値新版
+            fake.data["40"] = [bts.app40(1, 2, "2026-09-20T03:00:00Z", status="受理"),
+                               bts.app40(2, 2, "2026-09-20T03:00:00Z", LINEユーザーID=bts.LINE_C)]
+            fake.data["28"][1] = bts.app28(101, 2, "2026-09-21T01:00:00Z", line_user_id=bts.LINE_B,
+                                           category="その他判断系")
+            for t in (sync.TARGET_APP40, sync.TARGET_APP28, sync.TARGET_APP30):
+                assert (await sync.sync_target(t))["status"] == "ok", t
+            assert (await sync.recheck_target(sync.TARGET_APP28))["status"] == "ok"
+
+        async def observe():
+            out = {}
+            for key in (("40", "1"), ("40", "2")):
+                out[f"facts{key}"] = await ledger.list_case_facts(key, current_only=False)
+                out[f"events{key}"] = await ledger.list_case_events(key, current_only=False)
+                out[f"fresh{key}"] = await ledger.case_freshness_detail(key, "app40", sync.source_targets())
+            out["holds"] = await ledger.list_holds()
+            out["pending"] = await ledger.list_pending_links()
+            out["conflicts"] = await ledger.list_conflicts()
+            out["recheck"] = await ledger.list_recheck()
+            ov = await ledger.sync_overview()
+            out["ingest_counts"] = ov["ingest_counts"]
+            out["cursors"] = [(c["target_app"], c["kind"], c["state"]) for c in ov["cursors"]]
+            for app_id, rid in (("30", "5"), ("30", "61"), ("28", "100"), ("28", "101"), ("28", "102")):
+                out[f"link{app_id}/{rid}"] = await ledger.latest_link(app_id, rid)
+                cur = await ledger.current_case_of_source(app_id, rid)
+                info = await ledger.case_info(cur) if cur is not None else None
+                out[f"case{app_id}/{rid}"] = (info["case_app_id"], info["case_record_id"]) if info else None
+            return norm(out)
+
+        def legacyize(dbfile):
+            """A1 のデータ形へ落とす（case_id NULL・A1 形式の idem_key・case/識別子なし）。"""
+            con = sqlite3.connect(dbfile)
+            try:
+                con.execute("UPDATE case_fact SET case_id=NULL, prev_case_id=NULL")
+                con.execute("UPDATE case_event SET case_id=NULL")
+                con.execute("UPDATE source_ingest SET case_id=NULL")
+                con.execute("UPDATE link_history SET prev_case_id=NULL, new_case_id=NULL")
+                rows = con.execute("SELECT event_id, idem_key, case_app_id, case_record_id, source_app_id, "
+                                   "source_record_id, kind, locator FROM case_event").fetchall()
+                for event_id, key, app, rec, sapp, srec, kind, loc in rows:
+                    legacy = ledger.legacy_event_idem_key(app, rec, sapp, srec,
+                                                          ledger.event_revision_part(key), kind, loc)
+                    con.execute("UPDATE case_event SET idem_key=? WHERE event_id=?", (legacy, event_id))
+                con.execute("DELETE FROM case_identity")
+                con.execute('DELETE FROM "case"')
+                con.commit()
+                self.assertEqual(con.execute('SELECT count(*) FROM "case"').fetchone()[0], 0)
+            finally:
+                con.close()
+
+        def script(*args):
+            buf = _io.StringIO()
+            with patch.dict(os.environ, {**bts.BRAIN_ENV, "DATABASE_PUBLIC_URL": f"sqlite:///{m1_db}"}):
+                from hub import db
+                db.reset_for_tests()
+                rc = brain_case_backfill.main(list(args), out=buf)
+                db.reset_for_tests()
+            return rc, buf.getvalue()
+
+        try:
+            # head で作った DB（比較の基準）
+            self.assertEqual(alembic_head("upgrade", "head").returncode, 0)
+            with Ctx(head_db) as c:
+                asyncio.run(round1())
+                head_obs1 = asyncio.run(observe())
+                asyncio.run(round2(c.fake))
+                head_obs2 = asyncio.run(observe())
+            # (1) M1 だけ適用した DB: 同じ操作 → 同じ観測
+            self.assertEqual(alembic_m1("upgrade", self.BRAIN_M1).returncode, 0)
+            with Ctx(m1_db):
+                asyncio.run(round1())
+                self.assertEqual(asyncio.run(observe()), head_obs1)
+            # (2) A1 のデータ形に落としても同じ観測（互換の案件キー一致で読む）・次の同期も同じ
+            legacyize(m1_db)
+            with Ctx(m1_db) as c:
+                self.assertEqual(asyncio.run(observe()), head_obs1)
+                asyncio.run(round2(c.fake))
+                self.assertEqual(asyncio.run(observe()), head_obs2)
+            # (3) backfill: --verify は失敗（A1 形のデータあり）→ --dry-run（件数のみ）→ --apply → --verify
+            rc, text = script("--verify")
+            self.assertEqual(rc, 1)
+            self.assertIn("verify: FAILED", text)
+            rc, text = script("--dry-run")
+            self.assertEqual(rc, 0, text)
+            self.assertIn("mode: DRY-RUN", text)
+            self.assertIn("cases_to_create=", text)
+            self.assertIn("count_running_runs=0", text)
+            for pii in (bts.LINE_A, bts.LINE_B, bts.LINE_C, "テスト太郎"):
+                self.assertNotIn(pii, text)
+            rc, text = script("--apply")
+            self.assertEqual(rc, 0, text)
+            self.assertIn("verify: OK", text)
+            rc, text2 = script("--apply")                       # 冪等
+            self.assertEqual(rc, 0, text2)
+            self.assertIn("cases_created=0", text2)
+            self.assertIn("event_keys_rewritten=0", text2)
+            rc, text = script("--verify")
+            self.assertEqual(rc, 0, text)
+            self.assertIn("切替後の再開順序", text)
+            # (4) M2: 検算つき切替 → 観測は同じ・idem_key は新形式・登録済み案件に識別子
+            up = alembic_m1("upgrade", "head")
+            self.assertEqual(up.returncode, 0, f"stderr={up.stderr[-800:]}")
+            with Ctx(m1_db):
+                self.assertEqual(asyncio.run(observe()), head_obs2)
+                cases = {asyncio.run(ledger.resolve_case(("40", "1"))),
+                         asyncio.run(ledger.resolve_case(("40", "2")))}
+                self.assertEqual(len(cases - {None}), 2)
+                self.assertEqual(asyncio.run(ledger.active_cases_for_relation(
+                    sync.line_namespace(), ledger.IDENTITY_LINE_USER, bts.LINE_A)),
+                    [asyncio.run(ledger.resolve_case(("40", "1")))])
+            con = sqlite3.connect(m1_db)
+            try:
+                keys = [r[0] for r in con.execute("SELECT idem_key FROM case_event")]
+                self.assertTrue(keys and all(k.startswith("c") and k.split("|")[0][1:].isdigit() for k in keys))
+                self.assertEqual(con.execute("SELECT count(*) FROM case_fact WHERE case_id IS NULL").fetchone()[0], 0)
+                self.assertEqual(con.execute("SELECT count(*) FROM source_ingest WHERE line_user_id IS NOT NULL "
+                                             "AND source_app_id='28'").fetchone()[0],
+                                 con.execute("SELECT count(*) FROM source_ingest WHERE source_app_id='28'").fetchone()[0])
+            finally:
+                con.close()
+            # downgrade（新形式データゼロ）→ A1 形式の idem_key・upgrade で再び検算が通る
+            self.assertEqual(alembic_m1("downgrade", self.BRAIN_M1).returncode, 0)
+            con = sqlite3.connect(m1_db)
+            try:
+                keys = [r[0] for r in con.execute("SELECT idem_key FROM case_event")]
+                self.assertTrue(keys and all(k.startswith("40|") for k in keys))
+            finally:
+                con.close()
+            rc, text = script("--verify")
+            self.assertEqual(rc, 1, text)                      # 旧形式の idem_key を検出
+            self.assertIn(brain_migration.PROBLEM_IDEM_KEY, text)
+            rc, text = script("--apply")                       # 再計算だけが走る
+            self.assertEqual(rc, 0, text)
+            self.assertIn("cases_created=0", text)
+            self.assertEqual(alembic_m1("upgrade", "head").returncode, 0)
+            with Ctx(m1_db):
+                self.assertEqual(asyncio.run(observe()), head_obs2)
         finally:
             shutil.rmtree(d, ignore_errors=True)
 

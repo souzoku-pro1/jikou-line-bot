@@ -18,7 +18,7 @@ from unittest.mock import patch
 
 import sqlalchemy as sa
 
-from brain_test_support import (LINE_A, BrainDbMixin, FakeKintone, FakeQueryError, app28,
+from brain_test_support import (cid, LINE_A, LINE_B, BrainDbMixin, FakeKintone, FakeQueryError, app28,
                                 app30, app40, run)
 from hub import brain_ledger as ledger
 from hub import brain_sync as sync
@@ -41,13 +41,13 @@ class TestSyncRecovery(BrainDbMixin):
             self.fake.data["40"].append(app40(0, 1, t, 顧客名="遅れて見えた"))
             r = await sync.sync_target(sync.TARGET_APP40)
             self.assertEqual(r["status"], "ok")
-            self.assertEqual([f["value_text"] for f in await ledger.list_case_facts("40", "0")
+            self.assertEqual([f["value_text"] for f in await ledger.list_case_facts(("40", "0"))
                               if f["item_code"] == "app40.顧客名"], ["遅れて見えた"])
             # 発行 query は窓の始点（10 分前）から
             q = [q for a, q in self.fake.calls if a == "40" and "更新日時 >=" in q][-1]
             self.assertIn('更新日時 >= "2026-09-20T00:50:00Z"', q)
             # 重複取得分は冪等キーで吸収（1 と 2 は再挿入されない）
-            self.assertEqual(r["inserted"], len(await ledger.list_case_facts("40", "0")))
+            self.assertEqual(r["inserted"], len(await ledger.list_case_facts(("40", "0"))))
         run(body())
 
     def test_page_failure_keeps_cursor_at_completed_page(self):
@@ -69,8 +69,8 @@ class TestSyncRecovery(BrainDbMixin):
                 self.assertEqual(failed["incomplete_page"],
                                  {"after_updated_at": t1, "after_record_id": "1"})
                 self.assertEqual(failed["pages_done"], 1)
-                self.assertEqual(await ledger.case_freshness("40", "1", "app40"), "incomplete")
-                self.assertEqual(await ledger.list_case_facts("40", "2"), [])
+                self.assertEqual(await ledger.case_freshness(("40", "1"), "app40"), "incomplete")
+                self.assertEqual(await ledger.list_case_facts(("40", "2")), [])
                 # 続きから（窓は 1 の時刻 − 10 分）: 2・3 が取り込まれ、確認済み範囲が付く
                 self.fake.fail_at = set()
                 r = await sync.sync_target(sync.TARGET_APP40)
@@ -78,7 +78,7 @@ class TestSyncRecovery(BrainDbMixin):
                 cur = await ledger.get_cursor("app40")
                 self.assertEqual((cur["cursor_record_id"], cur["state"]), ("3", "synced"))
                 self.assertTrue(cur["confirmed_until"])
-                self.assertEqual(await ledger.case_freshness("40", "3", "app40"), "synced")
+                self.assertEqual(await ledger.case_freshness(("40", "3"), "app40"), "synced")
                 run_row = [x for x in (await ledger.sync_overview())["runs"]
                            if x["status"] == "ok"][0]
                 self.assertEqual(run_row["pages_done"], 3)
@@ -102,8 +102,8 @@ class TestSyncRecovery(BrainDbMixin):
             self.assertEqual((r["status"], r["failure"]), ("failed", "db_write_failed"))
             cur = await ledger.get_cursor("app40")
             self.assertEqual((cur["cursor_record_id"], cur["state"]), ("1", "error"))
-            self.assertEqual(await ledger.list_case_facts("40", "2"), [])
-            self.assertTrue(await ledger.list_case_facts("40", "1"))
+            self.assertEqual(await ledger.list_case_facts(("40", "2")), [])
+            self.assertTrue(await ledger.list_case_facts(("40", "1")))
             # 実トランザクション内で失敗しても巻き戻る（fact もカーソルも残らない）
             src = ledger.SourceRef("40", "9", 1, "app40_record", "1")
             bad = ledger.FactIn("case", "app40.status", "choice", "x",
@@ -117,7 +117,7 @@ class TestSyncRecovery(BrainDbMixin):
                     "app40", await ledger.start_run("app40", "2026-09-22T00:00:00Z"),
                     ingests=good_then_bad, cursor_updated_at="2026-09-22T00:00:00Z",
                     cursor_record_id="9", pages_done=9, records_seen=9)
-            self.assertEqual(await ledger.list_case_facts("40", "9"), [])
+            self.assertEqual(await ledger.list_case_facts(("40", "9")), [])
             self.assertEqual((await ledger.get_cursor("app40"))["cursor_record_id"], "1")
         run(body())
 
@@ -130,8 +130,8 @@ class TestSyncRecovery(BrainDbMixin):
                 await sync.sync_target(sync.TARGET_APP40)
             # 「再起動」= 新しい run。失敗直後の状態は未完了のまま
             self.assertEqual((await ledger.get_cursor("app40"))["state"], "error")
-            self.assertEqual(await ledger.case_freshness("40", "2", "app40"), "incomplete")
-            self.assertEqual(await ledger.case_freshness("40", "1", "app40"), "incomplete")
+            self.assertEqual(await ledger.case_freshness(("40", "2"), "app40"), "incomplete")
+            self.assertEqual(await ledger.case_freshness(("40", "1"), "app40"), "incomplete")
             # ページ上限に達した run は完了扱いにしない
             with patch.object(sync, "MAX_PAGES_PER_RUN", 1), patch.object(sync, "PAGE_SIZE", 1):
                 self.fake.fail_at = set()
@@ -141,7 +141,7 @@ class TestSyncRecovery(BrainDbMixin):
             self.fake.fail_at = set()
             r = await sync.sync_target(sync.TARGET_APP40)
             self.assertEqual(r["status"], "ok")
-            self.assertEqual(await ledger.case_freshness("40", "2", "app40"), "synced")
+            self.assertEqual(await ledger.case_freshness(("40", "2"), "app40"), "synced")
         run(body())
 
     def test_reconcile_detects_revision_change_outside_window(self):
@@ -156,7 +156,7 @@ class TestSyncRecovery(BrainDbMixin):
             self.assertEqual(r["inserted"], 0)                    # 窓では見えない
             rc = await sync.reconcile_target(sync.TARGET_APP40)
             self.assertEqual((rc["status"], rc["changed"]), ("ok", 1))
-            st = [f for f in await ledger.list_case_facts("40", "1")
+            st = [f for f in await ledger.list_case_facts(("40", "1"))
                   if f["item_code"] == "app40.status"]
             self.assertEqual([(f["value_text"], f["version"]) for f in st], [("受理", 2)])
             self.assertTrue((await ledger.get_cursor("app40"))["last_reconcile_at"])
@@ -164,7 +164,7 @@ class TestSyncRecovery(BrainDbMixin):
             self.fake.raise_all = True
             rc = await sync.reconcile_target(sync.TARGET_APP40)
             self.assertEqual(rc["status"], "failed")
-            self.assertEqual(len(st), len([f for f in await ledger.list_case_facts("40", "1")
+            self.assertEqual(len(st), len([f for f in await ledger.list_case_facts(("40", "1"))
                                            if f["item_code"] == "app40.status"]))
         run(body())
 
@@ -278,7 +278,7 @@ class TestSyncRecovery(BrainDbMixin):
             r = await sync.reconcile_target(sync.TARGET_APP28)
             self.assertEqual((r["status"], r["changed"]), ("ok", 1))
             self.assertEqual(await ledger.latest_known_revision("28", "100"), 2)
-            self.assertEqual(len([e for e in await ledger.list_case_events("40", "1")
+            self.assertEqual(len([e for e in await ledger.list_case_events(("40", "1"))
                                   if e["source_app_id"] == "28"]), 1)
         run(body())
 
@@ -298,7 +298,7 @@ class TestSyncRecovery(BrainDbMixin):
                                   cur["confirmed_until"]),
                                  ("incomplete", upper1,
                                   {"after_updated_at": t, "after_record_id": "2"}, ""))
-                self.assertEqual(await ledger.list_case_facts("40", "3"), [])
+                self.assertEqual(await ledger.list_case_facts(("40", "3")), [])
                 self.assertTrue(all(f'更新日時 <= "{upper1}"' in q for a, q in self.fake.calls))
                 # 上限より後に更新されたレコードは再開走査に入らない
                 self.fake.data["40"].append(app40(4, 1, "2026-09-25T00:00:30Z"))
@@ -307,8 +307,8 @@ class TestSyncRecovery(BrainDbMixin):
                                             now=now1 + datetime.timedelta(minutes=1))
                 self.assertEqual((r2["status"], r2["resumed"], r2["pages"], r2["scan_upper_bound"]),
                                  ("ok", True, 1, upper1))
-                self.assertTrue(await ledger.list_case_facts("40", "3"))
-                self.assertEqual(await ledger.list_case_facts("40", "4"), [])
+                self.assertTrue(await ledger.list_case_facts(("40", "3")))
+                self.assertEqual(await ledger.list_case_facts(("40", "4")), [])
                 cur = await ledger.get_cursor("app40")
                 self.assertEqual((cur["state"], cur["confirmed_until"], cur["page_position"]),
                                  ("synced", upper1, None))
@@ -322,7 +322,7 @@ class TestSyncRecovery(BrainDbMixin):
             r3 = await sync.sync_target(sync.TARGET_APP40,
                                         now=now1 + datetime.timedelta(minutes=2))
             self.assertEqual((r3["status"], r3["resumed"]), ("ok", False))
-            self.assertTrue(await ledger.list_case_facts("40", "4"))
+            self.assertTrue(await ledger.list_case_facts(("40", "4")))
             q = [q for a, q in self.fake.calls if a == "40"][-1]
             self.assertIn('更新日時 >= "2026-09-20T00:50:00Z"', q)
             self.assertIn('更新日時 <= "2026-09-25T00:02:00Z"', q)
@@ -348,7 +348,7 @@ class TestSyncRecovery(BrainDbMixin):
                     patch.object(ledger, "advance_cursor_with_page", advance_with_commit_failure):
                 r = await sync.sync_target(sync.TARGET_APP40)
             self.assertEqual((r["status"], r["failure"]), ("failed", "db_write_failed"))
-            self.assertEqual(await ledger.list_case_facts("40", "1", current_only=False), [])
+            self.assertEqual(await ledger.list_case_facts(("40", "1"), current_only=False), [])
             self.assertIsNone(await ledger.latest_known_revision("40", "1"))
             async with session_scope() as session:
                 n_events = (await session.execute(
@@ -363,88 +363,79 @@ class TestSyncRecovery(BrainDbMixin):
             # 障害が解ければ通常どおり
             r = await sync.sync_target(sync.TARGET_APP40)
             self.assertEqual(r["status"], "ok")
-            self.assertTrue(await ledger.list_case_facts("40", "1"))
-            self.assertTrue(await ledger.list_case_facts("40", "2"))
+            self.assertTrue(await ledger.list_case_facts(("40", "1")))
+            self.assertTrue(await ledger.list_case_facts(("40", "2")))
         run(body())
 
 
 class TestUndecidable(BrainDbMixin):
-    """fix2 BA-12 / R12: 判定不能は「処理不要」と区別し pending_recheck として記録する。"""
+    """fix2 BA-12 / R12: 判定不能は「処理不要」と区別し pending_recheck として記録する。
+    ID-1a（R29）: App 28 の判定は identity のみで外部確認が無いため、判定不能は App 30 の参照先
+    （台帳に無い App 40 レコード）の実在確認の失敗で起きる。"""
 
     def test_undecidable_is_pending_recheck_not_ok(self):
         self.fake.data["40"] = [app40(1, 1)]
-        self.fake.data["28"] = [app28(100, 1)]
+        self.fake.data["30"] = [app30(5, 1)]
 
         async def fresh():
-            return await ledger.case_freshness_detail("40", "1", "app40", sync.source_targets())
+            return await ledger.case_freshness_detail(("40", "1"), "app40", sync.source_targets())
 
         async def body():
             await sync.sync_target(sync.TARGET_APP40)
-            await sync.sync_target(sync.TARGET_APP28)
-            # 出典を確認不能にしてから復活させ、LINE 検索だけ失敗させる
-            self.fake.data["28"] = []
-            self.assertEqual((await sync.recheck_target(sync.TARGET_APP28))["unavailable"], 1)
+            await sync.sync_target(sync.TARGET_APP30)
+            # 出典を確認不能にしてから復活させ、参照先（台帳に無い App 40 No.3）の実在確認だけ失敗させる
+            self.fake.data["30"] = []
+            self.assertEqual((await sync.recheck_target(sync.TARGET_APP30))["unavailable"], 1)
             self.assertEqual([(h["source_record_id"], h["state"]) for h in await ledger.list_holds()],
-                             [("100", "unavailable")])
-            prev_done = (await ledger.get_cursor("app28", kind="recheck"))["recheck_completed_at"]
-            self.fake.data["28"] = [app28(100, 1)]
-            self.fake.fail_at = {len(self.fake.calls) + 2}         # 1=$id in・2=LINE 検索
-            rc = await sync.recheck_target(sync.TARGET_APP28)
+                             [("5", "unavailable")])
+            prev_done = (await ledger.get_cursor("app30", kind="recheck"))["recheck_completed_at"]
+            self.fake.data["30"] = [app30(5, 2, "2026-09-21T01:00:00Z", 案件レコードID="3")]
+            self.fake.fail_at = {len(self.fake.calls) + 2}         # 1=$id in・2=App 40 実在確認
+            rc = await sync.recheck_target(sync.TARGET_APP30)
             self.assertEqual((rc["status"], rc["complete"], rc["pending_recheck"]),
                              ("partial", False, 1))
             holds = await ledger.list_holds()
             self.assertEqual([(h["source_record_id"], h["state"], h["pending_recheck"]) for h in holds],
-                             [("100", "unavailable", True)])          # unavailable は解除されない
-            self.assertEqual(await ledger.count_pending_recheck("28"), 1)
+                             [("5", "unavailable", True)])          # unavailable は解除されない
+            self.assertEqual(await ledger.count_pending_recheck("30"), 1)
             fd = await fresh()
             self.assertEqual(fd["state"], "partial")
-            self.assertEqual(fd["reasons"], ["app28:100:pending_recheck"])
-            # 関連は保持（案件 1 の出来事は現在値のまま）
-            self.assertEqual(await ledger.current_case_of_source("28", "100"), ("40", "1"))
-            self.assertTrue([e for e in await ledger.list_case_events("40", "1")
-                             if e["source_app_id"] == "28"])
+            self.assertEqual(fd["reasons"], ["app30:5:pending_recheck"])
+            # 関連は保持（案件 1 の発送 fact は現在値のまま）・判定不能では case を起こさない
+            self.assertEqual(await ledger.current_case_of_source("30", "5"), await cid("40", "1"))
+            self.assertTrue([f for f in await ledger.list_case_facts(("40", "1"))
+                             if f["source_app_id"] == "30"])
+            self.assertIsNone(await cid("40", "3"))
             # 一巡完了にならない（完了時刻は前回のまま進まない）・次の job で続きが回る
-            rcur = await ledger.get_cursor("app28", kind="recheck")
+            rcur = await ledger.get_cursor("app30", kind="recheck")
             self.assertEqual((rcur["state"], rcur["recheck_completed_at"]), ("incomplete", prev_done))
             self.assertTrue(await sync._recheck_due(
-                "app28", await ledger.get_cursor("app28") or {}, sync._now()))
+                "app30", await ledger.get_cursor("app30") or {}, sync._now()))
             self.assertEqual((await ledger.sync_overview())["pending_recheck"], 1)
-            # 次回に検索成功で復旧: unavailable 解除・pending 解除・一巡完了・鮮度 synced
+            # 次回に実在確認が成功（No.3 が正本に実在）→ 案件 3 を起こして移動・unavailable 解除・
+            # pending 解除・一巡完了・鮮度 synced
             self.fake.fail_at = set()
-            rc = await sync.recheck_target(sync.TARGET_APP28)
-            self.assertEqual((rc["status"], rc["complete"], rc["pending_recheck"], rc["pending_left"]),
-                             ("ok", True, 0, 0))
+            self.fake.data["40"].append(app40(3, 1, "2026-09-20T03:00:00Z", LINEユーザーID=LINE_B))
+            rc = await sync.recheck_target(sync.TARGET_APP30)
+            self.assertEqual((rc["status"], rc["complete"], rc["pending_recheck"], rc["pending_left"],
+                              rc["moved"]), ("ok", True, 0, 0, 1))
             self.assertEqual(await ledger.list_holds(), [])
+            self.assertEqual(await ledger.current_case_of_source("30", "5"), await cid("40", "3"))
             self.assertEqual(await fresh(), {"state": "synced", "reasons": []})
-            done = (await ledger.get_cursor("app28", kind="recheck"))["recheck_completed_at"]
+            done = (await ledger.get_cursor("app30", kind="recheck"))["recheck_completed_at"]
             self.assertTrue(done and done > prev_done)                 # 一巡完了が進んだ
-            # 通常同期でも判定不能は partial（新規行は行が無いので記録せず、窓・照合で再試行）
-            self.fake.data["28"].append(app28(101, 1, "2026-09-21T01:00:00Z"))
-            self.fake.fail_at = {len(self.fake.calls) + 3}         # 1=ページ・2=100 の検索・3=101 の検索
-            r = await sync.sync_target(sync.TARGET_APP28)
+            # 通常同期でも判定不能は partial（初見の行は出典行が無いので記録せず、窓・照合で再試行）
+            self.fake.data["30"].append(app30(6, 1, "2026-09-21T02:00:00Z", 案件レコードID="4"))
+            self.fake.fail_at = {len(self.fake.calls) + 2}         # 1=ページ・2=No.4 の実在確認
+            r = await sync.sync_target(sync.TARGET_APP30)
             self.assertEqual((r["status"], r["pending_recheck"]), ("partial", 1))
-            self.assertIsNone(await ledger.latest_known_revision("28", "101"))
-            self.assertEqual(await ledger.count_pending_recheck("28"), 0)
+            self.assertIsNone(await ledger.latest_known_revision("30", "6"))
+            self.assertEqual(await ledger.count_pending_recheck("30"), 0)
             self.fake.fail_at = set()
-            self.assertEqual((await sync.sync_target(sync.TARGET_APP28))["status"], "ok")
-            self.assertEqual(await ledger.latest_known_revision("28", "101"), 1)
-            # App 30: 参照先の実在確認が失敗しても関連を外さない（pending のまま・moved 0）
-            self.fake.data["40"] = [app40(1, 1), app40(2, 1)]     # No.2 は台帳未同期
-            self.fake.data["30"] = [app30(5, 1, 案件レコードID="2")]
-            await sync.sync_target(sync.TARGET_APP30)
-            self.assertEqual(await ledger.current_case_of_source("30", "5"), ("40", "2"))
-            self.fake.fail_at = {len(self.fake.calls) + 2}         # 1=$id in・2=App 40 実在確認
-            rc = await sync.recheck_target(sync.TARGET_APP30)
-            self.assertEqual((rc["status"], rc["moved"], rc["pending_recheck"]), ("partial", 0, 1))
-            self.assertEqual(await ledger.current_case_of_source("30", "5"), ("40", "2"))
-            self.assertTrue([f for f in await ledger.list_case_facts("40", "2")
-                             if f["source_app_id"] == "30"])
-            self.assertEqual([(h["source_app_id"], h["source_record_id"], h["pending_recheck"])
-                              for h in await ledger.list_holds()], [("30", "5", True)])
-            self.assertEqual(await ledger.count_pending_recheck("30"), 1)
-            self.fake.fail_at = set()
-            rc = await sync.recheck_target(sync.TARGET_APP30)
-            self.assertEqual((rc["status"], rc["complete"], rc["pending_left"]), ("ok", True, 0))
+            self.assertEqual((await sync.sync_target(sync.TARGET_APP30))["status"], "ok")
+            self.assertEqual(await ledger.latest_known_revision("30", "6"), 1)
+            self.assertEqual([p["hold_reason"] for p in await ledger.list_pending_links()],
+                             ["ref_missing"])                       # No.4 は正本に無い＝紐付け待ち
         run(body())
 
 
@@ -458,10 +449,9 @@ class TestFix3Pending(BrainDbMixin):
         async def body():
             await sync.sync_target(sync.TARGET_APP40)
             await sync.sync_target(sync.TARGET_APP28)
-            # LINE 検索失敗で pending（検索失敗時は保持）
-            self.fake.fail_at = {len(self.fake.calls) + 2}
-            rc = await sync.recheck_target(sync.TARGET_APP28)
-            self.assertEqual((rc["status"], rc["pending_recheck"], rc["complete"]), ("partial", 1, False))
+            # 判定不能の記録（R12）。ID-1a: App 28 の判定は identity のみで外部確認が無いため、
+            # pending_recheck は台帳 API で直接置く（意味は同じ: 次回の再照合対象・失敗時は保持）
+            self.assertEqual(await ledger.set_pending_recheck("28", "100", True), 1)
             self.assertEqual(await ledger.count_pending_recheck("28"), 1)
             self.fake.raise_all = True
             rc = await sync.recheck_target(sync.TARGET_APP28)
@@ -491,41 +481,44 @@ class TestFix3Pending(BrainDbMixin):
         run(body())
 
     def test_unregistered_undecidable_is_persisted_and_retried(self):
-        # BA-17: 初見の App 28 行の LINE 検索失敗 → run ok にならない・cursor synced にならない・
-        # overview に 1・再起動後（新しい run）も再試行・次回成功で解消
+        # BA-17: 初見の App 30 行の参照先（台帳に無い App 40 No.2）の実在確認失敗 → run ok にならない・
+        # cursor synced にならない・overview に 1・再起動後（新しい run）も再試行・次回成功で解消
         self.fake.data["40"] = [app40(1, 1)]
-        self.fake.data["28"] = [app28(100, 1)]
+        self.fake.data["30"] = [app30(5, 1, 案件レコードID="2")]
 
         async def body():
             await sync.sync_target(sync.TARGET_APP40)
-            self.fake.fail_at = {len(self.fake.calls) + 2}          # 1=ページ・2=LINE 検索
-            r = await sync.sync_target(sync.TARGET_APP28)
+            self.fake.data["40"].append(app40(2, 1, "2026-09-20T02:00:00Z", LINEユーザーID=LINE_B))
+            self.fake.fail_at = {len(self.fake.calls) + 2}          # 1=ページ・2=No.2 の実在確認
+            r = await sync.sync_target(sync.TARGET_APP30)
             self.assertEqual((r["status"], r["pending_recheck"], r["pending_unregistered"]),
                              ("partial", 1, 1))
-            self.assertIsNone(await ledger.latest_known_revision("28", "100"))   # 出典行は作らない
+            self.assertIsNone(await ledger.latest_known_revision("30", "5"))   # 出典行は作らない
+            self.assertIsNone(await cid("40", "2"))                             # case も起こさない
             run_row = (await ledger.sync_overview())["runs"][0]
             self.assertEqual((run_row["status"], run_row["failure"], run_row["pending_unregistered"]),
                              ("partial", "pending_unregistered", 1))
-            cur = await ledger.get_cursor("app28")
+            cur = await ledger.get_cursor("app30")
             self.assertEqual((cur["state"], cur["confirmed_until"], cur["pending_unregistered"],
                               cur["cursor_updated_at"], cur["cursor_record_id"]),
-                             ("incomplete", "", 1, "2026-09-21T00:00:00Z", "100"))
+                             ("incomplete", "", 1, "2026-09-21T00:00:00Z", "5"))
             self.assertEqual((await ledger.sync_overview())["pending_unregistered"], 1)
-            self.assertEqual(await ledger.case_freshness("28", "100", "app28"), "incomplete")
+            self.assertEqual(await ledger.case_freshness(("30", "5"), "app30"), "incomplete")
             # 再起動（新しい run）でも再試行され、失敗が続く間は未完了表示が維持される
             self.fake.fail_at = {len(self.fake.calls) + 2}
-            r = await sync.sync_target(sync.TARGET_APP28)
+            r = await sync.sync_target(sync.TARGET_APP30)
             self.assertEqual((r["status"], r["pending_unregistered"]), ("partial", 1))
-            cur = await ledger.get_cursor("app28")
+            cur = await ledger.get_cursor("app30")
             self.assertEqual((cur["state"], cur["confirmed_until"], cur["pending_unregistered"]),
                              ("incomplete", "", 1))
             self.assertEqual((await ledger.sync_overview())["pending_unregistered"], 1)
-            # 次回成功で解消
+            # 次回成功で解消（参照先が正本に実在 → 案件 2 を起こして自動採用）
             self.fake.fail_at = set()
-            r = await sync.sync_target(sync.TARGET_APP28)
+            r = await sync.sync_target(sync.TARGET_APP30)
             self.assertEqual((r["status"], r["pending_unregistered"]), ("ok", 0))
-            self.assertEqual(await ledger.latest_known_revision("28", "100"), 1)
-            cur = await ledger.get_cursor("app28")
+            self.assertEqual(await ledger.latest_known_revision("30", "5"), 1)
+            self.assertEqual(await ledger.current_case_of_source("30", "5"), await cid("40", "2"))
+            cur = await ledger.get_cursor("app30")
             self.assertEqual((cur["state"], cur["pending_unregistered"]), ("synced", 0))
             self.assertTrue(cur["confirmed_until"])
             ov = await ledger.sync_overview()
@@ -545,29 +538,29 @@ class TestFix4(BrainDbMixin):
             await sync.sync_target(sync.TARGET_APP40)
             self.fake.data["40"] = []
             self.assertEqual((await sync.recheck_target(sync.TARGET_APP40))["unavailable"], 1)
-            self.assertEqual(await ledger.case_freshness("40", "1", "app40"), "error")
-            n = len(await ledger.list_case_facts("40", "1", current_only=False))
+            self.assertEqual(await ledger.case_freshness(("40", "1"), "app40"), "error")
+            n = len(await ledger.list_case_facts(("40", "1"), current_only=False))
             # 再照合で rev1（既知旧版）が返る → 復旧しない・何も積まない
             self.fake.data["40"] = [app40(1, 1)]
             rc = await sync.recheck_target(sync.TARGET_APP40)
             self.assertEqual((rc["status"], rc["unavailable"]), ("ok", 0))
             self.assertEqual([h["state"] for h in await ledger.list_holds()], ["unavailable"])
-            self.assertEqual(await ledger.case_freshness("40", "1", "app40"), "error")
-            self.assertEqual(len(await ledger.list_case_facts("40", "1", current_only=False)), n)
+            self.assertEqual(await ledger.case_freshness(("40", "1"), "app40"), "error")
+            self.assertEqual(len(await ledger.list_case_facts(("40", "1"), current_only=False)), n)
             # 通常同期で rev2（未知の旧版）が見える → 履歴のみ保存・復旧しない
             self.fake.data["40"] = [app40(1, 2, "2026-09-20T04:00:00Z", status="書類収集中")]
             self.assertEqual((await sync.sync_target(sync.TARGET_APP40))["status"], "ok")
             self.assertEqual([h["state"] for h in await ledger.list_holds()], ["unavailable"])
-            stale = [f for f in await ledger.list_case_facts("40", "1", current_only=False)
+            stale = [f for f in await ledger.list_case_facts(("40", "1"), current_only=False)
                      if f["version"] == 2]
             self.assertTrue(stale and all(f["invalid_reason"] == "stale_revision" for f in stale))
-            self.assertEqual([(f["value_text"], f["version"]) for f in await ledger.list_case_facts("40", "1")
+            self.assertEqual([(f["value_text"], f["version"]) for f in await ledger.list_case_facts(("40", "1"))
                               if f["item_code"] == "app40.status"], [("受理", 3)])
             # rev3（有効な最新版）が返れば復旧
             self.fake.data["40"] = [app40(1, 3, "2026-09-20T03:00:00Z", status="受理")]
             await sync.recheck_target(sync.TARGET_APP40)
             self.assertEqual(await ledger.list_holds(), [])
-            self.assertEqual(await ledger.case_freshness("40", "1", "app40"), "synced")
+            self.assertEqual(await ledger.case_freshness(("40", "1"), "app40"), "synced")
         run(body())
 
     def test_recovery_is_one_transaction_and_failure_keeps_both(self):
@@ -585,9 +578,7 @@ class TestFix4(BrainDbMixin):
             self.fake.data["28"] = []
             await sync.recheck_target(sync.TARGET_APP28)                     # unavailable
             self.fake.data["28"] = [app28(100, 1)]
-            self.fake.fail_at = {len(self.fake.calls) + 2}
-            await sync.recheck_target(sync.TARGET_APP28)                     # + pending
-            self.fake.fail_at = set()
+            await ledger.set_pending_recheck("28", "100", True)             # + pending（R12 の記録）
             self.assertEqual(await state(), [("unavailable", True)])
             real = ledger.mark_source_verified
 
@@ -613,60 +604,62 @@ class TestFix4(BrainDbMixin):
         run(body())
 
     def test_first_unresolved_position_survives_page_limit_and_restart(self):
-        # 1 ページ 1 件・上限 1 ページ。先頭行 100 の LINE 検索を失敗させる
-        t100, t101 = "2026-09-21T00:00:00Z", "2026-09-21T01:00:00Z"
+        # 1 ページ 1 件・上限 1 ページ。先頭行 5 の参照先（台帳に無い App 40 No.2）の実在確認を失敗させる
+        t5, t6 = "2026-09-21T00:00:00Z", "2026-09-21T01:00:00Z"
         self.fake.data["40"] = [app40(1, 1)]
-        self.fake.data["28"] = [app28(100, 1, t100), app28(101, 1, t101)]
+        self.fake.data["30"] = [app30(5, 1, t5, 案件レコードID="2"), app30(6, 1, t6)]
 
         async def body():
             await sync.sync_target(sync.TARGET_APP40)
+            self.fake.data["40"].append(app40(2, 1, "2026-09-20T02:00:00Z", LINEユーザーID=LINE_B))
             with patch.object(sync, "PAGE_SIZE", 1), patch.object(sync, "MAX_PAGES_PER_RUN", 1):
-                self.fake.fail_at = {len(self.fake.calls) + 2}      # 1=ページ・2=LINE 検索(100)
-                r = await sync.sync_target(sync.TARGET_APP28)
+                self.fake.fail_at = {len(self.fake.calls) + 2}      # 1=ページ・2=実在確認(No.2)
+                r = await sync.sync_target(sync.TARGET_APP30)
                 self.assertEqual((r["status"], r["failure"], r["pending_unregistered"]),
                                  ("failed", "page_limit_reached", 1))
-                cur = await ledger.get_cursor("app28")
+                cur = await ledger.get_cursor("app30")
                 self.assertEqual((cur["state"], cur["pending_unregistered"], cur["first_unresolved_position"],
                                   cur["confirmed_until"]),
-                                 ("incomplete", 1, {"updated_at": t100, "record_id": "100"}, ""))
+                                 ("incomplete", 1, {"updated_at": t5, "record_id": "5"}, ""))
                 run_row = (await ledger.sync_overview())["runs"][0]
                 self.assertEqual((run_row["pending_unregistered"], run_row["first_unresolved_position"]),
-                                 (1, {"updated_at": t100, "record_id": "100"}))
+                                 (1, {"updated_at": t5, "record_id": "5"}))
                 # 次回（再開）はその行から取り直し、また失敗 → pending_unregistered=1 が残る
                 self.fake.fail_at = {len(self.fake.calls) + 2}
                 n = len(self.fake.calls)
-                r = await sync.sync_target(sync.TARGET_APP28)
-                self.assertIn(f'更新日時 >= "{t100}"', self.fake.calls[n][1])
+                r = await sync.sync_target(sync.TARGET_APP30)
+                self.assertIn(f'更新日時 >= "{t5}"', self.fake.calls[n][1])
                 self.assertEqual((r["status"], r["pending_unregistered"]), ("failed", 1))
-                cur = await ledger.get_cursor("app28")
+                cur = await ledger.get_cursor("app30")
                 self.assertEqual((cur["state"], cur["pending_unregistered"], cur["confirmed_until"]),
                                  ("incomplete", 1, ""))
-                self.assertIsNone(await ledger.latest_known_revision("28", "100"))
+                self.assertIsNone(await ledger.latest_known_revision("30", "5"))
                 # 障害終了（kintone 失敗）をまたいでも位置と件数は引き継がれる
                 self.fake.raise_all = True
-                r = await sync.sync_target(sync.TARGET_APP28)
+                r = await sync.sync_target(sync.TARGET_APP30)
                 self.assertEqual(r["failure"], "kintone_fetch_failed")
                 self.fake.raise_all = False
-                cur = await ledger.get_cursor("app28")
+                cur = await ledger.get_cursor("app30")
                 self.assertEqual((cur["pending_unregistered"], cur["first_unresolved_position"]),
-                                 (1, {"updated_at": t100, "record_id": "100"}))
+                                 (1, {"updated_at": t5, "record_id": "5"}))
                 # 「再起動」＝新しい run。窓の始点は未解決位置を越えない（それ以前から取り直す）。
-                # 検索が成功すれば 100 を取り込み、未解決が解消
+                # 実在確認が成功すれば 5 を取り込み（案件 2 を起こして採用）、未解決が解消
                 n = len(self.fake.calls)
-                r = await sync.sync_target(sync.TARGET_APP28)
+                r = await sync.sync_target(sync.TARGET_APP30)
                 m = re.search(r'更新日時 >= "([^"]+)"', self.fake.calls[n][1])
-                self.assertTrue(m and m.group(1) <= t100, self.fake.calls[n][1])
+                self.assertTrue(m and m.group(1) <= t5, self.fake.calls[n][1])
                 self.assertEqual((r["failure"], r["pending_unregistered"]), ("page_limit_reached", 0))
-                self.assertEqual(await ledger.latest_known_revision("28", "100"), 1)
-                cur = await ledger.get_cursor("app28")
+                self.assertEqual(await ledger.latest_known_revision("30", "5"), 1)
+                self.assertEqual(await ledger.current_case_of_source("30", "5"), await cid("40", "2"))
+                cur = await ledger.get_cursor("app30")
                 self.assertEqual((cur["pending_unregistered"], cur["first_unresolved_position"]), (0, None))
-            # 上限を外せば残り（101）を取り込み synced
-            r = await sync.sync_target(sync.TARGET_APP28)
+            # 上限を外せば残り（6）を取り込み synced
+            r = await sync.sync_target(sync.TARGET_APP30)
             self.assertEqual((r["status"], r["pending_unregistered"]), ("ok", 0))
-            cur = await ledger.get_cursor("app28")
+            cur = await ledger.get_cursor("app30")
             self.assertEqual((cur["state"], cur["pending_unregistered"]), ("synced", 0))
             self.assertTrue(cur["confirmed_until"])
-            self.assertEqual(await ledger.latest_known_revision("28", "101"), 1)
+            self.assertEqual(await ledger.latest_known_revision("30", "6"), 1)
         run(body())
 
 

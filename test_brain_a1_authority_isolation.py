@@ -22,7 +22,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
-from brain_test_support import (BRAIN_ENV, LINE_A, BrainDbMixin, app28, app30, app40,
+from brain_test_support import (cid, BRAIN_ENV, LINE_A, BrainDbMixin, app28, app30, app40,
                                 run, subrow)
 
 for _k, _v in {
@@ -58,7 +58,7 @@ _client = TestClient(main.app)
 _ENV = {"WEBAPP_PASSWORD_HASH": hash_password("pw", iterations=MIN_ITERATIONS),
         "WEBAPP_SESSION_SECRET": "s" * 32,
         "BRAIN_SYNC_ENABLED": "1"}            # fix4 R14: OFF なら全ルート 404（下の専用テスト）
-BRAIN_FILES = ("hub/brain_ledger.py", "hub/brain_link.py", "hub/brain_sync.py",
+BRAIN_FILES = ("hub/brain_ledger.py", "hub/brain_link.py", "hub/brain_sync.py", "hub/brain_migration.py",
                "hub/webapp_brain_view.py")
 OP1 = "11111111-2222-4333-8444-555555555555"
 OP2 = "11111111-2222-4333-8444-666666666666"
@@ -111,7 +111,7 @@ class TestOperations(BrainDbMixin):
     def _seed(self):
         self.fake.data["40"] = [app40(1, 1)]
         run(sync.sync_target(sync.TARGET_APP40))
-        facts = run(ledger.list_case_facts("40", "1"))
+        facts = run(ledger.list_case_facts(("40", "1")))
         return [f for f in facts if f["item_code"] == "app40.status"][0]
 
     def test_confirm_idempotent_and_version_conflict(self):
@@ -160,12 +160,13 @@ class TestOperations(BrainDbMixin):
                 self.assertEqual(r.status_code, 400, bad)
                 self.assertEqual(r.text, "")                       # 反射なし
             r = _client.post("/app/brain/relink", data={"operation_id": OP1, "source_app_id": "30",
-                                                        "source_record_id": "5", "case_app_id": "40",
-                                                        "case_record_id": "a"},
+                                                        "source_record_id": "5", "case_id": "a"},
                              headers=_auth(), follow_redirects=False)
             self.assertEqual(r.status_code, 400)
             for path in ("/app/api/brain/pending?limit=0", "/app/api/brain/holds?limit=x",
-                         "/app/api/brain/facts?app=40&record=%3Cb%3E"):
+                         "/app/api/brain/facts?app=40&record=%3Cb%3E", "/app/api/brain/facts?case=x",
+                         "/app/api/brain/facts?case=1&app=40&record=1",
+                         "/app/api/brain/case?app=40&record=%3Cb%3E"):
                 r = _client.get(path, headers=_auth(), follow_redirects=False)
                 self.assertEqual(r.status_code, 400, path)
             self.assertEqual(len(run(ledger.list_confirmations(f["fact_id"]))), 0)
@@ -178,14 +179,14 @@ class TestOperations(BrainDbMixin):
         with patch.dict(os.environ, _ENV):
             # BA-06: 画面が見ていた紐付け版・出典 revision を添える（期待値は不変）
             body = {"operation_id": OP1, "source_app_id": "30", "source_record_id": "5",
-                    "case_app_id": "40", "case_record_id": "2", "reason": "誤り",
+                    "case_id": str(run(cid("40", "2"))), "reason": "誤り",
                     "seen_link_version": str(run(ledger.link_version("30", "5"))),
                     "seen_source_revision": "1"}
             r = _client.post("/app/brain/relink", data=body, headers=_auth(), follow_redirects=False)
             self.assertEqual((r.status_code, r.headers["location"]), (303, "/app/brain?done=relink"))
             r = _client.post("/app/brain/relink", data=body, headers=_auth(), follow_redirects=False)
             self.assertEqual(r.headers["location"], "/app/brain?done=dup")
-        self.assertEqual(run(ledger.current_case_of_source("30", "5")), ("40", "2"))
+        self.assertEqual(run(ledger.current_case_of_source("30", "5")), run(cid("40", "2")))
         self.assertEqual(run(ledger.latest_link("30", "5"))["actor"], "owner")
 
     # ── fix1: BA-06（紐付け訂正の版照合・訂正先検査）/ BA-07（鮮度の集約・flag） ──
@@ -204,8 +205,8 @@ class TestOperations(BrainDbMixin):
             self.assertEqual((pending[0]["source_record_id"], pending[0]["source_revision"]), ("61", 1))
             seen = {"seen_link_version": str(pending[0]["link_version"]),
                     "seen_source_revision": str(pending[0]["source_revision"])}
-            base = {"source_app_id": "30", "source_record_id": "61", "case_app_id": "40",
-                    "case_record_id": "2", "reason": "手動"}
+            base = {"source_app_id": "30", "source_record_id": "61",
+                    "case_id": str(run(cid("40", "2"))), "reason": "手動"}
             # 版の欠落は 400
             self.assertEqual(post({**base, "operation_id": OP1}).status_code, 400)
             # 出典が rev2 に進んだ後の古い画面の訂正 → 409 で最新
@@ -218,8 +219,8 @@ class TestOperations(BrainDbMixin):
                                                     "source_revision": 2}})
             self.assertIsNone(run(ledger.current_case_of_source("30", "61")))
             seen["seen_source_revision"] = "2"
-            # App 26/No.999 → 400・App 40/No.999（台帳に無い）→ 400
-            for bad in ({"case_app_id": "26", "case_record_id": "999"}, {"case_record_id": "999"}):
+            # 台帳に無い case_id（999999・0）→ 400（ID-1a: 訂正先は case_id）
+            for bad in ({"case_id": "999999"}, {"case_id": "0"}):
                 r = post({**base, **seen, **bad, "operation_id": OP2})
                 self.assertEqual((r.status_code, r.text), (400, ""), bad)
             # 台帳にはあるが正本に無い → 400・正本の確認不能 → 503（訂正を通さない）
@@ -235,10 +236,10 @@ class TestOperations(BrainDbMixin):
             # 正しい版で成功 → 303・履歴のみ・紐付け待ちから消え、次回同期で新案件側へ
             r = post({**base, **seen, "operation_id": OP2})
             self.assertEqual((r.status_code, r.headers["location"]), (303, "/app/brain?done=relink"))
-            self.assertEqual(run(ledger.current_case_of_source("30", "61")), ("40", "2"))
+            self.assertEqual(run(ledger.current_case_of_source("30", "61")), run(cid("40", "2")))
             self.assertEqual(run(ledger.list_pending_links()), [])
             run(sync.sync_target(sync.TARGET_APP30))
-            self.assertTrue([f for f in run(ledger.list_case_facts("40", "2"))
+            self.assertTrue([f for f in run(ledger.list_case_facts(("40", "2")))
                              if f["source_app_id"] == "30"])
             # 台帳レベル: 紐付け版の不一致も同一トランザクションの照合で 409
             with self.assertRaises(ledger.VersionConflict) as cm:
@@ -286,7 +287,7 @@ class TestOperations(BrainDbMixin):
             r = confirm(OP4, ship, "revoke", revoked_of=str(confs[0]["confirmation_id"]))
             self.assertEqual(r.status_code, 303)
             self.assertEqual(run(ledger.list_conflicts()), [])
-            self.assertEqual(run(ledger.case_freshness("40", "1", "app40", brain_sync_targets())),
+            self.assertEqual(run(ledger.case_freshness(("40", "1"), "app40", brain_sync_targets())),
                              "partial")
             # 案件自身のカーソルが error なら旧 confirmed_until で synced を返さない
             run(ledger.set_cursor_state("app40", "error"))
@@ -374,14 +375,15 @@ class TestOperations(BrainDbMixin):
                 patch.object(db, "get_async_session_factory", wraps=db.get_async_session_factory) as sf:
             for path in ("/app/brain", "/app/api/brain/enabled", "/app/api/brain/overview",
                          "/app/api/brain/pending", "/app/api/brain/holds", "/app/api/brain/conflicts",
-                         "/app/api/brain/recheck", "/app/api/brain/facts?app=40&record=1"):
+                         "/app/api/brain/recheck", "/app/api/brain/facts?app=40&record=1",
+                         "/app/api/brain/facts?case=1", "/app/api/brain/case?app=40&record=1"):
                 r = _client.get(path, headers=_auth(), follow_redirects=False)
                 self.assertEqual((r.status_code, r.text), (404, ""), path)
             for path, body in (("/app/brain/confirm", {"operation_id": OP1, "fact_id": "1",
                                                       "seen_version": "1", "decision": "confirm"}),
                                ("/app/brain/relink", {"operation_id": OP2, "source_app_id": "30",
-                                                     "source_record_id": "5", "case_app_id": "40",
-                                                     "case_record_id": "1", "seen_link_version": "0",
+                                                     "source_record_id": "5", "case_id": "1",
+                                                     "seen_link_version": "0",
                                                      "seen_source_revision": "1"})):
                 r = _client.post(path, data=body, headers=_auth(), follow_redirects=False)
                 self.assertEqual((r.status_code, r.text), (404, ""), path)
@@ -417,12 +419,12 @@ class TestOperations(BrainDbMixin):
         # 案件 1／案件 2 の fact 件数はともに不変
         self.fake.data["40"] = [app40(1, 1), app40(2, 1)]
         run(sync.sync_target(sync.TARGET_APP40))
-        n1 = len(run(ledger.list_case_facts("40", "1", current_only=False)))
-        n2 = len(run(ledger.list_case_facts("40", "2", current_only=False)))
+        n1 = len(run(ledger.list_case_facts(("40", "1"), current_only=False)))
+        n2 = len(run(ledger.list_case_facts(("40", "2"), current_only=False)))
         with patch.dict(os.environ, _ENV):
             r = _client.post("/app/brain/relink", headers=_auth(), follow_redirects=False,
                              data={"operation_id": OP1, "source_app_id": "40", "source_record_id": "1",
-                                   "case_app_id": "40", "case_record_id": "2",
+                                   "case_id": str(run(cid("40", "2"))),
                                    "seen_link_version": str(run(ledger.link_version("40", "1"))),
                                    "seen_source_revision": "1"})
             self.assertEqual((r.status_code, r.json()),
@@ -431,9 +433,9 @@ class TestOperations(BrainDbMixin):
             run(ledger.relink_source(source_app_id="40", source_record_id="1", new_case=("40", "2"),
                                      reason="", operation_id=OP2, actor="owner",
                                      seen_link_version=0, seen_source_revision=1))
-        self.assertEqual(len(run(ledger.list_case_facts("40", "1", current_only=False))), n1)
-        self.assertEqual(len(run(ledger.list_case_facts("40", "2", current_only=False))), n2)
-        self.assertEqual(run(ledger.current_case_of_source("40", "1")), ("40", "1"))
+        self.assertEqual(len(run(ledger.list_case_facts(("40", "1"), current_only=False))), n1)
+        self.assertEqual(len(run(ledger.list_case_facts(("40", "2"), current_only=False))), n2)
+        self.assertEqual(run(ledger.current_case_of_source("40", "1")), run(cid("40", "1")))
         self.assertIsNone(run(ledger.latest_link("40", "1")))
 
     def test_relink_closed_set_is_one_constant_used_by_api_and_ledger(self):
@@ -454,14 +456,14 @@ class TestOperations(BrainDbMixin):
                             ledger.make_locator("発送ステータス"))]))
 
         def snapshot():
-            return (run(ledger.list_case_facts("40", "1", current_only=False)),
-                    run(ledger.list_case_facts("40", "2", current_only=False)),
-                    run(ledger.list_case_events("40", "1", current_only=False)),
-                    run(ledger.list_case_events("40", "2", current_only=False)),
+            return (run(ledger.list_case_facts(("40", "1"), current_only=False)),
+                    run(ledger.list_case_facts(("40", "2"), current_only=False)),
+                    run(ledger.list_case_events(("40", "1"), current_only=False)),
+                    run(ledger.list_case_events(("40", "2"), current_only=False)),
                     run(ledger.latest_link("99", "7")), run(ledger.link_version("99", "7")),
                     run(ledger.current_case_of_source("99", "7")), run(ledger.list_holds()))
         before = snapshot()
-        self.assertEqual(before[6], ("40", "1"))
+        self.assertEqual(before[6], run(cid("40", "1")))
         for app_id, rid in (("99", "7"), ("40", "1")):
             with self.assertRaises(ledger.NotRelinkable):
                 run(ledger.relink_source(source_app_id=app_id, source_record_id=rid,
@@ -483,7 +485,8 @@ class TestPiiAndSinkPolicy(unittest.TestCase):
         self.assertNotIn("brain", allow)
 
     def test_ledger_link_view_do_not_import_logging(self):
-        for name in ("hub/brain_ledger.py", "hub/brain_link.py", "hub/webapp_brain_view.py"):
+        for name in ("hub/brain_ledger.py", "hub/brain_link.py", "hub/webapp_brain_view.py",
+                     "hub/brain_migration.py"):
             tree = ast.parse((REPO / name).read_text(encoding="utf-8"))
             imported = set()
             for node in ast.walk(tree):
@@ -615,7 +618,7 @@ class TestIsolationAndZeroWrites(unittest.TestCase):
                 run(sync.run_brain_sync_job())
                 run(sync.reconcile_target(sync.TARGET_APP40))
                 run(sync.recheck_target(sync.TARGET_APP30))
-                f = [x for x in run(ledger.list_case_facts("40", "1"))
+                f = [x for x in run(ledger.list_case_facts(("40", "1")))
                      if x["item_code"] == "app40.status"][0]
                 with patch.dict(os.environ, _ENV):
                     _client.post("/app/brain/confirm", headers=_auth(), follow_redirects=False,
@@ -623,8 +626,8 @@ class TestIsolationAndZeroWrites(unittest.TestCase):
                                        "seen_version": str(f["version"]), "decision": "confirm"})
                     r = _client.post("/app/brain/relink", headers=_auth(), follow_redirects=False,
                                      data={"operation_id": OP2, "source_app_id": "30",
-                                           "source_record_id": "5", "case_app_id": "40",
-                                           "case_record_id": "2",
+                                           "source_record_id": "5",
+                                           "case_id": str(run(cid("40", "2"))),
                                            "seen_link_version": str(run(ledger.link_version("30", "5"))),
                                            "seen_source_revision": "1"})
                     self.assertEqual(r.status_code, 303)      # 訂正は実行された（読取のみ）
