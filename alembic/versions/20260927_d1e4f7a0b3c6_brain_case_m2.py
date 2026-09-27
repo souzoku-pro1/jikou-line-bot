@@ -153,6 +153,7 @@ def _m1_tables() -> dict:
         sa.Column("registered_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()),
         sa.Column("case_id", _BIG, nullable=True),
         sa.Column("line_user_id", sa.Text, nullable=True),
+        sa.Column("pending_reason", sa.Text, nullable=True),
         sa.CheckConstraint("locator <> ''", name="ck_source_ingest_locator_nonempty"),
         sa.UniqueConstraint("source_app_id", "source_record_id", "source_revision", "locator",
                             "converter_name", "converter_version", name="uq_source_ingest_key"),

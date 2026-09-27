@@ -11,6 +11,7 @@
   業務台帳へは入らない（候補は自動確定しない）
 """
 
+import datetime
 import unittest
 
 from brain_test_support import (cid, LINE_A, LINE_B, BrainDbMixin, app28, app30, app40,
@@ -174,47 +175,49 @@ class TestCaseIsolation(BrainDbMixin):
     # ── fix1: BA-04（R5 の一意判定は正本・fail-closed）/ R10（App 28 の関連喪失） ──
 
     def test_line_id_uniqueness_is_decided_by_case_identity(self):
-        # R29（ID-1a・BA-04 の置換）: 「有効な案件」は case_identity で決まる。台帳には App 40 No.1 だけ・
-        # 正本には同じ LINE ID の No.2 もあるが未同期 → 識別子は 1 件なので採用（kintone は検索しない）。
-        # No.2 が同期されて識別子が 2 件になれば、次の再照合で一意不成立として関連解除（R10）
+        # R29＋R34（ID-1a fix1・BA-04 の置換）: 「有効な案件」は case_identity で決まるが、identity で
+        # 自動採用できるのは App 40 の確認済み範囲が会話の時点を覆っているときだけ。
+        # 台帳には App 40 No.1 だけ・正本に同じ LINE ID の No.2 が増えたが App 40 の取得は失敗中
+        # → その後の時点の会話は採用せず pending（app40_not_confirmed）。App 40 が復旧して No.2 が
+        # 同期されると識別子 2 件 → 一意不成立で不採用（kintone は検索しない）
+        utc = datetime.timezone.utc
+        t0 = datetime.datetime(2026, 9, 22, 0, 0, tzinfo=utc)
+        t1 = datetime.datetime(2026, 9, 22, 2, 0, tzinfo=utc)
+        t2 = datetime.datetime(2026, 9, 22, 3, 0, tzinfo=utc)
         self.fake.data["40"] = [app40(1, 1)]
-        self.fake.data["28"] = [app28(100, 1)]
+        self.fake.data["28"] = [app28(100, 1, "2026-09-22T01:30:00Z")]
 
         async def chats(case):
             return [e for e in await ledger.list_case_events(case) if e["source_app_id"] == "28"]
 
         async def body():
-            await sync.sync_target(sync.TARGET_APP40)
-            self.fake.data["40"].append(app40(2, 1, "2026-09-20T02:00:00Z"))
+            self.assertEqual((await sync.sync_target(sync.TARGET_APP40, now=t0))["status"], "ok")
+            self.assertEqual(await sync.app40_confirmed_until(), "2026-09-22T00:00:00Z")
+            self.fake.data["40"].append(app40(2, 1, "2026-09-22T01:00:00Z"))
             self.fake.fail_at = {len(self.fake.calls) + 1}
-            self.assertEqual((await sync.sync_target(sync.TARGET_APP40))["status"], "failed")
-            self.assertEqual(await ledger.find_case_by_item_value(sync.APP40_LINE_ID_ITEM, LINE_A),
-                             [await cid("40", "1")])
+            self.assertEqual((await sync.sync_target(sync.TARGET_APP40, now=t1))["status"], "failed")
+            self.assertEqual(await sync.app40_confirmed_until(), "2026-09-22T00:00:00Z")   # 進まない
+            # 台帳だけを見れば識別子は 1 件（＝確認済み範囲を見なければ誤って採用してしまう状態）
             self.assertEqual(await ledger.active_cases_for_relation(
                 sync.line_namespace(), ledger.IDENTITY_LINE_USER, LINE_A), [await cid("40", "1")])
-            r = await sync.sync_target(sync.TARGET_APP28)
-            self.assertEqual(r["status"], "ok")
-            self.assertEqual([e["source_record_id"] for e in await chats(("40", "1"))], ["100"])
-            self.assertEqual(await ledger.latest_known_revision("28", "100"), 1)
+            r = await sync.sync_target(sync.TARGET_APP28, now=t1)
+            self.assertEqual((r["status"], r["pending_recheck"], r["pending_unregistered"],
+                              r["pending_reasons"]), ("partial", 1, 1, {"app40_not_confirmed": 1}))
+            self.assertEqual(await chats(("40", "1")), [])
+            self.assertIsNone(await ledger.latest_known_revision("28", "100"))
             self.assertEqual([q for a, q in self.fake.calls if a == "40" and "LINEユーザーID" in q], [])
-            # No.2 が同期され識別子が 2 件 → 再照合で一意不成立（関連解除・detached・保留にしない）
-            self.assertEqual((await sync.sync_target(sync.TARGET_APP40))["status"], "ok")
+            # App 40 が復旧（No.2 が同期され識別子 2 件・確認済み範囲が会話の時点を覆う）→ 不採用
+            self.assertEqual((await sync.sync_target(sync.TARGET_APP40, now=t2))["status"], "ok")
             self.assertEqual(len(await ledger.active_cases_for_relation(
                 sync.line_namespace(), ledger.IDENTITY_LINE_USER, LINE_A)), 2)
-            rc = await sync.recheck_target(sync.TARGET_APP28)
-            self.assertEqual((rc["status"], rc["moved"]), ("ok", 1))
+            r = await sync.sync_target(sync.TARGET_APP28, now=t2)
+            self.assertEqual((r["status"], r["pending_recheck"], r["pending_unregistered"]),
+                             ("ok", 0, 0))
             self.assertEqual(await chats(("40", "1")), [])
             self.assertEqual(await chats(("40", "2")), [])
-            self.assertIsNone(await ledger.current_case_of_source("28", "100"))
-            self.assertEqual((await ledger.latest_link("28", "100"))["reason"], "line_id_not_unique")
+            self.assertIsNone(await ledger.latest_known_revision("28", "100"))
             self.assertEqual(await ledger.list_pending_links(), [])
-            self.assertEqual([(h["source_record_id"], h["state"]) for h in await ledger.list_holds()],
-                             [("100", "detached")])
-            # 新しい会話も採用しない（保留にもしない・出典行も作らない）
-            self.fake.data["28"].append(app28(101, 1, "2026-09-21T01:00:00Z"))
-            self.assertEqual((await sync.sync_target(sync.TARGET_APP28))["status"], "ok")
-            self.assertIsNone(await ledger.latest_known_revision("28", "101"))
-            self.assertEqual(await ledger.list_pending_links(), [])
+            self.assertEqual(await ledger.list_holds(), [])
         run(body())
 
     def test_lost_uniqueness_or_category_detaches_ingested_chat(self):

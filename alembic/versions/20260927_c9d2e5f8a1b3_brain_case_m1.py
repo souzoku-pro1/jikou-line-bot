@@ -9,7 +9,7 @@ sqlite では作らない＝dialect 条件付き DDL）・§14-4（R30: source_i
   subject_merge_history
 - case_fact / case_event / case_derivation / source_ingest に case_id（NULL 可・FK は M2）・
   case_fact に prev_case_id（NULL 可）・link_history に prev_case_id / new_case_id（NULL 可）・
-  source_ingest に line_user_id（NULL 可）・索引
+  source_ingest に line_user_id（NULL 可）と pending_reason（NULL 可・R34）・索引
 - sync_run.status に stopped_stale（R28）
 - この revision だけを適用した状態（新形式データゼロ）では挙動は A1 と同じ
   （test_brain_id1a_migration が pin）。downgrade は列・表を落として A1 形へ戻す
@@ -161,6 +161,8 @@ def upgrade() -> None:
     op.create_index("ix_case_derivation_case_id", "case_derivation", ["case_id"])
     op.add_column("source_ingest", sa.Column("case_id", _BIG, nullable=True))
     op.add_column("source_ingest", sa.Column("line_user_id", sa.Text, nullable=True))
+    # R34: 判定不能の理由（閉集合・理由なしは NULL）
+    op.add_column("source_ingest", sa.Column("pending_reason", sa.Text, nullable=True))
     op.create_index("ix_source_ingest_case_id", "source_ingest", ["case_id"])
     op.create_index("ix_source_ingest_line_user", "source_ingest", ["line_user_id"])
     op.add_column("link_history", sa.Column("prev_case_id", _BIG, nullable=True))
@@ -184,6 +186,7 @@ def downgrade() -> None:
     op.drop_index("ix_source_ingest_line_user", table_name="source_ingest")
     op.drop_index("ix_source_ingest_case_id", table_name="source_ingest")
     with op.batch_alter_table("source_ingest") as b:
+        b.drop_column("pending_reason")
         b.drop_column("line_user_id")
         b.drop_column("case_id")
     op.drop_index("ix_case_derivation_case_id", table_name="case_derivation")

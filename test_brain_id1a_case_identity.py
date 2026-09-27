@@ -14,7 +14,9 @@
 - PWA: 案件は ?case={case_id}（識別子検索 /app/api/brain/case で案件キー→case_id）
 """
 
+import contextlib
 import datetime
+import io
 import os
 import re
 import unittest
@@ -350,6 +352,270 @@ class TestCaseIdentity(BrainDbMixin):
                                            c3 + 100, f)
             self.assertEqual(await ledger.list_case_facts(None), [])
         run(body())
+
+
+def _t(day: int, hour: int, minute: int = 0) -> datetime.datetime:
+    return datetime.datetime(2026, 9, day, hour, minute, tzinfo=_UTC)
+
+
+def _z(day: int, hour: int, minute: int = 0) -> str:
+    return f"2026-09-{day:02d}T{hour:02d}:{minute:02d}:00Z"
+
+
+class TestR34App40Coverage(BrainDbMixin):
+    """fix1 BI-01 / R34: App 28 の会話を identity で自動採用できるのは、会話の時点（更新日時）までの
+    App 40 の走査が完了している（確認済み範囲がその時点を覆っている）場合に限る。"""
+
+    async def _chats(self, case, current_only=True):
+        return [e["source_record_id"] for e in await ledger.list_case_events(case, current_only)
+                if e["source_app_id"] == "28"]
+
+    async def _pending(self):
+        return [(h["source_record_id"], h["state"], h["pending_recheck"], h["pending_reason"])
+                for h in await ledger.list_holds()]
+
+    def test_a_b_app40_failure_holds_chat_and_recheck_decides_after_recovery(self):
+        self.fake.data["40"] = [app40(1, 1)]
+        self.fake.data["28"] = [app28(101, 1, _z(21, 0))]
+
+        async def body():
+            await sync.sync_target(sync.TARGET_APP40, now=_t(22, 0))
+            await sync.sync_target(sync.TARGET_APP28, now=_t(22, 0))
+            c1 = await cid("40", "1")
+            self.assertEqual(await self._chats(c1), ["101"])
+            # (a) 正本に同 LINE ID の別案件（No.2）・App 40 の取得だけ失敗
+            self.fake.data["40"].append(app40(2, 1, _z(22, 1)))
+            self.fake.fail_at = {len(self.fake.calls) + 1}
+            r40 = await sync.sync_target(sync.TARGET_APP40, now=_t(22, 2))
+            self.assertEqual((r40["status"], r40["failure"]), ("failed", "kintone_fetch_failed"))
+            self.assertEqual(await sync.app40_confirmed_until(), _z(22, 0))
+            self.fake.data["28"] = [app28(100, 1, _z(22, 1, 30)),                       # 初見
+                                    app28(101, 2, _z(22, 1, 40), message="編集後")]      # 取込済みの新版
+            n = len(self.fake.calls)
+            r = await sync.sync_target(sync.TARGET_APP28, now=_t(22, 2))
+            self.assertEqual([a for a, _q in self.fake.calls[n:]], ["28"])      # kintone は App 28 のページだけ
+            self.assertEqual((r["status"], r["pending_recheck"], r["pending_unregistered"],
+                              r["pending_reasons"]), ("partial", 2, 1, {"app40_not_confirmed": 2}))
+            # 初見の会話: 採用しない・出典行も作らない・未解決位置に理由つきで永続化
+            self.assertIsNone(await ledger.latest_known_revision("28", "100"))
+            cur = await ledger.get_cursor("app28")
+            self.assertEqual((cur["state"], cur["pending_unregistered"], cur["first_unresolved_position"]),
+                             ("incomplete", 1, {"updated_at": _z(22, 1, 30), "record_id": "100",
+                                                "reason": "app40_not_confirmed"}))
+            run_row = (await ledger.sync_overview())["runs"][0]
+            self.assertEqual((run_row["status"], run_row["first_unresolved_position"]["reason"]),
+                             ("partial", "app40_not_confirmed"))
+            # 取込済みの会話: 関連は保持・pending_recheck（理由 app40_not_confirmed）・新版は積まない
+            self.assertEqual(await self._pending(), [("101", "ingested", True, "app40_not_confirmed")])
+            self.assertEqual(await ledger.current_case_of_source("28", "101"), c1)
+            self.assertEqual(await self._chats(c1), ["101"])
+            self.assertEqual(await ledger.latest_known_revision("28", "101"), 1)
+            fd = await ledger.case_freshness_detail(c1, "app40", sync.source_targets())
+            self.assertIn("app28:101:pending_recheck", fd["reasons"])
+            # 追跡再照合も同じ判定（App 40 の確認済み範囲が進むまで pending のまま・一巡完了にしない）
+            rc = await sync.recheck_target(sync.TARGET_APP28, now=_t(22, 2, 30))
+            self.assertEqual((rc["status"], rc["complete"], rc["pending_left"]), ("partial", False, 1))
+            self.assertEqual(await self._pending(), [("101", "ingested", True, "app40_not_confirmed")])
+            # (b) 会話が再取得窓の外に出た後（3 日後）に App 40 を復旧 → 再照合で identity 2 件
+            #     → 採用されない（候補複数は 1b）・pending 解除
+            self.assertEqual((await sync.sync_target(sync.TARGET_APP40, now=_t(25, 0)))["status"], "ok")
+            self.assertEqual(await sync.app40_confirmed_until(), _z(25, 0))
+            self.assertEqual(len(await ledger.active_cases_for_relation(
+                sync.line_namespace(), ledger.IDENTITY_LINE_USER, LINE_A)), 2)
+            rc = await sync.recheck_target(sync.TARGET_APP28, now=_t(25, 0, 10))
+            self.assertEqual((rc["status"], rc["complete"], rc["pending_left"], rc["moved"]),
+                             ("ok", True, 0, 1))
+            self.assertEqual(await self._pending(), [("101", "detached", False, "")])
+            self.assertEqual((await ledger.latest_link("28", "101"))["reason"], "line_id_not_unique")
+            self.assertEqual(await self._chats(c1), [])
+            self.assertEqual(await self._chats(c1, False), ["101"])                  # 削除なし
+            n = len(self.fake.calls)
+            r = await sync.sync_target(sync.TARGET_APP28, now=_t(25, 0, 20))
+            m = re.search(r'更新日時 >= "([^"]+)"', self.fake.calls[n][1])
+            self.assertTrue(m and m.group(1) <= _z(22, 1, 30), self.fake.calls[n][1])  # 未解決位置から
+            self.assertEqual((r["status"], r["pending_recheck"], r["pending_unregistered"],
+                              r["pending_reasons"]), ("ok", 0, 0, {}))
+            self.assertIsNone(await ledger.latest_known_revision("28", "100"))       # 不採用のまま
+            cur = await ledger.get_cursor("app28")
+            self.assertEqual((cur["state"], cur["pending_unregistered"], cur["first_unresolved_position"]),
+                             ("synced", 0, None))
+            self.assertEqual(await ledger.list_pending_links(), [])
+        run(body())
+
+    def test_c_covered_chat_is_adopted_as_before(self):
+        self.fake.data["40"] = [app40(1, 1)]
+        self.fake.data["28"] = [app28(100, 1, _z(21, 0))]
+
+        async def body():
+            await sync.sync_target(sync.TARGET_APP40, now=_t(22, 0))
+            self.assertTrue(await sync.app40_covers(app28(100, 1, _z(22, 0))))       # 境界は覆う
+            self.assertFalse(await sync.app40_covers(app28(100, 1, "2026-09-22T00:00:01Z")))
+            self.assertFalse(await sync.app40_covers(app28(100, 1, "")))             # 読めない時刻
+            r = await sync.sync_target(sync.TARGET_APP28, now=_t(22, 0))
+            self.assertEqual((r["status"], r["pending_recheck"], r["pending_reasons"]), ("ok", 0, {}))
+            c1 = await cid("40", "1")
+            self.assertEqual(await self._chats(c1), ["100"])
+            self.assertEqual(await ledger.list_holds(), [])
+            # category 閉集合外・LINE ID の形式外は identity に依らない＝確認済み範囲を見ずに決まる
+            await ledger.set_cursor_state("app40", "error", confirmed_until="")
+            self.assertEqual((await sync._decide_app28(app28(9, 1, _z(23, 0), category="その他判断系")))[1:],
+                             ("category_out_of_set", True))
+            self.assertEqual((await sync._decide_app28(app28(9, 1, _z(23, 0), line_user_id="x")))[1:],
+                             ("line_id_not_unique", True))
+            self.assertEqual(await sync._decide_app28(app28(9, 1, _z(21, 0))),
+                             (None, "app40_not_confirmed", False))                  # 範囲なし＝判定しない
+            # 理由は閉集合
+            with self.assertRaises(ledger.LedgerError):
+                await ledger.set_pending_recheck("28", "100", True, reason="something_else")
+            self.assertIn("app40_not_confirmed", brain_link.REASONS)
+        run(body())
+
+    def test_d_page_limit_holds_only_chats_after_confirmed_range(self):
+        self.fake.data["40"] = [app40(1, 1)]
+        self.fake.data["28"] = [app28(101, 1, _z(21, 0))]
+
+        async def body():
+            await sync.sync_target(sync.TARGET_APP40, now=_t(22, 0))
+            await sync.sync_target(sync.TARGET_APP28, now=_t(22, 0))
+            c1 = await cid("40", "1")
+            self.fake.data["40"] += [app40(2, 1, _z(22, 1), LINEユーザーID=LINE_B),
+                                     app40(3, 1, _z(22, 1, 10), LINEユーザーID=LINE_C)]
+            with patch.object(sync, "PAGE_SIZE", 1), patch.object(sync, "MAX_PAGES_PER_RUN", 1):
+                r40 = await sync.sync_target(sync.TARGET_APP40, now=_t(22, 2))
+            self.assertEqual((r40["status"], r40["failure"]), ("failed", "page_limit_reached"))
+            self.assertEqual(await sync.app40_confirmed_until(), _z(22, 0))        # 上限は進まない
+            self.fake.data["28"] = [app28(101, 2, _z(22, 1, 40), message="編集後"),   # 取込済み・上限より後
+                                    app28(200, 1, _z(21, 10)),                         # 初見・上限より前
+                                    app28(202, 1, _z(22, 1, 30))]                      # 初見・上限より後
+            r = await sync.sync_target(sync.TARGET_APP28, now=_t(22, 2))
+            self.assertEqual((r["status"], r["pending_recheck"], r["pending_unregistered"],
+                              r["pending_reasons"]), ("partial", 2, 1, {"app40_not_confirmed": 2}))
+            self.assertEqual(sorted(await self._chats(c1)), ["101", "200"])       # 前の時点は採用
+            self.assertIsNone(await ledger.latest_known_revision("28", "202"))
+            self.assertEqual(await self._pending(), [("101", "ingested", True, "app40_not_confirmed")])
+            # App 40 の走査が完了して確認済み範囲が進む → 保留していた会話を通常判定で取り直す
+            self.assertEqual((await sync.sync_target(sync.TARGET_APP40, now=_t(22, 3)))["status"], "ok")
+            r = await sync.sync_target(sync.TARGET_APP28, now=_t(22, 3))
+            self.assertEqual((r["status"], r["pending_recheck"], r["pending_unregistered"]), ("ok", 0, 0))
+            self.assertEqual(sorted(await self._chats(c1)), ["101", "200", "202"])
+            self.assertEqual(await ledger.latest_known_revision("28", "101"), 2)
+            self.assertEqual(await ledger.list_holds(), [])
+        run(body())
+
+
+class TestBackfillCliBoundary(BrainDbMixin):
+    """fix1 BI-02: CLI 境界で例外を固定理由と非ゼロ終了コードだけにする（本文・SQL・
+    SQL パラメータ・トレースバックを stdout/stderr に出さない）。"""
+
+    def _run_cli(self, argv, *, url=None, patches=()):
+        from hub import db
+        from scripts import brain_case_backfill
+        out, so, se = io.StringIO(), io.StringIO(), io.StringIO()
+        env = {"DATABASE_PUBLIC_URL": url or f"sqlite:///{self._dir}/b.db"}
+        db.reset_for_tests()
+        try:
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(patch.dict(os.environ, env))
+                for p in patches:
+                    stack.enter_context(p)
+                stack.enter_context(contextlib.redirect_stdout(so))
+                stack.enter_context(contextlib.redirect_stderr(se))
+                rc = brain_case_backfill.main(argv, out=out)
+        finally:
+            db.reset_for_tests()                 # patch の外で後片付け（終了処理の注入と独立）
+        return rc, out.getvalue() + so.getvalue() + se.getvalue()
+
+    def _assert_clean(self, text):
+        for leak in (LINE_A, LINE_B, "Traceback", "INSERT", "SELECT", "UPDATE", "IntegrityError",
+                     "OperationalError", "UNIQUE constraint", "sqlite", "テスト太郎"):
+            self.assertNotIn(leak, text, leak)
+
+    def test_integrity_error_on_line_identity_insert_is_reported_as_fixed_reason(self):
+        from sqlalchemy.engine import Connection
+        from sqlalchemy.exc import IntegrityError
+        from scripts import brain_case_backfill
+        self.fake.data["40"] = [app40(1, 1)]
+        run(sync.sync_target(sync.TARGET_APP40))
+
+        async def drop_line_identities():
+            async with session_scope() as session:
+                await session.execute(sa.delete(ledger.case_identity).where(
+                    ledger.case_identity.c.kind == ledger.IDENTITY_LINE_USER))
+        run(drop_line_identities())
+        real = Connection.execute
+        hits = []
+
+        def boom(conn, statement, *args, **kwargs):
+            text = str(statement)
+            if text.lstrip().upper().startswith("INSERT INTO CASE_IDENTITY"):
+                hits.append(1)
+                raise IntegrityError(text, {"value": LINE_A, "kind": "line_user"},
+                                     Exception("UNIQUE constraint failed: " + LINE_A))
+            return real(conn, statement, *args, **kwargs)
+
+        rc, text = self._run_cli(["--apply"], patches=(patch.object(Connection, "execute", boom),))
+        self.assertTrue(hits)                                   # LINE 識別子の INSERT に到達した
+        self.assertEqual(rc, brain_case_backfill.RC_ERROR)
+        self.assertNotEqual(rc, 0)
+        self.assertIn("error: write_failed", text)
+        self._assert_clean(text)
+        # 失敗後に再実行すれば成功（冪等）
+        rc, text = self._run_cli(["--apply"])
+        self.assertEqual(rc, 0, text)
+        self.assertIn("line_identities_created=1", text)
+        self._assert_clean(text)
+
+    def test_every_stage_failure_maps_to_closed_reason_set(self):
+        from hub import brain_migration
+        from scripts import brain_case_backfill
+        self.assertEqual(brain_case_backfill.FAIL_REASONS,
+                         ("connect_failed", "write_failed", "verify_failed", "unexpected"))
+        self.fake.data["40"] = [app40(1, 1)]
+        run(sync.sync_target(sync.TARGET_APP40))
+        secret = RuntimeError("boom " + LINE_A + " INSERT INTO x VALUES (?)")
+
+        def raising(*_a, **_kw):
+            raise secret
+        # 接続の失敗（存在しないディレクトリ）
+        rc, text = self._run_cli(["--verify"], url=f"sqlite:///{self._dir}/no_such_dir/x.db")
+        self.assertEqual((rc, text.strip()), (3, "error: connect_failed"))
+        cases = (
+            (["--verify"], "verify", "verify_failed"),
+            (["--apply"], "verify", "verify_failed"),
+            (["--apply"], "backfill", "write_failed"),
+            (["--apply"], "stop_stale_runs", "write_failed"),
+            (["--dry-run"], "plan", "unexpected"),
+            ([], "count_running_runs", "write_failed"),
+        )
+        for argv, name, reason in cases:
+            rc, text = self._run_cli(argv, patches=(patch.object(brain_migration, name, raising),))
+            self.assertEqual(rc, 3, (argv, name, text))
+            self.assertTrue(text.strip().endswith("error: " + reason), (argv, name, text))
+            self._assert_clean(text)
+        # 終了処理の失敗も固定理由（成功していた場合だけ unexpected に落とす）
+        from hub import db
+        rc, text = self._run_cli(["--verify"], patches=(patch.object(db, "dispose_all", raising),))
+        self.assertEqual(rc, 3)
+        self.assertTrue(text.strip().endswith("error: unexpected"), text)
+        self._assert_clean(text)
+        # 固定語彙の中止（案件キーの曖昧）は理由を出す・語彙外の ValueError は固定理由へ
+        def ambiguous(*_a, **_kw):
+            raise ValueError("case_key_ambiguous")
+
+        def other(*_a, **_kw):
+            raise ValueError("bad value " + LINE_A)
+        rc, text = self._run_cli(["--apply"], patches=(patch.object(brain_migration, "backfill", ambiguous),))
+        self.assertEqual(rc, 1)
+        self.assertTrue(text.strip().endswith("abort: case_key_ambiguous"), text)
+        rc, text = self._run_cli(["--apply"], patches=(patch.object(brain_migration, "backfill", other),))
+        self.assertEqual(rc, 3)
+        self.assertTrue(text.strip().endswith("error: write_failed"), text)
+        self._assert_clean(text)
+        # 設定不備は固定文言・終了コード 2
+        with patch.dict(os.environ, {"KINTONE_SUBDOMAIN": ""}):
+            rc, text = self._run_cli(["--apply"])
+        self.assertEqual(rc, 2)
+        self.assertIn("KINTONE_SUBDOMAIN", text)
 
 
 class TestBrainViewCaseId(unittest.TestCase):

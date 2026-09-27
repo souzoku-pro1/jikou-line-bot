@@ -5,8 +5,9 @@
 kintone に触れない・logging 非 import（PII の反射経路を持たない）。
 
 - verify(conn)          検算（backfill --verify と M2 の upgrade() 冒頭が**同じ関数**を使う）:
-                        案件キー↔case_id 1:1・必須表で case_id NULL ゼロ・NULL 可の表は案件
-                        キー NULL の行だけが NULL・件数一致・再計算 idem_key の一致・running
+                        案件キー↔case_id 1:1（両方向・BI-04）・必須表で case_id NULL ゼロ・
+                        NULL 可の表は案件キー NULL の行だけが NULL・case_fact の prev 案件キーは
+                        prev_case_id と一致（BI-03）・件数一致・再計算 idem_key の一致・running
                         run ゼロ。戻り値 {"ok": bool, "problems": [固定語彙], "counts": {...}}
 - plan(conn, ...)       backfill が行う変更の件数（--dry-run の表示。書かない）
 - backfill(conn, ...)   冪等・バッチ tx（案件キーごとに case を 1 件・case_identity
@@ -39,6 +40,8 @@ PROBLEM_COUNT_MISMATCH = "case_row_count_mismatch"          # 件数不一致
 PROBLEM_IDEM_KEY = "event_idem_key_mismatch"                # 再計算 idem_key が保存値と違う
 PROBLEM_RUNNING = "running_runs_present"                    # running の sync_run がある
 PROBLEM_REGISTERED_WITHOUT_KEY = "registered_case_without_key"  # 登録済み case に識別子が無い
+PROBLEM_CASE_SHARED = "case_id_shared_by_keys"              # 1 つの case_id を 2 つ以上の旧案件キーが指す
+PREV_CASE = "case_fact.prev_case_id"                        # BI-03: 移動履歴の出所（旧案件）
 
 REFUSE_UNREGISTERED = "unregistered_case_present"
 REFUSE_MERGED = "merged_case_present"
@@ -87,10 +90,24 @@ def _legacy_keys(conn) -> set:
             t.c.case_app_id.isnot(None)).distinct()).fetchall()
         keys.update((str(r[0]), str(r[1])) for r in rows)
     for a, b in ((_LINK.c.prev_case_app_id, _LINK.c.prev_case_record_id),
-                 (_LINK.c.new_case_app_id, _LINK.c.new_case_record_id)):
+                 (_LINK.c.new_case_app_id, _LINK.c.new_case_record_id),
+                 (_FACT.c.prev_case_app_id, _FACT.c.prev_case_record_id)):     # BI-03
         rows = conn.execute(sa.select(a, b).where(a.isnot(None)).distinct()).fetchall()
         keys.update((str(r[0]), str(r[1])) for r in rows)
     return keys
+
+
+def _prev_mismatch_count(conn, mapping: dict) -> int:
+    """case_fact の prev 案件キーがある行で prev_case_id が対応表と違う件数（BI-03）。"""
+    n = 0
+    rows = conn.execute(sa.select(_FACT.c.prev_case_app_id, _FACT.c.prev_case_record_id,
+                                  _FACT.c.prev_case_id, sa.func.count()).where(
+        _FACT.c.prev_case_app_id.isnot(None), _FACT.c.prev_case_id.isnot(None)).group_by(
+        _FACT.c.prev_case_app_id, _FACT.c.prev_case_record_id, _FACT.c.prev_case_id)).fetchall()
+    for app, rec, cid, cnt in rows:
+        if mapping.get((str(app), str(rec))) != int(cid):
+            n += int(cnt)
+    return n
 
 
 def _identity_map(conn) -> tuple:
@@ -132,6 +149,15 @@ def verify(conn) -> dict:
             mapping[k] = ids[0]
     counts["case_keys"] = len(keys)
     counts["cases_mapped"] = len(mapping)
+    # BI-04: 逆方向の一意性（1 つの case_id を 2 つ以上の旧案件キーが指さない）
+    owners: dict = {}
+    for k, ids in ident.items():
+        for cid in set(ids):
+            owners.setdefault(cid, set()).add(k)
+    shared = sorted(cid for cid, ks in owners.items() if len(ks) > 1)
+    counts["case_id_shared_by_keys"] = len(shared)
+    if shared:
+        problems.append(PROBLEM_CASE_SHARED)
     # 登録済み case に有効な kintone_record 識別子が無い（1:1 の逆向き）
     registered = conn.execute(sa.select(_CASE.c.case_id).where(
         _CASE.c.registration == ledger.REGISTRATION_REGISTERED)).fetchall()
@@ -179,6 +205,14 @@ def verify(conn) -> dict:
             problems.append(f"{PROBLEM_NULLABLE_INCONSISTENT}:link_history.{prefix}case_id")
         if _link_mismatch_count(conn, prefix, mapping):
             problems.append(f"{PROBLEM_CASE_ID_MISMATCH}:link_history.{prefix}case_id")
+    # BI-03: case_fact の prev 案件キーがある行は prev_case_id が非 NULL で対応が一致
+    prev_null = _count(conn, sa.select(sa.func.count()).select_from(_FACT).where(
+        _FACT.c.prev_case_app_id.isnot(None), _FACT.c.prev_case_id.is_(None)))
+    counts["case_fact_prev_case_id_null"] = prev_null
+    if prev_null:
+        problems.append(f"{PROBLEM_NULLABLE_INCONSISTENT}:{PREV_CASE}")
+    if _prev_mismatch_count(conn, mapping):
+        problems.append(f"{PROBLEM_CASE_ID_MISMATCH}:{PREV_CASE}")
     # idem_key: 再計算が保存値と一致
     bad_keys = 0
     total_events = 0
@@ -256,6 +290,8 @@ def plan(conn, *, namespace_of, line_namespace: str) -> dict:
             conn, sa.select(sa.func.count()).select_from(_LINK).where(
                 _LINK.c[prefix + "case_app_id"].isnot(None),
                 _LINK.c[prefix + "case_id"].is_(None)))
+    out["case_fact_prev_to_fill"] = _count(conn, sa.select(sa.func.count()).select_from(_FACT).where(
+        _FACT.c.prev_case_app_id.isnot(None), _FACT.c.prev_case_id.is_(None)))
     out["event_keys_to_rewrite"] = _count(conn, sa.select(sa.func.count()).select_from(_EVENT).where(
         sa.not_(_EVENT.c.idem_key.like("c%|%"))))
     out["line_identities_to_create"] = len(_missing_line_identities(conn, line_namespace, ident, keys))
@@ -298,7 +334,7 @@ def backfill(conn, *, namespace_of, line_namespace: str, now=None, batch: int = 
     _namespace_check(namespace_of)
     now = now or _now()
     counts = {"cases_created": 0, "identities_created": 0, "rows_filled": {},
-              "link_history_filled": 0, "event_keys_rewritten": 0,
+              "link_history_filled": 0, "case_fact_prev_filled": 0, "event_keys_rewritten": 0,
               "line_identities_created": 0}
     keys = sorted(_legacy_keys(conn))
     ident = _identity_map(conn)
@@ -351,6 +387,15 @@ def backfill(conn, *, namespace_of, line_namespace: str, now=None, batch: int = 
             if i % batch == 0:
                 conn.commit()
         conn.commit()
+    # BI-03: case_fact の移動履歴（prev 案件キー → prev_case_id）
+    for i, (key, cid) in enumerate(mapping.items(), 1):
+        r = conn.execute(sa.update(_FACT).where(
+            _FACT.c.prev_case_app_id == key[0], _FACT.c.prev_case_record_id == key[1],
+            _FACT.c.prev_case_id.is_(None)).values(prev_case_id=cid))
+        counts["case_fact_prev_filled"] += int(r.rowcount or 0)
+        if i % batch == 0:
+            conn.commit()
+    conn.commit()
     # (R28) case_event.idem_key を case_id 内包の新形式へ再計算（旧形式は併存させない）
     rows = conn.execute(sa.select(_EVENT.c.event_id, _EVENT.c.idem_key, _EVENT.c.case_id,
                                   _EVENT.c.source_app_id, _EVENT.c.source_record_id,

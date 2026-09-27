@@ -8,7 +8,10 @@
 - App 28 のうち R5 の行（category が相続放棄の閉集合、line_user_id の関係者識別子
   line_user が有効な案件にちょうど 1 件・R29: identity のみを見る・kintone は検索しない）。
   case_event（種別=会話）として登録し fact にはしない（R9）。それ以外は取り込まない。
-  取込・再照合で source_ingest.line_user_id を埋める（R30・DB 内のみ）
+  取込・再照合で source_ingest.line_user_id を埋める（R30・DB 内のみ）。
+  R34: identity による自動採用は、App 40 の確認済み範囲（sync_cursor.confirmed_until）が
+  会話の更新日時を覆っているときだけ。覆っていなければ pending_recheck
+  （理由 app40_not_confirmed）に置き、確認済み範囲が進んだ後に取り直す
 
 案件の識別（ID-1a・v4.3 §14-3）: 案件は case_id。App 40 のレコードは kintone_record
 識別子（名前空間 "kintone:{KINTONE_SUBDOMAIN}:{app_id}"・本 module が文字列を生成）で
@@ -111,6 +114,8 @@ FAIL_MISMATCH = "mismatch_hold"
 FAIL_PAGE_LIMIT = "page_limit_reached"
 # R12: _prepare_ingest の戻り値「判定不能」（処理不要 None と区別する番兵）
 PENDING_RECHECK = ledger.FLAG_PENDING_RECHECK
+# R34: _prepare_ingest の戻り値「判定不能（App 40 の確認済み範囲が会話の時点を覆っていない）」
+PENDING_APP40_NOT_CONFIRMED = brain_link.REASON_APP40_NOT_CONFIRMED
 # R13: 既知の旧 revision による処理省略（復旧の契機にしない・None と区別する番兵）
 STALE_KNOWN = "stale_known"
 
@@ -400,16 +405,39 @@ async def _decide_app30(record: dict) -> tuple:
     return brain_link.decide_app30_reference(record, houki, target), ok
 
 
+async def app40_confirmed_until() -> str:
+    """App 40 の確認済み範囲（走査が完了した上限・sync_cursor.confirmed_until）。未完了は ""。
+    同期が失敗・ページ上限・古い上限からの再開中は進まない（完了したときだけ進む）。"""
+    cur = await ledger.get_cursor(TARGET_APP40)
+    until = (cur or {}).get("confirmed_until") or ""
+    return until if _KINTONE_DT_RE.fullmatch(until) else ""
+
+
+async def app40_covers(record: dict) -> bool:
+    """R34: 会話の時点（更新日時）までの App 40 の走査が完了しているか。App 40 の戻り値が
+    ok かどうかではなく確認済み範囲で判定する（時刻が読めない会話は覆っていない扱い）。"""
+    at = _s(record, "更新日時")
+    if not _KINTONE_DT_RE.fullmatch(at):
+        return False
+    until = await app40_confirmed_until()
+    return bool(until) and at <= until
+
+
 async def _decide_app28(record: dict) -> tuple:
     """R5 の判定を case_identity で行う（R29: kintone は検索しない）。
     戻り値 (decision|None, reason, ok)。有効な案件 0 件 = 不採用・1 件 = 自動採用・
     2 件以上 = 本票では従来どおり不採用（候補提示は 1b・R26）。台帳障害は例外のまま
-    （呼び出し側が db_write_failed で run を失敗させる＝fail-closed）。"""
+    （呼び出し側が db_write_failed で run を失敗させる＝fail-closed）。
+    R34: identity を見る判定（採用・一意不成立とも）は、App 40 の確認済み範囲が会話の時点を
+    覆っているときだけ行う。覆っていなければ ok=False・理由 app40_not_confirmed
+    （採用しない・既存の関連も変えない）。category／LINE ID の形式は identity に依らない。"""
     if not houki_chat_category(_s(record, "category")):
         return None, brain_link.REASON_CATEGORY_OUT, True
     luid = _s(record, "line_user_id")
     if not _LINE_ID_RE.fullmatch(luid):
         return None, brain_link.REASON_LINE_NOT_UNIQUE, True
+    if not await app40_covers(record):
+        return None, brain_link.REASON_APP40_NOT_CONFIRMED, False
     cases = await ledger.active_cases_for_relation(line_namespace(), ledger.IDENTITY_LINE_USER,
                                                   luid)
     if len(cases) != 1:
@@ -491,7 +519,9 @@ async def _prepare_ingest(target: str, record: dict):
         extras["line_user_id"] = line_user_id        # R30: 取込行に埋める（DB 内のみ）
         decision, reason, ok = await _decide_app28(record)
         if not ok:
-            return PENDING_RECHECK           # 判定不能＝採用しない・既存の関連も変えない
+            # 判定不能＝採用しない・既存の関連も変えない（R34 は理由つきの番兵）
+            return (PENDING_APP40_NOT_CONFIRMED
+                    if reason == brain_link.REASON_APP40_NOT_CONFIRMED else PENDING_RECHECK)
         prev = await ledger.current_case_of_source(APP_CHATLOG.app_id(), rid)
         if decision is None:
             change = brain_link.link_change_for(None, prev, lost_reason=reason,
@@ -576,9 +606,23 @@ def _log_run_failed(target: str, failure: str) -> None:
         logger.warning("[BRAIN_SYNC] run failed (page_limit_reached)")
 
 
-def _position(pos: tuple | None) -> dict | None:
-    """(更新日時, $id) → 永続化する JSON（BA-20）。"""
-    return {"updated_at": pos[0], "record_id": pos[1]} if pos else None
+def _position(pos: tuple | None, reason: str | None = None) -> dict | None:
+    """(更新日時, $id) → 永続化する JSON（BA-20）。R34: 理由があれば添える。"""
+    if not pos:
+        return None
+    out = {"updated_at": pos[0], "record_id": pos[1]}
+    if reason:
+        out["reason"] = reason
+    return out
+
+
+def _pending_reason(prepared):
+    """_prepare_ingest の戻り値が判定不能なら (True, 理由|None)。それ以外は (False, None)。"""
+    if prepared is PENDING_RECHECK:
+        return True, None
+    if prepared is PENDING_APP40_NOT_CONFIRMED:
+        return True, PENDING_APP40_NOT_CONFIRMED
+    return False, None
 
 
 def _log_pending(count: int) -> None:
@@ -642,12 +686,15 @@ async def sync_target(target: str, *, now=None) -> dict:
     pending = 0
     unregistered = 0
     first_unregistered = None                # 未登録で判定不能だった最初の (更新日時, $id)
+    first_reason = None                      # その理由（R34・理由なしは None）
+    reasons: dict = {}                       # 判定不能の理由別件数（R34・固定語彙）
+    result["pending_reasons"] = reasons
     while pages < MAX_PAGES_PER_RUN:
         query = _page_query(base, cursor, start, scan_upper)
         try:
             page = await kintone.search_records(app, query)       # DB を持たず待つ
         except Exception:
-            await _fail(target, run_id, FAIL_KINTONE, cursor, pages, records_seen, now, **_unres(unregistered, first_unregistered))
+            await _fail(target, run_id, FAIL_KINTONE, cursor, pages, records_seen, now, **_unres(unregistered, first_unregistered, first_reason))
             result.update(status="failed", failure=FAIL_KINTONE, pending_recheck=pending,
                           pending_unregistered=unregistered)
             return result
@@ -660,22 +707,27 @@ async def sync_target(target: str, *, now=None) -> dict:
             last = (ts, rid)
             try:
                 prepared = await _prepare_ingest(target, record)
-                if prepared is PENDING_RECHECK:
+                is_pending, why = _pending_reason(prepared)
+                if is_pending:
                     # R12: 判定不能。関連は保持し pending_recheck を記録。BA-17: 出典行が
                     # 無い（初見）ときは run/cursor に件数と未完了を永続化し、次回は
-                    # その位置から取り直す（再起動後も再試行される）
-                    flagged = await ledger.set_pending_recheck(app.app_id(), rid, True, now=now)
+                    # その位置から取り直す（再起動後も再試行される）。R34: 理由を添える
+                    flagged = await ledger.set_pending_recheck(app.app_id(), rid, True,
+                                                               reason=why, now=now)
                     if flagged == 0 and await ledger.latest_known_revision(
                             app.app_id(), rid) is None:
                         unregistered += 1
                         if first_unregistered is None:
                             first_unregistered = (ts, rid)
+                            first_reason = why
+                    if why:
+                        reasons[why] = reasons.get(why, 0) + 1
                     pending += 1
                     continue
                 if prepared is STALE_KNOWN:
                     continue
             except Exception:
-                await _fail(target, run_id, FAIL_DB, cursor, pages, records_seen, now, **_unres(unregistered, first_unregistered))
+                await _fail(target, run_id, FAIL_DB, cursor, pages, records_seen, now, **_unres(unregistered, first_unregistered, first_reason))
                 result.update(status="failed", failure=FAIL_DB, pending_recheck=pending,
                               pending_unregistered=unregistered)
                 return result
@@ -692,14 +744,14 @@ async def sync_target(target: str, *, now=None) -> dict:
                 cursor_record_id=last[1], pages_done=pages,
                 records_seen=records_seen, scan_upper_bound=scan_upper,
                 pending_unregistered=unregistered,
-                first_unresolved=_position(first_unregistered), now=now)
+                first_unresolved=_position(first_unregistered, first_reason), now=now)
         except ledger.MismatchError:
-            await _fail(target, run_id, FAIL_MISMATCH, cursor, pages - 1, records_seen, now, **_unres(unregistered, first_unregistered))
+            await _fail(target, run_id, FAIL_MISMATCH, cursor, pages - 1, records_seen, now, **_unres(unregistered, first_unregistered, first_reason))
             result.update(status="failed", failure=FAIL_MISMATCH, pending_recheck=pending,
                           pending_unregistered=unregistered)
             return result
         except Exception:
-            await _fail(target, run_id, FAIL_DB, cursor, pages - 1, records_seen, now, **_unres(unregistered, first_unregistered))
+            await _fail(target, run_id, FAIL_DB, cursor, pages - 1, records_seen, now, **_unres(unregistered, first_unregistered, first_reason))
             result.update(status="failed", failure=FAIL_DB, pending_recheck=pending,
                           pending_unregistered=unregistered)
             return result
@@ -711,7 +763,7 @@ async def sync_target(target: str, *, now=None) -> dict:
     else:
         # ページ上限: 走査は未完了のまま（再開位置と上限を残す・完了扱いにしない）
         await _fail(target, run_id, FAIL_PAGE_LIMIT, cursor, pages, records_seen, now,
-                    keep_position=True, **_unres(unregistered, first_unregistered))
+                    keep_position=True, **_unres(unregistered, first_unregistered, first_reason))
         result.update(status="failed", failure=FAIL_PAGE_LIMIT, pending_recheck=pending,
                       pending_unregistered=unregistered)
         return result
@@ -722,11 +774,13 @@ async def sync_target(target: str, *, now=None) -> dict:
             target, "incomplete", now=now, scan_upper_bound=scan_upper, page_position=None,
             cursor_updated_at=first_unregistered[0], cursor_record_id=first_unregistered[1],
             pending_unregistered=unregistered,
-            first_unresolved_position=_position(first_unregistered), last_run_id=run_id)
+            first_unresolved_position=_position(first_unregistered, first_reason),
+            last_run_id=run_id)
         await ledger.finish_run(run_id, "partial", failure="pending_unregistered",
                                 pages_done=pages, records_seen=records_seen,
                                 pending_unregistered=unregistered,
-                                first_unresolved=_position(first_unregistered), now=now)
+                                first_unresolved=_position(first_unregistered, first_reason),
+                                now=now)
     else:
         await ledger.set_cursor_state(target, "synced", now=now, confirmed_until=scan_upper,
                                       scan_upper_bound=scan_upper, page_position=None,
@@ -744,8 +798,8 @@ async def sync_target(target: str, *, now=None) -> dict:
     return result
 
 
-def _unres(count: int, pos: tuple | None) -> dict:
-    return {"pending_unregistered": count, "first_unresolved": _position(pos)}
+def _unres(count: int, pos: tuple | None, reason: str | None = None) -> dict:
+    return {"pending_unregistered": count, "first_unresolved": _position(pos, reason)}
 
 
 async def _fail(target: str, run_id: int, failure: str, cursor, pages: int,
@@ -833,8 +887,9 @@ async def _ingest_single(target: str, record_id: str) -> bool:
         await ledger.mark_source_unavailable(app.app_id(), record_id)
         return False
     prepared = await _prepare_ingest(target, found[0])
-    if prepared is PENDING_RECHECK:
-        await ledger.set_pending_recheck(app.app_id(), record_id, True)
+    is_pending, why = _pending_reason(prepared)
+    if is_pending:
+        await ledger.set_pending_recheck(app.app_id(), record_id, True, reason=why)
         return False
     if prepared is None or prepared is STALE_KNOWN:
         return False
@@ -858,9 +913,10 @@ async def _recheck_one(target: str, app, rid: str, record: dict | None, now) -> 
         return out
     prev = await ledger.current_case_of_source(app.app_id(), rid)
     prepared = await _prepare_ingest(target, record)
-    if prepared is PENDING_RECHECK:
-        # R12: 判定不能。既存の状態（unavailable 等）は復旧させない
-        await ledger.set_pending_recheck(app.app_id(), rid, True, now=now)
+    is_pending, why = _pending_reason(prepared)
+    if is_pending:
+        # R12: 判定不能。既存の状態（unavailable 等）は復旧させない。R34: 理由を添える
+        await ledger.set_pending_recheck(app.app_id(), rid, True, reason=why, now=now)
         out["pending"] = 1
         return out
     if prepared is STALE_KNOWN:

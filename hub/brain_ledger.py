@@ -97,6 +97,10 @@ HOLD_REASONS = ("ref_missing", "ref_not_digits", "unit_mismatch",
 DETACH_REASONS = ("category_out_of_set", "line_id_not_unique")
 FLAG_SOURCE_UNAVAILABLE = "source_unavailable"
 FLAG_PENDING_RECHECK = "pending_recheck"       # R12: 判定不能（正本の検索/実在確認の失敗）
+# R34: 判定不能の理由（閉集合）。app40_not_confirmed = App 40 の確認済み範囲が会話の時点を
+# 覆っていない（identity による自動採用の前提が成立していない）
+PENDING_APP40_NOT_CONFIRMED = "app40_not_confirmed"
+PENDING_REASONS = (PENDING_APP40_NOT_CONFIRMED,)
 REASON_RELINK_PENDING = "relink_pending"       # BA-11: 訂正先へ積み直せていない
 # unregistered: kintone 未登録の案件（R31）
 FRESHNESS_STATES = ("synced", "partial", "incomplete", "error", "stopped", "unregistered")
@@ -542,6 +546,8 @@ source_ingest = sa.Table(
     sa.Column("latest_seen_revision", _BIG, nullable=True),
     # R12: 判定不能（正本の検索失敗・実在確認失敗）＝次回の再照合対象・鮮度は partial
     sa.Column("pending_recheck", sa.Boolean, nullable=False, server_default=sa.false()),
+    # R34: 判定不能の理由（閉集合 PENDING_REASONS・理由なし＝NULL・pending 解除で NULL に戻す）
+    sa.Column("pending_reason", sa.Text, nullable=True),
     sa.Column("last_checked_at", sa.DateTime(timezone=True), nullable=False),
     sa.Column("registered_at", sa.DateTime(timezone=True), nullable=False,
               server_default=sa.func.now()),
@@ -1337,7 +1343,8 @@ async def _ingest_stale_tx(session, src: SourceRef, facts: list, now, s: dict,
                          now=now, line_user_id=(extras or {}).get("line_user_id"))
     if cur is not None and cur.pending_recheck:
         await session.execute(sa.update(source_ingest).where(
-            _ingest_key_where(src)).values(pending_recheck=True))
+            _ingest_key_where(src)).values(pending_recheck=True,
+                                           pending_reason=cur.pending_reason))
     s["state"] = STALE_STATE
     s["stale"] = 1
 
@@ -1360,7 +1367,8 @@ async def _ingest_record_tx(session, src: SourceRef, case_key, facts: list,
     # 当該出典の全取込行の pending_recheck を同一トランザクションで解除する
     await session.execute(sa.update(source_ingest).where(
         _source_where(source_ingest, src.app_id, src.record_id),
-        source_ingest.c.pending_recheck.is_(True)).values(pending_recheck=False))
+        source_ingest.c.pending_recheck.is_(True)).values(pending_recheck=False,
+                                                          pending_reason=None))
     line_user_id = extras.get("line_user_id")
     ref = await _resolve_case_tx(session, case_key, create=True, now=now)
     if ref is None:
@@ -1708,7 +1716,7 @@ async def mark_source_verified(source_app_id: str, source_record_id: str,
         cleared = await session.execute(sa.update(source_ingest).where(
             _source_where(source_ingest, source_app_id, source_record_id),
             source_ingest.c.pending_recheck.is_(True)).values(
-            pending_recheck=False, last_checked_at=now))
+            pending_recheck=False, pending_reason=None, last_checked_at=now))
         restored = await _restore_unavailable_tx(session, source_app_id, source_record_id, now)
         advanced = 0
         if revision is not None:
@@ -1758,15 +1766,27 @@ async def list_sources(source_app_id: str, *, after: str = "0",
 
 
 async def set_pending_recheck(source_app_id: str, source_record_id: str, flag: bool,
-                              *, now=None) -> int:
+                              *, reason: str | None = None, now=None) -> int:
     """R12: 判定不能を pending_recheck として記録（関連・状態は保持）／判定成功で解除。
-    出典の行が無い（未取込）ときは何も記録しない（窓の再取得・定期照合で再試行）。"""
+    出典の行が無い（未取込）ときは何も記録しない（窓の再取得・定期照合で再試行）。
+    R34: reason は閉集合 PENDING_REASONS（理由なしは None）。解除で理由も消す。
+    戻り値は pending の有無が変わった行数（理由だけの付け替えは数えない＝既に pending の
+    出典は 0 のまま）。"""
+    if reason is not None and reason not in PENDING_REASONS:
+        raise LedgerError("pending_reason_not_in_closed_set")
+    if not flag:
+        reason = None
     now = now or _now()
     async with session_scope() as session:
         result = await session.execute(sa.update(source_ingest).where(
             _source_where(source_ingest, source_app_id, source_record_id),
             source_ingest.c.pending_recheck.is_(not flag)).values(
-            pending_recheck=flag, last_checked_at=now))
+            pending_recheck=flag, pending_reason=reason, last_checked_at=now))
+        if flag:
+            # 既に pending の行は理由だけを最新の判定に合わせる
+            await session.execute(sa.update(source_ingest).where(
+                _source_where(source_ingest, source_app_id, source_record_id),
+                source_ingest.c.pending_recheck.is_(True)).values(pending_reason=reason))
         return int(result.rowcount or 0)
 
 
@@ -2199,6 +2219,7 @@ async def list_holds(limit: int = 100) -> list[dict]:
                         "case_app_id": r.case_app_id, "case_record_id": r.case_record_id,
                         "hold_reason": r.hold_reason or "",
                         "pending_recheck": bool(r.pending_recheck),
+                        "pending_reason": r.pending_reason or "",
                         "last_checked_at": _iso(r.last_checked_at)})
             if len(out) >= limit:
                 break

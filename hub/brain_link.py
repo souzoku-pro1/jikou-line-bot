@@ -17,6 +17,9 @@ R5（v3 §3 の例外・R29 で identity 化）: App 28 は「category が相続
 のみ自動採用可。0 件・2 件以上は取り込まない（保留にもしない・2 件以上の候補提示は 1b）。
 「有効な案件」は case_identity で決まり、kintone は検索しない（brain_sync 側で
 ledger.active_cases_for_relation を引く）。
+R34: identity で自動採用できるのは、会話の時点（更新日時）までの App 40 の走査が完了して
+いる（App 40 の確認済み範囲がその時点を覆っている）場合に限る。覆っていなければ採用せず
+pending_recheck（理由 app40_not_confirmed）に置き、確認済み範囲が進んだ後に取り直す。
 
 関連喪失（R10）: 自動採用可だった関連が失われた（参照消去・別アプリへの移動・
 不正参照・R5 の一意不成立・category 閉集合外）ときは brain_ledger の共通処理
@@ -43,9 +46,11 @@ REASON_UNIT_MISMATCH = "unit_mismatch"
 REASON_REF_MISSING = "ref_missing"
 REASON_MANUAL_PINNED = "manual_pinned"       # 手動訂正が同 revision の間は優先
 REASON_CATEGORY_OUT, REASON_LINE_NOT_UNIQUE = ledger.DETACH_REASONS   # R5 不成立
+# R34: App 40 の確認済み範囲が会話の時点を覆っていない（採用せず pending_recheck に置く理由）
+REASON_APP40_NOT_CONFIRMED = ledger.PENDING_APP40_NOT_CONFIRMED
 REASONS = (REASON_AUTO, REASON_REF_CHANGED, REASON_OTHER_APP, REASON_NOT_DIGITS,
            REASON_UNIT_MISMATCH, REASON_REF_MISSING, REASON_MANUAL_PINNED,
-           REASON_CATEGORY_OUT, REASON_LINE_NOT_UNIQUE)
+           REASON_CATEGORY_OUT, REASON_LINE_NOT_UNIQUE, REASON_APP40_NOT_CONFIRMED)
 
 
 class LinkDecision:

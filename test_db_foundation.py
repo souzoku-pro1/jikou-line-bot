@@ -375,6 +375,7 @@ class TestAlembicScaffold(unittest.TestCase):
                     self.assertTrue(nullable(con, name)["case_id"], name)
                 self.assertFalse(nullable(con, "case_fact")["case_app_id"])
                 self.assertTrue(nullable(con, "source_ingest")["line_user_id"])
+                self.assertTrue(nullable(con, "source_ingest")["pending_reason"])      # R34
                 self.assertTrue(nullable(con, "link_history")["prev_case_id"])
                 self.assertIn("'stopped_stale'", con.execute(
                     "SELECT sql FROM sqlite_master WHERE name='sync_run'").fetchone()[0])
@@ -511,6 +512,150 @@ class TestAlembicScaffold(unittest.TestCase):
             down = alembic("downgrade", self.BRAIN_M1)
             self.assertEqual(down.returncode, 0, f"stderr={down.stderr[-800:]}")
             self.assertIn(self.BRAIN_M1, alembic("current").stdout)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_brain_id1a_m2_refuses_case_id_shared_by_keys(self):
+        """fix1 BI-04: 検算の逆方向の一意性。1 つの case_id を 2 つ以上の旧案件キーが指していたら
+        M2 の upgrade() は冒頭の検算で拒否する（DDL 開始前・revision は M1 のまま）。"""
+        import sqlite3
+        import tempfile
+        from hub import brain_migration
+        d = tempfile.mkdtemp(prefix="brain_id1a_shared_")
+        dbfile = f"{d}/mig.db"
+        alembic, tables, unique_cols, nullable = self._brain_mig_tools(dbfile)
+        ingest = ("INSERT INTO source_ingest (source_kind, source_app_id, source_record_id, "
+                  "source_revision, locator, converter_name, converter_version, state, case_id, "
+                  "case_app_id, case_record_id, latest_seen_revision, pending_recheck, last_checked_at) "
+                  "VALUES ('kintone', '40', ?, 1, '-', 'app40_record', '1', 'ingested', 1, '40', ?, 1, 0, "
+                  "'2026-09-27 00:00:00')")
+        try:
+            self.assertEqual(alembic("upgrade", self.BRAIN_M1).returncode, 0)
+            con = sqlite3.connect(dbfile)
+            try:
+                con.execute("INSERT INTO \"case\" (case_id, registration, status, created_via) "
+                            "VALUES (1, 'registered', 'active', 'backfill')")
+                for rec in ("1", "2"):                      # 旧案件キー 40/1 と 40/2 が同じ case 1 を指す
+                    con.execute("INSERT INTO case_identity (case_id, namespace, kind, value, valid_from) "
+                                "VALUES (1, 'kintone:testsub:40', 'kintone_record', ?, "
+                                "'2026-09-27 00:00:00')", (rec,))
+                    con.execute(ingest, (rec, rec))
+                con.commit()
+                before = con.execute("SELECT * FROM source_ingest ORDER BY ingest_id").fetchall()
+            finally:
+                con.close()
+            # 他の検算項目は満たしている（この 1 点だけで拒否されること）
+            from hub import db
+            with patch.dict(os.environ, {"DATABASE_URL": f"sqlite:///{dbfile}"}):
+                db.reset_for_tests()
+                with db.get_engine().connect() as conn:
+                    result = brain_migration.verify(conn)
+                db.reset_for_tests()
+            self.assertEqual(result["problems"], [brain_migration.PROBLEM_CASE_SHARED])
+            self.assertEqual(brain_migration.PROBLEM_CASE_SHARED, "case_id_shared_by_keys")
+            up = alembic("upgrade", "head")
+            self.assertNotEqual(up.returncode, 0)
+            self.assertIn("brain_case_verify_failed: case_id_shared_by_keys", up.stderr)
+            self.assertIn(self.BRAIN_M1, alembic("current").stdout)          # revision は M1 のまま
+            con = sqlite3.connect(dbfile)
+            try:                                                # DDL は始まっていない
+                self.assertTrue(nullable(con, "case_fact")["case_id"])
+                self.assertFalse(nullable(con, "case_fact")["case_app_id"])
+                self.assertIn(("case_app_id", "case_record_id", "subject_id", "item_code",
+                               "source_app_id", "source_record_id", "source_revision",
+                               "locator", "converter_name", "converter_version"),
+                              unique_cols(con, "case_fact"))
+                self.assertEqual(con.execute("PRAGMA foreign_key_list(source_ingest)").fetchall(), [])
+                self.assertEqual(con.execute("SELECT * FROM source_ingest ORDER BY ingest_id").fetchall(),
+                                 before)
+                # 片方の識別子を別の case へ直せば通る
+                con.execute("INSERT INTO \"case\" (case_id, registration, status, created_via) "
+                            "VALUES (2, 'registered', 'active', 'backfill')")
+                con.execute("UPDATE case_identity SET case_id=2 WHERE value='2'")
+                con.execute("UPDATE source_ingest SET case_id=2 WHERE case_record_id='2'")
+                con.commit()
+            finally:
+                con.close()
+            up = alembic("upgrade", "head")
+            self.assertEqual(up.returncode, 0, f"stderr={up.stderr[-800:]}")
+            self.assertIn(self.BRAIN_M2, alembic("current").stdout)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_brain_id1a_m2_downgrade_refuses_rows_without_case_key_alone(self):
+        """fix1 BI-05: downgrade 拒否条件の 5 種目（案件キー NULL かつ case_id ありの fact）を、他の
+        拒否条件を満たさない状態で単独に用意し、固定理由での拒否・revision 据置・データ不変を検証する
+        （event・derivation も同じ形で単独に検証）。"""
+        import sqlite3
+        import tempfile
+        from hub import brain_migration
+        d = tempfile.mkdtemp(prefix="brain_id1a_nokey_")
+        dbfile = f"{d}/mig.db"
+        alembic, tables, unique_cols, nullable = self._brain_mig_tools(dbfile)
+        others = {brain_migration.REFUSE_UNREGISTERED, brain_migration.REFUSE_MERGED,
+                  brain_migration.REFUSE_IDENTITY_DUP, brain_migration.REFUSE_MERGE_HISTORY,
+                  brain_migration.REFUSE_SUBJECT_MERGE, brain_migration.REFUSE_FACT_WITHOUT_KEY,
+                  brain_migration.REFUSE_EVENT_WITHOUT_KEY, brain_migration.REFUSE_DERIVATION_WITHOUT_KEY}
+        inserts = (
+            ("case_fact", brain_migration.REFUSE_FACT_WITHOUT_KEY,
+             "INSERT INTO case_fact (case_id, case_app_id, case_record_id, subject_id, item_code, "
+             "value_type, value_text, source_kind, source_app_id, source_record_id, source_revision, "
+             "locator, converter_name, converter_version, observation_id, observed_at, confidence, "
+             "is_current) VALUES (1, NULL, NULL, 'shipping:5', 'app30.件名', 'text', 'x', 'kintone', "
+             "'30', '5', 1, '件名/-/-/-/-', 'app30_record', '1', 'obs', '2026-09-27 00:00:00', 'high', 1)"),
+            ("case_event", brain_migration.REFUSE_EVENT_WITHOUT_KEY,
+             "INSERT INTO case_event (idem_key, case_id, case_app_id, case_record_id, kind, "
+             "source_app_id, source_record_id, source_revision, locator, summary, is_current) "
+             "VALUES ('c1|28|100|-|chat_message|message/-/-/-/-', 1, NULL, NULL, 'chat_message', "
+             "'28', '100', 1, 'message/-/-/-/-', 'chat:user:hearing', 1)"),
+            ("case_derivation", brain_migration.REFUSE_DERIVATION_WITHOUT_KEY,
+             "INSERT INTO case_derivation (case_id, case_app_id, case_record_id, kind, "
+             "input_fact_versions, calculator_name, calculator_version, computed_at, needs_recalc) "
+             "VALUES (1, NULL, NULL, 'deadline', '[]', 'calc', '1', '2026-09-27 00:00:00', 0)"),
+        )
+        dump_tables = ('"case"', "case_identity", "case_fact", "case_event", "case_derivation",
+                       "source_ingest", "link_history", "merge_history", "subject_merge_history")
+
+        def dump(con):
+            return {t: con.execute(f"SELECT * FROM {t} ORDER BY 1").fetchall() for t in dump_tables}
+
+        try:
+            self.assertEqual(alembic("upgrade", "head").returncode, 0)
+            self.assertEqual(brain_migration.REFUSE_FACT_WITHOUT_KEY, "case_fact_without_case_key")
+            for table, reason, sql in inserts:
+                con = sqlite3.connect(dbfile)
+                try:
+                    # 登録済み・有効・識別子 1 件の案件（未登録・統合・識別子の重複・統合履歴は無い）
+                    con.execute("INSERT INTO \"case\" (case_id, registration, status, created_via) "
+                                "VALUES (1, 'registered', 'active', 'sync')")
+                    con.execute("INSERT INTO case_identity (case_id, namespace, kind, value, valid_from) "
+                                "VALUES (1, 'kintone:testsub:40', 'kintone_record', '1', "
+                                "'2026-09-27 00:00:00')")
+                    con.execute(sql)
+                    con.commit()
+                    before = dump(con)
+                    self.assertEqual(len(before[table]), 1)
+                finally:
+                    con.close()
+                down = alembic("downgrade", self.BRAIN_M1)
+                self.assertNotEqual(down.returncode, 0, reason)
+                self.assertIn(f"brain_case_downgrade_refused: {reason}", down.stderr)
+                for other in others - {reason}:                 # 単独の理由で拒否されている
+                    self.assertNotIn(other, down.stderr, (reason, other))
+                self.assertIn(self.BRAIN_M2, alembic("current").stdout, reason)   # revision 据置
+                con = sqlite3.connect(dbfile)
+                try:
+                    self.assertEqual(dump(con), before, reason)                  # データ不変
+                    self.assertFalse(nullable(con, table)["case_id"], reason)    # 形も M2 のまま
+                    self.assertTrue(nullable(con, table)["case_app_id"], reason)
+                    con.execute(f"DELETE FROM {table}")
+                    con.execute("DELETE FROM case_identity")
+                    con.execute('DELETE FROM "case"')
+                    con.commit()
+                finally:
+                    con.close()
+            down = alembic("downgrade", self.BRAIN_M1)
+            self.assertEqual(down.returncode, 0, f"stderr={down.stderr[-800:]}")
         finally:
             shutil.rmtree(d, ignore_errors=True)
 
@@ -678,6 +823,19 @@ class TestAlembicScaffold(unittest.TestCase):
             rc, text = script("--verify")
             self.assertEqual(rc, 1)
             self.assertIn("verify: FAILED", text)
+            # BI-03: 移動履歴のある A1 データ（prev 案件キーあり・prev_case_id NULL）を検算が検出
+            self.assertIn("nullable_case_id_inconsistent:case_fact.prev_case_id", text)
+            con = sqlite3.connect(m1_db)
+            try:
+                prev_before = con.execute(
+                    "SELECT fact_id, prev_case_app_id, prev_case_record_id FROM case_fact "
+                    "WHERE prev_case_app_id IS NOT NULL ORDER BY fact_id").fetchall()
+                self.assertTrue(prev_before)                       # 訂正（1→2）の移動履歴がある
+                self.assertEqual(con.execute(
+                    "SELECT count(*) FROM case_fact WHERE prev_case_app_id IS NOT NULL "
+                    "AND prev_case_id IS NOT NULL").fetchone()[0], 0)
+            finally:
+                con.close()
             rc, text = script("--dry-run")
             self.assertEqual(rc, 0, text)
             self.assertIn("mode: DRY-RUN", text)
@@ -685,10 +843,27 @@ class TestAlembicScaffold(unittest.TestCase):
             self.assertIn("count_running_runs=0", text)
             for pii in (bts.LINE_A, bts.LINE_B, bts.LINE_C, "テスト太郎"):
                 self.assertNotIn(pii, text)
+            self.assertIn(f"case_fact_prev_to_fill={len(prev_before)}", text)
             rc, text = script("--apply")
             self.assertEqual(rc, 0, text)
             self.assertIn("verify: OK", text)
+            self.assertIn(f"case_fact_prev_filled={len(prev_before)}", text)
+            # BI-03: 移行前後で対応が一致（NULL が残らない・prev_case_id の指す案件＝prev 案件キー）
+            con = sqlite3.connect(m1_db)
+            try:
+                rows = con.execute(
+                    "SELECT f.fact_id, f.prev_case_app_id, f.prev_case_record_id, f.prev_case_id, "
+                    "i.namespace, i.value FROM case_fact f LEFT JOIN case_identity i "
+                    "ON i.case_id = f.prev_case_id AND i.kind = 'kintone_record' AND i.valid_to IS NULL "
+                    "WHERE f.prev_case_app_id IS NOT NULL ORDER BY f.fact_id").fetchall()
+                self.assertEqual([(r[0], r[1], r[2]) for r in rows], prev_before)
+                for _fid, app, rec, prev_id, ns, value in rows:
+                    self.assertIsNotNone(prev_id)
+                    self.assertEqual((ns, value), (f"kintone:testsub:{app}", rec))
+            finally:
+                con.close()
             rc, text2 = script("--apply")                       # 冪等
+            self.assertIn("case_fact_prev_filled=0", text2)
             self.assertEqual(rc, 0, text2)
             self.assertIn("cases_created=0", text2)
             self.assertIn("event_keys_rewritten=0", text2)

@@ -17,7 +17,7 @@ from pathlib import Path
 
 import sqlalchemy as sa
 
-from brain_test_support import BrainDbMixin, app30, app40, cid, run, subrow
+from brain_test_support import BrainDbMixin, app30, app40, run, subrow
 from hub import brain_ledger as ledger
 from hub import brain_sync as sync
 from hub.db import session_scope
@@ -301,6 +301,10 @@ class TestIdempotency(BrainDbMixin):
                ).read_text(encoding="utf-8")
         self.assertIn('"pending_recheck", sa.Boolean, nullable=False', src)
         self.assertEqual(ledger.FLAG_PENDING_RECHECK, "pending_recheck")
+        self.assertEqual(ledger.PENDING_REASONS, ("app40_not_confirmed",))            # R34
+        self.assertIn("pending_reason", ledger.source_ingest.c)
+        self.assertTrue(ledger.source_ingest.c.pending_reason.nullable)
+        self.assertIs(sync.PENDING_APP40_NOT_CONFIRMED, ledger.PENDING_APP40_NOT_CONFIRMED)
         self.assertEqual(ledger.REASON_RELINK_PENDING, "relink_pending")            # BA-11
         self.assertEqual((ledger.CONFLICT_VERSION, ledger.CONFLICT_NOT_CURRENT,        # BA-13
                           ledger.CONFLICT_SOURCE_DETACHED),
