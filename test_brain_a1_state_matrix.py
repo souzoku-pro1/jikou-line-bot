@@ -1,5 +1,11 @@
 """BRAIN-A1 状態遷移表（fix3 自己点検・データ駆動）
 
+ID-1a（R29）: 案件は case_id（観測は case_info で kintone のレコード番号に戻して表と突合）。
+App 28 の判定は case_identity のみ（一意不成立は識別子 2 件で表現）。App 28 の判定不能は
+R34（App 40 の確認済み範囲が会話の時点を覆っていない）で起きる（fix1 で検証対象へ戻した）。
+App 30 の判定不能は「参照先が台帳に無い App 40 レコード」の実在確認失敗でのみ起きる。
+fix1（R34）: App 28 の自動採用の前提（App 40 の確認済み範囲が会話の時点を覆う）の行 (a)〜(d) を
+R34_APP28 として追加（既存の行は App 40 の走査完了後に会話を同期する＝前提を満たす）。
 行＝出典の状態（未登録／ingested／mismatch_hold／unavailable／detached／held と pending_recheck
 の組合せ）、列＝操作（通常同期・追跡再照合それぞれの 新版／同値新版／旧版／取得失敗／参照変更／
 参照消去／対象外化／一意不成立／判定不能、手動訂正、確認／却下／撤回）。
@@ -367,6 +373,39 @@ SEQUENCE_APP28 = (
 SEQUENCE_PATHS = ("sync", "recheck")
 SEQUENCES = (("App 28 連続遷移（BA-24）", SEQUENCE_APP28),)
 
+# ── R34（ID-1a fix1 BI-01）: App 28 の会話を identity で自動採用できるのは、会話の時点（更新日時）
+#    までの App 40 の走査が完了している（確認済み範囲がその時点を覆っている）場合に限る。
+#    行＝場面 (a)〜(d)・列＝会話の種類。期待＝(観測タプル, pending の理由)。
+#    観測タプルは他の表と同じ (state, pending, case, current, hist, src_fresh)。
+#    理由は 取込済み＝source_ingest.pending_reason／初見＝sync_cursor の未解決位置の reason
+R34_NOT_CONFIRMED = "app40_not_confirmed"
+R34_APP28 = (
+    ("a", "App 40 の取得だけ失敗・正本に同 LINE ID の別案件", "初見の会話（確認済み範囲より後）",
+     "同期", ("none", False, None, False, 0, "-"), R34_NOT_CONFIRMED),
+    ("a", "App 40 の取得だけ失敗・正本に同 LINE ID の別案件", "取込済みの会話の新版（確認済み範囲より後）",
+     "同期", ("ingested", True, "1", True, 0, "pending_recheck"), R34_NOT_CONFIRMED),
+    ("a", "App 40 の取得だけ失敗・正本に同 LINE ID の別案件", "取込済みの会話の新版（確認済み範囲より後）",
+     "再照合", ("ingested", True, "1", True, 0, "pending_recheck"), R34_NOT_CONFIRMED),
+    ("b", "再取得窓の外に出た後に App 40 を復旧（identity 2 件）", "取込済みの会話の新版",
+     "再照合", ("detached", False, None, False, 1, "-"), ""),
+    ("b", "再取得窓の外に出た後に App 40 を復旧（identity 2 件）", "初見の会話",
+     "同期", ("none", False, None, False, 0, "-"), ""),
+    ("c", "App 40 の確認済み範囲が会話の時点を覆っている", "初見の会話",
+     "同期", ("ingested", False, "1", True, 0, None), ""),
+    ("c", "App 40 の確認済み範囲が会話の時点を覆っている", "取込済みの会話の新版",
+     "同期", ("ingested", False, "1", True, 0, None), ""),
+    ("d", "App 40 がページ上限で未完了（確認済み範囲は前回のまま）", "初見の会話（上限より前の時点）",
+     "同期", ("ingested", False, "1", True, 0, None), ""),
+    ("d", "App 40 がページ上限で未完了（確認済み範囲は前回のまま）", "初見の会話（上限より後の時点）",
+     "同期", ("none", False, None, False, 0, "-"), R34_NOT_CONFIRMED),
+    ("d", "App 40 がページ上限で未完了（確認済み範囲は前回のまま）", "取込済みの会話の新版（上限より後の時点）",
+     "同期", ("ingested", True, "1", True, 0, "pending_recheck"), R34_NOT_CONFIRMED),
+    ("d", "App 40 の走査が完了して確認済み範囲が進んだ後", "保留していた初見の会話",
+     "同期", ("ingested", False, "1", True, 0, None), ""),
+    ("d", "App 40 の走査が完了して確認済み範囲が進んだ後", "保留していた取込済みの会話の新版",
+     "同期", ("ingested", False, "1", True, 0, None), ""),
+)
+
 
 def matrix_counts() -> dict:
     total = na = tested = 0
@@ -379,7 +418,9 @@ def matrix_counts() -> dict:
                 else:
                     tested += 1
     seq = sum(len(steps) for _n, steps in SEQUENCES) * len(SEQUENCE_PATHS)
-    return {"total": total + seq, "tested": tested + seq, "n_a": na, "sequence": seq}
+    r34 = len(R34_APP28)
+    return {"total": total + seq + r34, "tested": tested + seq + r34, "n_a": na,
+            "sequence": seq, "r34": r34}
 
 
 # ── 実行器 ───────────────────────────────────────────────────────────────────
@@ -417,15 +458,18 @@ class _Matrix(BrainDbMixin):
 
     async def observe(self, app_id, rid, hist_before, case_hint):
         state, pending = await _latest_state(app_id, rid)
-        case = await ledger.current_case_of_source(app_id, rid)
+        case_id = await ledger.current_case_of_source(app_id, rid)      # ID-1a: case_id
         src_fresh = "-"
-        if case is not None:
-            fd = await ledger.case_freshness_detail(case[0], case[1], "app40", sync.source_targets())
+        key = None
+        if case_id is not None:
+            info = await ledger.case_info(case_id)
+            key = (info["case_app_id"], info["case_record_id"])          # 表は kintone のレコード番号で読む
+            fd = await ledger.case_freshness_detail(case_id, "app40", sync.source_targets())
             hits = [r.split(":", 2)[2] for r in fd["reasons"] if r.startswith(f"app{app_id}:{rid}:")]
-            if (app_id, rid) == (case[0], case[1]):        # 案件自身: 全体の理由
+            if (app_id, rid) == key:                        # 案件自身: 全体の理由
                 hits = fd["reasons"]
             src_fresh = hits[0] if hits else None
-        return (state, pending, case[1] if case else None, await _has_current(app_id, rid),
+        return (state, pending, key[1] if key else None, await _has_current(app_id, rid),
                 await _count(ledger.link_history) - hist_before, src_fresh)
 
     async def relink(self, app_id, rid, new_case, rev):
@@ -536,10 +580,9 @@ class TestMatrixApp30(_Matrix):
             assert (await sync.recheck_target(sync.TARGET_APP30))["unavailable"] == 1
             self.fake.data["30"] = saved
         if state.endswith("_pending"):
-            self.fake.fail_at = {len(self.fake.calls) + 2}      # 1=$id in・2=App 40 実在確認
-            rc = await sync.recheck_target(sync.TARGET_APP30)
-            assert rc["pending_recheck"] == 1, rc
-            self.fake.fail_at = set()
+            # ID-1a: 参照先 No.2 は初回の実在確認で案件（識別子）が起こされるため、以後の再照合は
+            # kintone に触れない。判定不能の記録（R12）は台帳 API で置く（意味は同じ）
+            assert await ledger.set_pending_recheck("30", "5", True) >= 1
         ctx["last"] = self.fake.data["30"][0]                   # 直前レコード（BA-23）
         return ctx
 
@@ -547,7 +590,7 @@ class TestMatrixApp30(_Matrix):
         rid, ref, rev = ctx["rid"], ctx["ref"], ctx["rev"]
         before = await self.facts_snapshot("30", rid)
         if op in ("confirm", "reject", "revoke"):
-            facts = [f for f in await ledger.list_case_facts("40", ctx["case"], current_only=False)
+            facts = [f for f in await ledger.list_case_facts(("40", ctx["case"]), current_only=False)
                      if f["source_app_id"] == "30" and f["item_code"] == "app30.件名"]
             fact = sorted(facts, key=lambda f: f["fact_id"])[-1]
             if op == "revoke":
@@ -576,6 +619,9 @@ class TestMatrixApp30(_Matrix):
                 fields["案件レコードID"] = "1"
             elif what == "refclear":
                 fields["案件レコードID"] = ""
+            elif what == "undecidable":
+                # R29: 判定不能＝参照先が台帳に無い App 40（No.3）の実在確認が失敗する
+                fields["案件レコードID"] = "3"
             self.fake.data["30"] = [app30(5, new_rev, T4, **fields)]
             if what == "undecidable":
                 self.fake.fail_at = {len(self.fake.calls) + 2}
@@ -639,10 +685,9 @@ class TestMatrixApp28(_Matrix):
             assert (await sync.recheck_target(sync.TARGET_APP28))["unavailable"] == 1
             self.fake.data["28"] = saved
         if state.endswith("_pending"):
-            self.fake.fail_at = {len(self.fake.calls) + 2}      # 1=$id in・2=LINE 検索
-            rc = await sync.recheck_target(sync.TARGET_APP28)
-            assert rc["pending_recheck"] == 1, rc
-            self.fake.fail_at = set()
+            # ID-1a/R29: App 28 の判定は identity のみ（外部確認なし）。判定不能の記録（R12）は
+            # 台帳 API で置く（意味は同じ: 次回の再照合対象）
+            assert await ledger.set_pending_recheck("28", "100", True) >= 1
         ctx["last"] = self.fake.data["28"][0]                   # 直前レコード（BA-23）
         return ctx
 
@@ -666,10 +711,24 @@ class TestMatrixApp28(_Matrix):
             elif what == "catout":
                 fields["category"] = "その他判断系"
             elif what == "nonunique":
-                self.fake.data["40"].append(app40(3, 1, T4))    # 正本にだけ同じ LINE_A の No.3
-            self.fake.data["28"] = [app28(100, new_rev, T4, **fields)]
+                # R29: 同じ LINE_A の No.3 が同期され line_user 識別子が 2 件（正本だけでは不成立にならない）
+                self.fake.data["40"].append(app40(3, 1, T4))
+                await sync.sync_target(sync.TARGET_APP40)
+            updated, now = T4, None
             if what == "undecidable":
-                self.fake.fail_at = {len(self.fake.calls) + 2}
+                # R34（fix1）: App 28 の判定不能＝App 40 の確認済み範囲（setUp の同期時刻）が
+                # 会話の時点を覆っていない。会話は 1 時間後・走査は 2 時間後
+                import datetime
+                base = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)
+                updated = (base + datetime.timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+                now = base + datetime.timedelta(hours=2)
+            self.fake.data["28"] = [app28(100, new_rev, updated, **fields)]
+            if what == "undecidable":
+                if kind == "S":
+                    await sync.sync_target(sync.TARGET_APP28, now=now)
+                else:
+                    await sync.recheck_target(sync.TARGET_APP28, now=now)
+                return
         if kind == "S":
             await sync.sync_target(sync.TARGET_APP28)
         else:
@@ -732,7 +791,7 @@ class TestMatrixApp40(_Matrix):
         if op == "relink":
             return await self.relink("40", "1", ("40", "2"), rev)
         if op in ("confirm", "reject", "revoke"):
-            facts = [f for f in await ledger.list_case_facts("40", "1", current_only=False)
+            facts = [f for f in await ledger.list_case_facts(("40", "1"), current_only=False)
                      if f["item_code"] == "app40.status"]
             fact = sorted(facts, key=lambda f: f["fact_id"])[-1]
             if op == "revoke":
@@ -798,6 +857,136 @@ class TestSequenceApp28(_Matrix):
 
     def test_sequence_recheck(self):
         self._run("recheck")
+
+
+class TestR34App28(_Matrix):
+    """R34 の行 (a)〜(d)。期待は R34_APP28（表と Markdown の正）。時刻は固定（now を渡す）。"""
+
+    SOURCE = "app28-r34"
+
+    @staticmethod
+    def _t(day, hour, minute=0):
+        import datetime
+        return datetime.datetime(2026, 9, day, hour, minute, tzinfo=datetime.timezone.utc)
+
+    @staticmethod
+    def _z(day, hour, minute=0):
+        return f"2026-09-{day:02d}T{hour:02d}:{minute:02d}:00Z"
+
+    def _cells(self, scene):
+        return [c for c in R34_APP28 if c[0] == scene]
+
+    async def _reason(self, rid, first_seen):
+        if first_seen:
+            cur = await ledger.get_cursor("app28") or {}
+            pos = cur.get("first_unresolved_position") or {}
+            return pos.get("reason", "") if pos.get("record_id") == rid else ""
+        holds = [h for h in await ledger.list_holds() if h["source_record_id"] == rid]
+        return holds[0]["pending_reason"] if holds else ""
+
+    async def _check(self, cell, rid, hist_before, first_seen):
+        got = (await self.observe("28", rid, hist_before, "1"), await self._reason(rid, first_seen))
+        self.assertEqual(got, (cell[4], cell[5]), cell[:4])
+
+    async def _seed(self):
+        """App 40 No.1（LINE_A）を走査完了（確認済み範囲 9/22 00:00）・会話 101 を採用済みにする。"""
+        self.fake.data["40"] = [app40(1, 1)]
+        await sync.sync_target(sync.TARGET_APP40, now=self._t(22, 0))
+        self.fake.data["28"] = [app28(101, 1, self._z(21, 0))]
+        await sync.sync_target(sync.TARGET_APP28, now=self._t(22, 0))
+
+    def test_scene_a_b(self):
+        async def body():
+            await self._seed()
+            self.fake.data["40"].append(app40(2, 1, self._z(22, 1)))          # 正本に同 LINE ID の No.2
+            self.fake.fail_at = {len(self.fake.calls) + 1}
+            r = await sync.sync_target(sync.TARGET_APP40, now=self._t(22, 2))
+            assert r["status"] == "failed", r
+            self.fake.fail_at = set()
+            self.fake.data["28"] = [app28(100, 1, self._z(22, 1, 30)),
+                                    app28(101, 2, self._z(22, 1, 40), message="編集後")]
+            a = self._cells("a")
+            hist = await _count(ledger.link_history)
+            await sync.sync_target(sync.TARGET_APP28, now=self._t(22, 2))
+            with self.subTest(cell=a[0][:4]):
+                await self._check(a[0], "100", hist, True)
+            with self.subTest(cell=a[1][:4]):
+                await self._check(a[1], "101", hist, False)
+            await sync.recheck_target(sync.TARGET_APP28, now=self._t(22, 2, 30))
+            with self.subTest(cell=a[2][:4]):
+                await self._check(a[2], "101", hist, False)
+            # (b) 3 日後に App 40 を復旧（No.2 が同期され identity 2 件・確認済み範囲が進む）
+            r = await sync.sync_target(sync.TARGET_APP40, now=self._t(25, 0))
+            assert r["status"] == "ok", r
+            b = self._cells("b")
+            hist = await _count(ledger.link_history)
+            await sync.recheck_target(sync.TARGET_APP28, now=self._t(25, 0, 10))
+            with self.subTest(cell=b[0][:4]):
+                await self._check(b[0], "101", hist, False)
+            hist = await _count(ledger.link_history)
+            await sync.sync_target(sync.TARGET_APP28, now=self._t(25, 0, 20))
+            with self.subTest(cell=b[1][:4]):
+                await self._check(b[1], "100", hist, True)
+                cur = await ledger.get_cursor("app28")
+                self.assertEqual((cur["state"], cur["pending_unregistered"]), ("synced", 0))
+        self._fresh_db()
+        run(body())
+
+    def test_scene_c(self):
+        async def body():
+            await self._seed()
+            c = self._cells("c")
+            self.fake.data["28"] = [app28(100, 1, self._z(21, 10)),
+                                    app28(101, 2, self._z(21, 12), message="編集後")]
+            hist = await _count(ledger.link_history)
+            await sync.sync_target(sync.TARGET_APP28, now=self._t(22, 0))
+            with self.subTest(cell=c[0][:4]):
+                await self._check(c[0], "100", hist, True)
+            with self.subTest(cell=c[1][:4]):
+                await self._check(c[1], "101", hist, False)
+                self.assertEqual(await ledger.latest_known_revision("28", "101"), 2)
+        self._fresh_db()
+        run(body())
+
+    def test_scene_d(self):
+        from unittest.mock import patch
+
+        async def body():
+            await self._seed()
+            self.fake.data["40"] += [app40(2, 1, self._z(22, 1), LINEユーザーID=LINE_B),
+                                     app40(3, 1, self._z(22, 1, 10), LINEユーザーID="U" + "c" * 32)]
+            with patch.object(sync, "PAGE_SIZE", 1), patch.object(sync, "MAX_PAGES_PER_RUN", 1):
+                r = await sync.sync_target(sync.TARGET_APP40, now=self._t(22, 2))
+            assert (r["status"], r["failure"]) == ("failed", "page_limit_reached"), r
+            d = self._cells("d")
+            self.fake.data["28"] = [app28(101, 2, self._z(22, 1, 40), message="編集後"),
+                                    app28(200, 1, self._z(21, 10)),
+                                    app28(202, 1, self._z(22, 1, 30))]
+            hist = await _count(ledger.link_history)
+            await sync.sync_target(sync.TARGET_APP28, now=self._t(22, 2))
+            with self.subTest(cell=d[0][:4]):
+                await self._check(d[0], "200", hist, True)
+            with self.subTest(cell=d[1][:4]):
+                await self._check(d[1], "202", hist, True)
+            with self.subTest(cell=d[2][:4]):
+                await self._check(d[2], "101", hist, False)
+            r = await sync.sync_target(sync.TARGET_APP40, now=self._t(22, 3))
+            assert r["status"] == "ok", r
+            hist = await _count(ledger.link_history)
+            await sync.sync_target(sync.TARGET_APP28, now=self._t(22, 3))
+            with self.subTest(cell=d[3][:4]):
+                await self._check(d[3], "202", hist, True)
+            with self.subTest(cell=d[4][:4]):
+                await self._check(d[4], "101", hist, False)
+                self.assertEqual(await ledger.latest_known_revision("28", "101"), 2)
+        self._fresh_db()
+        run(body())
+
+    def test_every_r34_cell_is_covered_by_a_scene(self):
+        self.assertEqual({c[0] for c in R34_APP28}, {"a", "b", "c", "d"})
+        self.assertEqual(len(self._cells("a")) + len(self._cells("b")), 5)
+        self.assertEqual(len(self._cells("c")), 2)
+        self.assertEqual(len(self._cells("d")), 5)
 
 
 class TestMatrixShape(unittest.TestCase):

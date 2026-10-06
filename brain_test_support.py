@@ -36,6 +36,12 @@ def run(coro):
     return asyncio.run(coro)
 
 
+async def cid(app_id, record_id):
+    """互換の案件キー (アプリ ID, レコード番号) → case_id（識別子検索・無ければ None）。
+    ID-1a: 台帳の戻り値は case_id なので、テストはこれで比較する。"""
+    return await _ledger.resolve_case((str(app_id), str(record_id)))
+
+
 def rec(rid, rev, updated, **fields):
     """kintone records API の形（{"code": {"value": ...}}）を組む。"""
     r = {"$id": {"value": str(rid)}, "$revision": {"value": str(rev)},

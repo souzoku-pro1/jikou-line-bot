@@ -14,7 +14,7 @@
 
 import unittest
 
-from brain_test_support import BrainDbMixin, app28, app30, app40, run, subrow
+from brain_test_support import BrainDbMixin, app28, app30, app40, cid, run, subrow
 from hub import brain_ledger as ledger
 from hub import brain_sync as sync
 from hub.db import session_scope
@@ -37,7 +37,7 @@ class TestCorrectionHistory(BrainDbMixin):
             self.fake.data["40"] = [app40(1, 2, "2026-09-20T02:00:00Z", status="受理", 事件番号="")]
             await sync.sync_target(sync.TARGET_APP40)
             self.assertGreater(await _count(ledger.case_fact), n1)
-            allf = await ledger.list_case_facts("40", "1", current_only=False)
+            allf = await ledger.list_case_facts(("40", "1"), current_only=False)
             st = sorted((f["version"], f["value_text"], f["is_current"], f["invalid_reason"])
                         for f in allf if f["item_code"] == "app40.status")
             self.assertEqual(st, [(1, "受任", False, "superseded"), (2, "受理", True, None)])
@@ -59,23 +59,23 @@ class TestCorrectionHistory(BrainDbMixin):
         async def body():
             await sync.sync_target(sync.TARGET_APP40)
             await sync.sync_target(sync.TARGET_APP30)
-            self.assertTrue([f for f in await ledger.list_case_facts("40", "1")
+            self.assertTrue([f for f in await ledger.list_case_facts(("40", "1"))
                              if f["source_app_id"] == "30"])
             # 参照が 1 → 2 へ（新 revision）
             self.fake.data["30"] = [app30(5, 2, "2026-09-21T01:00:00Z", 案件レコードID="2")]
             r = await sync.sync_target(sync.TARGET_APP30)
             self.assertEqual(r["status"], "ok")
-            self.assertEqual([f for f in await ledger.list_case_facts("40", "1")
+            self.assertEqual([f for f in await ledger.list_case_facts(("40", "1"))
                               if f["source_app_id"] == "30"], [])
-            moved = [f for f in await ledger.list_case_facts("40", "2") if f["source_app_id"] == "30"]
+            moved = [f for f in await ledger.list_case_facts(("40", "2")) if f["source_app_id"] == "30"]
             self.assertTrue(moved)
-            old = [f for f in await ledger.list_case_facts("40", "1", current_only=False)
+            old = [f for f in await ledger.list_case_facts(("40", "1"), current_only=False)
                    if f["source_app_id"] == "30"]
             self.assertTrue(old and all(f["invalid_reason"] == "link_moved" for f in old))
             last = await ledger.latest_link("30", "5")
             self.assertEqual((last["reason"], last["prev_case"], last["new_case"]),
                              ("ref_changed", ("40", "1"), ("40", "2")))
-            self.assertEqual(await ledger.current_case_of_source("30", "5"), ("40", "2"))
+            self.assertEqual(await ledger.current_case_of_source("30", "5"), await cid("40", "2"))
             async with session_scope() as session:
                 new_row = (await session.execute(sa.select(ledger.case_fact).where(
                     ledger.case_fact.c.source_app_id == "30",
@@ -91,7 +91,7 @@ class TestCorrectionHistory(BrainDbMixin):
         async def body():
             await sync.sync_target(sync.TARGET_APP40)
             await sync.sync_target(sync.TARGET_APP30)
-            fact = [f for f in await ledger.list_case_facts("40", "1")
+            fact = [f for f in await ledger.list_case_facts(("40", "1"))
                     if f["item_code"] == "app30.件名"][0]
             await ledger.record_confirmation(fact_id=fact["fact_id"], seen_version=fact["version"],
                                              decision="confirm", reason="", operation_id="op-u1",
@@ -105,12 +105,12 @@ class TestCorrectionHistory(BrainDbMixin):
             self.assertEqual([(h["source_record_id"], h["state"]) for h in holds],
                              [("5", "unavailable")])
             # 値は「値なし」にならない
-            cur = [f for f in await ledger.list_case_facts("40", "1") if f["item_code"] == "app30.件名"]
+            cur = [f for f in await ledger.list_case_facts(("40", "1")) if f["item_code"] == "app30.件名"]
             self.assertEqual(cur[0]["value_text"], "受理通知送付状")
             # 確認は再確認対象（source_unavailable）
             rk = await ledger.list_recheck()
             self.assertEqual([x["reasons"] for x in rk], [["source_unavailable"]])
-            self.assertEqual(await ledger.case_freshness("30", "5", "app30"), "error")
+            self.assertEqual(await ledger.case_freshness(("30", "5"), "app30"), "error")
             # 出典確認不能は競合の相手にしない
             self.assertEqual(await ledger.list_conflicts(), [])
             # 再出現 → 復帰
@@ -126,7 +126,7 @@ class TestCorrectionHistory(BrainDbMixin):
 
         async def body():
             await sync.sync_target(sync.TARGET_APP40)
-            f1 = [f for f in await ledger.list_case_facts("40", "1") if f["item_code"] == "app40.status"][0]
+            f1 = [f for f in await ledger.list_case_facts(("40", "1")) if f["item_code"] == "app40.status"][0]
             r = await ledger.record_confirmation(fact_id=f1["fact_id"], seen_version=1,
                                                  decision="confirm", reason="ok",
                                                  operation_id="op-1", actor="owner")
@@ -137,7 +137,7 @@ class TestCorrectionHistory(BrainDbMixin):
             rk = await ledger.list_recheck()
             self.assertEqual([(x["confirmation_id"], x["reasons"], x["current"]["version"])
                               for x in rk], [(cid, ["superseded"], 2)])
-            f2 = [f for f in await ledger.list_case_facts("40", "1") if f["item_code"] == "app40.status"][0]
+            f2 = [f for f in await ledger.list_case_facts(("40", "1")) if f["item_code"] == "app40.status"][0]
             self.assertEqual(await ledger.list_confirmations(f2["fact_id"]), [])   # 新版に確認なし
             # 古い版への確認操作は拒否（最新を返す）
             with self.assertRaises(ledger.VersionConflict) as cm:
@@ -184,7 +184,7 @@ class TestCorrectionHistory(BrainDbMixin):
             r = await ledger.relink_source(source_app_id="30", source_record_id="5",
                                            new_case=("40", "2"), reason="誤紐付け",
                                            operation_id="op-r1", actor="owner", **seen)
-            self.assertEqual((r["duplicate"], r["prev"]), (False, ("40", "1")))
+            self.assertEqual((r["duplicate"], r["prev_case"]), (False, ("40", "1")))
             self.assertEqual(await _count(ledger.link_history), n_links + 1)
             # 同じ操作 ID は無視（履歴が増えない）
             r2 = await ledger.relink_source(source_app_id="30", source_record_id="5",
@@ -193,19 +193,19 @@ class TestCorrectionHistory(BrainDbMixin):
             self.assertTrue(r2["duplicate"])
             self.assertEqual(await _count(ledger.link_history), n_links + 1)
             # 旧案件の現在ビューから除外・次回同期で新案件側へ積まれる（手動が優先）
-            self.assertEqual([f for f in await ledger.list_case_facts("40", "1")
+            self.assertEqual([f for f in await ledger.list_case_facts(("40", "1"))
                               if f["source_app_id"] == "30"], [])
             await sync.sync_target(sync.TARGET_APP30)
-            self.assertTrue([f for f in await ledger.list_case_facts("40", "2")
+            self.assertTrue([f for f in await ledger.list_case_facts(("40", "2"))
                              if f["source_app_id"] == "30"])
-            self.assertEqual([f for f in await ledger.list_case_facts("40", "1")
+            self.assertEqual([f for f in await ledger.list_case_facts(("40", "1"))
                               if f["source_app_id"] == "30"], [])
             self.assertEqual((await ledger.latest_link("30", "5"))["actor"], "owner")
             # 出典の revision が進み、参照自体が 1 のまま → まだ手動が優先されるか？
             # 仕様: revision が変わったら自動判定へ戻る（正本の参照が正）
             self.fake.data["30"] = [app30(5, 2, "2026-09-21T01:00:00Z")]     # 参照は 1 のまま
             await sync.sync_target(sync.TARGET_APP30)
-            self.assertTrue([f for f in await ledger.list_case_facts("40", "1")
+            self.assertTrue([f for f in await ledger.list_case_facts(("40", "1"))
                              if f["source_app_id"] == "30"])
             last = await ledger.latest_link("30", "5")
             self.assertEqual((last["actor"], last["reason"], last["new_case"]),
@@ -236,7 +236,7 @@ class TestCorrectionHistory(BrainDbMixin):
     # ── fix1: BA-02（R10 関連喪失の共通処理）/ BA-03（行消去）/ BA-08（R9） ──
 
     async def _facts30(self, case=("40", "1"), current_only=True):
-        return [f for f in await ledger.list_case_facts(*case, current_only=current_only)
+        return [f for f in await ledger.list_case_facts(case, current_only=current_only)
                 if f["source_app_id"] == "30"]
 
     def test_lost_reference_detaches_facts_and_flags_confirmations(self):
@@ -260,10 +260,10 @@ class TestCorrectionHistory(BrainDbMixin):
             self.assertEqual(await self._facts30(), [])
             old = await self._facts30(current_only=False)
             self.assertTrue(old and all(f["invalid_reason"] == "link_lost" for f in old))
-            self.assertEqual([e for e in await ledger.list_case_events("40", "1")
+            self.assertEqual([e for e in await ledger.list_case_events(("40", "1"))
                               if e["source_app_id"] == "30"], [])
             self.assertEqual({e["invalid_reason"] for e in
-                              await ledger.list_case_events("40", "1", current_only=False)
+                              await ledger.list_case_events(("40", "1"), current_only=False)
                               if e["source_app_id"] == "30"}, {"link_lost"})
             self.assertEqual((await _count(ledger.case_fact), await _count(ledger.case_event)),
                              (n_facts, n_events))                                  # 削除なし
@@ -274,7 +274,7 @@ class TestCorrectionHistory(BrainDbMixin):
             self.assertIsNone(await ledger.current_case_of_source("30", "5"))
             self.assertEqual([(p["source_record_id"], p["hold_reason"], p["source_revision"])
                               for p in await ledger.list_pending_links()], [("5", "ref_other_app", 2)])
-            self.assertEqual(await ledger.list_case_facts("26", "1"), [])
+            self.assertEqual(await ledger.list_case_facts(("26", "1")), [])
             # 参照が戻れば履歴を繋いで復帰（新 revision）。旧版への確認は再確認のまま
             self.fake.data["30"] = [app30(5, 3, "2026-09-21T02:00:00Z")]
             await sync.recheck_target(sync.TARGET_APP30)
@@ -285,9 +285,9 @@ class TestCorrectionHistory(BrainDbMixin):
                     ledger.case_fact.c.fact_id == cur[0]["fact_id"]))).first()
             self.assertEqual(row.supersedes_fact_id, fact["fact_id"])
             self.assertEqual(await ledger.list_pending_links(), [])
-            self.assertEqual(await ledger.current_case_of_source("30", "5"), ("40", "1"))
+            self.assertEqual(await ledger.current_case_of_source("30", "5"), await cid("40", "1"))
             self.assertEqual([x["reasons"] for x in await ledger.list_recheck()], [["link_lost"]])
-            self.assertTrue([e for e in await ledger.list_case_events("40", "1")
+            self.assertTrue([e for e in await ledger.list_case_events(("40", "1"))
                              if e["source_app_id"] == "30"])
             # (b) 参照消去（通常同期の経路）
             self.fake.data["30"] = [app30(5, 4, "2026-09-21T03:00:00Z", 案件レコードID="")]
@@ -306,7 +306,7 @@ class TestCorrectionHistory(BrainDbMixin):
             last = await ledger.latest_link("30", "5")
             self.assertEqual((last["reason"], last["candidates"][0]["case_record_id"],
                               last["candidates"][0]["trust"]), ("ref_missing", "999", "candidate"))
-            self.assertEqual(await ledger.list_case_facts("40", "999"), [])
+            self.assertEqual(await ledger.list_case_facts(("40", "999")), [])
             self.assertEqual((await _count(ledger.case_fact)) >= n_facts, True)
         run(body())
 
@@ -316,7 +316,7 @@ class TestCorrectionHistory(BrainDbMixin):
         self.fake.data["40"] = [app40(1, 1)]
 
         async def creditors(current_only=True):
-            return {f["subject_id"] for f in await ledger.list_case_facts("40", "1", current_only)
+            return {f["subject_id"] for f in await ledger.list_case_facts(("40", "1"), current_only)
                     if f["subject_id"].startswith("creditor:")}
 
         async def body():
@@ -338,13 +338,13 @@ class TestCorrectionHistory(BrainDbMixin):
             await ledger.ingest_source(src, key, facts, events,
                                        extras={"subjects_seen": sync.app40_subjects_seen(partial)})
             self.assertEqual(await creditors(), {"creditor:11", "creditor:12"})
-            self.assertTrue([f for f in await ledger.list_case_facts("40", "1")
+            self.assertTrue([f for f in await ledger.list_case_facts(("40", "1"))
                              if f["item_code"] == "app40.LINEユーザーID" and f["value_text"]])
             # 完全取得した新版（rev3）で一覧が空 → 行の fact を row_removed（削除なし）
             self.fake.data["40"] = [app40(1, 3, "2026-09-20T03:00:00Z", 債権者一覧=[])]
             self.assertEqual((await sync.sync_target(sync.TARGET_APP40))["status"], "ok")
             self.assertEqual(await creditors(), set())
-            retired = [f for f in await ledger.list_case_facts("40", "1", current_only=False)
+            retired = [f for f in await ledger.list_case_facts(("40", "1"), current_only=False)
                        if f["subject_id"].startswith("creditor:")]
             self.assertTrue(retired and all(
                 f["invalid_reason"] == "row_removed" and not f["is_current"] for f in retired))
@@ -360,7 +360,7 @@ class TestCorrectionHistory(BrainDbMixin):
                                           債権者一覧=[subrow(11, 債権者名="甲社", 通知要否="要")])]
             await sync.sync_target(sync.TARGET_APP40)
             self.assertEqual(await creditors(), {"creditor:11"})
-            name = [f for f in await ledger.list_case_facts("40", "1")
+            name = [f for f in await ledger.list_case_facts(("40", "1"))
                     if f["subject_id"] == "creditor:11"
                     and f["item_code"] == "app40.債権者一覧.債権者名"][0]
             async with session_scope() as session:
@@ -380,7 +380,7 @@ class TestCorrectionHistory(BrainDbMixin):
         self.fake.data["30"] = [app30(5, 1, 件名="受理通知送付状"), app30(6, 1, 件名="債権者通知")]
 
         async def chats():
-            return [e for e in await ledger.list_case_events("40", "1") if e["source_app_id"] == "28"]
+            return [e for e in await ledger.list_case_events(("40", "1")) if e["source_app_id"] == "28"]
 
         async def body():
             for target in sync.TARGETS:
@@ -389,7 +389,7 @@ class TestCorrectionHistory(BrainDbMixin):
             self.assertEqual([(e["source_record_id"], e["kind"], e["summary"]) for e in await chats()],
                              [("100", "chat_message", "chat:user:hearing"),
                               ("101", "chat_message", "chat:assistant:hearing")])
-            self.assertEqual([f for f in await ledger.list_case_facts("40", "1")
+            self.assertEqual([f for f in await ledger.list_case_facts(("40", "1"))
                               if f["source_app_id"] == "28"], [])          # 会話は fact にしない
             self.assertEqual({f["subject_id"] for f in await self._facts30()},
                              {"shipping:5", "shipping:6"})
@@ -411,7 +411,7 @@ class TestCorrectionHistory(BrainDbMixin):
     # ── fix2: BA-10（R11 遅着旧版は履歴のみ）/ BA-11（訂正の同一 tx 再投影） ──
 
     async def _events30(self, case):
-        return [e for e in await ledger.list_case_events(*case) if e["source_app_id"] == "30"]
+        return [e for e in await ledger.list_case_events(case) if e["source_app_id"] == "30"]
 
     def test_stale_revision_never_mutates_links(self):
         # R11: rev1=案件1 → rev3=案件1 → 遅着 rev2=案件2 / 遅着 rev2=参照消去 → 何も変えない
@@ -430,7 +430,7 @@ class TestCorrectionHistory(BrainDbMixin):
             self.fake.data["30"] = [app30(5, 2, "2026-09-21T03:00:00Z", 案件レコードID="2")]
             r = await sync.sync_target(sync.TARGET_APP30)
             self.assertEqual(r["status"], "ok")
-            self.assertEqual(await ledger.current_case_of_source("30", "5"), ("40", "1"))
+            self.assertEqual(await ledger.current_case_of_source("30", "5"), await cid("40", "1"))
             self.assertEqual({(f["item_code"], f["version"], f["value_text"])
                               for f in await self._facts30()}, before)     # 案件1 の fact 有効のまま
             self.assertEqual(await self._facts30(("40", "2")), [])
@@ -448,7 +448,7 @@ class TestCorrectionHistory(BrainDbMixin):
             self.fake.data["30"] = [app30(5, 2, "2026-09-21T03:00:00Z", 案件レコードID="")]
             rc = await sync.recheck_target(sync.TARGET_APP30)
             self.assertEqual((rc["status"], rc["moved"], rc["pending_recheck"]), ("ok", 0, 0))
-            self.assertEqual(await ledger.current_case_of_source("30", "5"), ("40", "1"))
+            self.assertEqual(await ledger.current_case_of_source("30", "5"), await cid("40", "1"))
             self.assertEqual({(f["item_code"], f["version"], f["value_text"])
                               for f in await self._facts30()}, before)
             self.assertEqual(await _count(ledger.link_history), n_links)
@@ -459,7 +459,7 @@ class TestCorrectionHistory(BrainDbMixin):
                                 "candidates": None, "ingest_state": "held"},
                 "hold_reason": "ref_not_digits"})
             self.assertEqual((s["state"], s["detached"]), ("stale", 0))
-            self.assertEqual(await ledger.current_case_of_source("30", "5"), ("40", "1"))
+            self.assertEqual(await ledger.current_case_of_source("30", "5"), await cid("40", "1"))
             self.assertTrue(await self._facts30())
         run(body())
 
@@ -494,7 +494,7 @@ class TestCorrectionHistory(BrainDbMixin):
             self.assertEqual((row.prev_case_app_id, row.prev_case_record_id), ("40", "1"))
             self.assertIsNone(row.supersedes_fact_id)      # BA-16: 案件をまたぐ移動は supersedes を張らない
             self.assertEqual(await ledger.case_freshness_detail(
-                "40", "2", "app40", sync.source_targets()), {"state": "synced", "reasons": []})
+                ("40", "2"), "app40", sync.source_targets()), {"state": "synced", "reasons": []})
             # 次回同期で重複は積まれない（訂正は手動優先のまま）
             r2 = await sync.sync_target(sync.TARGET_APP30)
             self.assertEqual((r2["status"], r2["inserted"]), ("ok", 0))
@@ -509,12 +509,12 @@ class TestCorrectionHistory(BrainDbMixin):
                 seen_link_version=await ledger.link_version("30", "6"), seen_source_revision=1)
             self.assertEqual((r3["reprojected_facts"], r3["reprojected_events"]), (0, 0))
             self.assertEqual(await ledger.case_freshness_detail(
-                "40", "2", "app40", sync.source_targets()),
+                ("40", "2"), "app40", sync.source_targets()),
                 {"state": "partial", "reasons": ["app30:6:relink_pending"]})
             await sync.sync_target(sync.TARGET_APP30)
             self.assertTrue([f for f in await self._facts30(("40", "2")) if f["source_record_id"] == "6"])
             self.assertEqual(await ledger.case_freshness_detail(
-                "40", "2", "app40", sync.source_targets()), {"state": "synced", "reasons": []})
+                ("40", "2"), "app40", sync.source_targets()), {"state": "synced", "reasons": []})
         run(body())
 
     # ── fix3: BA-14（復旧は有効な最新版の成功時だけ）/ BA-16（往復訂正の履歴は一直線） ──
@@ -526,7 +526,7 @@ class TestCorrectionHistory(BrainDbMixin):
         self.fake.data["30"] = [app30(5, 1)]
 
         async def src_reason():
-            fd = await ledger.case_freshness_detail("40", "1", "app40", sync.source_targets())
+            fd = await ledger.case_freshness_detail(("40", "1"), "app40", sync.source_targets())
             return fd["state"], [r for r in fd["reasons"] if r.startswith("app30:5:")]
 
         async def body():
@@ -587,7 +587,7 @@ class TestCorrectionHistory(BrainDbMixin):
                 for case in ("1", "2", "3"):
                     self.assertEqual(len(await self._facts30(("40", case))),
                                      n_facts if case == to else 0, (to, case))
-                self.assertEqual(await ledger.current_case_of_source("30", "5"), ("40", to))
+                self.assertEqual(await ledger.current_case_of_source("30", "5"), await cid("40", to))
             # 履歴: 案件をまたぐ行は supersedes を持たず prev_case で出所を残す。UNIQUE 違反なし
             async with session_scope() as session:
                 rows = (await session.execute(sa.select(ledger.case_fact).where(
