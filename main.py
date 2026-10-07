@@ -2353,3 +2353,5 @@ include_before_catch_all(app, send_ops_router)
 send_ledger.register_recover_job()
 # fix1: 非 Postgres の排他代替は sqlite のみ（DATABASE_URL 設定時・他方言は起動時に例外）
 send_ledger.check_dialect_at_startup()
+# fix3 BQ-09: 時間設定の整合（heartbeat < 送信 timeout < deadline < 回収閾値）。不整合は警告+既定値
+send_ledger.check_timing_config()

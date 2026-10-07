@@ -120,7 +120,10 @@ async def reply_with_push_fallback(channel: LineChannelConfig,
         logger.info("[LINE] duplicate send skipped (send_ledger: unconfirmed)")
         return send_ledger.SEND_UNCONFIRMED
     try:
-        ok = await _reply_with_push_fallback_http(channel, reply_token, to, text)
+        # fix3 BQ-09: HTTP 待機中は heartbeat タスクが稼働中の印を打ち、全体期限（送信 timeout）
+        # で asyncio.TimeoutError → 既存の例外経路（unconfirmed・再送出）。記録なし（op None）は素通し
+        ok = await send_ledger.guarded_http(
+            op, _reply_with_push_fallback_http(channel, reply_token, to, text))
     except BaseException:
         await send_ledger.finish(op, send_ledger.STATE_UNCONFIRMED)
         raise
@@ -183,7 +186,8 @@ async def push_text(channel: LineChannelConfig, to: str, text: str) -> bool | st
         logger.info("[LINE_PUSH] duplicate send skipped (send_ledger: unconfirmed)")
         return send_ledger.SEND_UNCONFIRMED
     try:
-        ok = await _push_text_http(channel, to, text)
+        # fix3 BQ-09: heartbeat タスク + 全体期限（reply_with_push_fallback と同じ）
+        ok = await send_ledger.guarded_http(op, _push_text_http(channel, to, text))
     except BaseException:
         await send_ledger.finish(op, send_ledger.STATE_UNCONFIRMED)
         raise

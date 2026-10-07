@@ -136,6 +136,11 @@ STALE_MINUTES_ENV = "SEND_LEDGER_STALE_MINUTES"
 STALE_STARTED_MINUTES_DEFAULT = 10
 DEADLINE_MINUTES_ENV = "SEND_LEDGER_DEADLINE_MINUTES"
 DEADLINE_MINUTES_DEFAULT = 5                     # 処理全体の期限（回収閾値より短い）
+# fix3 BQ-09: 送信経路の稼働中の印と実効的な全体期限（heartbeat 間隔 < 送信 timeout < deadline < 回収閾値）
+HEARTBEAT_SECONDS_ENV = "SEND_LEDGER_HEARTBEAT_SECONDS"
+HEARTBEAT_SECONDS_DEFAULT = 60.0
+SEND_TIMEOUT_SECONDS_ENV = "SEND_LEDGER_SEND_TIMEOUT_SECONDS"
+SEND_TIMEOUT_SECONDS_DEFAULT = 240.0
 RECOVER_JOB_NAME = "SEND_LEDGER_RECOVER"
 RECOVER_INTERVAL_MINUTES = 5.0
 
@@ -314,6 +319,46 @@ def stale_started_minutes() -> int:
 def deadline_minutes() -> int:
     raw = os.environ.get(DEADLINE_MINUTES_ENV, "").strip()
     return int(raw) if raw.isdigit() and int(raw) > 0 else DEADLINE_MINUTES_DEFAULT
+
+
+def _float_env(name: str, default: float) -> float:
+    raw = os.environ.get(name, "").strip()
+    try:
+        v = float(raw)
+    except ValueError:
+        return default
+    return v if v > 0 else default
+
+
+def timing_config() -> dict:
+    """fix3 BQ-09: 送信経路の時間設定（秒）。整合（heartbeat < timeout < deadline < 回収閾値）
+    を満たさないときは fail-closed にせず、固定文言＋値のみの警告を出して既定値に戻す
+    （Q1a 限定の fail-open 方針を維持）。"""
+    hb = _float_env(HEARTBEAT_SECONDS_ENV, HEARTBEAT_SECONDS_DEFAULT)
+    to = _float_env(SEND_TIMEOUT_SECONDS_ENV, SEND_TIMEOUT_SECONDS_DEFAULT)
+    dl = deadline_minutes() * 60.0
+    st = stale_started_minutes() * 60.0
+    if hb < to < dl < st:
+        return {"heartbeat": hb, "timeout": to, "deadline": dl, "stale": st, "defaulted": False}
+    logger.warning("[SEND_LEDGER] timing config inconsistent (heartbeat<timeout<deadline<stale "
+                   "required); defaults applied")
+    return {"heartbeat": HEARTBEAT_SECONDS_DEFAULT, "timeout": SEND_TIMEOUT_SECONDS_DEFAULT,
+            "deadline": DEADLINE_MINUTES_DEFAULT * 60.0, "stale": STALE_STARTED_MINUTES_DEFAULT * 60.0,
+            "defaulted": True}
+
+
+def heartbeat_seconds() -> float:
+    return timing_config()["heartbeat"]
+
+
+def send_timeout_seconds() -> float:
+    return timing_config()["timeout"]
+
+
+def check_timing_config() -> bool:
+    """起動時の整合検査（main の末尾から呼ぶ）。不整合は警告して既定値（例外にしない）。
+    戻り値=整合していたか。"""
+    return not timing_config()["defaulted"]
 
 
 SUPPORTED_DIALECTS = ("postgresql", "sqlite")
@@ -610,6 +655,45 @@ async def heartbeat(op, *, now=None) -> bool:
     except Exception:
         logger.warning("[SEND_LEDGER] heartbeat failed")
         return False
+
+
+@contextlib.asynccontextmanager
+async def heartbeat_task(op):
+    """fix3 BQ-09: HTTP 呼出を await している間、別タスクが heartbeat 間隔ごとに
+    heartbeat(op) を呼ぶ。終了時（成功・失敗・例外のいずれでも）に必ず cancel して待つ。
+    op が None（記録なし）のときは何もしない。ログは出さない（op ID も出さない・RV-10）。"""
+    if op is None:
+        yield
+        return
+    interval = heartbeat_seconds()
+
+    async def _beat():
+        try:
+            while True:
+                await asyncio.sleep(interval)
+                await heartbeat(op)
+        except asyncio.CancelledError:
+            pass
+
+    task = asyncio.create_task(_beat())
+    try:
+        yield
+    finally:
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
+
+
+async def guarded_http(op, coro):
+    """fix3 BQ-09: 送信プリミティブの HTTP 部分を [heartbeat タスク + 全体期限] で囲む。
+    op が None（記録なし＝DB 未設定・fail-open）のときは従来どおり素通し（期限も付けない）。
+    期限到達は asyncio.TimeoutError を送出（呼び出し側の既存の例外経路＝unconfirmed）。"""
+    if op is None:
+        return await coro
+    async with heartbeat_task(op):
+        return await asyncio.wait_for(coro, timeout=send_timeout_seconds())
 
 
 async def finish(op, outcome: str) -> str:

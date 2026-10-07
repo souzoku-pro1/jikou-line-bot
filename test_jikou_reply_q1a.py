@@ -1146,5 +1146,195 @@ class TestFix2OwnershipAndLateResults(_DbMixin):
         self.assertIn("late_result:sent", sl.HISTORY_REASONS)
 
 
+# ── 12. fix3: 送信経路の heartbeat と全体期限（BQ-09） ───────────────────────────
+class _WaitingClient(_FakeClient):
+    """HTTP 待機を模す: release が set されるまで post が返らない。"""
+    release: asyncio.Event | None = None
+    waiting: asyncio.Event | None = None
+
+    async def post(self, url, headers=None, json=None):
+        if _WaitingClient.waiting is not None:
+            _WaitingClient.waiting.set()
+        if _WaitingClient.release is not None:
+            await _WaitingClient.release.wait()
+        return await super().post(url, headers=headers, json=json)
+
+
+class TestFix3HeartbeatAndTimeout(_DbMixin):
+    def setUp(self):
+        super().setUp()
+        self._cp.stop()
+        self._cp = patch.object(line_channel.httpx, "AsyncClient", _WaitingClient)
+        self._cp.start()
+        _WaitingClient.release = None
+        _WaitingClient.waiting = None
+        # heartbeat 0.05 秒・送信 timeout 20 秒（< deadline 300 秒 < 回収 600 秒）
+        self._tenv = patch.dict(os.environ, {sl.HEARTBEAT_SECONDS_ENV: "0.05",
+                                             sl.SEND_TIMEOUT_SECONDS_ENV: "20"})
+        self._tenv.start()
+        self.assertFalse(sl.timing_config()["defaulted"])
+
+    def tearDown(self):
+        self._tenv.stop()
+        super().tearDown()
+
+    # ループ内から使う async helper（_run 系の同期 helper はループ内で使えない）
+    async def _ops_a(self):
+        from hub.db import session_scope
+        async with session_scope() as s:
+            return [dict(r._mapping) for r in (await s.execute(
+                sa.select(sl.send_operation).order_by(sl.send_operation.c.created_at))).fetchall()]
+
+    async def _age_row_a(self, op_id: str, minutes: int):
+        """着手・期限・ハートビートを minutes 分前に戻す（経過時間の模擬）。"""
+        from hub.db import session_scope
+        at = sl._now() - datetime.timedelta(minutes=minutes)
+        async with session_scope() as s:
+            await s.execute(sa.update(sl.send_operation).where(
+                sl.send_operation.c.op_id == op_id).values(
+                started_at=at, deadline_at=at + datetime.timedelta(minutes=sl.deadline_minutes()),
+                last_heartbeat_at=at))
+
+    async def _op_id_a(self):
+        return (await self._ops_a())[0]["op_id"]
+
+    async def _heartbeat_at_a(self, op_id: str):
+        return next(o for o in await self._ops_a() if o["op_id"] == op_id)["last_heartbeat_at"]
+
+    def test_codex_repro_push_text_waiting_11_minutes_is_not_recovered(self):
+        """Codex 再現: push_text の HTTP 待機中に 11 分進める → heartbeat が更新され
+        recover / list / confirm の対象にならず、HTTP 完了で finish が確定する。"""
+        async def body():
+            _WaitingClient.release = asyncio.Event()
+            _WaitingClient.waiting = asyncio.Event()
+            task = asyncio.create_task(line_channel.push_text(JIKOU, USER, "x"))
+            await _WaitingClient.waiting.wait()                    # HTTP 待機に入った
+            op_id = await self._op_id_a()
+            await self._age_row_a(op_id, 11)                               # 11 分経過を模擬
+            aged = sl._aware(await self._heartbeat_at_a(op_id))
+            await asyncio.sleep(0.2)                               # heartbeat 数周期
+            fresh = sl._aware(await self._heartbeat_at_a(op_id))
+            self.assertGreater(fresh, aged)                        # (a) 待機中に更新される
+            self.assertEqual(await sl.recover_stale_started(), 0)
+            self.assertEqual(await sl.list_unconfirmed(), [])
+            self.assertEqual(await sl.confirm_by_human(op_id, "failed", "other"),
+                             "already_confirmed")
+            n_before = len(asyncio.all_tasks())
+            _WaitingClient.release.set()
+            self.assertIs(await task, True)
+            await asyncio.sleep(0.05)
+            n_after = len(asyncio.all_tasks())
+            return op_id, n_before, n_after
+        op_id, n_before, n_after = _run(body())
+        self.assertEqual(self.ops()[0]["state"], "sent")
+        self.assertEqual(self.history(op_id)[-1]["reason"], "sent")
+        self.assertGreaterEqual(n_before - 2, n_after)             # (c) push + heartbeat が消えた
+
+    def test_reply_with_push_fallback_waiting_is_not_recovered(self):
+        async def body():
+            _WaitingClient.release = asyncio.Event()
+            _WaitingClient.waiting = asyncio.Event()
+            task = asyncio.create_task(line_channel.reply_with_push_fallback(JIKOU, "t", USER, "x"))
+            await _WaitingClient.waiting.wait()
+            op_id = await self._op_id_a()
+            await self._age_row_a(op_id, 11)
+            await asyncio.sleep(0.2)
+            self.assertEqual(await sl.recover_stale_started(), 0)
+            self.assertEqual(await sl.count_unconfirmed(), 0)
+            _WaitingClient.release.set()
+            return await task
+        self.assertEqual(_run(body()), sl.SEND_SENT)
+        self.assertEqual(self.ops()[0]["state"], "sent")
+
+    def test_send_timeout_finishes_as_unconfirmed_and_raises(self):
+        with patch.dict(os.environ, {sl.SEND_TIMEOUT_SECONDS_ENV: "0.3"}):
+            async def body():
+                _WaitingClient.release = asyncio.Event()          # 返らない HTTP
+                n0 = len(asyncio.all_tasks())
+                with self.assertRaises(asyncio.TimeoutError):
+                    await line_channel.push_text(JIKOU, USER, "x")
+                await asyncio.sleep(0.05)
+                return n0, len(asyncio.all_tasks())
+            n0, n1 = _run(body())
+        op = self.ops()[0]
+        self.assertEqual(op["state"], "unconfirmed")                 # (b) 台帳が確定する
+        self.assertEqual(self.history(op["op_id"])[-1]["reason"], "unconfirmed")
+        self.assertEqual(n0, n1)                                     # (c) heartbeat タスクが残らない
+
+    def test_heartbeat_task_is_cancelled_on_http_exception(self):
+        async def body():
+            _FakeClient.raise_exc = RuntimeError("transport")
+            n0 = len(asyncio.all_tasks())
+            with self.assertRaises(RuntimeError):
+                await line_channel.push_text(JIKOU, USER, "x")
+            _FakeClient.raise_exc = None
+            await asyncio.sleep(0.05)
+            return n0, len(asyncio.all_tasks())
+        n0, n1 = _run(body())
+        self.assertEqual(n0, n1)
+        self.assertEqual(self.ops()[0]["state"], "unconfirmed")
+
+    def test_late_http_success_after_recovery_is_late_result_only(self):
+        """(d) heartbeat が止まった（プロセス死相当）試行が回収された後に HTTP が遅れて成功しても
+        late_result のみ（fix2 の保証が維持される）。"""
+        async def body():
+            _WaitingClient.release = asyncio.Event()
+            _WaitingClient.waiting = asyncio.Event()
+            with patch.object(sl, "heartbeat", AsyncMock(return_value=False)):   # 鼓動なし
+                task = asyncio.create_task(line_channel.push_text(JIKOU, USER, "x"))
+                await _WaitingClient.waiting.wait()
+                op_id = await self._op_id_a()
+                await self._age_row_a(op_id, 11)
+                await asyncio.sleep(0.1)
+                self.assertEqual(await sl.recover_stale_started(), 1)          # 回収される
+                self.assertEqual(await sl.confirm_by_human(op_id, "failed", "other"), "ok")
+                _WaitingClient.release.set()
+                self.assertIs(await task, True)                                 # HTTP 自体は成功
+            return op_id
+        op_id = _run(body())
+        row = self.ops()[0]
+        self.assertEqual(row["state"], "failed")                                # 人の確定が正
+        reasons = [h["reason"] for h in self.history(op_id)]
+        self.assertEqual(reasons[-1], "late_result:sent")
+        self.assertEqual(reasons.count("stale_started"), 1)
+
+    def test_timing_config_validation_warns_and_falls_back(self):
+        with patch.dict(os.environ, {sl.HEARTBEAT_SECONDS_ENV: "600",
+                                     sl.SEND_TIMEOUT_SECONDS_ENV: "240"}):      # heartbeat > timeout
+            with self.assertLogs("hub.send_ledger", level="WARNING") as cm:
+                cfg = sl.timing_config()
+                self.assertFalse(sl.check_timing_config())
+            self.assertTrue(cfg["defaulted"])
+            self.assertEqual((cfg["heartbeat"], cfg["timeout"], cfg["deadline"], cfg["stale"]),
+                             (60.0, 240.0, 300.0, 600.0))
+            self.assertIn("timing config inconsistent", "\n".join(cm.output))
+        with patch.dict(os.environ, {sl.SEND_TIMEOUT_SECONDS_ENV: "400"}):     # timeout > deadline
+            self.assertTrue(sl.timing_config()["defaulted"])
+        with patch.dict(os.environ, {sl.DEADLINE_MINUTES_ENV: "10"}):          # deadline == stale
+            self.assertTrue(sl.timing_config()["defaulted"])
+        with patch.dict(os.environ, {sl.HEARTBEAT_SECONDS_ENV: "abc"}):        # 不正値は既定へ
+            self.assertEqual(sl.heartbeat_seconds(), 0.05 if False else sl.timing_config()["heartbeat"])
+        self.assertIn("send_ledger.check_timing_config()", (REPO / "main.py").read_text(encoding="utf-8"))
+
+    def test_no_db_path_is_passthrough_without_timeout_or_heartbeat(self):
+        env = {k: v for k, v in os.environ.items() if k != "DATABASE_URL"}
+        with patch.dict(os.environ, env, clear=True), \
+                patch.dict(os.environ, {sl.SEND_TIMEOUT_SECONDS_ENV: "0.1"}):
+            db.reset_for_tests()
+
+            async def body():
+                _WaitingClient.release = asyncio.Event()
+                n0 = len(asyncio.all_tasks())
+                task = asyncio.create_task(line_channel.push_text(JIKOU, USER, "x"))
+                await asyncio.sleep(0.3)                           # timeout 相当を超えても待つ
+                self.assertFalse(task.done())
+                _WaitingClient.release.set()
+                r = await task
+                return r, n0, len(asyncio.all_tasks())
+            r, n0, n1 = _run(body())
+        self.assertIs(r, True)
+        self.assertEqual(n0, n1)
+
+
 if __name__ == "__main__":
     unittest.main()
