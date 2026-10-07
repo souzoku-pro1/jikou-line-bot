@@ -343,6 +343,11 @@ class _FlowBase(unittest.TestCase):
                          AsyncMock(return_value=True)),
             patch.dict(os.environ, {"ATTORNEY_LINE_USER_ID": "U_attorney",
                                     "AUTOREPLY_PAUSED": "0"}),
+            # FORM2-TTL-FIX-1: フロー経由の try_link は now を渡さず form_link が
+            # time.time() を読むため、fixture の作成日時（NOW 固定）との TTL 判定が
+            # 日付経過で落ちていた。現在時刻の取得点を NOW に固定し、TTL 内/切れの
+            # 両経路の検証を実時刻に依存させない（本番コードは不変）
+            patch.object(fl.time, "time", lambda: NOW.timestamp()),
         ]
         for p in patches:
             p.start()
