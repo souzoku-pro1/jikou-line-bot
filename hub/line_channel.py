@@ -28,6 +28,7 @@ from dataclasses import dataclass
 
 import httpx
 
+from hub import send_ledger
 from hub.redact import emit
 
 logger = logging.getLogger("hub.line_channel")
@@ -102,7 +103,28 @@ async def reply_with_push_fallback(channel: LineChannelConfig,
     """LINE Reply APIを試み、失敗（400等）したらPush APIにフォールバック。
 
     実装は旧 main._line_reply_with_fallback の逐語移設（ログ文言・順序とも
-    不変）。トークンのみチャネル引数から解決する。"""
+    不変）。トークンのみチャネル引数から解決する。
+
+    JIKOU-REPLY-Q1a: 送信操作記録と共通排他（hub/send_ledger）を通す——
+    [pending で記録 → 排他の中で started → push → sent / unconfirmed / failed]。
+    同じ受信イベント・用途の再配送（DUPLICATE）は送らない。記録不能（DB 未設定・
+    DB 例外）は素通り＝HTTP 呼び出し・ログ文言・順序は従来どおり。"""
+    op = await send_ledger.begin(channel.name, channel.name, to, text)
+    if op is send_ledger.DUPLICATE:
+        logger.info("[LINE] duplicate send skipped (send_ledger)")
+        return
+    try:
+        ok = await _reply_with_push_fallback_http(channel, reply_token, to, text)
+    except BaseException:
+        await send_ledger.finish(op, send_ledger.STATE_UNCONFIRMED)
+        raise
+    await send_ledger.finish(op, send_ledger.STATE_SENT if ok else send_ledger.STATE_FAILED)
+
+
+async def _reply_with_push_fallback_http(channel: LineChannelConfig,
+                                         reply_token: str, to: str,
+                                         text: str) -> bool:
+    """HTTP 部分（従来実装の逐語・戻り値 bool=最終的に 2xx を得たか、だけを追加）。"""
     token = channel.token()
     async with httpx.AsyncClient() as client:
         resp = await client.post(
@@ -114,7 +136,7 @@ async def reply_with_push_fallback(channel: LineChannelConfig,
     if resp.is_success:
         logger.info("[LINE] reply OK user_id=%s",
                     emit(to, "external_ref", "log", "operator"))
-        return
+        return True
     logger.warning("[LINE] reply failed %s %s, trying push",
                    emit(resp.status_code, "count", "log", "operator"),
                    emit(resp.text[:200], "vendor_raw", "log", "operator"))
@@ -129,6 +151,7 @@ async def reply_with_push_fallback(channel: LineChannelConfig,
     if not push_resp.is_success:
         logger.error("[LINE] push fallback error: %s",
                      emit(push_resp.text[:200], "vendor_raw", "log", "operator"))
+    return bool(push_resp.is_success)
 
 
 async def push_text(channel: LineChannelConfig, to: str, text: str) -> bool:
@@ -138,7 +161,24 @@ async def push_text(channel: LineChannelConfig, to: str, text: str) -> bool:
     トークンのみチャネル引数から解決する。
     IMAGE-INTAKE-1-fix1[03]: 戻り値 bool を追加（非 2xx=False）。既存 caller は
     戻り値を見ていないため挙動不変（非 2xx を例外化しない・通信例外は従来
-    どおり送出のまま。test_image_intake が pin）。"""
+    どおり送出のまま。test_image_intake が pin）。
+    JIKOU-REPLY-Q1a: 送信操作記録と共通排他を通す（reply_with_push_fallback と同じ
+    [begin → push → finish]・DUPLICATE は送らず True を返す＝呼び出し側から見て送信済み）。"""
+    op = await send_ledger.begin(channel.name, channel.name, to, text)
+    if op is send_ledger.DUPLICATE:
+        logger.info("[LINE_PUSH] duplicate send skipped (send_ledger)")
+        return True
+    try:
+        ok = await _push_text_http(channel, to, text)
+    except BaseException:
+        await send_ledger.finish(op, send_ledger.STATE_UNCONFIRMED)
+        raise
+    await send_ledger.finish(op, send_ledger.STATE_SENT if ok else send_ledger.STATE_FAILED)
+    return ok
+
+
+async def _push_text_http(channel: LineChannelConfig, to: str, text: str) -> bool:
+    """HTTP 部分（従来実装の逐語）。"""
     async with httpx.AsyncClient() as client:
         resp = await client.post(
             _PUSH_URL,

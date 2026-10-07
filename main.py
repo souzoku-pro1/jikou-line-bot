@@ -879,7 +879,7 @@ async def _process_line_event(reply_token: str, user_id: str, user_text: str) ->
                                                          app21_record)
                         return
                 elif outcome == "not_matched":
-                    await _line_reply_with_fallback(
+                    await send_ledger.with_purpose("receipt_number", _line_reply_with_fallback,  # JIKOU-REPLY-Q1a
                         reply_token, user_id, form_link.REPLY_NOT_MATCHED)
                     await save_to_chatlog(user_id, "user", user_text,
                                           "ヒアリング", "no")
@@ -943,7 +943,7 @@ async def _process_line_event(reply_token: str, user_id: str, user_text: str) ->
             if form_handover:
                 # JIKOU-FORM-2: 紐付け直後のターンの AI 失敗は固定文言 A のみ
                 # （紐付けは成立済み・次のメッセージから通常ヒアリング）
-                await _line_reply_with_fallback(
+                await send_ledger.with_purpose("receipt_number", _line_reply_with_fallback,  # JIKOU-REPLY-Q1a
                     reply_token, user_id, form_link.REPLY_LINKED_FALLBACK)
                 await save_to_chatlog(user_id, "user", user_text,
                                       "ヒアリング", "no")
@@ -1343,7 +1343,7 @@ async def _process_line_event_durable(reply_token: str, user_id: str, user_text:
                                      mark_line_failed)
     # STOPLIST-fix1（STOPLIST-01）: durable 文脈の event id を内側の停止再確認へ
     # 引き継ぐ（finally で必ず reset＝文脈漏れなし）
-    _ctx_token = _durable_event_id.set(webhook_event_id)
+    _ctx_token = _durable_event_id.set(webhook_event_id); _sl_token = send_ledger.bind_inbound(webhook_event_id)  # JIKOU-REPLY-Q1a
     try:
         if not already_claimed and not await mark_line_processing(webhook_event_id):
             logger.info("[DURABLE] ownership not acquired (claimed by "
@@ -1367,7 +1367,7 @@ async def _process_line_event_durable(reply_token: str, user_id: str, user_text:
         except Exception:
             pass
     finally:
-        _durable_event_id.reset(_ctx_token)
+        _durable_event_id.reset(_ctx_token); send_ledger.unbind(_sl_token)  # JIKOU-REPLY-Q1a
 
 
 @app.post("/webhook")
@@ -1595,7 +1595,7 @@ async def kintone_approval_webhook(request: Request):
     # LINE push 送信 → 送信済みフラグ更新 → チャットログ保存
     # RV-04c §4.2 phase 表: marker 後の失敗（例外・timeout）は sending 維持（failed 上書き禁止・
     # 不明は不明のまま §4.2 runbook へ）。例外は握らず伝播させ、state は sending に留める。
-    await send_line_push(user_id, ai_draft)
+    async with send_ledger.approved_draft(f"approval:{record_id}:{record.get('$revision', {}).get('value', '')}"): await send_line_push(user_id, ai_draft)  # JIKOU-REPLY-Q1a
     await mark_approval_sent(record_id)
     await save_to_chatlog(user_id, "assistant", ai_draft, category, "yes")
     if _ev:
@@ -2306,9 +2306,15 @@ async def _process_follow_event(reply_token: str, user_id: str, event_id: str,
             logger.info("[FOLLOW] shindan_link_no_public_host (no send)")
         else:
             token = await shindan_link.issue(user_id)
-            await _line_reply_with_fallback(
-                reply_token, user_id,
-                shindan_link.build_message(shindan_link.link_url(base_url, token)))
+            # JIKOU-REPLY-Q1a: follow あいさつも送信操作記録を通す（用途=follow・
+            # 初回返信判定の対象外・受信イベント ID=webhookEventId）
+            _sl_tok = send_ledger.bind_inbound(event_id)
+            try:
+                await send_ledger.with_purpose(
+                    "follow", _line_reply_with_fallback, reply_token, user_id,
+                    shindan_link.build_message(shindan_link.link_url(base_url, token)))
+            finally:
+                send_ledger.unbind(_sl_tok)
             logger.info("[FOLLOW] link sent head=%s",
                         emit(shindan_link.token_head(token), "record_id", "log",
                              "operator"))
@@ -2332,3 +2338,12 @@ from hub.webapp_brain_view import include_before_catch_all  # noqa: E402
 include_before_catch_all(app, brain_view_router)
 from hub.brain_sync import register_brain_sync_job  # noqa: E402
 register_brain_sync_job()
+
+# ── JIKOU-REPLY-Q1a-SEND-BASE: 送信操作記録・共通排他・送信確認待ち画面の結線。
+#    末尾追記（sink allowlist の行番号 pin を壊さない規約・本文中は 1 行置換のみ）。
+#    `send_ledger` は本文の 1 行置換（durable 文脈の束ね・承認済み下書き・受付番号系）
+#    から名前解決されるが、呼出しは import 完了後にしか起きない（module 末尾の束縛で足りる）。
+#    送信フック本体は hub/line_channel（reply_with_push_fallback / push_text）。
+from hub import send_ledger  # noqa: E402
+from hub.webapp_send_ops_view import router as send_ops_router  # noqa: E402
+include_before_catch_all(app, send_ops_router)

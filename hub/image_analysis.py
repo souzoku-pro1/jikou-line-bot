@@ -52,6 +52,7 @@ from hub import kintone
 from hub import notify
 from hub.autoreply_stoplist import is_suppressed
 from hub.image_store import APP_JIKOU_CASE, PHOTO_FIELD, detect_format
+from hub import send_ledger
 from hub.line_channel import HOUKI_CHANNEL, JIKOU_CHANNEL, push_text
 from hub.redact import emit
 
@@ -634,10 +635,16 @@ async def _analyze_and_reply(user_id: str, event_id: str,
     # 送信直前の抑止判定（pause／停止リスト。人対応は上の再取得判定で済み）
     if os.environ.get("AUTOREPLY_PAUSED") == "1" or await is_suppressed(user_id):
         return "blocked"
+    # JIKOU-REPLY-Q1a: 読解結果の送信も送信操作記録を通す（用途=image_result・
+    # 受信イベント ID=画像イベント）。送信の有無・文面は不変
+    _sl_tok = send_ledger.bind_inbound(event_id)
     try:
-        sent = await push_text(cfg.line_channel, user_id, text)
+        sent = await send_ledger.with_purpose("image_result", push_text,
+                                              cfg.line_channel, user_id, text)
     except Exception:
         sent = False
+    finally:
+        send_ledger.unbind(_sl_tok)
     if sent is not True:
         await _notify(cfg.send_failure_text.replace("{record_id}", record_id),
                       f"{cfg.send_failure_kind}:{user_id}")

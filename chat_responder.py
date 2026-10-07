@@ -1729,7 +1729,12 @@ async def handle_customer_message(
         # ——大野の文言確定=PENDING_CONTEXT_ENABLED までは現行文言）
         ack_text = guard.immediate_notice_text \
             or pending_reply_for(category, profile=p)
-        await reply_func(reply_token, ack_text)
+        # JIKOU-REPLY-Q1a: 送信操作記録の用途（緊急の即時定型=urgent・他=reply）。
+        # 送信の有無・文面・順序は不変（記録と排他の追加のみ）
+        from hub import send_ledger as _send_ledger
+        await _send_ledger.with_purpose(
+            "urgent" if p.urgent_notice_kinds.get(guard.immediate_notice, "") else "reply",
+            reply_func, reply_token, ack_text)
         await save_to_chatlog(user_id, "assistant", ack_text, category, "yes")
         # 弁護士へ承認依頼通知（希死念慮・差押え切迫は【緊急・要即時対応】）
         await _notify_attorney(

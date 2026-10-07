@@ -382,7 +382,7 @@ class TestAlembicScaffold(unittest.TestCase):
             finally:
                 con.close()
             # M2（空 DB の検算は通る）: NOT NULL・case_id 基準の一意制約・旧列は NULL 許容
-            up = alembic("upgrade", "head")
+            up = alembic("upgrade", self.BRAIN_M2)   # JIKOU-REPLY-Q1a 追随: head は e5f8a1b4c7d9 へ進んだ
             self.assertEqual(up.returncode, 0, f"stderr={up.stderr[-800:]}")
             con = sqlite3.connect(dbfile)
             try:
@@ -553,7 +553,7 @@ class TestAlembicScaffold(unittest.TestCase):
                 db.reset_for_tests()
             self.assertEqual(result["problems"], [brain_migration.PROBLEM_CASE_SHARED])
             self.assertEqual(brain_migration.PROBLEM_CASE_SHARED, "case_id_shared_by_keys")
-            up = alembic("upgrade", "head")
+            up = alembic("upgrade", self.BRAIN_M2)
             self.assertNotEqual(up.returncode, 0)
             self.assertIn("brain_case_verify_failed: case_id_shared_by_keys", up.stderr)
             self.assertIn(self.BRAIN_M1, alembic("current").stdout)          # revision は M1 のまま
@@ -576,7 +576,7 @@ class TestAlembicScaffold(unittest.TestCase):
                 con.commit()
             finally:
                 con.close()
-            up = alembic("upgrade", "head")
+            up = alembic("upgrade", self.BRAIN_M2)
             self.assertEqual(up.returncode, 0, f"stderr={up.stderr[-800:]}")
             self.assertIn(self.BRAIN_M2, alembic("current").stdout)
         finally:
@@ -922,3 +922,49 @@ class TestAlembicScaffold(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestSendLedgerMigration(unittest.TestCase):
+    """JIKOU-REPLY-Q1a: 送信操作記録の migration（e5f8a1b4c7d9）が d1e4f7a0b3c6 の後ろに
+    1 本で繋がり、up→down が往復し、head で 3 表の列集合が hub/send_ledger.metadata と
+    一致すること。"""
+
+    SEND_LEDGER = "e5f8a1b4c7d9"
+
+    def test_send_ledger_migration_round_trip(self):
+        import sqlite3
+        import tempfile
+        from hub import send_ledger
+        d = tempfile.mkdtemp(prefix="send_ledger_mig_")
+        dbfile = f"{d}/mig.db"
+        alembic, tables, unique_cols, nullable = TestAlembicScaffold._brain_mig_tools(dbfile)
+        try:
+            up = alembic("upgrade", "d1e4f7a0b3c6")
+            self.assertEqual(up.returncode, 0, f"stderr={up.stderr[-800:]}")
+            self.assertFalse(set(send_ledger.TABLE_NAMES) & tables())
+            up = alembic("upgrade", "head")
+            self.assertEqual(up.returncode, 0, f"stderr={up.stderr[-800:]}")
+            self.assertIn(self.SEND_LEDGER, alembic("current").stdout)
+            self.assertTrue(set(send_ledger.TABLE_NAMES) <= tables())
+            con = sqlite3.connect(dbfile)
+            try:
+                for name in send_ledger.TABLE_NAMES:
+                    cols = {r[1] for r in con.execute(f'PRAGMA table_info("{name}")')}
+                    self.assertEqual(
+                        cols, {c.name for c in send_ledger.metadata.tables[name].columns}, name)
+                self.assertIn(("ref",), unique_cols(con, "conversation"))
+                self.assertIn(("business", "channel", "inbound_event_id", "purpose", "inbound_seq"),
+                              unique_cols(con, "send_operation"))
+                fks = {(r[2], r[3]) for r in con.execute("PRAGMA foreign_key_list(send_operation)")}
+                self.assertIn(("conversation", "conversation_id"), fks)
+                self.assertFalse(nullable(con, "send_operation")["state"])
+            finally:
+                con.close()
+            down = alembic("downgrade", "d1e4f7a0b3c6")
+            self.assertEqual(down.returncode, 0, f"stderr={down.stderr[-800:]}")
+            self.assertFalse(set(send_ledger.TABLE_NAMES) & tables())
+            self.assertIn("d1e4f7a0b3c6", alembic("current").stdout)
+            self.assertIn("case", tables())                      # 下位 revision の表は残る
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
