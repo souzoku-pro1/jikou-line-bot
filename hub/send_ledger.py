@@ -311,14 +311,10 @@ def _lock_key(business: str, user_hash: str, channel: str) -> int:
     return int.from_bytes(digest[:8], "big", signed=True)
 
 
-def stale_started_minutes() -> int:
-    raw = os.environ.get(STALE_MINUTES_ENV, "").strip()
-    return int(raw) if raw.isdigit() and int(raw) > 0 else STALE_STARTED_MINUTES_DEFAULT
-
-
-def deadline_minutes() -> int:
-    raw = os.environ.get(DEADLINE_MINUTES_ENV, "").strip()
-    return int(raw) if raw.isdigit() and int(raw) > 0 else DEADLINE_MINUTES_DEFAULT
+# ── 時間設定（fix3 BQ-09・fix4 BQ-11: 生の環境変数の読取と検証済み設定を分離） ────────
+def _raw_minutes(name: str, default: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    return int(raw) if raw.isdigit() and int(raw) > 0 else default
 
 
 def _float_env(name: str, default: float) -> float:
@@ -330,21 +326,44 @@ def _float_env(name: str, default: float) -> float:
     return v if v > 0 else default
 
 
+_TIMING_DEFAULTS = {"heartbeat": HEARTBEAT_SECONDS_DEFAULT, "timeout": SEND_TIMEOUT_SECONDS_DEFAULT,
+                    "deadline": DEADLINE_MINUTES_DEFAULT * 60.0,
+                    "stale": STALE_STARTED_MINUTES_DEFAULT * 60.0}
+_timing_warned_for: tuple | None = None     # 1 回だけ警告（同じ不整合設定の間は重複ログを出さない）
+
+
 def timing_config() -> dict:
-    """fix3 BQ-09: 送信経路の時間設定（秒）。整合（heartbeat < timeout < deadline < 回収閾値）
-    を満たさないときは fail-closed にせず、固定文言＋値のみの警告を出して既定値に戻す
-    （Q1a 限定の fail-open 方針を維持）。"""
+    """検証済みの時間設定（秒）。整合（heartbeat < timeout < deadline < 回収閾値）を満たさない
+    ときは fail-closed にせず、固定文言の警告（値は出さない・同じ設定の間は 1 回だけ）を出して
+    既定値（60 / 240 / 300 / 600 秒）に戻す。**deadline_minutes() / stale_started_minutes() /
+    heartbeat_seconds() / send_timeout_seconds() はすべて本関数の補正済み値を返す**ため、
+    begin() の deadline_at 保存・回収境界（_stale_cut / _stale_started_where）・heartbeat_task・
+    guarded_http が同一の設定を使う（fix4 BQ-11）。"""
+    global _timing_warned_for
     hb = _float_env(HEARTBEAT_SECONDS_ENV, HEARTBEAT_SECONDS_DEFAULT)
     to = _float_env(SEND_TIMEOUT_SECONDS_ENV, SEND_TIMEOUT_SECONDS_DEFAULT)
-    dl = deadline_minutes() * 60.0
-    st = stale_started_minutes() * 60.0
+    dl = _raw_minutes(DEADLINE_MINUTES_ENV, DEADLINE_MINUTES_DEFAULT) * 60.0
+    st = _raw_minutes(STALE_MINUTES_ENV, STALE_STARTED_MINUTES_DEFAULT) * 60.0
     if hb < to < dl < st:
+        _timing_warned_for = None
         return {"heartbeat": hb, "timeout": to, "deadline": dl, "stale": st, "defaulted": False}
-    logger.warning("[SEND_LEDGER] timing config inconsistent (heartbeat<timeout<deadline<stale "
-                   "required); defaults applied")
-    return {"heartbeat": HEARTBEAT_SECONDS_DEFAULT, "timeout": SEND_TIMEOUT_SECONDS_DEFAULT,
-            "deadline": DEADLINE_MINUTES_DEFAULT * 60.0, "stale": STALE_STARTED_MINUTES_DEFAULT * 60.0,
-            "defaulted": True}
+    key = (hb, to, dl, st)
+    if _timing_warned_for != key:
+        logger.warning("[SEND_LEDGER] timing config inconsistent (heartbeat<timeout<deadline<stale "
+                       "required); defaults applied")
+        _timing_warned_for = key
+    return dict(_TIMING_DEFAULTS, defaulted=True)
+
+
+def stale_started_minutes() -> int:
+    """回収閾値（分・補正済み）。"""
+    return int(timing_config()["stale"] // 60)
+
+
+def deadline_minutes() -> int:
+    """処理全体の期限（分・補正済み）。begin() が deadline_at に保存する値の元。
+    保存済みの deadline_at（設定変更前に着手した行）は再計算せず保存値を尊重する。"""
+    return int(timing_config()["deadline"] // 60)
 
 
 def heartbeat_seconds() -> float:

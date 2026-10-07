@@ -592,8 +592,9 @@ class TestStaleStarted(_DbMixin):
 
     def test_threshold_is_configurable(self):
         # fix2 BQ-06: 回収は閾値超に加えて処理全体の期限切れ・ハートビート途絶が条件。
-        # 閾値 2 分・期限 1 分に下げた状態で 3 分前着手（期限・ハートビートとも切れ）を回収する
-        with patch.dict(os.environ, {sl.STALE_MINUTES_ENV: "2", sl.DEADLINE_MINUTES_ENV: "1"}):
+        # fix4 BQ-11: 補正済み設定を使うため整合する組（10 s < 30 s < 1 分 < 2 分）で下げる
+        with patch.dict(os.environ, {sl.STALE_MINUTES_ENV: "2", sl.DEADLINE_MINUTES_ENV: "1",
+                                     sl.HEARTBEAT_SECONDS_ENV: "10", sl.SEND_TIMEOUT_SECONDS_ENV: "30"}):
             self.assertEqual((sl.stale_started_minutes(), sl.deadline_minutes()), (2, 1))
             stale = self._started(3)
             self.assertEqual(_run(sl.recover_stale_started()), 1)
@@ -1334,6 +1335,111 @@ class TestFix3HeartbeatAndTimeout(_DbMixin):
             r, n0, n1 = _run(body())
         self.assertIs(r, True)
         self.assertEqual(n0, n1)
+
+
+# ── 13. fix4: 設定フォールバックの一貫性（BQ-11）と _now() を進める方式の再現 ────────
+class TestFix4TimingFallback(_DbMixin):
+    CODEX_ENV = {sl.HEARTBEAT_SECONDS_ENV: "60", sl.SEND_TIMEOUT_SECONDS_ENV: "240",
+                 sl.DEADLINE_MINUTES_ENV: "1", sl.STALE_MINUTES_ENV: "2"}      # deadline < timeout
+
+    def test_codex_inconsistent_config_warns_once_and_is_applied_consistently(self):
+        sl._timing_warned_for = None
+        with patch.dict(os.environ, self.CODEX_ENV):
+            with self.assertLogs("hub.send_ledger", level="WARNING") as cm:   # (a) 警告
+                self.assertTrue(sl.timing_config()["defaulted"])
+                sl.timing_config(); sl.deadline_minutes(); sl.stale_started_minutes()
+            self.assertEqual(sum("timing config inconsistent" in l for l in cm.output), 1)   # 1 回だけ
+            # 補正済み値を各 getter が返す
+            self.assertEqual((sl.deadline_minutes(), sl.stale_started_minutes(),
+                              sl.heartbeat_seconds(), sl.send_timeout_seconds()), (5, 10, 60.0, 240.0))
+            op = _run(sl.begin("jikou", "jikou", USER, "x"))
+            row = self.ops()[0]
+            stored = sl._aware(row["deadline_at"]) - sl._aware(row["started_at"])
+            self.assertEqual(stored, datetime.timedelta(seconds=300))                   # (b) 保存値
+            # (c) 回収境界は 600 秒: 着手 5 分後（鼓動途絶）は対象外、11 分後は回収される
+            self.set_started_at(op.op_id, sl._now() - datetime.timedelta(minutes=5))
+            self.assertEqual(_run(sl.recover_stale_started()), 0)
+            self.assertEqual(_run(sl.list_unconfirmed()), [])
+            self.assertEqual(_run(sl.confirm_by_human(op.op_id, "failed", "other")), "already_confirmed")
+            self.set_started_at(op.op_id, sl._now() - datetime.timedelta(minutes=11))
+            self.assertEqual(_run(sl.recover_stale_started()), 1)
+            self.assertEqual(self.ops()[0]["state"], "unconfirmed")
+        sl._timing_warned_for = None
+
+    def test_stored_deadline_is_respected_after_config_change(self):
+        op = _run(sl.begin("jikou", "jikou", USER, "x"))                   # deadline 5 分で保存
+        # 設定を 1 分期限・2 分回収（整合する組）へ変更しても、保存済み期限は再計算しない
+        with patch.dict(os.environ, {sl.HEARTBEAT_SECONDS_ENV: "10", sl.SEND_TIMEOUT_SECONDS_ENV: "30",
+                                     sl.DEADLINE_MINUTES_ENV: "1", sl.STALE_MINUTES_ENV: "2"}):
+            self.assertEqual(sl.deadline_minutes(), 1)
+            now = sl._now()
+            self.set_started_at(op.op_id, now - datetime.timedelta(minutes=3),
+                                deadline_at=now + datetime.timedelta(minutes=2))     # 保存値は未到来
+            self.assertEqual(_run(sl.recover_stale_started()), 0)
+            self.assertEqual(_run(sl.list_unconfirmed()), [])
+            self.set_started_at(op.op_id, now - datetime.timedelta(minutes=3))      # 保存値も経過
+            self.assertEqual(_run(sl.recover_stale_started()), 1)
+
+    def test_raw_env_and_validated_config_are_separate(self):
+        with patch.dict(os.environ, self.CODEX_ENV):
+            self.assertEqual((sl._raw_minutes(sl.DEADLINE_MINUTES_ENV, 5),
+                              sl._raw_minutes(sl.STALE_MINUTES_ENV, 10)), (1, 2))      # 生値
+            self.assertEqual((sl.deadline_minutes(), sl.stale_started_minutes()), (5, 10))   # 補正済み
+        sl._timing_warned_for = None
+
+
+class TestFix4ClockAdvance(_DbMixin):
+    """DB の日時を書き換えず _now() を 11 分進める方式（Codex の独立検証と同じ）。"""
+
+    def setUp(self):
+        super().setUp()
+        self._cp.stop()
+        self._cp = patch.object(line_channel.httpx, "AsyncClient", _WaitingClient)
+        self._cp.start()
+        _WaitingClient.release = None
+        _WaitingClient.waiting = None
+        self._tenv = patch.dict(os.environ, {sl.HEARTBEAT_SECONDS_ENV: "0.05",
+                                             sl.SEND_TIMEOUT_SECONDS_ENV: "20"})
+        self._tenv.start()
+
+    def tearDown(self):
+        self._tenv.stop()
+        super().tearDown()
+
+    def _run_with_clock(self, send_coro_factory):
+        base = sl._now()
+        offset = [datetime.timedelta(0)]
+
+        async def body():
+            with patch.object(sl, "_now", lambda: base + offset[0]):
+                _WaitingClient.release = asyncio.Event()
+                _WaitingClient.waiting = asyncio.Event()
+                task = asyncio.create_task(send_coro_factory())
+                await _WaitingClient.waiting.wait()
+                offset[0] = datetime.timedelta(minutes=11)                # 時計を 11 分進める
+                await asyncio.sleep(0.2)                                  # heartbeat が新しい時刻で打つ
+                from hub.db import session_scope
+                async with session_scope() as s:
+                    row = dict((await s.execute(sa.select(sl.send_operation))).first()._mapping)
+                hb = sl._aware(row["last_heartbeat_at"])
+                self.assertGreaterEqual(hb, base + datetime.timedelta(minutes=11))
+                self.assertLess(sl._aware(row["deadline_at"]), sl._now())        # 期限は切れている
+                self.assertEqual(await sl.recover_stale_started(), 0)            # それでも稼働中
+                self.assertEqual(await sl.list_unconfirmed(), [])
+                self.assertEqual(await sl.confirm_by_human(row["op_id"], "failed", "other"),
+                                 "already_confirmed")
+                _WaitingClient.release.set()
+                return await task
+        return _run(body())
+
+    def test_push_text_clock_advance_is_not_recovered(self):
+        self.assertIs(self._run_with_clock(lambda: line_channel.push_text(JIKOU, USER, "x")), True)
+        self.assertEqual(self.ops()[0]["state"], "sent")
+
+    def test_reply_with_push_fallback_clock_advance_is_not_recovered(self):
+        self.assertEqual(self._run_with_clock(
+            lambda: line_channel.reply_with_push_fallback(JIKOU, "t", USER, "x")), sl.SEND_SENT)
+        self.assertEqual(self.ops()[0]["state"], "sent")
 
 
 if __name__ == "__main__":
