@@ -87,7 +87,7 @@ def _page(rows: list[dict], notice: str) -> str:
                      f'<span class="badge">{html.escape(_ACTOR_LABELS.get(r["actor"], r["actor"]))}</span>'
                      f'<span class="badge">{html.escape(str(r["business"]))}</span>')
         parts.append(f'<div class="meta">操作 ID: {op_id}｜会話参照: {html.escape(str(r["conversation_ref"]))}'
-                     f'｜着手: {html.escape(str(r["started_at"]))}｜試行: {int(r["attempts"])}</div>')
+                     f'｜着手: {html.escape(str(r["started_at"]))}｜試行: {int(r["attempt_no"])}</div>')
         parts.append(f'<form method="post" action="{PAGE}/confirm">'
                      f'<input type="hidden" name="op_id" value="{op_id}">'
                      '<select name="reason">'

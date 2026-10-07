@@ -3,6 +3,9 @@
 fix1（BQ-03/04・未適用の同 revision を更新）: conversation に human_version（人の操作でのみ進む版）
 と last_inbound_event_id（再配送で直近受信時刻を更新しない）、send_operation.conversation_id は
 NULL 可（受信を伴わない送信で会話が無ければ作らずに NULL で記録）。
+fix2（BQ-06/07・未適用の同 revision を更新）: send_operation に attempt_no（試行番号・旧 attempts）・
+owner_token（着手ごとの所有者）・deadline_at（処理全体の期限）・last_heartbeat_at、新表 inbound_touch
+（反映済み受信イベント＝受信の重複判定と初回受付時刻の正本・一意制約）。
 
 正本: 時効LINEボット_返信規則_v1.4.md §10-5（送信操作記録・会話・共通排他）・§10-10
 （新設 DB 表・RV-08 の履歴）・§12 Q1a（新設書込: 送信操作記録・会話）。
@@ -63,7 +66,10 @@ def upgrade() -> None:
         sa.Column("state", sa.Text, nullable=False),
         sa.Column("completed_after_human", sa.Boolean, nullable=False,
                   server_default=sa.false()),
-        sa.Column("attempts", sa.Integer, nullable=False, server_default="1"),
+        sa.Column("attempt_no", sa.Integer, nullable=False, server_default="1"),
+        sa.Column("owner_token", sa.Text, nullable=True),
+        sa.Column("deadline_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("last_heartbeat_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("started_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("finished_at", sa.DateTime(timezone=True), nullable=True),
@@ -90,9 +96,21 @@ def upgrade() -> None:
         sa.Column("at", sa.DateTime(timezone=True), nullable=False),
     )
     op.create_index("ix_send_operation_history_op", "send_operation_history", ["op_id"])
+    op.create_table(
+        "inbound_touch",
+        sa.Column("touch_id", _BIG, primary_key=True, autoincrement=True),
+        sa.Column("business", sa.Text, nullable=False),
+        sa.Column("channel", sa.Text, nullable=False),
+        sa.Column("inbound_event_id", sa.Text, nullable=False),
+        sa.Column("first_received_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+        sa.UniqueConstraint("business", "channel", "inbound_event_id",
+                            name="uq_inbound_touch_event"),
+    )
 
 
 def downgrade() -> None:
+    op.drop_table("inbound_touch")
     op.drop_index("ix_send_operation_history_op", table_name="send_operation_history")
     op.drop_table("send_operation_history")
     op.drop_index("ix_send_operation_state", table_name="send_operation")

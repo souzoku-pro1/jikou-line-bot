@@ -179,12 +179,19 @@ class _DbMixin(unittest.TestCase):
     def history(self, op_id: str) -> list:
         return _run(sl.operation_history(op_id))
 
-    def set_started_at(self, op_id: str, at):
+    def set_started_at(self, op_id: str, at, *, deadline_at="auto", heartbeat_at="auto"):
+        """着手時刻を書き換える。期限・ハートビートは既定で着手時刻基準（=滞留）にする。"""
+        if deadline_at == "auto":
+            deadline_at = at + datetime.timedelta(minutes=sl.deadline_minutes())
+        if heartbeat_at == "auto":
+            heartbeat_at = at
+
         async def _u():
             from hub.db import session_scope
             async with session_scope() as s:
                 await s.execute(sa.update(sl.send_operation).where(
-                    sl.send_operation.c.op_id == op_id).values(started_at=at))
+                    sl.send_operation.c.op_id == op_id).values(
+                    started_at=at, deadline_at=deadline_at, last_heartbeat_at=heartbeat_at))
         _run(_u())
 
 
@@ -307,7 +314,7 @@ class TestRedelivery(_DbMixin):
         self.assertIs(self.send("evt-5"), True)                 # 失敗後の再配送は再試行
         ops = self.ops()
         self.assertEqual(len(ops), 1)
-        self.assertEqual((ops[0]["state"], ops[0]["attempts"]), ("sent", 2))
+        self.assertEqual((ops[0]["state"], ops[0]["attempt_no"]), ("sent", 2))
         self.assertIn("retry_after_failed", [h["reason"] for h in self.history(ops[0]["op_id"])])
 
     def test_unconfirmed_duplicate_is_reported_as_unconfirmed_not_success(self):
@@ -527,7 +534,7 @@ class TestUnconfirmed(_DbMixin):
         items = _run(sl.list_unconfirmed())
         self.assertEqual(len(items), 1)
         self.assertEqual(set(items[0]), {"op_id", "business", "channel", "purpose", "actor",
-                                         "state", "stale", "started_at", "attempts",
+                                         "state", "stale", "started_at", "attempt_no",
                                          "conversation_ref"})
         self.assertEqual((items[0]["state"], items[0]["stale"]), ("unconfirmed", False))
         self.assertNotIn(USER, str(items))
@@ -584,11 +591,13 @@ class TestStaleStarted(_DbMixin):
         self.assertEqual(len(_FakeClient.calls), 0)                  # 自動再送なし
 
     def test_threshold_is_configurable(self):
-        stale = self._started(3)
-        with patch.dict(os.environ, {sl.STALE_MINUTES_ENV: "2"}):
-            self.assertEqual(sl.stale_started_minutes(), 2)
+        # fix2 BQ-06: 回収は閾値超に加えて処理全体の期限切れ・ハートビート途絶が条件。
+        # 閾値 2 分・期限 1 分に下げた状態で 3 分前着手（期限・ハートビートとも切れ）を回収する
+        with patch.dict(os.environ, {sl.STALE_MINUTES_ENV: "2", sl.DEADLINE_MINUTES_ENV: "1"}):
+            self.assertEqual((sl.stale_started_minutes(), sl.deadline_minutes()), (2, 1))
+            stale = self._started(3)
             self.assertEqual(_run(sl.recover_stale_started()), 1)
-        self.assertEqual(sl.stale_started_minutes(), 10)
+        self.assertEqual((sl.stale_started_minutes(), sl.deadline_minutes()), (10, 5))
         self.assertEqual(self.ops()[0]["state"], "unconfirmed")
         self.assertEqual(self.ops()[0]["op_id"], stale)
 
@@ -968,13 +977,173 @@ class TestPiiAndSinkPolicy(unittest.TestCase):
                                             "customer_confirmed", "other"))
         self.assertEqual(sl.FIRST_REPLY_EXCLUDED, frozenset({"follow"}))
         self.assertEqual(sl.CONVERSATION_GAP, datetime.timedelta(days=30))
-        self.assertEqual(sl.TABLE_NAMES, ("conversation", "send_operation", "send_operation_history"))
+        self.assertEqual(sl.TABLE_NAMES, ("conversation", "send_operation", "send_operation_history",
+                                          "inbound_touch"))
         self.assertEqual((sl.SEND_SENT, sl.SEND_UNCONFIRMED, sl.SEND_FAILED),
                          ("sent", "unconfirmed", "failed"))
         self.assertIn("stale_started", sl.HISTORY_REASONS)
         self.assertEqual(sl.STALE_STARTED_MINUTES_DEFAULT, 10)
         self.assertEqual(len(sl.line_user_hash("jikou", USER)), 64)
         self.assertEqual(sl.line_user_hash("jikou", USER), sl.line_user_hash("jikou", USER))
+
+
+# ── 11. fix2: 試行の所有と遅着結果（BQ-06）・画像の再配送（BQ-07）・履歴の遷移元（BQ-08） ──
+class TestFix2OwnershipAndLateResults(_DbMixin):
+    def _begin(self, event_id="evt-r"):
+        async def body():
+            tok = sl.bind_inbound(event_id)
+            try:
+                return await sl.begin("jikou", "jikou", USER, "x")
+            finally:
+                sl.unbind(tok)
+        return _run(body())
+
+    async def _touches(self):
+        from hub.db import session_scope
+        async with session_scope() as s:
+            rows = (await s.execute(sa.select(sl.inbound_touch.c.inbound_event_id,
+                                              sl.inbound_touch.c.first_received_at)
+                                    .order_by(sl.inbound_touch.c.touch_id))).fetchall()
+        return [(r[0], sl._aware(r[1])) for r in rows]
+
+    def test_late_finish_after_recovery_and_new_attempt_does_not_confirm_new_attempt(self):
+        op1 = self._begin()
+        self.assertEqual((op1.attempt_no, len(op1.owner_token)), (1, 32))
+        self.set_started_at(op1.op_id, sl._now() - datetime.timedelta(minutes=11))
+        self.assertEqual(_run(sl.recover_stale_started()), 1)
+        self.assertEqual(_run(sl.confirm_by_human(op1.op_id, "failed", "line_not_delivered")), "ok")
+        op2 = self._begin()                                         # 同一操作の試行 2
+        self.assertIsInstance(op2, sl.Operation)
+        self.assertEqual((op2.op_id, op2.attempt_no), (op1.op_id, 2))
+        self.assertNotEqual(op2.owner_token, op1.owner_token)
+        self.assertEqual(_run(sl.finish(op1, sl.STATE_SENT)), "late")    # 試行 1 の遅着
+        row = self.ops()[0]
+        self.assertEqual((row["state"], row["attempt_no"]), ("started", 2))   # 試行 2 は未完了のまま
+        last = self.history(op1.op_id)[-1]
+        self.assertEqual((last["from"], last["to"], last["reason"]),
+                         ("started", "started", "late_result:sent"))
+        self.assertEqual(_run(sl.finish(op2, sl.STATE_SENT)), "applied")
+        self.assertEqual(self.ops()[0]["state"], "sent")
+
+    def test_late_finish_right_after_recovery_keeps_unconfirmed_and_history_consistent(self):
+        op = self._begin()
+        self.set_started_at(op.op_id, sl._now() - datetime.timedelta(minutes=11))
+        self.assertEqual(_run(sl.recover_stale_started()), 1)
+        self.assertEqual(_run(sl.finish(op, sl.STATE_SENT)), "late")
+        self.assertEqual(self.ops()[0]["state"], "unconfirmed")
+        hist = self.history(op.op_id)
+        self.assertEqual([h["reason"] for h in hist],
+                         ["created", "started", "stale_started", "late_result:sent"])
+        self.assertEqual((hist[-1]["from"], hist[-1]["to"]), ("unconfirmed", "unconfirmed"))
+
+    def test_running_process_is_not_recovered_while_heartbeat_or_deadline_alive(self):
+        op_hb = self._begin("evt-hb")
+        self.set_started_at(op_hb.op_id, sl._now() - datetime.timedelta(minutes=11),
+                            heartbeat_at=sl._now() - datetime.timedelta(minutes=1))
+        op_dl = self._begin("evt-dl")
+        self.set_started_at(op_dl.op_id, sl._now() - datetime.timedelta(minutes=11),
+                            deadline_at=sl._now() + datetime.timedelta(minutes=3))
+        self.assertEqual(_run(sl.recover_stale_started()), 0)
+        self.assertEqual(_run(sl.list_unconfirmed()), [])
+        self.assertEqual(_run(sl.confirm_by_human(op_hb.op_id, "failed", "other")),
+                         "already_confirmed")                         # 稼働中は人も確定できない
+        self.assertIs(_run(sl.heartbeat(op_hb)), True)
+        wrong = sl.Operation(**{**op_hb.__dict__, "owner_token": "not-owner"})
+        self.assertIs(_run(sl.heartbeat(wrong)), False)
+        self.assertEqual(_run(sl.finish(wrong, sl.STATE_SENT)), "late")
+        self.assertEqual(_run(sl.finish(op_hb, sl.STATE_SENT)), "applied")
+
+    def test_new_attempt_invalidates_previous_owner_token(self):
+        _FakeClient.responses = [_FakeResp(500, "x")]
+        self.assertIs(self.send("evt-f"), False)                      # 試行 1 failed
+        ops = self.ops()
+        self.assertEqual((ops[0]["state"], ops[0]["attempt_no"]), ("failed", 1))
+        old = sl.Operation(ops[0]["op_id"], ops[0]["conversation_id"],
+                           ops[0]["conversation_version"], None, "jikou", "jikou", "reply",
+                           "bot", 1, ops[0]["owner_token"])
+        self.assertIs(self.send("evt-f"), True)                       # 試行 2 sent
+        self.assertEqual(_run(sl.finish(old, sl.STATE_FAILED)), "late")
+        row = self.ops()[0]
+        self.assertEqual((row["state"], row["attempt_no"]), ("sent", 2))
+        self.assertNotEqual(row["owner_token"], old.owner_token)
+
+    def test_image_redelivery_after_other_event_does_not_advance_or_split_conversation(self):
+        self.touch("img-1", T0)                                        # 画像 E1
+        self.touch("img-2", T0 + datetime.timedelta(days=1))           # 別イベント E2
+        before = self.convs()
+        r = self.touch("img-1", T0 + datetime.timedelta(days=40))      # E1 の再配送（30 日超の時刻を模擬）
+        self.assertEqual((r["created"], r["updated"]), (False, False))
+        after = self.convs()
+        self.assertEqual(len(after), 1)
+        self.assertEqual(after[0]["last_inbound_at"], before[0]["last_inbound_at"])
+        self.assertEqual(after[0]["last_inbound_event_id"], "img-2")
+        touches = _run(self._touches())
+        self.assertEqual(touches, [("img-1", T0), ("img-2", T0 + datetime.timedelta(days=1))])
+
+    def test_first_received_at_is_recorded_not_recomputed(self):
+        r1 = self.touch("img-9")                                       # 受付時の現在時刻を保存
+        self.assertTrue(r1["created"])
+        t_first = _run(self._touches())[0][1]
+        self.touch("img-9", T0)                                        # 再配送（別の時刻でも無視）
+        self.assertEqual(_run(self._touches())[0][1], t_first)
+        self.assertEqual(len(self.convs()), 1)
+
+    def test_human_confirm_from_stale_started_records_two_steps(self):
+        op = self._begin()
+        self.set_started_at(op.op_id, sl._now() - datetime.timedelta(minutes=11))
+        self.assertEqual(_run(sl.confirm_by_human(op.op_id, "failed", "line_not_delivered")), "ok")
+        hist = self.history(op.op_id)
+        self.assertEqual([(h["from"], h["to"], h["reason"]) for h in hist],
+                         [(None, "pending", "created"), ("pending", "started", "started"),
+                          ("started", "unconfirmed", "human_direct"),
+                          ("unconfirmed", "failed", "human:line_not_delivered")])
+        self.assertEqual(self.ops()[0]["state"], "failed")
+
+    def test_late_result_and_human_confirm_race(self):
+        op = self._begin()
+        self.set_started_at(op.op_id, sl._now() - datetime.timedelta(minutes=11))
+        self.assertEqual(_run(sl.recover_stale_started()), 1)
+
+        async def body():
+            barrier = asyncio.Barrier(2)
+
+            async def late():
+                await barrier.wait()
+                return await sl.finish(op, sl.STATE_SENT)
+
+            async def human():
+                await barrier.wait()
+                return await sl.confirm_by_human(op.op_id, "failed", "customer_confirmed")
+            return await asyncio.gather(late(), human())
+        self.assertEqual(_run(body()), ["late", "ok"])
+        self.assertEqual(self.ops()[0]["state"], "failed")
+        reasons = [h["reason"] for h in self.history(op.op_id)]
+        self.assertEqual(reasons.count("human:customer_confirmed"), 1)
+        self.assertEqual(reasons.count("late_result:sent"), 1)
+
+    def test_concurrent_confirms_on_stale_started(self):
+        op = self._begin()
+        self.set_started_at(op.op_id, sl._now() - datetime.timedelta(minutes=11))
+
+        async def body():
+            barrier = asyncio.Barrier(2)
+
+            async def one(outcome):
+                await barrier.wait()
+                return await sl.confirm_by_human(op.op_id, outcome, "other")
+            return await asyncio.gather(one("sent"), one("failed"))
+        self.assertEqual(sorted(_run(body())), ["already_confirmed", "ok"])
+        reasons = [h["reason"] for h in self.history(op.op_id)]
+        self.assertEqual(reasons.count("human_direct"), 1)
+        self.assertEqual(sum(1 for r in reasons if r.startswith("human:")), 1)
+
+    def test_finish_return_values_and_pins(self):
+        self.assertEqual(_run(sl.finish(None, sl.STATE_SENT)), "skipped")
+        self.assertIn("inbound_touch", sl.TABLE_NAMES)
+        self.assertEqual(sl.DEADLINE_MINUTES_DEFAULT, 5)
+        self.assertLess(sl.DEADLINE_MINUTES_DEFAULT, sl.STALE_STARTED_MINUTES_DEFAULT)
+        self.assertIn("human_direct", sl.HISTORY_REASONS)
+        self.assertIn("late_result:sent", sl.HISTORY_REASONS)
 
 
 if __name__ == "__main__":

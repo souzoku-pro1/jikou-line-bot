@@ -38,6 +38,20 @@ follow・受付番号）に **記録と排他だけ** を足す。
 - 停止判定不能の分離（§2・§10-2）: `decide_send()` を純関数で実装するが既存経路には接続しない
   （flag JIKOU_SEND_POLICY_V2=0 既定・本票は `policy_v2_enabled()` の読取のみ）。
 
+fix2（Codex BQ-06〜08）:
+- BQ-06 試行の所有: send_operation に attempt_no（試行番号）と owner_token（着手ごとに新規）を持ち、
+  finish() は「操作 ID かつ started かつ attempt_no・owner_token 一致」の条件付き UPDATE が 1 件の
+  ときだけ状態遷移と履歴を書く。一致しない遅着結果は状態を変えず履歴 late_result:{outcome}
+  （観測状態付き）だけ残す。滞留回収は started_at の経過に加え、処理全体の期限（deadline_at＝
+  着手 + SEND_LEDGER_DEADLINE_MINUTES〔既定 5 分〕）とハートビート（heartbeat()）で稼働中を除く。
+  新しい試行の着手で前試行の owner_token は無効になる。
+- BQ-07 受信の反映済み判定: 新表 inbound_touch（業務・チャネル・受信イベント ID・初回受付時刻・
+  一意）。同じ受信イベント ID は 2 回目以降無視（直前 1 件との比較をやめる）。初回受付時刻は
+  inbound_event.received_at（durable）があればそれ、無ければ受付時の現在時刻を**保存して**使う。
+  画像・text・follow を同じ経路で統一。
+- BQ-08 履歴の遷移元: 人の確定は同一 tx で現在状態を取得（FOR UPDATE・sqlite は rowcount 条件で
+  同等）し、started からは「started → unconfirmed（human_direct）→ 確定状態」の 2 段を履歴に残す。
+
 fail-open の裁定（本票の仮置き・Q3a で見直し）: DB 未設定（DATABASE_URL なし）は記録を素通り、
 DB 例外時は送信を止めず記録失敗を固定語彙でログに出す＝相談者から見える挙動を不変に保つ。
 
@@ -106,16 +120,22 @@ REASON_FAILED = "failed"
 REASON_UNCONFIRMED = "unconfirmed"
 REASON_RETRY_AFTER_FAILED = "retry_after_failed"
 REASON_STALE_STARTED = "stale_started"
+REASON_HUMAN_DIRECT = "human_direct"            # BQ-08: started からの人の確定の 1 段目
+REASON_LATE_RESULT_PREFIX = "late_result:"      # BQ-06: 遅着結果の観測記録（状態は変えない）
 # 人の確定理由（PWA の閉集合）
 HUMAN_REASONS = ("line_delivered", "line_not_delivered", "customer_confirmed", "other")
 HISTORY_REASONS = (REASON_CREATED, REASON_STARTED, REASON_SENT, REASON_FAILED,
-                   REASON_UNCONFIRMED, REASON_RETRY_AFTER_FAILED, REASON_STALE_STARTED) + tuple(
-                       "human:" + r for r in HUMAN_REASONS)
+                   REASON_UNCONFIRMED, REASON_RETRY_AFTER_FAILED, REASON_STALE_STARTED,
+                   REASON_HUMAN_DIRECT) + tuple("human:" + r for r in HUMAN_REASONS) + tuple(
+                       REASON_LATE_RESULT_PREFIX + o for o in (STATE_SENT, STATE_FAILED,
+                                                              STATE_UNCONFIRMED))
 
 CONVERSATION_GAP = datetime.timedelta(days=30)
 POLICY_V2_ENV = "JIKOU_SEND_POLICY_V2"
 STALE_MINUTES_ENV = "SEND_LEDGER_STALE_MINUTES"
 STALE_STARTED_MINUTES_DEFAULT = 10
+DEADLINE_MINUTES_ENV = "SEND_LEDGER_DEADLINE_MINUTES"
+DEADLINE_MINUTES_DEFAULT = 5                     # 処理全体の期限（回収閾値より短い）
 RECOVER_JOB_NAME = "SEND_LEDGER_RECOVER"
 RECOVER_INTERVAL_MINUTES = 5.0
 
@@ -160,7 +180,11 @@ send_operation = sa.Table(
     sa.Column("inbound_seq", sa.Integer, nullable=False, server_default="1"),
     sa.Column("state", sa.Text, nullable=False),
     sa.Column("completed_after_human", sa.Boolean, nullable=False, server_default=sa.false()),
-    sa.Column("attempts", sa.Integer, nullable=False, server_default="1"),
+    # fix2 BQ-06: 試行番号・所有者トークン（着手ごとに新規）・処理全体の期限・ハートビート
+    sa.Column("attempt_no", sa.Integer, nullable=False, server_default="1"),
+    sa.Column("owner_token", sa.Text, nullable=True),
+    sa.Column("deadline_at", sa.DateTime(timezone=True), nullable=True),
+    sa.Column("last_heartbeat_at", sa.DateTime(timezone=True), nullable=True),
     sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
     sa.Column("started_at", sa.DateTime(timezone=True), nullable=True),
     sa.Column("finished_at", sa.DateTime(timezone=True), nullable=True),
@@ -190,7 +214,19 @@ send_operation_history = sa.Table(
     sa.Index("ix_send_operation_history_op", "op_id"),
 )
 
-TABLE_NAMES = ("conversation", "send_operation", "send_operation_history")
+# fix2 BQ-07: 反映済み受信イベント（受信の重複判定・初回受付時刻の正本）
+inbound_touch = sa.Table(
+    "inbound_touch", metadata,
+    sa.Column("touch_id", _BIG, primary_key=True, autoincrement=True),
+    sa.Column("business", sa.Text, nullable=False),
+    sa.Column("channel", sa.Text, nullable=False),
+    sa.Column("inbound_event_id", sa.Text, nullable=False),
+    sa.Column("first_received_at", sa.DateTime(timezone=True), nullable=False),
+    sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+    sa.UniqueConstraint("business", "channel", "inbound_event_id", name="uq_inbound_touch_event"),
+)
+
+TABLE_NAMES = ("conversation", "send_operation", "send_operation_history", "inbound_touch")
 
 
 # ── 文脈（ContextVar） ─────────────────────────────────────────────────────────
@@ -273,6 +309,11 @@ def _lock_key(business: str, user_hash: str, channel: str) -> int:
 def stale_started_minutes() -> int:
     raw = os.environ.get(STALE_MINUTES_ENV, "").strip()
     return int(raw) if raw.isdigit() and int(raw) > 0 else STALE_STARTED_MINUTES_DEFAULT
+
+
+def deadline_minutes() -> int:
+    raw = os.environ.get(DEADLINE_MINUTES_ENV, "").strip()
+    return int(raw) if raw.isdigit() and int(raw) > 0 else DEADLINE_MINUTES_DEFAULT
 
 
 SUPPORTED_DIALECTS = ("postgresql", "sqlite")
@@ -361,7 +402,7 @@ def _db_configured() -> bool:
     return True
 
 
-# ── 受信側: 会話の取得/作成と直近受信時刻（fix1 BQ-03） ───────────────────────
+# ── 受信側: 会話の取得/作成と直近受信時刻（fix1 BQ-03・fix2 BQ-07） ───────────
 async def _inbound_received_at(s, event_id: str):
     """inbound_event に保存済みの受付時刻（durable lane）。無ければ None。"""
     try:
@@ -374,24 +415,43 @@ async def _inbound_received_at(s, event_id: str):
     return _aware(row[0]) if row is not None and row[0] is not None else None
 
 
+async def _record_touch(s, business: str, channel: str, event_id: str, received_at, now):
+    """inbound_touch に反映済み記録を作る。戻り値 (first_received_at, created)。
+    既にあれば（再配送）保存済みの初回受付時刻を返し created=False。"""
+    row = (await s.execute(sa.select(inbound_touch.c.first_received_at).where(
+        inbound_touch.c.business == business, inbound_touch.c.channel == channel,
+        inbound_touch.c.inbound_event_id == str(event_id)))).first()
+    if row is not None:
+        return _aware(row[0]), False
+    at = _aware(received_at) or await _inbound_received_at(s, str(event_id)) or now
+    await s.execute(sa.insert(inbound_touch).values(
+        business=business, channel=channel, inbound_event_id=str(event_id),
+        first_received_at=at, created_at=now))
+    return at, True
+
+
 async def touch_inbound(business: str, user_id: str, event_id: str, *,
                         received_at: datetime.datetime | None = None,
                         channel: str | None = None) -> dict | None:
-    """受信の重複判定を通過した受信イベントごとに呼ぶ（送信の有無と独立）。
-    共通排他の中で: 同じ受信イベント ID を既に反映済みなら何もしない（再配送）／
-    直近受信から 30 日超なら新会話（前会話の attending を引き継ぐ）／直近受信時刻を進める。
+    """受信の重複判定を通過した受信イベントごとに呼ぶ（送信の有無と独立・text/画像/follow 共通）。
+    共通排他の中で: inbound_touch に同じ受信イベント ID が既にあれば何もしない（再配送・
+    直前 1 件との比較ではなく一意記録で判定）／初回受付時刻は inbound_event.received_at
+    （durable）があればそれ、無ければ受付時の現在時刻を保存して使う／直近受信から 30 日超なら
+    新会話（前会話の attending を引き継ぐ）／直近受信時刻を進める。
     戻り値は会話の要約（fail-open: DB 未設定・例外は None）。"""
     if not event_id or not _db_configured():
         return None
     user_hash = line_user_hash(business, user_id)
+    chan = channel or business
     now = _now()
     try:
-        async with _exclusive(business, user_hash, channel or business) as s:
+        async with _exclusive(business, user_hash, chan) as s:
+            at, created_touch = await _record_touch(s, business, chan, str(event_id),
+                                                    received_at, now)
             row = await _latest_conversation(s, business, user_hash)
-            if row is not None and row.last_inbound_event_id == str(event_id):
-                return {"conversation_id": int(row.conversation_id), "created": False,
-                        "updated": False}
-            at = _aware(received_at) or await _inbound_received_at(s, str(event_id)) or now
+            if not created_touch:
+                return {"conversation_id": (int(row.conversation_id) if row is not None else None),
+                        "created": False, "updated": False}
             if row is not None:
                 last = _aware(row.last_inbound_at)
                 if last is None or at <= last + CONVERSATION_GAP:
@@ -418,7 +478,7 @@ async def touch_inbound(business: str, user_id: str, event_id: str, *,
         return None
 
 
-# ── 送信操作（begin / finish） ────────────────────────────────────────────────
+# ── 送信操作（begin / heartbeat / finish） ─────────────────────────────────────
 class _Duplicate:
     """既存操作があるため送らない番兵。"""
 
@@ -443,12 +503,24 @@ class Operation:
     channel: str
     purpose: str
     actor: str
+    attempt_no: int = 1
+    owner_token: str = ""
+
+
+def _owner_match(op):
+    """BQ-06: この試行の所有者だけが状態を進められる条件。"""
+    return sa.and_(send_operation.c.op_id == op.op_id,
+                   send_operation.c.state == STATE_STARTED,
+                   send_operation.c.attempt_no == int(op.attempt_no),
+                   send_operation.c.owner_token == op.owner_token)
 
 
 async def begin(business: str, channel: str, user_id: str, text: str):
     """送信着手: pending で記録 → 排他の中で [直近会話の参照 → 重複の検出 → started]。
     戻り値: Operation（push へ進む）／DUPLICATE_SENT／DUPLICATE_UNCONFIRMED（送らない）／
-    None（記録なし＝素通り: DB 未設定・記録失敗の fail-open）。会話は作らない（BQ-03）。"""
+    None（記録なし＝素通り: DB 未設定・記録失敗の fail-open）。会話は作らない（BQ-03）。
+    fix2 BQ-06: 着手ごとに owner_token を新規発行し、failed の再試行は attempt_no+1
+    （前試行の所有者トークンは無効になる）。処理全体の期限 deadline_at を置く。"""
     if not _db_configured():
         return None
     ctx = _ctx.get()
@@ -462,6 +534,8 @@ async def begin(business: str, channel: str, user_id: str, text: str):
     preset_op_id = ctx.op_id if ctx else None
     user_hash = line_user_hash(business, user_id)
     now = _now()
+    owner = uuid.uuid4().hex
+    deadline = now + datetime.timedelta(minutes=deadline_minutes())
     try:
         async with _exclusive(business, user_hash, channel) as s:
             row = await _latest_conversation(s, business, user_hash)
@@ -488,29 +562,33 @@ async def begin(business: str, channel: str, user_id: str, text: str):
                     conversation.c.conversation_id == conv_id).values(version=new_version))
             if existing is not None:                      # failed の再試行（削除しない）
                 op_id = existing.op_id
+                attempt_no = int(existing.attempt_no) + 1
                 await s.execute(sa.update(send_operation).where(
                     send_operation.c.op_id == op_id).values(
-                    state=STATE_STARTED, attempts=int(existing.attempts) + 1,
+                    state=STATE_STARTED, attempt_no=attempt_no, owner_token=owner,
+                    deadline_at=deadline, last_heartbeat_at=now,
                     conversation_id=conv_id, conversation_version=new_version,
                     started_at=now, finished_at=None, text_version=text_version(text)))
                 await _history(s, op_id, STATE_FAILED, STATE_STARTED,
                                REASON_RETRY_AFTER_FAILED, now)
             else:
                 op_id = preset_op_id or uuid.uuid4().hex
+                attempt_no = 1
                 await s.execute(sa.insert(send_operation).values(
                     op_id=op_id, business=business, channel=channel,
                     conversation_id=conv_id, conversation_version=new_version,
                     actor=actor, purpose=purpose_,
                     first_reply_target=(purpose_ not in FIRST_REPLY_EXCLUDED),
                     text_version=text_version(text), inbound_event_id=event_id,
-                    inbound_seq=seq, state=STATE_PENDING, attempts=1, created_at=now))
+                    inbound_seq=seq, state=STATE_PENDING, attempt_no=1, created_at=now))
                 await _history(s, op_id, None, STATE_PENDING, REASON_CREATED, now)
                 await s.execute(sa.update(send_operation).where(
                     send_operation.c.op_id == op_id).values(
-                    state=STATE_STARTED, started_at=now))
+                    state=STATE_STARTED, started_at=now, owner_token=owner,
+                    deadline_at=deadline, last_heartbeat_at=now))
                 await _history(s, op_id, STATE_PENDING, STATE_STARTED, REASON_STARTED, now)
         return Operation(op_id, conv_id, new_version, human_version, business, channel,
-                         purpose_, actor)
+                         purpose_, actor, attempt_no, owner)
     except UnsupportedDialect:
         raise
     except Exception:
@@ -519,11 +597,29 @@ async def begin(business: str, channel: str, user_id: str, text: str):
         return None
 
 
-async def finish(op: Operation, outcome: str) -> None:
-    """送信結果の確定: sent / failed / unconfirmed（push の例外＝結果不明）。
-    着手後に人の操作（human_version）が入っていれば「人の操作後に完了」の印を付ける。"""
+async def heartbeat(op, *, now=None) -> bool:
+    """稼働中の印（所有者のみ）。戻り値=更新できたか（所有者でなければ False）。"""
     if op is None:
-        return
+        return False
+    now = now or _now()
+    try:
+        async with session_scope() as s:
+            r = await s.execute(sa.update(send_operation).where(_owner_match(op)).values(
+                last_heartbeat_at=now))
+            return int(r.rowcount or 0) == 1
+    except Exception:
+        logger.warning("[SEND_LEDGER] heartbeat failed")
+        return False
+
+
+async def finish(op, outcome: str) -> str:
+    """送信結果の確定: sent / failed / unconfirmed（push の例外＝結果不明）。
+    fix2 BQ-06: 所有者（attempt_no・owner_token）が一致し state=started のときだけ遷移と
+    履歴を書く（"applied"）。一致しない遅着結果は状態を変えず late_result:{outcome} の
+    観測記録（観測状態つき）だけ残す（"late"）。着手後に人の操作（human_version）が入って
+    いれば「人の操作後に完了」の印を付ける。戻り値は固定語彙（applied / late / skipped）。"""
+    if op is None:
+        return "skipped"
     if outcome not in (STATE_SENT, STATE_FAILED, STATE_UNCONFIRMED):
         outcome = STATE_UNCONFIRMED
     now = _now()
@@ -533,36 +629,52 @@ async def finish(op: Operation, outcome: str) -> None:
             if op.conversation_id is not None:
                 hv = (await s.execute(sa.select(conversation.c.human_version).where(
                     conversation.c.conversation_id == op.conversation_id))).scalar()
-                after_human = hv is not None and op.human_version is not None \
-                    and int(hv) != int(op.human_version)
-            await s.execute(sa.update(send_operation).where(
-                send_operation.c.op_id == op.op_id,
-                send_operation.c.state == STATE_STARTED).values(
+                after_human = (hv is not None and op.human_version is not None
+                               and int(hv) != int(op.human_version))
+            r = await s.execute(sa.update(send_operation).where(_owner_match(op)).values(
                 state=outcome, finished_at=now, completed_after_human=after_human))
-            await _history(s, op.op_id, STATE_STARTED, outcome, outcome, now)
+            if int(r.rowcount or 0) == 1:
+                await _history(s, op.op_id, STATE_STARTED, outcome, outcome, now)
+                return "applied"
+            observed = (await s.execute(sa.select(send_operation.c.state).where(
+                send_operation.c.op_id == op.op_id))).scalar()
+            if observed is not None:
+                await _history(s, op.op_id, observed, observed,
+                               REASON_LATE_RESULT_PREFIX + outcome, now)
+            return "late"
     except Exception:
         logger.warning("[SEND_LEDGER] finish failed (outcome not recorded)")
+        return "skipped"
 
 
-# ── 滞留した started の回収（fix1 BQ-02・自動再送なし） ───────────────────────
+# ── 滞留した started の回収（fix1 BQ-02・fix2 BQ-06: 稼働中を除く・自動再送なし） ────
 def _stale_cut(now) -> datetime.datetime:
     return now - datetime.timedelta(minutes=stale_started_minutes())
 
 
+def _stale_started_where(now):
+    """滞留 started: 着手から閾値超、かつ処理全体の期限切れ、かつハートビートも途絶。"""
+    hb_cut = now - datetime.timedelta(minutes=deadline_minutes())
+    return sa.and_(send_operation.c.state == STATE_STARTED,
+                   send_operation.c.started_at < _stale_cut(now),
+                   sa.or_(send_operation.c.deadline_at.is_(None),
+                          send_operation.c.deadline_at < now),
+                   sa.or_(send_operation.c.last_heartbeat_at.is_(None),
+                          send_operation.c.last_heartbeat_at < hb_cut))
+
+
 async def recover_stale_started(*, now=None) -> int:
-    """started のまま閾値を超えて更新が無い操作を unconfirmed に移す（履歴 stale_started）。
-    戻り値=移した件数。稼働中（閾値内）の started は触らない。"""
+    """滞留 started を unconfirmed に移す（履歴 stale_started）。戻り値=移した件数。
+    稼働中（期限内・ハートビート継続）の started は触らない。"""
     now = now or _now()
-    cut = _stale_cut(now)
     moved = 0
     async with session_scope() as s:
         rows = (await s.execute(sa.select(send_operation.c.op_id).where(
-            send_operation.c.state == STATE_STARTED,
-            send_operation.c.started_at < cut))).fetchall()
+            _stale_started_where(now)))).fetchall()
         for (op_id,) in rows:
             r = await s.execute(sa.update(send_operation).where(
-                send_operation.c.op_id == op_id, send_operation.c.state == STATE_STARTED,
-                send_operation.c.started_at < cut).values(state=STATE_UNCONFIRMED))
+                send_operation.c.op_id == op_id, _stale_started_where(now)).values(
+                state=STATE_UNCONFIRMED))
             if int(r.rowcount or 0) == 1:
                 await _history(s, op_id, STATE_STARTED, STATE_UNCONFIRMED,
                                REASON_STALE_STARTED, now)
@@ -596,11 +708,8 @@ def _iso(v) -> str:
 
 
 def _confirmable_where(now):
-    """人の確定を受け付ける操作: unconfirmed、または滞留した started（閾値超）。"""
-    cut = _stale_cut(now)
-    return sa.or_(send_operation.c.state == STATE_UNCONFIRMED,
-                  sa.and_(send_operation.c.state == STATE_STARTED,
-                          send_operation.c.started_at < cut))
+    """人の確定を受け付ける操作: unconfirmed、または滞留した started（稼働中は除く）。"""
+    return sa.or_(send_operation.c.state == STATE_UNCONFIRMED, _stale_started_where(now))
 
 
 async def list_unconfirmed(limit: int = 50, *, now=None) -> list[dict]:
@@ -610,7 +719,7 @@ async def list_unconfirmed(limit: int = 50, *, now=None) -> list[dict]:
         rows = (await s.execute(sa.select(
             send_operation.c.op_id, send_operation.c.business, send_operation.c.channel,
             send_operation.c.purpose, send_operation.c.actor, send_operation.c.state,
-            send_operation.c.started_at, send_operation.c.attempts, conversation.c.ref)
+            send_operation.c.started_at, send_operation.c.attempt_no, conversation.c.ref)
             .select_from(send_operation.outerjoin(
                 conversation, conversation.c.conversation_id == send_operation.c.conversation_id))
             .where(_confirmable_where(now))
@@ -618,7 +727,7 @@ async def list_unconfirmed(limit: int = 50, *, now=None) -> list[dict]:
     return [{"op_id": r.op_id, "business": r.business, "channel": r.channel,
              "purpose": r.purpose, "actor": r.actor, "state": r.state,
              "stale": r.state == STATE_STARTED, "started_at": _iso(r.started_at),
-             "attempts": int(r.attempts), "conversation_ref": r.ref or ""} for r in rows]
+             "attempt_no": int(r.attempt_no), "conversation_ref": r.ref or ""} for r in rows]
 
 
 async def count_unconfirmed(*, now=None) -> int:
@@ -629,22 +738,37 @@ async def count_unconfirmed(*, now=None) -> int:
 
 
 async def confirm_by_human(op_id: str, outcome: str, reason: str, *, now=None) -> str:
-    """unconfirmed（または滞留 started）→ sent / failed。条件付き UPDATE の更新件数が 1 のとき
-    だけ履歴を追加して "ok"。0 件は "already_confirmed"（履歴なし・fix1 BQ-05）。
-    戻り値: "ok" / "not_found" / "already_confirmed" / "bad_input"（固定語彙）。自動再送なし。"""
+    """unconfirmed（または滞留 started）→ sent / failed（人の確定・自動再送なし）。
+    fix2 BQ-08: 同一 tx で現在状態を取得（FOR UPDATE・sqlite は rowcount 条件で同等）し、
+    started からは「started → unconfirmed（human_direct）→ 確定状態」の 2 段を履歴に残す。
+    BQ-05: 各段とも条件付き UPDATE の更新件数が 1 のときだけ履歴を書き、0 件は
+    "already_confirmed"（履歴なし）。戻り値: ok / not_found / already_confirmed / bad_input。"""
     if outcome not in (STATE_SENT, STATE_FAILED) or reason not in HUMAN_REASONS:
         return "bad_input"
     now = now or _now()
     async with session_scope() as s:
+        q = sa.select(send_operation.c.state).where(send_operation.c.op_id == str(op_id))
+        if _dialect() == "postgresql":
+            q = q.with_for_update()
+        observed = (await s.execute(q)).scalar()
+        if observed is None:
+            return "not_found"
+        if observed == STATE_STARTED:
+            r = await s.execute(sa.update(send_operation).where(
+                send_operation.c.op_id == str(op_id), _stale_started_where(now)).values(
+                state=STATE_UNCONFIRMED))
+            if int(r.rowcount or 0) != 1:
+                return "already_confirmed"           # 稼働中、または他者が先に動かした
+            await _history(s, str(op_id), STATE_STARTED, STATE_UNCONFIRMED,
+                           REASON_HUMAN_DIRECT, now)
         r = await s.execute(sa.update(send_operation).where(
-            send_operation.c.op_id == str(op_id), _confirmable_where(now)).values(
+            send_operation.c.op_id == str(op_id),
+            send_operation.c.state == STATE_UNCONFIRMED).values(
             state=outcome, finished_at=now, confirmed_by=ACTOR_HUMAN))
-        if int(r.rowcount or 0) == 1:
-            await _history(s, str(op_id), STATE_UNCONFIRMED, outcome, "human:" + reason, now)
-            return "ok"
-        exists = (await s.execute(sa.select(send_operation.c.op_id).where(
-            send_operation.c.op_id == str(op_id)))).first()
-    return "already_confirmed" if exists is not None else "not_found"
+        if int(r.rowcount or 0) != 1:
+            return "already_confirmed"
+        await _history(s, str(op_id), STATE_UNCONFIRMED, outcome, "human:" + reason, now)
+    return "ok"
 
 
 async def operation_history(op_id: str) -> list[dict]:
