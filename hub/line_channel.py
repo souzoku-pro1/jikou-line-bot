@@ -99,7 +99,7 @@ def verify_line_signature(channel: LineChannelConfig,
 
 async def reply_with_push_fallback(channel: LineChannelConfig,
                                    reply_token: str, to: str,
-                                   text: str) -> None:
+                                   text: str) -> str:
     """LINE Reply APIを試み、失敗（400等）したらPush APIにフォールバック。
 
     実装は旧 main._line_reply_with_fallback の逐語移設（ログ文言・順序とも
@@ -107,18 +107,25 @@ async def reply_with_push_fallback(channel: LineChannelConfig,
 
     JIKOU-REPLY-Q1a: 送信操作記録と共通排他（hub/send_ledger）を通す——
     [pending で記録 → 排他の中で started → push → sent / unconfirmed / failed]。
-    同じ受信イベント・用途の再配送（DUPLICATE）は送らない。記録不能（DB 未設定・
-    DB 例外）は素通り＝HTTP 呼び出し・ログ文言・順序は従来どおり。"""
+    同じ受信イベント・用途の再配送は送らない。記録不能（DB 未設定・DB 例外）は素通り＝
+    HTTP 呼び出し・ログ文言・順序は従来どおり。
+    fix1 BQ-01: 戻り値は 3 値 send_ledger.SEND_SENT（送信成功、または送信済みの重複）／
+    SEND_UNCONFIRMED（結果未確認の重複＝既存操作が pending/started/unconfirmed）／
+    SEND_FAILED（最終的に非 2xx）。通信例外は従来どおり送出（記録は unconfirmed）。"""
     op = await send_ledger.begin(channel.name, channel.name, to, text)
-    if op is send_ledger.DUPLICATE:
-        logger.info("[LINE] duplicate send skipped (send_ledger)")
-        return
+    if op is send_ledger.DUPLICATE_SENT:
+        logger.info("[LINE] duplicate send skipped (send_ledger: already sent)")
+        return send_ledger.SEND_SENT
+    if op is send_ledger.DUPLICATE_UNCONFIRMED:
+        logger.info("[LINE] duplicate send skipped (send_ledger: unconfirmed)")
+        return send_ledger.SEND_UNCONFIRMED
     try:
         ok = await _reply_with_push_fallback_http(channel, reply_token, to, text)
     except BaseException:
         await send_ledger.finish(op, send_ledger.STATE_UNCONFIRMED)
         raise
     await send_ledger.finish(op, send_ledger.STATE_SENT if ok else send_ledger.STATE_FAILED)
+    return send_ledger.SEND_SENT if ok else send_ledger.SEND_FAILED
 
 
 async def _reply_with_push_fallback_http(channel: LineChannelConfig,
@@ -154,7 +161,7 @@ async def _reply_with_push_fallback_http(channel: LineChannelConfig,
     return bool(push_resp.is_success)
 
 
-async def push_text(channel: LineChannelConfig, to: str, text: str) -> bool:
+async def push_text(channel: LineChannelConfig, to: str, text: str) -> bool | str:
     """LINE Push API でメッセージを送信する。送信成功（2xx）で True。
 
     実装は旧 chat_responder.send_line_push の逐語移設（ログ文言不変）。
@@ -163,11 +170,18 @@ async def push_text(channel: LineChannelConfig, to: str, text: str) -> bool:
     戻り値を見ていないため挙動不変（非 2xx を例外化しない・通信例外は従来
     どおり送出のまま。test_image_intake が pin）。
     JIKOU-REPLY-Q1a: 送信操作記録と共通排他を通す（reply_with_push_fallback と同じ
-    [begin → push → finish]・DUPLICATE は送らず True を返す＝呼び出し側から見て送信済み）。"""
+    [begin → push → finish]）。fix1 BQ-01: 戻り値は 3 値——True（2xx、または送信済みの
+    重複）／send_ledger.SEND_UNCONFIRMED（結果未確認の重複＝既存操作が
+    pending/started/unconfirmed・成功として扱わない）／False（非 2xx）。既存 caller の
+    `is True` 判定は SEND_UNCONFIRMED を失敗側へ倒す（None ではなく文字列にして、
+    戻り値 None の mock・旧契約と混同しない）。"""
     op = await send_ledger.begin(channel.name, channel.name, to, text)
-    if op is send_ledger.DUPLICATE:
-        logger.info("[LINE_PUSH] duplicate send skipped (send_ledger)")
+    if op is send_ledger.DUPLICATE_SENT:
+        logger.info("[LINE_PUSH] duplicate send skipped (send_ledger: already sent)")
         return True
+    if op is send_ledger.DUPLICATE_UNCONFIRMED:
+        logger.info("[LINE_PUSH] duplicate send skipped (send_ledger: unconfirmed)")
+        return send_ledger.SEND_UNCONFIRMED
     try:
         ok = await _push_text_http(channel, to, text)
     except BaseException:

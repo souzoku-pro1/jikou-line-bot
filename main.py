@@ -1215,7 +1215,7 @@ async def _process_line_image_event(reply_token: str, user_id: str,
     再配送でも skip されるため、失敗通知→人の手動応答で回収する）。
     AI に画像内容の判断はさせない（読解は別票）。pause → 停止リスト →
     人対応のゲート順はテキストイベントと同一。画像バイナリは保存しない。"""
-    idem_key = _image_idem_key(event_id)
+    idem_key = _image_idem_key(event_id); await send_ledger.touch_inbound("jikou", user_id, event_id)  # JIKOU-REPLY-Q1a-fix1 BQ-03: 受信側で会話を更新（再配送は内部で無視）
     if _autoreply_paused():
         await _handle_paused_inbound(user_id, IMAGE_INBOUND_MARKER, event_id)
         return
@@ -1343,7 +1343,7 @@ async def _process_line_event_durable(reply_token: str, user_id: str, user_text:
                                      mark_line_failed)
     # STOPLIST-fix1（STOPLIST-01）: durable 文脈の event id を内側の停止再確認へ
     # 引き継ぐ（finally で必ず reset＝文脈漏れなし）
-    _ctx_token = _durable_event_id.set(webhook_event_id); _sl_token = send_ledger.bind_inbound(webhook_event_id)  # JIKOU-REPLY-Q1a
+    _ctx_token = _durable_event_id.set(webhook_event_id); _sl_token = send_ledger.bind_inbound(webhook_event_id); await send_ledger.touch_inbound("jikou", user_id, webhook_event_id)  # JIKOU-REPLY-Q1a(+fix1 BQ-03: 受信側で会話を更新)
     try:
         if not already_claimed and not await mark_line_processing(webhook_event_id):
             logger.info("[DURABLE] ownership not acquired (claimed by "
@@ -1595,9 +1595,9 @@ async def kintone_approval_webhook(request: Request):
     # LINE push 送信 → 送信済みフラグ更新 → チャットログ保存
     # RV-04c §4.2 phase 表: marker 後の失敗（例外・timeout）は sending 維持（failed 上書き禁止・
     # 不明は不明のまま §4.2 runbook へ）。例外は握らず伝播させ、state は sending に留める。
-    async with send_ledger.approved_draft(f"approval:{record_id}:{record.get('$revision', {}).get('value', '')}"): await send_line_push(user_id, ai_draft)  # JIKOU-REPLY-Q1a
-    await mark_approval_sent(record_id)
-    await save_to_chatlog(user_id, "assistant", ai_draft, category, "yes")
+    async with send_ledger.approved_draft(f"approval:{record_id}:{record.get('$revision', {}).get('value', '')}"): _sl_res = await send_line_push(user_id, ai_draft)  # JIKOU-REPLY-Q1a
+    if _sl_res == send_ledger.SEND_UNCONFIRMED: return {"ok": True, "skip": "send_unconfirmed_duplicate"}  # JIKOU-REPLY-Q1a-fix1 BQ-01: 結果未確認の重複は送信済更新・記録へ進まない（sending 維持=§4.2 runbook）
+    await mark_approval_sent(record_id); await save_to_chatlog(user_id, "assistant", ai_draft, category, "yes")
     if _ev:
         await mark_done(_ev)   # 全副作用完了後の terminal（sending→done・last_error=NULL）
 
@@ -2297,6 +2297,8 @@ async def _process_follow_event(reply_token: str, user_id: str, event_id: str,
         if not already_claimed and not await mark_line_processing(event_id):
             logger.info("[FOLLOW] ownership not acquired (claimed by redelivery)")
             return
+        # JIKOU-REPLY-Q1a-fix1 BQ-03: 受信側で会話を更新（送信の有無と独立・再配送は無視）
+        await send_ledger.touch_inbound("jikou", user_id, event_id)
         if _autoreply_paused():
             logger.info("[FOLLOW] paused (no send)")
         elif await autoreply_stoplist.is_suppressed(user_id):
@@ -2347,3 +2349,7 @@ register_brain_sync_job()
 from hub import send_ledger  # noqa: E402
 from hub.webapp_send_ops_view import router as send_ops_router  # noqa: E402
 include_before_catch_all(app, send_ops_router)
+# fix1 BQ-02: 滞留 started の回収ジョブ（既存 scheduler の interval・flag 不要・自動再送なし）
+send_ledger.register_recover_job()
+# fix1: 非 Postgres の排他代替は sqlite のみ（DATABASE_URL 設定時・他方言は起動時に例外）
+send_ledger.check_dialect_at_startup()

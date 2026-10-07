@@ -8,23 +8,33 @@ follow・受付番号）に **記録と排他だけ** を足す。
 構成:
 - 表: conversation（会話）・send_operation（送信操作記録）・send_operation_history（状態遷移
   履歴・RV-08: 削除せず追加）。migration は alembic の明示コマンドのみ（起動時に走らせない）。
-- 送信フック: hub/line_channel の 2 プリミティブ（reply_with_push_fallback / push_text）が
+- 受信側（fix1 BQ-03）: 会話の取得/作成と直近受信時刻の更新は `touch_inbound()`——受信の重複
+  判定を通過した受信イベントの受付時刻（inbound_event に保存済みの時刻・無ければ受付時の
+  現在時刻）で行い、送信の有無と独立。再配送（同じ受信イベント ID）では更新しない。30 日超で
+  新会話を作るときは前会話の attending（対応中）を引き継ぐ。
+- 送信側: hub/line_channel の 2 プリミティブ（reply_with_push_fallback / push_text）が
   `begin()` → [LINE push] → `finish()` を呼ぶ。各送信は
   [pending で記録 → 共通排他の中で started → push → sent / unconfirmed / failed] の順。
+  送信時には会話を作らない（確定済みの直近会話を参照・無ければ会話 ID NULL で記録）。
 - 文脈: 用途・主体・受信イベント ID は ContextVar で束ねる（`bind_inbound` / `purpose` /
   `approved_draft`）。束ねが無い送信は 用途=reply・主体=bot・受信イベント ID=NULL。
 - 共通排他（§10-5）: 業務・line_user_hash・チャネル単位。Postgres は
-  `pg_advisory_xact_lock`（トランザクション終了で解放）、sqlite はテスト用の process 内
-  asyncio.Lock。会話の作成（30 日超の無受信で新会話・受付時刻で判定・同一 userId で同時に
-  2 つ作らない）と送信着手の確定（started）はこの排他の中で行い、LINE push の待機中は
-  保持しない（着手確定＝commit で解放）。
-- 再配送: 同じ受信イベント ID＋用途＋連番の送信操作が started/sent/unconfirmed/pending で
-  既にあれば二重送信しない（DUPLICATE）。inbound_event（durable lane）は「受信配送の受付と
-  処理所有権」、本記録は「送信段階の二重送信遮断」＝分担（両方が効いても二重にならない）。
-- 送信確認待ち（unconfirmed）: push の例外（結果不明）で置く。自動再送はしない。人が
-  `confirm_by_human()` で sent / failed に確定し、理由を履歴に残す（PWA: hub/webapp_send_ops_view）。
-- 対応中（§10-1・R-J11）: 表と遷移関数（set_attending / end_attending）のみ。既存経路は参照
-  しない（参照は Q1c・画面は Q1b）。
+  `pg_advisory_xact_lock`（トランザクション終了で解放）。非 Postgres の asyncio.Lock 代替は
+  **DATABASE_URL が sqlite のときだけ**許可し、それ以外は例外（本番で誤って使われない担保・
+  fix1）。LINE push の待機中は保持しない（着手確定＝commit で解放）。
+- 再配送（fix1 BQ-01）: 同じ受信イベント ID＋用途＋連番（または同じ操作 ID）の既存操作が
+  sent なら DUPLICATE_SENT（送らない・送信済みとして扱う）、pending/started/unconfirmed なら
+  DUPLICATE_UNCONFIRMED（送らない・結果未確認として扱う＝呼び出し元は成功側へ進まない）、
+  failed なら同じ操作を attempts+1 で再試行。inbound_event（durable lane）は「受信配送の受付と
+  処理所有権」、本記録は「送信段階の二重送信遮断」＝分担。
+- 送信確認待ち（unconfirmed）: push の例外（結果不明）で置く。started のまま一定時間
+  （SEND_LEDGER_STALE_MINUTES・既定 10 分）更新が無い操作は回収ジョブ（fix1 BQ-02・既存
+  scheduler の interval）が unconfirmed に移す（履歴 stale_started）。自動再送はしない。人が
+  `confirm_by_human()` で sent / failed に確定し、条件付き UPDATE の更新件数が 1 のときだけ
+  履歴を追加して ok（fix1 BQ-05・競合側は履歴なし）。
+- 対応中（§10-1・R-J11）: 表と遷移関数（set_attending / end_attending）のみ。人の操作は
+  human_version（fix1 BQ-04）を進め、completed_after_human は着手時と完了時の human_version
+  の差で判定する（bot 送信同士では立たない）。既存経路は参照しない（参照は Q1c・画面は Q1b）。
 - 停止判定不能の分離（§2・§10-2）: `decide_send()` を純関数で実装するが既存経路には接続しない
   （flag JIKOU_SEND_POLICY_V2=0 既定・本票は `policy_v2_enabled()` の読取のみ）。
 
@@ -81,8 +91,13 @@ STATE_SENT = "sent"
 STATE_UNCONFIRMED = "unconfirmed"
 STATE_FAILED = "failed"
 STATES = (STATE_PENDING, STATE_STARTED, STATE_SENT, STATE_UNCONFIRMED, STATE_FAILED)
-# 同じ受信イベント・用途・連番の既存操作がこの状態なら二重送信しない
-_BLOCKING_STATES = frozenset({STATE_PENDING, STATE_STARTED, STATE_SENT, STATE_UNCONFIRMED})
+# 既存操作がこの状態なら「結果未確認の重複」（fix1 BQ-01）
+_UNCONFIRMED_LIKE = frozenset({STATE_PENDING, STATE_STARTED, STATE_UNCONFIRMED})
+
+# 送信フックの 3 値戻り値（reply_with_push_fallback）。push_text は True / None / False
+SEND_SENT = "sent"
+SEND_UNCONFIRMED = "unconfirmed"
+SEND_FAILED = "failed"
 
 REASON_CREATED = "created"
 REASON_STARTED = "started"
@@ -90,14 +105,19 @@ REASON_SENT = "sent"
 REASON_FAILED = "failed"
 REASON_UNCONFIRMED = "unconfirmed"
 REASON_RETRY_AFTER_FAILED = "retry_after_failed"
+REASON_STALE_STARTED = "stale_started"
 # 人の確定理由（PWA の閉集合）
 HUMAN_REASONS = ("line_delivered", "line_not_delivered", "customer_confirmed", "other")
 HISTORY_REASONS = (REASON_CREATED, REASON_STARTED, REASON_SENT, REASON_FAILED,
-                   REASON_UNCONFIRMED, REASON_RETRY_AFTER_FAILED) + tuple(
+                   REASON_UNCONFIRMED, REASON_RETRY_AFTER_FAILED, REASON_STALE_STARTED) + tuple(
                        "human:" + r for r in HUMAN_REASONS)
 
 CONVERSATION_GAP = datetime.timedelta(days=30)
 POLICY_V2_ENV = "JIKOU_SEND_POLICY_V2"
+STALE_MINUTES_ENV = "SEND_LEDGER_STALE_MINUTES"
+STALE_STARTED_MINUTES_DEFAULT = 10
+RECOVER_JOB_NAME = "SEND_LEDGER_RECOVER"
+RECOVER_INTERVAL_MINUTES = 5.0
 
 # ── 表 ──────────────────────────────────────────────────────────────────────
 conversation = sa.Table(
@@ -109,10 +129,14 @@ conversation = sa.Table(
     sa.Column("line_user_hash", sa.Text, nullable=False),
     sa.Column("started_at", sa.DateTime(timezone=True), nullable=False),
     sa.Column("version", _BIG, nullable=False, server_default="1"),
+    # fix1 BQ-04: 人の操作でのみ進む版（対応中への切替・対応終了）
+    sa.Column("human_version", _BIG, nullable=False, server_default="1"),
     sa.Column("attending", sa.Boolean, nullable=False, server_default=sa.false()),
     sa.Column("attending_since", sa.DateTime(timezone=True), nullable=True),
     sa.Column("attending_until", sa.DateTime(timezone=True), nullable=True),
     sa.Column("last_inbound_at", sa.DateTime(timezone=True), nullable=True),
+    # fix1 BQ-03: 直近に反映した受信イベント ID（再配送で直近受信時刻を更新しない）
+    sa.Column("last_inbound_event_id", sa.Text, nullable=True),
     sa.Column("created_at", sa.DateTime(timezone=True), nullable=False,
               server_default=sa.func.now()),
     sa.Index("ix_conversation_user", "business", "line_user_hash", "started_at"),
@@ -123,9 +147,10 @@ send_operation = sa.Table(
     sa.Column("op_id", sa.Text, primary_key=True),
     sa.Column("business", sa.Text, nullable=False),
     sa.Column("channel", sa.Text, nullable=False),
+    # fix1 BQ-03: 受信を伴わない送信で会話が無ければ NULL（送信時には会話を作らない）
     sa.Column("conversation_id", _BIG, sa.ForeignKey("conversation.conversation_id"),
-              nullable=False),
-    sa.Column("conversation_version", _BIG, nullable=False),
+              nullable=True),
+    sa.Column("conversation_version", _BIG, nullable=True),
     sa.Column("actor", sa.Text, nullable=False),
     sa.Column("purpose", sa.Text, nullable=False),
     sa.Column("first_reply_target", sa.Boolean, nullable=False),
@@ -172,7 +197,6 @@ TABLE_NAMES = ("conversation", "send_operation", "send_operation_history")
 @dataclass
 class SendContext:
     inbound_event_id: str | None = None
-    received_at: datetime.datetime | None = None
     purpose: str | None = None
     actor: str = ACTOR_BOT
     op_id: str | None = None
@@ -186,11 +210,10 @@ def _now() -> datetime.datetime:
     return datetime.datetime.now(datetime.timezone.utc)
 
 
-def bind_inbound(event_id: str | None, received_at: datetime.datetime | None = None):
-    """受信イベントの文脈を束ねる（durable lane の event id・受付時刻）。戻り値は
-    `unbind()` に渡す token。event_id が空なら受信イベント ID なしの文脈。"""
-    ctx = SendContext(inbound_event_id=(str(event_id) if event_id else None),
-                      received_at=received_at or _now())
+def bind_inbound(event_id: str | None):
+    """受信イベントの文脈を束ねる（durable lane の event id）。戻り値は `unbind()` に渡す
+    token。event_id が空なら受信イベント ID なしの文脈。会話の更新は `touch_inbound()`。"""
+    ctx = SendContext(inbound_event_id=(str(event_id) if event_id else None))
     return _ctx.set(ctx)
 
 
@@ -205,7 +228,7 @@ def current_context() -> SendContext | None:
 @contextlib.contextmanager
 def purpose(name: str):
     """送信の用途を束ねる（閉集合外は other）。同期 context manager。"""
-    base = _ctx.get() or SendContext(received_at=None)
+    base = _ctx.get() or SendContext()
     token = _ctx.set(replace(base, purpose=(name if name in PURPOSES else PURPOSE_OTHER)))
     try:
         yield
@@ -222,7 +245,7 @@ async def with_purpose(name: str, fn, *args, **kwargs):
 @contextlib.asynccontextmanager
 async def approved_draft(op_id: str):
     """承認済み下書きの送信（主体=approved_draft・操作 ID 固定・用途=reply）。"""
-    base = _ctx.get() or SendContext(received_at=None)
+    base = _ctx.get() or SendContext()
     token = _ctx.set(replace(base, actor=ACTOR_APPROVED_DRAFT, purpose=PURPOSE_REPLY,
                              op_id=str(op_id), inbound_event_id=None))
     try:
@@ -247,8 +270,35 @@ def _lock_key(business: str, user_hash: str, channel: str) -> int:
     return int.from_bytes(digest[:8], "big", signed=True)
 
 
+def stale_started_minutes() -> int:
+    raw = os.environ.get(STALE_MINUTES_ENV, "").strip()
+    return int(raw) if raw.isdigit() and int(raw) > 0 else STALE_STARTED_MINUTES_DEFAULT
+
+
+SUPPORTED_DIALECTS = ("postgresql", "sqlite")
+
+
+class UnsupportedDialect(RuntimeError):
+    """fix1: 非 Postgres の排他代替は sqlite（テスト）だけ。他方言は使わせない。"""
+
+
 def _dialect() -> str:
-    return db.get_async_engine().dialect.name
+    name = db.get_async_engine().dialect.name
+    if name not in SUPPORTED_DIALECTS:
+        raise UnsupportedDialect("send_ledger_unsupported_dialect")
+    return name
+
+
+def check_dialect_at_startup() -> None:
+    """起動時の担保（main の末尾から呼ぶ）: DATABASE_URL が設定されていて方言が
+    postgresql / sqlite 以外なら例外（URL の値は出さない）。未設定は何もしない。"""
+    try:
+        url = db.database_url()
+    except DatabaseNotConfigured:
+        return
+    scheme = url.split("://", 1)[0].split("+", 1)[0]
+    if scheme not in SUPPORTED_DIALECTS:
+        raise UnsupportedDialect("send_ledger_unsupported_dialect")
 
 
 # sqlite 用の process 内排他（イベントループごとに持つ＝テストの asyncio.run 跨ぎでも
@@ -271,10 +321,11 @@ def _local_lock(key: int) -> asyncio.Lock:
 
 @contextlib.asynccontextmanager
 async def _exclusive(business: str, user_hash: str, channel: str):
-    """共通排他: Postgres は tx 内 advisory lock・それ以外（sqlite）は process 内 Lock。
+    """共通排他: Postgres は tx 内 advisory lock・sqlite は process 内 Lock（他方言は例外）。
     yield する session はこの排他の中のトランザクション。commit で解放。"""
     key = _lock_key(business, user_hash, channel)
-    if _dialect() == "postgresql":
+    dialect = _dialect()
+    if dialect == "postgresql":
         async with session_scope() as s:
             await s.execute(sa.text("SELECT pg_advisory_xact_lock(:k)"), {"k": key})
             yield s
@@ -289,51 +340,17 @@ async def _history(s, op_id: str, from_state, to_state: str, reason: str, now) -
         op_id=op_id, from_state=from_state, to_state=to_state, reason=reason, at=now))
 
 
-async def _get_or_create_conversation(s, business: str, user_hash: str,
-                                      received_at, now) -> tuple:
-    """排他の中で呼ぶ。戻り値 (conversation_id, version, created)。
-    新会話の条件: 無し／直近受信（重複除外済み）から 30 日超（受付時刻で判定）。
-    遅着（受付時刻が直近受信より古い）は旧会話を再生成せず現会話に属する。"""
-    row = (await s.execute(sa.select(conversation).where(
+def _aware(v):
+    if v is not None and v.tzinfo is None:
+        v = v.replace(tzinfo=datetime.timezone.utc)
+    return v
+
+
+async def _latest_conversation(s, business: str, user_hash: str):
+    return (await s.execute(sa.select(conversation).where(
         conversation.c.business == business, conversation.c.line_user_hash == user_hash)
         .order_by(conversation.c.started_at.desc(), conversation.c.conversation_id.desc())
         .limit(1))).first()
-    at = received_at or now
-    if row is not None:
-        last = row.last_inbound_at
-        if last is not None and last.tzinfo is None:
-            last = last.replace(tzinfo=datetime.timezone.utc)
-        stale = last is not None and at > last + CONVERSATION_GAP
-        if not stale:
-            if received_at is not None and (last is None or at > last):
-                await s.execute(sa.update(conversation).where(
-                    conversation.c.conversation_id == row.conversation_id).values(
-                    last_inbound_at=at))
-            return int(row.conversation_id), int(row.version), False
-    res = await s.execute(sa.insert(conversation).values(
-        ref=uuid.uuid4().hex, business=business, line_user_hash=user_hash,
-        started_at=at, version=1, attending=False,
-        last_inbound_at=(at if received_at is not None else None), created_at=now))
-    return int(res.inserted_primary_key[0]), 1, True
-
-
-# ── 送信操作（begin / finish） ────────────────────────────────────────────────
-class Duplicate:
-    """同じ受信イベント（または同じ操作 ID）の送信操作が既にある＝二重送信しない番兵。"""
-
-
-DUPLICATE = Duplicate()
-
-
-@dataclass
-class Operation:
-    op_id: str
-    conversation_id: int
-    conversation_version: int
-    business: str
-    channel: str
-    purpose: str
-    actor: str
 
 
 def _db_configured() -> bool:
@@ -344,17 +361,100 @@ def _db_configured() -> bool:
     return True
 
 
+# ── 受信側: 会話の取得/作成と直近受信時刻（fix1 BQ-03） ───────────────────────
+async def _inbound_received_at(s, event_id: str):
+    """inbound_event に保存済みの受付時刻（durable lane）。無ければ None。"""
+    try:
+        from hub.durable_inbound import line_dedup_key
+        from hub.inbound_event import InboundEvent
+        row = (await s.execute(sa.select(InboundEvent.received_at).where(
+            InboundEvent.dedup_key == line_dedup_key(event_id)))).first()
+    except Exception:
+        return None
+    return _aware(row[0]) if row is not None and row[0] is not None else None
+
+
+async def touch_inbound(business: str, user_id: str, event_id: str, *,
+                        received_at: datetime.datetime | None = None,
+                        channel: str | None = None) -> dict | None:
+    """受信の重複判定を通過した受信イベントごとに呼ぶ（送信の有無と独立）。
+    共通排他の中で: 同じ受信イベント ID を既に反映済みなら何もしない（再配送）／
+    直近受信から 30 日超なら新会話（前会話の attending を引き継ぐ）／直近受信時刻を進める。
+    戻り値は会話の要約（fail-open: DB 未設定・例外は None）。"""
+    if not event_id or not _db_configured():
+        return None
+    user_hash = line_user_hash(business, user_id)
+    now = _now()
+    try:
+        async with _exclusive(business, user_hash, channel or business) as s:
+            row = await _latest_conversation(s, business, user_hash)
+            if row is not None and row.last_inbound_event_id == str(event_id):
+                return {"conversation_id": int(row.conversation_id), "created": False,
+                        "updated": False}
+            at = _aware(received_at) or await _inbound_received_at(s, str(event_id)) or now
+            if row is not None:
+                last = _aware(row.last_inbound_at)
+                if last is None or at <= last + CONVERSATION_GAP:
+                    values = {"last_inbound_event_id": str(event_id)}
+                    if last is None or at > last:
+                        values["last_inbound_at"] = at
+                    await s.execute(sa.update(conversation).where(
+                        conversation.c.conversation_id == row.conversation_id).values(**values))
+                    return {"conversation_id": int(row.conversation_id), "created": False,
+                            "updated": True}
+            # 新会話（初回、または 30 日超）。前会話の対応中は引き継ぐ
+            attending = bool(row.attending) if row is not None else False
+            res = await s.execute(sa.insert(conversation).values(
+                ref=uuid.uuid4().hex, business=business, line_user_hash=user_hash,
+                started_at=at, version=1, human_version=1, attending=attending,
+                attending_since=(row.attending_since if (row is not None and attending) else None),
+                last_inbound_at=at, last_inbound_event_id=str(event_id), created_at=now))
+            return {"conversation_id": int(res.inserted_primary_key[0]), "created": True,
+                    "updated": True}
+    except UnsupportedDialect:
+        raise
+    except Exception:
+        logger.warning("[SEND_LEDGER] touch_inbound failed (conversation not updated)")
+        return None
+
+
+# ── 送信操作（begin / finish） ────────────────────────────────────────────────
+class _Duplicate:
+    """既存操作があるため送らない番兵。"""
+
+    def __init__(self, kind: str):
+        self.kind = kind
+
+    def __repr__(self) -> str:
+        return f"<Duplicate {self.kind}>"
+
+
+DUPLICATE_SENT = _Duplicate("sent")                 # 送信済みの重複（成功として扱う）
+DUPLICATE_UNCONFIRMED = _Duplicate("unconfirmed")   # 結果未確認の重複（成功として扱わない）
+
+
+@dataclass
+class Operation:
+    op_id: str
+    conversation_id: int | None
+    conversation_version: int | None
+    human_version: int | None
+    business: str
+    channel: str
+    purpose: str
+    actor: str
+
+
 async def begin(business: str, channel: str, user_id: str, text: str):
-    """送信着手: pending で記録 → 排他の中で [会話の取得/作成 → 再配送の検出 → started]。
-    戻り値: Operation（push へ進む）／DUPLICATE（送らない）／None（記録なし＝素通り:
-    DB 未設定・記録失敗の fail-open）。"""
+    """送信着手: pending で記録 → 排他の中で [直近会話の参照 → 重複の検出 → started]。
+    戻り値: Operation（push へ進む）／DUPLICATE_SENT／DUPLICATE_UNCONFIRMED（送らない）／
+    None（記録なし＝素通り: DB 未設定・記録失敗の fail-open）。会話は作らない（BQ-03）。"""
     if not _db_configured():
         return None
     ctx = _ctx.get()
     purpose_ = (ctx.purpose if ctx and ctx.purpose in PURPOSES else PURPOSE_REPLY)
     actor = (ctx.actor if ctx and ctx.actor in ACTORS else ACTOR_BOT)
     event_id = ctx.inbound_event_id if ctx else None
-    received_at = ctx.received_at if ctx else None
     seq = 1
     if ctx is not None and event_id:
         ctx.seq[0] += 1
@@ -364,8 +464,10 @@ async def begin(business: str, channel: str, user_id: str, text: str):
     now = _now()
     try:
         async with _exclusive(business, user_hash, channel) as s:
-            conv_id, version, _created = await _get_or_create_conversation(
-                s, business, user_hash, received_at, now)
+            row = await _latest_conversation(s, business, user_hash)
+            conv_id = int(row.conversation_id) if row is not None else None
+            human_version = int(row.human_version) if row is not None else None
+            new_version = (int(row.version) + 1) if row is not None else None
             existing = None
             if preset_op_id:
                 existing = (await s.execute(sa.select(send_operation).where(
@@ -377,18 +479,20 @@ async def begin(business: str, channel: str, user_id: str, text: str):
                     send_operation.c.inbound_event_id == event_id,
                     send_operation.c.purpose == purpose_,
                     send_operation.c.inbound_seq == seq))).first()
-            if existing is not None and existing.state in _BLOCKING_STATES:
-                return DUPLICATE
-            new_version = version + 1
-            await s.execute(sa.update(conversation).where(
-                conversation.c.conversation_id == conv_id).values(version=new_version))
+            if existing is not None and existing.state == STATE_SENT:
+                return DUPLICATE_SENT
+            if existing is not None and existing.state in _UNCONFIRMED_LIKE:
+                return DUPLICATE_UNCONFIRMED
+            if row is not None:
+                await s.execute(sa.update(conversation).where(
+                    conversation.c.conversation_id == conv_id).values(version=new_version))
             if existing is not None:                      # failed の再試行（削除しない）
                 op_id = existing.op_id
                 await s.execute(sa.update(send_operation).where(
                     send_operation.c.op_id == op_id).values(
                     state=STATE_STARTED, attempts=int(existing.attempts) + 1,
-                    conversation_version=new_version, started_at=now, finished_at=None,
-                    text_version=text_version(text)))
+                    conversation_id=conv_id, conversation_version=new_version,
+                    started_at=now, finished_at=None, text_version=text_version(text)))
                 await _history(s, op_id, STATE_FAILED, STATE_STARTED,
                                REASON_RETRY_AFTER_FAILED, now)
             else:
@@ -405,7 +509,10 @@ async def begin(business: str, channel: str, user_id: str, text: str):
                     send_operation.c.op_id == op_id).values(
                     state=STATE_STARTED, started_at=now))
                 await _history(s, op_id, STATE_PENDING, STATE_STARTED, REASON_STARTED, now)
-        return Operation(op_id, conv_id, new_version, business, channel, purpose_, actor)
+        return Operation(op_id, conv_id, new_version, human_version, business, channel,
+                         purpose_, actor)
+    except UnsupportedDialect:
+        raise
     except Exception:
         # fail-open（本票の裁定）: 記録できなくても送信は従来どおり。固定語彙のみ
         logger.warning("[SEND_LEDGER] begin failed (record skipped, send continues)")
@@ -414,7 +521,7 @@ async def begin(business: str, channel: str, user_id: str, text: str):
 
 async def finish(op: Operation, outcome: str) -> None:
     """送信結果の確定: sent / failed / unconfirmed（push の例外＝結果不明）。
-    着手後に会話版が進んでいれば「人の操作後に完了」の印を付ける。"""
+    着手後に人の操作（human_version）が入っていれば「人の操作後に完了」の印を付ける。"""
     if op is None:
         return
     if outcome not in (STATE_SENT, STATE_FAILED, STATE_UNCONFIRMED):
@@ -422,9 +529,12 @@ async def finish(op: Operation, outcome: str) -> None:
     now = _now()
     try:
         async with session_scope() as s:
-            ver = (await s.execute(sa.select(conversation.c.version).where(
-                conversation.c.conversation_id == op.conversation_id))).scalar()
-            after_human = ver is not None and int(ver) != int(op.conversation_version)
+            after_human = False
+            if op.conversation_id is not None:
+                hv = (await s.execute(sa.select(conversation.c.human_version).where(
+                    conversation.c.conversation_id == op.conversation_id))).scalar()
+                after_human = hv is not None and op.human_version is not None \
+                    and int(hv) != int(op.human_version)
             await s.execute(sa.update(send_operation).where(
                 send_operation.c.op_id == op.op_id,
                 send_operation.c.state == STATE_STARTED).values(
@@ -434,55 +544,107 @@ async def finish(op: Operation, outcome: str) -> None:
         logger.warning("[SEND_LEDGER] finish failed (outcome not recorded)")
 
 
+# ── 滞留した started の回収（fix1 BQ-02・自動再送なし） ───────────────────────
+def _stale_cut(now) -> datetime.datetime:
+    return now - datetime.timedelta(minutes=stale_started_minutes())
+
+
+async def recover_stale_started(*, now=None) -> int:
+    """started のまま閾値を超えて更新が無い操作を unconfirmed に移す（履歴 stale_started）。
+    戻り値=移した件数。稼働中（閾値内）の started は触らない。"""
+    now = now or _now()
+    cut = _stale_cut(now)
+    moved = 0
+    async with session_scope() as s:
+        rows = (await s.execute(sa.select(send_operation.c.op_id).where(
+            send_operation.c.state == STATE_STARTED,
+            send_operation.c.started_at < cut))).fetchall()
+        for (op_id,) in rows:
+            r = await s.execute(sa.update(send_operation).where(
+                send_operation.c.op_id == op_id, send_operation.c.state == STATE_STARTED,
+                send_operation.c.started_at < cut).values(state=STATE_UNCONFIRMED))
+            if int(r.rowcount or 0) == 1:
+                await _history(s, op_id, STATE_STARTED, STATE_UNCONFIRMED,
+                               REASON_STALE_STARTED, now)
+                moved += 1
+    return moved
+
+
+async def run_recover_job() -> None:
+    """scheduler の interval job 本体（DB 未設定は何もしない・例外は固定語彙で握る）。"""
+    if not _db_configured():
+        return
+    try:
+        await recover_stale_started()
+    except Exception:
+        logger.warning("[SEND_LEDGER] recover job failed (fixed reason)")
+
+
+def register_recover_job() -> None:
+    """既存 scheduler へ interval 登録（flag 不要・main の末尾から呼ぶ・冪等）。"""
+    from hub import scheduler as hub_scheduler
+    if not hub_scheduler.is_registered(RECOVER_JOB_NAME):
+        hub_scheduler.register_interval(RECOVER_JOB_NAME, RECOVER_INTERVAL_MINUTES,
+                                        run_recover_job)
+
+
 # ── 送信確認待ちの表示と人の確定 ──────────────────────────────────────────────
 def _iso(v) -> str:
     if v is None:
         return ""
-    if v.tzinfo is None:
-        v = v.replace(tzinfo=datetime.timezone.utc)
-    return v.isoformat()
+    return _aware(v).isoformat()
 
 
-async def list_unconfirmed(limit: int = 50) -> list[dict]:
-    """unconfirmed の一覧（本文・氏名・LINE userId なし。会話は不透明参照 ID）。"""
+def _confirmable_where(now):
+    """人の確定を受け付ける操作: unconfirmed、または滞留した started（閾値超）。"""
+    cut = _stale_cut(now)
+    return sa.or_(send_operation.c.state == STATE_UNCONFIRMED,
+                  sa.and_(send_operation.c.state == STATE_STARTED,
+                          send_operation.c.started_at < cut))
+
+
+async def list_unconfirmed(limit: int = 50, *, now=None) -> list[dict]:
+    """unconfirmed と滞留 started の一覧（本文・氏名・LINE userId なし。会話は不透明参照 ID）。"""
+    now = now or _now()
     async with session_scope() as s:
         rows = (await s.execute(sa.select(
             send_operation.c.op_id, send_operation.c.business, send_operation.c.channel,
-            send_operation.c.purpose, send_operation.c.actor, send_operation.c.started_at,
-            send_operation.c.attempts, conversation.c.ref).join(
-            conversation, conversation.c.conversation_id == send_operation.c.conversation_id)
-            .where(send_operation.c.state == STATE_UNCONFIRMED)
+            send_operation.c.purpose, send_operation.c.actor, send_operation.c.state,
+            send_operation.c.started_at, send_operation.c.attempts, conversation.c.ref)
+            .select_from(send_operation.outerjoin(
+                conversation, conversation.c.conversation_id == send_operation.c.conversation_id))
+            .where(_confirmable_where(now))
             .order_by(send_operation.c.started_at.asc()).limit(int(limit)))).fetchall()
     return [{"op_id": r.op_id, "business": r.business, "channel": r.channel,
-             "purpose": r.purpose, "actor": r.actor, "started_at": _iso(r.started_at),
-             "attempts": int(r.attempts), "conversation_ref": r.ref} for r in rows]
+             "purpose": r.purpose, "actor": r.actor, "state": r.state,
+             "stale": r.state == STATE_STARTED, "started_at": _iso(r.started_at),
+             "attempts": int(r.attempts), "conversation_ref": r.ref or ""} for r in rows]
 
 
-async def count_unconfirmed() -> int:
+async def count_unconfirmed(*, now=None) -> int:
+    now = now or _now()
     async with session_scope() as s:
         return int((await s.execute(sa.select(sa.func.count()).select_from(send_operation)
-                                    .where(send_operation.c.state == STATE_UNCONFIRMED))).scalar() or 0)
+                                    .where(_confirmable_where(now)))).scalar() or 0)
 
 
-async def confirm_by_human(op_id: str, outcome: str, reason: str) -> str:
-    """unconfirmed → sent / failed（人の確定・理由は閉集合・履歴に残す・自動再送なし）。
-    戻り値: "ok" / "not_found" / "not_unconfirmed" / "bad_input"（固定語彙）。"""
+async def confirm_by_human(op_id: str, outcome: str, reason: str, *, now=None) -> str:
+    """unconfirmed（または滞留 started）→ sent / failed。条件付き UPDATE の更新件数が 1 のとき
+    だけ履歴を追加して "ok"。0 件は "already_confirmed"（履歴なし・fix1 BQ-05）。
+    戻り値: "ok" / "not_found" / "already_confirmed" / "bad_input"（固定語彙）。自動再送なし。"""
     if outcome not in (STATE_SENT, STATE_FAILED) or reason not in HUMAN_REASONS:
         return "bad_input"
-    now = _now()
+    now = now or _now()
     async with session_scope() as s:
-        row = (await s.execute(sa.select(send_operation.c.state).where(
-            send_operation.c.op_id == str(op_id)))).first()
-        if row is None:
-            return "not_found"
-        if row.state != STATE_UNCONFIRMED:
-            return "not_unconfirmed"
-        await s.execute(sa.update(send_operation).where(
-            send_operation.c.op_id == str(op_id),
-            send_operation.c.state == STATE_UNCONFIRMED).values(
+        r = await s.execute(sa.update(send_operation).where(
+            send_operation.c.op_id == str(op_id), _confirmable_where(now)).values(
             state=outcome, finished_at=now, confirmed_by=ACTOR_HUMAN))
-        await _history(s, str(op_id), STATE_UNCONFIRMED, outcome, "human:" + reason, now)
-    return "ok"
+        if int(r.rowcount or 0) == 1:
+            await _history(s, str(op_id), STATE_UNCONFIRMED, outcome, "human:" + reason, now)
+            return "ok"
+        exists = (await s.execute(sa.select(send_operation.c.op_id).where(
+            send_operation.c.op_id == str(op_id)))).first()
+    return "already_confirmed" if exists is not None else "not_found"
 
 
 async def operation_history(op_id: str) -> list[dict]:
@@ -497,7 +659,7 @@ async def operation_history(op_id: str) -> list[dict]:
 # ── 対応中（表と遷移のみ・Q1b が画面と切替を載せる） ──────────────────────────
 async def set_attending(business: str, user_id: str, *, channel: str | None = None,
                         now=None) -> dict:
-    """会話を対応中にする（共通排他の中・会話版を進める・会話が無ければ作る）。"""
+    """会話を対応中にする（共通排他の中・会話版と human_version を進める）。"""
     return await _attending(business, user_id, True, channel=channel, now=now)
 
 
@@ -511,30 +673,37 @@ async def _attending(business, user_id, on: bool, *, channel, now) -> dict:
     now = now or _now()
     user_hash = line_user_hash(business, user_id)
     async with _exclusive(business, user_hash, channel or business) as s:
-        conv_id, version, _c = await _get_or_create_conversation(s, business, user_hash,
-                                                                 None, now)
-        values = {"version": version + 1, "attending": on}
+        row = await _latest_conversation(s, business, user_hash)
+        if row is None:
+            # 人の操作は受信が無くても会話を起こす（Q1b の明示送信・切替の前提）
+            res = await s.execute(sa.insert(conversation).values(
+                ref=uuid.uuid4().hex, business=business, line_user_hash=user_hash,
+                started_at=now, version=1, human_version=1, attending=False, created_at=now))
+            conv_id, version, hv = int(res.inserted_primary_key[0]), 1, 1
+        else:
+            conv_id, version, hv = int(row.conversation_id), int(row.version), int(row.human_version)
+        values = {"version": version + 1, "human_version": hv + 1, "attending": on}
         if on:
             values.update(attending_since=now, attending_until=None)
         else:
             values.update(attending_until=now)
         await s.execute(sa.update(conversation).where(
             conversation.c.conversation_id == conv_id).values(**values))
-    return {"conversation_id": conv_id, "version": version + 1, "attending": on}
+    return {"conversation_id": conv_id, "version": version + 1, "human_version": hv + 1,
+            "attending": on}
 
 
 async def conversation_state(business: str, user_id: str) -> dict | None:
     user_hash = line_user_hash(business, user_id)
     async with session_scope() as s:
-        row = (await s.execute(sa.select(conversation).where(
-            conversation.c.business == business, conversation.c.line_user_hash == user_hash)
-            .order_by(conversation.c.started_at.desc(), conversation.c.conversation_id.desc())
-            .limit(1))).first()
+        row = await _latest_conversation(s, business, user_hash)
     if row is None:
         return None
     return {"conversation_id": int(row.conversation_id), "ref": row.ref,
-            "version": int(row.version), "attending": bool(row.attending),
+            "version": int(row.version), "human_version": int(row.human_version),
+            "attending": bool(row.attending),
             "started_at": _iso(row.started_at), "last_inbound_at": _iso(row.last_inbound_at),
+            "last_inbound_event_id": row.last_inbound_event_id,
             "attending_since": _iso(row.attending_since),
             "attending_until": _iso(row.attending_until)}
 

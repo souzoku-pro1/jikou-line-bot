@@ -10,6 +10,9 @@
 - 人の操作は「送信済みとして確定」「失敗として確定」の 2 つ。理由は閉集合
   （send_ledger.HUMAN_REASONS）。確定は send_operation_history に理由つきで残る（RV-08）。
   自動再送はしない（再送の口を持たない）。
+- fix1 BQ-02: 一覧は unconfirmed に加え「滞留 started」（着手のまま閾値超）も表示し、人の確定は
+  両方を受け付ける。fix1 BQ-05: 確定は条件付き UPDATE の更新件数 1 のときだけ ok、0 件は
+  「既に確定済み」（履歴なし）。
 - 承認画面（/app/approvals）は既存テストが参照専用 UI を閉集合で pin しているため、
   一覧と操作は本画面（/app/send_ops・サーバ描画・native form POST・PRG 303）に置き、
   承認画面からはリンクで辿る。
@@ -43,6 +46,7 @@ _PURPOSE_LABELS = {
     "receipt_number": "受付番号", "other": "その他",
 }
 _ACTOR_LABELS = {"bot": "bot", "human": "大野", "approved_draft": "承認済み下書き"}
+_STATE_LABELS = {"unconfirmed": "送信確認待ち", "started": "滞留（着手のまま・結果未確認）"}
 
 
 def _bad_request() -> Response:
@@ -78,7 +82,8 @@ def _page(rows: list[dict], notice: str) -> str:
     for r in rows:
         op_id = html.escape(str(r["op_id"]))
         parts.append('<div class="item">')
-        parts.append(f'<span class="badge">{html.escape(_PURPOSE_LABELS.get(r["purpose"], r["purpose"]))}</span>'
+        parts.append(f'<span class="badge">{html.escape(_STATE_LABELS.get(r.get("state", ""), r.get("state", "")))}</span>'
+                     f'<span class="badge">{html.escape(_PURPOSE_LABELS.get(r["purpose"], r["purpose"]))}</span>'
                      f'<span class="badge">{html.escape(_ACTOR_LABELS.get(r["actor"], r["actor"]))}</span>'
                      f'<span class="badge">{html.escape(str(r["business"]))}</span>')
         parts.append(f'<div class="meta">操作 ID: {op_id}｜会話参照: {html.escape(str(r["conversation_ref"]))}'
@@ -98,7 +103,7 @@ def _page(rows: list[dict], notice: str) -> str:
 
 _NOTICES = {
     "ok": "確定しました。", "not_found": "対象の操作が見つかりません。",
-    "not_unconfirmed": "この操作は既に確定済みです。", "bad_input": "入力が不正です。",
+    "already_confirmed": "この操作は既に確定済みです。", "bad_input": "入力が不正です。",
     "db": "記録を読み書きできませんでした。",
 }
 

@@ -1434,12 +1434,12 @@ async def mark_approval_sent(record_id: str) -> None:
 
 # ── LINE 送信 ──────────────────────────────────────────────────────────────────
 
-async def send_line_push(to: str, text: str) -> None:
+async def send_line_push(to: str, text: str) -> bool | str:  # JIKOU-REPLY-Q1a-fix1 BQ-01: push_text の 3 値をそのまま返す
     """LINE Push API でメッセージを送信する。
 
     SOUZOKU-HOUKI-H1: 実装は hub/line_channel.push_text へ逐語移設
     （時効チャネル JIKOU_CHANNEL=従来 env・ログ文言不変）。"""
-    await line_channel.push_text(line_channel.JIKOU_CHANNEL, to, text)
+    return await line_channel.push_text(line_channel.JIKOU_CHANNEL, to, text)
 
 
 def build_attorney_notification(

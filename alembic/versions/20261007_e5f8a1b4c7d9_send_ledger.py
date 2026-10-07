@@ -1,5 +1,9 @@
 """JIKOU-REPLY-Q1a-SEND-BASE: 会話・送信操作記録・状態遷移履歴（DDL のみ・可逆）
 
+fix1（BQ-03/04・未適用の同 revision を更新）: conversation に human_version（人の操作でのみ進む版）
+と last_inbound_event_id（再配送で直近受信時刻を更新しない）、send_operation.conversation_id は
+NULL 可（受信を伴わない送信で会話が無ければ作らずに NULL で記録）。
+
 正本: 時効LINEボット_返信規則_v1.4.md §10-5（送信操作記録・会話・共通排他）・§10-10
 （新設 DB 表・RV-08 の履歴）・§12 Q1a（新設書込: 送信操作記録・会話）。
 表定義は hub/send_ledger.py の metadata と同一。アプリ起動時には走らせない（D2: alembic CLI
@@ -31,10 +35,12 @@ def upgrade() -> None:
         sa.Column("line_user_hash", sa.Text, nullable=False),
         sa.Column("started_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("version", _BIG, nullable=False, server_default="1"),
+        sa.Column("human_version", _BIG, nullable=False, server_default="1"),
         sa.Column("attending", sa.Boolean, nullable=False, server_default=sa.false()),
         sa.Column("attending_since", sa.DateTime(timezone=True), nullable=True),
         sa.Column("attending_until", sa.DateTime(timezone=True), nullable=True),
         sa.Column("last_inbound_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("last_inbound_event_id", sa.Text, nullable=True),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False,
                   server_default=sa.func.now()),
     )
@@ -46,8 +52,8 @@ def upgrade() -> None:
         sa.Column("business", sa.Text, nullable=False),
         sa.Column("channel", sa.Text, nullable=False),
         sa.Column("conversation_id", _BIG, sa.ForeignKey("conversation.conversation_id"),
-                  nullable=False),
-        sa.Column("conversation_version", _BIG, nullable=False),
+                  nullable=True),
+        sa.Column("conversation_version", _BIG, nullable=True),
         sa.Column("actor", sa.Text, nullable=False),
         sa.Column("purpose", sa.Text, nullable=False),
         sa.Column("first_reply_target", sa.Boolean, nullable=False),
