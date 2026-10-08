@@ -1,20 +1,21 @@
-"""HOUKI-JUKURYO-CRON-1 / fix1 / fix2: 相続放棄 熟慮期間 日次監視のテスト。
+"""HOUKI-JUKURYO-2（大野裁定 2026-10-08・法的判断）: 相続放棄 熟慮期間 監視のテスト。
 
-- 期日計算（応当日・月末・閏年・起算日代用順・全空）
-- 社内締切 10 日前・マイルストーン判定（7 日前／当日／3 日前／毎日／超過・境界）
-- 対象抽出（受任以外・提出日ありは除外）・弁護士設定優先
-- 履歴による冪等（同日再実行 0 通）・fix1: 送信成功→履歴追記の順序（失敗時は追記しない・
-  追記 CAS 失敗は警告のみ・throttled は成功扱い）
-- fix2 HJC-01: 分割送信（上限・(n/N)・縮約・失敗した通の案件だけ履歴なし）
-- fix2 HJC-02: digest キー（別集合は別キー・同一内容の再実行は throttled=成功）
-- fix2 HJC-03: 全件取得（500 ちょうど→次ページ・501 件目・0/499/1000 超）
-- fix2 HJC-04: 単発の未送信回収（遅延・本来）・8 日前は回収しない・13:00 の回・起算日未設定は 8:00 のみ
-- 本文に個人情報なし・kind 登録・定数 pin・ジョブ登録（8/13/18 JST）・main 結線
+CRON-1 のテスト（申告 3 日付の代用順・法定/社内の 2 本立て・ONE_SHOT/DAILY・履歴欄）は
+本票で挙動ごと差し替えられたため、同じ性質（計算・対象・冪等・送信→書込の順序・分割・
+ページング・PII なし・登録）を新裁定の形で検証する。削除した性質はない。
+
+- 期限計算（応当日の前日・応当日なし＝その月の末日の前日・閏年・年またぎ・月初）
+- 入力は 起算日_確定 のみ（申告 3 日付・起算点確定済・法定満了日・社内締切日 は読まない）
+- 対象 status の網羅（受任後 8 値・受任前は対象外・申述提出日ありは対象外）
+- 熟慮期間期限／残日数 の保存（差分だけ書く・起算日_確定 変更で上書き・空に戻れば空に戻す）
+- 通知: 14/7 日前・各 1 回（同日 3 回走っても 1 通・通知済み閾値 で判定・送信成功後に刻印）
+- 送信失敗は刻印しない（期限欄は書く）・throttled は成功扱い・CAS 409 は再取得 1 回
+- 起算日未確定: 件数のみ・1 日 1 回・ID なし
+- PII 非漏洩（本文・ログ・キー）・書く欄は 3 欄の閉集合・分割送信・ページング・登録（8/13/18）
+- phone_triage の式が同じ関数に寄っている（一本化）
 """
 
 import asyncio
-import hashlib
-import json
 import logging
 import re
 import unittest
@@ -23,6 +24,8 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 from hub import houki_jukuryo as hj
+from hub import houki_phone_triage as tri
+from hub import houki_profile
 from hub import kintone as hub_kintone
 from hub import notify as hub_notify
 from hub import scheduler as hub_scheduler
@@ -30,379 +33,220 @@ from hub import scheduler as hub_scheduler
 TODAY = date(2026, 9, 8)
 _REAL_NOTIFY_RESULT = hub_notify.notify_admin_line_result      # _Base の mock 前に捕捉
 KEY_RE = re.compile(r"^houki_jukuryo_daily:2026-09-\d\d:[0-9a-f]{16}$")
+NAME = "山田太郎"
+KANA = "やまだたろう"
+
+ALL_POST = ("受任", "書類収集中", "申述書作成", "裁判所提出済", "照会書対応", "受理", "債権者通知", "完了")
 
 
-def _rec(rid="1", status="受任", submitted="", history="", legal="", internal="",
-         knew="", knew_death="", death="", name="山田太郎", revision="3"):
+def _rec(rid="1", status="受任", submitted="", start="", deadline="", remaining="",
+         notified=(), knew="2026-05-01", death="2026-04-01", revision="3"):
     return {
         "$id": {"value": rid}, "$revision": {"value": revision},
         "status": {"value": status}, "申述提出日": {"value": submitted},
-        "熟慮期間通知履歴": {"value": history},
-        "法定満了日": {"value": legal}, "社内締切日": {"value": internal},
-        "相続人と知った日_申告": {"value": knew}, "死亡を知った日_申告": {"value": knew_death},
-        "死亡日_申告": {"value": death}, "氏名": {"value": name},
+        "起算日_確定": {"value": start},
+        "熟慮期間期限": {"value": deadline}, "残日数": {"value": remaining},
+        "通知済み閾値": {"value": list(notified)},
+        # 読んではいけない欄（値が入っていても結果に影響しない）
+        "相続人と知った日_申告": {"value": knew}, "死亡を知った日_申告": {"value": knew},
+        "死亡日_申告": {"value": death}, "起算点確定済": {"value": "no"},
+        "法定満了日": {"value": "2026-09-01"}, "社内締切日": {"value": "2026-08-20"},
+        "顧客名": {"value": NAME}, "furigana": {"value": KANA},
     }
 
 
-def _names(ms):
-    return [m.name for m in ms]
+def _start_for_remaining(remaining: int, today: date = TODAY) -> str:
+    """今日の残日数が remaining になる 起算日_確定 を逆算（応当日の前日の式に合わせる）。"""
+    target = date.fromordinal(today.toordinal() + remaining)        # 期限日
+    for back in range(85, 96):
+        cand = date.fromordinal(target.toordinal() - back)
+        if hj.jukuryo_deadline(cand) == target:
+            return cand.isoformat()
+    raise AssertionError("no start found")
 
 
-# 社内締切当日（9/8）の案件。7 日前（9/1）は回収窓（今日−7）内に入るため、送信済みの履歴を
-# 持たせて「当日」だけを検証する（回収そのものは TestOneShotRecovery で検証）
-H7 = "2026-09-01 社内締切7日前@2026-09-01 通知済"
+# ── 期限計算（裁定 (a)） ─────────────────────────────────────────────────────
+class TestDeadlineFormula(unittest.TestCase):
+    def test_normal_anniversary_minus_one(self):
+        self.assertEqual(hj.jukuryo_deadline(date(2026, 4, 10)), date(2026, 7, 9))      # 票の例
+        self.assertEqual(hj.jukuryo_deadline(date(2026, 6, 15)), date(2026, 9, 14))
 
+    def test_no_anniversary_is_month_end_minus_one_non_leap(self):
+        # 11/30 → 2 月に 30 日なし → 2 月末日（2/28）の前日 = 2/27（翌月末日の前日ではない）
+        self.assertEqual(hj.jukuryo_deadline(date(2026, 11, 30)), date(2027, 2, 27))
 
-def _due(rid="1", **kw):
-    kw.setdefault("knew", "2026-06-18")
-    kw.setdefault("history", H7)
-    return _rec(rid=rid, **kw)
-
-
-# ── 期日計算 ────────────────────────────────────────────────────────────────
-class TestAddMonths(unittest.TestCase):
-    def test_same_day_of_month(self):
-        self.assertEqual(hj.add_months(date(2026, 6, 15), 3), date(2026, 9, 15))
-
-    def test_month_end_clamp_non_leap(self):
-        self.assertEqual(hj.add_months(date(2026, 11, 30), 3), date(2027, 2, 28))
-
-    def test_month_end_clamp_leap_year(self):
-        self.assertEqual(hj.add_months(date(2027, 11, 30), 3), date(2028, 2, 29))
+    def test_no_anniversary_leap_year(self):
+        self.assertEqual(hj.jukuryo_deadline(date(2027, 11, 30)), date(2028, 2, 28))
+        self.assertEqual(hj.jukuryo_deadline(date(2027, 11, 29)), date(2028, 2, 28))   # 応当日あり → 前日
 
     def test_31st_to_30_day_month(self):
-        self.assertEqual(hj.add_months(date(2026, 8, 31), 3), date(2026, 11, 30))
+        self.assertEqual(hj.jukuryo_deadline(date(2026, 1, 31)), date(2026, 4, 29))
+        self.assertEqual(hj.jukuryo_deadline(date(2026, 8, 31)), date(2026, 11, 29))
 
-    def test_year_rollover(self):
-        self.assertEqual(hj.add_months(date(2026, 12, 20), 3), date(2027, 3, 20))
+    def test_year_rollover_and_first_of_month(self):
+        self.assertEqual(hj.jukuryo_deadline(date(2026, 12, 20)), date(2027, 3, 19))
+        self.assertEqual(hj.jukuryo_deadline(date(2026, 3, 1)), date(2026, 5, 31))      # 前日が前月へ
+        self.assertEqual(hj.jukuryo_deadline(date(2026, 10, 1)), date(2026, 12, 31))
+
+    def test_remaining_days_boundaries(self):
+        self.assertEqual(hj.remaining_days(date(2026, 9, 22), TODAY), 14)
+        self.assertEqual(hj.remaining_days(date(2026, 9, 15), TODAY), 7)
+        self.assertEqual(hj.remaining_days(TODAY, TODAY), 0)
+        self.assertEqual(hj.remaining_days(date(2026, 9, 7), TODAY), -1)
+
+    def test_phone_triage_uses_the_same_formula(self):
+        self.assertIs(tri.jukuryo_deadline, hj.jukuryo_deadline)
+        for d in (date(2026, 4, 10), date(2026, 11, 30), date(2026, 1, 31)):
+            self.assertEqual(tri.shanai_deadline(d), hj.jukuryo_deadline(d))
 
 
+# ── 入力は 起算日_確定 のみ ──────────────────────────────────────────────────
 class TestResolveStart(unittest.TestCase):
-    def test_priority_knew_heir_first(self):
-        r = _rec(knew="2026-06-15", knew_death="2026-06-01", death="2026-05-01")
-        self.assertEqual(hj.resolve_start(r), (date(2026, 6, 15), "相続人と知った日_申告"))
+    def test_confirmed_start_only(self):
+        self.assertEqual(hj.resolve_start(_rec(start="2026-04-10")), date(2026, 4, 10))
 
-    def test_fallback_to_knew_death(self):
-        r = _rec(knew_death="2026-06-01", death="2026-05-01")
-        self.assertEqual(hj.resolve_start(r), (date(2026, 6, 1), "死亡を知った日_申告"))
+    def test_declared_dates_and_attorney_deadlines_are_ignored(self):
+        r = _rec(start="", knew="2026-05-01", death="2026-04-01")
+        r["法定満了日"] = {"value": "2026-09-10"}
+        r["起算点確定済"] = {"value": "yes"}
+        self.assertIsNone(hj.resolve_start(r))
+        self.assertIsNone(hj.compute(r, TODAY))
 
-    def test_fallback_to_death(self):
-        r = _rec(death="2026-05-01")
-        self.assertEqual(hj.resolve_start(r), (date(2026, 5, 1), "死亡日_申告"))
+    def test_invalid_date_is_none(self):
+        self.assertIsNone(hj.resolve_start(_rec(start="2026/04/10")))
 
-    def test_all_empty_is_unset(self):
-        self.assertEqual(hj.resolve_start(_rec()), (None, hj.START_UNSET))
-
-    def test_invalid_date_is_skipped(self):
-        r = _rec(knew="not-a-date", death="2026-05-01")
-        self.assertEqual(hj.resolve_start(r), (date(2026, 5, 1), "死亡日_申告"))
+    def test_compute(self):
+        c = hj.compute(_rec(start="2026-06-15"), TODAY)
+        self.assertEqual((c.start, c.deadline, c.remaining), (date(2026, 6, 15), date(2026, 9, 14), 6))
 
 
-class TestComputeDeadlines(unittest.TestCase):
-    def test_computed_legal_and_internal(self):
-        dl = hj.compute_deadlines(_rec(knew="2026-06-15"))
-        self.assertEqual((dl.legal, dl.legal_source), (date(2026, 9, 15), hj.SOURCE_COMPUTED))
-        self.assertEqual((dl.internal, dl.internal_source), (date(2026, 9, 5), hj.SOURCE_COMPUTED))
-        self.assertTrue(dl.determinable)
+# ── 対象 ────────────────────────────────────────────────────────────────────
+class TestTargets(unittest.TestCase):
+    def test_target_statuses_are_the_profile_post_engagement_set(self):
+        self.assertEqual(set(hj.TARGET_STATUSES), set(ALL_POST))
+        self.assertEqual(set(hj.TARGET_STATUSES), set(houki_profile.HOUKI_PROFILE.post_engagement_statuses))
+        self.assertEqual(len(hj.TARGET_STATUSES), 8)
 
-    def test_attorney_legal_overrides_computed(self):
-        dl = hj.compute_deadlines(_rec(knew="2026-06-15", legal="2026-10-01"))
-        self.assertEqual((dl.legal, dl.legal_source), (date(2026, 10, 1), hj.SOURCE_ATTORNEY))
-        self.assertEqual((dl.internal, dl.internal_source), (date(2026, 9, 21), hj.SOURCE_COMPUTED))
+    def test_is_target_all_post_engagement_statuses(self):
+        for s in ALL_POST:
+            with self.subTest(status=s):
+                self.assertTrue(hj.is_target(_rec(status=s)))
 
-    def test_attorney_internal_overrides_computed(self):
-        dl = hj.compute_deadlines(_rec(knew="2026-06-15", internal="2026-09-01"))
-        self.assertEqual((dl.legal, dl.legal_source), (date(2026, 9, 15), hj.SOURCE_COMPUTED))
-        self.assertEqual((dl.internal, dl.internal_source), (date(2026, 9, 1), hj.SOURCE_ATTORNEY))
+    def test_pre_engagement_and_closed_are_not_targets(self):
+        for s in ("", "問い合わせ", "電話判断待ち", "電話調整中", "決済待ち", "契約待ち", "不受任", "辞任"):
+            with self.subTest(status=s):
+                self.assertFalse(hj.is_target(_rec(status=s)))
 
-    def test_unset_when_no_start_and_no_attorney_legal(self):
-        dl = hj.compute_deadlines(_rec())
-        self.assertFalse(dl.determinable)
-        self.assertEqual(dl.legal_source, hj.START_UNSET)
-
-    def test_attorney_legal_without_start_is_determinable(self):
-        dl = hj.compute_deadlines(_rec(legal="2026-10-01"))
-        self.assertTrue(dl.determinable)
-        self.assertEqual(dl.start_source, hj.START_UNSET)
-        self.assertEqual(dl.internal, date(2026, 9, 21))
-
-
-class TestMilestones(unittest.TestCase):
-    DL = hj.compute_deadlines(_rec(knew="2026-06-15"))   # 法定 9/15・社内 9/5
-
-    def ms(self, d):
-        return hj.milestones_for(d, self.DL)
-
-    def test_internal_pre_7_boundary(self):
-        self.assertEqual(self.ms(date(2026, 8, 28)), [])                        # 前日は非該当
-        on = self.ms(date(2026, 8, 29))
-        self.assertEqual(_names(on), [hj.MS_INTERNAL_PRE])
-        self.assertFalse(on[0].delayed(date(2026, 8, 29)))                      # 当日は定刻
-        late = self.ms(date(2026, 8, 30))                                        # 翌日は遅延回収
-        self.assertEqual([(m.name, m.due) for m in late], [(hj.MS_INTERNAL_PRE, date(2026, 8, 29))])
-        self.assertTrue(late[0].delayed(date(2026, 8, 30)))
-
-    def test_internal_day_boundary(self):
-        self.assertNotIn(hj.MS_INTERNAL_DAY, _names(self.ms(date(2026, 9, 4))))
-        self.assertIn(hj.MS_INTERNAL_DAY, _names(self.ms(date(2026, 9, 5))))
-        self.assertIn((hj.MS_INTERNAL_DAY, date(2026, 9, 5)),
-                      [(m.name, m.due) for m in self.ms(date(2026, 9, 6))])
-
-    def test_legal_pre_3_boundary(self):
-        self.assertNotIn(hj.MS_LEGAL_PRE, _names(self.ms(date(2026, 9, 11))))
-        self.assertIn(hj.MS_LEGAL_PRE, _names(self.ms(date(2026, 9, 12))))
-
-    def test_one_shot_recovery_window_is_7_days(self):
-        # 社内締切当日 9/5 → 9/12 は 7 日後で回収、9/13 は 8 日後で回収しない
-        self.assertIn(hj.MS_INTERNAL_DAY, _names(self.ms(date(2026, 9, 12))))
-        self.assertNotIn(hj.MS_INTERNAL_DAY, _names(self.ms(date(2026, 9, 13))))
-        # 社内締切7日前 8/29 → 9/5 は回収、9/6 は回収しない
-        self.assertIn(hj.MS_INTERNAL_PRE, _names(self.ms(date(2026, 9, 5))))
-        self.assertNotIn(hj.MS_INTERNAL_PRE, _names(self.ms(date(2026, 9, 6))))
-
-    def test_legal_daily_2_1_0_are_daily_only(self):
-        self.assertEqual([(m.name, m.due) for m in self.ms(date(2026, 9, 13))
-                          if m.name in hj.DAILY], [(hj.MS_LEGAL_2, date(2026, 9, 13))])
-        self.assertIn(hj.MS_LEGAL_1, _names(self.ms(date(2026, 9, 14))))
-        self.assertIn(hj.MS_LEGAL_DAY, _names(self.ms(date(2026, 9, 15))))
-        self.assertNotIn(hj.MS_LEGAL_2, _names(self.ms(date(2026, 9, 14))))   # DAILY は当日一致のみ
-
-    def test_overdue_every_day(self):
-        self.assertIn(hj.MS_OVERDUE, _names(self.ms(date(2026, 9, 16))))
-        self.assertEqual(_names(self.ms(date(2026, 12, 1))), [hj.MS_OVERDUE])
-
-    def test_multiple_when_attorney_dates_coincide(self):
-        dl = hj.compute_deadlines(_rec(legal="2026-09-15", internal="2026-09-12"))
-        self.assertEqual(_names(hj.milestones_for(date(2026, 9, 12), dl)),
-                         [hj.MS_INTERNAL_PRE, hj.MS_INTERNAL_DAY, hj.MS_LEGAL_PRE])   # 7日前(9/5)は回収窓内
-
-    def test_unset_has_no_milestone(self):
-        self.assertEqual(hj.milestones_for(date(2026, 9, 15), hj.compute_deadlines(_rec())), [])
-
-    def test_kinds_partition(self):
-        self.assertEqual(hj.ONE_SHOT, ("社内締切7日前", "社内締切当日", "法定満了3日前"))
-        self.assertEqual(hj.DAILY, ("法定満了2日前", "法定満了1日前", "法定満了当日", "満了超過"))
-        self.assertEqual(hj.MILESTONES, hj.ONE_SHOT + hj.DAILY)
-
-
-class TestTargetAndHistory(unittest.TestCase):
-    def test_is_target(self):
-        self.assertTrue(hj.is_target(_rec()))
-        self.assertFalse(hj.is_target(_rec(status="書類収集中")))
-        self.assertFalse(hj.is_target(_rec(status="問い合わせ")))
+    def test_submitted_is_not_target(self):
         self.assertFalse(hj.is_target(_rec(submitted="2026-09-01")))
 
-    def test_search_query_pins_status_and_empty_submitted(self):
+    def test_search_query_pins_statuses_and_empty_submitted(self):
         q = hj.search_query()
-        self.assertIn('status in ("受任")', q)
+        for s in ALL_POST:
+            self.assertIn(f'"{s}"', q)
+        self.assertNotIn("問い合わせ", q)
         self.assertIn('申述提出日 = ""', q)
         self.assertIn("order by $id asc limit 500", q)
-        self.assertIn("and $id > 500 order by", hj.search_query("500"))
-
-    def test_history_line_and_has(self):
-        line = hj.history_line(TODAY, hj.MS_LEGAL_DAY)
-        self.assertEqual(line, "2026-09-08 法定満了当日 通知済")
-        self.assertTrue(hj.history_has("x\n" + line + "\n", TODAY, hj.MS_LEGAL_DAY))
-        self.assertFalse(hj.history_has(line, date(2026, 9, 7), hj.MS_LEGAL_DAY))
-        self.assertFalse(hj.history_has(line, TODAY, hj.MS_OVERDUE))
-        self.assertFalse(hj.history_has("", TODAY, hj.MS_LEGAL_DAY))
-
-    def test_one_shot_history_line_format_and_match(self):
-        """fix3: ONE_SHOT の履歴行は該当日を必ず含む（遅延でも同形式）。除外は名+該当日の一致。"""
-        late = hj.history_line(TODAY, hj.MS_INTERNAL_DAY, date(2026, 9, 7))
-        self.assertEqual(late, "2026-09-08 社内締切当日@2026-09-07 通知済")
-        on_time = hj.history_line(TODAY, hj.MS_INTERNAL_DAY, TODAY)
-        self.assertEqual(on_time, "2026-09-08 社内締切当日@2026-09-08 通知済")
-        self.assertNotIn("本来", late)
-        self.assertTrue(hj.history_has_one_shot(late, hj.MS_INTERNAL_DAY, date(2026, 9, 7)))
-        self.assertTrue(hj.history_has_one_shot("2026-08-01 社内締切当日@2026-07-31 通知済",
-                                                hj.MS_INTERNAL_DAY, date(2026, 7, 31)))   # 日付不問
-        self.assertFalse(hj.history_has_one_shot(late, hj.MS_INTERNAL_DAY, date(2026, 9, 8)))   # 該当日違い
-        self.assertFalse(hj.history_has_one_shot(late, hj.MS_INTERNAL_PRE, date(2026, 9, 7)))   # 名違い
-        self.assertFalse(hj.history_has(late, TODAY, hj.MS_INTERNAL_DAY))     # DAILY 判定は名@該当日を拾わない
-        self.assertFalse(hasattr(hj, "history_has_name"))                       # 名前だけの除外は廃止
-        # DAILY・起算日未設定は従来形式
-        self.assertEqual(hj.history_line(TODAY, hj.MS_LEGAL_DAY), "2026-09-08 法定満了当日 通知済")
-        self.assertEqual(hj.history_line(TODAY, hj.START_UNSET), "2026-09-08 起算日未設定 通知済")
-
-    def test_append_history_text(self):
-        self.assertEqual(hj.append_history_text("", "a"), "a")
-        self.assertEqual(hj.append_history_text("a", "b"), "a\nb")
+        self.assertIn("$id > 500", hj.search_query("500"))
 
 
+# ── 通知判定・保存差分（pure） ───────────────────────────────────────────────
+class TestAlertsAndUpdates(unittest.TestCase):
+    def test_alerts_due(self):
+        self.assertEqual(hj.alerts_due(15, []), [])
+        self.assertEqual(hj.alerts_due(14, []), [14])
+        self.assertEqual(hj.alerts_due(8, ["14日前"]), [])
+        self.assertEqual(hj.alerts_due(7, ["14日前"]), [7])
+        self.assertEqual(hj.alerts_due(7, []), [14, 7])                 # 14 を取りこぼしていれば両方
+        self.assertEqual(hj.alerts_due(0, ["14日前"]), [7])
+        self.assertEqual(hj.alerts_due(-3, []), [14, 7])                # 超過でも未通知分は送る
+        self.assertEqual(hj.alerts_due(-3, ["14日前", "7日前"]), [])
+        self.assertEqual(hj.alerts_due(7, ["30日前", "14日前", "7日前", "超過"]), [])
+
+    def test_field_updates_writes_only_changed(self):
+        c = hj.compute(_rec(start="2026-06-15"), TODAY)
+        self.assertEqual(hj.field_updates(_rec(start="2026-06-15"), c),
+                         {"熟慮期間期限": "2026-09-14", "残日数": "6"})
+        self.assertEqual(hj.field_updates(_rec(start="2026-06-15", deadline="2026-09-14", remaining="6"), c), {})
+        self.assertEqual(hj.field_updates(_rec(start="2026-06-15", deadline="2026-09-14", remaining="6.0"), c), {})
+        self.assertEqual(hj.field_updates(_rec(start="2026-06-15", deadline="2026-09-14", remaining="7"), c),
+                         {"残日数": "6"})
+        self.assertEqual(hj.field_updates(_rec(start="2026-06-15", deadline="2026-09-20", remaining="6"), c),
+                         {"熟慮期間期限": "2026-09-14"})
+
+    def test_field_updates_clears_when_start_removed(self):
+        self.assertEqual(hj.field_updates(_rec(start="", deadline="2026-09-14", remaining="6"), None),
+                         {"熟慮期間期限": "", "残日数": ""})
+        self.assertEqual(hj.field_updates(_rec(start=""), None), {})
+
+    def test_record_writes_merges_marks_and_keeps_existing(self):
+        r = _rec(start="2026-06-15", deadline="2026-09-14", remaining="6", notified=("30日前",))
+        self.assertEqual(hj.record_writes(r, TODAY, [14, 7]),
+                         {"通知済み閾値": ["30日前", "14日前", "7日前"]})
+        self.assertEqual(hj.record_writes(_rec(start="2026-06-15", deadline="2026-09-14", remaining="6",
+                                               notified=("14日前",)), TODAY, [14]), {})
+        self.assertEqual(hj.WRITE_FIELDS, frozenset({"熟慮期間期限", "残日数", "通知済み閾値"}))
+
+
+# ── 本文・digest（PII なし） ─────────────────────────────────────────────────
 class TestNoticeBody(unittest.TestCase):
-    def test_body_has_no_pii_and_marks_sources(self):
-        recs = [_due(rid="7", name="山田太郎"), _rec(rid="9")]
-        notices = hj.build_notices(TODAY, hj.plan_today(recs, TODAY))
+    def test_line_has_record_deadline_remaining_only(self):
+        c = hj.compute(_rec(start="2026-06-15"), TODAY)
+        line = hj.format_alert_line("12", 7, c)
+        self.assertEqual(line, "・No.12 期限 2026-09-14 残 6 日（7日前の通知）")
+        self.assertNotIn(NAME, line)
+
+    def test_notice_text_and_key(self):
+        entries, unset = hj.plan_alerts([_rec(rid="1", start=_start_for_remaining(14)),
+                                         _rec(rid="2", start=_start_for_remaining(7))], TODAY)
+        self.assertEqual(unset, 0)
+        notices = hj.build_notices(TODAY, entries)
         self.assertEqual(len(notices), 1)
-        body = notices[0].text
-        self.assertNotIn("山田", body)
-        self.assertIn("(1/1)", body)
-        self.assertIn("No.7 社内締切当日 /", body)
-        self.assertIn("法定満了 2026-09-18（計算値）", body)
-        self.assertIn("社内締切 2026-09-08（計算値）", body)
-        self.assertIn("相続人と知った日_申告・申告ベース・要確認", body)
-        self.assertIn("起算日未設定: No.9", body)
-        self.assertIn(hj.NOTICE_FOOTER, body)
+        t = notices[0].text
+        self.assertTrue(t.startswith("【相続放棄 熟慮期間】 2026-09-08 (1/1)"))
+        self.assertIn("・No.1 期限 2026-09-22 残 14 日（14日前の通知）", t)
+        self.assertIn("・No.2 期限 2026-09-15 残 7 日（14日前の通知）", t)
+        self.assertIn("・No.2 期限 2026-09-15 残 7 日（7日前の通知）", t)
+        self.assertTrue(t.endswith(hj.NOTICE_FOOTER))
+        for leak in (NAME, KANA, "2026-05-01", "2026-04-01"):
+            self.assertNotIn(leak, t)
+        self.assertTrue(KEY_RE.match(hj.notify_key(TODAY, notices[0].digest)))
 
-    def test_attorney_source_marked(self):
-        dl = hj.compute_deadlines(_rec(knew="2026-06-15", legal="2026-10-01", internal="2026-09-20"))
-        line = hj.format_item("3", hj.Milestone(hj.MS_LEGAL_PRE, TODAY), dl, TODAY)
-        self.assertIn("法定満了 2026-10-01（弁護士設定）", line)
-        self.assertIn("社内締切 2026-09-20（弁護士設定）", line)
-        self.assertNotIn("遅延", line)
-
-    def test_delayed_item_marked(self):
-        dl = hj.compute_deadlines(_rec(knew="2026-06-17"))                         # 社内 9/7
-        line = hj.format_item("3", hj.Milestone(hj.MS_INTERNAL_DAY, date(2026, 9, 7)), dl, TODAY)
-        self.assertIn("No.3 社内締切当日（遅延・本来 2026-09-07） /", line)
+    def test_digest_is_order_independent_and_content_sensitive(self):
+        a = _rec(rid="1", start=_start_for_remaining(14))
+        b = _rec(rid="2", start=_start_for_remaining(7))
+        e1, _ = hj.plan_alerts([a, b], TODAY)
+        e2, _ = hj.plan_alerts([b, a], TODAY)
+        self.assertEqual(hj.digest_of(e1), hj.digest_of(e2))
+        e3, _ = hj.plan_alerts([a], TODAY)
+        self.assertNotEqual(hj.digest_of(e1), hj.digest_of(e3))
 
     def test_split_by_entry_and_numbered(self):
-        recs = [_due(rid=str(i)) for i in range(1, 61)]      # 60 案件・全て社内締切当日
-        entries = hj.plan_today(recs, TODAY)
-        notices = hj.build_notices(TODAY, entries)
+        recs = [_rec(rid=str(i), start=_start_for_remaining(14)) for i in range(1, 61)]
+        entries, _ = hj.plan_alerts(recs, TODAY)
+        notices = hj.build_notices(TODAY, entries, max_chars=600)
         self.assertGreater(len(notices), 1)
-        for i, nt in enumerate(notices, 1):
-            self.assertLessEqual(len(nt.text), hj.NOTICE_MAX_CHARS)
-            self.assertIn(f"({i}/{len(notices)})", nt.text)
-        ids = [e.record_id for nt in notices for e in nt.entries]
-        self.assertEqual(sorted(ids, key=int), [str(i) for i in range(1, 61)])     # 全案件が丁度 1 通に
-        self.assertEqual(len(set(nt.digest for nt in notices)), len(notices))      # 通ごとに別 digest
+        ids = [e.record_id for n in notices for e in n.entries]
+        self.assertEqual(ids, [str(i) for i in range(1, 61)])
+        for i, n in enumerate(notices, 1):
+            self.assertIn(f"({i}/{len(notices)})", n.text)
+            self.assertLessEqual(len(n.text), 600)
 
-    def test_entry_lines_stay_together(self):
-        rec = _rec(rid="1", legal="2026-09-11", internal="2026-09-08", history=H7)            # 社内当日+法定3日前
-        entries = hj.plan_today([rec], TODAY)
-        self.assertEqual(len(entries), 1)
-        self.assertEqual(len(entries[0].lines), 2)
-        notices = hj.build_notices(TODAY, entries)
-        self.assertEqual(len(notices), 1)
-        self.assertIn("社内締切当日", notices[0].text)
-        self.assertIn("法定満了3日前", notices[0].text)
-
-    def test_oversize_entry_is_compacted_not_silently_cut(self):
-        rec = _rec(rid="1", legal="2026-09-11", internal="2026-09-08", history=H7)
-        entries = hj.plan_today([rec], TODAY)
-        frame = len(hj._notice_text(TODAY, [], 99, 99))
-        notices = hj.build_notices(TODAY, entries, max_chars=frame + 120)            # 案件 2 行は入らない
-        self.assertEqual(len(notices), 1)
-        self.assertIn(hj.COMPACT_MARK, notices[0].text)
-        self.assertIn("No.1 社内締切当日/法定満了3日前 / 法定満了 2026-09-11 / 社内締切 2026-09-08", notices[0].text)
-        self.assertEqual(notices[0].entries[0].history_lines,
-                         ["2026-09-08 社内締切当日@2026-09-08 通知済", "2026-09-08 法定満了3日前@2026-09-08 通知済"])
-
-    def test_digest_depends_on_record_and_milestone_set(self):
-        a = hj.plan_today([_due(rid="1")], TODAY)
-        b = hj.plan_today([_due(rid="2")], TODAY)
-        ab = hj.plan_today([_due(rid="1"), _due(rid="2")], TODAY)
-        self.assertNotEqual(hj.digest_of(a), hj.digest_of(b))
-        self.assertNotEqual(hj.digest_of(a), hj.digest_of(ab))
-        self.assertEqual(hj.digest_of(a), hj.digest_of(hj.plan_today([_due(rid="1")], TODAY)))
-        self.assertTrue(KEY_RE.match(hj.notify_key(TODAY, hj.digest_of(a))))
-
-    def test_digest_material_is_structured_json(self):
-        """fix4 HJCF2-01: 材料は record_id・milestone_name で並べた正規化 JSON（文字列連結ではない）。"""
-        entries = hj.plan_today([_due(rid="1")], TODAY)
-        material = hj.digest_material(entries)
-        self.assertEqual(json.loads(material), [{
-            "record_id": "1", "milestone_name": "社内締切当日", "due_date": "2026-09-08",
-            "start_date": "2026-06-18", "start_basis": "相続人と知った日_申告",
-            "legal_deadline": "2026-09-18", "legal_source": "計算値",
-            "internal_deadline": "2026-09-08", "internal_source": "計算値", "delayed": False}])
-        self.assertEqual(material, json.dumps(json.loads(material), sort_keys=True, ensure_ascii=False,
-                                              separators=(",", ":")))
-        self.assertEqual(hj.digest_of(entries),
-                         hashlib.sha256(material.encode("utf-8")).hexdigest()[:16])
-
-    def test_digest_is_deterministic_and_order_independent(self):
-        r1, r2 = _due(rid="1"), _rec(rid="2", knew="2026-06-25")           # 当日 / 7 日前
-        self.assertEqual(hj.digest_of(hj.plan_today([r1, r2], TODAY)),
-                         hj.digest_of(hj.plan_today([r2, r1], TODAY)))
-        # 通の中の entries 順が違っても同値
-        e = hj.plan_today([r1, r2], TODAY)
-        self.assertEqual(hj.digest_of(e), hj.digest_of(list(reversed(e))))
-
-    def test_digest_changes_when_any_fact_changes(self):
-        base = hj.digest_of(hj.plan_today([_rec(rid="1", legal="2026-09-16", history="")], TODAY))   # 社内 9/6・遅延
-        variants = {
-            "due/legal": _rec(rid="1", legal="2026-09-17", history=""),                              # 該当日 9/7・法定 9/17
-            "internal(attorney)": _rec(rid="1", legal="2026-09-16", internal="2026-09-08", history=""),  # 社内締切 9/8
-            "basis": _rec(rid="1", knew="2026-06-16", history=""),                                    # 計算で同じ期日・根拠が欄名
-            "milestone set": _rec(rid="1", legal="2026-09-11", internal="2026-09-08", history=""),  # 当日+法定3日前
-        }
-        seen = {base}
-        for label, rec in variants.items():
-            d = hj.digest_of(hj.plan_today([rec], TODAY))
-            self.assertNotIn(d, seen, label)
-            seen.add(d)
-        # 遅延フラグだけが違う場合（同じ該当日を定刻に送る日と遅延で送る日）
-        rec = _rec(rid="1", internal="2026-09-08", legal="2026-10-31", history="")
-        on_time = hj.digest_of(hj.plan_today([rec], TODAY))
-        late = hj.digest_of(hj.plan_today([rec], date(2026, 9, 9)))
-        self.assertNotEqual(on_time, late)
-        facts = hj.plan_today([rec], date(2026, 9, 9))[0].facts
-        self.assertEqual((facts[0]["due_date"], facts[0]["delayed"]), ("2026-09-08", True))
-
-    def test_unset_entry_fact(self):
-        facts = hj.plan_today([_rec(rid="9")], TODAY)[0].facts
-        self.assertEqual(facts, [{"record_id": "9", "milestone_name": "起算日未設定", "due_date": None,
-                                  "start_date": None, "start_basis": "起算日未設定",
-                                  "legal_deadline": None, "legal_source": "起算日未設定",
-                                  "internal_deadline": None, "internal_source": "起算日未設定",
-                                  "delayed": False}])
-        atty = hj.plan_today([_rec(rid="8", legal="2026-09-18")], TODAY)[0].facts   # 起算日空・弁護士設定
-        self.assertEqual((atty[0]["start_basis"], atty[0]["start_date"], atty[0]["legal_source"],
-                          atty[0]["internal_source"]), ("弁護士設定", None, "弁護士設定", "計算値"))
-
-    def test_digest_changes_for_start_date_legal_source_internal_source_alone(self):
-        """fix5 HJCF4-01: 起算日の実日付・法定満了日/社内締切日の 弁護士設定/計算値 が単独で変わっても別値。"""
-        def d(**kw):
-            kw.setdefault("history", "")
-            return hj.digest_of(hj.plan_today([_rec(rid="1", **kw)], TODAY))
-        # start_date のみ（法定満了日は弁護士設定 9/16 で固定・根拠欄名は同じ）
-        self.assertNotEqual(d(legal="2026-09-16", knew="2026-06-01"), d(legal="2026-09-16", knew="2026-06-02"))
-        # legal_source のみ（同じ 9/16 を計算値で得る場合と弁護士設定で得る場合）
-        self.assertNotEqual(d(knew="2026-06-16"), d(knew="2026-06-16", legal="2026-09-16"))
-        # internal_source のみ（同じ 9/6 を計算値で得る場合と弁護士設定で得る場合）
-        self.assertNotEqual(d(knew="2026-06-16"), d(knew="2026-06-16", internal="2026-09-06"))
-        # 同一内容は同値
-        self.assertEqual(d(legal="2026-09-16", knew="2026-06-01"), d(legal="2026-09-16", knew="2026-06-01"))
-
-    def test_body_values_are_all_in_facts(self):
-        """原則「通知本文に表示する値は、すべて facts に含める」を両側から生成して pin:
-        (a) 本文組立関数が参照する dl./ms./record_id の集合 ⊆ 対応表のキー、
-        (b) 対応表の値 == 実 fact のキー集合。"""
-        import ast as _ast
-        tree = _ast.parse(Path(hj.__file__).read_text(encoding="utf-8"))
-        used = set()
-        for node in tree.body:
-            if isinstance(node, _ast.FunctionDef) and node.name in ("format_item", "format_item_compact"):
-                for sub in _ast.walk(node):
-                    if isinstance(sub, _ast.Attribute) and isinstance(sub.value, _ast.Name) \
-                            and sub.value.id in ("dl", "ms"):
-                        used.add(f"{sub.value.id}.{sub.attr}")
-                    if isinstance(sub, _ast.Name) and sub.id == "record_id":
-                        used.add("record_id")
-        self.assertTrue(used)
-        self.assertLessEqual(used, set(hj.BODY_TO_FACT_KEYS))                          # (a)
-        self.assertIn("dl.start", used)
-        self.assertIn("dl.legal_source", used)
-        fact = hj.milestone_fact("1", hj.MS_INTERNAL_DAY, TODAY, hj.compute_deadlines(_due()), TODAY)
-        self.assertEqual(set(fact), set(hj.BODY_TO_FACT_KEYS.values()))                # (b)
-        self.assertEqual(set(fact), set(hj.FACT_KEYS))
-        for e in hj.plan_today([_due(rid="1"), _rec(rid="9")], TODAY):                 # 実 entry も同じキー集合
-            for f in e.facts:
-                self.assertEqual(set(f), set(hj.FACT_KEYS))
+    def test_unset_text_has_count_only(self):
+        t = hj.unset_text(TODAY, 3)
+        self.assertIn("起算日未確定 3 件", t)
+        self.assertNotIn("No.", t)
 
 
-# ── ジョブ（kintone・LINE は mock） ──────────────────────────────────────────
+# ── ジョブ（kintone・notify を fake） ──────────────────────────────────────────
 class _Base(unittest.TestCase):
     def setUp(self):
         self.records: dict[str, dict] = {}
         self.updates: list[tuple] = []
-        self.conflict_on: set[str] = set()
+        self.gets: list[str] = []
+        self.conflict_next: dict[str, int] = {}        # rid → 409 を返す残回数
         self.fail_on: set[str] = set()
         self.queries: list[str] = []
-        self.seeded_history: dict[str, str] = {}
 
         async def search_records(app, query, fields=None):
             self.queries.append(query)
@@ -410,23 +254,32 @@ class _Base(unittest.TestCase):
             after = int(m.group(1)) if m else 0
             rows = sorted((r for r in self.records.values() if int(r["$id"]["value"]) > after),
                           key=lambda r: int(r["$id"]["value"]))
-            return [dict(r) for r in rows[:hj.SEARCH_LIMIT]]
+            return [{k: dict(v) if isinstance(v, dict) else v for k, v in r.items()}
+                    for r in rows[:hj.SEARCH_LIMIT]]
+
+        async def get_record(app, rid):
+            self.gets.append(rid)
+            return {k: dict(v) for k, v in self.records[rid].items()}
 
         async def update_record(app, rid, fields, revision=None):
             self.updates.append((app.app_id_env, rid, dict(fields), revision))
-            if rid in self.conflict_on:
-                raise hub_kintone.KintoneConflict("409")
+            if self.conflict_next.get(rid, 0) > 0:
+                self.conflict_next[rid] -= 1
+                raise hub_kintone.KintoneConflict(409, "GAIA_CO02", "conflict")
             if rid in self.fail_on:
-                raise hub_kintone.KintoneError("500")
+                raise hub_kintone.KintoneError(500, "GAIA_XX", "down")
             rec = self.records[rid]
             self.assertEqual(revision, rec["$revision"]["value"])
             for k, v in fields.items():
                 rec[k] = {"value": v}
             rec["$revision"] = {"value": str(int(revision) + 1)}
 
-        self.admin = AsyncMock(return_value="sent")       # 3 値（sent/throttled/failed）
+        self.admin = AsyncMock(return_value="sent")
         self.today = TODAY
+        hj._unset_notified_on = None
+        self.addCleanup(setattr, hj, "_unset_notified_on", None)
         for p in (patch.object(hub_kintone, "search_records", search_records),
+                  patch.object(hub_kintone, "get_record", get_record),
                   patch.object(hub_kintone, "update_record", update_record),
                   patch.object(hub_notify, "notify_admin_line_result", self.admin),
                   patch.object(hj, "_today_jst", lambda: self.today)):
@@ -436,22 +289,12 @@ class _Base(unittest.TestCase):
     def seed(self, *recs):
         for r in recs:
             self.records[r["$id"]["value"]] = r
-            self.seeded_history[r["$id"]["value"]] = r["熟慮期間通知履歴"]["value"]
 
     def run_job(self, hour=8):
         return asyncio.run(hj.jukuryo_daily_check(hour))
 
-    def raw_history(self, rid):
-        return self.records[rid]["熟慮期間通知履歴"]["value"]
-
-    def history(self, rid):
-        """seed 時の履歴より後に追記された分だけ（追記なしなら ""）。"""
-        raw = self.raw_history(rid)
-        seeded = self.seeded_history.get(rid, "")
-        if not seeded:
-            return raw
-        self.assertTrue(raw.startswith(seeded), raw)
-        return raw[len(seeded):].lstrip("\n")
+    def val(self, rid, code):
+        return self.records[rid][code]["value"]
 
     def sent_texts(self):
         return [c.args[0] for c in self.admin.await_args_list]
@@ -459,485 +302,374 @@ class _Base(unittest.TestCase):
     def sent_keys(self):
         return [c.kwargs["throttle_key"] for c in self.admin.await_args_list]
 
+    def alert_texts(self):
+        return [t for t in self.sent_texts() if hj.UNSET_LABEL not in t]
+
     def written_fields(self):
         return sorted({k for _, _, f, _ in self.updates for k in f})
 
 
 class TestDailyJob(_Base):
-    def test_internal_day_notifies_once_and_appends_history(self):
-        self.seed(_due(rid="1"))          # 法定 9/18・社内 9/8=TODAY
-        out = self.run_job()
-        self.assertEqual(out, {"targets": 1, "items": 1, "unset": 0, "notices": 1, "sent": 1,
-                               "failed": 0, "history_failed": 0})
-        self.assertEqual(self.history("1"), "2026-09-08 社内締切当日@2026-09-08 通知済")
-        self.assertEqual(self.written_fields(), ["熟慮期間通知履歴"])   # 履歴欄以外は書かない
-        self.assertEqual(self.updates[0][0], "APP_HOUKI")                # App 40 のみ
-        self.assertEqual(self.admin.await_count, 1)
-        self.assertTrue(KEY_RE.match(self.sent_keys()[0]))
-        self.assertIn("No.1 社内締切当日 /", self.sent_texts()[0])
-        self.assertNotIn("山田", self.sent_texts()[0])
-
-    def test_same_day_rerun_sends_nothing(self):
-        self.seed(_due(rid="1"))
-        self.run_job()
-        self.admin.reset_mock()
-        n = len(self.updates)
-        out = self.run_job()
-        self.assertEqual((out["items"], out["notices"]), (0, 0))
-        self.assertEqual(self.admin.await_count, 0)
-        self.assertEqual(len(self.updates), n)                            # 追記もしない
-        self.assertEqual(self.history("1"), "2026-09-08 社内締切当日@2026-09-08 通知済")
-
-    def test_history_from_previous_day_does_not_block(self):
-        self.seed(_rec(rid="1", knew="2026-06-18", history="2026-09-01 社内締切7日前@2026-09-01 通知済"))
-        out = self.run_job()
-        self.assertEqual(out["items"], 1)                                 # 7日前は同名履歴で除外・当日のみ
-        self.assertEqual(self.raw_history("1"),
-                         "2026-09-01 社内締切7日前@2026-09-01 通知済\n2026-09-08 社内締切当日@2026-09-08 通知済")
-
-    def test_internal_day_without_prior_7day_notice_recovers_it_too(self):
-        """7 日前の通知が一度も無い当日案件は、当日+遅延の 7 日前（本来 9/1）の 2 行になる。"""
-        self.seed(_rec(rid="1", knew="2026-06-18", history=""))
-        out = self.run_job()
-        self.assertEqual(out["items"], 2)
-        body = self.sent_texts()[0]
-        self.assertIn("No.1 社内締切7日前（遅延・本来 2026-09-01） /", body)
-        self.assertIn("No.1 社内締切当日 /", body)
-        self.assertEqual(self.raw_history("1"),
-                         "2026-09-08 社内締切7日前@2026-09-01 通知済\n2026-09-08 社内締切当日@2026-09-08 通知済")
-
-    def test_cas_conflict_after_send_logs_warning_and_does_not_raise(self):
-        self.seed(_due(rid="1"))
-        self.conflict_on.add("1")
-        with self.assertLogs("hub.houki_jukuryo", level=logging.WARNING) as cm:
-            out = self.run_job()
-        self.assertEqual((out["items"], out["sent"], out["history_failed"]), (1, 1, 1))
-        self.assertEqual(self.admin.await_count, 1)                       # 送信は行われる
-        self.assertEqual(self.history("1"), "")                           # 履歴は書けていない
-        self.assertTrue(any("history append failed after notice" in m for m in cm.output))
-        self.assertFalse(any("山田" in m for m in cm.output))
-
-    def test_write_error_after_send_logs_warning_and_does_not_raise(self):
-        self.seed(_due(rid="1"))
-        self.fail_on.add("1")
-        with self.assertLogs("hub.houki_jukuryo", level=logging.WARNING) as cm:
-            out = self.run_job()
-        self.assertEqual((out["items"], out["sent"], out["history_failed"]), (1, 1, 1))
-        self.assertEqual(self.admin.await_count, 1)
-        self.assertTrue(any("history append failed after notice" in m for m in cm.output))
-
-    def test_send_failed_writes_no_history(self):
-        self.seed(_due(rid="1"), _rec(rid="5"))
-        self.admin.return_value = "failed"
-        with self.assertLogs("hub.houki_jukuryo", level=logging.WARNING) as cm:
-            out = self.run_job()
-        self.assertEqual((out["items"], out["unset"], out["sent"], out["failed"]), (1, 1, 0, 1))
-        self.assertEqual(self.updates, [])                                # 履歴追記 0（未設定分も）
-        self.assertEqual(self.history("1"), "")
-        self.assertEqual(self.history("5"), "")
-        self.assertTrue(any("notice not sent" in m for m in cm.output))
-        # 同日の再実行で再び対象になる
-        self.admin.return_value = "sent"
-        out2 = self.run_job()
-        self.assertEqual((out2["items"], out2["unset"]), (1, 1))
-        self.assertEqual(self.history("1"), "2026-09-08 社内締切当日@2026-09-08 通知済")
-        self.assertEqual(self.history("5"), "2026-09-08 起算日未設定 通知済")
-
-    def test_throttled_counts_as_sent_and_writes_history(self):
-        self.seed(_due(rid="1"))
-        self.admin.return_value = "throttled"
-        out = self.run_job()
-        self.assertEqual((out["sent"], out["history_failed"]), (1, 0))
-        self.assertEqual(self.history("1"), "2026-09-08 社内締切当日@2026-09-08 通知済")
-
-    def test_history_written_only_after_send(self):
-        """送信呼出しの時点で履歴追記が 0 件であること（順序 pin）。"""
-        self.seed(_due(rid="1"))
-        seen = []
-
-        async def admin(text, throttle_key=""):
-            seen.append(len(self.updates))
-            return "sent"
-        self.admin.side_effect = admin
-        self.run_job()
-        self.assertEqual(seen, [0])
+    def test_writes_deadline_and_remaining_without_alert(self):
+        self.seed(_rec(rid="2", start=_start_for_remaining(30), revision="7"))
+        res = self.run_job()
+        self.assertEqual(self.val("2", "熟慮期間期限"), date.fromordinal(TODAY.toordinal() + 30).isoformat())
+        self.assertEqual(self.val("2", "残日数"), "30")
         self.assertEqual(len(self.updates), 1)
+        self.assertEqual(self.updates[0][3], "7")                       # $revision CAS
+        self.assertEqual(set(self.updates[0][2]), {"熟慮期間期限", "残日数"})
+        self.assertEqual((res["written"], res["alerts"]), (1, 0))
+        self.assertEqual(self.sent_texts(), [])
 
-    def test_multiple_milestones_same_record_one_update(self):
-        self.seed(_rec(rid="1", legal="2026-09-11", internal="2026-09-08", history=H7))   # 社内当日+法定3日前
-        out = self.run_job()
-        self.assertEqual(out["items"], 2)
-        self.assertEqual(len(self.updates), 1)                             # 1 レコード 1 回の CAS 更新
-        self.assertEqual(self.history("1"),
-                         "2026-09-08 社内締切当日@2026-09-08 通知済\n2026-09-08 法定満了3日前@2026-09-08 通知済")
+    def test_alert_14_sent_once_and_marked(self):
+        self.seed(_rec(rid="1", start=_start_for_remaining(14)))
+        res = self.run_job()
+        self.assertEqual(len(self.alert_texts()), 1)
+        self.assertIn("・No.1 期限 2026-09-22 残 14 日（14日前の通知）", self.alert_texts()[0])
+        self.assertEqual(self.val("1", "通知済み閾値"), ["14日前"])
+        self.assertEqual(self.val("1", "残日数"), "14")
+        self.assertEqual((res["alerts"], res["sent"], res["written"]), (1, 1, 1))
+        self.assertEqual(len([u for u in self.updates if u[1] == "1"]), 1)   # 1 レコード 1 回の書込
+
+    def test_same_day_three_runs_send_once_and_write_once(self):
+        self.seed(_rec(rid="1", start=_start_for_remaining(14)))
+        self.run_job(8)
+        self.run_job(13)
+        self.run_job(18)
+        self.assertEqual(len(self.alert_texts()), 1)
+        self.assertEqual(len(self.updates), 1)
+        self.assertEqual(self.val("1", "通知済み閾値"), ["14日前"])
+
+    def test_alert_7_after_14_marked(self):
+        self.seed(_rec(rid="1", start=_start_for_remaining(7), notified=("14日前",),
+                       deadline="2026-09-15", remaining="8"))
+        self.run_job()
+        t = self.alert_texts()[0]
+        self.assertIn("（7日前の通知）", t)
+        self.assertNotIn("（14日前の通知）", t)
+        self.assertEqual(self.val("1", "通知済み閾値"), ["14日前", "7日前"])
+        self.assertEqual(self.val("1", "残日数"), "7")
+
+    def test_missed_14_is_sent_together_with_7(self):
+        self.seed(_rec(rid="1", start=_start_for_remaining(7)))
+        self.run_job()
+        self.assertEqual(len(self.alert_texts()), 1)
+        self.assertIn("（14日前の通知）", self.alert_texts()[0])
+        self.assertIn("（7日前の通知）", self.alert_texts()[0])
+        self.assertEqual(self.val("1", "通知済み閾値"), ["14日前", "7日前"])
+
+    def test_remaining_15_no_alert_only_fields(self):
+        self.seed(_rec(rid="1", start=_start_for_remaining(15)))
+        res = self.run_job()
+        self.assertEqual(self.alert_texts(), [])
+        self.assertEqual(self.val("1", "残日数"), "15")
+        self.assertEqual(self.val("1", "通知済み閾値"), [])
+        self.assertEqual(res["alerts"], 0)
+
+    def test_overdue_without_marks_still_sends_once_no_overdue_notice(self):
+        self.seed(_rec(rid="1", start=_start_for_remaining(-3)))
+        self.run_job()
+        self.run_job(13)
+        self.assertEqual(len(self.alert_texts()), 1)
+        self.assertIn("残 -3 日", self.alert_texts()[0])
+        self.assertNotIn("超過", self.alert_texts()[0])
+        self.assertEqual(self.val("1", "通知済み閾値"), ["14日前", "7日前"])
+
+    def test_both_marked_overdue_sends_nothing(self):
+        self.seed(_rec(rid="1", start=_start_for_remaining(-3), notified=("14日前", "7日前")))
+        self.run_job()
+        self.assertEqual(self.alert_texts(), [])
+        self.assertEqual(self.val("1", "残日数"), "-3")
+
+    def test_start_change_recalculates_and_overwrites(self):
+        self.seed(_rec(rid="1", start="2026-06-15", deadline="2026-09-14", remaining="6",
+                       notified=("14日前", "7日前")))
+        self.run_job()
+        self.assertEqual(self.updates, [])                                # 変化なし → 書かない
+        self.records["1"]["起算日_確定"] = {"value": "2026-08-01"}       # 弁護士が起算日を直す
+        self.run_job(13)
+        self.assertEqual(self.val("1", "熟慮期間期限"), "2026-10-31")
+        self.assertEqual(self.val("1", "残日数"), "53")
+        self.assertEqual(len(self.updates), 1)
+        self.assertEqual(self.alert_texts(), [])
+
+    def test_start_cleared_clears_system_fields(self):
+        self.seed(_rec(rid="1", start="", deadline="2026-09-14", remaining="6"))
+        res = self.run_job()
+        self.assertEqual(self.val("1", "熟慮期間期限"), "")
+        self.assertEqual(self.val("1", "残日数"), "")
+        self.assertEqual(res["unset"], 1)
+
+    def test_all_eight_statuses_are_processed(self):
+        for i, s in enumerate(ALL_POST, 1):
+            self.seed(_rec(rid=str(i), status=s, start=_start_for_remaining(14)))
+        res = self.run_job()
+        self.assertEqual(res["targets"], 8)
+        self.assertEqual(res["alerts"], 8)
+        for i in range(1, 9):
+            self.assertEqual(self.val(str(i), "通知済み閾値"), ["14日前"])
 
     def test_non_target_records_are_skipped_even_if_returned(self):
-        self.seed(_rec(rid="1", knew="2026-06-18", status="書類収集中"),
-                  _rec(rid="2", knew="2026-06-18", submitted="2026-09-01"))
-        out = self.run_job()
-        self.assertEqual((out["items"], out["notices"]), (0, 0))
-        self.assertEqual(self.admin.await_count, 0)
+        self.seed(_rec(rid="1", status="問い合わせ", start=_start_for_remaining(14)),
+                  _rec(rid="2", status="受任", submitted="2026-09-01", start=_start_for_remaining(14)),
+                  _rec(rid="3", status="辞任", start=_start_for_remaining(14)))
+        res = self.run_job()
+        self.assertEqual(self.sent_texts(), [])
         self.assertEqual(self.updates, [])
+        self.assertEqual(res["alerts"], 0)
 
-    def test_no_milestone_today_sends_nothing(self):
-        self.seed(_rec(rid="1", knew="2026-07-01"))            # 法定 10/1・社内 9/21
-        out = self.run_job()
-        self.assertEqual((out["items"], out["notices"]), (0, 0))
-        self.assertEqual(self.admin.await_count, 0)
+    def test_send_failed_writes_fields_but_no_mark_and_resends_next_run(self):
+        self.seed(_rec(rid="1", start=_start_for_remaining(14)))
+        self.admin.return_value = "failed"
+        with self.assertLogs("hub.houki_jukuryo", level=logging.WARNING):
+            res = self.run_job()
+        self.assertEqual(res["failed"], 1)
+        self.assertEqual(self.val("1", "通知済み閾値"), [])
+        self.assertEqual(self.val("1", "残日数"), "14")                  # 期限欄は書く
+        self.admin.return_value = "sent"
+        self.run_job(13)
+        self.assertEqual(len(self.alert_texts()), 2)
+        self.assertEqual(self.val("1", "通知済み閾値"), ["14日前"])
+
+    def test_throttled_counts_as_sent_and_marks(self):
+        self.seed(_rec(rid="1", start=_start_for_remaining(14)))
+        self.admin.return_value = "throttled"
+        res = self.run_job()
+        self.assertEqual(res["sent"], 1)
+        self.assertEqual(self.val("1", "通知済み閾値"), ["14日前"])
+
+    def test_mark_written_only_after_send(self):
+        order = []
+        self.seed(_rec(rid="1", start=_start_for_remaining(14)))
+        real_update = hub_kintone.update_record
+
+        async def spy_update(app, rid, fields, revision=None):
+            order.append(("update", sorted(fields)))
+            return await real_update(app, rid, fields, revision)
+
+        async def spy_notify(text, throttle_key=None):
+            order.append(("notify",))
+            return "sent"
+        with patch.object(hub_kintone, "update_record", spy_update), \
+                patch.object(hub_notify, "notify_admin_line_result", spy_notify):
+            self.run_job()
+        self.assertEqual(order, [("notify",), ("update", ["残日数", "熟慮期間期限", "通知済み閾値"])])
+
+    def test_cas_conflict_refetches_once_and_retries_with_new_values(self):
+        self.seed(_rec(rid="1", start=_start_for_remaining(14), revision="5"))
+        self.conflict_next["1"] = 1
+        orig_get = hub_kintone.get_record
+
+        async def get_changed(app, rid):            # 409 の裏で弁護士が起算日を変えていた
+            self.records[rid]["$revision"] = {"value": "6"}
+            self.records[rid]["起算日_確定"] = {"value": _start_for_remaining(40)}
+            return await orig_get(app, rid)
+        with patch.object(hub_kintone, "get_record", get_changed):
+            res = self.run_job()
+        self.assertEqual(res["written"], 1)
+        self.assertEqual([u[3] for u in self.updates], ["5", "6"])
+        self.assertEqual(self.val("1", "残日数"), "40")                  # 再計算した値で保存
+        self.assertEqual(self.val("1", "通知済み閾値"), ["14日前"])      # 送った刻印は保持
+
+    def test_cas_conflict_twice_warns_and_does_not_raise(self):
+        self.seed(_rec(rid="1", start=_start_for_remaining(14)))
+        self.conflict_next["1"] = 2
+        with self.assertLogs("hub.houki_jukuryo", level=logging.WARNING) as cm:
+            res = self.run_job()
+        self.assertEqual(res["write_failed"], 1)
+        self.assertIn("CAS conflict twice", "\n".join(cm.output))
+        self.assertEqual(len(self.updates), 2)
+
+    def test_write_error_warns_and_does_not_raise(self):
+        self.seed(_rec(rid="1", start=_start_for_remaining(30)))
+        self.fail_on.add("1")
+        with self.assertLogs("hub.houki_jukuryo", level=logging.WARNING) as cm:
+            res = self.run_job()
+        self.assertEqual(res["write_failed"], 1)
+        self.assertIn("write failed", "\n".join(cm.output))
+        self.assertNotIn(NAME, "\n".join(cm.output))
+
+    def test_fetch_error_sends_and_writes_nothing(self):
+        async def boom(app, query, fields=None):
+            raise hub_kintone.KintoneError(500, "GAIA_XX", "down")
+        with patch.object(hub_kintone, "search_records", boom), \
+                self.assertLogs("hub.houki_jukuryo", level=logging.ERROR):
+            res = self.run_job()
+        self.assertEqual(res["targets"], 0)
+        self.assertEqual(self.sent_texts(), [])
         self.assertEqual(self.updates, [])
-
-    def test_unset_start_is_listed_once_per_day(self):
-        self.seed(_rec(rid="5"))
-        out = self.run_job()
-        self.assertEqual(out["unset"], 1)
-        self.assertIn("起算日未設定: No.5", self.sent_texts()[0])
-        self.assertEqual(self.history("5"), "2026-09-08 起算日未設定 通知済")
-        self.admin.reset_mock()
-        self.assertEqual(self.run_job()["unset"], 0)
-        self.assertEqual(self.admin.await_count, 0)
 
     def test_multiple_records_one_notice(self):
-        self.seed(_due(rid="1"),            # 社内締切当日
-                  _rec(rid="2", knew="2026-06-25"),            # 法定 9/25・社内 9/15 → 7日前
-                  _rec(rid="3", knew="2026-05-01"),            # 法定 8/1 → 超過（単発は窓外）
-                  _rec(rid="4"))                               # 未設定
-        out = self.run_job()
-        self.assertEqual((out["items"], out["unset"], out["notices"]), (3, 1, 1))
-        self.assertEqual(self.admin.await_count, 1)
-        body = self.sent_texts()[0]
-        for s in ("No.1 社内締切当日 /", "No.2 社内締切7日前 /", "No.3 満了超過 /", "起算日未設定: No.4"):
-            self.assertIn(s, body)
-        self.assertNotIn("遅延", body)
+        self.seed(_rec(rid="1", start=_start_for_remaining(14)),
+                  _rec(rid="2", start=_start_for_remaining(7), notified=("14日前",)),
+                  _rec(rid="3", start=_start_for_remaining(20)))
+        res = self.run_job()
+        self.assertEqual(len(self.alert_texts()), 1)
+        self.assertIn("No.1", self.alert_texts()[0])
+        self.assertIn("No.2", self.alert_texts()[0])
+        self.assertNotIn("No.3", self.alert_texts()[0])
+        self.assertEqual(res["written"], 3)
 
-    def test_attorney_dates_are_used_and_not_overwritten(self):
-        self.seed(_rec(rid="1", knew="2026-06-01", legal="2026-09-18", internal="2026-09-08", history=H7))
-        out = self.run_job()
-        self.assertEqual(out["items"], 1)
-        self.assertIn("社内締切 2026-09-08（弁護士設定）", self.sent_texts()[0])
-        self.assertIn("法定満了 2026-09-18（弁護士設定）", self.sent_texts()[0])
-        self.assertEqual(self.written_fields(), ["熟慮期間通知履歴"])
-        self.assertEqual(self.records["1"]["法定満了日"]["value"], "2026-09-18")
 
-    def test_fetch_error_sends_nothing(self):
-        with patch.object(hub_kintone, "search_records",
-                          AsyncMock(side_effect=hub_kintone.KintoneError("x"))):
-            out = self.run_job()
-        self.assertEqual((out["sent"], out["notices"]), (0, 0))
-        self.assertEqual(self.admin.await_count, 0)
+class TestUnsetCount(_Base):
+    def test_count_only_once_per_day(self):
+        self.seed(_rec(rid="1", start=""), _rec(rid="2", start=""), _rec(rid="3", start=_start_for_remaining(30)))
+        res = self.run_job(8)
+        self.assertTrue(res["unset_notified"])
+        unset = [t for t in self.sent_texts() if hj.UNSET_LABEL in t]
+        self.assertEqual(len(unset), 1)
+        self.assertIn("起算日未確定 2 件", unset[0])
+        self.assertNotIn("No.", unset[0])
+        self.assertNotIn(NAME, unset[0])
+        self.assertEqual(self.sent_keys()[-1], "houki_jukuryo_daily:2026-09-08:unset")
+        self.run_job(13)
+        self.run_job(18)
+        self.assertEqual(len([t for t in self.sent_texts() if hj.UNSET_LABEL in t]), 1)
 
-    def test_notify_failure_is_logged_not_raised(self):
-        self.seed(_due(rid="1"))
+    def test_new_day_notifies_again(self):
+        self.seed(_rec(rid="1", start=""))
+        self.run_job()
+        self.today = date(2026, 9, 9)
+        self.run_job()
+        self.assertEqual(len([t for t in self.sent_texts() if hj.UNSET_LABEL in t]), 2)
+
+    def test_zero_unset_no_notice(self):
+        self.seed(_rec(rid="1", start=_start_for_remaining(30)))
+        res = self.run_job()
+        self.assertFalse(res["unset_notified"])
+        self.assertEqual(self.sent_texts(), [])
+
+    def test_failed_unset_notice_is_retried_at_next_run(self):
+        self.seed(_rec(rid="1", start=""))
         self.admin.return_value = "failed"
-        out = self.run_job()
-        self.assertEqual((out["sent"], out["failed"], out["items"]), (0, 1, 1))
-        self.assertEqual(self.history("1"), "")                           # 失敗時は追記しない
+        with self.assertLogs("hub.houki_jukuryo", level=logging.WARNING):
+            res = self.run_job(8)
+        self.assertFalse(res["unset_notified"])
+        self.admin.return_value = "sent"
+        res = self.run_job(13)
+        self.assertTrue(res["unset_notified"])
+
+    def test_unset_records_write_nothing_when_fields_empty(self):
+        self.seed(_rec(rid="1", start=""))
+        self.run_job()
+        self.assertEqual(self.updates, [])
+
+
+class TestPiiAndClosedSet(_Base):
+    def test_no_pii_in_texts_keys_or_logs(self):
+        self.seed(_rec(rid="1", start=_start_for_remaining(7)), _rec(rid="2", start=""))
+        with self.assertLogs("hub.houki_jukuryo", level=logging.INFO) as cm:
+            self.run_job()
+        blob = "\n".join(self.sent_texts() + self.sent_keys() + cm.output)
+        for leak in (NAME, KANA, "2026-05-01", "2026-04-01"):
+            self.assertNotIn(leak, blob)
+
+    def test_only_three_fields_are_ever_written(self):
+        self.seed(_rec(rid="1", start=_start_for_remaining(7)),
+                  _rec(rid="2", start="", deadline="2026-01-01", remaining="3"))
+        self.run_job()
+        self.assertTrue(set(self.written_fields()) <= hj.WRITE_FIELDS, self.written_fields())
+        for _app, _rid, fields, _rev in self.updates:
+            for banned in ("status", "起算日_確定", "法定満了日", "社内締切日", "熟慮期間通知履歴", "申述提出日"):
+                self.assertNotIn(banned, fields)
+        self.assertEqual({u[0] for u in self.updates}, {"APP_HOUKI"})
 
 
 class TestSplitSend(_Base):
-    """fix2 HJC-01: 分割送信と「送った分だけ履歴」。"""
-
-    def seed60(self):
-        self.seed(*[_due(rid=str(i)) for i in range(1, 61)])
-
-    def test_60_records_split_into_multiple_notices_all_included(self):
-        self.seed60()
-        out = self.run_job()
-        self.assertGreater(out["notices"], 1)
-        self.assertEqual((out["sent"], out["failed"], out["items"]), (out["notices"], 0, 60))
-        texts = self.sent_texts()
-        for t in texts:
-            self.assertLessEqual(len(t), hj.NOTICE_MAX_CHARS)
+    def test_60_records_split_into_multiple_notices_all_marked(self):
         for i in range(1, 61):
-            self.assertEqual(sum(1 for t in texts if f"No.{i} 社内締切当日" in t), 1)
-            self.assertEqual(self.history(str(i)), "2026-09-08 社内締切当日@2026-09-08 通知済")
-        self.assertEqual(len(set(self.sent_keys())), out["notices"])
-
-    def test_one_failed_notice_leaves_only_its_records_without_history(self):
-        self.seed60()
-        calls = []
-
-        async def admin(text, throttle_key=""):
-            calls.append(text)
-            return "failed" if len(calls) == 2 else "sent"
-        self.admin.side_effect = admin
-        out = self.run_job()
-        self.assertEqual((out["sent"], out["failed"]), (out["notices"] - 1, 1))
-        failed_ids = set(re.findall(r"No\.(\d+) 社内締切当日", calls[1]))
-        self.assertTrue(failed_ids)
+            self.seed(_rec(rid=str(i), start=_start_for_remaining(14)))
+        with patch.object(hj, "NOTICE_MAX_CHARS", 600):
+            res = self.run_job()
+        self.assertGreater(res["notices"], 1)
+        self.assertEqual(res["sent"], res["notices"])
         for i in range(1, 61):
-            if str(i) in failed_ids:
-                self.assertEqual(self.history(str(i)), "")
-            else:
-                self.assertEqual(self.history(str(i)), "2026-09-08 社内締切当日@2026-09-08 通知済")
-        # 13:00 の回: 失敗した通の案件だけが送られる
-        self.admin.side_effect = None
-        self.admin.return_value = "sent"
-        self.admin.reset_mock()
-        out2 = self.run_job(hour=13)
-        self.assertEqual(out2["items"], len(failed_ids))
-        sent_ids = {m for t in self.sent_texts() for m in re.findall(r"No\.(\d+) 社内締切当日", t)}
-        self.assertEqual(sent_ids, failed_ids)
+            self.assertEqual(self.val(str(i), "通知済み閾値"), ["14日前"])
+        for k in self.sent_keys():
+            self.assertTrue(KEY_RE.match(k), k)
+
+    def test_one_failed_notice_leaves_only_its_records_unmarked(self):
         for i in range(1, 61):
-            self.assertEqual(self.history(str(i)), "2026-09-08 社内締切当日@2026-09-08 通知済")
+            self.seed(_rec(rid=str(i), start=_start_for_remaining(14)))
+        calls = {"n": 0}
+
+        async def flaky(text, throttle_key=None):
+            calls["n"] += 1
+            return "failed" if calls["n"] == 2 else "sent"
+        with patch.object(hj, "NOTICE_MAX_CHARS", 600), \
+                patch.object(hub_notify, "notify_admin_line_result", flaky):
+            res = self.run_job()
+        self.assertEqual(res["failed"], 1)
+        marked = [i for i in range(1, 61) if self.val(str(i), "通知済み閾値") == ["14日前"]]
+        unmarked = [i for i in range(1, 61) if self.val(str(i), "通知済み閾値") == []]
+        self.assertTrue(marked and unmarked)
+        self.assertEqual(len(marked) + len(unmarked), 60)
+        for i in unmarked:
+            self.assertEqual(self.val(str(i), "残日数"), "14")             # 期限欄は書かれている
 
 
 class TestDigestKeys(_Base):
-    """fix2 HJC-02: 別集合は別キー・同一内容は throttled=成功扱い。"""
-
-    def test_new_record_within_window_gets_new_key(self):
-        self.seed(_due(rid="1"))
-        self.run_job()
-        self.seed(_due(rid="2"))
-        out = self.run_job()
-        self.assertEqual(out["items"], 1)                                  # No.1 は履歴で除外
-        keys = self.sent_keys()
-        self.assertEqual(len(keys), 2)
-        self.assertNotEqual(keys[0], keys[1])
-        self.assertIn("No.2 社内締切当日", self.sent_texts()[1])
-        self.assertNotIn("No.1 ", self.sent_texts()[1])
-
     def test_real_notify_same_content_is_throttled_and_treated_as_sent(self):
-        """実 notify_admin_line_result（push は mock）: 同一内容の再実行は throttled=成功・
-        別集合は sent。"""
-        push = AsyncMock(return_value=True)
-        for p in (patch.object(hub_notify, "notify_admin_line_result", _REAL_NOTIFY_RESULT),
-                  patch.object(hub_notify, "push_line_message", push),
-                  patch.object(hub_notify, "get_admin_line_user_id", return_value="Uadmin")):
-            p.start()
-            self.addCleanup(p.stop)
-        hub_notify._last_notify_at.clear()
-        hub_notify._notify_in_flight.clear()
-        self.addCleanup(hub_notify._last_notify_at.clear)
-        self.seed(_due(rid="1"))
-        out = self.run_job()
-        self.assertEqual((out["sent"], push.await_count), (1, 1))
-        # 履歴が書けなかった想定（人為的に空へ戻す）→ 同一内容の再実行は throttled=成功扱いで履歴追記
-        self.records["1"]["熟慮期間通知履歴"] = {"value": H7}
-        out2 = self.run_job()
-        self.assertEqual((out2["sent"], out2["failed"], push.await_count), (1, 0, 1))   # 送信は増えない
-        self.assertEqual(self.history("1"), "2026-09-08 社内締切当日@2026-09-08 通知済")
-        # 別の案件集合は別キーで実送信される（300 秒窓内でも throttled にならない）
-        self.seed(_due(rid="2"))
-        out3 = self.run_job()
-        self.assertEqual((out3["sent"], push.await_count), (1, 2))
-        self.assertEqual(self.history("2"), "2026-09-08 社内締切当日@2026-09-08 通知済")
+        self.seed(_rec(rid="1", start=_start_for_remaining(14)))
+        pushes = []
 
-
-    def _use_real_notify(self):
-        push = AsyncMock(return_value=True)
-        for p in (patch.object(hub_notify, "notify_admin_line_result", _REAL_NOTIFY_RESULT),
-                  patch.object(hub_notify, "push_line_message", push),
-                  patch.object(hub_notify, "get_admin_line_user_id", return_value="Uadmin")):
-            p.start()
-            self.addCleanup(p.stop)
-        hub_notify._last_notify_at.clear()
-        hub_notify._notify_in_flight.clear()
-        self.addCleanup(hub_notify._last_notify_at.clear)
-        return push
-
-    def test_codex_repro_deadline_change_within_window_is_sent_not_throttled(self):
-        """HJCF2-01 再現: 9/8 に 法定満了 9/16（弁護士設定）・社内締切 9/6（計算値）の案件を遅延通知
-        → 法定満了 を 9/17 に変更 → 300 秒以内に再実行 → 新該当日 9/7 の通知は sent（throttled でない）。"""
-        push = self._use_real_notify()
-        rec = _rec(rid="1", legal="2026-09-16", history="")
-        self.seed(rec)
-        out = self.run_job()
-        self.assertEqual((out["sent"], push.await_count), (1, 1))
-        self.assertIn("No.1 社内締切当日（遅延・本来 2026-09-06） /", push.await_args_list[0].args[1])
-        self.assertEqual(self.history("1"), "2026-09-08 社内締切当日@2026-09-06 通知済")
-        rec["法定満了日"] = {"value": "2026-09-17"}                                 # 社内締切 9/7 へ
-        out2 = self.run_job()
-        self.assertEqual((out2["items"], out2["sent"], out2["failed"], push.await_count), (1, 1, 0, 2))
-        self.assertIn("No.1 社内締切当日（遅延・本来 2026-09-07） /", push.await_args_list[1].args[1])
-        self.assertEqual(self.raw_history("1").splitlines()[-1], "2026-09-08 社内締切当日@2026-09-07 通知済")
-        # 同一内容の再実行（履歴が書けなかった想定）は従来どおり throttled=成功扱い
-        self.records["1"]["熟慮期間通知履歴"] = {"value": "2026-09-08 社内締切当日@2026-09-06 通知済"}
-        out3 = self.run_job()
-        self.assertEqual((out3["sent"], out3["failed"], push.await_count), (1, 0, 2))
-        self.assertEqual(self.raw_history("1").splitlines()[-1], "2026-09-08 社内締切当日@2026-09-07 通知済")
-
-
-    def test_codex_repro_start_date_correction_after_cas_failure_is_sent(self):
-        """HJCF4-01 再現: 通知成功後に履歴 CAS 失敗 → 弁護士設定の法定満了日は維持したまま申告起算日を
-        訂正（6/1→6/2）→ 300 秒以内に再実行 → sent（throttled でない）・履歴追記。"""
-        push = self._use_real_notify()
-        rec = _rec(rid="1", legal="2026-09-16", knew="2026-06-01", history="")   # 社内 9/6（計算値）・遅延
-        self.seed(rec)
-        self.conflict_on.add("1")
-        out = self.run_job()
-        self.assertEqual((out["sent"], out["history_failed"], push.await_count), (1, 1, 1))
-        self.assertEqual(self.history("1"), "")
-        self.conflict_on.discard("1")
-        rec["相続人と知った日_申告"] = {"value": "2026-06-02"}                    # 起算日の訂正のみ
-        out2 = self.run_job()
-        self.assertEqual((out2["sent"], out2["failed"], push.await_count), (1, 0, 2))
-        self.assertIn("起算日 2026-06-02（相続人と知った日_申告・申告ベース・要確認）", push.await_args_list[1].args[1])
-        self.assertEqual(self.history("1"), "2026-09-08 社内締切当日@2026-09-06 通知済")
-
-    def test_explicit_internal_same_date_changes_digest_and_is_sent(self):
-        """社内締切を同じ日付で明示設定（計算値 → 弁護士設定）→ 別 digest で sent。"""
-        push = self._use_real_notify()
-        rec = _rec(rid="1", legal="2026-09-16", knew="2026-06-01", history="")
-        self.seed(rec)
-        self.conflict_on.add("1")
-        self.run_job()
-        self.assertEqual(push.await_count, 1)
-        self.conflict_on.discard("1")
-        rec["社内締切日"] = {"value": "2026-09-06"}
-        out2 = self.run_job()
-        self.assertEqual((out2["sent"], push.await_count), (1, 2))
-        self.assertIn("社内締切 2026-09-06（弁護士設定）", push.await_args_list[1].args[1])
-        # 同一内容の再実行は throttled=成功扱い（不変）
-        self.records["1"]["熟慮期間通知履歴"] = {"value": ""}
-        out3 = self.run_job()
-        self.assertEqual((out3["sent"], out3["failed"], push.await_count), (1, 0, 2))
-        self.assertEqual(self.history("1"), "2026-09-08 社内締切当日@2026-09-06 通知済")
+        async def fake_push(admin_id, text, token_env=None):
+            pushes.append(text)
+            return True
+        with patch.object(hub_notify, "notify_admin_line_result", _REAL_NOTIFY_RESULT), \
+                patch.object(hub_notify, "get_admin_line_user_id", lambda: "Uadmin"), \
+                patch.object(hub_notify, "push_line_message", fake_push), \
+                patch.dict(hub_notify._last_notify_at, {}, clear=True):
+            r1 = self.run_job(8)
+            self.records["1"]["通知済み閾値"] = {"value": []}            # 刻印が消えた体で同内容を再送
+            r2 = self.run_job(13)
+        self.assertEqual((r1["sent"], r2["sent"]), (1, 1))
+        self.assertEqual(len([p for p in pushes if "14日前" in p]), 1)      # 実送信は 1 回（throttled）
 
 
 class TestPaging(_Base):
-    """fix2 HJC-03: 全件取得。"""
-
-    def seed_n(self, n, knew="2026-07-01"):
-        self.seed(*[_rec(rid=str(i), knew=knew) for i in range(1, n + 1)])
+    def _seed_n(self, n, remaining=30):
+        for i in range(1, n + 1):
+            self.seed(_rec(rid=str(i), start=_start_for_remaining(remaining),
+                           deadline=date.fromordinal(TODAY.toordinal() + remaining).isoformat(),
+                           remaining=str(remaining)))
 
     def test_zero_records_one_query(self):
-        out = self.run_job()
-        self.assertEqual((out["targets"], len(self.queries)), (0, 1))
+        res = self.run_job()
+        self.assertEqual((len(self.queries), res["targets"]), (1, 0))
 
     def test_499_records_one_query(self):
-        self.seed_n(499)
-        out = self.run_job()
-        self.assertEqual((out["targets"], len(self.queries)), (499, 1))
+        self._seed_n(499)
+        res = self.run_job()
+        self.assertEqual((len(self.queries), res["targets"]), (1, 499))
 
     def test_exactly_500_fetches_next_page(self):
-        self.seed_n(500)
-        out = self.run_job()
-        self.assertEqual((out["targets"], len(self.queries)), (500, 2))
+        self._seed_n(500)
+        res = self.run_job()
+        self.assertEqual((len(self.queries), res["targets"]), (2, 500))
         self.assertIn("$id > 500", self.queries[1])
 
-    def test_501st_record_due_today_is_notified(self):
-        self.seed_n(500)                                                     # 500 件は該当なし
-        self.seed(_due(rid="501"))                        # 501 件目が社内締切当日
-        out = self.run_job()
-        self.assertEqual((out["targets"], len(self.queries), out["items"]), (501, 2, 1))
-        self.assertIn("No.501 社内締切当日", self.sent_texts()[0])
-        self.assertEqual(self.history("501"), "2026-09-08 社内締切当日@2026-09-08 通知済")
+    def test_501st_record_due_is_notified(self):
+        self._seed_n(500)
+        self.seed(_rec(rid="501", start=_start_for_remaining(14)))
+        res = self.run_job()
+        self.assertEqual(res["targets"], 501)
+        self.assertEqual(self.val("501", "通知済み閾値"), ["14日前"])
 
     def test_over_1000_records_three_pages(self):
-        self.seed_n(1001)
-        out = self.run_job()
-        self.assertEqual((out["targets"], len(self.queries)), (1001, 3))
-        self.assertIn("$id > 1000", self.queries[2])
+        self._seed_n(1001)
+        res = self.run_job()
+        self.assertEqual((len(self.queries), res["targets"]), (3, 1001))
 
     def test_fetch_all_targets_stops_when_id_does_not_advance(self):
         async def stuck(app, query, fields=None):
-            return [_rec(rid="7")] * hj.SEARCH_LIMIT
+            return [_rec(rid="7", start=_start_for_remaining(30)) for _ in range(hj.SEARCH_LIMIT)]
         with patch.object(hub_kintone, "search_records", stuck), \
                 self.assertLogs("hub.houki_jukuryo", level=logging.WARNING):
             rows = asyncio.run(hj.fetch_all_targets())
-        self.assertEqual(len(rows), hj.SEARCH_LIMIT * 2)                       # 2 ページ目で停止
+        self.assertEqual(len(rows), 1000)
 
 
-class TestOneShotRecovery(_Base):
-    """fix2 HJC-04: 単発の未送信回収と同日再送。"""
-
-    def test_failed_internal_day_is_recovered_next_day_with_delay_mark(self):
-        self.seed(_due(rid="1"))                                             # 社内 9/8
-        self.admin.return_value = "failed"
-        self.run_job()
-        self.assertEqual(self.history("1"), "")
-        # 翌日: 遅延付きで送信・履歴に本来
-        self.today = date(2026, 9, 9)
-        self.admin.return_value = "sent"
-        self.admin.reset_mock()
-        out = self.run_job()
-        self.assertEqual(out["items"], 1)
-        self.assertIn("No.1 社内締切当日（遅延・本来 2026-09-08） /", self.sent_texts()[0])
-        self.assertEqual(self.history("1"), "2026-09-09 社内締切当日@2026-09-08 通知済")
-        # 翌々日: 送らない
-        self.today = date(2026, 9, 10)
-        self.admin.reset_mock()
-        out2 = self.run_job()
-        self.assertEqual((out2["items"], self.admin.await_count), (0, 0))
-
-    def test_unsent_8_days_ago_is_not_recovered(self):
-        self.seed(_rec(rid="1", internal="2026-08-31", legal="2026-10-31"))   # 社内 8/31 = 今日−8
-        out = self.run_job()
-        self.assertEqual((out["items"], out["notices"]), (0, 0))
-        self.seed(_rec(rid="2", internal="2026-09-01", legal="2026-10-31"))   # 社内 9/1 = 今日−7 → 回収
-        out2 = self.run_job()
-        self.assertEqual(out2["items"], 1)
-        self.assertIn("No.2 社内締切当日（遅延・本来 2026-09-01）", self.sent_texts()[0])
-
-    def test_recovered_one_shot_excluded_by_name_and_due_regardless_of_date(self):
-        # 社内 9/1（今日−7・回収窓内）。該当日込みの同名行があれば日付不問で 1 回のみ
-        self.seed(_rec(rid="1", internal="2026-09-01", legal="2026-10-31",
-                       history="2026-09-02 社内締切当日@2026-09-01 通知済"))
-        out = self.run_job()
-        self.assertEqual((out["items"], out["notices"]), (0, 0))
-
-    def test_same_name_with_different_due_is_not_excluded(self):
-        # 同名でも該当日が違う行（8/31）しか無ければ、9/1 の分は再通知される
-        self.seed(_rec(rid="1", internal="2026-09-01", legal="2026-10-31",
-                       history="2026-09-01 社内締切当日@2026-08-31 通知済"))
-        out = self.run_job()
-        self.assertEqual(out["items"], 1)
-        self.assertIn("No.1 社内締切当日（遅延・本来 2026-09-01） /", self.sent_texts()[0])
-        self.assertEqual(self.history("1"), "2026-09-08 社内締切当日@2026-09-01 通知済")
-
-    def test_attorney_moves_legal_deadline_renotifies_new_due_dates(self):
-        """弁護士が 法定満了日 を後から変更 → 新しい該当日の 7 日前/当日/3 日前が再通知される。"""
-        rec = _due(rid="1", history=H7 + "\n" + "2026-09-08 社内締切当日@2026-09-08 通知済")
-        self.seed(rec)
-        self.assertEqual(self.run_job()["items"], 0)                            # 変更前: 送信済み
-        rec["法定満了日"] = {"value": "2026-09-25"}                              # 社内 9/15・7日前 9/8
-        out = self.run_job()
-        self.assertEqual(out["items"], 1)
-        self.assertIn("No.1 社内締切7日前 / 法定満了 2026-09-25（弁護士設定）", self.sent_texts()[0])
-        self.assertEqual(self.history("1"), "2026-09-08 社内締切7日前@2026-09-08 通知済")
-        self.admin.reset_mock()
-        self.today = date(2026, 9, 15)                                          # 新しい社内締切当日
-        out2 = self.run_job()
-        self.assertEqual(out2["items"], 1)
-        self.assertIn("No.1 社内締切当日 /", self.sent_texts()[0])              # 旧 @9/8 の行では除外されない
-        self.assertEqual(self.raw_history("1").splitlines()[-1], "2026-09-15 社内締切当日@2026-09-15 通知済")
-        self.admin.reset_mock()
-        self.today = date(2026, 9, 22)                                          # 新しい法定 3 日前
-        out3 = self.run_job()
-        self.assertEqual(out3["items"], 1)
-        self.assertEqual(self.raw_history("1").splitlines()[-1], "2026-09-22 法定満了3日前@2026-09-22 通知済")
-        self.admin.reset_mock()
-        self.today = date(2026, 9, 16)                                          # 動いていなければ 1 回のみ
-        self.assertEqual(self.run_job()["items"], 0)
-
-    def test_1300_run_sends_only_what_0800_failed(self):
-        self.seed(_due(rid="1"), _rec(rid="2", knew="2026-06-25"))   # 当日 / 7日前
-        self.admin.return_value = "failed"
-        self.run_job(hour=8)
-        self.assertEqual((self.history("1"), self.history("2")), ("", ""))
-        self.admin.return_value = "sent"
-        self.admin.reset_mock()
-        out = self.run_job(hour=13)
-        self.assertEqual((out["items"], out["notices"]), (2, 1))
-        self.assertEqual(self.history("1"), "2026-09-08 社内締切当日@2026-09-08 通知済")
-        self.assertEqual(self.history("2"), "2026-09-08 社内締切7日前@2026-09-08 通知済")
-        self.admin.reset_mock()
-        out2 = self.run_job(hour=18)
-        self.assertEqual((out2["items"], self.admin.await_count), (0, 0))
-
-    def test_unset_listed_only_at_0800(self):
-        self.seed(_rec(rid="5"))
-        out13 = self.run_job(hour=13)
-        self.assertEqual((out13["unset"], out13["notices"], self.updates), (0, 0, []))
-        out18 = self.run_job(hour=18)
-        self.assertEqual((out18["unset"], out18["notices"]), (0, 0))
-        out8 = self.run_job(hour=8)
-        self.assertEqual(out8["unset"], 1)
-        self.assertIn("起算日未設定: No.5", self.sent_texts()[0])
-        self.assertEqual(self.history("5"), "2026-09-08 起算日未設定 通知済")
-
-
-# ── kind・定数・登録・結線 ────────────────────────────────────────────────────
 class TestKindAndConstants(unittest.TestCase):
     def test_kind_registered_in_log_throttled(self):
         with self.assertLogs("hub.notify", level=logging.INFO) as cm:
@@ -948,35 +680,35 @@ class TestKindAndConstants(unittest.TestCase):
         self.assertNotIn("2026-09-08", out)
 
     def test_constants_pinned(self):
+        # HOUKI-JUKURYO-2（大野裁定 2026-10-08）
         self.assertEqual(hj.JUKURYO_MONTHS, 3)
-        self.assertEqual(hj.INTERNAL_MARGIN_DAYS, 10)
-        self.assertEqual(hj.INTERNAL_PRE_DAYS, 7)
-        self.assertEqual(hj.LEGAL_PRE_DAYS, 3)
-        self.assertEqual(hj.LEGAL_DAILY_FROM_DAYS, 2)
-        self.assertEqual(hj.ONE_SHOT_RECOVERY_DAYS, 7)
+        self.assertEqual(hj.ALERT_DAYS, (14, 7))
+        self.assertEqual(hj.NOTIFIED_VALUES, {14: "14日前", 7: "7日前"})
         self.assertEqual(hj.RUN_HOURS_JST, (8, 13, 18))
-        self.assertEqual(hj.UNSET_LIST_HOUR_JST, 8)
         self.assertEqual(hj.NOTICE_MAX_CHARS, 3800)
         self.assertLess(hj.NOTICE_MAX_CHARS, 4900)
         self.assertEqual(hj.DIGEST_HEX_LEN, 16)
         self.assertEqual(hj.JOB_NAME, "HOUKI_JUKURYO")
         self.assertEqual(hj.NOTIFY_KIND, "houki_jukuryo_daily")
-        self.assertEqual(hj.FIELD_STATUS, "status")
-        self.assertEqual(hj.STATUS_JUNIN, "受任")
-        self.assertEqual(hj.FIELD_SUBMITTED, "申述提出日")
-        self.assertEqual(hj.FIELD_HISTORY, "熟慮期間通知履歴")
-        self.assertEqual(hj.FIELD_LEGAL_DEADLINE, "法定満了日")
-        self.assertEqual(hj.FIELD_INTERNAL_DEADLINE, "社内締切日")
-        self.assertEqual(hj.START_DATE_FIELDS,
-                         ("相続人と知った日_申告", "死亡を知った日_申告", "死亡日_申告"))
-        self.assertEqual(hj.MILESTONES, ("社内締切7日前", "社内締切当日", "法定満了3日前",
-                                         "法定満了2日前", "法定満了1日前", "法定満了当日", "満了超過"))
+        self.assertEqual((hj.FIELD_STATUS, hj.FIELD_SUBMITTED, hj.FIELD_START),
+                         ("status", "申述提出日", "起算日_確定"))
+        self.assertEqual((hj.FIELD_DEADLINE, hj.FIELD_REMAINING, hj.FIELD_NOTIFIED),
+                         ("熟慮期間期限", "残日数", "通知済み閾値"))
         self.assertEqual(hj.SEARCH_LIMIT, 500)
+        self.assertEqual(sorted(hj.SEARCH_FIELDS),
+                         sorted(["$id", "$revision", "status", "申述提出日", "起算日_確定",
+                                 "熟慮期間期限", "残日数", "通知済み閾値"]))
+        for absent in ("法定満了日", "社内締切日", "熟慮期間通知履歴", "相続人と知った日_申告",
+                       "死亡を知った日_申告", "死亡日_申告", "起算点確定済", "伸長後満了日"):
+            self.assertNotIn(absent, hj.SEARCH_FIELDS)
+        self.assertFalse(hasattr(hj, "INTERNAL_MARGIN_DAYS"))             # 2 本立ては廃止
+        self.assertFalse(hasattr(hj, "START_DATE_FIELDS"))                 # 申告代用は廃止
 
-    def test_module_reads_no_env(self):
+    def test_module_reads_no_env_and_no_extension(self):
         src = Path(hj.__file__).read_text(encoding="utf-8")
         self.assertNotIn("os.environ", src)
         self.assertNotIn("import os", src)
+        self.assertNotIn("伸長後満了日", src.split('"""', 2)[2])           # 本文コードに伸長の分岐なし
 
     def test_main_registers_job(self):
         src = (Path(__file__).parent / "main.py").read_text(encoding="utf-8")
@@ -985,6 +717,14 @@ class TestKindAndConstants(unittest.TestCase):
     def test_notify_truncation_untouched(self):
         src = Path(hub_notify.__file__).read_text(encoding="utf-8")
         self.assertIn("text[:4900]", src)
+
+    def test_config_schema_lists_system_fields(self):
+        from config import EXPECTED_KINTONE_SCHEMA
+        f = EXPECTED_KINTONE_SCHEMA["App 40 (相続放棄案件)"]["fields"]
+        self.assertEqual(f["熟慮期間期限"]["type"], "DATE")
+        self.assertEqual(f["残日数"]["type"], "NUMBER")
+        self.assertEqual(f["起算日_確定"]["type"], "DATE")
+        self.assertEqual(f["通知済み閾値"]["required_options"], ["14日前", "7日前"])
 
 
 class TestJobRegistration(unittest.TestCase):
