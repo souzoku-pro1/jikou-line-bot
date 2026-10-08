@@ -43,6 +43,10 @@ pre.draft{background:#eef7e8;border:1px solid #cfe6c2}
 <!-- P4-004: 参照のみ——承認・送信の操作 UI はこの画面に存在しない（承認経路は
      既存 webhook が単一の正）。裁定: AI 下書き本文（顧客往復含む）の表示可・
      既定は送信済み=no のみ（全件切替あり） -->
+<!-- JIKOU-REPLY-Q1a: 送信確認待ち（結果不明の送信操作）の一覧と人の確定は別画面
+     （/app/send_ops・サーバ描画）。この画面は参照専用の閉集合 pin（button 2・input 1・
+     form なし・参照 API は /app/api/approvals のみ）を維持し、リンクのみ置く -->
+<p class="sub"><a href="/app/send_ops">送信確認待ちの一覧と確定へ</a></p>
 <div class="toolbar">
   <label><input type="checkbox" id="all"> 送信済みも表示する</label>
   <button id="prev">前へ</button><button id="next">次へ</button>

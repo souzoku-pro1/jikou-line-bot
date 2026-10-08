@@ -49,6 +49,7 @@ from hub import image_store
 from hub import kintone
 from hub import notify
 from hub.autoreply_stoplist import is_suppressed
+from hub import send_ledger
 from hub.line_channel import HOUKI_CHANNEL, push_text
 from hub.redact import emit
 
@@ -252,9 +253,12 @@ async def _send_receipt_and_close(channel_name: str, channel,
     _send_claims.add(key)
     try:
         # claim 取得後の永続再確認（未返信でなければ送らない）
-        marker = await latest_marker_row_id(channel_name, user_id)
+        # JIKOU-REPLY-Q1a: 同じ照会から受信イベント ID（category 末尾）も取る
+        # （追加の kintone 照会なし）＝送信操作記録の受信イベント ID に使う
+        marker, _marker_cat = await _latest_marker_row(channel_name, user_id)
         if not marker:
             return None
+        _event_id = _marker_cat.rsplit(":", 1)[-1] if _marker_cat else ""
         receipt = await _latest_receipt_row_id(channel_name, user_id)
         if receipt and int(receipt) > int(marker):
             return None                      # 既に閉鎖済み（重複送信の遮断）
@@ -266,13 +270,17 @@ async def _send_receipt_and_close(channel_name: str, channel,
             if hold and int(hold) > int(marker):
                 logger.info("[IMAGE_INTAKE] held by human mode (no send)")
                 return None
+        _sl_tok = send_ledger.bind_inbound(_event_id)
         try:
-            sent = await push_text(channel, user_id, IMAGE_RECEIPT_REPLY)
+            sent = await send_ledger.with_purpose("image_receipt", push_text,
+                                                  channel, user_id, IMAGE_RECEIPT_REPLY)
         except Exception:
             logger.error("[IMAGE_INTAKE] receipt push transport error "
                          "(stays unreplied)")
             await _notify_send_failure(channel_name, user_id)
             return False
+        finally:
+            send_ledger.unbind(_sl_tok)
         if sent is not True:
             logger.error("[IMAGE_INTAKE] receipt push rejected "
                          "(stays unreplied)")
