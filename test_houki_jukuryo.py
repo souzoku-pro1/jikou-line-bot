@@ -1,40 +1,48 @@
-"""HOUKI-JUKURYO-2（大野裁定 2026-10-08・法的判断）: 相続放棄 熟慮期間 監視のテスト。
+"""HOUKI-JUKURYO-2（大野裁定 2026-10-08・法的判断）/ fix1（Codex BH-01〜04）: 相続放棄 熟慮期間 監視。
 
 CRON-1 のテスト（申告 3 日付の代用順・法定/社内の 2 本立て・ONE_SHOT/DAILY・履歴欄）は
-本票で挙動ごと差し替えられたため、同じ性質（計算・対象・冪等・送信→書込の順序・分割・
-ページング・PII なし・登録）を新裁定の形で検証する。削除した性質はない。
+本票で挙動ごと差し替えられたため、同じ性質（計算・対象・冪等・送信→書込の順序・件数が落ちない・
+ページング・PII なし・登録）を新裁定の形で検証する。fix1 BH-04 で「期限が変われば通知キーが変わる」
+「刻印失敗後の訂正が旧通知に抑止されない」の 2 性質を復元。
 
 - 期限計算（応当日の前日・応当日なし＝その月の末日の前日・閏年・年またぎ・月初）
 - 入力は 起算日_確定 のみ（申告 3 日付・起算点確定済・法定満了日・社内締切日 は読まない）
 - 対象 status の網羅（受任後 8 値・受任前は対象外・申述提出日ありは対象外）
 - 熟慮期間期限／残日数 の保存（差分だけ書く・起算日_確定 変更で上書き・空に戻れば空に戻す）
-- 通知: 14/7 日前・各 1 回（同日 3 回走っても 1 通・通知済み閾値 で判定・送信成功後に刻印）
-- 送信失敗は刻印しない（期限欄は書く）・throttled は成功扱い・CAS 409 は再取得 1 回
-- 起算日未確定: 件数のみ・1 日 1 回・ID なし
-- PII 非漏洩（本文・ログ・キー）・書く欄は 3 欄の閉集合・分割送信・ページング・登録（8/13/18）
-- phone_triage の式が同じ関数に寄っている（一本化）
+- 通知の 1 回性の正は send_ledger（1 レコード×1 閾値 = 1 操作 = 1 push・purpose other・
+  channel houki_jukuryo・業務キー {種別}:{レコード}:{期限}）。刻印は写し（失敗しても再通知しない・
+  次回は刻印だけ再試行）。unconfirmed は自動再送なし。台帳が使えないときだけ写しで抑止
+- BH-01: 409 再取得後に対象外なら更新中止。BH-03: 未確定件数の 1 日 1 回も台帳（再起動相当で重複なし）
+- PII 非漏洩（本文・ログ）・書く欄は 3 欄の閉集合・ページング・登録（8/13/18）・phone_triage と同式
 """
 
 import asyncio
 import logging
+import os
 import re
+import shutil
+import tempfile
+import time
 import unittest
 from datetime import date
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
+import sqlalchemy as sa
+
+from hub import db
 from hub import houki_jukuryo as hj
 from hub import houki_phone_triage as tri
 from hub import houki_profile
 from hub import kintone as hub_kintone
 from hub import notify as hub_notify
 from hub import scheduler as hub_scheduler
+from hub import send_ledger as sl
 
 TODAY = date(2026, 9, 8)
-_REAL_NOTIFY_RESULT = hub_notify.notify_admin_line_result      # _Base の mock 前に捕捉
-KEY_RE = re.compile(r"^houki_jukuryo_daily:2026-09-\d\d:[0-9a-f]{16}$")
 NAME = "山田太郎"
 KANA = "やまだたろう"
+ADMIN = "Uadmin000000000000000000000000001"
 
 ALL_POST = ("受任", "書類収集中", "申述書作成", "裁判所提出済", "照会書対応", "受理", "債権者通知", "完了")
 
@@ -65,6 +73,10 @@ def _start_for_remaining(remaining: int, today: date = TODAY) -> str:
     raise AssertionError("no start found")
 
 
+def _run(coro):
+    return asyncio.run(coro)
+
+
 # ── 期限計算（裁定 (a)） ─────────────────────────────────────────────────────
 class TestDeadlineFormula(unittest.TestCase):
     def test_normal_anniversary_minus_one(self):
@@ -72,7 +84,6 @@ class TestDeadlineFormula(unittest.TestCase):
         self.assertEqual(hj.jukuryo_deadline(date(2026, 6, 15)), date(2026, 9, 14))
 
     def test_no_anniversary_is_month_end_minus_one_non_leap(self):
-        # 11/30 → 2 月に 30 日なし → 2 月末日（2/28）の前日 = 2/27（翌月末日の前日ではない）
         self.assertEqual(hj.jukuryo_deadline(date(2026, 11, 30)), date(2027, 2, 27))
 
     def test_no_anniversary_leap_year(self):
@@ -150,18 +161,24 @@ class TestTargets(unittest.TestCase):
         self.assertIn("$id > 500", hj.search_query("500"))
 
 
-# ── 通知判定・保存差分（pure） ───────────────────────────────────────────────
+# ── 通知判定・保存差分・業務キー（pure） ─────────────────────────────────────
 class TestAlertsAndUpdates(unittest.TestCase):
-    def test_alerts_due(self):
-        self.assertEqual(hj.alerts_due(15, []), [])
-        self.assertEqual(hj.alerts_due(14, []), [14])
-        self.assertEqual(hj.alerts_due(8, ["14日前"]), [])
-        self.assertEqual(hj.alerts_due(7, ["14日前"]), [7])
-        self.assertEqual(hj.alerts_due(7, []), [14, 7])                 # 14 を取りこぼしていれば両方
-        self.assertEqual(hj.alerts_due(0, ["14日前"]), [7])
-        self.assertEqual(hj.alerts_due(-3, []), [14, 7])                # 超過でも未通知分は送る
-        self.assertEqual(hj.alerts_due(-3, ["14日前", "7日前"]), [])
-        self.assertEqual(hj.alerts_due(7, ["30日前", "14日前", "7日前", "超過"]), [])
+    def test_alert_candidates(self):
+        self.assertEqual(hj.alert_candidates(15), [])
+        self.assertEqual(hj.alert_candidates(14), [14])
+        self.assertEqual(hj.alert_candidates(8), [14])
+        self.assertEqual(hj.alert_candidates(7), [14, 7])
+        self.assertEqual(hj.alert_candidates(0), [14, 7])
+        self.assertEqual(hj.alert_candidates(-3), [14, 7])                 # 超過でも候補（1 回性は台帳）
+
+    def test_ledger_business_key_includes_deadline(self):
+        c = hj.compute(_rec(start="2026-06-15"), TODAY)
+        self.assertEqual(hj.alert_business_key("12", c), "12:2026-09-14")
+        self.assertEqual(hj.ledger_key(hj.LEDGER_KIND_14, hj.alert_business_key("12", c)),
+                         "houki_jukuryo_14:12:2026-09-14")
+        c2 = hj.compute(_rec(start="2026-06-20"), TODAY)
+        self.assertNotEqual(hj.alert_business_key("12", c), hj.alert_business_key("12", c2))   # BH-04 (a)
+        self.assertEqual(hj.ledger_key(hj.LEDGER_KIND_UNSET, "2026-09-08"), "houki_jukuryo_unset:2026-09-08")
 
     def test_field_updates_writes_only_changed(self):
         c = hj.compute(_rec(start="2026-06-15"), TODAY)
@@ -188,49 +205,15 @@ class TestAlertsAndUpdates(unittest.TestCase):
         self.assertEqual(hj.WRITE_FIELDS, frozenset({"熟慮期間期限", "残日数", "通知済み閾値"}))
 
 
-# ── 本文・digest（PII なし） ─────────────────────────────────────────────────
+# ── 本文（PII なし） ────────────────────────────────────────────────────────
 class TestNoticeBody(unittest.TestCase):
-    def test_line_has_record_deadline_remaining_only(self):
+    def test_alert_text_has_record_deadline_remaining_only(self):
         c = hj.compute(_rec(start="2026-06-15"), TODAY)
-        line = hj.format_alert_line("12", 7, c)
-        self.assertEqual(line, "・No.12 期限 2026-09-14 残 6 日（7日前の通知）")
-        self.assertNotIn(NAME, line)
-
-    def test_notice_text_and_key(self):
-        entries, unset = hj.plan_alerts([_rec(rid="1", start=_start_for_remaining(14)),
-                                         _rec(rid="2", start=_start_for_remaining(7))], TODAY)
-        self.assertEqual(unset, 0)
-        notices = hj.build_notices(TODAY, entries)
-        self.assertEqual(len(notices), 1)
-        t = notices[0].text
-        self.assertTrue(t.startswith("【相続放棄 熟慮期間】 2026-09-08 (1/1)"))
-        self.assertIn("・No.1 期限 2026-09-22 残 14 日（14日前の通知）", t)
-        self.assertIn("・No.2 期限 2026-09-15 残 7 日（14日前の通知）", t)
-        self.assertIn("・No.2 期限 2026-09-15 残 7 日（7日前の通知）", t)
-        self.assertTrue(t.endswith(hj.NOTICE_FOOTER))
+        t = hj.alert_text(TODAY, "12", 7, c)
+        self.assertEqual(t, "【相続放棄 熟慮期間】 2026-09-08\n・No.12 期限 2026-09-14 残 6 日（7日前の通知）\n"
+                            + hj.NOTICE_FOOTER)
         for leak in (NAME, KANA, "2026-05-01", "2026-04-01"):
             self.assertNotIn(leak, t)
-        self.assertTrue(KEY_RE.match(hj.notify_key(TODAY, notices[0].digest)))
-
-    def test_digest_is_order_independent_and_content_sensitive(self):
-        a = _rec(rid="1", start=_start_for_remaining(14))
-        b = _rec(rid="2", start=_start_for_remaining(7))
-        e1, _ = hj.plan_alerts([a, b], TODAY)
-        e2, _ = hj.plan_alerts([b, a], TODAY)
-        self.assertEqual(hj.digest_of(e1), hj.digest_of(e2))
-        e3, _ = hj.plan_alerts([a], TODAY)
-        self.assertNotEqual(hj.digest_of(e1), hj.digest_of(e3))
-
-    def test_split_by_entry_and_numbered(self):
-        recs = [_rec(rid=str(i), start=_start_for_remaining(14)) for i in range(1, 61)]
-        entries, _ = hj.plan_alerts(recs, TODAY)
-        notices = hj.build_notices(TODAY, entries, max_chars=600)
-        self.assertGreater(len(notices), 1)
-        ids = [e.record_id for n in notices for e in n.entries]
-        self.assertEqual(ids, [str(i) for i in range(1, 61)])
-        for i, n in enumerate(notices, 1):
-            self.assertIn(f"({i}/{len(notices)})", n.text)
-            self.assertLessEqual(len(n.text), 600)
 
     def test_unset_text_has_count_only(self):
         t = hj.unset_text(TODAY, 3)
@@ -238,15 +221,29 @@ class TestNoticeBody(unittest.TestCase):
         self.assertNotIn("No.", t)
 
 
-# ── ジョブ（kintone・notify を fake） ──────────────────────────────────────────
+# ── ジョブ（kintone fake・台帳は sqlite 実体・push は fake） ──────────────────
 class _Base(unittest.TestCase):
     def setUp(self):
+        self._dir = tempfile.mkdtemp(prefix="hj_")
+        self._env = patch.dict(os.environ, {
+            "DATABASE_URL": f"sqlite+aiosqlite:///{self._dir}/l.db",
+            "DISPATCHBOT_CHANNEL_ACCESS_TOKEN": "biz-token", "LINE_ADMIN_USER_ID": ADMIN})
+        self._env.start()
+        db.reset_for_tests()
+
+        async def _create():
+            eng = db.get_async_engine()
+            async with eng.begin() as c:
+                await c.run_sync(sl.metadata.create_all)
+        _run(_create())
+
         self.records: dict[str, dict] = {}
         self.updates: list[tuple] = []
         self.gets: list[str] = []
-        self.conflict_next: dict[str, int] = {}        # rid → 409 を返す残回数
+        self.conflict_next: dict[str, int] = {}
         self.fail_on: set[str] = set()
         self.queries: list[str] = []
+        self.refetch_mutator = None            # BH-01: 409 の裏でレコードが変わった体
 
         async def search_records(app, query, fields=None):
             self.queries.append(query)
@@ -259,6 +256,8 @@ class _Base(unittest.TestCase):
 
         async def get_record(app, rid):
             self.gets.append(rid)
+            if self.refetch_mutator:
+                self.refetch_mutator(self.records[rid])
             return {k: dict(v) for k, v in self.records[rid].items()}
 
         async def update_record(app, rid, fields, revision=None):
@@ -274,36 +273,47 @@ class _Base(unittest.TestCase):
                 rec[k] = {"value": v}
             rec["$revision"] = {"value": str(int(revision) + 1)}
 
-        self.admin = AsyncMock(return_value="sent")
+        self.push = AsyncMock(return_value=True)          # _push_admin_http の代替（True=2xx）
         self.today = TODAY
         hj._unset_notified_on = None
         self.addCleanup(setattr, hj, "_unset_notified_on", None)
         for p in (patch.object(hub_kintone, "search_records", search_records),
                   patch.object(hub_kintone, "get_record", get_record),
                   patch.object(hub_kintone, "update_record", update_record),
-                  patch.object(hub_notify, "notify_admin_line_result", self.admin),
+                  patch.object(hj, "_push_admin_http", self.push),
+                  patch.object(hj, "get_admin_line_user_id", lambda: ADMIN),
                   patch.object(hj, "_today_jst", lambda: self.today)):
             p.start()
             self.addCleanup(p.stop)
+
+    def tearDown(self):
+        db.reset_for_tests()
+        self._env.stop()
+        shutil.rmtree(self._dir, ignore_errors=True)
 
     def seed(self, *recs):
         for r in recs:
             self.records[r["$id"]["value"]] = r
 
     def run_job(self, hour=8):
-        return asyncio.run(hj.jukuryo_daily_check(hour))
+        return _run(hj.jukuryo_daily_check(hour))
 
     def val(self, rid, code):
         return self.records[rid][code]["value"]
 
     def sent_texts(self):
-        return [c.args[0] for c in self.admin.await_args_list]
-
-    def sent_keys(self):
-        return [c.kwargs["throttle_key"] for c in self.admin.await_args_list]
+        return [c.args[1] for c in self.push.await_args_list]
 
     def alert_texts(self):
         return [t for t in self.sent_texts() if hj.UNSET_LABEL not in t]
+
+    def ops(self):
+        async def q():
+            async with db.session_scope() as s:
+                rows = (await s.execute(sa.select(sl.send_operation).order_by(
+                    sl.send_operation.c.created_at, sl.send_operation.c.op_id))).mappings().all()
+            return [dict(r) for r in rows]
+        return _run(q())
 
     def written_fields(self):
         return sorted({k for _, _, f, _ in self.updates for k in f})
@@ -318,45 +328,58 @@ class TestDailyJob(_Base):
         self.assertEqual(len(self.updates), 1)
         self.assertEqual(self.updates[0][3], "7")                       # $revision CAS
         self.assertEqual(set(self.updates[0][2]), {"熟慮期間期限", "残日数"})
-        self.assertEqual((res["written"], res["alerts"]), (1, 0))
+        self.assertEqual((res["written"], res["candidates"]), (1, 0))
         self.assertEqual(self.sent_texts(), [])
+        self.assertEqual(self.ops(), [])
 
-    def test_alert_14_sent_once_and_marked(self):
+    def test_alert_14_sent_once_recorded_in_ledger_and_marked(self):
         self.seed(_rec(rid="1", start=_start_for_remaining(14)))
         res = self.run_job()
         self.assertEqual(len(self.alert_texts()), 1)
         self.assertIn("・No.1 期限 2026-09-22 残 14 日（14日前の通知）", self.alert_texts()[0])
         self.assertEqual(self.val("1", "通知済み閾値"), ["14日前"])
         self.assertEqual(self.val("1", "残日数"), "14")
-        self.assertEqual((res["alerts"], res["sent"], res["written"]), (1, 1, 1))
+        self.assertEqual((res["candidates"], res["sent"], res["written"]), (1, 1, 1))
         self.assertEqual(len([u for u in self.updates if u[1] == "1"]), 1)   # 1 レコード 1 回の書込
+        ops = self.ops()
+        self.assertEqual(len(ops), 1)
+        o = ops[0]
+        self.assertEqual((o["business"], o["channel"], o["purpose"], o["actor"], o["state"]),
+                         ("souzoku-houki", "houki_jukuryo", "other", "bot", "sent"))
+        self.assertEqual(o["inbound_event_id"], "houki_jukuryo_14:1:2026-09-22")
+        self.assertIsNone(o["conversation_id"])
 
     def test_same_day_three_runs_send_once_and_write_once(self):
         self.seed(_rec(rid="1", start=_start_for_remaining(14)))
         self.run_job(8)
-        self.run_job(13)
+        r2 = self.run_job(13)
         self.run_job(18)
         self.assertEqual(len(self.alert_texts()), 1)
         self.assertEqual(len(self.updates), 1)
-        self.assertEqual(self.val("1", "通知済み閾値"), ["14日前"])
+        self.assertEqual(r2["duplicate"], 1)
+        self.assertEqual(len(self.ops()), 1)
 
-    def test_alert_7_after_14_marked(self):
+    def test_alert_7_after_14_marked_and_recorded(self):
         self.seed(_rec(rid="1", start=_start_for_remaining(7), notified=("14日前",),
                        deadline="2026-09-15", remaining="8"))
-        self.run_job()
-        t = self.alert_texts()[0]
-        self.assertIn("（7日前の通知）", t)
-        self.assertNotIn("（14日前の通知）", t)
+        self.run_job()                                     # 14 は台帳に無い → 1 回送られる（写しは判定に使わない）
+        texts = self.alert_texts()
+        self.assertEqual(len(texts), 2)
+        self.assertTrue(any("（14日前の通知）" in t for t in texts))
+        self.assertTrue(any("（7日前の通知）" in t for t in texts))
         self.assertEqual(self.val("1", "通知済み閾値"), ["14日前", "7日前"])
-        self.assertEqual(self.val("1", "残日数"), "7")
+        self.run_job(13)
+        self.assertEqual(len(self.alert_texts()), 2)
 
-    def test_missed_14_is_sent_together_with_7(self):
+    def test_missed_14_is_sent_together_with_7_as_two_operations(self):
         self.seed(_rec(rid="1", start=_start_for_remaining(7)))
-        self.run_job()
-        self.assertEqual(len(self.alert_texts()), 1)
-        self.assertIn("（14日前の通知）", self.alert_texts()[0])
-        self.assertIn("（7日前の通知）", self.alert_texts()[0])
+        res = self.run_job()
+        self.assertEqual(len(self.alert_texts()), 2)
+        self.assertEqual(res["candidates"], 2)
+        self.assertEqual(sorted(o["inbound_event_id"] for o in self.ops()),
+                         ["houki_jukuryo_14:1:2026-09-15", "houki_jukuryo_7:1:2026-09-15"])
         self.assertEqual(self.val("1", "通知済み閾値"), ["14日前", "7日前"])
+        self.assertEqual(len(self.updates), 1)             # 2 操作でも kintone 書込は 1 回
 
     def test_remaining_15_no_alert_only_fields(self):
         self.seed(_rec(rid="1", start=_start_for_remaining(15)))
@@ -364,34 +387,26 @@ class TestDailyJob(_Base):
         self.assertEqual(self.alert_texts(), [])
         self.assertEqual(self.val("1", "残日数"), "15")
         self.assertEqual(self.val("1", "通知済み閾値"), [])
-        self.assertEqual(res["alerts"], 0)
+        self.assertEqual(res["candidates"], 0)
 
-    def test_overdue_without_marks_still_sends_once_no_overdue_notice(self):
+    def test_overdue_without_ledger_sends_once_no_overdue_notice(self):
         self.seed(_rec(rid="1", start=_start_for_remaining(-3)))
         self.run_job()
         self.run_job(13)
-        self.assertEqual(len(self.alert_texts()), 1)
-        self.assertIn("残 -3 日", self.alert_texts()[0])
-        self.assertNotIn("超過", self.alert_texts()[0])
+        self.assertEqual(len(self.alert_texts()), 2)       # 14 と 7 の各 1 回
+        self.assertTrue(all("残 -3 日" in t for t in self.alert_texts()))
+        self.assertFalse(any("超過" in t for t in self.alert_texts()))
         self.assertEqual(self.val("1", "通知済み閾値"), ["14日前", "7日前"])
 
-    def test_both_marked_overdue_sends_nothing(self):
-        self.seed(_rec(rid="1", start=_start_for_remaining(-3), notified=("14日前", "7日前")))
-        self.run_job()
-        self.assertEqual(self.alert_texts(), [])
-        self.assertEqual(self.val("1", "残日数"), "-3")
-
     def test_start_change_recalculates_and_overwrites(self):
-        self.seed(_rec(rid="1", start="2026-06-15", deadline="2026-09-14", remaining="6",
-                       notified=("14日前", "7日前")))
-        self.run_job()
-        self.assertEqual(self.updates, [])                                # 変化なし → 書かない
-        self.records["1"]["起算日_確定"] = {"value": "2026-08-01"}       # 弁護士が起算日を直す
+        self.seed(_rec(rid="1", start="2026-06-15", deadline="2026-09-14", remaining="6"))
+        self.run_job()                                     # 残 6 → 14/7 を送る
+        self.assertEqual(len(self.alert_texts()), 2)
+        self.records["1"]["起算日_確定"] = {"value": "2026-08-01"}       # 弁護士が起算日を直す（残 53）
         self.run_job(13)
         self.assertEqual(self.val("1", "熟慮期間期限"), "2026-10-31")
         self.assertEqual(self.val("1", "残日数"), "53")
-        self.assertEqual(len(self.updates), 1)
-        self.assertEqual(self.alert_texts(), [])
+        self.assertEqual(len(self.alert_texts()), 2)       # 新期限は閾値外 → 追加通知なし
 
     def test_start_cleared_clears_system_fields(self):
         self.seed(_rec(rid="1", start="", deadline="2026-09-14", remaining="6"))
@@ -405,9 +420,10 @@ class TestDailyJob(_Base):
             self.seed(_rec(rid=str(i), status=s, start=_start_for_remaining(14)))
         res = self.run_job()
         self.assertEqual(res["targets"], 8)
-        self.assertEqual(res["alerts"], 8)
+        self.assertEqual((res["candidates"], res["sent"]), (8, 8))
         for i in range(1, 9):
             self.assertEqual(self.val(str(i), "通知済み閾値"), ["14日前"])
+        self.assertEqual(len(self.ops()), 8)
 
     def test_non_target_records_are_skipped_even_if_returned(self):
         self.seed(_rec(rid="1", status="問い合わせ", start=_start_for_remaining(14)),
@@ -416,27 +432,39 @@ class TestDailyJob(_Base):
         res = self.run_job()
         self.assertEqual(self.sent_texts(), [])
         self.assertEqual(self.updates, [])
-        self.assertEqual(res["alerts"], 0)
+        self.assertEqual(res["candidates"], 0)
 
-    def test_send_failed_writes_fields_but_no_mark_and_resends_next_run(self):
+    def test_push_failed_is_failed_in_ledger_no_mark_and_retried_next_run(self):
         self.seed(_rec(rid="1", start=_start_for_remaining(14)))
-        self.admin.return_value = "failed"
-        with self.assertLogs("hub.houki_jukuryo", level=logging.WARNING):
-            res = self.run_job()
+        self.push.return_value = False
+        res = self.run_job()
         self.assertEqual(res["failed"], 1)
         self.assertEqual(self.val("1", "通知済み閾値"), [])
         self.assertEqual(self.val("1", "残日数"), "14")                  # 期限欄は書く
-        self.admin.return_value = "sent"
+        self.assertEqual(self.ops()[0]["state"], "failed")
+        self.push.return_value = True
         self.run_job(13)
         self.assertEqual(len(self.alert_texts()), 2)
+        o = self.ops()
+        self.assertEqual(len(o), 1)                                     # 再試行は同じ操作（attempt_no+1）
+        self.assertEqual((o[0]["state"], o[0]["attempt_no"]), ("sent", 2))
         self.assertEqual(self.val("1", "通知済み閾値"), ["14日前"])
 
-    def test_throttled_counts_as_sent_and_marks(self):
+    def test_push_exception_is_unconfirmed_no_mark_no_auto_resend(self):
         self.seed(_rec(rid="1", start=_start_for_remaining(14)))
-        self.admin.return_value = "throttled"
-        res = self.run_job()
-        self.assertEqual(res["sent"], 1)
-        self.assertEqual(self.val("1", "通知済み閾値"), ["14日前"])
+        self.push.side_effect = RuntimeError("socket")
+        with self.assertLogs("hub.houki_jukuryo", level=logging.WARNING):
+            res = self.run_job()
+        self.assertEqual(res["unconfirmed"], 1)
+        self.assertEqual(self.val("1", "通知済み閾値"), [])
+        self.assertEqual(self.ops()[0]["state"], "unconfirmed")
+        self.push.side_effect = None
+        res2 = self.run_job(13)
+        self.assertEqual(res2["unconfirmed"], 1)                        # 人の確定待ち・自動再送なし
+        self.assertEqual(self.push.await_count, 1)
+        listed = _run(sl.list_unconfirmed())
+        self.assertEqual([(x["purpose"], x["channel"], x["business"]) for x in listed],
+                         [("other", "houki_jukuryo", "souzoku-houki")])
 
     def test_mark_written_only_after_send(self):
         order = []
@@ -447,32 +475,30 @@ class TestDailyJob(_Base):
             order.append(("update", sorted(fields)))
             return await real_update(app, rid, fields, revision)
 
-        async def spy_notify(text, throttle_key=None):
-            order.append(("notify",))
-            return "sent"
+        async def spy_push(admin, text):
+            order.append(("push",))
+            return True
         with patch.object(hub_kintone, "update_record", spy_update), \
-                patch.object(hub_notify, "notify_admin_line_result", spy_notify):
+                patch.object(hj, "_push_admin_http", spy_push):
             self.run_job()
-        self.assertEqual(order, [("notify",), ("update", ["残日数", "熟慮期間期限", "通知済み閾値"])])
+        self.assertEqual(order, [("push",), ("update", ["残日数", "熟慮期間期限", "通知済み閾値"])])
 
     def test_cas_conflict_refetches_once_and_retries_with_new_values(self):
         self.seed(_rec(rid="1", start=_start_for_remaining(14), revision="5"))
         self.conflict_next["1"] = 1
-        orig_get = hub_kintone.get_record
 
-        async def get_changed(app, rid):            # 409 の裏で弁護士が起算日を変えていた
-            self.records[rid]["$revision"] = {"value": "6"}
-            self.records[rid]["起算日_確定"] = {"value": _start_for_remaining(40)}
-            return await orig_get(app, rid)
-        with patch.object(hub_kintone, "get_record", get_changed):
-            res = self.run_job()
+        def mutate(rec):                                   # 409 の裏で弁護士が起算日を変えていた（対象のまま）
+            rec["$revision"] = {"value": "6"}
+            rec["起算日_確定"] = {"value": _start_for_remaining(40)}
+        self.refetch_mutator = mutate
+        res = self.run_job()
         self.assertEqual(res["written"], 1)
         self.assertEqual([u[3] for u in self.updates], ["5", "6"])
         self.assertEqual(self.val("1", "残日数"), "40")                  # 再計算した値で保存
         self.assertEqual(self.val("1", "通知済み閾値"), ["14日前"])      # 送った刻印は保持
 
     def test_cas_conflict_twice_warns_and_does_not_raise(self):
-        self.seed(_rec(rid="1", start=_start_for_remaining(14)))
+        self.seed(_rec(rid="1", start=_start_for_remaining(30)))
         self.conflict_next["1"] = 2
         with self.assertLogs("hub.houki_jukuryo", level=logging.WARNING) as cm:
             res = self.run_job()
@@ -499,31 +525,167 @@ class TestDailyJob(_Base):
         self.assertEqual(self.sent_texts(), [])
         self.assertEqual(self.updates, [])
 
-    def test_multiple_records_one_notice(self):
-        self.seed(_rec(rid="1", start=_start_for_remaining(14)),
-                  _rec(rid="2", start=_start_for_remaining(7), notified=("14日前",)),
-                  _rec(rid="3", start=_start_for_remaining(20)))
+    def test_candidates_all_become_operations_no_loss(self):
+        """旧「分割で件数が落ちない」の継承: 候補 = 操作 = push（60 件）。"""
+        for i in range(1, 61):
+            self.seed(_rec(rid=str(i), start=_start_for_remaining(14)))
         res = self.run_job()
-        self.assertEqual(len(self.alert_texts()), 1)
-        self.assertIn("No.1", self.alert_texts()[0])
-        self.assertIn("No.2", self.alert_texts()[0])
-        self.assertNotIn("No.3", self.alert_texts()[0])
-        self.assertEqual(res["written"], 3)
+        self.assertEqual((res["candidates"], res["sent"]), (60, 60))
+        self.assertEqual(len(self.ops()), 60)
+        self.assertEqual(len(self.alert_texts()), 60)
+        for i in range(1, 61):
+            self.assertEqual(self.val(str(i), "通知済み閾値"), ["14日前"])
+
+    def test_one_failed_push_leaves_only_its_record_unmarked(self):
+        for i in range(1, 6):
+            self.seed(_rec(rid=str(i), start=_start_for_remaining(14)))
+        self.push.side_effect = [True, True, False, True, True]
+        res = self.run_job()
+        self.assertEqual((res["sent"], res["failed"]), (4, 1))
+        self.assertEqual(self.val("3", "通知済み閾値"), [])
+        self.assertEqual(self.val("3", "残日数"), "14")
+        for i in (1, 2, 4, 5):
+            self.assertEqual(self.val(str(i), "通知済み閾値"), ["14日前"])
 
 
-class TestUnsetCount(_Base):
-    def test_count_only_once_per_day(self):
+# ── BH-01: 409 再取得後に対象外なら更新中止 ───────────────────────────────────
+class TestBH01AbortAfterRefetch(_Base):
+    def _abort_case(self, mutate):
+        self.seed(_rec(rid="1", start=_start_for_remaining(30), revision="5"))
+        self.conflict_next["1"] = 1
+        self.refetch_mutator = mutate
+        with self.assertLogs("hub.houki_jukuryo", level=logging.INFO) as cm:
+            res = self.run_job()
+        self.assertEqual(res["aborted"], 1)
+        self.assertEqual(res["written"], 0)
+        self.assertEqual(len(self.updates), 1)             # 2 回目の PUT は出ない
+        self.assertEqual(self.gets, ["1"])
+        self.assertIn("write aborted after refetch", "\n".join(cm.output))
+        return res
+
+    def test_submitted_during_race(self):
+        def m(rec):
+            rec["$revision"] = {"value": "6"}
+            rec["申述提出日"] = {"value": "2026-09-08"}
+        self._abort_case(m)
+        self.assertEqual(self.val("1", "残日数"), "")       # 書かれていない
+
+    def test_status_closed_during_race(self):
+        def m(rec):
+            rec["$revision"] = {"value": "6"}
+            rec["status"] = {"value": "辞任"}
+        self._abort_case(m)
+
+    def test_start_cleared_during_race(self):
+        def m(rec):
+            rec["$revision"] = {"value": "6"}
+            rec["起算日_確定"] = {"value": ""}
+        self._abort_case(m)
+
+    def test_still_target_after_refetch_writes(self):
+        self.seed(_rec(rid="1", start=_start_for_remaining(30), revision="5"))
+        self.conflict_next["1"] = 1
+
+        def m(rec):
+            rec["$revision"] = {"value": "6"}
+        self.refetch_mutator = m
+        res = self.run_job()
+        self.assertEqual((res["written"], res["aborted"]), (1, 0))
+
+
+# ── BH-02: 1 回性の正は台帳・刻印は写し ─────────────────────────────────────────
+class TestBH02LedgerIsTruth(_Base):
+    def test_mark_failure_does_not_resend_and_mark_is_retried(self):
+        self.seed(_rec(rid="1", start=_start_for_remaining(14)))
+        self.fail_on.add("1")                              # 刻印（kintone 書込）が失敗
+        with self.assertLogs("hub.houki_jukuryo", level=logging.WARNING):
+            res = self.run_job()
+        self.assertEqual((res["sent"], res["write_failed"]), (1, 1))
+        self.assertEqual(self.val("1", "通知済み閾値"), [])
+        self.assertEqual(self.ops()[0]["state"], "sent")
+        self.fail_on.clear()
+        res2 = self.run_job(13)                            # 再通知なし・刻印だけ再試行
+        self.assertEqual((res2["sent"], res2["duplicate"], res2["remark"], res2["written"]), (0, 1, 1, 1))
+        self.assertEqual(self.push.await_count, 1)
+        self.assertEqual(self.val("1", "通知済み閾値"), ["14日前"])
+
+    def test_bh04c_clock_5_hours_later_no_resend(self):
+        self.seed(_rec(rid="1", start=_start_for_remaining(14)))
+        self.fail_on.add("1")
+        with self.assertLogs("hub.houki_jukuryo", level=logging.WARNING):
+            self.run_job(8)
+        self.fail_on.clear()
+        base = time.monotonic()
+        with patch.object(hub_notify.time, "monotonic", lambda: base + 5 * 3600), \
+                patch.object(sl, "_now", lambda: sl.datetime.datetime.now(sl.datetime.timezone.utc)
+                             + sl.datetime.timedelta(hours=5)):
+            res = self.run_job(13)
+        self.assertEqual((res["sent"], res["duplicate"], res["remark"]), (0, 1, 1))
+        self.assertEqual(self.push.await_count, 1)
+        self.assertEqual(self.val("1", "通知済み閾値"), ["14日前"])
+
+    def test_unchecking_the_copy_does_not_resend(self):
+        self.seed(_rec(rid="1", start=_start_for_remaining(14)))
+        self.run_job()
+        self.records["1"]["通知済み閾値"] = {"value": []}            # 人が写しを外しても台帳が正
+        res = self.run_job(13)
+        self.assertEqual((res["sent"], res["duplicate"], res["remark"]), (0, 1, 1))
+        self.assertEqual(self.push.await_count, 1)
+        self.assertEqual(self.val("1", "通知済み閾値"), ["14日前"])    # 写しを復元
+
+    def test_ledger_begin_uses_purpose_other_and_channel_houki_jukuryo(self):
+        self.seed(_rec(rid="1", start=_start_for_remaining(14)))
+        self.run_job()
+        o = self.ops()[0]
+        self.assertEqual(o["purpose"], "other")                          # DB CHECK 制約の範囲内
+        self.assertIn(o["purpose"], sl.PURPOSES)
+        self.assertEqual(o["channel"], hj.LEDGER_CHANNEL)
+        self.assertTrue(o["inbound_event_id"].startswith("houki_jukuryo_14:"))
+        hist = _run(sl.operation_history(o["op_id"]))
+        self.assertEqual([h["reason"] for h in hist], ["created", "started", "sent"])
+
+    def test_guarded_http_timeout_is_unconfirmed(self):
+        self.seed(_rec(rid="1", start=_start_for_remaining(14)))
+
+        async def slow(admin, text):
+            await asyncio.sleep(0.5)
+            return True
+        with patch.object(hj, "_push_admin_http", slow), \
+                patch.dict(os.environ, {sl.SEND_TIMEOUT_SECONDS_ENV: "0.05", sl.HEARTBEAT_SECONDS_ENV: "0.01",
+                                        sl.DEADLINE_MINUTES_ENV: "1", sl.STALE_MINUTES_ENV: "2"}), \
+                self.assertLogs("hub.houki_jukuryo", level=logging.WARNING):
+            res = self.run_job()
+        self.assertEqual(res["unconfirmed"], 1)
+        self.assertEqual(self.ops()[0]["state"], "unconfirmed")
+        self.assertEqual(self.val("1", "通知済み閾値"), [])
+
+
+# ── BH-03: 起算日未確定の 1 日 1 回も台帳 ───────────────────────────────────────
+class TestBH03UnsetCount(_Base):
+    def test_count_only_once_per_day_recorded_in_ledger(self):
         self.seed(_rec(rid="1", start=""), _rec(rid="2", start=""), _rec(rid="3", start=_start_for_remaining(30)))
         res = self.run_job(8)
-        self.assertTrue(res["unset_notified"])
+        self.assertEqual(res["unset_result"], hj.SEND_SENT)
         unset = [t for t in self.sent_texts() if hj.UNSET_LABEL in t]
         self.assertEqual(len(unset), 1)
         self.assertIn("起算日未確定 2 件", unset[0])
         self.assertNotIn("No.", unset[0])
         self.assertNotIn(NAME, unset[0])
-        self.assertEqual(self.sent_keys()[-1], "houki_jukuryo_daily:2026-09-08:unset")
-        self.run_job(13)
+        o = [x for x in self.ops() if x["inbound_event_id"].startswith("houki_jukuryo_unset:")]
+        self.assertEqual(len(o), 1)
+        self.assertEqual(o[0]["inbound_event_id"], "houki_jukuryo_unset:2026-09-08")
+        r13 = self.run_job(13)
         self.run_job(18)
+        self.assertEqual(r13["unset_result"], hj.SEND_DUPLICATE_SENT)
+        self.assertEqual(len([t for t in self.sent_texts() if hj.UNSET_LABEL in t]), 1)
+
+    def test_restart_same_day_does_not_resend(self):
+        self.seed(_rec(rid="1", start=""))
+        self.run_job(8)
+        hj._unset_notified_on = None                       # 再起動相当（モジュール状態の初期化）
+        hub_notify._last_notify_at.clear()
+        res = self.run_job(13)
+        self.assertEqual(res["unset_result"], hj.SEND_DUPLICATE_SENT)
         self.assertEqual(len([t for t in self.sent_texts() if hj.UNSET_LABEL in t]), 1)
 
     def test_new_day_notifies_again(self):
@@ -536,18 +698,18 @@ class TestUnsetCount(_Base):
     def test_zero_unset_no_notice(self):
         self.seed(_rec(rid="1", start=_start_for_remaining(30)))
         res = self.run_job()
-        self.assertFalse(res["unset_notified"])
+        self.assertEqual(res["unset_result"], "")
         self.assertEqual(self.sent_texts(), [])
 
     def test_failed_unset_notice_is_retried_at_next_run(self):
         self.seed(_rec(rid="1", start=""))
-        self.admin.return_value = "failed"
+        self.push.return_value = False
         with self.assertLogs("hub.houki_jukuryo", level=logging.WARNING):
             res = self.run_job(8)
-        self.assertFalse(res["unset_notified"])
-        self.admin.return_value = "sent"
+        self.assertEqual(res["unset_result"], hj.SEND_FAILED)
+        self.push.return_value = True
         res = self.run_job(13)
-        self.assertTrue(res["unset_notified"])
+        self.assertEqual(res["unset_result"], hj.SEND_SENT)
 
     def test_unset_records_write_nothing_when_fields_empty(self):
         self.seed(_rec(rid="1", start=""))
@@ -555,14 +717,131 @@ class TestUnsetCount(_Base):
         self.assertEqual(self.updates, [])
 
 
+# ── BH-04: 期限変更と通知キーの連動 ──────────────────────────────────────────────
+class TestBH04DeadlineChangeRearms(_Base):
+    def test_a_same_record_same_threshold_new_deadline_is_a_new_operation(self):
+        self.seed(_rec(rid="1", start=_start_for_remaining(14)))
+        self.run_job()
+        self.records["1"]["起算日_確定"] = {"value": _start_for_remaining(10)}   # 期限訂正（まだ閾値内）
+        res = self.run_job(13)
+        self.assertEqual(res["sent"], 1)                                      # 訂正後に 1 回
+        keys = sorted(o["inbound_event_id"] for o in self.ops())
+        self.assertEqual(keys, [f"houki_jukuryo_14:1:{date.fromordinal(TODAY.toordinal() + 10).isoformat()}",
+                                "houki_jukuryo_14:1:2026-09-22"])
+        self.assertEqual(self.val("1", "残日数"), "10")
+        self.run_job(18)
+        self.assertEqual(self.push.await_count, 2)                             # 以後は増えない
+
+    def test_b_correction_after_mark_failure_is_not_throttled_within_300s(self):
+        self.seed(_rec(rid="1", start=_start_for_remaining(14)))
+        self.fail_on.add("1")
+        with self.assertLogs("hub.houki_jukuryo", level=logging.WARNING):
+            self.run_job(8)
+        self.fail_on.clear()
+        self.records["1"]["起算日_確定"] = {"value": _start_for_remaining(12)}
+        base = time.monotonic()
+        with patch.object(hub_notify.time, "monotonic", lambda: base + 10):   # 旧通知から 10 秒
+            res = self.run_job(13)
+        self.assertEqual(res["sent"], 1)
+        self.assertEqual(self.push.await_count, 2)
+        self.assertEqual(self.val("1", "通知済み閾値"), ["14日前"])
+
+
+# ── 台帳が使えないとき（DB 未設定・fail-open）は写しとプロセス内日付で抑止 ───────────
+class TestNoLedgerFallback(_Base):
+    def setUp(self):
+        super().setUp()
+        # 親の env patch（DATABASE_URL あり）を外し、DATABASE_URL 無しの patch に差し替える
+        # （patch.dict の入れ子で DATABASE_URL が復元され他テストへ漏れないように）
+        self._env.stop()
+        self._env = patch.dict(os.environ, {"DISPATCHBOT_CHANNEL_ACCESS_TOKEN": "biz-token",
+                                            "LINE_ADMIN_USER_ID": ADMIN})
+        self._env.start()
+        os.environ.pop("DATABASE_URL", None)
+        db.reset_for_tests()
+
+    def test_unmarked_sends_and_marks_marked_skips(self):
+        self.seed(_rec(rid="1", start=_start_for_remaining(14)),
+                  _rec(rid="2", start=_start_for_remaining(14), notified=("14日前",)))
+        res = self.run_job()
+        self.assertEqual((res["sent"], res["duplicate"]), (1, 1))
+        self.assertEqual(len(self.alert_texts()), 1)
+        self.assertIn("No.1", self.alert_texts()[0])
+        self.assertEqual(self.val("1", "通知済み閾値"), ["14日前"])
+        self.run_job(13)
+        self.assertEqual(self.push.await_count, 1)
+
+    def test_unset_once_per_process_day(self):
+        self.seed(_rec(rid="1", start=""))
+        r1 = self.run_job(8)
+        r2 = self.run_job(13)
+        self.assertEqual(r1["unset_result"], hj.SEND_SENT_UNRECORDED)
+        self.assertEqual(r2["unset_result"], hj.SEND_SKIPPED_MARKED)
+        self.assertEqual(self.push.await_count, 1)
+
+
+class TestPushHttp(unittest.TestCase):
+    def test_recipient_not_allowlisted_is_refused_without_http(self):
+        calls = []
+
+        class _C:
+            def __init__(self, **_k): ...
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_a):
+                return False
+
+            async def post(self, *a, **k):
+                calls.append(a)
+        with patch.dict(os.environ, {"DISPATCHBOT_CHANNEL_ACCESS_TOKEN": "t"}, clear=False), \
+                patch.object(hj, "business_channel_allowlist", lambda: frozenset()), \
+                patch.object(hj.httpx, "AsyncClient", _C), \
+                self.assertLogs("hub.houki_jukuryo", level=logging.WARNING):
+            self.assertFalse(_run(hj._push_admin_http(ADMIN, "x")))
+        self.assertEqual(calls, [])
+
+    def test_post_uses_business_token_and_admin(self):
+        seen = {}
+
+        class _R:
+            is_success = True
+            status_code = 200
+            text = "{}"
+
+        class _C:
+            def __init__(self, **_k): ...
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_a):
+                return False
+
+            async def post(self, url, headers=None, json=None):
+                seen.update(url=url, headers=headers, json=json)
+                return _R()
+        with patch.dict(os.environ, {"DISPATCHBOT_CHANNEL_ACCESS_TOKEN": "biz"}, clear=False), \
+                patch.object(hj, "business_channel_allowlist", lambda: frozenset({ADMIN})), \
+                patch.object(hj.httpx, "AsyncClient", _C):
+            self.assertTrue(_run(hj._push_admin_http(ADMIN, "hello")))
+        self.assertEqual(seen["headers"]["Authorization"], "Bearer biz")
+        self.assertEqual(seen["json"]["to"], ADMIN)
+        self.assertEqual(seen["json"]["messages"][0]["text"], "hello")
+
+
 class TestPiiAndClosedSet(_Base):
-    def test_no_pii_in_texts_keys_or_logs(self):
+    def test_no_pii_in_texts_or_logs(self):
         self.seed(_rec(rid="1", start=_start_for_remaining(7)), _rec(rid="2", start=""))
         with self.assertLogs("hub.houki_jukuryo", level=logging.INFO) as cm:
             self.run_job()
-        blob = "\n".join(self.sent_texts() + self.sent_keys() + cm.output)
-        for leak in (NAME, KANA, "2026-05-01", "2026-04-01"):
+        blob = "\n".join(self.sent_texts() + cm.output)
+        for leak in (NAME, KANA, "2026-05-01", "2026-04-01", ADMIN):
             self.assertNotIn(leak, blob)
+        for o in self.ops():
+            self.assertNotIn(NAME, str(o))
+            self.assertNotIn(ADMIN, str(o))               # 宛先は hash（RV-10）
 
     def test_only_three_fields_are_ever_written(self):
         self.seed(_rec(rid="1", start=_start_for_remaining(7)),
@@ -573,58 +852,6 @@ class TestPiiAndClosedSet(_Base):
             for banned in ("status", "起算日_確定", "法定満了日", "社内締切日", "熟慮期間通知履歴", "申述提出日"):
                 self.assertNotIn(banned, fields)
         self.assertEqual({u[0] for u in self.updates}, {"APP_HOUKI"})
-
-
-class TestSplitSend(_Base):
-    def test_60_records_split_into_multiple_notices_all_marked(self):
-        for i in range(1, 61):
-            self.seed(_rec(rid=str(i), start=_start_for_remaining(14)))
-        with patch.object(hj, "NOTICE_MAX_CHARS", 600):
-            res = self.run_job()
-        self.assertGreater(res["notices"], 1)
-        self.assertEqual(res["sent"], res["notices"])
-        for i in range(1, 61):
-            self.assertEqual(self.val(str(i), "通知済み閾値"), ["14日前"])
-        for k in self.sent_keys():
-            self.assertTrue(KEY_RE.match(k), k)
-
-    def test_one_failed_notice_leaves_only_its_records_unmarked(self):
-        for i in range(1, 61):
-            self.seed(_rec(rid=str(i), start=_start_for_remaining(14)))
-        calls = {"n": 0}
-
-        async def flaky(text, throttle_key=None):
-            calls["n"] += 1
-            return "failed" if calls["n"] == 2 else "sent"
-        with patch.object(hj, "NOTICE_MAX_CHARS", 600), \
-                patch.object(hub_notify, "notify_admin_line_result", flaky):
-            res = self.run_job()
-        self.assertEqual(res["failed"], 1)
-        marked = [i for i in range(1, 61) if self.val(str(i), "通知済み閾値") == ["14日前"]]
-        unmarked = [i for i in range(1, 61) if self.val(str(i), "通知済み閾値") == []]
-        self.assertTrue(marked and unmarked)
-        self.assertEqual(len(marked) + len(unmarked), 60)
-        for i in unmarked:
-            self.assertEqual(self.val(str(i), "残日数"), "14")             # 期限欄は書かれている
-
-
-class TestDigestKeys(_Base):
-    def test_real_notify_same_content_is_throttled_and_treated_as_sent(self):
-        self.seed(_rec(rid="1", start=_start_for_remaining(14)))
-        pushes = []
-
-        async def fake_push(admin_id, text, token_env=None):
-            pushes.append(text)
-            return True
-        with patch.object(hub_notify, "notify_admin_line_result", _REAL_NOTIFY_RESULT), \
-                patch.object(hub_notify, "get_admin_line_user_id", lambda: "Uadmin"), \
-                patch.object(hub_notify, "push_line_message", fake_push), \
-                patch.dict(hub_notify._last_notify_at, {}, clear=True):
-            r1 = self.run_job(8)
-            self.records["1"]["通知済み閾値"] = {"value": []}            # 刻印が消えた体で同内容を再送
-            r2 = self.run_job(13)
-        self.assertEqual((r1["sent"], r2["sent"]), (1, 1))
-        self.assertEqual(len([p for p in pushes if "14日前" in p]), 1)      # 実送信は 1 回（throttled）
 
 
 class TestPaging(_Base):
@@ -666,34 +893,27 @@ class TestPaging(_Base):
             return [_rec(rid="7", start=_start_for_remaining(30)) for _ in range(hj.SEARCH_LIMIT)]
         with patch.object(hub_kintone, "search_records", stuck), \
                 self.assertLogs("hub.houki_jukuryo", level=logging.WARNING):
-            rows = asyncio.run(hj.fetch_all_targets())
+            rows = _run(hj.fetch_all_targets())
         self.assertEqual(len(rows), 1000)
 
 
 class TestKindAndConstants(unittest.TestCase):
-    def test_kind_registered_in_log_throttled(self):
-        with self.assertLogs("hub.notify", level=logging.INFO) as cm:
-            hub_notify._log_throttled("houki_jukuryo_daily:2026-09-08:0123456789abcdef")
-        out = "\n".join(cm.output)
-        self.assertIn("kind=houki_jukuryo_daily", out)
-        self.assertNotIn("unknown_kind", out)
-        self.assertNotIn("2026-09-08", out)
-
     def test_constants_pinned(self):
-        # HOUKI-JUKURYO-2（大野裁定 2026-10-08）
+        # HOUKI-JUKURYO-2（大野裁定 2026-10-08）/ fix1
         self.assertEqual(hj.JUKURYO_MONTHS, 3)
         self.assertEqual(hj.ALERT_DAYS, (14, 7))
         self.assertEqual(hj.NOTIFIED_VALUES, {14: "14日前", 7: "7日前"})
         self.assertEqual(hj.RUN_HOURS_JST, (8, 13, 18))
-        self.assertEqual(hj.NOTICE_MAX_CHARS, 3800)
-        self.assertLess(hj.NOTICE_MAX_CHARS, 4900)
-        self.assertEqual(hj.DIGEST_HEX_LEN, 16)
         self.assertEqual(hj.JOB_NAME, "HOUKI_JUKURYO")
-        self.assertEqual(hj.NOTIFY_KIND, "houki_jukuryo_daily")
         self.assertEqual((hj.FIELD_STATUS, hj.FIELD_SUBMITTED, hj.FIELD_START),
                          ("status", "申述提出日", "起算日_確定"))
         self.assertEqual((hj.FIELD_DEADLINE, hj.FIELD_REMAINING, hj.FIELD_NOTIFIED),
                          ("熟慮期間期限", "残日数", "通知済み閾値"))
+        self.assertEqual((hj.LEDGER_BUSINESS, hj.LEDGER_CHANNEL, hj.LEDGER_PURPOSE),
+                         ("souzoku-houki", "houki_jukuryo", "other"))
+        self.assertEqual((hj.LEDGER_KIND_14, hj.LEDGER_KIND_7, hj.LEDGER_KIND_UNSET),
+                         ("houki_jukuryo_14", "houki_jukuryo_7", "houki_jukuryo_unset"))
+        self.assertEqual(hj.LEDGER_KINDS, {14: "houki_jukuryo_14", 7: "houki_jukuryo_7"})
         self.assertEqual(hj.SEARCH_LIMIT, 500)
         self.assertEqual(sorted(hj.SEARCH_FIELDS),
                          sorted(["$id", "$revision", "status", "申述提出日", "起算日_確定",
@@ -703,12 +923,21 @@ class TestKindAndConstants(unittest.TestCase):
             self.assertNotIn(absent, hj.SEARCH_FIELDS)
         self.assertFalse(hasattr(hj, "INTERNAL_MARGIN_DAYS"))             # 2 本立ては廃止
         self.assertFalse(hasattr(hj, "START_DATE_FIELDS"))                 # 申告代用は廃止
+        self.assertFalse(hasattr(hj, "NOTIFY_KIND"))                       # notify throttle 不使用
 
-    def test_module_reads_no_env_and_no_extension(self):
+    def test_send_ledger_closed_sets_untouched(self):
+        self.assertEqual(sl.PURPOSES, ("reply", "first_reply", "urgent", "image_receipt",
+                                       "image_result", "follow", "receipt_number", "other"))
+        self.assertIn(hj.LEDGER_PURPOSE, sl.PURPOSES)
+
+    def test_module_reads_no_new_env_and_no_extension(self):
         src = Path(hj.__file__).read_text(encoding="utf-8")
-        self.assertNotIn("os.environ", src)
-        self.assertNotIn("import os", src)
-        self.assertNotIn("伸長後満了日", src.split('"""', 2)[2])           # 本文コードに伸長の分岐なし
+        body = src.split('"""', 2)[2]
+        self.assertEqual(body.count("os.environ"), 1)                       # 既存 env（業務トークン）のみ
+        self.assertIn('os.environ.get(business_token_env(), "")', body)
+        self.assertNotIn("伸長後満了日", body)                              # 本文コードに伸長の分岐なし
+        self.assertNotIn("notify_admin_line_result", body)
+        self.assertNotIn("alembic", body)
 
     def test_main_registers_job(self):
         src = (Path(__file__).parent / "main.py").read_text(encoding="utf-8")

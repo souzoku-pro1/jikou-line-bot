@@ -1,4 +1,4 @@
-"""相続放棄 熟慮期間 監視（hub/houki_jukuryo・HOUKI-JUKURYO-2）
+"""相続放棄 熟慮期間 監視（hub/houki_jukuryo・HOUKI-JUKURYO-2 / fix1）
 
 App 40（相続放棄案件）の受任後案件について熟慮期間（3 か月）の期限を **1 か所で算出**し、
 App 40 の「熟慮期間期限」「残日数」に保存し、期限 14 日前・7 日前に業務 LINE へ 1 回ずつ
@@ -19,48 +19,65 @@ App 40 の「熟慮期間期限」「残日数」に保存し、期限 14 日前
  - 熟慮期間期限／残日数 はシステム所有欄: 起算日_確定 が変われば **再計算して上書き**
    （空欄のみ CAS ではない）。起算日_確定 が空に戻れば両欄を空に戻す。
  - 対象 = 受任後の全 status（HOUKI_PROFILE.post_engagement_statuses の 8 値）かつ 申述提出日 が空。
- - 通知済みの記録は App 40 の既存欄 通知済み閾値（CHECK_BOX・選択肢 14日前／7日前）で判定。
-   同日に何度走っても、通知済みの値が立っている閾値は送らない。
  - 通知文は固定文言＋レコード番号＋期限＋残日数のみ（氏名等の PII を載せない・RV-10）。
 
+fix1（Codex R-HOUKI-JUKURYO-2 BH-01〜04・司令塔裁定「通知を送った事実の正は send_ledger」）:
+ - BH-02/03: 通知（14/7 日前・起算日未確定）は **送信台帳（hub/send_ledger・本番 DB・永続）**を
+   通す。1 レコード×1 閾値 = 1 送信操作 = 1 LINE push（分割の単位と台帳の単位を一致させる・
+   操作の付帯情報列を増やさない）。業務キーは inbound_event_id に
+   「{種別}:{レコード ID}:{期限日}」（未確定件数は「{種別}:{JST 日付}」）として置き、
+   同キーの sent／unconfirmed があれば送らない（台帳の重複検出をそのまま使う）。
+   HTTP は guarded_http（heartbeat・timeout）経由。結果不明は unconfirmed（自動再送なし・
+   /app/send_ops に出る）。kintone の 通知済み閾値 は **写し**（送信成功後に刻印・刻印失敗は
+   次回実行で刻印だけ再試行＝再通知しない）。台帳が使えない（DB 未設定・記録失敗の fail-open）
+   ときだけ、写し（刻印）と プロセス内の日付を代替の抑止に使う。
+ - purpose: 本番 DB の CHECK 制約 ck_send_operation_purpose（migration e5f8）が閉集合を固定して
+   おり、票の規律「migration なし」の下では新 purpose を挿入できない。purpose は other とし、
+   種別は inbound_event_id の接頭辞（houki_jukuryo_14 / houki_jukuryo_7 / houki_jukuryo_unset）と
+   channel="houki_jukuryo" で判別する（purpose の正式追加は migration を伴う別票）。
+ - BH-01: 保存の 409 再取得後は対象（status・申述提出日・起算日_確定）を再評価し、対象外に
+   なっていれば更新を中止する（件数ログのみ）。
+ - BH-04: 期限が変われば業務キーが変わる（同一案件・同一閾値でも訂正後は 1 回通知される）。
+   notify のメモリ throttle は使わない。
+
 書く欄は 熟慮期間期限・残日数（算出結果）と 通知済み閾値（送信成功後の刻印）の 3 つだけ。
-他の欄・status は書かない。順序: 算出 → 通知送信 → 送信成功（sent/throttled）を確認してから
-1 レコード 1 回の $revision CAS で保存（409 は再取得して 1 回だけ再計算・再試行）。
+他の欄・status は書かない。順序: 算出 → 通知（台帳 begin → push → finish）→ 1 レコード
+1 回の $revision CAS で保存（409 は再取得して 1 回だけ再計算・再試行）。
 登録方式は hub/return_deadline と同じ（hub/scheduler の daily・8/13/18 JST・単一 worker 前提）。
 新規 env は読まない。App 21 には触れない。hub/notify の切り詰め（4900 字）には触れない。
 """
 
 import calendar
 import functools
-import hashlib
-import json
 import logging
-from dataclasses import dataclass, field
+import os
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 
-from hub import kintone, notify
+import httpx
+
+from hub import kintone, send_ledger
 from hub import scheduler as hub_scheduler
 from hub.houki_case_store import APP_HOUKI_CASE
 from hub.houki_profile import HOUKI_PROFILE
+from hub.notify import business_channel_allowlist, business_token_env, get_admin_line_user_id
 from hub.redact import emit  # RV-10: sink 出力は emit 契約経由
 
 logger = logging.getLogger("hub.houki_jukuryo")
 
 _JST = timezone(timedelta(hours=9))
+_PUSH_URL = "https://api.line.me/v2/bot/message/push"
 
 # ── 定数（1 か所・テストで pin） ─────────────────────────────────────────────
 JOB_NAME = "HOUKI_JUKURYO"                   # ジョブ名は f"{JOB_NAME}_{HH}"（時刻ごとに 1 つ）
 RUN_HOURS_JST = (8, 13, 18)                  # CRON-1 から時刻を維持（票 6）
-NOTIFY_KIND = "houki_jukuryo_daily"          # throttle_key = f"{NOTIFY_KIND}:{YYYY-MM-DD}:{digest}"
-NOTICE_MAX_CHARS = 3800                      # 1 通の上限（notify 側 4900 より小さい）
-DIGEST_HEX_LEN = 16
 
 FIELD_STATUS = "status"
 FIELD_SUBMITTED = "申述提出日"
 FIELD_START = "起算日_確定"                   # 唯一の入力（司令塔裁定）
 FIELD_DEADLINE = "熟慮期間期限"               # 出力 1（DATE・システム所有）
 FIELD_REMAINING = "残日数"                    # 出力 2（NUMBER・システム所有）
-FIELD_NOTIFIED = "通知済み閾値"               # 通知済みの刻印（CHECK_BOX・既存欄）
+FIELD_NOTIFIED = "通知済み閾値"               # 通知済みの写し（CHECK_BOX・既存欄）
 WRITE_FIELDS = frozenset({FIELD_DEADLINE, FIELD_REMAINING, FIELD_NOTIFIED})   # 書く欄の閉集合
 
 # 対象 status（受任後の 8 値・hub/houki_profile が単一の正）
@@ -70,6 +87,25 @@ JUKURYO_MONTHS = 3                           # 裁定 (a)
 ALERT_DAYS = (14, 7)                         # 裁定 (c)・残日数がこの値以下で未通知なら送る
 NOTIFIED_VALUES = {14: "14日前", 7: "7日前"}  # 通知済み閾値 の実選択肢値（form fields 実測）
 
+# 送信台帳（fix1 BH-02/03）: business は相続放棄・channel は本ジョブ・purpose は DB CHECK 制約の
+# 範囲内（other）。種別は inbound_event_id の接頭辞で表す
+LEDGER_BUSINESS = "souzoku-houki"
+LEDGER_CHANNEL = "houki_jukuryo"
+LEDGER_PURPOSE = send_ledger.PURPOSE_OTHER
+LEDGER_KIND_14 = "houki_jukuryo_14"
+LEDGER_KIND_7 = "houki_jukuryo_7"
+LEDGER_KIND_UNSET = "houki_jukuryo_unset"
+LEDGER_KINDS = {14: LEDGER_KIND_14, 7: LEDGER_KIND_7}
+
+# 送信結果（固定語彙）
+SEND_SENT = "sent"                           # 台帳に記録して送った
+SEND_SENT_UNRECORDED = "sent_unrecorded"     # 台帳が使えず（fail-open）送った
+SEND_DUPLICATE_SENT = "duplicate_sent"       # 台帳に sent がある（送らない・刻印の再試行のみ）
+SEND_DUPLICATE_UNCONFIRMED = "duplicate_unconfirmed"   # 台帳に未確定がある（送らない・人の確定待ち）
+SEND_SKIPPED_MARKED = "skipped_marked"       # 台帳が使えず、写し（刻印）があるので送らない
+SEND_UNCONFIRMED = "unconfirmed"             # push の結果不明（自動再送なし）
+SEND_FAILED = "failed"                       # push 失敗・宛先なし（次回実行で再試行）
+
 NOTICE_HEADER = "【相続放棄 熟慮期間】"
 NOTICE_FOOTER = "期限＝起算日_確定の3か月後の応当日の前日。レコード番号と残日数のみ・詳細はApp 40で確認してください。"
 UNSET_LABEL = "起算日未確定"
@@ -78,8 +114,7 @@ SEARCH_FIELDS = ["$id", "$revision", FIELD_STATUS, FIELD_SUBMITTED, FIELD_START,
                  FIELD_DEADLINE, FIELD_REMAINING, FIELD_NOTIFIED]
 SEARCH_LIMIT = 500                           # kintone records.json の上限（ページング）
 
-# 起算日未確定の件数通知を送った日（プロセス内・1 日 1 回の判定。再起動で消えるが
-# notify 側の同一キー throttle と合わせて同日重複を抑える）
+# 台帳が使えないときだけ使う代替抑止（起算日未確定の件数通知を送った日・プロセス内）
 _unset_notified_on: date | None = None
 
 
@@ -159,10 +194,21 @@ def notified_values(record: dict) -> list[str]:
     return [x for x in str(val or "").split(",") if x]
 
 
-def alerts_due(remaining: int, notified: list[str]) -> list[int]:
-    """残日数が閾値以下で、その閾値の通知済みが無いもの（当日に走れなかった分も翌日以降に
-    拾う。期限超過でも未通知の閾値があれば送る＝取りこぼしを黙らせない）。"""
-    return [d for d in ALERT_DAYS if remaining <= d and NOTIFIED_VALUES[d] not in notified]
+def alert_candidates(remaining: int) -> list[int]:
+    """残日数が閾値以下の閾値（14→7 の順）。1 回性は台帳で判定する（写しは代替）。
+    当日に走れなかった分も翌日以降に拾う。期限超過でも未通知の閾値があれば送る
+    （取りこぼしを黙らせない・「超過」の通知は作らない）。"""
+    return [d for d in ALERT_DAYS if remaining <= d]
+
+
+def ledger_key(kind: str, business_key: str) -> str:
+    """台帳の業務キー（inbound_event_id）。{種別}:{業務キー}。"""
+    return f"{kind}:{business_key}"
+
+
+def alert_business_key(record_id: str, comp: Computation) -> str:
+    """BH-04: 期限日を含める＝期限が訂正されれば別の送信操作になり、訂正後に 1 回通知される。"""
+    return f"{record_id}:{comp.deadline.isoformat()}"
 
 
 def _stored_remaining(record: dict) -> int | None:
@@ -191,7 +237,7 @@ def field_updates(record: dict, comp: Computation | None) -> dict:
 
 
 def record_writes(record: dict, today: date, mark_days: list[int]) -> dict:
-    """1 レコードの書込集合 = 算出差分 + 送信成功した閾値の刻印（既存の刻印は保持）。"""
+    """1 レコードの書込集合 = 算出差分 + 送信済み閾値の刻印（既存の刻印は保持）。"""
     fields = field_updates(record, compute(record, today))
     if mark_days:
         current = notified_values(record)
@@ -208,94 +254,73 @@ def format_alert_line(record_id: str, day: int, comp: Computation) -> str:
             f"（{day}日前の通知）")
 
 
-@dataclass
-class Entry:
-    record: dict
-    record_id: str
-    comp: Computation
-    days: list[int]                        # 送る閾値（14／7）
-
-    def lines(self) -> list[str]:
-        return [format_alert_line(self.record_id, d, self.comp) for d in self.days]
-
-    def facts(self) -> list[dict]:
-        return [{"record_id": self.record_id, "alert_day": d,
-                 "deadline": self.comp.deadline.isoformat(), "remaining": self.comp.remaining}
-                for d in self.days]
-
-
-@dataclass
-class Notice:
-    entries: list[Entry] = field(default_factory=list)
-    text: str = ""
-    digest: str = ""
-
-
-def plan_alerts(records: list[dict], today: date) -> tuple[list[Entry], int]:
-    """(通知対象 Entry, 起算日未確定の件数)。対象外レコードは無視。"""
-    entries: list[Entry] = []
-    unset = 0
-    for rec in records:
-        if not is_target(rec):
-            continue
-        comp = compute(rec, today)
-        if comp is None:
-            unset += 1
-            continue
-        days = alerts_due(comp.remaining, notified_values(rec))
-        if days:
-            entries.append(Entry(rec, _v(rec, "$id"), comp, days))
-    return entries, unset
-
-
-def digest_of(entries: list[Entry]) -> str:
-    facts = sorted((f for e in entries for f in e.facts()),
-                   key=lambda f: (f["record_id"], f["alert_day"]))
-    material = json.dumps(facts, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
-    return hashlib.sha256(material.encode("utf-8")).hexdigest()[:DIGEST_HEX_LEN]
-
-
-def notify_key(today: date, digest: str) -> str:
-    return f"{NOTIFY_KIND}:{today.isoformat()}:{digest}"
-
-
-def unset_key(today: date) -> str:
-    return f"{NOTIFY_KIND}:{today.isoformat()}:unset"
-
-
-def _notice_text(today: date, bodies: list[str], n: int, total: int) -> str:
-    head = f"{NOTICE_HEADER} {today.isoformat()} ({n}/{total})"
-    return "\n".join([head, *bodies, NOTICE_FOOTER])
-
-
-def build_notices(today: date, entries: list[Entry], max_chars: int | None = None) -> list[Notice]:
-    """案件単位で NOTICE_MAX_CHARS 以内に分割。各通に (n/N)。"""
-    limit = NOTICE_MAX_CHARS if max_chars is None else max_chars
-    if not entries:
-        return []
-    frame = len(_notice_text(today, [], 99, 99))
-    budget = max(limit - frame, 1)
-    groups: list[list[tuple[Entry, str]]] = []
-    cur: list[tuple[Entry, str]] = []
-    cur_len = 0
-    for e in entries:
-        body = "\n".join(e.lines())
-        add = len(body) + (1 if cur else 0)
-        if cur and cur_len + add > budget:
-            groups.append(cur)
-            cur, cur_len = [], 0
-            add = len(body)
-        cur.append((e, body))
-        cur_len += add
-    if cur:
-        groups.append(cur)
-    total = len(groups)
-    return [Notice([e for e, _b in g], _notice_text(today, [b for _e, b in g], i, total),
-                   digest_of([e for e, _b in g])) for i, g in enumerate(groups, 1)]
+def alert_text(today: date, record_id: str, day: int, comp: Computation) -> str:
+    """1 レコード×1 閾値 = 1 通（台帳の単位と一致）。"""
+    return "\n".join([f"{NOTICE_HEADER} {today.isoformat()}",
+                      format_alert_line(record_id, day, comp), NOTICE_FOOTER])
 
 
 def unset_text(today: date, count: int) -> str:
     return f"{NOTICE_HEADER} {today.isoformat()}\n{UNSET_LABEL} {count} 件{UNSET_NOTE}"
+
+
+# ── 送信（台帳 → push → 確定） ───────────────────────────────────────────────
+async def _push_admin_http(admin_id: str, text: str) -> bool:
+    """業務チャネル（DISPATCHBOT）で管理者へ push する HTTP 部分。宛先 allowlist（H02）は
+    hub/notify と同じ関所。transport 例外は上へ（guarded_http の呼出側で unconfirmed）。
+    非 2xx は False（failed）。本文・宛先は emit 契約の外へ出さない。"""
+    if admin_id not in business_channel_allowlist():
+        logger.warning("houki_jukuryo push skipped (recipient not allowlisted)")
+        return False
+    token = os.environ.get(business_token_env(), "")
+    if not token:
+        logger.warning("houki_jukuryo push skipped (no business token)")
+        return False
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            _PUSH_URL,
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            json={"to": admin_id, "messages": [{"type": "text", "text": text[:4900]}]},
+        )
+    if not resp.is_success:
+        logger.error("houki_jukuryo push failed status=%s body=%s",
+                     emit(resp.status_code, "count", "log", "operator"),
+                     emit(resp.text, "vendor_raw", "log", "operator"))
+    return bool(resp.is_success)
+
+
+async def send_notice(kind: str, business_key: str, text: str, *, already_marked: bool = False) -> str:
+    """台帳を通した 1 通の送信。戻り値は固定語彙（SEND_*）。
+    - 台帳に同キーの sent → SEND_DUPLICATE_SENT（送らない）
+    - 台帳に同キーの未確定 → SEND_DUPLICATE_UNCONFIRMED（送らない・人の確定待ち）
+    - 台帳が使えない（begin が None）→ 写し（already_marked）があれば送らない、無ければ送る
+    - push の例外（timeout 含む）→ unconfirmed（自動再送なし）"""
+    admin_id = get_admin_line_user_id()
+    if not admin_id:
+        logger.warning("houki_jukuryo notice skipped (no admin id)")
+        return SEND_FAILED
+    token = send_ledger.bind_inbound(ledger_key(kind, business_key))
+    try:
+        with send_ledger.purpose(LEDGER_PURPOSE):
+            op = await send_ledger.begin(LEDGER_BUSINESS, LEDGER_CHANNEL, admin_id, text)
+        if op is send_ledger.DUPLICATE_SENT:
+            return SEND_DUPLICATE_SENT
+        if op is send_ledger.DUPLICATE_UNCONFIRMED:
+            return SEND_DUPLICATE_UNCONFIRMED
+        if op is None and already_marked:
+            return SEND_SKIPPED_MARKED
+        try:
+            ok = await send_ledger.guarded_http(op, _push_admin_http(admin_id, text))
+        except Exception:
+            await send_ledger.finish(op, send_ledger.STATE_UNCONFIRMED)
+            logger.warning("houki_jukuryo push result unknown (unconfirmed)")
+            return SEND_UNCONFIRMED
+        await send_ledger.finish(op, send_ledger.STATE_SENT if ok else send_ledger.STATE_FAILED)
+        if not ok:
+            return SEND_FAILED
+        return SEND_SENT if op is not None else SEND_SENT_UNRECORDED
+    finally:
+        send_ledger.unbind(token)
 
 
 # ── kintone 読取（全件取得）・書込（3 欄のみ・CAS） ─────────────────────────
@@ -315,103 +340,142 @@ async def fetch_all_targets() -> list[dict]:
         after = last
 
 
-async def commit_writes(record: dict, today: date, mark_days: list[int]) -> bool:
+WRITE_WRITTEN = "written"
+WRITE_NOOP = "noop"
+WRITE_ABORTED = "aborted"        # BH-01: 409 再取得後に対象外になっていた
+WRITE_FAILED = "failed"
+
+
+async def commit_writes(record: dict, today: date, mark_days: list[int]) -> str:
     """算出差分＋刻印を 1 回の $revision CAS で保存。409 は最新を再取得して 1 回だけ
-    再計算・再試行（起算日_確定 が同時に変わっていれば新しい値で算出）。失敗は False。"""
+    再計算・再試行。BH-01: 再取得後に対象外（status 変更・申述提出日 入力・起算日_確定 空）
+    になっていれば更新を中止（件数ログのみ・次回実行で改めて判定）。"""
     rid = _v(record, "$id")
     rec = record
     for attempt in range(2):
         fields = record_writes(rec, today, mark_days)
         if not fields:
-            return True
+            return WRITE_NOOP
         try:
             await kintone.update_record(APP_HOUKI_CASE, rid, fields,
                                         revision=_v(rec, "$revision") or None)
-            return True
+            return WRITE_WRITTEN
         except kintone.KintoneConflict:
             if attempt == 1:
                 logger.warning("houki_jukuryo write CAS conflict twice record=%s",
                                emit(rid, "record_id", "log", "operator"))
-                return False
+                return WRITE_FAILED
             try:
                 rec = await kintone.get_record(APP_HOUKI_CASE, rid)
             except kintone.KintoneError as e:
                 logger.warning("houki_jukuryo refetch failed cls=%s record=%s",
                                emit(type(e).__name__, "vendor_raw", "log", "operator"),
                                emit(rid, "record_id", "log", "operator"))
-                return False
+                return WRITE_FAILED
+            if not is_target(rec) or resolve_start(rec) is None:
+                logger.info("houki_jukuryo write aborted after refetch (no longer target) count=%s",
+                            emit(1, "count", "log", "operator"))
+                return WRITE_ABORTED
         except kintone.KintoneError as e:
             logger.warning("houki_jukuryo write failed cls=%s record=%s",
                            emit(type(e).__name__, "vendor_raw", "log", "operator"),
                            emit(rid, "record_id", "log", "operator"))
-            return False
-    return False
+            return WRITE_FAILED
+    return WRITE_FAILED
 
 
 # ── ジョブ本体 ───────────────────────────────────────────────────────────────
+def _empty_result() -> dict:
+    return {"targets": 0, "candidates": 0, "sent": 0, "duplicate": 0, "remark": 0,
+            "unconfirmed": 0, "failed": 0, "unset": 0, "unset_result": "", "written": 0,
+            "write_failed": 0, "aborted": 0}
+
+
 async def jukuryo_daily_check(run_hour: int = RUN_HOURS_JST[0]) -> dict:
-    """受任後×未提出の案件を算出し、(1) 14/7 日前の未通知分を送信、(2) 送信成功分の刻印と
-    熟慮期間期限／残日数 の差分を 1 レコード 1 回で保存、(3) 起算日未確定の件数を 1 日 1 回通知。
-    run_hour は 3 回のジョブで共通の処理（判定は欄の値で行うため時刻で分けない）。戻り値は件数。"""
+    """受任後×未提出の案件を算出し、(1) 14/7 日前の各閾値を台帳で 1 回性判定して送信、
+    (2) 送信済み（今回 sent・台帳 sent で刻印未了）の刻印と 熟慮期間期限／残日数 の差分を
+    1 レコード 1 回で保存、(3) 起算日未確定の件数を台帳で 1 日 1 回通知。
+    run_hour は 3 回のジョブで共通の処理（判定は欄と台帳で行うため時刻で分けない）。"""
     global _unset_notified_on
+    res = _empty_result()
     today = _today_jst()
     try:
         records = await fetch_all_targets()
     except kintone.KintoneError as e:
         logger.error("houki_jukuryo fetch failed cls=%s",
                      emit(type(e).__name__, "vendor_raw", "log", "operator"))
-        return {"targets": 0, "alerts": 0, "unset": 0, "notices": 0, "sent": 0,
-                "failed": 0, "written": 0, "write_failed": 0, "unset_notified": False}
+        return res
+    res["targets"] = len(records)
 
-    entries, unset = plan_alerts(records, today)
-    notices = build_notices(today, entries)
-    sent = failed = 0
     marks: dict[str, list[int]] = {}
-    for nt in notices:
-        result = await notify.notify_admin_line_result(nt.text, throttle_key=notify_key(today, nt.digest))
-        if result not in ("sent", "throttled"):
-            failed += 1
-            logger.warning("houki_jukuryo notice not sent (no mark written for that notice)")
+    unset = 0
+    for rec in records:
+        if not is_target(rec):
             continue
-        sent += 1
-        for e in nt.entries:
-            marks[e.record_id] = e.days
+        rid = _v(rec, "$id")
+        comp = compute(rec, today)
+        if comp is None:
+            unset += 1
+            continue
+        notified = notified_values(rec)
+        for day in alert_candidates(comp.remaining):
+            res["candidates"] += 1
+            marked = NOTIFIED_VALUES[day] in notified
+            r = await send_notice(LEDGER_KINDS[day], alert_business_key(rid, comp),
+                                  alert_text(today, rid, day, comp), already_marked=marked)
+            if r in (SEND_SENT, SEND_SENT_UNRECORDED):
+                res["sent"] += 1
+                marks.setdefault(rid, []).append(day)
+            elif r == SEND_DUPLICATE_SENT:
+                res["duplicate"] += 1
+                if not marked:                       # 刻印未了 → 刻印だけ再試行（再通知しない）
+                    res["remark"] += 1
+                    marks.setdefault(rid, []).append(day)
+            elif r in (SEND_DUPLICATE_UNCONFIRMED, SEND_UNCONFIRMED):
+                res["unconfirmed"] += 1
+            elif r == SEND_SKIPPED_MARKED:
+                res["duplicate"] += 1
+            else:
+                res["failed"] += 1
+    res["unset"] = unset
 
-    written = write_failed = 0
     for rec in records:
         if not is_target(rec):
             continue
         rid = _v(rec, "$id")
         if not record_writes(rec, today, marks.get(rid, [])):
             continue
-        if await commit_writes(rec, today, marks.get(rid, [])):
-            written += 1
-        else:
-            write_failed += 1
+        outcome = await commit_writes(rec, today, marks.get(rid, []))
+        if outcome == WRITE_WRITTEN:
+            res["written"] += 1
+        elif outcome == WRITE_ABORTED:
+            res["aborted"] += 1
+        elif outcome == WRITE_FAILED:
+            res["write_failed"] += 1
 
-    unset_notified = False
-    if unset > 0 and _unset_notified_on != today:
-        result = await notify.notify_admin_line_result(unset_text(today, unset),
-                                                       throttle_key=unset_key(today))
-        if result in ("sent", "throttled"):
-            _unset_notified_on = today
-            unset_notified = True
-        else:
+    if unset > 0:
+        r = await send_notice(LEDGER_KIND_UNSET, today.isoformat(), unset_text(today, unset),
+                              already_marked=(_unset_notified_on == today))
+        res["unset_result"] = r
+        if r == SEND_SENT_UNRECORDED:
+            _unset_notified_on = today                 # 台帳が使えないときだけの代替抑止
+        elif r == SEND_FAILED:
             logger.warning("houki_jukuryo unset-count notice not sent")
 
-    logger.info("houki_jukuryo run: targets=%s alerts=%s unset=%s notices=%s sent=%s "
-                "failed=%s written=%s write_failed=%s",
-                emit(len(records), "count", "log", "operator"),
-                emit(sum(len(e.days) for e in entries), "count", "log", "operator"),
-                emit(unset, "count", "log", "operator"),
-                emit(len(notices), "count", "log", "operator"),
-                emit(sent, "count", "log", "operator"),
-                emit(failed, "count", "log", "operator"),
-                emit(written, "count", "log", "operator"),
-                emit(write_failed, "count", "log", "operator"))
-    return {"targets": len(records), "alerts": sum(len(e.days) for e in entries), "unset": unset,
-            "notices": len(notices), "sent": sent, "failed": failed, "written": written,
-            "write_failed": write_failed, "unset_notified": unset_notified}
+    logger.info("houki_jukuryo run: targets=%s candidates=%s sent=%s duplicate=%s remark=%s "
+                "unconfirmed=%s failed=%s unset=%s written=%s write_failed=%s aborted=%s",
+                emit(res["targets"], "count", "log", "operator"),
+                emit(res["candidates"], "count", "log", "operator"),
+                emit(res["sent"], "count", "log", "operator"),
+                emit(res["duplicate"], "count", "log", "operator"),
+                emit(res["remark"], "count", "log", "operator"),
+                emit(res["unconfirmed"], "count", "log", "operator"),
+                emit(res["failed"], "count", "log", "operator"),
+                emit(res["unset"], "count", "log", "operator"),
+                emit(res["written"], "count", "log", "operator"),
+                emit(res["write_failed"], "count", "log", "operator"),
+                emit(res["aborted"], "count", "log", "operator"))
+    return res
 
 
 def job_name(hour: int) -> str:
