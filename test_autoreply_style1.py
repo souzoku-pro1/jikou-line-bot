@@ -209,13 +209,17 @@ FAQ_BASIS_EVIDENCE = {
 }
 
 # ── main 時点（4b61b41）の凍結文言 sha256 ────────────────────────────────────
+# JIKOU-FURIGANA-1（大野裁定 2026-10-08・凍結解除は「①お名前」の 1 問と
+# KINTONE_UPDATE の ふりがな キー＋分離指示 1 行に限る）: hearing_prompt_body と
+# hearing_template_blocks（①を含む罫線ブロック）のみ新値へ更新。
+# 旧値 hearing_prompt_body=d1b1ef47…31883 / hearing_template_blocks=ebd2dea6…8ab2e
 FROZEN_SHA = {
     "hearing_prompt_body":
-        "d1b1ef4743a814d80726434206fc2dbf73ac507327271c8bb9f24cbafd831883",
+        "52a8e0fefb8920f4189908aa9c62a068c0f4357148a8d8c2bbcb391a6be9c9a6",
     "customer_prompt_base":
         "8e4f0625fbf998fb9472afa5ffa54eecd2940f8424c23509f5f7906b3ad3822c",
     "hearing_template_blocks":
-        "ebd2dea63cb3e81b4f4e95235d49c78ac2933ea6f932ffcd19bff632fc78ab2e",
+        "24103a7b21a889319c8b9eefb9f15bbf35f1c9b065ef459903b27ff6c990159e",
     "hoterasu":
         "93bd619e1270a61ef38af3dffb5ed6ea247a1838fe79c803f8ea324e016dd631",
     "pending_reply":

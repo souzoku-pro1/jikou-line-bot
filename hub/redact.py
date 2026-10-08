@@ -31,6 +31,7 @@ import re
 # 素通し（非 PII・運用に必要。値域検証つき）
 KINDS_PASSTHROUGH = frozenset({"record_id", "count"})
 # PII（既定は完全抑止・本人宛のみ素通し）
+# name は氏名の読み（ふりがな・JIKOU-FURIGANA-1）を含む
 KINDS_PII = frozenset({
     "name", "address", "phone", "email", "birthdate", "koseki", "asset",
     "freetext",

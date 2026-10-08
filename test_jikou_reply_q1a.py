@@ -406,10 +406,11 @@ class TestThreeValuedCallers(_DbMixin):
 
     def test_approval_webhook_skips_sent_update_on_unconfirmed_duplicate(self):
         src = (REPO / "main.py").read_text(encoding="utf-8").split("\n")
-        self.assertIn("_sl_res = await send_line_push(user_id, ai_draft)", src[1597])
+        # JIKOU-FURIGANA-1（大野裁定 2026-10-08）: 凍結台本に 2 行追加 → 番地 +2（1597→1599 …）
+        self.assertIn("_sl_res = await send_line_push(user_id, ai_draft)", src[1599])
         self.assertIn('if _sl_res == send_ledger.SEND_UNCONFIRMED: return {"ok": True, "skip": "send_unconfirmed_duplicate"}',
-                      src[1598])
-        self.assertIn("await mark_approval_sent(record_id); await save_to_chatlog(", src[1599])
+                      src[1600])
+        self.assertIn("await mark_approval_sent(record_id); await save_to_chatlog(", src[1601])
 
     def test_states_distinguish_unconfirmed_for_callers_that_ignore_return(self):
         _FakeClient.raise_exc = RuntimeError("t")
@@ -959,15 +960,16 @@ class TestPiiAndSinkPolicy(unittest.TestCase):
         src = (REPO / "main.py").read_text(encoding="utf-8").split("\n")
         tagged = [i + 1 for i, l in enumerate(src) if "JIKOU-REPLY-Q1a" in l]
         self.assertGreaterEqual(len(tagged), 8)
-        # sink allowlist の main.py 番地（661/683/1318/1618/1915）は不変
+        # sink allowlist の main.py 番地は Q1a では不変（661/683/1318/1618/1915）。
+        # JIKOU-FURIGANA-1（大野裁定 2026-10-08）: 凍結台本に 2 行追加 → 全番地 +2
         import json
         entries = json.load(open(REPO / "redaction_sink_allowlist.json", encoding="utf-8"))["entries"]
         self.assertEqual(sorted(int(e.split(":")[1]) for e in entries if e.startswith("main.py:")),
-                         [661, 683, 1318, 1618, 1915])
+                         [663, 685, 1320, 1620, 1917])
         self.assertEqual(sorted(int(e.split(":")[1]) for e in entries
                                 if e.startswith("chat_responder.py:")), [1660, 1672])
-        self.assertIn("send_ledger.touch_inbound", src[1217])      # 画像受信（1 行置換）
-        self.assertIn("send_ledger.touch_inbound", src[1345])      # durable 受信（1 行置換）
+        self.assertIn("send_ledger.touch_inbound", src[1219])      # 画像受信（1 行置換）
+        self.assertIn("send_ledger.touch_inbound", src[1347])      # durable 受信（1 行置換）
 
     def test_closed_sets_are_pinned(self):
         self.assertEqual(sl.ACTORS, ("bot", "human", "approved_draft"))

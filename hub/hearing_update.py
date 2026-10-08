@@ -37,6 +37,8 @@ fix1（Codex R-JIKOU-HEARING-HOTFIX-1）:
 import asyncio
 import hashlib
 import logging
+import re
+import unicodedata
 
 from hub import kintone as hub_kintone
 from hub import notify
@@ -53,12 +55,45 @@ USER_FIELD = "LINEユーザーID"
 # この対応表が許可集合の単一の正。表示順は通知の並び順
 UPDATE_FIELD_LABELS: dict = {
     "顧客名": "氏名",
+    # JIKOU-FURIGANA-1（大野裁定 2026-10-08）: App 21 欄コード furigana
+    # （ラベル ふりがな・SINGLE_LINE_TEXT・任意・form fields API 実測）。
+    # 台本の JSON キーは「ふりがな」（UPDATE_KEY_ALIASES で欄コードへ読み替え）
+    "furigana": "ふりがな",
     "住所": "住所",
     "生年月日": "生年月日",
     "電話番号": "電話番号",
     "メールアドレス": "メールアドレス",
 }
 UPDATE_FIELDS: frozenset = frozenset(UPDATE_FIELD_LABELS)
+
+# JIKOU-FURIGANA-1: 台本の JSON キー → App 21 欄コード（許可集合の判定前に適用。
+# 欄コードそのもの（furigana）で来た場合もそのまま許可集合に当たる）
+UPDATE_KEY_ALIASES: dict = {"ふりがな": "furigana"}
+
+# JIKOU-FURIGANA-1: ふりがなに許す文字（正規化後）= ひらがな・長音・踊り字・全角空白。
+# 漢字・英数・カタカナ残り（ヷヸヹヺ 等ひらがなに写せないもの）が混ざれば「書かない」
+_HIRAGANA_ONLY_RE = re.compile(r"^[ぁ-ゖゝゞー　]+$")
+
+
+def normalize_furigana(value) -> str:
+    """ふりがなの正規化: strip → NFKC（半角カナ・半角長音を全角へ統一）→
+    カタカナをひらがなへ写す → 空白は全角 1 個に統一。ひらがな以外が残る・空の
+    ときは ""（=書かない。欄は任意項目なので失敗にはしない）。値はログに出さない。"""
+    s = unicodedata.normalize("NFKC", str(value or "")).strip()
+    if not s:
+        return ""
+    out = []
+    for ch in s:
+        o = ord(ch)
+        if 0x30A1 <= o <= 0x30F6:          # ァ..ヶ → ぁ..ゖ
+            ch = chr(o - 0x60)
+        elif o in (0x30FD, 0x30FE):        # ヽヾ → ゝゞ
+            ch = chr(o - 0x60)
+        elif ch.isspace():
+            ch = "　"
+        out.append(ch)
+    s = re.sub("　+", "　", "".join(out)).strip("　")
+    return s if _HIRAGANA_ONLY_RE.fullmatch(s) else ""
 
 # 409（KintoneConflict）後の再取得回数（票: 再取得 1 回）
 CAS_REFETCH = 1
@@ -134,10 +169,22 @@ async def resolve_record_id(user_id: str, memory_id) -> tuple[str, str]:
 
 def split_fields(fields: dict) -> tuple[dict, int]:
     """JHH-01: (許可集合内で非空の候補 {欄コード: 値}, 対象外キーの件数)。
-    対象外キーの名前・値はここで捨てる（以後どこにも渡らない）。"""
-    candidate = {k: str(v).strip() for k, v in (fields or {}).items()
+    対象外キーの名前・値はここで捨てる（以後どこにも渡らない）。
+    JIKOU-FURIGANA-1: キーは UPDATE_KEY_ALIASES で欄コードへ読み替えてから判定。
+    furigana は normalize_furigana を通し、ひらがなに写せない値は候補から外す
+    （件数ログのみ・対象外キーには数えない）。"""
+    aliased = {UPDATE_KEY_ALIASES.get(k, k): v for k, v in (fields or {}).items()}
+    candidate = {k: str(v).strip() for k, v in aliased.items()
                  if k in UPDATE_FIELDS and str(v or "").strip()}
-    dropped_count = sum(1 for k in (fields or {}) if k not in UPDATE_FIELDS)
+    dropped_count = sum(1 for k in aliased if k not in UPDATE_FIELDS)
+    if "furigana" in candidate:
+        kana = normalize_furigana(candidate["furigana"])
+        if kana:
+            candidate["furigana"] = kana
+        else:
+            del candidate["furigana"]
+            logger.info("[HEARING_UPDATE] furigana not writable count=%s",
+                        emit(1, "count", "log", "operator"))
     return candidate, dropped_count
 
 

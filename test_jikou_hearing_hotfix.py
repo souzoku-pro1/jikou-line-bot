@@ -197,8 +197,10 @@ class TestResolve(_ModuleBase):
 
     def test_constants_pinned(self):
         self.assertEqual(hu.CAS_REFETCH, 1)
+        # JIKOU-FURIGANA-1（大野裁定 2026-10-08）: furigana 1 欄のみ追加（5→6 欄）
         self.assertEqual(hu.UPDATE_FIELDS,
-                         frozenset({"顧客名", "住所", "生年月日", "電話番号", "メールアドレス"}))
+                         frozenset({"顧客名", "furigana", "住所", "生年月日", "電話番号",
+                                    "メールアドレス"}))
 
 
 # ── 2. 書込（空欄のみ・CAS・409 再取得 1 回） ────────────────────────────────────
@@ -595,9 +597,12 @@ class TestFix1ForeignKeysAndNotify(_ModuleBase):
         self.addCleanup(root.setLevel, self._old_level)
 
     def test_constants_pinned(self):
+        # JIKOU-FURIGANA-1（大野裁定 2026-10-08）: "furigana": "ふりがな" を 顧客名 の
+        # 直後に追加（通知の並び順）。他 5 欄の表示名は不変
         self.assertEqual(hu.UPDATE_FIELD_LABELS,
-                         {"顧客名": "氏名", "住所": "住所", "生年月日": "生年月日",
-                          "電話番号": "電話番号", "メールアドレス": "メールアドレス"})
+                         {"顧客名": "氏名", "furigana": "ふりがな", "住所": "住所",
+                          "生年月日": "生年月日", "電話番号": "電話番号",
+                          "メールアドレス": "メールアドレス"})
         self.assertEqual(hu.UPDATE_FIELDS, frozenset(hu.UPDATE_FIELD_LABELS))
         self.assertEqual(hu.NOTIFY_RETRY_MAX, 2)
         self.assertEqual(hu.NOTIFY_FAILED_REASON, "hearing_notify_failed")
