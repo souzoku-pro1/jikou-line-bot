@@ -51,7 +51,10 @@ FREE_150 = "ご回答ありがとうございます。" + "あ" * 136   # 150 �
 NL = "\n"
 
 # 凍結集合の sha256 pin（T7・本票は本文に触れない）
-PIN_JIKOU = "ebd2dea63cb3e81b4f4e95235d49c78ac2933ea6f932ffcd19bff632fc78ab2e"
+# JIKOU-FURIGANA-1（大野裁定 2026-10-08）: 時効の定型ブロック 2 件目の「①お名前」が
+# 「①お名前とふりがな」になったため PIN_JIKOU のみ新値（test_autoreply_style1 の
+# hearing_template_blocks と同一の値）。旧値 ebd2dea6…8ab2e。HOUKI は不変
+PIN_JIKOU = "24103a7b21a889319c8b9eefb9f15bbf35f1c9b065ef459903b27ff6c990159e"
 PIN_HOUKI = "e218c0e5c2ab6caeb55ddcdbb88e6e8d5e14cf30374d1e3094e81911008ffc6f"
 
 
