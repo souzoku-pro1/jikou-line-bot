@@ -67,6 +67,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from hub import image_store
+from hub import jikou_case_create
 from hub import kintone as hub_kintone
 from hub import notify
 from hub import shindan_link
@@ -1056,14 +1057,26 @@ async def _handle_submit_linked(pattern: str, fields_base: dict, link: dict):
             outcome, record_id = await _update_existing_linked(record, fields_base)
         elif method == "none":
             # E-2: 現状のフォーム保存と同じレコード + LINEユーザーID（受付番号は発行しない）
+            # HRI-07: 作成は返答取込・ヒアリング・受付番号紐付けと同じ単一の入口を通す
+            # （共通の排他区間の内側で再検索→無ければ作成→作成失敗〔App 21 の
+            # 一意制約の発火 等〕は再検索して既存を採用）。採用時は E-1 と同じ
+            # 「空欄のみ・CAS」の更新へ振り替える。複数件は書かない（ambiguous と同じ）
             try:
-                record_id = await hub_kintone.create_record(
-                    APP_JIKOU_CASE, {**fields_base, "LINEユーザーID": line_user_id})
-                outcome = "created"
+                record_id, how, count = await jikou_case_create.create_or_adopt(
+                    line_user_id, lambda: hub_kintone.create_record(
+                        APP_JIKOU_CASE, {**fields_base, "LINEユーザーID": line_user_id}))
+                if how == jikou_case_create.CREATED:
+                    outcome = "created"
+                elif count >= 2:
+                    outcome, record_id = "failed", ""
+                else:
+                    outcome, record_id = await _update_existing_linked(
+                        await hub_kintone.get_record(APP_JIKOU_CASE, record_id),
+                        fields_base)
             except hub_kintone.KintoneError as e:
                 logger.warning("[SHINDAN] linked create failed code=%s",
                                emit(e.code, "vendor_raw", "log", "operator"))
-                outcome = "failed"
+                outcome, record_id = "failed", ""
         if outcome in ("updated", "noop", "created"):
             used_marked = bool(await shindan_link.mark_used(token, claimed_at))
     except Exception:

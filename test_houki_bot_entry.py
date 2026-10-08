@@ -322,8 +322,30 @@ class TestDenyAllV1(unittest.TestCase):
             resp = client.post(URL, content=body,
                                headers={"X-Line-Signature": _sign(body)})
         self.assertEqual(resp.status_code, 200)
-        hearing.assert_awaited_once_with("rt1", uid, "相談です")
+        # HUMAN-REPLY-INTAKE-1: 第 4 引数=返答取込の冪等キー（webhookEventId →
+        # message id の順・画像経路と同じ導出。本 body はどちらも無い=空）
+        hearing.assert_awaited_once_with("rt1", uid, "相談です", "")
         alert.assert_not_awaited()
+
+    def test_text_message_passes_webhook_event_id(self):
+        uid = "U_houki_customer_1"
+        hearing = AsyncMock()
+        event = json.loads(_event_body(user_id=uid, text="相談です"))["events"][0]
+        event["webhookEventId"] = "01HOUKIEVENT0001"
+        event["message"]["id"] = "m-1"
+        body = json.dumps({"events": [event]}).encode()
+        with patch("houki_bot.router.handle_houki_hearing", new=hearing),              patch("hub.notify.notify_admin_line", new=AsyncMock(return_value=True)):
+            resp = client.post(URL, content=body,
+                               headers={"X-Line-Signature": _sign(body)})
+        self.assertEqual(resp.status_code, 200)
+        hearing.assert_awaited_once_with("rt1", uid, "相談です", "01HOUKIEVENT0001")
+        # webhookEventId 無し → message id
+        hearing.reset_mock()
+        del event["webhookEventId"]
+        body = json.dumps({"events": [event]}).encode()
+        with patch("houki_bot.router.handle_houki_hearing", new=hearing),              patch("hub.notify.notify_admin_line", new=AsyncMock(return_value=True)):
+            client.post(URL, content=body, headers={"X-Line-Signature": _sign(body)})
+        hearing.assert_awaited_once_with("rt1", uid, "相談です", "m-1")
 
     def test_image_message_notifies(self):
         uid = "U_houki_customer_2"

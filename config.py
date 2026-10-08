@@ -111,8 +111,9 @@ EXPECTED_KINTONE_SCHEMA = {
             # 受付番号は kintone 側「値の重複を禁止する」ON が前提=CU 実測済み。
             # 受信書類写真 FILE は FORM-3 で書くようになった時点で追加する）
             "受付番号": {"type": "SINGLE_LINE_TEXT"},
+            # HUMAN-REPLY-INTAKE-1: 返答取込の最小レコード作成が "LINE" を書く
             "受付チャネル": {"type": "DROP_DOWN",
-                             "required_options": ["フォーム"]},
+                             "required_options": ["フォーム", "LINE"]},
             "診断パターン": {"type": "DROP_DOWN",
                              "required_options": ["A", "B", "C", "D"]},
             # 必須 RADIO（既定値「あり」を書かない=明示指定で書く 4 欄）

@@ -382,12 +382,18 @@ class TestGatesAndMarkers(_Base):
         self.assertEqual(ia.REPLY_MAX_CHARS, 600)
 
     def test_7_human_pause_stoplist_not_sent_no_marker(self):
-        # 人対応
-        self.store.seed_case({"LINEユーザーID": UID, "response_mode": "人対応"}, ["k1"])
-        self.assertEqual(self.go(), "blocked")
-        # pause
+        # 人対応: HRI-09（裁定 G-2 の時効への適用）で期待値を更新——送らずに転記と解析済みの
+        # 印まで行う（held）。解除後の次の束で再読解→後出し送信されない。送信行は書かない
+        rid = self.store.seed_case({"LINEユーザーID": UID, "response_mode": "人対応"}, ["k1"])
+        self.assertEqual(self.go(), "held")
+        self.push.assert_not_awaited()
+        self.assertEqual(self.store.analysis_rows(), [])
+        self.assertEqual(self.store.analyzed_keys(), ["k1"])
+        self.assertEqual(self.store.field(rid, "問い合わせ業者名"), "アコム")
+        # pause（人対応の束の記録は消して独立に検査）
         self.store.cases.clear()
-        self.seed()
+        self.store.chatlog.clear()
+        rid2 = self.seed()
         with patch.dict(os.environ, {"AUTOREPLY_PAUSED": "1"}):
             ia._claims.clear()
             self.assertEqual(self.go(), "blocked")
@@ -398,7 +404,7 @@ class TestGatesAndMarkers(_Base):
         self.push.assert_not_awaited()
         self.assertEqual(self.store.analysis_rows(), [])
         self.assertEqual(self.store.analyzed_keys(), [])
-        self.assertEqual(self.store.field("2", "問い合わせ業者名"), "")
+        self.assertEqual(self.store.field(rid2, "問い合わせ業者名"), "")
 
     def test_8_send_failure_no_marker_notify_and_success_marker(self):
         self.seed(keys=["k1", "k2"])
@@ -847,16 +853,19 @@ class TestFix2StrictParseAndRecheck(_Base):
                 [{"name": "アコム", "role": "原債権者", "confidence": "high"}]))
         self.ai.side_effect = ai
 
-    def test_i2_02_human_switch_during_ai_blocks_send(self):
+    def test_i2_02_human_switch_during_ai_holds_and_stores(self):
+        # HRI-09（裁定 G-2）で期待値を更新: AI 処理中に人対応へ切り替わった束は送らず、
+        # 転記と解析済みの印まで行う（従来は blocked で何も書かず、解除後の次の束で
+        # 再読解→後出し送信され得た）。再取得での判定（I2-02）は不変
         rid = self.seed()
         self._ai_with_side_effect(
             lambda: self.store.cases[rid].update(
                 {"response_mode": {"value": "人対応"}}))
-        self.assertEqual(self.go(), "blocked")
+        self.assertEqual(self.go(), "held")
         self.push.assert_not_awaited()
         self.assertEqual(self.store.analysis_rows(), [])
-        self.assertEqual(self.store.analyzed_keys(), [])
-        self.assertEqual(self.store.field(rid, "問い合わせ業者名"), "")
+        self.assertEqual(self.store.analyzed_keys(), ["k1"])
+        self.assertEqual(self.store.field(rid, "問い合わせ業者名"), "アコム")
         self.assertGreaterEqual(self.store.case_queries, 2)   # 送信直前に再取得
 
     def test_i2_02_field_filled_during_ai_is_not_asked(self):

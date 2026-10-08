@@ -24,6 +24,21 @@ HP の時効診断フォーム（shindan_form.py・FORM-1）が発行した 6 �
 - 弁護士通知（紐付け成功）:「【フォーム紐付け】受付番号:xxxxxx → レコード番号:N」
   のみ（notify_business 流儀・PII なし・best-effort）
 - 固定文言 A/B は司令塔案（大野裁定で差し替え可・test_jikou_form2 が sha256 pin）
+
+HRI-07（App 21「LINEユーザーID」一意制約の前提整備）:
+- 紐付け（bind_record）が失敗したとき（一意制約の発火 等）は、本人のレコードを
+  再検索し、見つかれば例外にも「不該当」にもせず、その既存レコードを採用して継続する
+  （try_link の outcome="adopted"）。フォーム由来レコードは未紐付けのまま残し、
+  レコード番号 2 件だけを弁護士へ要確認通知する（統合・削除はしない=人の判断）。
+  フォーム回答の引き継ぎ注入は行わない。
+- 作成経路の単一の入口 hub.jikou_case_create.create_or_adopt は**通さない**（個別実装）。
+  理由: create_or_adopt は実行の前に必ず再検索して既存を採用するため、紐付けに使うと
+  R-JIKOU-FORM-2 fix2 の裁定（並行処理が本人の通常レコードを作っていても紐付けは
+  成立させ、統合先は CAS で本人性を確定した linked_id・分裂は要確認通知=
+  test_jikou_form2 が pin）を、一意制約が未設定の現状でも変えてしまう。本実装は
+  「失敗したときだけ再検索」=制約が未設定の間は収束コードが発火しないだけで、
+  成功系・409（cas_lost）の挙動は従来と同一。排他区間（hub.user_section）は作成経路と
+  共有する（順序を直列化するだけ・結果は変えない）。
 """
 
 import hashlib
@@ -35,9 +50,11 @@ import unicodedata
 from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
 
+from hub import jikou_case_create
 from hub import kintone as hub_kintone
 from hub import notify
 from hub.redact import emit
+from hub.user_section import user_section
 
 logger = logging.getLogger("form_link")
 
@@ -171,24 +188,51 @@ async def find_form_record(number: str, now: float) -> dict | None:
     return rec
 
 
-async def bind_record(user_id: str, record: dict) -> str | None:
-    """LINEユーザーID を $revision CAS で書込。成功=record_id・409/失敗=None。"""
+# bind_record の結果（固定語彙）
+BIND_LINKED = "linked"        # フォーム由来レコードへ紐付けた（record_id=そのレコード）
+BIND_ADOPTED = "adopted"      # 本人の既存レコードが別に在る=それを採用（紐付けていない）
+BIND_FAILED = "failed"        # 409（cas_lost）・その他の失敗（作用 0）
+
+
+async def bind_record(user_id: str, record: dict) -> tuple[str, str | None]:
+    """LINEユーザーID を $revision CAS で書込。戻り値 (結果, record_id)。
+
+    成功=BIND_LINKED・409=BIND_FAILED（cas_lost・作用 0）は従来どおり。
+    HRI-07: それ以外の失敗（App 21 の一意制約の発火・応答を失った書込 等）は本人の
+    レコードを再検索し、見つかったレコードが紐付け対象そのものなら BIND_LINKED
+    （書込は着いていた）、別レコードなら BIND_ADOPTED（既存を採用して継続）。
+    見つからなければ従来どおり BIND_FAILED。例外は外へ出さない。"""
     rid = _value(record, "$id")
     rev = _value(record, "$revision")
     if not rid or not rev:
-        return None
-    try:
-        await hub_kintone.update_record(
-            APP_JIKOU_CASE, rid, {USER_FIELD: user_id}, revision=rev)
-    except hub_kintone.KintoneConflict:
-        logger.info("[FORM_LINK] cas_lost record_id=%s",
+        return BIND_FAILED, None
+    async with user_section(jikou_case_create.CHANNEL, user_id):
+        try:
+            await hub_kintone.update_record(
+                APP_JIKOU_CASE, rid, {USER_FIELD: user_id}, revision=rev)
+            return BIND_LINKED, rid
+        except hub_kintone.KintoneConflict:
+            logger.info("[FORM_LINK] cas_lost record_id=%s",
+                        emit(rid, "record_id", "log", "operator"))
+            return BIND_FAILED, None
+        except hub_kintone.KintoneError as e:
+            logger.warning("[FORM_LINK] bind failed code=%s",
+                           emit(e.code, "vendor_raw", "log", "operator"))
+        try:
+            found, _count = await jikou_case_create.find_existing(user_id)
+        except Exception:
+            found = ""
+    if not found:
+        return BIND_FAILED, None
+    if found == rid:
+        logger.info("[FORM_LINK] bind converged (write had landed) record_id=%s",
                     emit(rid, "record_id", "log", "operator"))
-        return None
-    except hub_kintone.KintoneError as e:
-        logger.warning("[FORM_LINK] bind failed code=%s",
-                       emit(e.code, "vendor_raw", "log", "operator"))
-        return None
-    return rid
+        return BIND_LINKED, rid
+    logger.warning("[FORM_LINK] own record already exists (adopted) form_id=%s "
+                   "adopted_id=%s",
+                   emit(rid, "record_id", "log", "operator"),
+                   emit(found, "record_id", "log", "operator"))
+    return BIND_ADOPTED, found
 
 
 def _attorney_id() -> str:
@@ -212,7 +256,8 @@ async def try_link(user_id: str, number: str,
                    now: float | None = None) -> tuple[str, str | None]:
     """紐付け処理の単一入口。戻り値 (outcome, record_id):
     linked=紐付け成功／not_matched=不該当（固定文言 B）／silent=試行上限超過
-    （無言・超過の瞬間に弁護士通知 1 回）。"""
+    （無言・超過の瞬間に弁護士通知 1 回）／adopted=本人の既存レコードを採用
+    （HRI-07: 紐付けていない・record_id=採用したレコード・弁護士へ要確認通知）。"""
     now = time.time() if now is None else now
     state = record_attempt(user_id, now)
     if state != "allow":
@@ -231,8 +276,17 @@ async def try_link(user_id: str, number: str,
         rec = None
     if rec is None:
         return "not_matched", None
-    rid = await bind_record(user_id, rec)
-    if rid is None:
+    bind_outcome, rid = await bind_record(user_id, rec)
+    if bind_outcome == BIND_ADOPTED:
+        # 本人の案件レコードが別に在る（並行する作成・一意制約の発火）。不該当には
+        # せず既存を採用して継続。統合・削除はしない=レコード番号 2 件だけを通知
+        await _notify(
+            "【フォーム紐付け・要確認】受付番号:"
+            f"{number} のフォームレコード（レコード番号:{_value(rec, '$id')}）は、同じ "
+            f"LINE ユーザーの案件レコード（レコード番号:{rid}）が既にあるため紐付けて"
+            "いません。App 21 で 2 件を確認してください。")
+        return "adopted", rid
+    if bind_outcome != BIND_LINKED or rid is None:
         return "not_matched", None
     logger.info("[FORM_LINK] linked record_id=%s",
                 emit(rid, "record_id", "log", "operator"))

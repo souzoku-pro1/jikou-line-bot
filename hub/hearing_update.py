@@ -132,20 +132,25 @@ async def resolve_record_id(user_id: str, memory_id) -> tuple[str, str]:
     return rid, METHOD_SEARCH
 
 
-def split_fields(fields: dict) -> tuple[dict, int]:
+def split_fields(fields: dict,
+                 allowed: frozenset = UPDATE_FIELDS) -> tuple[dict, int]:
     """JHH-01: (許可集合内で非空の候補 {欄コード: 値}, 対象外キーの件数)。
-    対象外キーの名前・値はここで捨てる（以後どこにも渡らない）。"""
+    対象外キーの名前・値はここで捨てる（以後どこにも渡らない）。
+    allowed（HUMAN-REPLY-INTAKE-1）: 許可集合の差し替え。既定=UPDATE_FIELDS。"""
     candidate = {k: str(v).strip() for k, v in (fields or {}).items()
-                 if k in UPDATE_FIELDS and str(v or "").strip()}
-    dropped_count = sum(1 for k in (fields or {}) if k not in UPDATE_FIELDS)
+                 if k in allowed and str(v or "").strip()}
+    dropped_count = sum(1 for k in (fields or {}) if k not in allowed)
     return candidate, dropped_count
 
 
-async def apply_update(record_id: str, fields: dict) -> dict:
+async def apply_update(record_id: str, fields: dict,
+                       allowed: frozenset = UPDATE_FIELDS) -> dict:
     """許可集合内・非空の値を、最新レコードで空欄の欄にだけ $revision CAS で書く。
     戻り値: {"outcome", "written", "preexisting", "dropped_count"}
-    （欄コードは許可集合のもののみ・値なし・対象外キーは件数のみ）。"""
-    candidate, dropped_count = split_fields(fields)
+    （欄コードは許可集合のもののみ・値なし・対象外キーは件数のみ）。
+    allowed（HUMAN-REPLY-INTAKE-1）: 許可集合の差し替え。既定=UPDATE_FIELDS
+    （KINTONE_UPDATE 経路の挙動不変）。"""
+    candidate, dropped_count = split_fields(fields, allowed)
     if dropped_count:
         logger.info("[HEARING_UPDATE] foreign keys dropped count=%s",
                     emit(dropped_count, "count", "log", "operator"))

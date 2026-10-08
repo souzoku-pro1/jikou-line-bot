@@ -404,7 +404,10 @@ class TestHoukiParse(_Base):
 
 # ── 8〜9: 送信直前の再取得・通知のみ ─────────────────────────────────────────────
 class TestGates(_Base):
-    def test_8_human_switch_during_ai_blocks_but_notifies(self):
+    def test_8_human_switch_during_ai_holds_stores_and_notifies(self):
+        # HRI-06（裁定 G-2）で期待値を更新: AI 処理中に人対応へ切り替わった束は、送らずに
+        # 転記と解析済みマーカーまで行う（従来は blocked で何も書かず、解除後の次の束で
+        # 再解析→結果が後出しされ得た）。送信行は書かない・弁護士通知は従来どおり
         rid = self.seed()
 
         async def ai(*_a, **_k):
@@ -412,12 +415,12 @@ class TestGates(_Base):
             return _tool_response(_hrep([_hc("アコム")], court="訴状"),
                                   name="report_documents")
         self.ai.side_effect = ai
-        self.assertEqual(self.go(), "blocked")
+        self.assertEqual(self.go(), "held")
         self.push.assert_not_awaited()
-        self.assertEqual(self.store.analysis_rows(), [])
-        self.assertEqual(self.store.analyzed_keys(), [])
+        self.assertEqual(self.store.analysis_rows(), [])             # 送信行なし（送っていない）
+        self.assertEqual(len(self.store.analyzed_keys()), 1)         # 解除後に再解析しない
         self.assertEqual(self.notify_kinds(), ["houki_image_analysis_court"])
-        self.assertEqual(self.store.creditors(rid), [])              # 転記も送信後のみ
+        self.assertEqual(self.store.creditors(rid), ["アコム"])       # 人対応者が参照できる
         # 再取得失敗 → push 0・マーカー 0
         self.setUp()
         self.seed()

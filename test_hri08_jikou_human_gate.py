@@ -414,7 +414,7 @@ class TestSingleGateFunction(unittest.TestCase):
         self.assertEqual(cr_src.count("HUMAN_MODE_VALUE"), 2)   # 定義 1+関数内 1
         src = io.open(os.path.join(REPO, "main.py"), encoding="utf-8").read()
         self.assertNotIn('"response_mode"', src.replace("HUMAN_MODE", ""))   # 欄名の直参照なし
-        self.assertEqual(src.count("is_human_mode("), 4)     # テキスト・紐付け後・画像 2 箇所
+        self.assertEqual(src.count("is_human_mode("), 5)     # テキスト・紐付け後・採用後（HRI-07）・画像 2 箇所
         ia_src = io.open(os.path.join(REPO, "hub/image_analysis.py"), encoding="utf-8").read()
         blocked = ia_src[ia_src.index("def _blocked("):ia_src.index("async def _store_creditor_names")]
         self.assertIn("is_human_mode(", blocked)             # 読解結果の送信直前確認も同じ関数

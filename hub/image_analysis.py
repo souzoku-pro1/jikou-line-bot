@@ -367,6 +367,20 @@ async def _write_markers(user_id: str, event_id: str, text: str,
         logger.error("[IMAGE_ANALYSIS] marker save failed (may re-analyze)")
 
 
+async def _write_analyzed_markers(user_id: str, file_keys: list[str],
+                                  channel: str = CHANNEL) -> None:
+    """HRI-06: 送信を伴わない解析済みマーカー（人対応中の転記のみの束）。送信行は
+    書かない。失敗はログのみ（再解析されても人対応中・保留中は送信されない）。"""
+    try:
+        for key in file_keys:
+            await kintone.create_record(_APP_CHATLOG, {
+                "line_user_id": user_id, "role": "assistant",
+                "message": ANALYZED_MARKER_TEXT,
+                "category": analyzed_category(key, channel), "auto_sent": "no"})
+    except Exception:
+        logger.error("[IMAGE_ANALYSIS] marker save failed (may re-analyze)")
+
+
 # ── App 21 ────────────────────────────────────────────────────────────────────
 def _v(record: dict, code: str) -> str:
     return str(((record or {}).get(code) or {}).get("value") or "")
@@ -505,6 +519,8 @@ def _log_result(outcome: str) -> None:
         logger.error("[IMAGE_ANALYSIS] reply too long (not sent)")
     elif outcome == "blocked":
         logger.info("[IMAGE_ANALYSIS] blocked (paused/stoplist/human)")
+    elif outcome == "held":
+        logger.info("[IMAGE_ANALYSIS] held by human mode (stored, not sent)")
     elif outcome == "recheck_failed":
         logger.warning("[IMAGE_ANALYSIS] recheck_failed (no send, no marker)")
     elif outcome == "date_inconsistent":
@@ -548,13 +564,19 @@ class ChannelConfig:
     too_long_text: str              # {record_id} を含む固定文言
     send_failure_text: str
     store_failure_text: str
+    # HRI-06（裁定 G-2）: 人対応中は顧客へ送らず、読解結果の転記だけ行う（相続放棄のみ
+    # True。時効は既定 False=従来どおり blocked で終了=挙動不変）
+    store_when_human: bool = False
 
 
 # ── 本体 ─────────────────────────────────────────────────────────────────────
 async def analyze_and_reply(user_id: str, event_id: str,
-                            cfg: "ChannelConfig | None" = None) -> str:
+                            cfg: "ChannelConfig | None" = None,
+                            no_send: bool = False) -> str:
     """受領返信成功後に呼ばれる 2 通目。戻り値は分類（閉集合）。
-    例外は外へ出さない（受領返信の経路を道連れにしない）。cfg 省略=時効。"""
+    例外は外へ出さない（受領返信の経路を道連れにしない）。cfg 省略=時効。
+    no_send（HRI-06）: 人対応ゲートが受領返信を抑止した束から呼ぶ。読解と App への
+    転記は行うが、顧客へは送らない（cfg.store_when_human のチャネルのみ有効）。"""
     cfg = cfg or JIKOU
     key = f"{cfg.name}:{user_id}:{event_id}"
     if key in _claims:                       # 確認→取得（同期区間・await なし）
@@ -562,7 +584,7 @@ async def analyze_and_reply(user_id: str, event_id: str,
         return "claimed"
     _claims.add(key)
     try:
-        outcome = await _analyze_and_reply(user_id, event_id, cfg)
+        outcome = await _analyze_and_reply(user_id, event_id, cfg, no_send)
     except Exception:
         outcome = "failed"
     finally:
@@ -572,7 +594,7 @@ async def analyze_and_reply(user_id: str, event_id: str,
 
 
 async def _analyze_and_reply(user_id: str, event_id: str,
-                             cfg: "ChannelConfig") -> str:
+                             cfg: "ChannelConfig", no_send: bool = False) -> str:
     record = await _fetch_record(user_id, cfg.app)
     if record is None:
         return "no_record"
@@ -618,6 +640,20 @@ async def _analyze_and_reply(user_id: str, event_id: str,
     if latest is None:
         return "recheck_failed"
     record_id = _v(latest, "$id") or record_id
+    human = (_v(latest, "response_mode") or "自動") == "人対応"
+    if cfg.store_when_human and (no_send or human):
+        # HRI-06（裁定 G-2）: 人対応中（または人対応ゲートが受領返信を抑止した束）は
+        # 顧客へ送らない。読解結果は App へ転記して人対応者が参照できるようにし、
+        # 解析済みマーカーを書いて解除後に再解析→後出し送信されないようにする。
+        # 送信行（assistant）は書かない=送っていない
+        composed = cfg.compose_fn(report, latest)
+        await _write_analyzed_markers(user_id, targets, cfg.name)
+        if record_id:
+            stored = await cfg.store_fn(record_id, latest, composed)
+            if stored == "failed":
+                await _notify(cfg.store_failure_text.replace("{record_id}", record_id),
+                              f"{cfg.store_kind}:{record_id}")
+        return "held"
     if _blocked(latest, user_id):
         return "blocked"
     composed = cfg.compose_fn(report, latest)
@@ -698,6 +734,7 @@ JIKOU = ChannelConfig(
     notify_fn=_jikou_notify, notify_timing="after_send",
     send_failure_kind="image_analysis_send_failure",
     store_kind="image_analysis_store",
+    store_when_human=True,                 # HRI-09（裁定 G-2）: 人対応中は転記のみ（送らない）
     too_long_text=("【書類写真・要確認】お写真への自動返信が文字数上限を超えたため"
                    "送信していません（レコード番号: {record_id}）。App 21 と App 28 を"
                    "確認し、必要なら手動でご返信ください。"),
@@ -1067,6 +1104,7 @@ HOUKI = ChannelConfig(
     store_fn=_houki_store, notify_fn=_houki_notify, notify_timing="after_ai",
     send_failure_kind="houki_image_analysis_send_failure",
     store_kind="houki_image_analysis_store",
+    store_when_human=True,                 # HRI-06: 人対応中は転記のみ（送らない）
     too_long_text=("【相続放棄・書類写真・要確認】お写真への自動返信が文字数上限を"
                    "超えたため送信していません（レコード番号 {record_id}）。App 40 と"
                    " App 28 を確認し、必要なら手動でご返信ください。"),
