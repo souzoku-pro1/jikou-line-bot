@@ -17,6 +17,11 @@
   一覧と操作は本画面（/app/send_ops・サーバ描画・native form POST・PRG 303）に置き、
   承認画面からはリンクで辿る。
 - 登録は add_api_route 経由（webapp_q と同じ流儀）。kintone・外部送信は呼ばない。
+- HOUKI-JUKURYO-2-fix2 BH-07: channel=houki_jukuryo（相続放棄 熟慮期間の通知）の操作に限り、
+  業務キー（inbound_event_id）を接頭辞の閉集合（houki_jukuryo_14 / houki_jukuryo_7 /
+  houki_jukuryo_unset）で厳密に解析し「案件番号・期限・14日前/7日前」（未確定件数通知は
+  「対象日」）とチャネル名を表示する。一致しないものは空欄。他チャネルの表示は従来どおり
+  （業務キーの生の値は画面・参照 API のどちらにも出さない。URL にも載せない）。
 """
 
 import html
@@ -48,6 +53,35 @@ _PURPOSE_LABELS = {
 _ACTOR_LABELS = {"bot": "bot", "human": "大野", "approved_draft": "承認済み下書き"}
 _STATE_LABELS = {"unconfirmed": "送信確認待ち", "started": "滞留（着手のまま・結果未確認）"}
 
+# ── HOUKI-JUKURYO-2-fix2 BH-07: 熟慮期間通知の業務キー解析（閉集合・厳密一致のみ） ──
+JUKURYO_CHANNEL = "houki_jukuryo"
+_JUKURYO_KIND_LABELS = {"houki_jukuryo_14": "14日前", "houki_jukuryo_7": "7日前"}
+_JUKURYO_ALERT_RE = re.compile(r"^(houki_jukuryo_14|houki_jukuryo_7):(\d{1,12}):(\d{4}-\d{2}-\d{2})$")
+_JUKURYO_UNSET_RE = re.compile(r"^houki_jukuryo_unset:(\d{4}-\d{2}-\d{2})$")
+_JUKURYO_CHANNEL_LABEL = "相続放棄 熟慮期間（業務 LINE）"
+
+
+def jukuryo_label(row: dict) -> str:
+    """channel=houki_jukuryo の操作だけ、業務キーを閉集合で解析して表示文を返す。
+    一致しない・他チャネルは ""（生の値は返さない）。"""
+    if str(row.get("channel", "")) != JUKURYO_CHANNEL:
+        return ""
+    key = str(row.get("inbound_event_id", "") or "")
+    m = _JUKURYO_ALERT_RE.fullmatch(key)
+    if m:
+        return f"案件番号 {m.group(2)}・期限 {m.group(3)}・{_JUKURYO_KIND_LABELS[m.group(1)]}"
+    m = _JUKURYO_UNSET_RE.fullmatch(key)
+    if m:
+        return f"起算日未確定の件数通知・対象日 {m.group(1)}"
+    return ""
+
+
+def public_row(row: dict) -> dict:
+    """参照 API 用: 業務キーの生の値は出さず、解析済みの表示文（jukuryo）だけを付ける。"""
+    out = {k: v for k, v in row.items() if k != "inbound_event_id"}
+    out["jukuryo"] = jukuryo_label(row)
+    return out
+
 
 def _bad_request() -> Response:
     return Response(status_code=400)     # 固定応答（入力値を反射しない）
@@ -65,6 +99,7 @@ def _page(rows: list[dict], notice: str) -> str:
         ".item{background:#fff;border:1px solid #d8dde5;border-radius:14px;padding:.75rem 1rem;margin:.6rem 0}"
         ".meta{color:#8a8f98;font-size:.78rem;margin-top:.3rem}.badge{display:inline-block;"
         "border-radius:999px;padding:.12rem .6rem;font-size:.78rem;background:#fff3d6;color:#8a6d00;margin-right:.35rem}"
+        ".case{font-size:.95rem;margin-top:.35rem;color:#1a3d6d}"
         "form{display:flex;gap:.5rem;flex-wrap:wrap;align-items:center;margin-top:.5rem}"
         "button{font-size:.95rem;padding:.5rem 1rem;border-radius:10px;border:1px solid #c8cdd5;"
         "background:#fff;min-height:44px}select{min-height:44px;font-size:.95rem}"
@@ -82,10 +117,16 @@ def _page(rows: list[dict], notice: str) -> str:
     for r in rows:
         op_id = html.escape(str(r["op_id"]))
         parts.append('<div class="item">')
-        parts.append(f'<span class="badge">{html.escape(_STATE_LABELS.get(r.get("state", ""), r.get("state", "")))}</span>'
-                     f'<span class="badge">{html.escape(_PURPOSE_LABELS.get(r["purpose"], r["purpose"]))}</span>'
-                     f'<span class="badge">{html.escape(_ACTOR_LABELS.get(r["actor"], r["actor"]))}</span>'
-                     f'<span class="badge">{html.escape(str(r["business"]))}</span>')
+        badges = (f'<span class="badge">{html.escape(_STATE_LABELS.get(r.get("state", ""), r.get("state", "")))}</span>'
+                  f'<span class="badge">{html.escape(_PURPOSE_LABELS.get(r["purpose"], r["purpose"]))}</span>'
+                  f'<span class="badge">{html.escape(_ACTOR_LABELS.get(r["actor"], r["actor"]))}</span>'
+                  f'<span class="badge">{html.escape(str(r["business"]))}</span>')
+        label = jukuryo_label(r)
+        if str(r.get("channel", "")) == JUKURYO_CHANNEL:
+            badges += f'<span class="badge">{html.escape(_JUKURYO_CHANNEL_LABEL)}</span>'
+        parts.append(badges)
+        if label:
+            parts.append(f'<div class="case">{html.escape(label)}</div>')
         parts.append(f'<div class="meta">操作 ID: {op_id}｜会話参照: {html.escape(str(r["conversation_ref"]))}'
                      f'｜着手: {html.escape(str(r["started_at"]))}｜試行: {int(r["attempt_no"])}</div>')
         parts.append(f'<form method="post" action="{PAGE}/confirm">'
@@ -136,12 +177,12 @@ async def send_ops_confirm(request: Request):
 
 
 async def api_send_ops_unconfirmed(request: Request):
-    """参照 API（本文なし・件数と一覧）。"""
+    """参照 API（本文なし・件数と一覧。業務キーは解析済み表示文のみ）。"""
     try:
         rows = await send_ledger.list_unconfirmed(LIST_LIMIT)
     except Exception:
         return {"ok": False, "reason": "db", "count": 0, "items": []}
-    return {"ok": True, "count": len(rows), "items": rows}
+    return {"ok": True, "count": len(rows), "items": [public_row(r) for r in rows]}
 
 
 router.add_api_route(PAGE, _gate(send_ops_page), methods=["GET"])

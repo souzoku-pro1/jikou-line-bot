@@ -275,8 +275,6 @@ class _Base(unittest.TestCase):
 
         self.push = AsyncMock(return_value=True)          # _push_admin_http の代替（True=2xx）
         self.today = TODAY
-        hj._unset_notified_on = None
-        self.addCleanup(setattr, hj, "_unset_notified_on", None)
         for p in (patch.object(hub_kintone, "search_records", search_records),
                   patch.object(hub_kintone, "get_record", get_record),
                   patch.object(hub_kintone, "update_record", update_record),
@@ -682,8 +680,7 @@ class TestBH03UnsetCount(_Base):
     def test_restart_same_day_does_not_resend(self):
         self.seed(_rec(rid="1", start=""))
         self.run_job(8)
-        hj._unset_notified_on = None                       # 再起動相当（モジュール状態の初期化）
-        hub_notify._last_notify_at.clear()
+        hub_notify._last_notify_at.clear()                 # 再起動相当（プロセス内状態の初期化・台帳だけが残る）
         res = self.run_job(13)
         self.assertEqual(res["unset_result"], hj.SEND_DUPLICATE_SENT)
         self.assertEqual(len([t for t in self.sent_texts() if hj.UNSET_LABEL in t]), 1)
@@ -747,8 +744,10 @@ class TestBH04DeadlineChangeRearms(_Base):
         self.assertEqual(self.val("1", "通知済み閾値"), ["14日前"])
 
 
-# ── 台帳が使えないとき（DB 未設定・fail-open）は写しとプロセス内日付で抑止 ───────────
-class TestNoLedgerFallback(_Base):
+# ── fix2 BH-05: 台帳が使えない（DB 未設定・記録失敗）ときは送らない（fail-closed） ──────────
+# fix1 の「台帳なしでも写しで抑止して送る」は司令塔裁定（熟慮期間通知ジョブは台帳必須）により
+# 「台帳なしなら送らない・固定理由の件数ログのみ・期限欄の保存は行う」へ仕様変更（緩和ではない）
+class TestBH05LedgerUnavailableFailClosed(_Base):
     def setUp(self):
         super().setUp()
         # 親の env patch（DATABASE_URL あり）を外し、DATABASE_URL 無しの patch に差し替える
@@ -760,24 +759,167 @@ class TestNoLedgerFallback(_Base):
         os.environ.pop("DATABASE_URL", None)
         db.reset_for_tests()
 
-    def test_unmarked_sends_and_marks_marked_skips(self):
+    def test_no_database_url_sends_nothing_counts_only_and_still_writes_fields(self):
         self.seed(_rec(rid="1", start=_start_for_remaining(14)),
-                  _rec(rid="2", start=_start_for_remaining(14), notified=("14日前",)))
-        res = self.run_job()
-        self.assertEqual((res["sent"], res["duplicate"]), (1, 1))
-        self.assertEqual(len(self.alert_texts()), 1)
-        self.assertIn("No.1", self.alert_texts()[0])
-        self.assertEqual(self.val("1", "通知済み閾値"), ["14日前"])
-        self.run_job(13)
-        self.assertEqual(self.push.await_count, 1)
+                  _rec(rid="2", start=_start_for_remaining(14), notified=("14日前",)),
+                  _rec(rid="3", start=""))
+        with self.assertLogs("hub.houki_jukuryo", level=logging.WARNING) as cm:
+            res = self.run_job()
+        self.assertEqual(self.push.await_count, 0)
+        self.assertEqual((res["sent"], res["duplicate"], res["ledger_unavailable"]), (0, 0, 2))
+        self.assertEqual(res["unset_result"], hj.SEND_LEDGER_UNAVAILABLE)
+        self.assertEqual(self.val("1", "通知済み閾値"), [])                 # 刻印しない
+        self.assertEqual(self.val("1", "残日数"), "14")                     # 期限欄は書く
+        logs = "\n".join(cm.output)
+        self.assertEqual(logs.count("ledger_unavailable"), 3)              # 14 日前×2 + 未確定件数
+        self.assertNotIn(NAME, logs)
 
-    def test_unset_once_per_process_day(self):
-        self.seed(_rec(rid="1", start=""))
-        r1 = self.run_job(8)
-        r2 = self.run_job(13)
-        self.assertEqual(r1["unset_result"], hj.SEND_SENT_UNRECORDED)
-        self.assertEqual(r2["unset_result"], hj.SEND_SKIPPED_MARKED)
-        self.assertEqual(self.push.await_count, 1)
+    def test_ledger_record_failure_also_sends_nothing(self):
+        self.seed(_rec(rid="1", start=_start_for_remaining(14)))
+
+        async def broken_begin(*a, **k):
+            return None                                   # begin の fail-open（記録失敗）と同じ戻り
+        with patch.object(sl, "begin", broken_begin), \
+                self.assertLogs("hub.houki_jukuryo", level=logging.WARNING):
+            res = self.run_job()
+        self.assertEqual(self.push.await_count, 0)
+        self.assertEqual(res["ledger_unavailable"], 1)
+
+    def test_recovery_sends_once_without_duplicate(self):
+        self.seed(_rec(rid="1", start=_start_for_remaining(14)))
+        with self.assertLogs("hub.houki_jukuryo", level=logging.WARNING):
+            self.run_job(8)                               # 台帳なし → 送らない
+        # 復旧（台帳が使える状態へ）
+        self._env.stop()
+        self._env = patch.dict(os.environ, {"DATABASE_URL": f"sqlite+aiosqlite:///{self._dir}/l.db",
+                                            "DISPATCHBOT_CHANNEL_ACCESS_TOKEN": "biz-token",
+                                            "LINE_ADMIN_USER_ID": ADMIN})
+        self._env.start()
+        db.reset_for_tests()
+        res = self.run_job(13)
+        self.assertEqual((res["sent"], self.push.await_count), (1, 1))
+        self.run_job(18)
+        self.assertEqual(self.push.await_count, 1)        # 復旧後の再送は 1 回だけ
+
+
+# ── fix2 BH-06: finish(sent) が applied でなければ写しを作らない ─────────────────────
+class TestBH06FinishMustBeApplied(_Base):
+    def test_finish_db_failure_leaves_started_counts_unconfirmed_no_mark(self):
+        self.seed(_rec(rid="1", start=_start_for_remaining(14)))
+        real_finish = sl.finish
+
+        async def finish_db_down(op, outcome):
+            # finish 内の DB 障害を注入: 実装どおり "skipped" を返し、台帳は started のまま
+            if outcome == sl.STATE_SENT:
+                return "skipped"
+            return await real_finish(op, outcome)
+        with patch.object(sl, "finish", finish_db_down), \
+                self.assertLogs("hub.houki_jukuryo", level=logging.WARNING) as cm:
+            res = self.run_job()
+        self.assertEqual(self.push.await_count, 1)                           # 送信はした
+        self.assertEqual((res["sent"], res["unconfirmed"]), (0, 1))          # 集計は unconfirmed
+        self.assertEqual(self.val("1", "通知済み閾値"), [])                   # 刻印なし
+        self.assertEqual(self.ops()[0]["state"], "started")                   # 台帳は started
+        self.assertIn("finish not applied", "\n".join(cm.output))
+        res2 = self.run_job(13)                                               # 自動再送なし（未確定の重複）
+        self.assertEqual((res2["unconfirmed"], self.push.await_count), (1, 1))
+
+    def test_late_result_is_unconfirmed(self):
+        self.seed(_rec(rid="1", start=_start_for_remaining(14)))
+
+        async def late_finish(op, outcome):
+            return "late"
+        with patch.object(sl, "finish", late_finish), \
+                self.assertLogs("hub.houki_jukuryo", level=logging.WARNING):
+            res = self.run_job()
+        self.assertEqual((res["sent"], res["unconfirmed"]), (0, 1))
+        self.assertEqual(self.val("1", "通知済み閾値"), [])
+
+    def test_applied_is_sent_and_marked(self):
+        self.seed(_rec(rid="1", start=_start_for_remaining(14)))
+        res = self.run_job()
+        self.assertEqual((res["sent"], res["unconfirmed"]), (1, 0))
+        self.assertEqual(self.val("1", "通知済み閾値"), ["14日前"])
+
+
+# ── fix2 付随 5: JST 日付境界（23:59 → 0:00） ───────────────────────────────────────
+class TestJstDateBoundary(unittest.TestCase):
+    def _today_at_utc(self, iso_utc: str) -> date:
+        from datetime import datetime as _dt, timezone as _tz
+
+        class _FakeDatetime:
+            @staticmethod
+            def now(tz=None):
+                base = _dt.fromisoformat(iso_utc).replace(tzinfo=_tz.utc)
+                return base.astimezone(tz) if tz else base
+        with patch.object(hj, "datetime", _FakeDatetime):
+            return hj._today_jst()
+
+    def test_2359_jst_and_0000_jst_are_different_days(self):
+        self.assertEqual(self._today_at_utc("2026-09-08T14:59:59"), date(2026, 9, 8))   # 23:59:59 JST
+        self.assertEqual(self._today_at_utc("2026-09-08T15:00:00"), date(2026, 9, 9))   # 00:00:00 JST
+        # UTC の日付（9/8）に引きずられない: 未確定件数の業務キーも JST の日付で切り替わる
+        self.assertEqual(hj.ledger_key(hj.LEDGER_KIND_UNSET, self._today_at_utc("2026-09-08T15:00:00").isoformat()),
+                         "houki_jukuryo_unset:2026-09-09")
+
+
+# ── fix2 BH-07: /app/send_ops の表示（閉集合解析・生の業務キーは出さない） ───────────
+class TestBH07SendOpsView(_Base):
+    def test_list_unconfirmed_includes_inbound_event_id_and_channel(self):
+        self.seed(_rec(rid="12", start=_start_for_remaining(14)))
+        self.push.side_effect = RuntimeError("socket")
+        with self.assertLogs("hub.houki_jukuryo", level=logging.WARNING):
+            self.run_job()
+        items = _run(sl.list_unconfirmed())
+        self.assertEqual(len(items), 1)
+        self.assertEqual((items[0]["channel"], items[0]["inbound_event_id"]),
+                         ("houki_jukuryo", "houki_jukuryo_14:12:2026-09-22"))
+
+    def test_jukuryo_label_closed_set(self):
+        from hub import webapp_send_ops_view as sov
+        self.assertEqual(sov.jukuryo_label({"channel": "houki_jukuryo",
+                                            "inbound_event_id": "houki_jukuryo_14:12:2026-09-22"}),
+                         "案件番号 12・期限 2026-09-22・14日前")
+        self.assertEqual(sov.jukuryo_label({"channel": "houki_jukuryo",
+                                            "inbound_event_id": "houki_jukuryo_7:3:2026-09-15"}),
+                         "案件番号 3・期限 2026-09-15・7日前")
+        self.assertEqual(sov.jukuryo_label({"channel": "houki_jukuryo",
+                                            "inbound_event_id": "houki_jukuryo_unset:2026-09-08"}),
+                         "起算日未確定の件数通知・対象日 2026-09-08")
+        for bad in ("houki_jukuryo_30:1:2026-09-22", "houki_jukuryo_14:abc:2026-09-22",
+                    "houki_jukuryo_14:1:2026/09/22", "x", "", None):
+            self.assertEqual(sov.jukuryo_label({"channel": "houki_jukuryo", "inbound_event_id": bad}), "")
+        # 他チャネルは解析しない（時効側の webhookEventId は表示しない）
+        self.assertEqual(sov.jukuryo_label({"channel": "jikou", "inbound_event_id": "houki_jukuryo_14:1:2026-09-22"}), "")
+
+    def test_page_shows_case_deadline_threshold_without_raw_key(self):
+        from hub import webapp_send_ops_view as sov
+        self.seed(_rec(rid="12", start=_start_for_remaining(14)))
+        self.push.side_effect = RuntimeError("socket")
+        with self.assertLogs("hub.houki_jukuryo", level=logging.WARNING):
+            self.run_job()
+        rows = _run(sl.list_unconfirmed())
+        page = sov._page(rows, "")
+        self.assertIn("案件番号 12・期限 2026-09-22・14日前", page)
+        self.assertIn("相続放棄 熟慮期間（業務 LINE）", page)
+        self.assertNotIn("houki_jukuryo_14:12:2026-09-22", page)              # 生の業務キーは出さない
+        self.assertNotIn(ADMIN, page)
+        self.assertNotIn(NAME, page)
+        api_items = [sov.public_row(r) for r in rows]
+        self.assertNotIn("inbound_event_id", api_items[0])
+        self.assertEqual(api_items[0]["jukuryo"], "案件番号 12・期限 2026-09-22・14日前")
+
+    def test_other_channel_rows_render_as_before(self):
+        from hub import webapp_send_ops_view as sov
+        row = {"op_id": "op1", "business": "jikou", "channel": "jikou", "purpose": "reply", "actor": "bot",
+               "state": "unconfirmed", "stale": False, "started_at": "2026-09-08T00:00:00+00:00",
+               "attempt_no": 1, "conversation_ref": "c-1", "inbound_event_id": "wh-xyz"}
+        page = sov._page([row], "")
+        self.assertNotIn("wh-xyz", page)
+        self.assertNotIn("相続放棄 熟慮期間", page)
+        self.assertNotIn('class="case"', page)
+        self.assertEqual(sov.public_row(row)["jukuryo"], "")
+        self.assertNotIn("inbound_event_id", sov.public_row(row))
 
 
 class TestPushHttp(unittest.TestCase):
@@ -924,6 +1066,9 @@ class TestKindAndConstants(unittest.TestCase):
         self.assertFalse(hasattr(hj, "INTERNAL_MARGIN_DAYS"))             # 2 本立ては廃止
         self.assertFalse(hasattr(hj, "START_DATE_FIELDS"))                 # 申告代用は廃止
         self.assertFalse(hasattr(hj, "NOTIFY_KIND"))                       # notify throttle 不使用
+        self.assertFalse(hasattr(hj, "SEND_SENT_UNRECORDED"))              # fix2 BH-05: fail-open 経路の廃止
+        self.assertFalse(hasattr(hj, "_unset_notified_on"))
+        self.assertEqual(hj.SEND_LEDGER_UNAVAILABLE, "ledger_unavailable")
 
     def test_send_ledger_closed_sets_untouched(self):
         self.assertEqual(sl.PURPOSES, ("reply", "first_reply", "urgent", "image_receipt",

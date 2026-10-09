@@ -28,9 +28,13 @@ fix1（Codex R-HOUKI-JUKURYO-2 BH-01〜04・司令塔裁定「通知を送った
    「{種別}:{レコード ID}:{期限日}」（未確定件数は「{種別}:{JST 日付}」）として置き、
    同キーの sent／unconfirmed があれば送らない（台帳の重複検出をそのまま使う）。
    HTTP は guarded_http（heartbeat・timeout）経由。結果不明は unconfirmed（自動再送なし・
-   /app/send_ops に出る）。kintone の 通知済み閾値 は **写し**（送信成功後に刻印・刻印失敗は
-   次回実行で刻印だけ再試行＝再通知しない）。台帳が使えない（DB 未設定・記録失敗の fail-open）
-   ときだけ、写し（刻印）と プロセス内の日付を代替の抑止に使う。
+   /app/send_ops に出る）。kintone の 通知済み閾値 は **写し**（finish(sent) が applied の後に
+   刻印・刻印失敗は次回実行で刻印だけ再試行＝再通知しない）。
+ - fix2（Codex BH-05〜07・司令塔裁定「熟慮期間通知ジョブは台帳必須」）: 台帳が使えない
+   （begin が None）ときは **送らない**（fail-closed・固定理由 ledger_unavailable の件数ログ・
+   次回再試行）。finish(sent) の戻り値が applied のときだけ sent と刻印へ進み、late／skipped は
+   unconfirmed 扱い（刻印しない・自動再送しない）。/app/send_ops は channel=houki_jukuryo の操作に
+   限って業務キーを閉集合で解析し「案件番号・期限・14日前/7日前」（未確定件数は「対象日」）を表示。
  - purpose: 本番 DB の CHECK 制約 ck_send_operation_purpose（migration e5f8）が閉集合を固定して
    おり、票の規律「migration なし」の下では新 purpose を挿入できない。purpose は other とし、
    種別は inbound_event_id の接頭辞（houki_jukuryo_14 / houki_jukuryo_7 / houki_jukuryo_unset）と
@@ -98,13 +102,12 @@ LEDGER_KIND_UNSET = "houki_jukuryo_unset"
 LEDGER_KINDS = {14: LEDGER_KIND_14, 7: LEDGER_KIND_7}
 
 # 送信結果（固定語彙）
-SEND_SENT = "sent"                           # 台帳に記録して送った
-SEND_SENT_UNRECORDED = "sent_unrecorded"     # 台帳が使えず（fail-open）送った
+SEND_SENT = "sent"                           # 台帳に記録し、送信し、finish(sent) が applied
 SEND_DUPLICATE_SENT = "duplicate_sent"       # 台帳に sent がある（送らない・刻印の再試行のみ）
 SEND_DUPLICATE_UNCONFIRMED = "duplicate_unconfirmed"   # 台帳に未確定がある（送らない・人の確定待ち）
-SEND_SKIPPED_MARKED = "skipped_marked"       # 台帳が使えず、写し（刻印）があるので送らない
-SEND_UNCONFIRMED = "unconfirmed"             # push の結果不明（自動再送なし）
+SEND_UNCONFIRMED = "unconfirmed"             # push の結果不明、または finish が applied でない（自動再送なし）
 SEND_FAILED = "failed"                       # push 失敗・宛先なし（次回実行で再試行）
+SEND_LEDGER_UNAVAILABLE = "ledger_unavailable"   # fix2 BH-05: 台帳が使えない → 送らない（fail-closed・次回再試行）
 
 NOTICE_HEADER = "【相続放棄 熟慮期間】"
 NOTICE_FOOTER = "期限＝起算日_確定の3か月後の応当日の前日。レコード番号と残日数のみ・詳細はApp 40で確認してください。"
@@ -113,10 +116,6 @@ UNSET_NOTE = "（受任後・申述提出日なし・起算日_確定が空。�
 SEARCH_FIELDS = ["$id", "$revision", FIELD_STATUS, FIELD_SUBMITTED, FIELD_START,
                  FIELD_DEADLINE, FIELD_REMAINING, FIELD_NOTIFIED]
 SEARCH_LIMIT = 500                           # kintone records.json の上限（ページング）
-
-# 台帳が使えないときだけ使う代替抑止（起算日未確定の件数通知を送った日・プロセス内）
-_unset_notified_on: date | None = None
-
 
 def _today_jst() -> date:
     return datetime.now(_JST).date()
@@ -289,12 +288,15 @@ async def _push_admin_http(admin_id: str, text: str) -> bool:
     return bool(resp.is_success)
 
 
-async def send_notice(kind: str, business_key: str, text: str, *, already_marked: bool = False) -> str:
+async def send_notice(kind: str, business_key: str, text: str) -> str:
     """台帳を通した 1 通の送信。戻り値は固定語彙（SEND_*）。
     - 台帳に同キーの sent → SEND_DUPLICATE_SENT（送らない）
     - 台帳に同キーの未確定 → SEND_DUPLICATE_UNCONFIRMED（送らない・人の確定待ち）
-    - 台帳が使えない（begin が None）→ 写し（already_marked）があれば送らない、無ければ送る
-    - push の例外（timeout 含む）→ unconfirmed（自動再送なし）"""
+    - 台帳が使えない（begin が None＝DB 未設定・記録失敗）→ **送らない**（fix2 BH-05・fail-closed・
+      固定理由の件数ログのみ・次回実行で再試行）。時効側の fail-open（Q1a 限定仮置き）は変えない
+    - push の例外（timeout 含む）→ finish(unconfirmed)・SEND_UNCONFIRMED（自動再送なし）
+    - push 成功でも finish(sent) が applied でない（late／skipped）→ SEND_UNCONFIRMED（fix2 BH-06・
+      写しを作らない・集計は unconfirmed・自動再送なし）"""
     admin_id = get_admin_line_user_id()
     if not admin_id:
         logger.warning("houki_jukuryo notice skipped (no admin id)")
@@ -307,18 +309,24 @@ async def send_notice(kind: str, business_key: str, text: str, *, already_marked
             return SEND_DUPLICATE_SENT
         if op is send_ledger.DUPLICATE_UNCONFIRMED:
             return SEND_DUPLICATE_UNCONFIRMED
-        if op is None and already_marked:
-            return SEND_SKIPPED_MARKED
+        if op is None:
+            logger.warning("houki_jukuryo notice skipped (ledger_unavailable) count=%s",
+                           emit(1, "count", "log", "operator"))
+            return SEND_LEDGER_UNAVAILABLE
         try:
             ok = await send_ledger.guarded_http(op, _push_admin_http(admin_id, text))
         except Exception:
             await send_ledger.finish(op, send_ledger.STATE_UNCONFIRMED)
             logger.warning("houki_jukuryo push result unknown (unconfirmed)")
             return SEND_UNCONFIRMED
-        await send_ledger.finish(op, send_ledger.STATE_SENT if ok else send_ledger.STATE_FAILED)
         if not ok:
+            await send_ledger.finish(op, send_ledger.STATE_FAILED)
             return SEND_FAILED
-        return SEND_SENT if op is not None else SEND_SENT_UNRECORDED
+        applied = await send_ledger.finish(op, send_ledger.STATE_SENT)
+        if applied != "applied":
+            logger.warning("houki_jukuryo finish not applied (treated as unconfirmed)")
+            return SEND_UNCONFIRMED
+        return SEND_SENT
     finally:
         send_ledger.unbind(token)
 
@@ -387,16 +395,16 @@ async def commit_writes(record: dict, today: date, mark_days: list[int]) -> str:
 # ── ジョブ本体 ───────────────────────────────────────────────────────────────
 def _empty_result() -> dict:
     return {"targets": 0, "candidates": 0, "sent": 0, "duplicate": 0, "remark": 0,
-            "unconfirmed": 0, "failed": 0, "unset": 0, "unset_result": "", "written": 0,
-            "write_failed": 0, "aborted": 0}
+            "unconfirmed": 0, "failed": 0, "ledger_unavailable": 0, "unset": 0, "unset_result": "",
+            "written": 0, "write_failed": 0, "aborted": 0}
 
 
 async def jukuryo_daily_check(run_hour: int = RUN_HOURS_JST[0]) -> dict:
     """受任後×未提出の案件を算出し、(1) 14/7 日前の各閾値を台帳で 1 回性判定して送信、
     (2) 送信済み（今回 sent・台帳 sent で刻印未了）の刻印と 熟慮期間期限／残日数 の差分を
     1 レコード 1 回で保存、(3) 起算日未確定の件数を台帳で 1 日 1 回通知。
-    run_hour は 3 回のジョブで共通の処理（判定は欄と台帳で行うため時刻で分けない）。"""
-    global _unset_notified_on
+    run_hour は 3 回のジョブで共通の処理（判定は欄と台帳で行うため時刻で分けない）。
+    台帳が使えないときは通知を送らない（fail-closed・期限欄の保存は行う）。"""
     res = _empty_result()
     today = _today_jst()
     try:
@@ -422,8 +430,8 @@ async def jukuryo_daily_check(run_hour: int = RUN_HOURS_JST[0]) -> dict:
             res["candidates"] += 1
             marked = NOTIFIED_VALUES[day] in notified
             r = await send_notice(LEDGER_KINDS[day], alert_business_key(rid, comp),
-                                  alert_text(today, rid, day, comp), already_marked=marked)
-            if r in (SEND_SENT, SEND_SENT_UNRECORDED):
+                                  alert_text(today, rid, day, comp))
+            if r == SEND_SENT:
                 res["sent"] += 1
                 marks.setdefault(rid, []).append(day)
             elif r == SEND_DUPLICATE_SENT:
@@ -433,8 +441,8 @@ async def jukuryo_daily_check(run_hour: int = RUN_HOURS_JST[0]) -> dict:
                     marks.setdefault(rid, []).append(day)
             elif r in (SEND_DUPLICATE_UNCONFIRMED, SEND_UNCONFIRMED):
                 res["unconfirmed"] += 1
-            elif r == SEND_SKIPPED_MARKED:
-                res["duplicate"] += 1
+            elif r == SEND_LEDGER_UNAVAILABLE:
+                res["ledger_unavailable"] += 1
             else:
                 res["failed"] += 1
     res["unset"] = unset
@@ -454,16 +462,14 @@ async def jukuryo_daily_check(run_hour: int = RUN_HOURS_JST[0]) -> dict:
             res["write_failed"] += 1
 
     if unset > 0:
-        r = await send_notice(LEDGER_KIND_UNSET, today.isoformat(), unset_text(today, unset),
-                              already_marked=(_unset_notified_on == today))
+        r = await send_notice(LEDGER_KIND_UNSET, today.isoformat(), unset_text(today, unset))
         res["unset_result"] = r
-        if r == SEND_SENT_UNRECORDED:
-            _unset_notified_on = today                 # 台帳が使えないときだけの代替抑止
-        elif r == SEND_FAILED:
+        if r == SEND_FAILED:
             logger.warning("houki_jukuryo unset-count notice not sent")
 
     logger.info("houki_jukuryo run: targets=%s candidates=%s sent=%s duplicate=%s remark=%s "
-                "unconfirmed=%s failed=%s unset=%s written=%s write_failed=%s aborted=%s",
+                "unconfirmed=%s failed=%s ledger_unavailable=%s unset=%s written=%s "
+                "write_failed=%s aborted=%s",
                 emit(res["targets"], "count", "log", "operator"),
                 emit(res["candidates"], "count", "log", "operator"),
                 emit(res["sent"], "count", "log", "operator"),
@@ -471,6 +477,7 @@ async def jukuryo_daily_check(run_hour: int = RUN_HOURS_JST[0]) -> dict:
                 emit(res["remark"], "count", "log", "operator"),
                 emit(res["unconfirmed"], "count", "log", "operator"),
                 emit(res["failed"], "count", "log", "operator"),
+                emit(res["ledger_unavailable"], "count", "log", "operator"),
                 emit(res["unset"], "count", "log", "operator"),
                 emit(res["written"], "count", "log", "operator"),
                 emit(res["write_failed"], "count", "log", "operator"),
