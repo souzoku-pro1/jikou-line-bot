@@ -301,6 +301,13 @@ async def send_notice(kind: str, business_key: str, text: str) -> str:
     if not admin_id:
         logger.warning("houki_jukuryo notice skipped (no admin id)")
         return SEND_FAILED
+    # fix3 BH-10: 宛先 allowlist・業務トークンの不備は台帳行を作る前に弾く（failed 試行を積まない）
+    if admin_id not in business_channel_allowlist():
+        logger.warning("houki_jukuryo notice skipped (recipient not allowlisted)")
+        return SEND_FAILED
+    if not os.environ.get(business_token_env(), ""):
+        logger.warning("houki_jukuryo notice skipped (no business token)")
+        return SEND_FAILED
     token = send_ledger.bind_inbound(ledger_key(kind, business_key))
     try:
         with send_ledger.purpose(LEDGER_PURPOSE):

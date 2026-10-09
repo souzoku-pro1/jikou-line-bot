@@ -17,6 +17,7 @@ CRON-1 のテスト（申告 3 日付の代用順・法定/社内の 2 本立て
 """
 
 import asyncio
+import contextlib
 import logging
 import os
 import re
@@ -75,6 +76,11 @@ def _start_for_remaining(remaining: int, today: date = TODAY) -> str:
 
 def _run(coro):
     return asyncio.run(coro)
+
+
+def _run_in_loop_now():
+    """実行中のループ内から呼ぶ現在時刻（send_ledger と同じ UTC aware）。"""
+    return sl._now()
 
 
 # ── 期限計算（裁定 (a)） ─────────────────────────────────────────────────────
@@ -804,36 +810,64 @@ class TestBH05LedgerUnavailableFailClosed(_Base):
 
 # ── fix2 BH-06: finish(sent) が applied でなければ写しを作らない ─────────────────────
 class TestBH06FinishMustBeApplied(_Base):
+    """fix3 BH-08: 実物の send_ledger.finish を通す（finish の丸ごと差し替えは使わない）。"""
+
     def test_finish_db_failure_leaves_started_counts_unconfirmed_no_mark(self):
         self.seed(_rec(rid="1", start=_start_for_remaining(14)))
-        real_finish = sl.finish
+        real_scope = sl.session_scope
+        state = {"fail": False}
 
-        async def finish_db_down(op, outcome):
-            # finish 内の DB 障害を注入: 実装どおり "skipped" を返し、台帳は started のまま
-            if outcome == sl.STATE_SENT:
-                return "skipped"
-            return await real_finish(op, outcome)
-        with patch.object(sl, "finish", finish_db_down), \
-                self.assertLogs("hub.houki_jukuryo", level=logging.WARNING) as cm:
+        @contextlib.asynccontextmanager
+        async def flaky_scope():
+            if state["fail"]:
+                raise RuntimeError("db down")               # finish 内の session_scope で DB 障害
+            async with real_scope() as s:
+                yield s
+
+        async def push_then_db_down(admin, text):
+            state["fail"] = True                            # push 成功の直後から台帳 DB が落ちる
+            return True
+        with patch.object(sl, "session_scope", flaky_scope), \
+                patch.object(hj, "_push_admin_http", push_then_db_down), \
+                self.assertLogs("hub.houki_jukuryo", level=logging.WARNING) as cm_hj, \
+                self.assertLogs("hub.send_ledger", level=logging.WARNING) as cm_sl:
             res = self.run_job()
-        self.assertEqual(self.push.await_count, 1)                           # 送信はした
+        state["fail"] = False
         self.assertEqual((res["sent"], res["unconfirmed"]), (0, 1))          # 集計は unconfirmed
         self.assertEqual(self.val("1", "通知済み閾値"), [])                   # 刻印なし
-        self.assertEqual(self.ops()[0]["state"], "started")                   # 台帳は started
-        self.assertIn("finish not applied", "\n".join(cm.output))
+        ops = self.ops()
+        self.assertEqual(len(ops), 1)
+        self.assertEqual(ops[0]["state"], "started")                          # 実物 finish は行を進めない
+        hist = [h["reason"] for h in _run(sl.operation_history(ops[0]["op_id"]))]
+        self.assertEqual(hist, ["created", "started"])                        # sent 行なし
+        self.assertIn("finish not applied", "\n".join(cm_hj.output))
+        self.assertIn("finish failed (outcome not recorded)", "\n".join(cm_sl.output))
         res2 = self.run_job(13)                                               # 自動再送なし（未確定の重複）
-        self.assertEqual((res2["unconfirmed"], self.push.await_count), (1, 1))
+        self.assertEqual(res2["unconfirmed"], 1)
+        self.assertEqual(self.ops()[0]["state"], "started")
+        self.assertEqual(self.val("1", "通知済み閾値"), [])
 
     def test_late_result_is_unconfirmed(self):
         self.seed(_rec(rid="1", start=_start_for_remaining(14)))
 
-        async def late_finish(op, outcome):
-            return "late"
-        with patch.object(sl, "finish", late_finish), \
-                self.assertLogs("hub.houki_jukuryo", level=logging.WARNING):
+        async def push_then_recovered(admin, text):
+            # push 中に回収ジョブが滞留扱いで unconfirmed へ移した体（実物 recover_stale_started を
+            # 未来時刻で走らせる）→ 実物 finish は所有者不一致で "late" を返す
+            n = _run_in_loop_now()
+            await sl.recover_stale_started(now=n + sl.datetime.timedelta(days=1))
+            return True
+        with patch.object(hj, "_push_admin_http", push_then_recovered), \
+                self.assertLogs("hub.houki_jukuryo", level=logging.WARNING) as cm:
             res = self.run_job()
         self.assertEqual((res["sent"], res["unconfirmed"]), (0, 1))
         self.assertEqual(self.val("1", "通知済み閾値"), [])
+        op = self.ops()[0]
+        self.assertEqual(op["state"], "unconfirmed")
+        hist = [h["reason"] for h in _run(sl.operation_history(op["op_id"]))]
+        self.assertEqual(hist, ["created", "started", "stale_started", "late_result:sent"])
+        self.assertIn("finish not applied", "\n".join(cm.output))
+        res2 = self.run_job(13)
+        self.assertEqual((res2["unconfirmed"], self.val("1", "通知済み閾値")), (1, []))
 
     def test_applied_is_sent_and_marked(self):
         self.seed(_rec(rid="1", start=_start_for_remaining(14)))
@@ -920,6 +954,47 @@ class TestBH07SendOpsView(_Base):
         self.assertNotIn('class="case"', page)
         self.assertEqual(sov.public_row(row)["jukuryo"], "")
         self.assertNotIn("inbound_event_id", sov.public_row(row))
+
+
+class TestBH10ConfigChecksBeforeLedger(_Base):
+    """fix3 BH-10: 宛先未許可・業務トークン未設定は begin の前で弾く（台帳に failed 試行を積まない）。"""
+
+    def _run_with_begin_spy(self):
+        calls = []
+        real_begin = sl.begin
+
+        async def spy(*a, **k):
+            calls.append(a)
+            return await real_begin(*a, **k)
+        with patch.object(sl, "begin", spy), \
+                self.assertLogs("hub.houki_jukuryo", level=logging.WARNING) as cm:
+            res = self.run_job()
+        return res, calls, "\n".join(cm.output)
+
+    def test_recipient_not_allowlisted_skips_before_begin(self):
+        self.seed(_rec(rid="1", start=_start_for_remaining(14)), _rec(rid="2", start=""))
+        with patch.object(hj, "business_channel_allowlist", lambda: frozenset()):
+            res, calls, logs = self._run_with_begin_spy()
+        self.assertEqual(calls, [])                                  # begin は呼ばれない
+        self.assertEqual(self.ops(), [])                             # failed 試行が積まれない
+        self.assertEqual(self.push.await_count, 0)
+        self.assertEqual((res["failed"], res["unset_result"]), (1, hj.SEND_FAILED))
+        self.assertIn("recipient not allowlisted", logs)
+        self.assertEqual(self.val("1", "残日数"), "14")              # 期限欄の保存は続く
+        self.assertEqual(self.val("1", "通知済み閾値"), [])
+
+    def test_missing_business_token_skips_before_begin(self):
+        self.seed(_rec(rid="1", start=_start_for_remaining(14)))
+        with patch.dict(os.environ, {"DISPATCHBOT_CHANNEL_ACCESS_TOKEN": ""}):
+            res, calls, logs = self._run_with_begin_spy()
+        self.assertEqual((calls, self.ops(), self.push.await_count), ([], [], 0))
+        self.assertEqual(res["failed"], 1)
+        self.assertIn("no business token", logs)
+
+    def test_configured_recipient_goes_through_ledger(self):
+        self.seed(_rec(rid="1", start=_start_for_remaining(14)))
+        res = self.run_job()
+        self.assertEqual((res["sent"], len(self.ops())), (1, 1))
 
 
 class TestPushHttp(unittest.TestCase):
@@ -1078,8 +1153,9 @@ class TestKindAndConstants(unittest.TestCase):
     def test_module_reads_no_new_env_and_no_extension(self):
         src = Path(hj.__file__).read_text(encoding="utf-8")
         body = src.split('"""', 2)[2]
-        self.assertEqual(body.count("os.environ"), 1)                       # 既存 env（業務トークン）のみ
-        self.assertIn('os.environ.get(business_token_env(), "")', body)
+        # 既存 env（業務トークン）だけを読む。fix3 BH-10 で begin 前の事前検査が増え 2 箇所（同じ env 名）
+        self.assertEqual(body.count("os.environ"), 2)
+        self.assertEqual(body.count('os.environ.get(business_token_env(), "")'), 2)
         self.assertNotIn("伸長後満了日", body)                              # 本文コードに伸長の分岐なし
         self.assertNotIn("notify_admin_line_result", body)
         self.assertNotIn("alembic", body)

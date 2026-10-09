@@ -4,7 +4,8 @@
 HOUKI-JUKURYO-2-fix1 付随 8／fix2 付随 6: 本番 App 40 を GET だけして、初回実行で何が起きるかを
 件数で示す（書込・送信なし）。Codex が全文審査できるようリポジトリ scripts/ に置く。
 
-出力（件数のみ・レコード番号・氏名・個別日付は出さない＝RV-10）:
+出力（件数のみ・レコード番号・氏名・日付の個別値は出さない＝RV-10。集計日も出さず
+「集計日は実行時 JST」の固定文言のみ・fix3 BH-09）:
   - fetched / targets（受任後 8 status × 申述提出日 空）
   - 起算日未確定（起算日_確定 空）
   - 残日数 <= 14 / <= 7 / 期限超過（< 0）
@@ -12,8 +13,11 @@ HOUKI-JUKURYO-2-fix1 付随 8／fix2 付随 6: 本番 App 40 を GET だけし�
   - 初回の最大 push 数 = ≤14 件数 + ≤7 件数 + 1（未確定件数通知。未確定 0 件なら +0）
 計算は hub/houki_jukuryo と同じ関数（jukuryo_deadline / is_target / compute）を使う。
 
-使い方（リポジトリ直下で env を注入して・司令塔の票で実行）:
+実行手順（司令塔の票で・リポジトリ直下で Railway の env を注入して実行。本番 kintone への GET のみ・
+書込・送信・DB アクセスなし）:
     cd C:/work/jikou-line-bot && railway run python scripts/houki_jukuryo_precount.py
+**出力は標準出力（stdout）**（fix3 BH-11: logging を stream=sys.stdout に固定。Railway CLI の
+更新案内は stderr に出るので混ざらない）。終了コード 0 = 正常。
 """
 
 import asyncio
@@ -35,7 +39,7 @@ if sys.platform == "win32":
 from hub import houki_jukuryo as hj  # noqa: E402
 from hub.redact import emit  # noqa: E402
 
-logging.basicConfig(level=logging.INFO, format="%(message)s")
+logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stdout)   # fix3 BH-11
 logger = logging.getLogger("scripts.houki_jukuryo_precount")
 _JST = timezone(timedelta(hours=9))
 
@@ -59,7 +63,7 @@ async def main() -> int:
     max_push = le14 + le7 + (1 if unset else 0)
     # sink 方針: 値は emit 契約経由（count は値域検証つき素通し）。ラッパー関数は AST が emit と
     # 認識しないため直接書く
-    logger.info("today(JST)=%s", emit(today.isoformat(), "record_id", "log", "operator"))
+    logger.info("集計日は実行時 JST（日付は出力しない）")                     # fix3 BH-09: 固定文言のみ
     logger.info("fetched=%s targets(受任後×未提出)=%s",
                 emit(len(records), "count", "log", "operator"),
                 emit(len(targets), "count", "log", "operator"))
