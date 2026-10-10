@@ -1,118 +1,131 @@
-"""相続放棄 熟慮期間 日次監視（hub/houki_jukuryo・HOUKI-JUKURYO-CRON-1 / fix1 / fix2）
+"""相続放棄 熟慮期間 監視（hub/houki_jukuryo・HOUKI-JUKURYO-2 / fix1）
 
-App 40（相続放棄案件）の受任案件について熟慮期間（3 か月）の期日を判定し、
-迫った案件を LINE で弁護士へ通知する。**判定のみ**——期日欄・ステータス・
-その他の欄は一切書かない。書くのは 熟慮期間通知履歴（MULTI_LINE_TEXT）だけ。
+App 40（相続放棄案件）の受任後案件について熟慮期間（3 か月）の期限を **1 か所で算出**し、
+App 40 の「熟慮期間期限」「残日数」に保存し、期限 14 日前・7 日前に業務 LINE へ 1 回ずつ
+通知する。HOUKI-JUKURYO-CRON-1（申告 3 日付の代用順・法定/社内の 2 本立て・履歴欄）は
+本票で全面差し替え。
 
-弁護士確定（凍結・改変禁止）:
- 1. 起算日 = 相続人と知った日_申告 → 空なら 死亡を知った日_申告 → 空なら 死亡日_申告。
-    いずれも空なら「起算日未設定」。通知本文に使用欄と「申告ベース・要確認」を明記。
- 2. 法定満了日（計算値）= 起算日の 3 か月後の応当日。応当日が無い月は月末。
- 3. 社内締切日（計算値）= 法定満了日の 10 日前。
- 4. 弁護士が 法定満了日／社内締切日 の欄に値を入れていればその値を優先（計算値で
-    上書きしない・欄には書かない）。本文に「弁護士設定」か「計算値」かを明記。
- 5. 通知タイミング: 社内締切 7 日前／社内締切当日／法定満了 3 日前／法定満了 2 日前〜
-    当日は毎日／満了日超過は毎日（「満了超過」）。
- 6. 対象: status = 受任 かつ 申述提出日 が空 のレコードのみ。
+大野裁定（2026-10-08・法的判断・凍結）:
+ (a) 期限日 = 起算日_確定 の 3 か月後の応当日の **前日**（安全側・民法原則より 1 日早い）。
+     例: 起算日_確定 4/10 → 期限 7/9。応当日が無い月（例 11/30 の 3 か月後）は
+     翌月末日の前日ではなく、**その月の末日の前日**（11/30 → 2/27〔平年〕・2/28〔閏年〕）。
+ (b) 期間伸長は扱わない（伸長後の欄・分岐を作らない）。
+ (c) アラートは期限の 14 日前と 7 日前の 2 回（各 1 回のみ・重複送信なし）。期限超過の
+     通知は作らない。
 
-fix2（Codex HJC-01〜04）:
- A. 通知は案件行の集合として組み立て、1 通 NOTICE_MAX_CHARS 字以内に案件単位で分割
-    （1 案件で超える行は要点へ縮約し「（縮約）」を明記・黙った切り捨てなし）。各通に
-    「(n/N)」。送信キーは houki_jukuryo_daily:{日付}:{digest}（fix4: digest=その通の
-    案件×マイルストーンの構造化データ {record_id, milestone_name, due_date, legal_deadline,
-    internal_deadline, start_basis, delayed} を並べ替えた正規化 JSON の sha256 先頭 16 桁）
-    ＝同一内容の再送だけが
-    throttled=成功扱い。履歴追記は sent/throttled になった通の案件だけ。
- B. App 40 の全件取得（$id asc・500 件ごとに $id > 最後の id で継続）。
- C. マイルストーンを単発 ONE_SHOT（社内締切 7 日前／当日・法定満了 3 日前）と毎日 DAILY
-    （法定満了 2 日前〜当日・満了超過）に分ける。ONE_SHOT は該当日が今日以前 7 日以内で
-    履歴に同名かつ同じ該当日の行「{名}@{該当日}」が（日付を問わず）無ければ対象＝送信失敗の
-    翌日以降も回収され、本文に「（遅延・本来 {該当日}）」を付ける（fix3: 履歴行は
-    「{今日} {名}@{該当日} 通知済」。弁護士が期日欄を動かして該当日が変われば再通知）。ジョブは
-    8:00・13:00・18:00 JST に登録し、各回は履歴の無い分だけを送る。起算日未設定の列挙は
-    8:00 の回のみ。
+司令塔裁定:
+ - 入力は 起算日_確定 のみ（申告 3 日付・起算点確定済・法定満了日・社内締切日 は読まない）。
+   起算日_確定 が空なら算出しない（受任後なら「起算日未確定 n 件」の件数通知のみ・1 日 1 回）。
+ - 熟慮期間期限／残日数 はシステム所有欄: 起算日_確定 が変われば **再計算して上書き**
+   （空欄のみ CAS ではない）。起算日_確定 が空に戻れば両欄を空に戻す。
+ - 対象 = 受任後の全 status（HOUKI_PROFILE.post_engagement_statuses の 8 値）かつ 申述提出日 が空。
+ - 通知文は固定文言＋レコード番号＋期限＋残日数のみ（氏名等の PII を載せない・RV-10）。
 
-冪等はレコードの履歴で判定する（in-memory なし・再起動・二重起動に耐える）。
-順序（fix1）: 送信 → 送信成功（sent/throttled）を確認してから履歴追記。失敗した通の案件は
-追記しない（次回実行で再対象）。追記の CAS 失敗は警告のみ（同日再実行の二重通知は許容）。
-登録方式は hub/return_deadline と同じ（hub/scheduler の daily・単一 worker 前提）。
+fix1（Codex R-HOUKI-JUKURYO-2 BH-01〜04・司令塔裁定「通知を送った事実の正は send_ledger」）:
+ - BH-02/03: 通知（14/7 日前・起算日未確定）は **送信台帳（hub/send_ledger・本番 DB・永続）**を
+   通す。1 レコード×1 閾値 = 1 送信操作 = 1 LINE push（分割の単位と台帳の単位を一致させる・
+   操作の付帯情報列を増やさない）。業務キーは inbound_event_id に
+   「{種別}:{レコード ID}:{期限日}」（未確定件数は「{種別}:{JST 日付}」）として置き、
+   同キーの sent／unconfirmed があれば送らない（台帳の重複検出をそのまま使う）。
+   HTTP は guarded_http（heartbeat・timeout）経由。結果不明は unconfirmed（自動再送なし・
+   /app/send_ops に出る）。kintone の 通知済み閾値 は **写し**（finish(sent) が applied の後に
+   刻印・刻印失敗は次回実行で刻印だけ再試行＝再通知しない）。
+ - fix2（Codex BH-05〜07・司令塔裁定「熟慮期間通知ジョブは台帳必須」）: 台帳が使えない
+   （begin が None）ときは **送らない**（fail-closed・固定理由 ledger_unavailable の件数ログ・
+   次回再試行）。finish(sent) の戻り値が applied のときだけ sent と刻印へ進み、late／skipped は
+   unconfirmed 扱い（刻印しない・自動再送しない）。/app/send_ops は channel=houki_jukuryo の操作に
+   限って業務キーを閉集合で解析し「案件番号・期限・14日前/7日前」（未確定件数は「対象日」）を表示。
+ - purpose: 本番 DB の CHECK 制約 ck_send_operation_purpose（migration e5f8）が閉集合を固定して
+   おり、票の規律「migration なし」の下では新 purpose を挿入できない。purpose は other とし、
+   種別は inbound_event_id の接頭辞（houki_jukuryo_14 / houki_jukuryo_7 / houki_jukuryo_unset）と
+   channel="houki_jukuryo" で判別する（purpose の正式追加は migration を伴う別票）。
+ - BH-01: 保存の 409 再取得後は対象（status・申述提出日・起算日_確定）を再評価し、対象外に
+   なっていれば更新を中止する（件数ログのみ）。
+ - BH-04: 期限が変われば業務キーが変わる（同一案件・同一閾値でも訂正後は 1 回通知される）。
+   notify のメモリ throttle は使わない。
+
+書く欄は 熟慮期間期限・残日数（算出結果）と 通知済み閾値（送信成功後の刻印）の 3 つだけ。
+他の欄・status は書かない。順序: 算出 → 通知（台帳 begin → push → finish）→ 1 レコード
+1 回の $revision CAS で保存（409 は再取得して 1 回だけ再計算・再試行）。
+登録方式は hub/return_deadline と同じ（hub/scheduler の daily・8/13/18 JST・単一 worker 前提）。
 新規 env は読まない。App 21 には触れない。hub/notify の切り詰め（4900 字）には触れない。
 """
 
 import calendar
 import functools
-import hashlib
-import json
 import logging
-from dataclasses import dataclass, field
+import os
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 
-from hub import kintone, notify
+import httpx
+
+from hub import kintone, send_ledger
 from hub import scheduler as hub_scheduler
 from hub.houki_case_store import APP_HOUKI_CASE
+from hub.houki_profile import HOUKI_PROFILE
+from hub.notify import business_channel_allowlist, business_token_env, get_admin_line_user_id
 from hub.redact import emit  # RV-10: sink 出力は emit 契約経由
 
 logger = logging.getLogger("hub.houki_jukuryo")
 
 _JST = timezone(timedelta(hours=9))
+_PUSH_URL = "https://api.line.me/v2/bot/message/push"
 
 # ── 定数（1 か所・テストで pin） ─────────────────────────────────────────────
 JOB_NAME = "HOUKI_JUKURYO"                   # ジョブ名は f"{JOB_NAME}_{HH}"（時刻ごとに 1 つ）
-RUN_HOURS_JST = (8, 13, 18)                  # fix2 C-4: 同日再送（各回は履歴の無い分だけ）
-UNSET_LIST_HOUR_JST = 8                      # fix2 C-5: 起算日未設定の列挙はこの回のみ
-NOTIFY_KIND = "houki_jukuryo_daily"          # throttle_key = f"{NOTIFY_KIND}:{YYYY-MM-DD}:{digest}"
-NOTICE_MAX_CHARS = 3800                      # fix2 A-1: 1 通の上限（notify 側 4900 より小さい）
-DIGEST_HEX_LEN = 16
+RUN_HOURS_JST = (8, 13, 18)                  # CRON-1 から時刻を維持（票 6）
 
-FIELD_STATUS = "status"                      # 票の「相談状況」= App 40 実コード status（label ステータス）
-STATUS_JUNIN = "受任"
+FIELD_STATUS = "status"
 FIELD_SUBMITTED = "申述提出日"
-FIELD_HISTORY = "熟慮期間通知履歴"
-FIELD_LEGAL_DEADLINE = "法定満了日"
-FIELD_INTERNAL_DEADLINE = "社内締切日"
-START_DATE_FIELDS = ("相続人と知った日_申告", "死亡を知った日_申告", "死亡日_申告")   # 代用順（凍結 1）
+FIELD_START = "起算日_確定"                   # 唯一の入力（司令塔裁定）
+FIELD_DEADLINE = "熟慮期間期限"               # 出力 1（DATE・システム所有）
+FIELD_REMAINING = "残日数"                    # 出力 2（NUMBER・システム所有）
+FIELD_NOTIFIED = "通知済み閾値"               # 通知済みの写し（CHECK_BOX・既存欄）
+WRITE_FIELDS = frozenset({FIELD_DEADLINE, FIELD_REMAINING, FIELD_NOTIFIED})   # 書く欄の閉集合
 
-JUKURYO_MONTHS = 3                           # 凍結 2
-INTERNAL_MARGIN_DAYS = 10                    # 凍結 3
-INTERNAL_PRE_DAYS = 7                        # 凍結 5: 社内締切 7 日前
-LEGAL_PRE_DAYS = 3                           # 凍結 5: 法定満了 3 日前
-LEGAL_DAILY_FROM_DAYS = 2                    # 凍結 5: 法定満了 2 日前〜当日は毎日
-ONE_SHOT_RECOVERY_DAYS = 7                   # fix2 C-3: 単発の未送信回収窓（該当日 ≥ 今日−7）
+# 対象 status（受任後の 8 値・hub/houki_profile が単一の正）
+TARGET_STATUSES: tuple = tuple(sorted(HOUKI_PROFILE.post_engagement_statuses))
 
-SOURCE_ATTORNEY = "弁護士設定"
-SOURCE_COMPUTED = "計算値"
-START_UNSET = "起算日未設定"
-DECLARED_NOTE = "申告ベース・要確認"
+JUKURYO_MONTHS = 3                           # 裁定 (a)
+ALERT_DAYS = (14, 7)                         # 裁定 (c)・残日数がこの値以下で未通知なら送る
+NOTIFIED_VALUES = {14: "14日前", 7: "7日前"}  # 通知済み閾値 の実選択肢値（form fields 実測）
 
-MS_INTERNAL_PRE = "社内締切7日前"
-MS_INTERNAL_DAY = "社内締切当日"
-MS_LEGAL_PRE = "法定満了3日前"
-MS_LEGAL_2 = "法定満了2日前"
-MS_LEGAL_1 = "法定満了1日前"
-MS_LEGAL_DAY = "法定満了当日"
-MS_OVERDUE = "満了超過"
-ONE_SHOT = (MS_INTERNAL_PRE, MS_INTERNAL_DAY, MS_LEGAL_PRE)          # fix2 C-1
-DAILY = (MS_LEGAL_2, MS_LEGAL_1, MS_LEGAL_DAY, MS_OVERDUE)
-MILESTONES = ONE_SHOT + DAILY
+# 送信台帳（fix1 BH-02/03）: business は相続放棄・channel は本ジョブ・purpose は DB CHECK 制約の
+# 範囲内（other）。種別は inbound_event_id の接頭辞で表す
+LEDGER_BUSINESS = "souzoku-houki"
+LEDGER_CHANNEL = "houki_jukuryo"
+LEDGER_PURPOSE = send_ledger.PURPOSE_OTHER
+LEDGER_KIND_14 = "houki_jukuryo_14"
+LEDGER_KIND_7 = "houki_jukuryo_7"
+LEDGER_KIND_UNSET = "houki_jukuryo_unset"
+LEDGER_KINDS = {14: LEDGER_KIND_14, 7: LEDGER_KIND_7}
 
-HISTORY_SUFFIX = "通知済"
-DELAY_MARK = "遅延・本来"                   # 本文「（遅延・本来 YYYY-MM-DD）」
-HISTORY_DUE_SEP = "@"                        # fix3: ONE_SHOT 履歴「{今日} {名}@{該当日} 通知済」
-COMPACT_MARK = "（縮約）"
+# 送信結果（固定語彙）
+SEND_SENT = "sent"                           # 台帳に記録し、送信し、finish(sent) が applied
+SEND_DUPLICATE_SENT = "duplicate_sent"       # 台帳に sent がある（送らない・刻印の再試行のみ）
+SEND_DUPLICATE_UNCONFIRMED = "duplicate_unconfirmed"   # 台帳に未確定がある（送らない・人の確定待ち）
+SEND_UNCONFIRMED = "unconfirmed"             # push の結果不明、または finish が applied でない（自動再送なし）
+SEND_FAILED = "failed"                       # push 失敗・宛先なし（次回実行で再試行）
+SEND_LEDGER_UNAVAILABLE = "ledger_unavailable"   # fix2 BH-05: 台帳が使えない → 送らない（fail-closed・次回再試行）
+
 NOTICE_HEADER = "【相続放棄 熟慮期間】"
-NOTICE_FOOTER = "期日は申告欄からの計算を含みます。レコードの期日欄・ステータスは変更していません。"
-NOTICE_EMPTY = "本日のマイルストーン該当なし"
-SEARCH_FIELDS = ["$id", "$revision", FIELD_STATUS, FIELD_SUBMITTED, FIELD_HISTORY,
-                 FIELD_LEGAL_DEADLINE, FIELD_INTERNAL_DEADLINE, *START_DATE_FIELDS]
-SEARCH_LIMIT = 500                           # kintone records.json の上限（fix2 B: ページング）
-
+NOTICE_FOOTER = "期限＝起算日_確定の3か月後の応当日の前日。レコード番号と残日数のみ・詳細はApp 40で確認してください。"
+UNSET_LABEL = "起算日未確定"
+UNSET_NOTE = "（受任後・申述提出日なし・起算日_確定が空。個別のレコードはPWA/App 40で確認してください）"
+SEARCH_FIELDS = ["$id", "$revision", FIELD_STATUS, FIELD_SUBMITTED, FIELD_START,
+                 FIELD_DEADLINE, FIELD_REMAINING, FIELD_NOTIFIED]
+SEARCH_LIMIT = 500                           # kintone records.json の上限（ページング）
 
 def _today_jst() -> date:
     return datetime.now(_JST).date()
 
 
 def _v(record: dict, code: str) -> str:
-    return str((record.get(code) or {}).get("value") or "").strip()
+    val = (record.get(code) or {}).get("value")
+    if isinstance(val, list):
+        return ",".join(str(x) for x in val)
+    return str(val or "").strip()
 
 
 def _parse_date(text: str) -> date | None:
@@ -122,324 +135,212 @@ def _parse_date(text: str) -> date | None:
         return None
 
 
-# ── 期日計算（pure） ─────────────────────────────────────────────────────────
-def add_months(d: date, months: int) -> date:
-    """d の months か月後の応当日。応当日が無い月はその月の末日（凍結 2）。"""
-    month_index = d.month - 1 + months
-    year = d.year + month_index // 12
+# ── 期限計算（pure・唯一の正。phone_triage もここを使う） ──────────────────────
+def jukuryo_deadline(start: date) -> date:
+    """裁定 (a): start の 3 か月後の応当日の前日。応当日が無い月はその月の末日の前日。
+    例: 4/10 → 7/9・11/30 → 2/27（平年）/ 2/28（閏年）・1/31 → 4/29・3/1 → 5/31。"""
+    month_index = start.month - 1 + JUKURYO_MONTHS
+    year = start.year + month_index // 12
     month = month_index % 12 + 1
     last = calendar.monthrange(year, month)[1]
-    return date(year, month, min(d.day, last))
+    anniversary = date(year, month, min(start.day, last))
+    return anniversary - timedelta(days=1)
 
 
-def resolve_start(record: dict) -> tuple[date | None, str]:
-    """起算日と使用欄（凍結 1）。全て空なら (None, START_UNSET)。"""
-    for code in START_DATE_FIELDS:
-        d = _parse_date(_v(record, code))
-        if d is not None:
-            return d, code
-    return None, START_UNSET
+def remaining_days(deadline: date, today: date) -> int:
+    """残日数（期限日当日=0・超過は負）。"""
+    return (deadline - today).days
 
 
-@dataclass(frozen=True)
-class Deadlines:
-    start: date | None
-    start_source: str          # 使用欄コード or START_UNSET
-    legal: date | None
-    legal_source: str          # SOURCE_ATTORNEY / SOURCE_COMPUTED / START_UNSET
-    internal: date | None
-    internal_source: str
-
-    @property
-    def determinable(self) -> bool:
-        return self.legal is not None and self.internal is not None
-
-
-def compute_deadlines(record: dict) -> Deadlines:
-    """凍結 1〜4 の適用。欄には書かない（戻り値のみ）。
-
-    法定満了日 欄に弁護士の値があればそれを優先し、無ければ起算日から計算。
-    社内締切日 欄に値があればそれを優先し、無ければ法定満了日の 10 日前。
-    起算日が無く 法定満了日 欄も空なら判定不能（START_UNSET）。"""
-    start, start_source = resolve_start(record)
-    legal_set = _parse_date(_v(record, FIELD_LEGAL_DEADLINE))
-    if legal_set is not None:
-        legal, legal_source = legal_set, SOURCE_ATTORNEY
-    elif start is not None:
-        legal, legal_source = add_months(start, JUKURYO_MONTHS), SOURCE_COMPUTED
-    else:
-        legal, legal_source = None, START_UNSET
-    internal_set = _parse_date(_v(record, FIELD_INTERNAL_DEADLINE))
-    if internal_set is not None:
-        internal, internal_source = internal_set, SOURCE_ATTORNEY
-    elif legal is not None:
-        internal, internal_source = legal - timedelta(days=INTERNAL_MARGIN_DAYS), SOURCE_COMPUTED
-    else:
-        internal, internal_source = None, START_UNSET
-    return Deadlines(start, start_source, legal, legal_source, internal, internal_source)
+def resolve_start(record: dict) -> date | None:
+    """起算日_確定 のみ（空・不正は None=算出しない）。"""
+    return _parse_date(_v(record, FIELD_START))
 
 
 @dataclass(frozen=True)
-class Milestone:
-    name: str
-    due: date                  # 本来の該当日（DAILY は今日）
-
-    def delayed(self, today: date) -> bool:
-        return self.due < today
+class Computation:
+    start: date
+    deadline: date
+    remaining: int
 
 
-def milestones_for(today: date, dl: Deadlines) -> list[Milestone]:
-    """今日に該当するマイルストーン（凍結 5・境界判定は不変）。
-    ONE_SHOT は fix2 C-3 の回収窓（該当日 ≤ 今日 かつ 該当日 ≥ 今日−7 日）で拾う
-    （履歴による除外は plan 側）。DAILY は当日一致のみ。複数同時可。"""
-    if not dl.determinable:
-        return []
-    out: list[Milestone] = []
-    earliest = today - timedelta(days=ONE_SHOT_RECOVERY_DAYS)
-    for name, due in ((MS_INTERNAL_PRE, dl.internal - timedelta(days=INTERNAL_PRE_DAYS)),
-                      (MS_INTERNAL_DAY, dl.internal),
-                      (MS_LEGAL_PRE, dl.legal - timedelta(days=LEGAL_PRE_DAYS))):
-        if earliest <= due <= today:
-            out.append(Milestone(name, due))
-    remaining = (dl.legal - today).days
-    if 0 <= remaining <= LEGAL_DAILY_FROM_DAYS:
-        out.append(Milestone({2: MS_LEGAL_2, 1: MS_LEGAL_1, 0: MS_LEGAL_DAY}[remaining], today))
-    if remaining < 0:
-        out.append(Milestone(MS_OVERDUE, today))
-    return out
+def compute(record: dict, today: date) -> Computation | None:
+    start = resolve_start(record)
+    if start is None:
+        return None
+    deadline = jukuryo_deadline(start)
+    return Computation(start, deadline, remaining_days(deadline, today))
 
 
-# ── 対象・履歴・本文（pure） ─────────────────────────────────────────────────
+# ── 対象・通知判定・保存差分（pure） ─────────────────────────────────────────
 def is_target(record: dict) -> bool:
-    """凍結 6（検索条件と二重に検査・防御的）。"""
-    return _v(record, FIELD_STATUS) == STATUS_JUNIN and not _v(record, FIELD_SUBMITTED)
+    """受任後 8 status かつ 申述提出日 空（検索条件と二重に検査・防御的）。"""
+    return _v(record, FIELD_STATUS) in TARGET_STATUSES and not _v(record, FIELD_SUBMITTED)
 
 
 def search_query(after_id: str | None = None) -> str:
-    cond = f'{FIELD_STATUS} in ("{STATUS_JUNIN}") and {FIELD_SUBMITTED} = ""'
+    statuses = ",".join(f'"{s}"' for s in TARGET_STATUSES)
+    cond = f'{FIELD_STATUS} in ({statuses}) and {FIELD_SUBMITTED} = ""'
     if after_id:
         cond += f" and $id > {int(after_id)}"
     return f"{cond} order by $id asc limit {SEARCH_LIMIT}"
 
 
-def history_line(today: date, milestone: str, due: date | None = None) -> str:
-    """履歴行（fix3）。DAILY／起算日未設定は「{今日} {名} 通知済」、ONE_SHOT は該当日を
-    必ず含む「{今日} {名}@{該当日} 通知済」（遅延でも同形式・「本来」表記は @該当日 に統合）。"""
-    label = f"{milestone}{HISTORY_DUE_SEP}{due.isoformat()}" if due is not None else milestone
-    return f"{today.isoformat()} {label} {HISTORY_SUFFIX}"
+def notified_values(record: dict) -> list[str]:
+    val = (record.get(FIELD_NOTIFIED) or {}).get("value")
+    if isinstance(val, list):
+        return [str(x) for x in val]
+    return [x for x in str(val or "").split(",") if x]
 
 
-def _history_tokens(history: str):
-    """新形式のみ: (日付, 名[@該当日], 残り)。旧形式（fix2 まで）は本番未配備のため非対応。"""
-    for ln in (history or "").splitlines():
-        parts = ln.strip().split(" ", 2)
-        if len(parts) >= 3:
-            yield parts[0], parts[1], parts[2]
+def alert_candidates(remaining: int) -> list[int]:
+    """残日数が閾値以下の閾値（14→7 の順）。1 回性は台帳で判定する（写しは代替）。
+    当日に走れなかった分も翌日以降に拾う。期限超過でも未通知の閾値があれば送る
+    （取りこぼしを黙らせない・「超過」の通知は作らない）。"""
+    return [d for d in ALERT_DAYS if remaining <= d]
 
 
-def history_has(history: str, today: date, milestone: str) -> bool:
-    """同日・同名の履歴行があるか（DAILY／起算日未設定の除外）。"""
-    return any(d == today.isoformat() and n == milestone and rest.startswith(HISTORY_SUFFIX)
-               for d, n, rest in _history_tokens(history))
+def ledger_key(kind: str, business_key: str) -> str:
+    """台帳の業務キー（inbound_event_id）。{種別}:{業務キー}。"""
+    return f"{kind}:{business_key}"
 
 
-def history_has_one_shot(history: str, milestone: str, due: date) -> bool:
-    """同名かつ同じ該当日（名@該当日）の履歴行が日付を問わず有るか（ONE_SHOT の除外・fix3）。
-    弁護士が期日欄を動かして該当日が変われば別行になり再通知される。"""
-    label = f"{milestone}{HISTORY_DUE_SEP}{due.isoformat()}"
-    return any(n == label and rest.startswith(HISTORY_SUFFIX)
-               for _d, n, rest in _history_tokens(history))
+def alert_business_key(record_id: str, comp: Computation) -> str:
+    """BH-04: 期限日を含める＝期限が訂正されれば別の送信操作になり、訂正後に 1 回通知される。"""
+    return f"{record_id}:{comp.deadline.isoformat()}"
 
 
-def append_history_text(history: str, line: str) -> str:
-    return f"{history}\n{line}" if history else line
+def _stored_remaining(record: dict) -> int | None:
+    text = _v(record, FIELD_REMAINING)
+    try:
+        return int(float(text)) if text else None
+    except ValueError:
+        return None
 
 
-def _fmt(d: date | None) -> str:
-    return d.isoformat() if d else "未設定"
-
-
-def format_item(record_id: str, ms: Milestone, dl: Deadlines, today: date | None = None) -> str:
-    """1 案件 1 行（個人情報なし: レコード番号・期日・根拠のみ）。"""
-    if dl.start is not None:
-        start_text = f"{_fmt(dl.start)}（{dl.start_source}・{DECLARED_NOTE}）"
-    else:
-        start_text = START_UNSET
-    label = ms.name
-    if today is not None and ms.delayed(today):
-        label += f"（{DELAY_MARK} {ms.due.isoformat()}）"
-    return (f"・No.{record_id} {label} / 法定満了 {_fmt(dl.legal)}（{dl.legal_source}）"
-            f" / 社内締切 {_fmt(dl.internal)}（{dl.internal_source}）"
-            f" / 起算日 {start_text}")
-
-
-def format_item_compact(record_id: str, names: list[str], dl: Deadlines) -> str:
-    """fix2 A-1: 1 案件の行が上限を超えるときの要点（レコード番号・マイルストーン・期日）。"""
-    return (f"・No.{record_id} {'/'.join(names)} / 法定満了 {_fmt(dl.legal)}"
-            f" / 社内締切 {_fmt(dl.internal)}{COMPACT_MARK}")
-
-
-@dataclass
-class Entry:
-    """通知本文の案件単位（分割の最小単位）。"""
-    record: dict
-    record_id: str
-    lines: list[str]                       # 本文行（1 マイルストーン 1 行）
-    keys: list[tuple[str, str]]            # (record_id, マイルストーン名)
-    history_lines: list[str]               # 送信成功後に追記する履歴行
-    compact: str = ""                      # 上限超過時の縮約行（空なら不要）
-    facts: list[dict] = field(default_factory=list)   # fix4: digest の材料（構造化・案件×マイルストーン）
-
-    def text(self) -> str:
-        return "\n".join(self.lines)
-
-
-def start_basis(dl: Deadlines) -> str:
-    """digest 用の起算日根拠: 使用欄名／弁護士設定（起算日空で 法定満了日 が弁護士設定）／起算日未設定。"""
-    if dl.start is not None:
-        return dl.start_source
-    if dl.legal_source == SOURCE_ATTORNEY:
-        return SOURCE_ATTORNEY
-    return START_UNSET
-
-
-# 原則（fix5 HJCF4-01）: 通知本文に表示する値は、すべて facts に含める（digest が本文の差分を必ず識別する）。
-# 本文組立（format_item / format_item_compact）が参照する値 → facts のキー。テストが両側から生成して一致を pin。
-BODY_TO_FACT_KEYS = {
-    "record_id": "record_id",
-    "ms.name": "milestone_name",
-    "ms.due": "due_date",
-    "ms.delayed": "delayed",
-    "dl.start": "start_date",
-    "dl.start_source": "start_basis",
-    "dl.legal": "legal_deadline",
-    "dl.legal_source": "legal_source",
-    "dl.internal": "internal_deadline",
-    "dl.internal_source": "internal_source",
-}
-FACT_KEYS = frozenset(BODY_TO_FACT_KEYS.values())
-
-
-def milestone_fact(record_id: str, name: str, due: date | None, dl: Deadlines, today: date) -> dict:
-    """fix4 HJCF2-01 / fix5 HJCF4-01: 案件×マイルストーンの構造化データ（該当日・期日・
-    起算日の実日付・根拠・弁護士設定/計算値・遅延を含む＝本文に出る値は全て含める）。"""
-    return {
-        "record_id": record_id,
-        "milestone_name": name,
-        "due_date": due.isoformat() if due else None,
-        "start_date": dl.start.isoformat() if dl.start else None,
-        "start_basis": start_basis(dl),
-        "legal_deadline": dl.legal.isoformat() if dl.legal else None,
-        "legal_source": dl.legal_source,
-        "internal_deadline": dl.internal.isoformat() if dl.internal else None,
-        "internal_source": dl.internal_source,
-        "delayed": bool(due is not None and due < today),
-    }
-
-
-def plan_today(records: list[dict], today: date, include_unset: bool = True) -> list[Entry]:
-    """当日の通知計画（pure・書込なし）。当日分（DAILY）／同名（ONE_SHOT）の履歴が
-    既にあるものは除外（同日再実行・回収済みの二重防止）。"""
-    entries: list[Entry] = []
-    for rec in records:
-        if not is_target(rec):
-            continue
-        rid = _v(rec, "$id")
-        dl = compute_deadlines(rec)
-        history = _v(rec, FIELD_HISTORY)
-        if not dl.determinable:
-            if include_unset and not history_has(history, today, START_UNSET):
-                entries.append(Entry(rec, rid, [f"{START_UNSET}: No.{rid}"], [(rid, START_UNSET)],
-                                     [history_line(today, START_UNSET)],
-                                     facts=[milestone_fact(rid, START_UNSET, None, dl, today)]))
-            continue
-        pending = []
-        for ms in milestones_for(today, dl):
-            skip = (history_has_one_shot(history, ms.name, ms.due) if ms.name in ONE_SHOT
-                    else history_has(history, today, ms.name))
-            if not skip:
-                pending.append(ms)
-        if not pending:
-            continue
-        entries.append(Entry(
-            rec, rid,
-            [format_item(rid, ms, dl, today) for ms in pending],
-            [(rid, ms.name) for ms in pending],
-            [history_line(today, ms.name, ms.due if ms.name in ONE_SHOT else None) for ms in pending],
-            compact=format_item_compact(rid, [ms.name for ms in pending], dl),
-            facts=[milestone_fact(rid, ms.name, ms.due, dl, today) for ms in pending]))
-    return entries
-
-
-@dataclass
-class Notice:
-    entries: list[Entry] = field(default_factory=list)
-    text: str = ""
-    digest: str = ""
-
-
-def digest_material(entries: list[Entry]) -> str:
-    """fix4 HJCF2-01: 通に含まれる案件×マイルストーンの構造化データを record_id・milestone_name で
-    並べ替え、正規化 JSON にする（文字列連結は使わない・HCG-03 と同方針）。"""
-    facts = sorted((f for e in entries for f in e.facts),
-                   key=lambda f: (f["record_id"], f["milestone_name"]))
-    return json.dumps(facts, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
-
-
-def digest_of(entries: list[Entry]) -> str:
-    """該当日・法定満了日・社内締切日・根拠・遅延のいずれかが変われば別値（履歴で未送信と
-    判定される変更は必ず digest も変わる）。案件順の入替では同値。"""
-    return hashlib.sha256(digest_material(entries).encode("utf-8")).hexdigest()[:DIGEST_HEX_LEN]
-
-
-def notify_key(today: date, digest: str) -> str:
-    return f"{NOTIFY_KIND}:{today.isoformat()}:{digest}"
-
-
-def _notice_text(today: date, bodies: list[str], n: int, total: int) -> str:
-    head = f"{NOTICE_HEADER} {today.isoformat()} ({n}/{total})"
-    return "\n".join([head, *(bodies or [NOTICE_EMPTY]), NOTICE_FOOTER])
-
-
-def build_notices(today: date, entries: list[Entry],
-                  max_chars: int | None = None) -> list[Notice]:
-    """fix2 A-1: 案件単位で NOTICE_MAX_CHARS 以内に分割。1 案件で超える行は縮約
-    （COMPACT_MARK を明記・黙った切り捨てなし）。各通に (n/N)。"""
-    limit = NOTICE_MAX_CHARS if max_chars is None else max_chars
-    if not entries:
-        return []
-    frame = len(_notice_text(today, [], 99, 99))          # 見出し+空+末尾の器（最大幅）
-    budget = max(limit - frame, 1)
-    groups: list[list[tuple[Entry, str]]] = []
-    cur: list[tuple[Entry, str]] = []
-    cur_len = 0
-    for e in entries:
-        body = e.text()
-        if len(body) > budget and e.compact:
-            body = e.compact
-        if len(body) > budget:                             # 縮約後も超える＝要点だけ
-            body = (f"・No.{e.record_id} {'/'.join(n for _r, n in e.keys)}{COMPACT_MARK}")[:budget]
-        add = len(body) + (1 if cur else 0)
-        if cur and cur_len + add > budget:
-            groups.append(cur)
-            cur, cur_len = [], 0
-            add = len(body)
-        cur.append((e, body))
-        cur_len += add
-    if cur:
-        groups.append(cur)
-    total = len(groups)
-    out: list[Notice] = []
-    for i, g in enumerate(groups, 1):
-        ents = [e for e, _b in g]
-        out.append(Notice(ents, _notice_text(today, [b for _e, b in g], i, total), digest_of(ents)))
+def field_updates(record: dict, comp: Computation | None) -> dict:
+    """保存すべき差分（熟慮期間期限・残日数）。値が同じなら空（同日再実行で書かない）。
+    comp が None（起算日_確定 空）で欄に値が残っていれば空に戻す（システム所有欄）。"""
+    out: dict = {}
+    if comp is None:
+        if _v(record, FIELD_DEADLINE):
+            out[FIELD_DEADLINE] = ""
+        if _v(record, FIELD_REMAINING):
+            out[FIELD_REMAINING] = ""
+        return out
+    if _parse_date(_v(record, FIELD_DEADLINE)) != comp.deadline:
+        out[FIELD_DEADLINE] = comp.deadline.isoformat()
+    if _stored_remaining(record) != comp.remaining:
+        out[FIELD_REMAINING] = str(comp.remaining)
     return out
 
 
-# ── kintone 読取（fix2 B: 全件取得）・書込（履歴欄のみ・CAS） ─────────────────
+def record_writes(record: dict, today: date, mark_days: list[int]) -> dict:
+    """1 レコードの書込集合 = 算出差分 + 送信済み閾値の刻印（既存の刻印は保持）。"""
+    fields = field_updates(record, compute(record, today))
+    if mark_days:
+        current = notified_values(record)
+        merged = current + [NOTIFIED_VALUES[d] for d in mark_days if NOTIFIED_VALUES[d] not in current]
+        if merged != current:
+            fields[FIELD_NOTIFIED] = merged
+    assert set(fields) <= WRITE_FIELDS
+    return fields
+
+
+# ── 通知本文（pure・PII なし） ───────────────────────────────────────────────
+def format_alert_line(record_id: str, day: int, comp: Computation) -> str:
+    return (f"・No.{record_id} 期限 {comp.deadline.isoformat()} 残 {comp.remaining} 日"
+            f"（{day}日前の通知）")
+
+
+def alert_text(today: date, record_id: str, day: int, comp: Computation) -> str:
+    """1 レコード×1 閾値 = 1 通（台帳の単位と一致）。"""
+    return "\n".join([f"{NOTICE_HEADER} {today.isoformat()}",
+                      format_alert_line(record_id, day, comp), NOTICE_FOOTER])
+
+
+def unset_text(today: date, count: int) -> str:
+    return f"{NOTICE_HEADER} {today.isoformat()}\n{UNSET_LABEL} {count} 件{UNSET_NOTE}"
+
+
+# ── 送信（台帳 → push → 確定） ───────────────────────────────────────────────
+async def _push_admin_http(admin_id: str, text: str) -> bool:
+    """業務チャネル（DISPATCHBOT）で管理者へ push する HTTP 部分。宛先 allowlist（H02）は
+    hub/notify と同じ関所。transport 例外は上へ（guarded_http の呼出側で unconfirmed）。
+    非 2xx は False（failed）。本文・宛先は emit 契約の外へ出さない。"""
+    if admin_id not in business_channel_allowlist():
+        logger.warning("houki_jukuryo push skipped (recipient not allowlisted)")
+        return False
+    token = os.environ.get(business_token_env(), "")
+    if not token:
+        logger.warning("houki_jukuryo push skipped (no business token)")
+        return False
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            _PUSH_URL,
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            json={"to": admin_id, "messages": [{"type": "text", "text": text[:4900]}]},
+        )
+    if not resp.is_success:
+        logger.error("houki_jukuryo push failed status=%s body=%s",
+                     emit(resp.status_code, "count", "log", "operator"),
+                     emit(resp.text, "vendor_raw", "log", "operator"))
+    return bool(resp.is_success)
+
+
+async def send_notice(kind: str, business_key: str, text: str) -> str:
+    """台帳を通した 1 通の送信。戻り値は固定語彙（SEND_*）。
+    - 台帳に同キーの sent → SEND_DUPLICATE_SENT（送らない）
+    - 台帳に同キーの未確定 → SEND_DUPLICATE_UNCONFIRMED（送らない・人の確定待ち）
+    - 台帳が使えない（begin が None＝DB 未設定・記録失敗）→ **送らない**（fix2 BH-05・fail-closed・
+      固定理由の件数ログのみ・次回実行で再試行）。時効側の fail-open（Q1a 限定仮置き）は変えない
+    - push の例外（timeout 含む）→ finish(unconfirmed)・SEND_UNCONFIRMED（自動再送なし）
+    - push 成功でも finish(sent) が applied でない（late／skipped）→ SEND_UNCONFIRMED（fix2 BH-06・
+      写しを作らない・集計は unconfirmed・自動再送なし）"""
+    admin_id = get_admin_line_user_id()
+    if not admin_id:
+        logger.warning("houki_jukuryo notice skipped (no admin id)")
+        return SEND_FAILED
+    # fix3 BH-10: 宛先 allowlist・業務トークンの不備は台帳行を作る前に弾く（failed 試行を積まない）
+    if admin_id not in business_channel_allowlist():
+        logger.warning("houki_jukuryo notice skipped (recipient not allowlisted)")
+        return SEND_FAILED
+    if not os.environ.get(business_token_env(), ""):
+        logger.warning("houki_jukuryo notice skipped (no business token)")
+        return SEND_FAILED
+    token = send_ledger.bind_inbound(ledger_key(kind, business_key))
+    try:
+        with send_ledger.purpose(LEDGER_PURPOSE):
+            op = await send_ledger.begin(LEDGER_BUSINESS, LEDGER_CHANNEL, admin_id, text)
+        if op is send_ledger.DUPLICATE_SENT:
+            return SEND_DUPLICATE_SENT
+        if op is send_ledger.DUPLICATE_UNCONFIRMED:
+            return SEND_DUPLICATE_UNCONFIRMED
+        if op is None:
+            logger.warning("houki_jukuryo notice skipped (ledger_unavailable) count=%s",
+                           emit(1, "count", "log", "operator"))
+            return SEND_LEDGER_UNAVAILABLE
+        try:
+            ok = await send_ledger.guarded_http(op, _push_admin_http(admin_id, text))
+        except Exception:
+            await send_ledger.finish(op, send_ledger.STATE_UNCONFIRMED)
+            logger.warning("houki_jukuryo push result unknown (unconfirmed)")
+            return SEND_UNCONFIRMED
+        if not ok:
+            await send_ledger.finish(op, send_ledger.STATE_FAILED)
+            return SEND_FAILED
+        applied = await send_ledger.finish(op, send_ledger.STATE_SENT)
+        if applied != "applied":
+            logger.warning("houki_jukuryo finish not applied (treated as unconfirmed)")
+            return SEND_UNCONFIRMED
+        return SEND_SENT
+    finally:
+        send_ledger.unbind(token)
+
+
+# ── kintone 読取（全件取得）・書込（3 欄のみ・CAS） ─────────────────────────
 async def fetch_all_targets() -> list[dict]:
-    """受任×未提出を $id asc・500 件ごとに全件取得（$id > 最後の id で継続）。
-    共通 search_records は変更しない。"""
+    """受任後×未提出を $id asc・500 件ごとに全件取得（$id > 最後の id で継続）。"""
     out: list[dict] = []
     after: str | None = None
     while True:
@@ -454,77 +355,141 @@ async def fetch_all_targets() -> list[dict]:
         after = last
 
 
-async def append_history(record: dict, line: str) -> bool:
-    """熟慮期間通知履歴 へ 1 行を $revision CAS で追記。409・その他失敗は False。
-    他の欄には書かない。"""
-    return await append_history_lines(record, [line])
+WRITE_WRITTEN = "written"
+WRITE_NOOP = "noop"
+WRITE_ABORTED = "aborted"        # BH-01: 409 再取得後に対象外になっていた
+WRITE_FAILED = "failed"
 
 
-async def append_history_lines(record: dict, lines: list[str]) -> bool:
-    """熟慮期間通知履歴 へ複数行を 1 回の $revision CAS 更新で追記（同一案件の
-    同日分をまとめる）。409・その他失敗は False。他の欄には書かない。"""
+async def commit_writes(record: dict, today: date, mark_days: list[int]) -> str:
+    """算出差分＋刻印を 1 回の $revision CAS で保存。409 は最新を再取得して 1 回だけ
+    再計算・再試行。BH-01: 再取得後に対象外（status 変更・申述提出日 入力・起算日_確定 空）
+    になっていれば更新を中止（件数ログのみ・次回実行で改めて判定）。"""
     rid = _v(record, "$id")
-    new_text = _v(record, FIELD_HISTORY)
-    for line in lines:
-        new_text = append_history_text(new_text, line)
-    try:
-        await kintone.update_record(APP_HOUKI_CASE, rid, {FIELD_HISTORY: new_text},
-                                    revision=_v(record, "$revision") or None)
-    except kintone.KintoneConflict:
-        logger.warning("houki_jukuryo history CAS conflict record=%s",
-                       emit(rid, "record_id", "log", "operator"))
-        return False
-    except kintone.KintoneError as e:
-        logger.warning("houki_jukuryo history write failed cls=%s record=%s",
-                       emit(type(e).__name__, "vendor_raw", "log", "operator"),
-                       emit(rid, "record_id", "log", "operator"))
-        return False
-    return True
+    rec = record
+    for attempt in range(2):
+        fields = record_writes(rec, today, mark_days)
+        if not fields:
+            return WRITE_NOOP
+        try:
+            await kintone.update_record(APP_HOUKI_CASE, rid, fields,
+                                        revision=_v(rec, "$revision") or None)
+            return WRITE_WRITTEN
+        except kintone.KintoneConflict:
+            if attempt == 1:
+                logger.warning("houki_jukuryo write CAS conflict twice record=%s",
+                               emit(rid, "record_id", "log", "operator"))
+                return WRITE_FAILED
+            try:
+                rec = await kintone.get_record(APP_HOUKI_CASE, rid)
+            except kintone.KintoneError as e:
+                logger.warning("houki_jukuryo refetch failed cls=%s record=%s",
+                               emit(type(e).__name__, "vendor_raw", "log", "operator"),
+                               emit(rid, "record_id", "log", "operator"))
+                return WRITE_FAILED
+            if not is_target(rec) or resolve_start(rec) is None:
+                logger.info("houki_jukuryo write aborted after refetch (no longer target) count=%s",
+                            emit(1, "count", "log", "operator"))
+                return WRITE_ABORTED
+        except kintone.KintoneError as e:
+            logger.warning("houki_jukuryo write failed cls=%s record=%s",
+                           emit(type(e).__name__, "vendor_raw", "log", "operator"),
+                           emit(rid, "record_id", "log", "operator"))
+            return WRITE_FAILED
+    return WRITE_FAILED
 
 
 # ── ジョブ本体 ───────────────────────────────────────────────────────────────
-async def jukuryo_daily_check(run_hour: int = UNSET_LIST_HOUR_JST) -> dict:
-    """受任×未提出の案件を判定し、当回の未送信分を分割送信する（fix1: 送信 → 成功
-    確認 → 履歴追記。fix2: 通ごとに digest キーで送り、sent/throttled の通の案件だけ
-    履歴追記）。起算日未設定の列挙は run_hour == UNSET_LIST_HOUR_JST の回のみ。
-    戻り値は件数（テスト用）。"""
+def _empty_result() -> dict:
+    return {"targets": 0, "candidates": 0, "sent": 0, "duplicate": 0, "remark": 0,
+            "unconfirmed": 0, "failed": 0, "ledger_unavailable": 0, "unset": 0, "unset_result": "",
+            "written": 0, "write_failed": 0, "aborted": 0}
+
+
+async def jukuryo_daily_check(run_hour: int = RUN_HOURS_JST[0]) -> dict:
+    """受任後×未提出の案件を算出し、(1) 14/7 日前の各閾値を台帳で 1 回性判定して送信、
+    (2) 送信済み（今回 sent・台帳 sent で刻印未了）の刻印と 熟慮期間期限／残日数 の差分を
+    1 レコード 1 回で保存、(3) 起算日未確定の件数を台帳で 1 日 1 回通知。
+    run_hour は 3 回のジョブで共通の処理（判定は欄と台帳で行うため時刻で分けない）。
+    台帳が使えないときは通知を送らない（fail-closed・期限欄の保存は行う）。"""
+    res = _empty_result()
     today = _today_jst()
     try:
         records = await fetch_all_targets()
     except kintone.KintoneError as e:
         logger.error("houki_jukuryo fetch failed cls=%s",
                      emit(type(e).__name__, "vendor_raw", "log", "operator"))
-        return {"targets": 0, "items": 0, "unset": 0, "notices": 0, "sent": 0,
-                "failed": 0, "history_failed": 0}
+        return res
+    res["targets"] = len(records)
 
-    entries = plan_today(records, today, include_unset=(run_hour == UNSET_LIST_HOUR_JST))
-    notices = build_notices(today, entries)
-    sent = failed = history_failed = 0
-    for nt in notices:
-        result = await notify.notify_admin_line_result(nt.text, throttle_key=notify_key(today, nt.digest))
-        if result not in ("sent", "throttled"):
-            failed += 1
-            logger.warning("houki_jukuryo notice not sent (history not written for that notice)")
+    marks: dict[str, list[int]] = {}
+    unset = 0
+    for rec in records:
+        if not is_target(rec):
             continue
-        sent += 1
-        for e in nt.entries:
-            if not await append_history_lines(e.record, e.history_lines):
-                history_failed += 1
-                logger.warning("houki_jukuryo history append failed after notice record=%s",
-                               emit(e.record_id, "record_id", "log", "operator"))
-    n_items = sum(len(e.keys) for e in entries if e.keys[0][1] != START_UNSET)
-    n_unset = sum(1 for e in entries if e.keys[0][1] == START_UNSET)
-    logger.info("houki_jukuryo run: targets=%s items=%s unset=%s notices=%s sent=%s "
-                "failed=%s history_failed=%s",
-                emit(len(records), "count", "log", "operator"),
-                emit(n_items, "count", "log", "operator"),
-                emit(n_unset, "count", "log", "operator"),
-                emit(len(notices), "count", "log", "operator"),
-                emit(sent, "count", "log", "operator"),
-                emit(failed, "count", "log", "operator"),
-                emit(history_failed, "count", "log", "operator"))
-    return {"targets": len(records), "items": n_items, "unset": n_unset, "notices": len(notices),
-            "sent": sent, "failed": failed, "history_failed": history_failed}
+        rid = _v(rec, "$id")
+        comp = compute(rec, today)
+        if comp is None:
+            unset += 1
+            continue
+        notified = notified_values(rec)
+        for day in alert_candidates(comp.remaining):
+            res["candidates"] += 1
+            marked = NOTIFIED_VALUES[day] in notified
+            r = await send_notice(LEDGER_KINDS[day], alert_business_key(rid, comp),
+                                  alert_text(today, rid, day, comp))
+            if r == SEND_SENT:
+                res["sent"] += 1
+                marks.setdefault(rid, []).append(day)
+            elif r == SEND_DUPLICATE_SENT:
+                res["duplicate"] += 1
+                if not marked:                       # 刻印未了 → 刻印だけ再試行（再通知しない）
+                    res["remark"] += 1
+                    marks.setdefault(rid, []).append(day)
+            elif r in (SEND_DUPLICATE_UNCONFIRMED, SEND_UNCONFIRMED):
+                res["unconfirmed"] += 1
+            elif r == SEND_LEDGER_UNAVAILABLE:
+                res["ledger_unavailable"] += 1
+            else:
+                res["failed"] += 1
+    res["unset"] = unset
+
+    for rec in records:
+        if not is_target(rec):
+            continue
+        rid = _v(rec, "$id")
+        if not record_writes(rec, today, marks.get(rid, [])):
+            continue
+        outcome = await commit_writes(rec, today, marks.get(rid, []))
+        if outcome == WRITE_WRITTEN:
+            res["written"] += 1
+        elif outcome == WRITE_ABORTED:
+            res["aborted"] += 1
+        elif outcome == WRITE_FAILED:
+            res["write_failed"] += 1
+
+    if unset > 0:
+        r = await send_notice(LEDGER_KIND_UNSET, today.isoformat(), unset_text(today, unset))
+        res["unset_result"] = r
+        if r == SEND_FAILED:
+            logger.warning("houki_jukuryo unset-count notice not sent")
+
+    logger.info("houki_jukuryo run: targets=%s candidates=%s sent=%s duplicate=%s remark=%s "
+                "unconfirmed=%s failed=%s ledger_unavailable=%s unset=%s written=%s "
+                "write_failed=%s aborted=%s",
+                emit(res["targets"], "count", "log", "operator"),
+                emit(res["candidates"], "count", "log", "operator"),
+                emit(res["sent"], "count", "log", "operator"),
+                emit(res["duplicate"], "count", "log", "operator"),
+                emit(res["remark"], "count", "log", "operator"),
+                emit(res["unconfirmed"], "count", "log", "operator"),
+                emit(res["failed"], "count", "log", "operator"),
+                emit(res["ledger_unavailable"], "count", "log", "operator"),
+                emit(res["unset"], "count", "log", "operator"),
+                emit(res["written"], "count", "log", "operator"),
+                emit(res["write_failed"], "count", "log", "operator"),
+                emit(res["aborted"], "count", "log", "operator"))
+    return res
 
 
 def job_name(hour: int) -> str:
@@ -533,7 +498,7 @@ def job_name(hour: int) -> str:
 
 def register_houki_jukuryo_job() -> None:
     """FastAPI startup から呼ぶ（return_deadline と同方式・env なし）。
-    fix2 C-4: RUN_HOURS_JST の各時刻に 1 ジョブずつ登録（hub/scheduler は 1 ジョブ 1 時刻）。"""
+    RUN_HOURS_JST の各時刻に 1 ジョブずつ登録（hub/scheduler は 1 ジョブ 1 時刻）。"""
     for hour in RUN_HOURS_JST:
         name = job_name(hour)
         if not hub_scheduler.is_registered(name):

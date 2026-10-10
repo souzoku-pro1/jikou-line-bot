@@ -243,11 +243,18 @@ class TestDeadlineCalc(unittest.TestCase):
                          datetime.date(2026, 8, 19))
 
     def test_no_anniversary_month_end(self):
-        # 11/30 起算 → 2月に応当日 30 なし → 月末（前日は取らない）
+        # HOUKI-JUKURYO-2（大野裁定 2026-10-08）: 11/30 起算 → 2 月に応当日 30 なし →
+        # その月の末日の **前日**（旧: 月末）。式は hub/houki_jukuryo.jukuryo_deadline に一本化
         self.assertEqual(tri.shanai_deadline(datetime.date(2026, 11, 30)),
-                         datetime.date(2027, 2, 28))
+                         datetime.date(2027, 2, 27))
         self.assertEqual(tri.shanai_deadline(datetime.date(2026, 1, 31)),
-                         datetime.date(2026, 4, 30))
+                         datetime.date(2026, 4, 29))
+
+    def test_formula_is_unified_with_houki_jukuryo(self):
+        from hub import houki_jukuryo as hj
+        for d in (datetime.date(2026, 4, 10), datetime.date(2026, 11, 30), datetime.date(2027, 11, 30),
+                  datetime.date(2026, 1, 31), datetime.date(2026, 3, 1)):
+            self.assertEqual(tri.shanai_deadline(d), hj.jukuryo_deadline(d))
 
     def test_month_anniversary(self):
         self.assertEqual(

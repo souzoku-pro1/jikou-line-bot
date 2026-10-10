@@ -737,6 +737,12 @@ EXPECTED_KINTONE_SCHEMA = {
             "法定満了日": {"type": "DATE"},
             "社内締切日": {"type": "DATE"},
             "熟慮期間通知履歴": {"type": "MULTI_LINE_TEXT"},
+            # HOUKI-JUKURYO-2（大野裁定 2026-10-08）: 起算日_確定 → 熟慮期間期限／残日数 を
+            # hub/houki_jukuryo が書く。通知済み閾値 は 14日前／7日前 の刻印に使う（form fields 実測）
+            "起算日_確定": {"type": "DATE"},
+            "熟慮期間期限": {"type": "DATE"},
+            "残日数": {"type": "NUMBER"},
+            "通知済み閾値": {"type": "CHECK_BOX", "required_options": ["14日前", "7日前"]},
             "申述提出日": {"type": "DATE"},
             "管轄家庭裁判所": {"type": "SINGLE_LINE_TEXT"},
             "事件番号": {"type": "SINGLE_LINE_TEXT"},

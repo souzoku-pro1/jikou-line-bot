@@ -23,7 +23,9 @@
   通知が届く」ことで担保。スキップ判断は常に弁護士）。
 - 熟慮期間の最小日数計算（票 5.・fail-closed）: 起算点=起算点確定済 yes なら
   起算日_確定、なければ申告 3 日付の最小値（souzoku-houki/03 §3.1）。
-  社内締切日=初日算入の 3 ヶ月後応当日の前日・応当日なしは月末（同 §3.3）。
+  締切日の式は HOUKI-JUKURYO-2 で hub/houki_jukuryo.jukuryo_deadline に一本化
+  （大野裁定 2026-10-08: 3 か月後の応当日の前日・応当日なしはその月の末日の前日）。
+  本 module は起算点の選び方（トリアージ時は未確定が通常のため申告値で代用）だけを持つ。
   起算点が導出できない（日付なし）場合は #2「熟慮期間の経過疑い」を該当扱い
   （安全側）とし #1 の数値判定は行わない。期日フィールドへの書込・閾値警報は
   H-8 スコープ（本票は判定にのみ使う）。
@@ -45,6 +47,7 @@ import anthropic
 from claude_gateway import ClaudeUnavailableError, create_message_with_fallback
 from hub import houki_case_store
 from hub import notify
+from hub.houki_jukuryo import jukuryo_deadline
 from hub.redact import emit
 
 logger = logging.getLogger("hub.houki_phone_triage")
@@ -134,15 +137,10 @@ def _month_anniversary(start: datetime.date, months: int) -> datetime.date:
 
 
 def shanai_deadline(start: datetime.date) -> datetime.date:
-    """社内締切日（安全側・03 §3.3）: 初日算入=起算点を起算日として
-    3 ヶ月後の応当日の前日。応当日なしはその月の末日。繰越なし。"""
-    m = start.month + 3
-    y = start.year + (m - 1) // 12
-    m = (m - 1) % 12 + 1
-    last = calendar.monthrange(y, m)[1]
-    if start.day > last:
-        return datetime.date(y, m, last)            # 応当日なし → 月末
-    return datetime.date(y, m, start.day) - datetime.timedelta(days=1)
+    """熟慮期間の期限（HOUKI-JUKURYO-2 で hub/houki_jukuryo.jukuryo_deadline に一本化。
+    大野裁定 2026-10-08: 3 か月後の応当日の前日・応当日なしはその月の末日の前日）。
+    旧実装（応当日なしは月末）は廃止。"""
+    return jukuryo_deadline(start)
 
 
 def _start_point(record: dict) -> datetime.date | None:

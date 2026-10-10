@@ -816,13 +816,16 @@ def _confirmable_where(now):
 
 
 async def list_unconfirmed(limit: int = 50, *, now=None) -> list[dict]:
-    """unconfirmed と滞留 started の一覧（本文・氏名・LINE userId なし。会話は不透明参照 ID）。"""
+    """unconfirmed と滞留 started の一覧（本文・氏名・LINE userId なし。会話は不透明参照 ID）。
+    HOUKI-JUKURYO-2-fix2 BH-07: inbound_event_id（業務キー）を返却項目に加える（表定義不変・読取のみ。
+    画面側は channel ごとに閉集合で解析して表示し、生の値はそのまま出さない）。"""
     now = now or _now()
     async with session_scope() as s:
         rows = (await s.execute(sa.select(
             send_operation.c.op_id, send_operation.c.business, send_operation.c.channel,
             send_operation.c.purpose, send_operation.c.actor, send_operation.c.state,
-            send_operation.c.started_at, send_operation.c.attempt_no, conversation.c.ref)
+            send_operation.c.started_at, send_operation.c.attempt_no,
+            send_operation.c.inbound_event_id, conversation.c.ref)
             .select_from(send_operation.outerjoin(
                 conversation, conversation.c.conversation_id == send_operation.c.conversation_id))
             .where(_confirmable_where(now))
@@ -830,7 +833,8 @@ async def list_unconfirmed(limit: int = 50, *, now=None) -> list[dict]:
     return [{"op_id": r.op_id, "business": r.business, "channel": r.channel,
              "purpose": r.purpose, "actor": r.actor, "state": r.state,
              "stale": r.state == STATE_STARTED, "started_at": _iso(r.started_at),
-             "attempt_no": int(r.attempt_no), "conversation_ref": r.ref or ""} for r in rows]
+             "attempt_no": int(r.attempt_no), "conversation_ref": r.ref or "",
+             "inbound_event_id": r.inbound_event_id or ""} for r in rows]
 
 
 async def count_unconfirmed(*, now=None) -> int:

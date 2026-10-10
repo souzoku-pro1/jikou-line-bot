@@ -534,9 +534,10 @@ class TestUnconfirmed(_DbMixin):
         op_id = self._unconfirmed()
         items = _run(sl.list_unconfirmed())
         self.assertEqual(len(items), 1)
+        # HOUKI-JUKURYO-2-fix2 BH-07: inbound_event_id（業務キー）を返却項目に追加（読取のみ・表定義不変）
         self.assertEqual(set(items[0]), {"op_id", "business", "channel", "purpose", "actor",
                                          "state", "stale", "started_at", "attempt_no",
-                                         "conversation_ref"})
+                                         "conversation_ref", "inbound_event_id"})
         self.assertEqual((items[0]["state"], items[0]["stale"]), ("unconfirmed", False))
         self.assertNotIn(USER, str(items))
         self.assertEqual(_run(sl.count_unconfirmed()), 1)
