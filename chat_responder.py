@@ -171,28 +171,28 @@ FAQ3_CANONICAL_TEXTS = [
 ]
 
 # ── 費用の定型案内（固定文） ────────────────────────────────────────────────────
-# 金額表記は「44,000円（税込）」で統一（2026-07-03 弁護士確定）
+# 金額表記は「44,000円（税込）」で統一（2026-07-03 弁護士確定）。JIKOU-FEE-RULE-1（大野裁定 2026-10-11）: 3社目以降 1社22,000円（税込）を追記
 FEE_GUIDE_TEXT = (
     "【費用のご案内】\n"
-    "・費用: 1社あたり44,000円（税込）。複数社の場合は 44,000円（税込）× 社数\n"
+    "・費用: 1社あたり44,000円（税込）。2社までは 44,000円（税込）× 社数\n"
+    "・3社目からは1社あたり22,000円（税込）。例: 3社 110,000円・4社 132,000円\n"
     "・お支払い: 前払いのみ（分割払いは承っておりません）\n"
     "・お支払い方法: 銀行振込またはカード決済（Stripe・デビットカード可）\n"
-    "・万一時効が完成していなかった場合も、時効援用通知の送付と業者への確認までの"
-    "業務に対する費用は発生いたします。その場合、確認をもって業務は終了となります。"
+    "・万一時効が完成していなかった場合も、時効援用通知の送付と業者への確認までの業務に対する費用は発生いたします。その場合、確認をもって業務は終了となります。"
 )
 
 # 会話履歴に固定文を送付済みかを判定するマーカー（費用ガードの会話単位化に使用）
 FEE_GUIDE_MARKER = "【費用のご案内】"
 
-# カテゴリ「費用の定型案内」の自動送信文に必須の文言（欠けたら承認制に降格。
-# ただし直近の会話履歴で固定文を送付済みなら、続き質問への簡潔な回答を許容する）
+# カテゴリ「費用の定型案内」の自動送信文に必須の文言（欠けたら承認制に降格。ただし直近の会話履歴で固定文を送付済みなら、続き質問への簡潔な回答を許容する）
+FEE_MULTI_REQUIRED_PHRASES = ["22,000円"]   # JIKOU-FEE-RULE-1: 「3社」以上の文脈でのみ必須（1〜2社の回答は従来どおり・送付済み緩和の対象外）
 FEE_REQUIRED_PHRASES = ["44,000円", "税込", "前払い", "分割払い", "費用は発生"]
 
-# 法テラスの標準回答（弁護士確認済み文言・2026-07-03。数値・条件の改変禁止）
+# 法テラスの標準回答（弁護士確認済み文言・2026-07-03。JIKOU-FEE-RULE-1〔大野裁定 2026-10-11〕で 3社目以降の規則を追記。数値・条件の改変禁止）
 HOTERASU_STANDARD_REPLY = (
     "申し訳ございません。当事務所では法テラス（民事法律扶助）の"
     "ご利用には対応しておりません。"
-    "費用は1社あたり44,000円（税込）の前払いとなります。"
+    "費用は1社あたり44,000円（税込）、3社目からは1社あたり22,000円（税込）の前払いとなります。"
 )
 # AUTOREPLY-GEN2 要件6: 法テラス質問に本標準回答をサーバー側で決定的に
 # 到達させる（従来はプロンプト内 FAQ 指示のみ＝モデル依存で不達だった）。
@@ -615,7 +615,7 @@ auto_send=true のときは常に "none"。
 【費用の定型案内】
 費用に関する質問には、次の固定文を一字一句変えずに返信に含めること（前後に会話の流れに合う自然な一文を添えてよい。省略・改変・要約は不可）:
 <<FEE_GUIDE>>
-例外: この会話で固定文を既に送付済みの場合、続き質問（「3社だといくらか」等）には固定文を繰り返さず簡潔に答えてよい（金額は必ず 44,000円（税込）× 社数 と整合させる）。
+例外: この会話で固定文を既に送付済みの場合、続き質問（「3社だといくらか」等）には固定文を繰り返さず簡潔に答えてよい（金額は必ず次の規則と整合させる: 1〜2社は 44,000円（税込）× 社数、3社目以降は 1社あたり 22,000円（税込）を加算。例: 1社 44,000円・2社 88,000円・3社 110,000円・4社 132,000円。3社以上の金額を答えるときは「22,000円」の語を必ず含める）。
 費用の値引き・分割回数の相談への応答は「費用交渉・減額相談」（承認必須）。
 
 【FAQ（弁護士確認済みの標準回答。数値・条件の改変禁止。自動送信可）】
@@ -684,7 +684,7 @@ auto_send=true のときは常に "none"。
 - 実績: 時効援用の解決実績は1000件以上。Googleの口コミは「大野法律事務所 川口」で検索いただけると案内してよい
 進行中・完了後:
 - 通知送付後、結果判明まで: 2〜4週間程度が多い
-- 完了後の追加依頼の費用: 同一料金（1社あたり44,000円（税込））。割引制度はない。費用の質問なので【費用の定型案内】の固定文ルールに従う。※「安くなりますか？」と割引の有無を尋ねられただけならこのFAQで自動送信可。値引きを求める交渉（「安くしてほしい」等）は「費用交渉・減額相談」
+- 完了後の追加依頼の費用: 同一の委任者については通算の社数で算定する（これまでの依頼分と合わせて3社目以降となる分は1社あたり22,000円（税込）。例: 前回1社+今回1社=通算2社なら44,000円（税込）、前回2社+今回1社=通算3社なら22,000円（税込））。割引制度はない。費用の質問なので【費用の定型案内】の固定文ルールに従う。※「安くなりますか？」と割引の有無を尋ねられただけならこのFAQで自動送信可。値引きを求める交渉（「安くしてほしい」等）は「費用交渉・減額相談」
 - 時効成立の証明書: 業者から証明書等は発行されない。完了は既存FAQのとおりLINEまたはメールで報告する
 
 【FAQ第3弾（弁護士確定済み・2026-07-03追加。数値・条件・言い回しの改変禁止。特記なき項目は自動送信可）】
@@ -1057,8 +1057,8 @@ JIKOU_PROFILE = BusinessProfile(
     hearing_style_route="hearing",
     style_section=STYLE_SECTION,
     fee_category="費用の定型案内",
-    fee_required_phrases=tuple(FEE_REQUIRED_PHRASES),
-    fee_guide_marker=FEE_GUIDE_MARKER,
+    fee_required_phrases=tuple(FEE_REQUIRED_PHRASES), fee_guide_marker=FEE_GUIDE_MARKER,
+    fee_multi_required_phrases=tuple(FEE_MULTI_REQUIRED_PHRASES),   # JIKOU-FEE-RULE-1
     conditional_category="時効見立て_条件付き",
     reservation_general_marker=RESERVATION_GENERAL_MARKER,
     reservation_individual_markers=tuple(RESERVATION_INDIVIDUAL_MARKERS),
@@ -1166,8 +1166,8 @@ def apply_server_guards(
         # b) 費用定型の必須文言（会話単位: 固定文を送付済みの顧客への
         #    続き質問には簡潔な回答を許容する。2026-07-03 弁護士承認済みの緩和）
         if category == p.fee_category:
-            missing = [ph for ph in p.fee_required_phrases if ph not in reply]
-            if missing and not _fee_guide_already_sent(history, profile=p):
+            missing = _fee_missing_phrases(reply, history, user_message, p)
+            if missing:   # JIKOU-FEE-RULE-1: 3社以上の文脈は追加必須語（緩和なし）
                 can_auto_send = False
                 reasons.append("費用定型の必須文言欠落: " + "、".join(missing))
         # c) 条件付き見立てカテゴリの留保文言・更新事由フラグ
@@ -1747,3 +1747,58 @@ async def handle_customer_message(
             emit(user_id, "external_ref", "log", "operator"),
             emit(approval_id, "record_id", "log", "operator"),
         )
+
+
+# ── JIKOU-FEE-RULE-1（大野裁定 2026-10-11）: 社数に応じた料金規則と費用ガードの追加必須語 ──
+#    末尾追記（redaction_sink_allowlist の file:line 番地を動かさない規約）。
+#    料金: 1社 44,000円（税込）・2社 88,000円・3社目以降は 1社あたり 22,000円（税込）を加算。
+#    手続完了後の追加依頼も同一委任者の通算社数で算定する（prompt の FAQ 第2弾に記載）。
+FEE_BASE_YEN = 44_000          # 1〜2社目の 1社あたり（弁護士確定 2026-07-03・凍結維持）
+FEE_EXTRA_YEN = 22_000         # 3社目以降の 1社あたり（大野裁定 2026-10-11）
+FEE_BASE_MAX_COUNT = 2         # 44,000円で算定する社数の上限
+_KANJI_DIGITS = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7,
+                 "八": 8, "九": 9, "十": 10}
+# 「3社」「３社」「三社」「10社」。「複数社」「数社」「各社」は数を持たないため対象外
+_CREDITOR_COUNT_RE = re.compile(r"(\d{1,2}|[一二三四五六七八九十])社")
+
+
+def fee_total_yen(count: int) -> int:
+    """通算社数 count に対する弁護士報酬の合計（税込）。count<=0 は 0。
+    1→44,000 / 2→88,000 / 3→110,000 / 4→132,000。"""
+    n = max(int(count), 0)
+    base = min(n, FEE_BASE_MAX_COUNT) * FEE_BASE_YEN
+    extra = max(n - FEE_BASE_MAX_COUNT, 0) * FEE_EXTRA_YEN
+    return base + extra
+
+
+def _creditor_count_mentioned(text: str) -> int:
+    """文中の「N社」の最大 N（NFKC 正規化後・算用数字 2 桁まで・漢数字 一〜十）。
+    該当なしは 0。費用ガードの「3社以上の文脈」判定に使う（機構側・業務非依存）。"""
+    norm = unicodedata.normalize("NFKC", str(text or ""))
+    best = 0
+    for m in _CREDITOR_COUNT_RE.finditer(norm):
+        token = m.group(1)
+        n = _KANJI_DIGITS.get(token) or (int(token) if token.isdigit() else 0)
+        best = max(best, n)
+    return best
+
+
+def _fee_missing_phrases(reply: str, history: list[dict], user_message: str,
+                         profile: BusinessProfile | None = None) -> list[str]:
+    """費用定型の欠落必須語（apply_server_guards の b) から呼ぶ・単一の正）。
+    - 基本必須語（fee_required_phrases）: 固定文を送付済みの顧客への続き質問では
+      免除（2026-07-03 弁護士承認済みの緩和・従来どおり）
+    - 追加必須語（fee_multi_required_phrases）: 質問文または返信文に
+      「N社」（N >= fee_multi_threshold）が現れる文脈でのみ必須。送付済み緩和の
+      対象外（3社以上の金額を 44,000円×社数 で答える誤りを構造的に止める）
+    順序は基本→追加（降格理由の表示順）。"""
+    p = profile or JIKOU_PROFILE
+    missing = [ph for ph in p.fee_required_phrases if ph not in reply]
+    if missing and _fee_guide_already_sent(history, profile=p):
+        missing = []
+    if p.fee_multi_required_phrases:
+        n = max(_creditor_count_mentioned(user_message), _creditor_count_mentioned(reply))
+        if n >= p.fee_multi_threshold:
+            missing += [ph for ph in p.fee_multi_required_phrases
+                        if ph not in reply and ph not in missing]
+    return missing

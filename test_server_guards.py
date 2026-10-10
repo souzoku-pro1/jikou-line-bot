@@ -17,7 +17,9 @@
 import unittest
 
 from chat_responder import (
+    _creditor_count_mentioned,
     _FORBIDDEN_PATTERNS,
+    _SYSTEM_PROMPT_BASE,
     APPROVED_DUNNING_INSTRUCTION,
     APPROVED_PHONE_INSTRUCTION,
     AUTO_SEND_CATEGORIES,
@@ -27,13 +29,16 @@ from chat_responder import (
     CRISIS_SUPPORT_REPLY,
     FAQ3_CANONICAL_TEXTS,
     FEE_GUIDE_TEXT,
+    FEE_MULTI_REQUIRED_PHRASES,
     FEE_REQUIRED_PHRASES,
+    HOTERASU_STANDARD_REPLY,
     IMMEDIATE_NOTICE_TEXTS,
     OUT_OF_SCOPE_DEBT_REPLY,
     URGENT_NOTICE_KINDS,
     URGENT_SEIZURE_PANIC_REPLY,
     apply_server_guards,
     build_attorney_notification,
+    fee_total_yen,
     find_forbidden_words,
     looks_like_court_doc_report,
 )
@@ -317,7 +322,9 @@ class TestFeeRequiredPhrases(unittest.TestCase):
             {"role": "user", "content": "費用はいくらですか？"},
             {"role": "assistant", "content": f"ご案内いたします。\n{FEE_GUIDE_TEXT}"},
         ]
-        reply = "3社ですと、44,000円（税込）× 3社 = 132,000円（税込）となります。"
+        # JIKOU-FEE-RULE-1（大野裁定 2026-10-11）: 3社=88,000+22,000=110,000円
+        # （旧例文「44,000円×3社=132,000円」は新規則では誤り）
+        reply = "3社ですと、2社分88,000円（税込）に3社目22,000円（税込）を加えた110,000円（税込）となります。"
         g = apply_server_guards(
             _result(reply=reply, category="費用の定型案内"), history, "三社だといくらですか？"
         )
@@ -329,7 +336,7 @@ class TestFeeRequiredPhrases(unittest.TestCase):
             {"role": "user", "content": "こんにちは"},
             {"role": "assistant", "content": "こんにちは。ご連絡ありがとうございます。"},
         ]
-        reply = "3社ですと、44,000円（税込）× 3社 = 132,000円（税込）となります。"
+        reply = "3社ですと、2社分88,000円（税込）に3社目22,000円（税込）を加えた110,000円（税込）となります。"
         g = apply_server_guards(
             _result(reply=reply, category="費用の定型案内"), history, "三社だといくらですか？"
         )
@@ -342,6 +349,125 @@ class TestFeeRequiredPhrases(unittest.TestCase):
             _result(reply="こんにちは。ご連絡ありがとうございます。"), [], "こんにちは"
         )
         self.assertTrue(g.can_auto_send)
+
+
+class TestFeeRuleMultiCreditor(unittest.TestCase):
+    """JIKOU-FEE-RULE-1（大野裁定 2026-10-11）: 1社 44,000円・2社 88,000円・
+    3社目以降 1社 22,000円。3社以上の文脈でのみ「22,000円」を追加必須語とし、
+    1〜2社の回答は従来どおり（単純追加で降格しない）。"""
+
+    _SENT = [
+        {"role": "user", "content": "費用はいくらですか？"},
+        {"role": "assistant", "content": f"ご案内いたします。\n{FEE_GUIDE_TEXT}"},
+    ]
+
+    def test_a_fee_totals_and_guide_examples(self):
+        """(a) 1〜4 社の合計と、固定文の例示・必須語の自己整合"""
+        self.assertEqual([fee_total_yen(n) for n in (1, 2, 3, 4)],
+                         [44000, 88000, 110000, 132000])
+        self.assertEqual(fee_total_yen(0), 0)
+        self.assertIn("3社目からは1社あたり22,000円（税込）", FEE_GUIDE_TEXT)
+        self.assertIn("3社 110,000円・4社 132,000円", FEE_GUIDE_TEXT)
+        self.assertIn("2社までは 44,000円（税込）× 社数", FEE_GUIDE_TEXT)
+        for phrase in FEE_REQUIRED_PHRASES + FEE_MULTI_REQUIRED_PHRASES:
+            self.assertIn(phrase, FEE_GUIDE_TEXT)
+        self.assertEqual(FEE_MULTI_REQUIRED_PHRASES, ["22,000円"])
+        # 固定文自体は 4 社の例を含む=3社以上の文脈でも自己整合で自動送信可
+        for n, q in ((1, "1社です"), (2, "2社あります"), (3, "3社です"), (4, "四社です")):
+            with self.subTest(n=n):
+                g = apply_server_guards(
+                    _result(reply=f"ご案内します。\n{FEE_GUIDE_TEXT}",
+                            category="費用の定型案内"), [], q)
+                self.assertTrue(g.can_auto_send, g.demotion_reasons)
+
+    def test_a_correct_totals_auto_send(self):
+        """(a) 固定文送付済みの続き質問で、正しい合計の回答は自動送信可"""
+        cases = (
+            ("1社だといくらですか", "1社ですと44,000円（税込）です。"),
+            ("2社だといくらですか", "2社ですと44,000円（税込）×2社で88,000円（税込）です。"),
+            ("3社だといくらですか", "3社ですと88,000円に3社目の22,000円（税込）を加えた110,000円（税込）です。"),
+            ("4社だといくらですか", "4社ですと88,000円に3社目・4社目の各22,000円（税込）を加えた132,000円（税込）です。"),
+        )
+        for q, reply in cases:
+            with self.subTest(q=q):
+                g = apply_server_guards(
+                    _result(reply=reply, category="費用の定型案内"), self._SENT, q)
+                self.assertTrue(g.can_auto_send, g.demotion_reasons)
+
+    def test_b_one_or_two_creditors_without_22000_not_demoted(self):
+        """(b) 1〜2 社の文脈では 22,000円 が無くても降格しない（必須語の単純追加ではない）"""
+        for q, reply in (("1社だといくらですか", "1社ですと44,000円（税込）です。"),
+                         ("二社だといくら", "2社ですと88,000円（税込）です。"),
+                         ("費用を教えて", "合計は44,000円（税込）です。")):
+            with self.subTest(q=q):
+                g = apply_server_guards(
+                    _result(reply=reply, category="費用の定型案内"), self._SENT, q)
+                self.assertTrue(g.can_auto_send, g.demotion_reasons)
+                self.assertFalse(any("22,000円" in r for r in g.demotion_reasons))
+
+    def test_c_three_or_more_without_22000_demoted(self):
+        """(c) 3 社以上の文脈で 22,000円 が無ければ降格（送付済み緩和の対象外・
+        質問側/返信側どちらに社数が現れても検知）"""
+        wrong = "3社ですと、44,000円（税込）× 3社 = 132,000円（税込）となります。"
+        for history in ([], self._SENT):
+            for q, reply in (("三社だといくらですか？", wrong),
+                             ("3社あります", "合計は132,000円（税込）です。"),
+                             ("４社です", "4社ですと176,000円（税込）です。"),
+                             ("費用はいくらですか", "3社ですと132,000円（税込）です。")):
+                with self.subTest(sent=bool(history), q=q):
+                    g = apply_server_guards(
+                        _result(reply=reply, category="費用の定型案内"), history, q)
+                    self.assertFalse(g.can_auto_send)
+                    self.assertTrue(any("22,000円" in r for r in g.demotion_reasons),
+                                    g.demotion_reasons)
+
+    def test_c_full_guide_in_reply_satisfies_three_or_more(self):
+        """固定文を返信に含めれば 3 社の文脈でも必須語を満たす（固定文未送付の顧客）"""
+        g = apply_server_guards(
+            _result(reply=f"ご案内します。\n{FEE_GUIDE_TEXT}", category="費用の定型案内"),
+            [], "3社あるのですが費用は？")
+        self.assertTrue(g.can_auto_send, g.demotion_reasons)
+
+    def test_d_additional_request_uses_cumulative_count(self):
+        """(d) 追加依頼は通算社数（前回2社+今回1社=通算3社 → 22,000円）。
+        通算の算定は prompt（FAQ 第2弾）の責務で、ガードは「返信が通算3社目と述べながら
+        44,000円 のみで答える」誤りを「3社」の語で検知して止める（質問文の「2社」+「1社」
+        の加算は行わない=「2社のうち1社だけ」と区別できないため）。モデル実測は
+        test_triage_classification の fee-rule-1 ケース。前回1社+今回1社=通算2社は
+        44,000円 のまま（22,000円 不要）"""
+        q3 = "前回2社お願いしました。別の1社も追加でお願いしたいのですが費用は？"
+        g = apply_server_guards(
+            _result(reply="通算3社目となりますので、追加の1社は22,000円（税込）です。",
+                    category="費用の定型案内"), self._SENT, q3)
+        self.assertTrue(g.can_auto_send, g.demotion_reasons)
+        g = apply_server_guards(
+            _result(reply="通算3社目となりますが、追加の1社も44,000円（税込）です。",
+                    category="費用の定型案内"), self._SENT, q3)
+        self.assertFalse(g.can_auto_send)
+        self.assertTrue(any("22,000円" in r for r in g.demotion_reasons), g.demotion_reasons)
+        q2 = "前回1社お願いしました。別の1社も追加でお願いしたいのですが費用は？"
+        g = apply_server_guards(
+            _result(reply="通算2社ですので、追加の1社は44,000円（税込）です。",
+                    category="費用の定型案内"), self._SENT, q2)
+        self.assertTrue(g.can_auto_send, g.demotion_reasons)
+        # prompt の FAQ（追加依頼=通算社数）と固定文の整合ルール
+        self.assertIn("通算の社数で算定", _SYSTEM_PROMPT_BASE)
+        self.assertIn("3社目以降は 1社あたり 22,000円（税込）を加算", _SYSTEM_PROMPT_BASE)
+        self.assertNotIn("44,000円（税込）× 社数 と整合", _SYSTEM_PROMPT_BASE)
+
+    def test_creditor_count_detector(self):
+        """「N社」の読取（NFKC・漢数字）。数を持たない表現は 0"""
+        for text, n in (("三社", 3), ("３社", 3), ("3社", 3), ("10社", 10),
+                        ("1社あたり", 1), ("複数社", 0), ("数社", 0), ("各社", 0),
+                        ("", 0), ("会社です", 0)):
+            with self.subTest(text=text):
+                self.assertEqual(_creditor_count_mentioned(text), n)
+
+    def test_hoterasu_reply_aligned(self):
+        """法テラス標準回答も同じ規則（44,000円 維持+22,000円 追記）"""
+        self.assertIn("1社あたり44,000円（税込）", HOTERASU_STANDARD_REPLY)
+        self.assertIn("3社目からは1社あたり22,000円（税込）", HOTERASU_STANDARD_REPLY)
+        self.assertIn("前払い", HOTERASU_STANDARD_REPLY)
 
 
 class TestMitateReservation(unittest.TestCase):

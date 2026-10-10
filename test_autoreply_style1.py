@@ -216,12 +216,16 @@ FAQ_BASIS_EVIDENCE = {
 FROZEN_SHA = {
     "hearing_prompt_body":
         "52a8e0fefb8920f4189908aa9c62a068c0f4357148a8d8c2bbcb391a6be9c9a6",
+    # JIKOU-FEE-RULE-1（大野裁定 2026-10-11）: 費用の社数規則（【費用の定型案内】の
+    # 整合ルール・FAQ 第2弾の追加依頼）を prompt 本文に反映 → 再 pin
     "customer_prompt_base":
-        "8e4f0625fbf998fb9472afa5ffa54eecd2940f8424c23509f5f7906b3ad3822c",
+        "89fd82e178692d69fda80381c35b297cb59b79fd6a29531d4ed27e03689f0dd4",
     "hearing_template_blocks":
         "24103a7b21a889319c8b9eefb9f15bbf35f1c9b065ef459903b27ff6c990159e",
+    # JIKOU-FEE-RULE-1（大野裁定 2026-10-11）: 法テラス標準回答に「3社目からは1社あたり
+    # 22,000円（税込）」を追記 → 再 pin（immediate_notice_texts も同文を含むため連動）
     "hoterasu":
-        "93bd619e1270a61ef38af3dffb5ed6ea247a1838fe79c803f8ea324e016dd631",
+        "4b2063a97ce2b5c68bedb9bb1e548efcfe48c5a5083ff9eb09de224189308206",
     "pending_reply":
         "72f4332c206d683e55822b935680febaa4622dca6997d9abdb80c120a24f895c",
     "pending_by_category":
@@ -231,11 +235,13 @@ FROZEN_SHA = {
     "image_marker":
         "e8e3a1a6b89bae7bb1eb369843281d5af333d8cb4f0953ed83c99062230d03b0",
     "immediate_notice_texts":
-        "b565c9fc4157eb584777735eaa422d46945b40798366e0adaae5afe4bc419c52",
+        "7371acea6fda4062aff5933f52c2eddc788f610163df76e5b4341216c9340f06",
     "faq3_canonical":
         "74035d95b0fda4efb5af025a628dadd7e7f625e0182a5b96d68bd632974f2587",
+    # JIKOU-FEE-RULE-1（大野裁定 2026-10-11）: 固定文に「3社目からは1社あたり22,000円
+    # （税込）。例: 3社 110,000円・4社 132,000円」を追記（44,000円の文言は維持）→ 再 pin
     "fee_guide":
-        "ab4b02e474f234b3deaa2f47dad0a048578cd0dc7a77f682c383d89b73356e2f",
+        "1581839b9c8cdb68231079ce547ca6145a17667dace08fc08051a2540f68baf7",
     "phone_instruction":
         "9b5003ff979dc6ccac5448359559dc6d52f4fecf39d97583555c48fde02c6ef6",
     "dunning_instruction":
