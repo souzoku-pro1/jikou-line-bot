@@ -56,6 +56,13 @@ class TestFailurePaths(_Common):
     def test_compute_failure_is_reason_code_only(self):
         self.assert_no_leak(_run("compute"), "PRECOUNT_FAILED:compute")
 
+    # fix5 BH-13: SystemExit（依存先の sys.exit 相当）も 3 境界で捕捉し、文字列・コードを出さない
+    def test_a_fetch_systemexit_is_reason_code_only(self):
+        self.assert_no_leak(_run("fetch_exit"), "PRECOUNT_FAILED:fetch")
+
+    def test_b_import_systemexit_is_reason_code_only(self):
+        self.assert_no_leak(_run("import_exit"), "PRECOUNT_FAILED:import")
+
 
 class TestNormalPath(_Common):
     def test_c_counts_only_without_dates_or_ids(self):

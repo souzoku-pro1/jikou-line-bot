@@ -28,7 +28,9 @@ NullHandler にし、本スクリプトのロガーだけを stdout に繋ぐ。
 テスト用の注入点（HOUKI_PRECOUNT_FAULT・未設定なら何もしない。test_houki_jukuryo_precount.py が
 subprocess で使う。本番では設定しない）:
   import        … 存在しないモジュールの import を強制（import 失敗の経路）
+  import_exit   … import 境界で SystemExit（fix5 BH-13・本文に HOUKI_PRECOUNT_FAULT_MARKER）
   fetch         … 取得で例外（HOUKI_PRECOUNT_FAULT_MARKER の文字列を例外本文に含める＝漏洩検査用）
+  fetch_exit    … 取得で SystemExit（fix5 BH-13・同上）
   compute       … 集計で例外（同上・取得は合成レコード）
   fake_records  … kintone に触らず合成レコード（PII なし）で正常経路を通す
 """
@@ -73,6 +75,9 @@ logger = _configure_logging()
 
 def _excepthook(exc_type, exc, tb):
     """想定外の例外（main の外・終了処理中など）: 固定文言のみ・Traceback を出さない。
+    SystemExit は扱わない（Python は SystemExit を excepthook に渡さず終了コードとして処理する。
+    main() 内の SystemExit は fix5 BH-13 で 3 境界が捕捉して理由コード＋終了 2 に変換する。
+    CLI 末尾の sys.exit(main()) は捕捉範囲外のまま）。KeyboardInterrupt は従来どおり本 hook で unexpected。
     （sink 方針: logger の引数はリテラルで書く＝REASON_* と同値・テストが同値を pin）"""
     logger.error("PRECOUNT_FAILED:unexpected")
 
@@ -83,8 +88,11 @@ sys.excepthook = _excepthook
 def _load():
     """実装モジュールの import（hub の import 失敗もここに含まれる）。"""
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    if os.environ.get(FAULT_ENV, "").strip() == "import":
+    fault = os.environ.get(FAULT_ENV, "").strip()
+    if fault == "import":
         importlib.import_module("houki_precount_nonexistent_module_for_test")
+    if fault == "import_exit":                  # fix5 BH-13: import 境界での SystemExit（テスト用）
+        raise SystemExit(os.environ.get("HOUKI_PRECOUNT_FAULT_MARKER", "injected-exit"))
     try:
         import truststore
         truststore.inject_into_ssl()
@@ -96,20 +104,22 @@ def _load():
 
 
 def main() -> int:
-    """CLI 入口: 全失敗を捕捉し、固定の理由コードと非ゼロ終了にする（例外本文は出さない）。"""
+    """CLI 入口: 全失敗を捕捉し、固定の理由コードと非ゼロ終了にする（例外本文は出さない）。
+    fix5 BH-13: 3 境界は SystemExit も捕捉し（依存先の sys.exit を含む）、その文字列・コードを出さず
+    理由コード＋終了 2 に変換する。KeyboardInterrupt は捕捉しない（従来どおり excepthook → unexpected）。"""
     try:
         impl = _load()
-    except Exception:
+    except (Exception, SystemExit):
         logger.error("PRECOUNT_FAILED:import")
         return EXIT_FAILED
     try:
         records = asyncio.run(impl.fetch())
-    except Exception:
+    except (Exception, SystemExit):
         logger.error("PRECOUNT_FAILED:fetch")
         return EXIT_FAILED
     try:
         impl.report(impl.compute(records))
-    except Exception:
+    except (Exception, SystemExit):
         logger.error("PRECOUNT_FAILED:compute")
         return EXIT_FAILED
     return 0

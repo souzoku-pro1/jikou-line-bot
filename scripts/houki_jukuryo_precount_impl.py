@@ -47,6 +47,8 @@ async def fetch() -> list[dict]:
     f = _fault()
     if f == "fetch":
         raise RuntimeError(_marker())
+    if f == "fetch_exit":                       # fix5 BH-13: 依存先の sys.exit 相当
+        raise SystemExit(_marker())
     if f in ("fake_records", "compute"):
         return fake_records()
     return await hj.fetch_all_targets()
