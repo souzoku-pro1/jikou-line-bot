@@ -20,6 +20,8 @@ from chat_responder import (
     _creditor_count_mentioned,
     _FORBIDDEN_PATTERNS,
     _SYSTEM_PROMPT_BASE,
+    COUNT_UNKNOWN,
+    FEE_COUNT_UNKNOWN_REASON,
     APPROVED_DUNNING_INSTRUCTION,
     APPROVED_PHONE_INSTRUCTION,
     AUTO_SEND_CATEGORIES,
@@ -456,12 +458,74 @@ class TestFeeRuleMultiCreditor(unittest.TestCase):
         self.assertNotIn("44,000円（税込）× 社数 と整合", _SYSTEM_PROMPT_BASE)
 
     def test_creditor_count_detector(self):
-        """「N社」の読取（NFKC・漢数字）。数を持たない表現は 0"""
+        """「N社」の読取（NFKC・漢数字）。数を持たない表現は 0。
+        fix1 BF-01（Codex R-JIKOU-FEE-RULE-1）: 数字列全体を読む・途中からの部分一致禁止"""
         for text, n in (("三社", 3), ("３社", 3), ("3社", 3), ("10社", 10),
                         ("1社あたり", 1), ("複数社", 0), ("数社", 0), ("各社", 0),
-                        ("", 0), ("会社です", 0)):
+                        ("", 0), ("会社です", 0),
+                        # BF-01 回帰: 複合漢数字（旧実装は末尾 1 文字だけ読み 1/2/1 になった）
+                        ("十一社", 11), ("十二社", 12), ("二十一社", 21), ("十社", 10),
+                        ("百社", 100), ("二百三十社", 230), ("3社目", 3), ("3 社", 3),
+                        ("３社です", 3), ("三社分", 3), ("三社以上", 3), ("三社合計", 3),
+                        ("2026社", 2026),
+                        # 対象外のまま
+                        ("3件", 0), ("三件", 0),
+                        # 社名文脈（漢数字+社+助数詞外の漢字）は数えない → 残る「1 社」=1
+                        ("三社電機の 1 社です", 1), ("三社電機", 0), ("五社協定です", 0),
+                        # 算用数字形の社名は除外しない=安全側（3 社扱い）
+                        ("3社電機の1社です", 3), ("３社電機", 3)):
             with self.subTest(text=text):
                 self.assertEqual(_creditor_count_mentioned(text), n)
+
+    def test_creditor_count_unknown(self):
+        """fix1 BF-01: 解釈できない数表現は 1〜2 社に倒さず判定不能（COUNT_UNKNOWN）"""
+        for text in ("十十社", "一十社", "二三社", "十百社", "1十社", "三1社",
+                     "２社と十十社"):                      # 解釈可能な表現が混在しても不能
+            with self.subTest(text=text):
+                self.assertIs(_creditor_count_mentioned(text), COUNT_UNKNOWN)
+        self.assertIsNone(COUNT_UNKNOWN)
+
+    def test_c_compound_kanji_three_or_more_demoted(self):
+        """fix1 BF-01: 「十一社」「二十一社」も 3 社以上の文脈として 22,000円 を要求"""
+        for q in ("十一社あります", "二十一社です", "十社だといくら"):
+            with self.subTest(q=q):
+                g = apply_server_guards(
+                    _result(reply="合計は484,000円（税込）です。", category="費用の定型案内"),
+                    self._SENT, q)
+                self.assertFalse(g.can_auto_send)
+                self.assertTrue(any("22,000円" in r for r in g.demotion_reasons),
+                                g.demotion_reasons)
+                g = apply_server_guards(
+                    _result(reply="2社分88,000円に3社目以降は1社あたり22,000円（税込）を加算します。",
+                            category="費用の定型案内"), self._SENT, q)
+                self.assertTrue(g.can_auto_send, g.demotion_reasons)
+
+    def test_unknown_count_demotes_even_after_guide_sent(self):
+        """fix1 BF-01: 判定不能は送付済み緩和の対象外で承認へ（質問側・返信側とも）。
+        降格理由は固定文言。必須語欠落と併記される場合は「／」区切り"""
+        for q, reply in (("十十社あります", "合計は44,000円（税込）です。"),
+                         ("費用は？", "一十社ですと44,000円（税込）です。")):
+            with self.subTest(q=q):
+                g = apply_server_guards(
+                    _result(reply=reply, category="費用の定型案内"), self._SENT, q)
+                self.assertFalse(g.can_auto_send)
+                self.assertIn(FEE_COUNT_UNKNOWN_REASON, g.demotion_reasons)
+        g = apply_server_guards(
+            _result(reply="合計は44,000円です。", category="費用の定型案内"), [], "十十社あります")
+        self.assertFalse(g.can_auto_send)
+        self.assertEqual(len(g.demotion_reasons), 1)
+        self.assertTrue(g.demotion_reasons[0].startswith("費用定型の必須文言欠落: "))
+        self.assertTrue(g.demotion_reasons[0].endswith("／" + FEE_COUNT_UNKNOWN_REASON))
+        # 1〜2 社・社名文脈は従来どおり自動送信可（判定不能にならない）
+        for q in ("二社です", "三社電機の 1 社です", "2社あります"):
+            with self.subTest(q=q):
+                g = apply_server_guards(
+                    _result(reply="2社ですと88,000円（税込）です。", category="費用の定型案内"),
+                    self._SENT, q)
+                self.assertTrue(g.can_auto_send, g.demotion_reasons)
+        # 費用カテゴリ以外は社数を見ない
+        g = apply_server_guards(_result(reply="承知しました。"), [], "十十社あります")
+        self.assertTrue(g.can_auto_send)
 
     def test_hoterasu_reply_aligned(self):
         """法テラス標準回答も同じ規則（44,000円 維持+22,000円 追記）"""

@@ -1166,10 +1166,10 @@ def apply_server_guards(
         # b) 費用定型の必須文言（会話単位: 固定文を送付済みの顧客への
         #    続き質問には簡潔な回答を許容する。2026-07-03 弁護士承認済みの緩和）
         if category == p.fee_category:
-            missing = _fee_missing_phrases(reply, history, user_message, p)
-            if missing:   # JIKOU-FEE-RULE-1: 3社以上の文脈は追加必須語（緩和なし）
+            missing, unknown = _fee_check(reply, history, user_message, p)
+            if missing or unknown:   # JIKOU-FEE-RULE-1: 3社以上は追加必須語・fix1 BF-01: 判定不能も降格
                 can_auto_send = False
-                reasons.append("費用定型の必須文言欠落: " + "、".join(missing))
+                reasons.append(_fee_demotion_reason(missing, unknown))
         # c) 条件付き見立てカテゴリの留保文言・更新事由フラグ
         if category == p.conditional_category:
             has_reservation = (
@@ -1757,9 +1757,57 @@ FEE_BASE_YEN = 44_000          # 1〜2社目の 1社あたり（弁護士確定 
 FEE_EXTRA_YEN = 22_000         # 3社目以降の 1社あたり（大野裁定 2026-10-11）
 FEE_BASE_MAX_COUNT = 2         # 44,000円で算定する社数の上限
 _KANJI_DIGITS = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7,
-                 "八": 8, "九": 9, "十": 10}
-# 「3社」「３社」「三社」「10社」。「複数社」「数社」「各社」は数を持たないため対象外
-_CREDITOR_COUNT_RE = re.compile(r"(\d{1,2}|[一二三四五六七八九十])社")
+                 "八": 8, "九": 9}
+_KANJI_UNITS = {"十": 10, "百": 100}
+_NUMERAL_CHARS = "0-9一二三四五六七八九十百"
+# fix1 BF-01: 数字列**全体**を読む（算用数字は桁数制限なし・全角は NFKC で算用化・漢数字は
+# 「十」「百」を含む複合）。先頭に数字が続く途中からの部分一致は lookbehind で禁止
+# （「十二社」を「二社」と読まない・「1十社」を「十社」と読まない）。数字と「社」の間の
+# 空白 1 つは許容（票の表記「3 社」）。「複数社」「数社」「各社」は数を持たないため対象外。
+_CREDITOR_COUNT_RE = re.compile(rf"(?<![{_NUMERAL_CHARS}])([{_NUMERAL_CHARS}]+)\s?社(.?)")
+# fix1 BF-01: 漢数字+社 の直後が「社名」文脈（会社名の一部）なら除外する。除外は漢数字形
+# かつ直後が助数詞系の許容集合**外**の CJK 漢字に限る（「三社電機」「五社協定」）。算用
+# 数字形（「3社電機」）は除外しない=安全側（3 社扱い）。許容集合は「3社目/分/以上/合計…」
+# の読み漏れを防ぐためのもので、外れた表現は安全側でなく除外側に倒れる可能性がある——
+# その場合も返信側の「3社ですと…」（算用数字が通常）が第 2 の網として効く
+_COUNTER_SUFFIX_OK = frozenset("目分以全合中程共同超未間毎計位内外前後迄")
+_CJK_RE = re.compile(r"[一-鿿]")
+
+# 判定不能の印（解釈できない数表現が 1 つでもあれば全体を不能とし、1〜2 社に倒さない）
+COUNT_UNKNOWN = None
+
+
+def _parse_kanji_number(token: str) -> int | None:
+    """漢数字（一〜九・十・百の複合）を整数に。厳密文法のみ受理し、それ以外は None:
+      [D]百 [D]十 [D]  （D=一〜九・各位は高い順に 1 回まで・「十」「百」は単独でも可）
+    例: 十=10 十一=11 二十一=21 百=100 二百三十=230。「十十」「一十」「二三」は None。"""
+    n, last_unit = 0, 10_000
+    digit = None
+    for ch in token:
+        if ch in _KANJI_DIGITS:
+            if digit is not None:
+                return None                     # 「二三」: 位なしの連続
+            digit = _KANJI_DIGITS[ch]
+        elif ch in _KANJI_UNITS:
+            unit = _KANJI_UNITS[ch]
+            if unit >= last_unit:
+                return None                     # 「十百」「十十」: 位の逆順・重複
+            if digit == 1:
+                return None                     # 「一十」: 慣用外は不能に倒す
+            n += (digit or 1) * unit
+            digit, last_unit = None, unit
+        else:
+            return None
+    return n + (digit or 0)
+
+
+def _parse_count_token(token: str) -> int | None:
+    """数字列 → 整数。算用数字のみ／漢数字のみを受理。混在（「1十」）や文法外は None。"""
+    if token.isdigit():
+        return int(token)
+    if all(ch in _KANJI_DIGITS or ch in _KANJI_UNITS for ch in token):
+        return _parse_kanji_number(token)
+    return None
 
 
 def fee_total_yen(count: int) -> int:
@@ -1771,34 +1819,67 @@ def fee_total_yen(count: int) -> int:
     return base + extra
 
 
-def _creditor_count_mentioned(text: str) -> int:
-    """文中の「N社」の最大 N（NFKC 正規化後・算用数字 2 桁まで・漢数字 一〜十）。
-    該当なしは 0。費用ガードの「3社以上の文脈」判定に使う（機構側・業務非依存）。"""
+def _creditor_count_mentioned(text: str) -> int | None:
+    """文中の「N社」の最大 N（NFKC 正規化後・数字列全体を読む・fix1 BF-01）。
+    該当なしは 0。解釈できない数表現（文法外の漢数字・算用/漢数字の混在）が 1 つでも
+    あれば COUNT_UNKNOWN（None）＝呼び出し側は 1〜2 社に倒さず判定不能として降格する。
+    「社名」文脈（漢数字+社+助数詞外の漢字）は数えない（_COUNTER_SUFFIX_OK 参照）。
+    費用ガードの「3社以上の文脈」判定に使う（機構側・業務非依存）。"""
     norm = unicodedata.normalize("NFKC", str(text or ""))
     best = 0
     for m in _CREDITOR_COUNT_RE.finditer(norm):
-        token = m.group(1)
-        n = _KANJI_DIGITS.get(token) or (int(token) if token.isdigit() else 0)
+        token, after = m.group(1), m.group(2)
+        n = _parse_count_token(token)
+        if n is None:
+            return COUNT_UNKNOWN
+        if not token.isdigit() and after and _CJK_RE.match(after) \
+                and after not in _COUNTER_SUFFIX_OK:
+            continue                            # 「三社電機」: 会社名の一部とみなす
         best = max(best, n)
     return best
 
 
-def _fee_missing_phrases(reply: str, history: list[dict], user_message: str,
-                         profile: BusinessProfile | None = None) -> list[str]:
-    """費用定型の欠落必須語（apply_server_guards の b) から呼ぶ・単一の正）。
+def _fee_check(reply: str, history: list[dict], user_message: str,
+               profile: BusinessProfile | None = None) -> tuple[list[str], bool]:
+    """費用定型の検査（apply_server_guards の b) から呼ぶ・単一の正）。
+    戻り値 (欠落必須語, 社数判定不能)。
     - 基本必須語（fee_required_phrases）: 固定文を送付済みの顧客への続き質問では
       免除（2026-07-03 弁護士承認済みの緩和・従来どおり）
     - 追加必須語（fee_multi_required_phrases）: 質問文または返信文に
       「N社」（N >= fee_multi_threshold）が現れる文脈でのみ必須。送付済み緩和の
       対象外（3社以上の金額を 44,000円×社数 で答える誤りを構造的に止める）
+    - fix1 BF-01: 質問文・返信文のどちらかの社数表現が解釈できないときは判定不能
+      （True）＝1〜2 社扱いにせず承認へ倒す（追加必須語の有無とは独立）
     順序は基本→追加（降格理由の表示順）。"""
     p = profile or JIKOU_PROFILE
     missing = [ph for ph in p.fee_required_phrases if ph not in reply]
     if missing and _fee_guide_already_sent(history, profile=p):
         missing = []
+    unknown = False
     if p.fee_multi_required_phrases:
-        n = max(_creditor_count_mentioned(user_message), _creditor_count_mentioned(reply))
-        if n >= p.fee_multi_threshold:
+        counts = (_creditor_count_mentioned(user_message), _creditor_count_mentioned(reply))
+        if any(c is COUNT_UNKNOWN for c in counts):
+            unknown = True
+        elif max(counts) >= p.fee_multi_threshold:
             missing += [ph for ph in p.fee_multi_required_phrases
                         if ph not in reply and ph not in missing]
-    return missing
+    return missing, unknown
+
+
+def _fee_missing_phrases(reply: str, history: list[dict], user_message: str,
+                         profile: BusinessProfile | None = None) -> list[str]:
+    """互換: 欠落必須語のみ（判定不能は含めない）。新規呼び出しは _fee_check を使う。"""
+    return _fee_check(reply, history, user_message, profile)[0]
+
+
+FEE_COUNT_UNKNOWN_REASON = "費用定型: 社数の表現を判定できません（承認へ）"
+
+
+def _fee_demotion_reason(missing: list[str], unknown: bool) -> str:
+    """b) の降格理由（欠落必須語の従来文言を維持し、判定不能は固定文言を併記）。"""
+    parts = []
+    if missing:
+        parts.append("費用定型の必須文言欠落: " + "、".join(missing))
+    if unknown:
+        parts.append(FEE_COUNT_UNKNOWN_REASON)
+    return "／".join(parts)
