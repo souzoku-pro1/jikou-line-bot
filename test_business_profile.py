@@ -179,9 +179,12 @@ class TestJikouProfileIsVerbatimBundle(unittest.TestCase):
             "first_report_detector": "looks_like_court_doc_report",
             "first_report_notice_key": P.first_report_notice_key,
         }, ensure_ascii=False, sort_keys=True)
+        # JIKOU-FEE-RULE-1（大野裁定 2026-10-11）: system_prompt_template（費用の社数
+        # 規則）・mandatory_reply_text / immediate_notice_texts（法テラス標準回答）の
+        # 改定に伴う再 pin（024773… → 3400bf…）。他の束は不変
         self.assertEqual(
             hashlib.sha256(payload.encode("utf-8")).hexdigest(),
-            "024773159246717a1bd3730d667acedcc3d475dd813f54d5b9af10ea35e33fe1")
+            "3400bf7564881e4a8bdbff8c3d6a6577c1bb240d3294b4bfd19732ef72040c63")
 
 
 class TestDefaultEqualsJikouProfile(unittest.TestCase):
@@ -436,11 +439,17 @@ class TestOutagePathProfile(unittest.TestCase):
         self.assertEqual(reply.await_args.args[1], "D確認中です。")
         self.assertEqual(self._assistant_saves(log), ["D確認中です。"])
 
-    def test_field_count_pinned_30(self):
+    def test_field_count_pinned_32(self):
         # [02]: BusinessProfile のフィールド数=30（H2 報告の 31 は誤記・
-        # 実体の増減なし）。増減は票由来でのみ行う
+        # 実体の増減なし）。増減は票由来でのみ行う。
+        # JIKOU-FEE-RULE-1（大野裁定 2026-10-11）: 費用ガードの社数文脈
+        # （fee_multi_required_phrases / fee_multi_threshold・既定値つき）を追加 → 32
         import dataclasses
-        self.assertEqual(len(dataclasses.fields(BusinessProfile)), 30)
+        self.assertEqual(len(dataclasses.fields(BusinessProfile)), 32)
+        self.assertEqual(P.fee_multi_required_phrases, ("22,000円",))
+        self.assertEqual(P.fee_multi_threshold, 3)
+        # 既定値（他業務のプロファイルは追加検査なし）
+        self.assertEqual(_dummy_profile().fee_multi_required_phrases, ())
 
 
 class TestHandleCustomerMessagePlumbing(unittest.TestCase):

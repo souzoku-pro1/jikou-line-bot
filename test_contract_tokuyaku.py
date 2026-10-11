@@ -42,12 +42,18 @@ from config import EXPECTED_DOCX_TEMPLATES, EXPECTED_KINTONE_SCHEMA  # noqa: E40
 
 sys.path.insert(0, "scripts")
 from add_contract_tokuyaku import build_tokuyaku_template  # noqa: E402
+from update_contract_fee_rule import build_fee_rule_template  # noqa: E402
 
 _client = TestClient(main.app)
 _URL = "/contract/doc-secret"
 _OLD_TEMPLATE = "scripts/fixtures/委任契約書_2026-08-22.docx"
 _OLD_SHA256 = "7cc168a1bbce3ca183e9f4a3d46b6b8288c17d4d21954f07cdf038428c355334"
-_NEW_SHA256 = "ead90bb8154f64318cc80ee7d6a2dda129192936ca29e32746348ac6145856fd"
+# JIKOU-FEE-RULE-1（大野裁定 2026-10-11）: 雛形は 3 世代。
+#   7cc168a1（2026-08-22 収載）→ 特約 2 段落追加 = ead90bb8（TOKUYAKU・fixture 化）
+#   → 第2条 新料金規則 = 7cb0d823（現行 TEMPLATE_SHA256）
+_TOKUYAKU_TEMPLATE = "scripts/fixtures/委任契約書_2026-09-05_tokuyaku.docx"
+_TOKUYAKU_SHA256 = "ead90bb8154f64318cc80ee7d6a2dda129192936ca29e32746348ac6145856fd"
+_NEW_SHA256 = "7cb0d8233cbaf35be22976c9e18b13a75e27928f5ff9e65b636e948d9f75f054"
 _EMAIL = "hanako@example.com"
 
 
@@ -341,34 +347,60 @@ class TestCloudSignPdf(_Base):
 # ── 8: 雛形 pin と再現性 ───────────────────────────────────────────────────────
 class TestTemplatePins(unittest.TestCase):
     def test_8_sha_paragraphs_and_reproducibility(self):
+        """JIKOU-FEE-RULE-1（大野裁定 2026-10-11）で 3 世代チェーンに更新:
+        7cc168a1 → build_tokuyaku_template → ead90bb8（fixture）→ build_fee_rule_template
+        → 7cb0d823（現行）。特約 2 段落の pin は TOKUYAKU 世代（fixture）に対して維持し、
+        現行雛形は第2条の差し替え（1 段落削除）ぶんだけ添字が 1 つ繰り上がる。"""
         new = open(cw.TEMPLATE_PATH, "rb").read()
         self.assertEqual(hashlib.sha256(new).hexdigest(), _NEW_SHA256)
         self.assertEqual(cw.TEMPLATE_SHA256, _NEW_SHA256)
         old = open(_OLD_TEMPLATE, "rb").read()
         self.assertEqual(hashlib.sha256(old).hexdigest(), _OLD_SHA256)      # 旧雛形 fixture
-        rebuilt = build_tokuyaku_template(old)
-        self.assertEqual(rebuilt, new)                                       # 再現性（同一 SHA）
-        self.assertEqual(build_tokuyaku_template(old), rebuilt)              # 決定的
-        paras = Document(io.BytesIO(new)).paragraphs
-        self.assertEqual(len(paras), 64 + 2)
-        texts = [p.text for p in paras]
-        self.assertEqual(texts[48], "第12条（合意管轄）")
-        self.assertTrue(texts[49].startswith("本契約に関して甲乙間に紛争が生じた場合は"))
-        self.assertEqual(texts[50], cw.TOKUYAKU_HEADING)
-        self.assertEqual(texts[51], cw.TOKUYAKU_KEY)
-        self.assertEqual(texts[52], "")
-        self.assertTrue(texts[53].startswith("本契約の成立を証するため"))
-        # 書式は既存の条見出し/条文本文の複製・単一 run・表なし
-        self.assertEqual(_ppr(paras[50]), _ppr(paras[48]))
-        self.assertEqual(_rpr(paras[50]), _rpr(paras[48]))
-        self.assertEqual(_ppr(paras[51]), _ppr(paras[49]))
-        self.assertEqual(_rpr(paras[51]), _rpr(paras[49]))
-        self.assertEqual(len(paras[51].runs), 1)
-        self.assertEqual(Document(io.BytesIO(new)).tables, [])
-        # 旧雛形との差分は 2 段落の挿入のみ（他の文面は一字も変えない）
+        tokuyaku = open(_TOKUYAKU_TEMPLATE, "rb").read()
+        self.assertEqual(hashlib.sha256(tokuyaku).hexdigest(), _TOKUYAKU_SHA256)
+        self.assertEqual(build_tokuyaku_template(old), tokuyaku)             # 第 1 段の再現性
+        rebuilt = build_fee_rule_template(tokuyaku)
+        self.assertEqual(rebuilt, new)                                       # 第 2 段の再現性（同一 SHA）
+        self.assertEqual(build_fee_rule_template(tokuyaku), rebuilt)         # 決定的
+        # ── TOKUYAKU 世代（fixture）に対する特約 2 段落の pin（従来どおり） ──
+        tparas = Document(io.BytesIO(tokuyaku)).paragraphs
+        self.assertEqual(len(tparas), 64 + 2)
+        ttexts = [p.text for p in tparas]
+        self.assertEqual(ttexts[48], "第12条（合意管轄）")
+        self.assertTrue(ttexts[49].startswith("本契約に関して甲乙間に紛争が生じた場合は"))
+        self.assertEqual(ttexts[50], cw.TOKUYAKU_HEADING)
+        self.assertEqual(ttexts[51], cw.TOKUYAKU_KEY)
+        self.assertEqual(ttexts[52], "")
+        self.assertTrue(ttexts[53].startswith("本契約の成立を証するため"))
+        self.assertEqual(_ppr(tparas[50]), _ppr(tparas[48]))
+        self.assertEqual(_rpr(tparas[50]), _rpr(tparas[48]))
+        self.assertEqual(_ppr(tparas[51]), _ppr(tparas[49]))
+        self.assertEqual(_rpr(tparas[51]), _rpr(tparas[49]))
+        self.assertEqual(len(tparas[51].runs), 1)
         old_texts = [p.text for p in Document(io.BytesIO(old)).paragraphs]
-        self.assertEqual(texts[:50] + texts[52:], old_texts)
-        # 第 2 条は不変・登録・スキーマ
+        self.assertEqual(ttexts[:50] + ttexts[52:], old_texts)               # 2 段落の挿入のみ
+        # ── 現行雛形: 第2条（見出し+旧 3 項 → 新 2 項）以外は TOKUYAKU 世代と一字一句同じ ──
+        paras = Document(io.BytesIO(new)).paragraphs
+        self.assertEqual(len(paras), 64 + 2 - 1)
+        texts = [p.text for p in paras]
+        self.assertEqual(texts[12], "第2条（弁護士報酬）")
+        self.assertEqual(ttexts[12], "第2条（弁護士報酬）")
+        self.assertEqual(tuple(texts[12:15]), cw.FROZEN_CLAUSE)
+        self.assertEqual(texts[:12], ttexts[:12])
+        self.assertEqual(texts[15:], ttexts[16:])
+        # 新 1 項・2 項は旧 1 項・旧 3 項の段落を流用（pPr・rPr 不変・単一 run）
+        self.assertEqual(_ppr(paras[13]), _ppr(tparas[13]))
+        self.assertEqual(_rpr(paras[13]), _rpr(tparas[13]))
+        self.assertEqual(_ppr(paras[14]), _ppr(tparas[15]))
+        self.assertEqual(_rpr(paras[14]), _rpr(tparas[15]))
+        self.assertEqual([len(paras[i].runs) for i in (12, 13, 14)], [1, 1, 1])
+        self.assertEqual(texts[47], "第12条（合意管轄）")
+        self.assertEqual(texts[49], cw.TOKUYAKU_HEADING)
+        self.assertEqual(texts[50], cw.TOKUYAKU_KEY)
+        self.assertEqual(texts[51], "")
+        self.assertTrue(texts[52].startswith("本契約の成立を証するため"))
+        self.assertEqual(Document(io.BytesIO(new)).tables, [])
+        # 第 2 条の凍結逐語・登録・スキーマ
         self.assertEqual(cw._clause_of(new), cw.FROZEN_CLAUSE)
         self.assertIn("{{特約}}", EXPECTED_DOCX_TEMPLATES["docx_templates/jikou/委任契約書.docx"])
         app21 = next(v for v in EXPECTED_KINTONE_SCHEMA.values()
@@ -379,6 +411,71 @@ class TestTemplatePins(unittest.TestCase):
         new = open(cw.TEMPLATE_PATH, "rb").read()
         with self.assertRaises(ValueError):
             build_tokuyaku_template(new)
+        # JIKOU-FEE-RULE-1: 料金規則スクリプトも二重適用（入力 SHA 不一致）を拒否
+        with self.assertRaises(ValueError):
+            build_fee_rule_template(new)
+        with self.assertRaises(ValueError):
+            build_fee_rule_template(open(_OLD_TEMPLATE, "rb").read())      # 特約前の世代も拒否
+
+
+# ── JIKOU-FEE-RULE-1（大野裁定 2026-10-11）: 第2条の新条文と旧雛形の拒否 ──────────
+class TestFeeRuleClause(unittest.TestCase):
+    NEW_ITEM_1 = ("1　本件弁護士報酬（手数料）は、対象1社あたり44,000円（消費税込み）とする。"
+                  "ただし、同一の委任者について対象が3社以上となる場合、3社目以降は1社あたり"
+                  "22,000円（消費税込み）とし、本契約締結後に対象を追加する場合も通算の社数"
+                  "により算定する。")
+    NEW_ITEM_2 = "2　報酬は前払いとし、分割払いはできない。"
+
+    def test_e_generated_contract_has_new_clause_and_other_articles_unchanged(self):
+        """(e) 生成物の第2条=新条文（裁定文言逐語）・他条項は雛形と不変"""
+        self.assertEqual(cw.FROZEN_CLAUSE,
+                         ("第2条（弁護士報酬）", self.NEW_ITEM_1, self.NEW_ITEM_2))
+        self.assertNotIn("社数を乗じた額", "".join(cw.FROZEN_CLAUSE))
+        rec = _record(対象債権者2="B社", 対象債権者3="C社", 特約="")
+        docx = cw.render_contract_docx(rec)
+        texts = _texts(docx)
+        self.assertEqual(tuple(texts[12:15]), cw.FROZEN_CLAUSE)
+        self.assertEqual(texts.count("第2条（弁護士報酬）"), 1)
+        # 第2条以外: 雛形の段落と差し込み（{{…}}）以外の差がない
+        tpl = _texts(open(cw.TEMPLATE_PATH, "rb").read())
+        tpl_wo = [t for i, t in enumerate(tpl) if t not in (cw.TOKUYAKU_HEADING, cw.TOKUYAKU_KEY)]
+        self.assertEqual(len(texts), len(tpl_wo))                           # 特約空=2 段落削除
+        for got, exp in zip(texts, tpl_wo):
+            if "{{" in exp:
+                continue
+            self.assertEqual(got, exp)
+        self.assertNotIn("{{", "\n".join(texts))
+        # PDF 段でも新条文が逐語で連続（折返し吸収）
+        pdf = contract_pdf.docx_to_pdf_bytes(docx)
+        cw.verify_frozen_pdf(pdf)
+        flat = "".join(contract_pdf.pdf_text(pdf).split())
+        self.assertIn("".join(self.NEW_ITEM_1.split()), flat)
+        self.assertNotIn("社数を乗じた額", flat)
+
+    def test_f_old_templates_rejected(self):
+        """(f) 旧雛形（特約前 7cc168a1・特約後 ead90bb8）はいずれも生成を拒否:
+        TEMPLATE_PATH に旧現物を向けると SHA 不一致（verify_template_integrity）、
+        旧現物の第2条は凍結逐語と不一致（verify_frozen_clause）。既存 negative
+        （TEMPLATE_SHA256 改変）も維持。"""
+        for path in (_OLD_TEMPLATE, _TOKUYAKU_TEMPLATE):
+            with self.subTest(path=path):
+                data = open(path, "rb").read()
+                with patch.object(cw, "TEMPLATE_PATH", path):
+                    with self.assertRaises(cw.ContractIntegrityError):
+                        cw.verify_template_integrity()
+                    with self.assertRaises(cw.ContractIntegrityError):
+                        cw.render_contract_docx(_record())
+                self.assertNotEqual(cw._clause_of(data), cw.FROZEN_CLAUSE)
+                self.assertIn("44,000", "".join(cw._clause_of(data)))        # 旧条文は 44,000 のみ
+                self.assertNotIn("22,000", "".join(cw._clause_of(data)))
+                with self.assertRaises(cw.ContractIntegrityError):
+                    cw.verify_frozen_clause(data)
+        with patch.object(cw, "TEMPLATE_SHA256", "0" * 64):
+            with self.assertRaises(cw.ContractIntegrityError):
+                cw.render_contract_docx(_record())
+        # 現行雛形は通る
+        cw.verify_template_integrity()
+        cw.verify_frozen_clause(open(cw.TEMPLATE_PATH, "rb").read())
 
 
 if __name__ == "__main__":
