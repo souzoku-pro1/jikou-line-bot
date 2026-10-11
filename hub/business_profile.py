@@ -89,6 +89,10 @@ class BusinessProfile:
     # 検出（N社 の読取）は機構側（chat_responder._creditor_count_mentioned）
     fee_multi_required_phrases: tuple = ()
     fee_multi_threshold: int = 3
+    # fix3（司令塔裁定 2026-10-11）: 費用の固定文（逐語）。顧客対応経路の長さ上限で
+    # 免除ブロックとして扱う（逐語一致した 1 回分のみ免除・自由文には従来の上限）。
+    # 空=免除なし（相続放棄は既定のまま）。実測: 固定文 248 字+宛名・前置きで 300 字超過
+    fee_guide_text: str = ""
 
 
 __all__ = ["BusinessProfile"]

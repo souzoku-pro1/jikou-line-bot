@@ -1058,7 +1058,7 @@ JIKOU_PROFILE = BusinessProfile(
     style_section=STYLE_SECTION,
     fee_category="費用の定型案内",
     fee_required_phrases=tuple(FEE_REQUIRED_PHRASES), fee_guide_marker=FEE_GUIDE_MARKER,
-    fee_multi_required_phrases=tuple(FEE_MULTI_REQUIRED_PHRASES),   # JIKOU-FEE-RULE-1
+    fee_multi_required_phrases=tuple(FEE_MULTI_REQUIRED_PHRASES), fee_guide_text=FEE_GUIDE_TEXT,   # JIKOU-FEE-RULE-1 / fix3
     conditional_category="時効見立て_条件付き",
     reservation_general_marker=RESERVATION_GENERAL_MARKER,
     reservation_individual_markers=tuple(RESERVATION_INDIVIDUAL_MARKERS),
@@ -1139,7 +1139,7 @@ def apply_server_guards(
         if sanitize_fatal:
             can_auto_send = False
             reasons.append("プレースホルダ/内部マーカー残存")
-        structural = reply_sanitizer.structure_violations(reply)
+        structural = reply_sanitizer.structure_violations(reply, exempt_blocks=(p.fee_guide_text,))   # fix3: 費用固定文は逐語 1 回分のみ長さ免除
         if structural:
             can_auto_send = False
             reasons.extend(structural)

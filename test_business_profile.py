@@ -444,12 +444,16 @@ class TestOutagePathProfile(unittest.TestCase):
         # 実体の増減なし）。増減は票由来でのみ行う。
         # JIKOU-FEE-RULE-1（大野裁定 2026-10-11）: 費用ガードの社数文脈
         # （fee_multi_required_phrases / fee_multi_threshold・既定値つき）を追加 → 32
+        # JIKOU-FEE-RULE-1-fix3（司令塔裁定 2026-10-11）: fee_guide_text（長さ免除ブロック・
+        # 既定 ""=免除なし）を追加 → 33
         import dataclasses
-        self.assertEqual(len(dataclasses.fields(BusinessProfile)), 32)
+        self.assertEqual(len(dataclasses.fields(BusinessProfile)), 33)
         self.assertEqual(P.fee_multi_required_phrases, ("22,000円",))
         self.assertEqual(P.fee_multi_threshold, 3)
-        # 既定値（他業務のプロファイルは追加検査なし）
+        self.assertEqual(P.fee_guide_text, cr.FEE_GUIDE_TEXT)
+        # 既定値（他業務のプロファイルは追加検査なし・免除なし）
         self.assertEqual(_dummy_profile().fee_multi_required_phrases, ())
+        self.assertEqual(_dummy_profile().fee_guide_text, "")
 
 
 class TestHandleCustomerMessagePlumbing(unittest.TestCase):
