@@ -83,6 +83,17 @@ class BusinessProfile:
     first_report_detector: Optional[Callable]
     first_report_notice_key: str
 
+    # ── 費用ガード（社数文脈の追加必須語・JIKOU-FEE-RULE-1・大野裁定 2026-10-11） ──
+    # 質問文または返信文に「N社」（N>=fee_multi_threshold）が現れる文脈でのみ
+    # 必須となる文言（時効=「22,000円」）。空=追加検査なし（相続放棄は既定のまま）。
+    # 検出（N社 の読取）は機構側（chat_responder._creditor_count_mentioned）
+    fee_multi_required_phrases: tuple = ()
+    fee_multi_threshold: int = 3
+    # fix3（司令塔裁定 2026-10-11）: 費用の固定文（逐語）。顧客対応経路の長さ上限で
+    # 免除ブロックとして扱う（逐語一致した 1 回分のみ免除・自由文には従来の上限）。
+    # 空=免除なし（相続放棄は既定のまま）。実測: 固定文 248 字+宛名・前置きで 300 字超過
+    fee_guide_text: str = ""
+
 
 __all__ = ["BusinessProfile"]
 _ = (Pattern,)   # 型注記用途の明示（forbidden_patterns の中身は re.Pattern）
