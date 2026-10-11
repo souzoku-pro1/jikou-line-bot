@@ -55,6 +55,16 @@ fix2（Codex BQ-06〜08）:
 fail-open の裁定（本票の仮置き・Q3a で見直し）: DB 未設定（DATABASE_URL なし）は記録を素通り、
 DB 例外時は送信を止めず記録失敗を固定語彙でログに出す＝相談者から見える挙動を不変に保つ。
 
+JIKOU-REPLY-Q1b-fix1（Codex R-JIKOU-REPLY-Q1b-1）:
+- BR-05 人の明示送信（human_reply 文脈・attend=True）は begin() の同一トランザクション・会話単位の
+  排他内で対応中（attending=True・human_version+1）を確定する（会話が無ければ起こす）。bot の
+  許可表切替（V2 ON）は Q1c のまま。
+- BR-03 finish(text_version=...) は着手時に固定した本文ハッシュも照合し、不一致は late 扱い。
+- BR-08 run_recover_job は register_recover_hook() で登録された回収（App 28 記録未了の再試行）
+  を相乗りで回す（各 hook は固定語彙で握る・自動再送なし）。
+- BR-01 の fail-closed（台帳が使えなければ送らない）は人の明示送信だけ（hub/line_channel
+  .push_text_explicit）。本 module の bot 経路の fail-open 裁定は不変。
+
 RV-10: 本表・ログ・例外に本文・氏名・LINE userId を載せない。line_user_hash は一方向
 （sha256）。文面は hash（text_version）だけを保存する。
 """
@@ -242,6 +252,7 @@ class SendContext:
     actor: str = ACTOR_BOT
     op_id: str | None = None
     seq: list = field(default_factory=lambda: [0])   # 受信イベント内の送信連番（共有）
+    attend: bool = False     # fix1 BR-05: 着手と同じ tx で会話を対応中にする（人の明示送信）
 
 
 _ctx: contextvars.ContextVar = contextvars.ContextVar("send_ledger_ctx", default=None)
@@ -298,10 +309,11 @@ async def approved_draft(op_id: str):
 @contextlib.asynccontextmanager
 async def human_reply(op_id: str):
     """JIKOU-REPLY-Q1b: 大野の明示送信（主体=human・用途=reply・操作 ID 固定＝二重クリックは
-    同じ操作として DUPLICATE_* に倒れる・受信イベント ID なし）。"""
+    同じ操作として DUPLICATE_* に倒れる・受信イベント ID なし）。fix1 BR-05: attend=True＝
+    begin() が同一 tx で会話を対応中にする。"""
     base = _ctx.get() or SendContext()
     token = _ctx.set(replace(base, actor=ACTOR_HUMAN, purpose=PURPOSE_REPLY,
-                             op_id=str(op_id), inbound_event_id=None))
+                             op_id=str(op_id), inbound_event_id=None, attend=True))
     try:
         yield
     finally:
@@ -634,7 +646,23 @@ async def begin(business: str, channel: str, user_id: str, text: str):
                 return DUPLICATE_SENT
             if existing is not None and existing.state in _UNCONFIRMED_LIKE:
                 return DUPLICATE_UNCONFIRMED
-            if row is not None:
+            if ctx is not None and ctx.attend and actor == ACTOR_HUMAN:
+                # fix1 BR-05: 送信着手と同じ排他・同一 tx で対応中（attending・human_version+1）を確定。
+                # 会話が無ければ起こす（人の操作は受信が無くても会話を作る＝_attending と同じ）
+                if row is None:
+                    res = await s.execute(sa.insert(conversation).values(
+                        ref=uuid.uuid4().hex, business=business, line_user_hash=user_hash,
+                        started_at=now, version=1, human_version=1, attending=True,
+                        attending_since=now, created_at=now))
+                    conv_id, new_version, human_version = int(res.inserted_primary_key[0]), 1, 1
+                else:
+                    human_version = int(row.human_version) + 1
+                    await s.execute(sa.update(conversation).where(
+                        conversation.c.conversation_id == conv_id).values(
+                        version=new_version, human_version=human_version, attending=True,
+                        attending_since=(row.attending_since if row.attending else now),
+                        attending_until=None))
+            elif row is not None:
                 await s.execute(sa.update(conversation).where(
                     conversation.c.conversation_id == conv_id).values(version=new_version))
             if existing is not None:                      # failed の再試行（削除しない）
@@ -728,8 +756,9 @@ async def guarded_http(op, coro):
         return await asyncio.wait_for(coro, timeout=send_timeout_seconds())
 
 
-async def finish(op, outcome: str) -> str:
+async def finish(op, outcome: str, *, text_version: str | None = None) -> str:
     """送信結果の確定: sent / failed / unconfirmed（push の例外＝結果不明）。
+    fix1 BR-03: text_version を渡すと着手時に固定した本文ハッシュも照合し、不一致は late 扱い。
     fix2 BQ-06: 所有者（attempt_no・owner_token）が一致し state=started のときだけ遷移と
     履歴を書く（"applied"）。一致しない遅着結果は状態を変えず late_result:{outcome} の
     観測記録（観測状態つき）だけ残す（"late"）。着手後に人の操作（human_version）が入って
@@ -747,7 +776,10 @@ async def finish(op, outcome: str) -> str:
                     conversation.c.conversation_id == op.conversation_id))).scalar()
                 after_human = (hv is not None and op.human_version is not None
                                and int(hv) != int(op.human_version))
-            r = await s.execute(sa.update(send_operation).where(_owner_match(op)).values(
+            where = _owner_match(op)
+            if text_version is not None:
+                where = sa.and_(where, send_operation.c.text_version == str(text_version))
+            r = await s.execute(sa.update(send_operation).where(where).values(
                 state=outcome, finished_at=now, completed_after_human=after_human))
             if int(r.rowcount or 0) == 1:
                 await _history(s, op.op_id, STATE_STARTED, outcome, outcome, now)
@@ -798,14 +830,29 @@ async def recover_stale_started(*, now=None) -> int:
     return moved
 
 
+_recover_hooks: list = []
+
+
+def register_recover_hook(fn) -> None:
+    """fix1 BR-08: 回収ジョブに相乗りする非同期関数（引数なし）を登録する（同じ関数は 1 回だけ）。"""
+    if fn not in _recover_hooks:
+        _recover_hooks.append(fn)
+
+
 async def run_recover_job() -> None:
-    """scheduler の interval job 本体（DB 未設定は何もしない・例外は固定語彙で握る）。"""
+    """scheduler の interval job 本体（DB 未設定は何もしない・例外は固定語彙で握る）。
+    fix1 BR-08: 滞留 started の回収の後に登録済み hook（App 28 記録未了の再試行など）を順に回す。"""
     if not _db_configured():
         return
     try:
         await recover_stale_started()
     except Exception:
         logger.warning("[SEND_LEDGER] recover job failed (fixed reason)")
+    for fn in list(_recover_hooks):
+        try:
+            await fn()
+        except Exception:
+            logger.warning("[SEND_LEDGER] recover hook failed (fixed reason)")
 
 
 def register_recover_job() -> None:

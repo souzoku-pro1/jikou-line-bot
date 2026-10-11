@@ -57,7 +57,7 @@ app.include_router(shindan_router)
 
 from chat_responder import (
     get_app21_record,
-    is_human_mode, model_role,  # JIKOU-REPLY-Q1b
+    is_human_mode, model_role, model_content, sanitize_reply_without_human_marker,  # JIKOU-REPLY-Q1b（fix1 BR-07）
     App21LookupError,
     classify_routing,
     handle_customer_message,
@@ -475,7 +475,7 @@ def _normalize_history(rows: list[dict]) -> list[dict]:
     out: list[dict] = []
     for m in rows:
         role = model_role(m.get("role"))  # JIKOU-REPLY-Q1b: human（事務所の返信）→ assistant
-        content = m.get("content") or ""
+        content = model_content(m.get("role"), m.get("content"))  # JIKOU-REPLY-Q1b-fix1 BR-07: human 行に [事務所からの返信] マーカー
         if role not in ("user", "assistant") or not content:
             continue
         if out and out[-1]["role"] == role:
@@ -1052,7 +1052,7 @@ async def _process_line_event(reply_token: str, user_id: str, user_text: str) ->
         # AUTOREPLY-GEN2 要件1/2: ヒアリング返信もサニタイズ+構成検証して
         # から送信。fatal（マーカー残存）・上限超過（定型テンプレブロックは
         # 免除）は自動送信せず承認キュー+現行定型で応答（切り詰めはしない）
-        cleaned, _issues, _fatal = reply_sanitizer.sanitize_reply(
+        cleaned, _issues, _fatal = sanitize_reply_without_human_marker(  # JIKOU-REPLY-Q1b-fix1 BR-07: マーカー除去・空なら降格
             claude_reply, allowed_emoji=ALLOWED_CANONICAL_EMOJI, exempt_blocks=HEARING_TEMPLATE_BLOCKS)  # GATE-EXEMPT-FIX-1
         # AUTOREPLY-STYLE-1-fix1 [B]: 弁護士本人の名乗り・見本の匿名化記号・
         # 旧見本由来の無根拠表現もヒアリング経路で承認降格（顧客対応と同一関数）

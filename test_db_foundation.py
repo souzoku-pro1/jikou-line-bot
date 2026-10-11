@@ -981,7 +981,7 @@ class TestReplyExemplarMigration(unittest.TestCase):
     def test_reply_exemplar_migration_round_trip(self):
         import sqlite3
         import tempfile
-        from hub import reply_exemplar, send_ledger
+        from hub import reply_exemplar, reply_followup, send_ledger
         d = tempfile.mkdtemp(prefix="reply_exemplar_mig_")
         dbfile = f"{d}/mig.db"
         alembic, tables, unique_cols, nullable = TestAlembicScaffold._brain_mig_tools(dbfile)
@@ -992,24 +992,66 @@ class TestReplyExemplarMigration(unittest.TestCase):
             up = alembic("upgrade", "head")
             self.assertEqual(up.returncode, 0, f"stderr={up.stderr[-800:]}")
             self.assertIn(self.REPLY_EXEMPLAR, alembic("current").stdout)
-            self.assertIn(reply_exemplar.TABLE_NAME, tables())
+            # fix1 BR-08/BR-09: 3 表（手本・履歴・App 28 記録未了）が同一 revision で作られ、列集合が metadata と一致
+            self.assertTrue({reply_exemplar.TABLE_NAME, reply_exemplar.HISTORY_TABLE_NAME,
+                             reply_followup.TABLE_NAME} <= tables())
             con = sqlite3.connect(dbfile)
             try:
-                cols = {r[1] for r in con.execute(f'PRAGMA table_info("{reply_exemplar.TABLE_NAME}")')}
-                self.assertEqual(cols, {c.name for c in reply_exemplar.reply_exemplar.columns})
+                for name, table in ((reply_exemplar.TABLE_NAME, reply_exemplar.reply_exemplar),
+                                    (reply_exemplar.HISTORY_TABLE_NAME, reply_exemplar.reply_exemplar_history),
+                                    (reply_followup.TABLE_NAME, reply_followup.reply_chatlog_followup)):
+                    cols = {r[1] for r in con.execute(f'PRAGMA table_info("{name}")')}
+                    self.assertEqual(cols, {c.name for c in table.columns}, name)
                 nn = nullable(con, reply_exemplar.TABLE_NAME)
                 self.assertFalse(nn["human_reply"])
                 self.assertFalse(nn["stage"])
+                self.assertFalse(nn["approved_at"])
+                self.assertFalse(nn["active"])
                 self.assertTrue(nn["conversation_ref"])
                 self.assertTrue(nn["creditor_name"])
+                self.assertTrue(nn["category_id"])
+                self.assertTrue(nn["source_text_version"])
                 idx = {r[1] for r in con.execute(f'PRAGMA index_list("{reply_exemplar.TABLE_NAME}")')}
                 self.assertIn("ix_reply_exemplar_lookup", idx)
+                self.assertIn("ix_reply_exemplar_active", idx)
+                fks = {(r[2], r[3]) for r in con.execute("PRAGMA foreign_key_list(reply_exemplar_history)")}
+                self.assertIn(("reply_exemplar", "exemplar_id"), fks)          # (参照表, from 列)
+                self.assertFalse(nullable(con, reply_followup.TABLE_NAME)["state"])
+                self.assertTrue(nullable(con, reply_followup.TABLE_NAME)["text"])
             finally:
                 con.close()
             down = alembic("downgrade", self.SEND_LEDGER)
             self.assertEqual(down.returncode, 0, f"stderr={down.stderr[-800:]}")
-            self.assertNotIn(reply_exemplar.TABLE_NAME, tables())
+            for name in (reply_exemplar.TABLE_NAME, reply_exemplar.HISTORY_TABLE_NAME, reply_followup.TABLE_NAME):
+                self.assertNotIn(name, tables())
             self.assertTrue(set(send_ledger.TABLE_NAMES) <= tables())     # 下位の表は残る
             self.assertIn(self.SEND_LEDGER, alembic("current").stdout)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_reply_exemplar_downgrade_is_refused_when_data_present(self):
+        """fix1 BR-09: データがあれば downgrade 禁止（手本・履歴・記録未了のいずれかに 1 行でもあれば拒否・表は残る）。"""
+        import sqlite3
+        import tempfile
+        from hub import reply_exemplar, reply_followup
+        d = tempfile.mkdtemp(prefix="reply_exemplar_mig_refuse_")
+        dbfile = f"{d}/mig.db"
+        alembic, tables, _unique_cols, _nullable = TestAlembicScaffold._brain_mig_tools(dbfile)
+        try:
+            self.assertEqual(alembic("upgrade", "head").returncode, 0)
+            con = sqlite3.connect(dbfile)
+            try:
+                con.execute("INSERT INTO reply_chatlog_followup (op_id, business, kind, approval_record_id, line_user_hash, "
+                            "text, state, attempts, created_at, updated_at) VALUES ('a', 'jikou', 'chatlog_human', '1', 'h', "
+                            "'t', 'pending', 0, '2026-10-12 00:00:00', '2026-10-12 00:00:00')")
+                con.commit()
+            finally:
+                con.close()
+            down = alembic("downgrade", self.SEND_LEDGER)
+            self.assertNotEqual(down.returncode, 0)
+            self.assertIn("reply_exemplar_downgrade_refused_data_present", down.stderr)
+            self.assertNotIn("'t'", down.stderr)                                   # 値は出さない
+            self.assertTrue({reply_exemplar.TABLE_NAME, reply_followup.TABLE_NAME} <= tables())
+            self.assertIn(self.REPLY_EXEMPLAR, alembic("current").stdout)
         finally:
             shutil.rmtree(d, ignore_errors=True)

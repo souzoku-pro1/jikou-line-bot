@@ -1679,7 +1679,7 @@ async def handle_customer_message(
     # 絵文字除去）。fatal（プレースホルダ/内部マーカー残存）はガードで
     # 承認降格＝その文面は送信しない
     reply_text, sanitize_issues, sanitize_fatal = \
-        reply_sanitizer.sanitize_reply(
+        sanitize_reply_without_human_marker(  # JIKOU-REPLY-Q1b-fix1 BR-07: マーカー除去・空なら降格
             result["reply"], allowed_emoji=p.allowed_emoji)
     if sanitize_issues:
         logger.info("[SANITIZE] user_id=%s issues=%s",
@@ -1882,16 +1882,20 @@ def _fee_demotion_reason(missing: list[str], unknown: bool) -> str:
 # JIKOU-REPLY-Q1b: 事務所（大野）の返信 role=human を LLM 文脈に含める（§7）
 #   - App 28 の role=human（PWA の返信欄が書く）は、モデル入力では assistant に変換する
 #     （Anthropic API の role は user/assistant のみ＝未変換は 400 → pending_reply）。
-#   - 変換した履歴（ChatHistory）は human 行の件数を持ち、顧客対応経路の system prompt に
-#     注記 1 行（HUMAN_HISTORY_NOTE）を足す。human 行が無ければ注記なし＝従来と同一。
-#   - 既存テストが get_recent_chat_history を素の list で差し替えても動く（件数 0 扱い）。
+#   - fix1 BR-07: 変換した各発話の本文先頭に「[事務所からの返信]」マーカーを付け（顧客対応経路・
+#     ヒアリングのメモリ経路とも）、system prompt の注記でマーカーの意味と「出力に含めない」を指示する。
+#     送信前サニタイズ（sanitize_reply_without_human_marker）でモデル出力からマーカーを除去し、
+#     除去後に空なら fatal（承認降格）。human 行が無ければ注記なし＝従来と byte 同一（pin 不変）。
+#   - 変換した履歴（ChatHistory）は human 行の件数を持つ。既存テストが get_recent_chat_history を
+#     素の list で差し替えても動く（件数 0 扱い）。
 #   - 本節は末尾追記（sink allowlist の行番号 pin を動かさない）。
 # ══════════════════════════════════════════════════════════════
 ROLE_HUMAN = "human"
 MODEL_ROLES = ("user", "assistant")
+HUMAN_MARKER = "[事務所からの返信]"
 HUMAN_HISTORY_NOTE = (
-    "\n\n【注記】会話履歴の assistant 発話には、弁護士本人（事務所）が送った返信（human）が"
-    "含まれます。これを前提に続きを書いてください。その内容を繰り返さない・言い換えない。"
+    "\n\n【注記】会話履歴の assistant 発話のうち [事務所からの返信] で始まるものは弁護士本人（事務所）の"
+    "返信。これを前提に続きを書く。繰り返さない・言い換えない。このマーカーを出力に含めない。"
 )
 
 
@@ -1900,25 +1904,59 @@ def model_role(role: str | None) -> str | None:
     return "assistant" if role == ROLE_HUMAN else role
 
 
+def model_content(role: str | None, content) -> str:
+    """モデル入力用の本文（human 行は先頭に [事務所からの返信] マーカー・空は ""）。"""
+    text = str(content or "")
+    if role == ROLE_HUMAN and text:
+        return f"{HUMAN_MARKER} {text}"
+    return text
+
+
 class ChatHistory(list):
     """Claude messages 形式の履歴（list 互換）。human_rows=変換した human 行の件数。"""
     human_rows: int = 0
 
 
 def model_history(rows: list[dict]) -> ChatHistory:
-    """role を変換し、モデルに渡せない role（user/assistant 以外）は落とす。"""
+    """role を変換し、モデルに渡せない role（user/assistant 以外）は落とす。human 行は本文に
+    マーカーを付ける。"""
     out = ChatHistory()
     for r in rows:
         role = r.get("role")
         if role == ROLE_HUMAN:
             out.human_rows += 1
-        role = model_role(role)
-        if role not in MODEL_ROLES:
+        mrole = model_role(role)
+        if mrole not in MODEL_ROLES:
             continue
-        out.append({"role": role, "content": r.get("content", "")})
+        out.append({"role": mrole, "content": model_content(role, r.get("content", ""))})
     return out
 
 
 def human_history_note(history) -> str:
     """履歴に human 行があれば system prompt への注記、無ければ ""（pin 不変）。"""
     return HUMAN_HISTORY_NOTE if getattr(history, "human_rows", 0) else ""
+
+
+def strip_human_marker(text: str) -> str:
+    """モデル出力からマーカーを除去する（前後の空白・空行も整える）。"""
+    s = str(text or "")
+    if HUMAN_MARKER not in s:
+        return s
+    s = s.replace(HUMAN_MARKER, "")
+    return "\n".join(line.rstrip() for line in s.split("\n")).strip()
+
+
+HUMAN_MARKER_ONLY_ISSUE = "事務所返信マーカーの除去後に本文なし"
+
+
+def sanitize_reply_without_human_marker(text: str, **kwargs) -> tuple[str, list[str], bool]:
+    """送信前サニタイズの入口（顧客対応・ヒアリングの両経路）。マーカーを除去してから
+    reply_sanitizer.sanitize_reply に渡す。マーカーを含み除去後に空なら fatal=True（承認降格）。"""
+    raw = str(text or "")
+    stripped = strip_human_marker(raw)
+    if stripped != raw and not stripped:
+        return "", [HUMAN_MARKER_ONLY_ISSUE], True
+    out, issues, fatal = reply_sanitizer.sanitize_reply(stripped, **kwargs)
+    if stripped != raw:
+        issues = list(issues) + ["human_marker_removed"]
+    return out, issues, fatal

@@ -1,8 +1,9 @@
 """webapp_reply_view — JIKOU-REPLY-Q1b: 大野の返信欄（PWA・明示送信）
 
 正本: 時効LINEボット_返信規則_v1.4.md §7（大野の返信の扱い）・§10-1（返信欄・明示送信・
-操作 ID・送信確認待ち）・§10-2（許可表の「大野の明示送信」列）・§10-7（手本）・§12 Q1b。
-QUEUE-2026-10-11-B Q-3 (a)(b)(d)(f)。
+操作 ID・送信確認待ち・送信着手と同じ排他で対応中にする）・§10-2（許可表の「大野の明示送信」列）・
+§10-7（手本）・§12 Q1b。QUEUE-2026-10-11-B Q-3 (a)(b)(d)(f)。
+fix1（Codex R-JIKOU-REPLY-Q1b-1 BR-01〜09・司令塔裁定: 人の明示送信は台帳必須＝fail-closed）。
 
 - 入口: 承認画面（/app/approvals）の各件に「この相談者に返信する」リンク。承認画面は参照専用の
   閉集合 pin（button 2・input 1・form なし・fetch は参照 API のみ）を維持するため、返信欄は本画面
@@ -10,24 +11,37 @@ QUEUE-2026-10-11-B Q-3 (a)(b)(d)(f)。
   （/app/send_ops と同型）。URL・画面に LINE userId を載せない（宛先は App 29 のレコード ID で
   指定し、サーバ内で line_user_id を解決する＝RV-10）。
 - 認証は P4-001 の関所（_gate）＝承認 webhook と同じく「大野のみ」の前提。未認証は 303 → /app/login。
-- 送信: 操作 ID（画面描画時に発行する uuid・hidden）を固定し、send_ledger を actor=human・
-  purpose=reply で経由（hub/line_channel.push_text_explicit＝guarded_http・3 値＋重複 2 値）。
-  通信例外・期限到達は「送信確認待ち」（/app/send_ops に既存どおり表示・自動再送なし）。
-  同じ操作 ID の再送信（二重クリック・再読込後の再送）は副作用なしで弾く。
-- 許可表 (f): human 列のみ適用（send_ledger.human_explicit_decision）。停止判定の照会はしない
-  （対象外）。画面の明示確認チェックが無ければ送らない（固定 303 で戻す）。
+- BR-03 宛先の固定: GET で表示した宛先（App 29 No.・line_user_id のハッシュ・App 29 revision）と
+  操作 ID を **署名付き hidden（ticket）** に埋め、POST で署名と束縛を再検証し、App 29 を再取得して
+  ハッシュ・revision が一致するときだけ送る（不一致＝「相談者情報が更新されました。画面を開き直して
+  ください」・送らない）。本文のハッシュは着手時に台帳へ固定し（text_version）、finish で照合する。
+- BR-01 台帳必須: send_ledger.begin() が None（DB 未設定・記録失敗）なら送らず固定文言
+  「台帳が使えないため送信できません」（fail-closed。Q1a の bot 経路の fail-open は不変）。
+  重複検査（operation_state）が例外のときも同じ（送らない）。
+- BR-02 finish の戻り値: applied のときだけ成功処理（App 28 記録・手本保存・「送信しました」）。
+  skipped（台帳の確定失敗）は「送信確認待ち」として表示、late（遅着）は現在の台帳状態を照合して表示。
+  いずれも自動再送なし・App 28 記録・手本保存はしない。
+- BR-05 対応中: 送信着手と set_attending（attending=human・human_version+1）は send_ledger.begin()
+  の **同一トランザクション・会話単位の排他内** で確定（human_reply 文脈の attend=True）。
+- BR-06 確認文: 「全体停止・停止リスト・人対応中の状態は確認していません。これを承知のうえ送信する」
+  （チェック必須・無ければ送らない）。許可表 (f) は human 列のみ（send_ledger.human_explicit_decision）。
+- BR-08 App 28 記録の回収: 送信成功後の App 28 書込が failed / skipped（role 選択肢なし）なら
+  hub/reply_followup に記録未了（op_id 単位）を置き、SEND_LEDGER_RECOVER（5 分ごと）に相乗りした
+  回収で冪等に再試行する。同じ操作 ID の再 POST は「送信済み・記録のみ再試行」に分岐。
 - App 28 (b): 送信成功後に role=human・category=human_reply・auto_sent=no で 1 行書く。App 28 の
   role に human の選択肢が無ければ **失敗にせず件数ログで skip**（選択肢追加＝大野の kintone 操作
-  の後に有効になる）。時刻は kintone の作成日時。
-- 手本 (d): 画面のチェック（既定 ON）で hub/reply_exemplar に匿名化して保存（残留検査に落ちたら
-  保存しない）。段階は App 21 の status（classify_routing）・業者名は App 21 の問い合わせ業者名。
-- メモリ履歴: ヒアリング経路のプロセス内履歴（main.conversation_histories）に当該相談者の
-  履歴があれば assistant として反映（§7「ヒアリング側のメモリ履歴にも human 行を反映」）。
-- 順序（副作用）: [重複検査 → 許可表 → LINE 送信 → App 28 記録 → メモリ反映 → 手本保存]。
-  送信後の失敗は送信を取り消さず、結果コードを画面に出す。
+  の後、回収ジョブが記録する）。時刻は kintone の作成日時。
+- 手本 (d)・BR-04/BR-09: 画面のチェック（既定 ON）で hub/reply_exemplar に匿名化して保存（共通検査器
+  hub/pii_scan・残留検査に落ちたら保存しない＝件数ログのみ）。段階は App 21 の status
+  （classify_routing）・業者名は App 21 の問い合わせ業者名。source_text_version は台帳の text_version。
+- BR-07 メモリ履歴: ヒアリング経路のプロセス内履歴（main.conversation_histories）に当該相談者の
+  履歴があれば assistant（本文先頭に [事務所からの返信] マーカー）として反映。
+- 順序（副作用）: [入力検査 → 明示確認 → ticket 検証 → 重複検査 → App 29 再取得と宛先照合 → 許可表 →
+  LINE 送信（台帳 begin/finish） → App 28 記録（失敗は記録未了へ） → メモリ反映 → 手本保存]。
 - RV-10: ログは固定語彙＋emit のみ。本文・氏名・LINE userId はログに出さない。
 """
 
+import hmac
 import html
 import logging
 import re
@@ -36,9 +50,9 @@ import uuid
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 
-from hub import kintone, line_channel, reply_exemplar, send_ledger
+from hub import kintone, line_channel, reply_exemplar, reply_followup, send_ledger
 from hub.redact import emit
-from hub.webapp_auth import _gate
+from hub.webapp_auth import _gate, _sign
 
 logger = logging.getLogger("hub.webapp_reply_view")
 
@@ -55,9 +69,12 @@ MAX_TEXT_CHARS = 2000
 _RECORD_ID_RE = re.compile(r"^[0-9]{1,12}$")
 _OP_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 _LINE_USER_ID_RE = re.compile(r"^U[0-9a-f]{32}$")
+_REVISION_RE = re.compile(r"^[0-9]{1,12}$")
+_TICKET_RE = re.compile(r"^[0-9]{1,12}\.[0-9a-f]{32}\.[0-9]{1,12}\.[0-9a-f]{32}\.[0-9a-f]{64}$")
 _ROLE_LABELS = {"user": "相談者", "assistant": "bot", ROLE_HUMAN: "事務所（大野）"}
+CONFIRM_LABEL = "全体停止・停止リスト・人対応中の状態は確認していません。これを承知のうえ送信する"
 
-# 送信結果（done）・App 28 記録（log）・手本（ex）の閉集合（画面文言は固定・入力値を反射しない）
+# 送信結果（done）・App 28 記録（log）・手本（ex）・台帳状態（state）の閉集合（画面文言は固定・入力値を反射しない）
 _DONE_NOTICES = {
     "sent": "送信しました。",
     "failed": "LINE への送信に失敗しました（LINE 側が受け付けませんでした）。送信されていません。",
@@ -68,12 +85,28 @@ _DONE_NOTICES = {
     "not_found": "宛先の相談者を特定できませんでした。送信していません。",
     "bad_input": "入力が不正です。送信していません。",
     "blocked": "許可表により送信できません。",
+    # fix1
+    "ledger_unavailable": "台帳が使えないため送信できません。時間をおいて再試行してください。",
+    "stale": "相談者情報が更新されました。画面を開き直してください。送信していません。",
+    "record_unconfirmed": "送信結果を台帳に確定できませんでした。送信確認待ちで結果を確定してください"
+                          "（自動再送はしません。チャットログ記録・手本保存は行っていません）。",
+    "late": "この操作の結果は台帳で遅着と判定されました（別の処理が先に確定しています）。"
+            "チャットログ記録・手本保存は行っていません。現在の台帳状態: ",
 }
+_STATE_LABELS = {"sent": "送信済み", "unconfirmed": "送信確認待ち", "failed": "失敗",
+                 "started": "着手済（確認中）", "pending": "着手前", "none": "不明"}
 _LOG_NOTICES = {
     "written": "チャットログ（App 28）に事務所の返信として記録しました。",
-    "skipped": "チャットログの role に「human」の選択肢が無いため記録を省略しました（kintone 側で選択肢を追加すると記録されます）。",
-    "failed": "チャットログへの記録に失敗しました（送信は完了しています）。",
+    "skipped": "チャットログの role に「human」の選択肢が無いため記録を省略しました"
+               "（kintone 側で選択肢を追加すると回収ジョブが記録します）。",
+    "failed": "チャットログへの記録に失敗しました（送信は完了しています。回収ジョブが再試行します）。",
     "unconfigured": "チャットログは未設定のため記録していません。",
+    # fix1 BR-08
+    "pending_retry": "チャットログへの記録は未了です。回収ジョブ（5 分ごと）が再試行します。",
+    "not_pending": "チャットログの記録は既に完了しています。",
+    "destination_mismatch": "宛先の照合に失敗したためチャットログの記録を保留しています。",
+    "exhausted": "チャットログの記録の再試行回数が上限に達しました。手動で記録してください。",
+    "not_found": "",
 }
 _EX_NOTICES = {
     "saved": "手本として匿名化して保存しました。",
@@ -95,11 +128,47 @@ def _v(rec: dict, code: str) -> str:
     return str(((rec or {}).get(code) or {}).get("value") or "")
 
 
+def _revision(rec: dict | None) -> str:
+    rev = _v(rec, "$revision") if rec else ""
+    return rev if _REVISION_RE.fullmatch(rev) else "0"
+
+
+def _user_hash(user_id: str) -> str:
+    return send_ledger.line_user_hash(BUSINESS, user_id)[:32]
+
+
 async def _approval_record(record_id: str) -> dict | None:
     try:
         return await kintone.get_record(APP_APPROVAL, record_id)
     except Exception:
         return None
+
+
+async def _resolve_user_id(record_id: str) -> str | None:
+    """App 29 のレコード ID から宛先を再解決（回収ジョブ・記録のみ再試行で使う）。"""
+    rec = await _approval_record(str(record_id))
+    user_id = _v(rec, "line_user_id") if rec else ""
+    return user_id if _LINE_USER_ID_RE.fullmatch(user_id) else None
+
+
+# ── BR-03: 署名付き ticket（宛先・revision・操作 ID の束縛） ──────────────────────
+def make_ticket(record_id: str, user_id: str, revision: str, op_id: str) -> str | None:
+    payload = f"{record_id}.{_user_hash(user_id)}.{revision}.{op_id}"
+    sig = _sign(payload)
+    return f"{payload}.{sig}" if sig else None
+
+
+def parse_ticket(ticket: str, record_id: str, op_id: str) -> tuple[str, str] | None:
+    """署名と束縛（record_id・op_id）を検証し (user_hash, revision) を返す。不正は None。"""
+    if not _TICKET_RE.fullmatch(ticket or ""):
+        return None
+    rid, uhash, rev, oid, sig = ticket.split(".")
+    expected = _sign(f"{rid}.{uhash}.{rev}.{oid}")
+    if expected is None or not hmac.compare_digest(sig, expected):
+        return None
+    if rid != record_id or oid != op_id:
+        return None
+    return uhash, rev
 
 
 async def _history_rows(user_id: str) -> list[dict]:
@@ -145,20 +214,28 @@ async def write_human_chatlog(user_id: str, text: str) -> str:
     return "written"
 
 
+async def run_chatlog_followup() -> dict:
+    """BR-08: SEND_LEDGER_RECOVER に相乗りする回収（記録未了の App 28 human 行を冪等に再試行）。"""
+    return await reply_followup.run_followup(resolve_user_id=_resolve_user_id,
+                                             write_chatlog=write_human_chatlog)
+
+
 def reflect_memory_history(user_id: str, text: str) -> bool:
-    """ヒアリング経路のプロセス内履歴に assistant として反映（履歴が無い相談者は何もしない＝
-    次の受信で App 28 から復元される）。戻り値=反映したか。"""
+    """ヒアリング経路のプロセス内履歴に assistant（[事務所からの返信] マーカー付き）として反映
+    （履歴が無い相談者は何もしない＝次の受信で App 28 から復元される）。戻り値=反映したか。"""
     try:
         import main as _main
+        from chat_responder import HUMAN_MARKER
         hist = _main.conversation_histories.get(user_id)
     except Exception:
         return False
     if hist is None:
         return False
+    marked = f"{HUMAN_MARKER} {text}"
     if hist and hist[-1].get("role") == "assistant":
-        hist[-1]["content"] = str(hist[-1].get("content") or "") + "\n" + text
+        hist[-1]["content"] = str(hist[-1].get("content") or "") + "\n" + marked
     else:
-        hist.append({"role": "assistant", "content": text})
+        hist.append({"role": "assistant", "content": marked})
     return True
 
 
@@ -183,11 +260,12 @@ async def _save_exemplar(user_id: str, inbound_text: str, text: str, op_id: str,
     return await reply_exemplar.save_exemplar(
         business=BUSINESS, inbound_text=inbound_text, human_reply=text,
         customer_name=customer_name, creditor_name=creditor, stage=stage,
-        conversation_ref=ref, source_op_id=op_id)
+        conversation_ref=ref, source_op_id=op_id,
+        source_text_version=send_ledger.text_version(text))
 
 
 # ── 画面 ────────────────────────────────────────────────────────────────────
-def _page(record_id: str, rec: dict | None, rows: list[dict], op_id: str,
+def _page(record_id: str, rec: dict | None, rows: list[dict], op_id: str, ticket: str | None,
           notices: list[str]) -> str:
     e = html.escape
     parts = [
@@ -217,7 +295,7 @@ def _page(record_id: str, rec: dict | None, rows: list[dict], op_id: str,
     for n in notices:
         if n:
             parts.append(f'<p class="notice">{e(n)}</p>')
-    if rec is None:
+    if rec is None or ticket is None:
         parts.append('<p class="empty">宛先の相談者を特定できませんでした</p>')
         parts.append('<script src="/app/shell.js"></script></body></html>')
         return "".join(parts)
@@ -238,10 +316,10 @@ def _page(record_id: str, rec: dict | None, rows: list[dict], op_id: str,
     draft = _v(rec, "AI下書き")
     parts.append(f'<form method="post" action="{PAGE}/{e(record_id)}/send" class="item">'
                  f'<input type="hidden" name="op_id" value="{e(op_id)}">'
+                 f'<input type="hidden" name="ticket" value="{e(ticket)}">'
                  '<div class="lbl">返信文（AI 下書きがあれば初期表示。直して送れます）</div>'
                  f'<textarea name="text" maxlength="{MAX_TEXT_CHARS}" required>{e(draft)}</textarea>'
-                 '<label><input type="checkbox" name="confirm" value="1"> 内容を確認しました'
-                 "（停止中・人対応中でも事務所の判断で送ります）</label>"
+                 f'<label><input type="checkbox" name="confirm" value="1" required> {e(CONFIRM_LABEL)}</label>'
                  '<label><input type="checkbox" name="exemplar" value="1" checked> '
                  "この返信を手本として保存する（氏名・連絡先などを伏せて保存）</label>"
                  '<button type="submit">LINE で送信する</button></form>')
@@ -249,19 +327,32 @@ def _page(record_id: str, rec: dict | None, rows: list[dict], op_id: str,
     return "".join(parts)
 
 
+def _notices(q) -> list[str]:
+    done = q.get("done", "")
+    done_text = _DONE_NOTICES.get(done, "")
+    if done == "late" and done_text:
+        done_text += _STATE_LABELS.get(q.get("state", ""), _STATE_LABELS["none"])
+    return [done_text, _LOG_NOTICES.get(q.get("log", ""), ""), _EX_NOTICES.get(q.get("ex", ""), "")]
+
+
 async def reply_page(request: Request):
     record_id = str(request.path_params.get("record_id", ""))
     if not _RECORD_ID_RE.fullmatch(record_id):
         return _bad_request()
-    q = request.query_params
-    notices = [_DONE_NOTICES.get(q.get("done", ""), ""), _LOG_NOTICES.get(q.get("log", ""), ""),
-               _EX_NOTICES.get(q.get("ex", ""), "")]
+    notices = _notices(request.query_params)
     rec = await _approval_record(record_id)
     user_id = _v(rec, "line_user_id") if rec else ""
     if rec is not None and not _LINE_USER_ID_RE.fullmatch(user_id):
         rec = None
     rows = await _history_rows(user_id) if rec is not None else []
-    return HTMLResponse(_page(record_id, rec, rows, uuid.uuid4().hex, notices))
+    op_id = uuid.uuid4().hex
+    ticket = make_ticket(record_id, user_id, _revision(rec), op_id) if rec is not None else None
+    return HTMLResponse(_page(record_id, rec, rows, op_id, ticket, notices))
+
+
+def _redirect(back: str, done: str, **extra) -> RedirectResponse:
+    qs = "&".join([f"done={done}"] + [f"{k}={v}" for k, v in extra.items() if v])
+    return RedirectResponse(f"{back}?{qs}", status_code=303)
 
 
 async def reply_send(request: Request):
@@ -269,50 +360,93 @@ async def reply_send(request: Request):
     record_id = str(request.path_params.get("record_id", ""))
     form = await request.form()
     op_id = str(form.get("op_id", ""))
+    ticket = str(form.get("ticket", ""))
     text = str(form.get("text", "")).strip()
     confirm = str(form.get("confirm", "")) == "1"
     want_exemplar = str(form.get("exemplar", "")) == "1"
     if not _RECORD_ID_RE.fullmatch(record_id) or not _OP_ID_RE.fullmatch(op_id):
         return _bad_request()
+    bound = parse_ticket(ticket, record_id, op_id)
+    if bound is None:
+        return _bad_request()                      # 署名不正・束縛不一致は固定 400（送らない）
+    ticket_hash, ticket_rev = bound
     back = f"{PAGE}/{record_id}"
     if not text or len(text) > MAX_TEXT_CHARS:
-        return RedirectResponse(f"{back}?done=bad_input", status_code=303)
+        return _redirect(back, "bad_input")
     if not confirm:
-        return RedirectResponse(f"{back}?done=confirm_required", status_code=303)
-    # 同じ操作 ID の再送信は副作用なしで弾く（二重クリック・戻る→再送）
+        return _redirect(back, "confirm_required")
+    # 同じ操作 ID の再送信は副作用なしで弾く（二重クリック・戻る→再送）。照会不能は fail-closed
     try:
         state = await send_ledger.operation_state(op_id)
     except Exception:
-        state = None
+        logger.warning("[REPLY] ledger unavailable (duplicate check failed, not sent)")
+        return _redirect(back, "ledger_unavailable")
     if state == send_ledger.STATE_SENT:
-        return RedirectResponse(f"{back}?done=duplicate_sent", status_code=303)
+        # BR-08: 送信済み・記録のみ再試行
+        fu = await _safe_followup(op_id)
+        if fu is not None and fu["state"] == reply_followup.STATE_PENDING:
+            res = await reply_followup.retry_one(op_id, resolve_user_id=_resolve_user_id,
+                                                 write_chatlog=write_human_chatlog)
+            return _redirect(back, "duplicate_sent", log=res)
+        return _redirect(back, "duplicate_sent", log=("not_pending" if fu is not None else ""))
     if state is not None:
-        return RedirectResponse(f"{back}?done=duplicate_unconfirmed", status_code=303)
+        return _redirect(back, "duplicate_unconfirmed")
+    # BR-03: 宛先の再取得と照合（ハッシュ・revision が GET 時と一致するときだけ送る）
     rec = await _approval_record(record_id)
     user_id = _v(rec, "line_user_id") if rec else ""
     if rec is None or not _LINE_USER_ID_RE.fullmatch(user_id):
-        return RedirectResponse(f"{back}?done=not_found", status_code=303)
+        return _redirect(back, "not_found")
+    if _user_hash(user_id) != ticket_hash or _revision(rec) != ticket_rev:
+        logger.info("[REPLY] destination changed since page render (not sent)")
+        return _redirect(back, "stale")
     decision = send_ledger.human_explicit_decision(confirm)
     if not decision.allow:
-        return RedirectResponse(f"{back}?done=blocked", status_code=303)
-    try:
-        outcome = await line_channel.push_text_explicit(line_channel.JIKOU_CHANNEL, op_id, user_id, text)
-    except Exception:
+        return _redirect(back, "blocked")
+    result = await line_channel.push_text_explicit(line_channel.JIKOU_CHANNEL, op_id, user_id, text)
+    if result.outcome == line_channel.PUSH_LEDGER_UNAVAILABLE:
+        logger.warning("[REPLY] ledger unavailable (not sent) record_id=%s",
+                       emit(record_id, "record_id", "log", "operator"))
+        return _redirect(back, "ledger_unavailable")
+    if result.outcome in (line_channel.PUSH_DUPLICATE_SENT, line_channel.PUSH_DUPLICATE_UNCONFIRMED):
+        return _redirect(back, result.outcome)
+    if result.outcome == line_channel.PUSH_UNCONFIRMED:
         logger.warning("[REPLY] explicit send unconfirmed (exception) record_id=%s",
                        emit(record_id, "record_id", "log", "operator"))
-        return RedirectResponse(f"{back}?done=unconfirmed", status_code=303)
-    if outcome != line_channel.PUSH_SENT:
-        return RedirectResponse(f"{back}?done={outcome}", status_code=303)
+        return _redirect(back, "unconfirmed")
+    # BR-02: finish の戻り値で分岐（applied のときだけ成功処理）
+    if result.ledger == "late":
+        return _redirect(back, "late", state=(result.state or "none"))
+    if result.ledger != "applied":
+        return _redirect(back, "record_unconfirmed")
+    if result.outcome != line_channel.PUSH_SENT:
+        return _redirect(back, result.outcome)
     logger.info("[REPLY] explicit send ok record_id=%s",
                 emit(record_id, "record_id", "log", "operator"))
     log_res = await write_human_chatlog(user_id, text)
+    if log_res in ("failed", "skipped"):
+        # BR-08: 記録未了を付帯情報に残す（回収ジョブが冪等に再試行）
+        marked = await reply_followup.mark_pending(
+            op_id, business=BUSINESS, approval_record_id=record_id,
+            line_user_hash=send_ledger.line_user_hash(BUSINESS, user_id), text=text,
+            last_result=log_res)
+        if marked in ("pending", "exists"):
+            log_res = "pending_retry"
     reflect_memory_history(user_id, text)
     ex_res = "off"
     if want_exemplar:
         ex_res = await _save_exemplar(user_id, _v(rec, "顧客メッセージ"), text, op_id,
                                       _v(rec, "顧客名"))
-    return RedirectResponse(f"{back}?done=sent&log={log_res}&ex={ex_res}", status_code=303)
+    return _redirect(back, "sent", log=log_res, ex=ex_res)
+
+
+async def _safe_followup(op_id: str) -> dict | None:
+    try:
+        return await reply_followup.get_followup(op_id)
+    except Exception:
+        return None
 
 
 router.add_api_route(f"{PAGE}/{{record_id}}", _gate(reply_page), methods=["GET"])
 router.add_api_route(f"{PAGE}/{{record_id}}/send", _gate(reply_send), methods=["POST"])
+# BR-08: 回収ジョブへの相乗り（冪等登録・main の末尾で register_recover_job が走る前後どちらでも可）
+send_ledger.register_recover_hook(run_chatlog_followup)
