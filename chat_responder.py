@@ -1764,14 +1764,11 @@ _NUMERAL_CHARS = "0-9一二三四五六七八九十百"
 # 「十」「百」を含む複合）。先頭に数字が続く途中からの部分一致は lookbehind で禁止
 # （「十二社」を「二社」と読まない・「1十社」を「十社」と読まない）。数字と「社」の間の
 # 空白 1 つは許容（票の表記「3 社」）。「複数社」「数社」「各社」は数を持たないため対象外。
-_CREDITOR_COUNT_RE = re.compile(rf"(?<![{_NUMERAL_CHARS}])([{_NUMERAL_CHARS}]+)\s?社(.?)")
-# fix1 BF-01: 漢数字+社 の直後が「社名」文脈（会社名の一部）なら除外する。除外は漢数字形
-# かつ直後が助数詞系の許容集合**外**の CJK 漢字に限る（「三社電機」「五社協定」）。算用
-# 数字形（「3社電機」）は除外しない=安全側（3 社扱い）。許容集合は「3社目/分/以上/合計…」
-# の読み漏れを防ぐためのもので、外れた表現は安全側でなく除外側に倒れる可能性がある——
-# その場合も返信側の「3社ですと…」（算用数字が通常）が第 2 の網として効く
-_COUNTER_SUFFIX_OK = frozenset("目分以全合中程共同超未間毎計位内外前後迄")
-_CJK_RE = re.compile(r"[一-鿿]")
+_CREDITOR_COUNT_RE = re.compile(rf"(?<![{_NUMERAL_CHARS}])([{_NUMERAL_CHARS}]+)\s?社")
+# fix2 BF-02（司令塔裁定）: 「社」の直後の漢字で社名（「三社電機」「五社協定」）を除外する
+# ヒューリスティックは撤去。社数らしい表現はすべて社数として検出し、社名と区別がつかない
+# 場合は**安全側**（検出した社数を維持＝3 社以上なら 22,000円 の必須語を要求し、満たさなければ
+# 承認へ降格）。誤検知で承認に回るコストは許容し、見逃し（3 社以上を 1〜2 社扱い）は許容しない。
 
 # 判定不能の印（解釈できない数表現が 1 つでもあれば全体を不能とし、1〜2 社に倒さない）
 COUNT_UNKNOWN = None
@@ -1823,18 +1820,14 @@ def _creditor_count_mentioned(text: str) -> int | None:
     """文中の「N社」の最大 N（NFKC 正規化後・数字列全体を読む・fix1 BF-01）。
     該当なしは 0。解釈できない数表現（文法外の漢数字・算用/漢数字の混在）が 1 つでも
     あれば COUNT_UNKNOWN（None）＝呼び出し側は 1〜2 社に倒さず判定不能として降格する。
-    「社名」文脈（漢数字+社+助数詞外の漢字）は数えない（_COUNTER_SUFFIX_OK 参照）。
+    fix2 BF-02: 社名（「三社電機」）との区別はしない＝安全側で社数として数える（3 扱い）。
     費用ガードの「3社以上の文脈」判定に使う（機構側・業務非依存）。"""
     norm = unicodedata.normalize("NFKC", str(text or ""))
     best = 0
     for m in _CREDITOR_COUNT_RE.finditer(norm):
-        token, after = m.group(1), m.group(2)
-        n = _parse_count_token(token)
+        n = _parse_count_token(m.group(1))
         if n is None:
             return COUNT_UNKNOWN
-        if not token.isdigit() and after and _CJK_RE.match(after) \
-                and after not in _COUNTER_SUFFIX_OK:
-            continue                            # 「三社電機」: 会社名の一部とみなす
         best = max(best, n)
     return best
 

@@ -470,10 +470,13 @@ class TestFeeRuleMultiCreditor(unittest.TestCase):
                         ("2026社", 2026),
                         # 対象外のまま
                         ("3件", 0), ("三件", 0),
-                        # 社名文脈（漢数字+社+助数詞外の漢字）は数えない → 残る「1 社」=1
-                        ("三社電機の 1 社です", 1), ("三社電機", 0), ("五社協定です", 0),
-                        # 算用数字形の社名は除外しない=安全側（3 社扱い）
-                        ("3社電機の1社です", 3), ("３社電機", 3)):
+                        # fix2 BF-02（司令塔裁定）: 社名との区別はしない=安全側で社数として数える
+                        # （誤検知で承認に回るコストは許容・見逃しは許容しない）
+                        ("三社電機の 1 社です", 3), ("三社電機", 3), ("五社協定です", 5),
+                        ("3社電機の1社です", 3), ("３社電機", 3), ("3社電機", 3),
+                        # fix2 回帰: 社数らしい表現は文脈語に関わらず検出
+                        ("三社借入があります。費用はいくらですか", 3),
+                        ("十一社依頼した場合の費用は？", 11)):
             with self.subTest(text=text):
                 self.assertEqual(_creditor_count_mentioned(text), n)
 
@@ -516,12 +519,41 @@ class TestFeeRuleMultiCreditor(unittest.TestCase):
         self.assertEqual(len(g.demotion_reasons), 1)
         self.assertTrue(g.demotion_reasons[0].startswith("費用定型の必須文言欠落: "))
         self.assertTrue(g.demotion_reasons[0].endswith("／" + FEE_COUNT_UNKNOWN_REASON))
-        # 1〜2 社・社名文脈は従来どおり自動送信可（判定不能にならない）
-        for q in ("二社です", "三社電機の 1 社です", "2社あります"):
+        # 1〜2 社は従来どおり自動送信可（判定不能にならない）
+        for q in ("二社です", "2社あります"):
             with self.subTest(q=q):
                 g = apply_server_guards(
                     _result(reply="2社ですと88,000円（税込）です。", category="費用の定型案内"),
                     self._SENT, q)
+                self.assertTrue(g.can_auto_send, g.demotion_reasons)
+
+    def test_fix2_company_name_counted_as_safe_side(self):
+        """fix2 BF-02（司令塔裁定）: 社名（「三社電機」）は除外せず 3 社として扱う＝22,000円 が
+        無ければ承認へ降格（誤検知のコストは許容）。固定文を含む返信なら自動送信可"""
+        q = "三社電機の 1 社です。費用はいくらですか"
+        g = apply_server_guards(
+            _result(reply="1社ですと44,000円（税込）です。", category="費用の定型案内"), self._SENT, q)
+        self.assertFalse(g.can_auto_send)
+        self.assertTrue(any("22,000円" in r for r in g.demotion_reasons), g.demotion_reasons)
+        g = apply_server_guards(
+            _result(reply=f"ご案内します。\n{FEE_GUIDE_TEXT}", category="費用の定型案内"), [], q)
+        self.assertTrue(g.can_auto_send, g.demotion_reasons)
+        self.assertEqual(_creditor_count_mentioned("3社電機"), 3)
+
+    def test_fix2_question_side_count_applies_when_reply_omits_count(self):
+        """fix2: 返信側が社数を省略しても質問側の社数で検査が働く
+        （「十一社」質問+「合計は 132,000 円」返信 → 22,000円 欠落で降格）"""
+        for q in ("十一社依頼した場合の費用は？", "三社借入があります。費用はいくらですか"):
+            with self.subTest(q=q):
+                g = apply_server_guards(
+                    _result(reply="合計は 132,000 円（税込）です。", category="費用の定型案内"),
+                    self._SENT, q)
+                self.assertFalse(g.can_auto_send)
+                self.assertTrue(any("22,000円" in r for r in g.demotion_reasons),
+                                g.demotion_reasons)
+                g = apply_server_guards(
+                    _result(reply="2社分88,000円に3社目以降1社あたり22,000円（税込）を加算した額です。",
+                            category="費用の定型案内"), self._SENT, q)
                 self.assertTrue(g.can_auto_send, g.demotion_reasons)
         # 費用カテゴリ以外は社数を見ない
         g = apply_server_guards(_result(reply="承知しました。"), [], "十十社あります")
