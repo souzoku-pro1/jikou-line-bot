@@ -57,7 +57,7 @@ app.include_router(shindan_router)
 
 from chat_responder import (
     get_app21_record,
-    is_human_mode,
+    is_human_mode, model_role,  # JIKOU-REPLY-Q1b
     App21LookupError,
     classify_routing,
     handle_customer_message,
@@ -474,7 +474,7 @@ def _normalize_history(rows: list[dict]) -> list[dict]:
     （AUTOREPLY-GEN2 要件3・ヒアリング履歴の永続化復元用）。"""
     out: list[dict] = []
     for m in rows:
-        role = m.get("role")
+        role = model_role(m.get("role"))  # JIKOU-REPLY-Q1b: human（事務所の返信）→ assistant
         content = m.get("content") or ""
         if role not in ("user", "assistant") or not content:
             continue
@@ -2357,3 +2357,9 @@ send_ledger.register_recover_job()
 send_ledger.check_dialect_at_startup()
 # fix3 BQ-09: 時間設定の整合（heartbeat < 送信 timeout < deadline < 回収閾値）。不整合は警告+既定値
 send_ledger.check_timing_config()
+
+# ── JIKOU-REPLY-Q1b: 大野の返信欄（/app/reply/{record_id}・明示送信・actor=human）の結線。
+#    末尾追記（sink allowlist の行番号 pin を壊さない規約）。catch-all より前へ並べ替える。
+#    送信は hub/line_channel.push_text_explicit → send_ledger（human_reply 文脈）。
+from hub.webapp_reply_view import router as reply_view_router  # noqa: E402
+include_before_catch_all(app, reply_view_router)

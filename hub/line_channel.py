@@ -213,3 +213,34 @@ async def _push_text_http(channel: LineChannelConfig, to: str, text: str) -> boo
         logger.error("[LINE_PUSH] ERROR: %s",
                      emit(resp.text, "vendor_raw", "log", "operator"))
     return bool(resp.is_success)
+
+
+# ── JIKOU-REPLY-Q1b: 大野の明示送信（PWA 返信欄） ─────────────────────────────
+PUSH_SENT = "sent"
+PUSH_FAILED = "failed"
+PUSH_DUPLICATE_SENT = "duplicate_sent"
+PUSH_DUPLICATE_UNCONFIRMED = "duplicate_unconfirmed"
+
+
+async def push_text_explicit(channel: LineChannelConfig, op_id: str, to: str, text: str) -> str:
+    """大野の明示送信: 操作 ID を固定して送信操作記録を通す（主体=human・用途=reply）。
+    push_text と同じ [begin → guarded_http → finish] だが、**重複を成功と区別して返す**
+    （画面側が App 28 記録・手本保存を二重に行わないため）。戻り値は閉集合:
+    sent / failed（非 2xx）/ duplicate_sent / duplicate_unconfirmed。通信例外・期限到達は
+    記録を unconfirmed にして再送出（呼び出し側が「送信確認待ち」として扱う）。
+    記録なし（DB 未設定＝fail-open）は重複検出なしで送る（他経路と同じ）。"""
+    async with send_ledger.human_reply(op_id):
+        op = await send_ledger.begin(channel.name, channel.name, to, text)
+    if op is send_ledger.DUPLICATE_SENT:
+        logger.info("[LINE_PUSH] explicit duplicate skipped (send_ledger: already sent)")
+        return PUSH_DUPLICATE_SENT
+    if op is send_ledger.DUPLICATE_UNCONFIRMED:
+        logger.info("[LINE_PUSH] explicit duplicate skipped (send_ledger: unconfirmed)")
+        return PUSH_DUPLICATE_UNCONFIRMED
+    try:
+        ok = await send_ledger.guarded_http(op, _push_text_http(channel, to, text))
+    except BaseException:
+        await send_ledger.finish(op, send_ledger.STATE_UNCONFIRMED)
+        raise
+    await send_ledger.finish(op, send_ledger.STATE_SENT if ok else send_ledger.STATE_FAILED)
+    return PUSH_SENT if ok else PUSH_FAILED

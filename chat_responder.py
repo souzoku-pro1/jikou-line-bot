@@ -861,7 +861,7 @@ def build_system_prompt(
     court_docs: str = "（未登録）",
     credit_check: str = "（未登録）",
     known_items: Optional[dict] = None,
-    profile: BusinessProfile | None = None,
+    profile: BusinessProfile | None = None, human_note: str = "",  # JIKOU-REPLY-Q1b: 履歴に human 行があるときの注記（空なら従来どおり）
 ) -> str:
     """顧客対応Claudeのシステムプロンプトを組み立てる。
 
@@ -890,7 +890,7 @@ def build_system_prompt(
             "\n上記は既に回答済み・受領済みの項目です。同じ内容を再度"
             "質問・依頼しないでください。"
         )
-    return prompt
+    return prompt + human_note  # JIKOU-REPLY-Q1b: human_note は "" 既定＝customer_prompt_base の pin 不変
 
 
 # ── サーバー側ガード（自動送信前の二重チェック） ─────────────────────────────────
@@ -1329,13 +1329,13 @@ async def get_recent_chat_history(user_id: str, limit: int = 10) -> list[dict]:
     # HRI-08（裁定 G-2）: 画像の保留行・人対応済行（固定文言の内部行）は会話履歴に
     # 含めない（モデルへの注入・既知項目判定の汚染を防ぐ。他の行は従来どおり）
     from hub.image_intake import IMAGE_HUMAN_CLOSED_MARKER, IMAGE_HUMAN_HOLD_MARKER
-    # desc で取得しているので reversed で古い順に並べ直す
-    return [
+    # desc で取得しているので reversed で古い順に並べ直す。JIKOU-REPLY-Q1b: human 行は model_history で assistant へ
+    return model_history([
         {"role": r["role"]["value"], "content": r["message"]["value"]}
         for r in reversed(records)
         if r["message"]["value"] not in (IMAGE_HUMAN_HOLD_MARKER,
                                          IMAGE_HUMAN_CLOSED_MARKER)
-    ]
+    ])
 
 
 # ── 承認キュー（APP_APPROVAL 未設定時はスキップ） ──────────────────────────────
@@ -1648,7 +1648,7 @@ async def handle_customer_message(
         court_docs=_field("裁判所書類"),
         credit_check=_field("信用情報確認"),
         known_items=known_items,
-        profile=p,
+        profile=p, human_note=human_history_note(history),  # JIKOU-REPLY-Q1b: 事務所（human）返信を前提にする注記
     )
 
     # Claude で返信案を作成
@@ -1876,3 +1876,49 @@ def _fee_demotion_reason(missing: list[str], unknown: bool) -> str:
     if unknown:
         parts.append(FEE_COUNT_UNKNOWN_REASON)
     return "／".join(parts)
+
+
+# ══════════════════════════════════════════════════════════════
+# JIKOU-REPLY-Q1b: 事務所（大野）の返信 role=human を LLM 文脈に含める（§7）
+#   - App 28 の role=human（PWA の返信欄が書く）は、モデル入力では assistant に変換する
+#     （Anthropic API の role は user/assistant のみ＝未変換は 400 → pending_reply）。
+#   - 変換した履歴（ChatHistory）は human 行の件数を持ち、顧客対応経路の system prompt に
+#     注記 1 行（HUMAN_HISTORY_NOTE）を足す。human 行が無ければ注記なし＝従来と同一。
+#   - 既存テストが get_recent_chat_history を素の list で差し替えても動く（件数 0 扱い）。
+#   - 本節は末尾追記（sink allowlist の行番号 pin を動かさない）。
+# ══════════════════════════════════════════════════════════════
+ROLE_HUMAN = "human"
+MODEL_ROLES = ("user", "assistant")
+HUMAN_HISTORY_NOTE = (
+    "\n\n【注記】会話履歴の assistant 発話には、弁護士本人（事務所）が送った返信（human）が"
+    "含まれます。これを前提に続きを書いてください。その内容を繰り返さない・言い換えない。"
+)
+
+
+def model_role(role: str | None) -> str | None:
+    """App 28 の role をモデル入力用に正規化（human → assistant・他はそのまま）。"""
+    return "assistant" if role == ROLE_HUMAN else role
+
+
+class ChatHistory(list):
+    """Claude messages 形式の履歴（list 互換）。human_rows=変換した human 行の件数。"""
+    human_rows: int = 0
+
+
+def model_history(rows: list[dict]) -> ChatHistory:
+    """role を変換し、モデルに渡せない role（user/assistant 以外）は落とす。"""
+    out = ChatHistory()
+    for r in rows:
+        role = r.get("role")
+        if role == ROLE_HUMAN:
+            out.human_rows += 1
+        role = model_role(role)
+        if role not in MODEL_ROLES:
+            continue
+        out.append({"role": role, "content": r.get("content", "")})
+    return out
+
+
+def human_history_note(history) -> str:
+    """履歴に human 行があれば system prompt への注記、無ければ ""（pin 不変）。"""
+    return HUMAN_HISTORY_NOTE if getattr(history, "human_rows", 0) else ""

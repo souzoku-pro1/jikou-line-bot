@@ -295,6 +295,19 @@ async def approved_draft(op_id: str):
         _ctx.reset(token)
 
 
+@contextlib.asynccontextmanager
+async def human_reply(op_id: str):
+    """JIKOU-REPLY-Q1b: 大野の明示送信（主体=human・用途=reply・操作 ID 固定＝二重クリックは
+    同じ操作として DUPLICATE_* に倒れる・受信イベント ID なし）。"""
+    base = _ctx.get() or SendContext()
+    token = _ctx.set(replace(base, actor=ACTOR_HUMAN, purpose=PURPOSE_REPLY,
+                             op_id=str(op_id), inbound_event_id=None))
+    try:
+        yield
+    finally:
+        _ctx.reset(token)
+
+
 # ── 補助 ────────────────────────────────────────────────────────────────────
 def line_user_hash(business: str, user_id: str) -> str:
     """一方向ハッシュ（RV-10: userId を表に置かない）。"""
@@ -878,6 +891,16 @@ async def confirm_by_human(op_id: str, outcome: str, reason: str, *, now=None) -
     return "ok"
 
 
+async def operation_state(op_id: str) -> str | None:
+    """JIKOU-REPLY-Q1b: 操作 ID の現在状態（無ければ None・DB 未設定は None）。
+    明示送信の画面が「同じ操作 ID の再送信」を副作用なしで弾くための読取。"""
+    if not _db_configured():
+        return None
+    async with session_scope() as s:
+        return (await s.execute(sa.select(send_operation.c.state).where(
+            send_operation.c.op_id == str(op_id)))).scalar()
+
+
 async def operation_history(op_id: str) -> list[dict]:
     async with session_scope() as s:
         rows = (await s.execute(sa.select(send_operation_history).where(
@@ -1000,3 +1023,12 @@ def decide_send(actor: str, *, paused: str = CLEAR, stoplisted: str = CLEAR,
     if attending and not versions_match:
         reasons.append("attending:version_mismatch")
     return Decision(not reasons, tuple(reasons))
+
+
+def human_explicit_decision(explicit_confirm: bool) -> Decision:
+    """JIKOU-REPLY-Q1b (f): 許可表のうち「大野の明示送信」列だけを適用する入口。
+    human は停止判定（全体停止・停止リスト・人対応）の照会対象外＝各条件を UNKNOWN（最悪側）
+    として評価し、明示確認（画面のチェック）があれば全場面で送信可。確認が無ければ不可。
+    bot / approved_draft 列の適用は Q1c（flag JIKOU_SEND_POLICY_V2）。"""
+    return decide_send(ACTOR_HUMAN, paused=UNKNOWN, stoplisted=UNKNOWN, human_mode=UNKNOWN,
+                       attending=True, stage_known=False, explicit_confirm=bool(explicit_confirm))

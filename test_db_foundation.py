@@ -942,7 +942,8 @@ class TestSendLedgerMigration(unittest.TestCase):
             up = alembic("upgrade", "d1e4f7a0b3c6")
             self.assertEqual(up.returncode, 0, f"stderr={up.stderr[-800:]}")
             self.assertFalse(set(send_ledger.TABLE_NAMES) & tables())
-            up = alembic("upgrade", "head")
+            # JIKOU-REPLY-Q1b: head が f7b2c9d4e1a6 へ進んだため本 revision までを明示（検証内容は不変）
+            up = alembic("upgrade", self.SEND_LEDGER)
             self.assertEqual(up.returncode, 0, f"stderr={up.stderr[-800:]}")
             self.assertIn(self.SEND_LEDGER, alembic("current").stdout)
             self.assertTrue(set(send_ledger.TABLE_NAMES) <= tables())
@@ -968,3 +969,47 @@ class TestSendLedgerMigration(unittest.TestCase):
         finally:
             shutil.rmtree(d, ignore_errors=True)
 
+
+class TestReplyExemplarMigration(unittest.TestCase):
+    """JIKOU-REPLY-Q1b: 手本集の migration（f7b2c9d4e1a6）が e5f8a1b4c7d9 の後ろに 1 本で繋がり、
+    up→down が往復し、head で列集合が hub/reply_exemplar.metadata と一致すること。downgrade は
+    本表だけを落とし、send_ledger の表は残る。"""
+
+    SEND_LEDGER = "e5f8a1b4c7d9"
+    REPLY_EXEMPLAR = "f7b2c9d4e1a6"
+
+    def test_reply_exemplar_migration_round_trip(self):
+        import sqlite3
+        import tempfile
+        from hub import reply_exemplar, send_ledger
+        d = tempfile.mkdtemp(prefix="reply_exemplar_mig_")
+        dbfile = f"{d}/mig.db"
+        alembic, tables, unique_cols, nullable = TestAlembicScaffold._brain_mig_tools(dbfile)
+        try:
+            up = alembic("upgrade", self.SEND_LEDGER)
+            self.assertEqual(up.returncode, 0, f"stderr={up.stderr[-800:]}")
+            self.assertNotIn(reply_exemplar.TABLE_NAME, tables())
+            up = alembic("upgrade", "head")
+            self.assertEqual(up.returncode, 0, f"stderr={up.stderr[-800:]}")
+            self.assertIn(self.REPLY_EXEMPLAR, alembic("current").stdout)
+            self.assertIn(reply_exemplar.TABLE_NAME, tables())
+            con = sqlite3.connect(dbfile)
+            try:
+                cols = {r[1] for r in con.execute(f'PRAGMA table_info("{reply_exemplar.TABLE_NAME}")')}
+                self.assertEqual(cols, {c.name for c in reply_exemplar.reply_exemplar.columns})
+                nn = nullable(con, reply_exemplar.TABLE_NAME)
+                self.assertFalse(nn["human_reply"])
+                self.assertFalse(nn["stage"])
+                self.assertTrue(nn["conversation_ref"])
+                self.assertTrue(nn["creditor_name"])
+                idx = {r[1] for r in con.execute(f'PRAGMA index_list("{reply_exemplar.TABLE_NAME}")')}
+                self.assertIn("ix_reply_exemplar_lookup", idx)
+            finally:
+                con.close()
+            down = alembic("downgrade", self.SEND_LEDGER)
+            self.assertEqual(down.returncode, 0, f"stderr={down.stderr[-800:]}")
+            self.assertNotIn(reply_exemplar.TABLE_NAME, tables())
+            self.assertTrue(set(send_ledger.TABLE_NAMES) <= tables())     # 下位の表は残る
+            self.assertIn(self.SEND_LEDGER, alembic("current").stdout)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
