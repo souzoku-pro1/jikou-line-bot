@@ -1747,6 +1747,7 @@ async def handle_customer_message(
             send_policy.ack_purpose(p, guard, ack_text),  # JIKOU-REPLY-Q1c: urgent / first_reply（J-0）/ reply
             reply_func, reply_token, ack_text)
         if ack_text: await save_to_chatlog(user_id, "assistant", ack_text, category, "yes")  # JIKOU-REPLY-Q1c
+        await reply_draft.maybe_generate(user_id, user_message, history, category, status, profile=p)  # JIKOU-REPLY-Q3b: V2 ON・手本があれば AI 下書き（承認待ち・送信なし）
         # 弁護士へ承認依頼通知（希死念慮・差押え切迫は【緊急・要即時対応】）
         await _notify_attorney(
             user_id, customer_name, approval_id, category,
@@ -1986,3 +1987,6 @@ from hub import reply_exemplar  # noqa: E402
 # ── JIKOU-REPLY-Q2（QUEUE-2026-10-13-D D-1）: 選択器・描画器・閉集合送信の結線（V2 ON のみ）。末尾追記。
 from dataclasses import replace as replace_dc  # noqa: E402
 from hub import jikou_reply_flow  # noqa: E402
+
+# ── JIKOU-REPLY-Q3b（QUEUE-2026-10-13-D D-2）: 手本参考の AI 下書き（承認待ち・自動送信なし）。末尾追記。
+from hub import reply_draft  # noqa: E402
