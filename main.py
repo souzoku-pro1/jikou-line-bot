@@ -2357,3 +2357,7 @@ send_ledger.register_recover_job()
 send_ledger.check_dialect_at_startup()
 # fix3 BQ-09: 時間設定の整合（heartbeat < 送信 timeout < deadline < 回収閾値）。不整合は警告+既定値
 send_ledger.check_timing_config()
+
+# ── HOUKI-JIJOU-1（QUEUE-2026-10-13-D D-5）: 上申書（事情説明書）の下書き・承認・生成画面（/app/houki/jijou）の結線。末尾追記。
+from hub.webapp_houki_jijou_view import router as houki_jijou_router  # noqa: E402
+include_before_catch_all(app, houki_jijou_router)
