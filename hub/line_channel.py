@@ -97,6 +97,26 @@ def verify_line_signature(channel: LineChannelConfig,
         base64.b64encode(digest).decode("utf-8"), signature)
 
 
+async def _begin_with_policy(channel: LineChannelConfig, to: str, text: str):
+    """JIKOU-REPLY-Q1c (a): V2 ON・顧客チャネル・主体 human 以外のときだけ停止条件（hub/send_policy）を
+    束ねて begin() を呼ぶ。該当しなければ従来どおりの begin()（OFF は本関数の分岐に入らない）。"""
+    from hub import send_policy
+    cond = await send_policy.conditions_if_applicable(channel.name, to)
+    if cond is None:
+        return await send_ledger.begin(channel.name, channel.name, to, text)
+    with send_ledger.policy(cond):
+        op = await send_ledger.begin(channel.name, channel.name, to, text)
+    if isinstance(op, send_ledger.PolicyStopped):
+        send_policy.record_stop(op.reasons)
+    elif op is send_ledger.FIRST_REPLY_ALREADY:
+        send_policy.record_stop(("first_reply:already",))
+    return op
+
+
+def _policy_stopped(op) -> bool:
+    return isinstance(op, send_ledger.PolicyStopped) or op is send_ledger.FIRST_REPLY_ALREADY
+
+
 async def reply_with_push_fallback(channel: LineChannelConfig,
                                    reply_token: str, to: str,
                                    text: str) -> str:
@@ -111,14 +131,19 @@ async def reply_with_push_fallback(channel: LineChannelConfig,
     HTTP 呼び出し・ログ文言・順序は従来どおり。
     fix1 BQ-01: 戻り値は 3 値 send_ledger.SEND_SENT（送信成功、または送信済みの重複）／
     SEND_UNCONFIRMED（結果未確認の重複＝既存操作が pending/started/unconfirmed）／
-    SEND_FAILED（最終的に非 2xx）。通信例外は従来どおり送出（記録は unconfirmed）。"""
-    op = await send_ledger.begin(channel.name, channel.name, to, text)
+    SEND_FAILED（最終的に非 2xx）。通信例外は従来どおり送出（記録は unconfirmed）。
+    JIKOU-REPLY-Q1c (a): flag V2 ON の顧客チャネルでは送信前に停止条件を束ね、begin() の排他の中の許可表で
+    止まれば送らず SEND_POLICY_STOPPED（J-0 の在庫検査で止まった場合も同じ）。OFF は従来どおり。"""
+    op = await _begin_with_policy(channel, to, text)
     if op is send_ledger.DUPLICATE_SENT:
         logger.info("[LINE] duplicate send skipped (send_ledger: already sent)")
         return send_ledger.SEND_SENT
     if op is send_ledger.DUPLICATE_UNCONFIRMED:
         logger.info("[LINE] duplicate send skipped (send_ledger: unconfirmed)")
         return send_ledger.SEND_UNCONFIRMED
+    if _policy_stopped(op):
+        logger.info("[LINE] send skipped (send_policy v2: not allowed)")
+        return send_ledger.SEND_POLICY_STOPPED
     try:
         # fix3 BQ-09: HTTP 待機中は heartbeat タスクが稼働中の印を打ち、全体期限（送信 timeout）
         # で asyncio.TimeoutError → 既存の例外経路（unconfirmed・再送出）。記録なし（op None）は素通し
@@ -177,14 +202,19 @@ async def push_text(channel: LineChannelConfig, to: str, text: str) -> bool | st
     重複）／send_ledger.SEND_UNCONFIRMED（結果未確認の重複＝既存操作が
     pending/started/unconfirmed・成功として扱わない）／False（非 2xx）。既存 caller の
     `is True` 判定は SEND_UNCONFIRMED を失敗側へ倒す（None ではなく文字列にして、
-    戻り値 None の mock・旧契約と混同しない）。"""
-    op = await send_ledger.begin(channel.name, channel.name, to, text)
+    戻り値 None の mock・旧契約と混同しない）。
+    JIKOU-REPLY-Q1c (a): V2 ON で許可表に落ちた送信は send_ledger.SEND_POLICY_STOPPED（文字列＝`is True`
+    判定は失敗側）。承認 webhook はこの値で送信済み更新へ進まない。"""
+    op = await _begin_with_policy(channel, to, text)
     if op is send_ledger.DUPLICATE_SENT:
         logger.info("[LINE_PUSH] duplicate send skipped (send_ledger: already sent)")
         return True
     if op is send_ledger.DUPLICATE_UNCONFIRMED:
         logger.info("[LINE_PUSH] duplicate send skipped (send_ledger: unconfirmed)")
         return send_ledger.SEND_UNCONFIRMED
+    if _policy_stopped(op):
+        logger.info("[LINE_PUSH] send skipped (send_policy v2: not allowed)")
+        return send_ledger.SEND_POLICY_STOPPED
     try:
         # fix3 BQ-09: heartbeat タスク + 全体期限（reply_with_push_fallback と同じ）
         ok = await send_ledger.guarded_http(op, _push_text_http(channel, to, text))

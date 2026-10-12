@@ -50,7 +50,7 @@ import uuid
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 
-from hub import kintone, line_channel, reply_exemplar, reply_followup, send_ledger
+from hub import kintone, line_channel, reply_exemplar, reply_followup, send_ledger, send_policy
 from hub.redact import emit
 from hub.webapp_auth import _gate, _sign
 
@@ -332,7 +332,9 @@ def _notices(q) -> list[str]:
     done_text = _DONE_NOTICES.get(done, "")
     if done == "late" and done_text:
         done_text += _STATE_LABELS.get(q.get("state", ""), _STATE_LABELS["none"])
-    return [done_text, _LOG_NOTICES.get(q.get("log", ""), ""), _EX_NOTICES.get(q.get("ex", ""), "")]
+    pd = q.get("pd", "")
+    pd_text = f"同じ相談者の対応待ち {html.escape(pd)} 件を閉じました。" if pd.isdigit() else ""   # JIKOU-REPLY-Q1c (d)
+    return [done_text, _LOG_NOTICES.get(q.get("log", ""), ""), _EX_NOTICES.get(q.get("ex", ""), ""), pd_text]
 
 
 async def reply_page(request: Request):
@@ -432,11 +434,12 @@ async def reply_send(request: Request):
         if marked in ("pending", "exists"):
             log_res = "pending_retry"
     reflect_memory_history(user_id, text)
+    pd_res = await send_policy.human_replied(user_id)   # JIKOU-REPLY-Q1c (d): 同じ相談者の対応待ちを閉じる
     ex_res = "off"
     if want_exemplar:
         ex_res = await _save_exemplar(user_id, _v(rec, "顧客メッセージ"), text, op_id,
                                       _v(rec, "顧客名"))
-    return _redirect(back, "sent", log=log_res, ex=ex_res)
+    return _redirect(back, "sent", log=log_res, ex=ex_res, pd=(str(pd_res) if pd_res else ""))
 
 
 async def _safe_followup(op_id: str) -> dict | None:
