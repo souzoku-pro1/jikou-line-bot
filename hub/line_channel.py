@@ -213,3 +213,41 @@ async def _push_text_http(channel: LineChannelConfig, to: str, text: str) -> boo
         logger.error("[LINE_PUSH] ERROR: %s",
                      emit(resp.text, "vendor_raw", "log", "operator"))
     return bool(resp.is_success)
+
+
+# ── HOUKI-SEND-LEDGER-1（QUEUE-2026-10-13-D D-8）: houki_bot 向けの台帳入口（houki_bot は send_ledger を直接 import しない＝
+#    test_houki_bot_policy の閉集合を守る。送信・台帳の作用は本 module に閉じる）。末尾追記。
+HOUKI_REPLY_PREFIX = "houki_reply:"
+
+
+async def touch_houki_inbound(user_id: str, event_id: str):
+    """相続放棄 LINE の受信ごとに会話を更新（再配送は内部で無視・DB 未設定は None・例外は握る）。"""
+    try:
+        return await send_ledger.touch_inbound(HOUKI_CHANNEL.name, user_id, event_id)
+    except Exception:
+        logger.warning("[HOUKI] touch_inbound failed (fixed reason)")
+        return None
+
+
+class houki_reply_context:
+    """ヒアリング返信の台帳文脈: 受信イベント ID=houki_reply:{event_id}（無ければ None）・purpose=other。
+    `with houki_reply_context(event_id): ...` で使う（同期 context manager・contextvars）。"""
+
+    def __init__(self, event_id: str = ""):
+        self._event_id = str(event_id or "")
+        self._token = None
+        self._purpose = None
+
+    def __enter__(self):
+        self._token = send_ledger.bind_inbound(f"{HOUKI_REPLY_PREFIX}{self._event_id}" if self._event_id else None)
+        self._purpose = send_ledger.purpose(send_ledger.PURPOSE_OTHER)
+        self._purpose.__enter__()
+        return self
+
+    def __exit__(self, *exc):
+        try:
+            self._purpose.__exit__(*exc)
+        finally:
+            send_ledger.unbind(self._token)
+        return False
+

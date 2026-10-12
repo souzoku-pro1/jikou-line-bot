@@ -322,7 +322,10 @@ class TestDenyAllV1(unittest.TestCase):
             resp = client.post(URL, content=body,
                                headers={"X-Line-Signature": _sign(body)})
         self.assertEqual(resp.status_code, 200)
-        hearing.assert_awaited_once_with("rt1", uid, "相談です")
+        # HOUKI-SEND-LEDGER-1: 第 4 引数に受信イベント ID（webhookEventId／message id）が加わる（先頭 3 引数は逐語不変）
+        hearing.assert_awaited_once()
+        self.assertEqual(hearing.await_args.args[:3], ("rt1", uid, "相談です"))
+        self.assertIsInstance(hearing.await_args.args[3], str)
         alert.assert_not_awaited()
 
     def test_image_message_notifies(self):

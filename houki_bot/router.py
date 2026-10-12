@@ -31,7 +31,7 @@ from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 
 from hub import image_intake
 from hub import notify
-from hub.line_channel import (HOUKI_CHANNEL, houki_channel_disabled_reason,
+from hub.line_channel import (HOUKI_CHANNEL, touch_houki_inbound, houki_channel_disabled_reason,
                               verify_line_signature)
 from hub.redact import emit
 from houki_bot.hearing import handle_houki_hearing
@@ -120,10 +120,14 @@ async def houki_webhook(request: Request, background_tasks: BackgroundTasks):
         # 画像・友だち追加・その他メッセージは H-1 の記録+管理者通知のまま
         # （画像 AI 判断はさせない・時効の要件4と同じ原則）
         if kind == _KIND_TEXT:
+            # HOUKI-SEND-LEDGER-1: 受信ごとに会話を更新（再配送は内部で無視・DB 未設定は None）。
+            # 受信イベント ID は webhookEventId（無ければ message id）
+            text_event_id = str(event.get("webhookEventId") or (event.get("message") or {}).get("id", "") or "")
+            await touch_houki_inbound(user_id, text_event_id)
             background_tasks.add_task(
                 handle_houki_hearing,
                 event.get("replyToken", ""), user_id,
-                (event.get("message") or {}).get("text", ""))
+                (event.get("message") or {}).get("text", ""), text_event_id)
             continue
         background_tasks.add_task(_record_inbound, user_id, kind)
         if kind == _KIND_IMAGE:
