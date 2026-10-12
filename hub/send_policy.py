@@ -418,8 +418,37 @@ async def approval_blocked(record_id: str, revision: str, reasons) -> str:
     return await send_business_notice(f"approval_blocked:{record_id}:{revision}", text)
 
 
-async def approved_draft_sent(record_id: str, user_id: str) -> int:
-    """承認済み下書きの送信成功: 同じ相談者の対応待ちを human_replied（approved_draft）で閉じる。"""
+PROMOTION_HEADER = "【凍結定型の候補】"
+PROMOTION_FOOTER = "/app/exemplars と承認キューを確認し、凍結定型への昇格を検討してください（昇格は Q5・票で反映）。"
+
+
+async def promotion_check(record_id: str, text: str) -> str:
+    """JIKOU-REPLY-Q3a (c): 承認済み下書きの送信文を起票時の下書きと照合し、無修正承認が PROMOTION_THRESHOLD 回に
+    達した category は業務 LINE へ固定文言を 1 回だけ通知（台帳キー exemplar_promotion:{category}:{回数}）。
+    戻り値: none（照合対象なし／修正あり／閾値未達）・sent・throttled・failed 等（通知の結果）。"""
+    from hub import reply_exemplar
+    res = await reply_exemplar.record_sent(record_id, text)
+    if not res or not res.get("unmodified") or not res.get("category"):
+        return "none"
+    if int(res.get("count") or 0) != reply_exemplar.PROMOTION_THRESHOLD:
+        return "none"
+    cat = str(res["category"])
+    n = int(res["count"])
+    logger.info("[SEND_POLICY] exemplar promotion candidate count=%s", emit(n, "count", "log", "operator"))
+    return await send_business_notice(
+        f"exemplar_promotion:{cat}:{n}",
+        f"{PROMOTION_HEADER}\nカテゴリ「{cat}」の AI 下書きが無修正で {n} 回承認されました。\n{PROMOTION_FOOTER}")
+
+
+async def approved_draft_sent(record_id: str, user_id: str, text: str | None = None,
+                              category: str | None = None) -> int:
+    """承認済み下書きの送信成功: (Q1c) V2 ON なら同じ相談者の対応待ちを human_replied（approved_draft）で閉じる。
+    (Q3a) 無修正承認の計数と候補通知（flag 非依存・失敗は握る）。"""
+    if text is not None:
+        try:
+            await promotion_check(record_id, text)
+        except Exception:
+            logger.warning("[SEND_POLICY] promotion check failed (fixed reason)")
     if not enabled():
         return 0
     return await reply_pending.resolve_for_user(
