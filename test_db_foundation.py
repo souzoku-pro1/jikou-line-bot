@@ -980,7 +980,8 @@ class TestReplyExemplarMigration(unittest.TestCase):
     REPLY_PENDING = "a1c3e5f7b9d2"      # JIKOU-REPLY-Q1c: 対応待ち（f7b2 の後ろ）
     DRAFT_APPROVAL = "b2d4f6a8c0e1"     # JIKOU-REPLY-Q3a: 下書き照合（a1c3 の後ろ）
     REPLY_DRAFT = "c3e5a7b9d1f3"        # JIKOU-REPLY-Q3b: AI 下書き（b2d4 の後ろ）
-    DRAFT_OUTCOME = "d4f6b8c0e2a4"      # JIKOU-REPLY-Q4: reply_draft_approval.outcome（c3e5 の後ろ・head）
+    DRAFT_OUTCOME = "d4f6b8c0e2a4"      # JIKOU-REPLY-Q4: reply_draft_approval.outcome（c3e5 の後ろ）
+    PROMOTED_TEXT = "e6a8c0d2f4b6"      # JIKOU-REPLY-Q5: 昇格定型（d4f6 の後ろ・head）
 
     def test_reply_exemplar_migration_round_trip(self):
         import sqlite3
@@ -1019,10 +1020,26 @@ class TestReplyExemplarMigration(unittest.TestCase):
             self.assertEqual(up.returncode, 0, f"stderr={up.stderr[-800:]}")
             self.assertIn(self.REPLY_DRAFT, alembic("current").stdout)
             self.assertTrue(set(reply_draft.TABLE_NAMES) <= tables())
-            # JIKOU-REPLY-Q4: head（d4f6b8c0e2a4）で reply_draft_approval に outcome 列（列集合が metadata と一致）
-            up = alembic("upgrade", "head")
+            # JIKOU-REPLY-Q4: d4f6b8c0e2a4 で reply_draft_approval に outcome 列（列集合が metadata と一致）
+            up = alembic("upgrade", self.DRAFT_OUTCOME)
             self.assertEqual(up.returncode, 0, f"stderr={up.stderr[-800:]}")
             self.assertIn(self.DRAFT_OUTCOME, alembic("current").stdout)
+            # JIKOU-REPLY-Q5: head（e6a8c0d2f4b6）で昇格定型 2 表（列集合が hub/jikou_reply_promote.metadata と一致）
+            from hub import jikou_reply_promote
+            up = alembic("upgrade", "head")
+            self.assertEqual(up.returncode, 0, f"stderr={up.stderr[-800:]}")
+            self.assertIn(self.PROMOTED_TEXT, alembic("current").stdout)
+            self.assertTrue(set(jikou_reply_promote.TABLE_NAMES) <= tables())
+            con = sqlite3.connect(dbfile)
+            try:
+                for t in jikou_reply_promote.TABLE_NAMES:
+                    got = {r[1] for r in con.execute(f'PRAGMA table_info("{t}")')}
+                    self.assertEqual(got, {c.name for c in jikou_reply_promote.metadata.tables[t].columns}, t)
+            finally:
+                con.close()
+            down = alembic("downgrade", self.DRAFT_OUTCOME)
+            self.assertEqual(down.returncode, 0, f"stderr={down.stderr[-800:]}")
+            self.assertFalse(set(jikou_reply_promote.TABLE_NAMES) & tables())
             con = sqlite3.connect(dbfile)
             try:
                 cols = {r[1] for r in con.execute(f'PRAGMA table_info("{reply_exemplar.DRAFT_TABLE_NAME}")')}

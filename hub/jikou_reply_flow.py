@@ -213,7 +213,9 @@ async def try_closed_set(user_id: str, user_message: str, app21_record: dict, hi
     logger.info("[Q2] selected ids=%s dropped=%s", emit(",".join(sel.ids), "freetext", "log", "operator"),
                 emit(",".join(sel.reasons), "freetext", "log", "operator"))
     if sel.empty:
-        return False
+        # JIKOU-REPLY-Q5 (b): 昇格定型（データ表・category 対応）を 1 件。履歴に同文があれば送らない（R-J4）
+        return await _try_promoted(user_id, history, category, profile=profile, reply_token=reply_token,
+                                   reply_func=reply_func)
     if sel.j5_detail is not None:
         if not await _j5_notice(user_id, app21_record, sel):
             sel = S.drop_j5(sel)
@@ -248,4 +250,31 @@ async def try_closed_set(user_id: str, user_message: str, app21_record: dict, hi
     await cr.save_to_chatlog(user_id, "assistant", text, category, "yes")
     logger.info("[Q2] closed-set reply sent ids=%s len=%s", emit(",".join(sel.ids), "freetext", "log", "operator"),
                 emit(len(text), "count", "log", "operator"))
+    return True
+
+
+# ── JIKOU-REPLY-Q5（QUEUE-2026-10-13-D D-4）: 昇格定型の選択（Q2 の表で該当なしのとき）。末尾追記。
+async def _try_promoted(user_id: str, history: list[dict], category: str, *, profile, reply_token: str,
+                        reply_func) -> bool:
+    import chat_responder as cr
+    from hub import jikou_reply_promote
+    row = await jikou_reply_promote.pick_for_category(category)
+    if not row:
+        return False
+    text = str(row["text"])
+    if any(text in str(m.get("content") or "") for m in (history or []) if m.get("role") == "assistant"):
+        logger.info("[Q5] promoted text already used in conversation")
+        return False
+    v = guard_violations(text, (), profile=profile)
+    if v:
+        logger.info("[Q5] guard rejected count=%s", emit(len(v), "count", "log", "operator"))
+        return False
+    res = await send_ledger.with_purpose(send_ledger.PURPOSE_REPLY, reply_func, reply_token, text)
+    if res == send_ledger.SEND_POLICY_STOPPED:
+        await send_policy._register_and_notify(user_id, route=reply_pending.ROUTE_CUSTOMER,
+                                               reason=reply_pending.REASON_POLICY_STOPPED, category=category,
+                                               approval_record_id=None)
+        return True
+    await cr.save_to_chatlog(user_id, "assistant", text, category, "yes")
+    logger.info("[Q5] promoted reply sent id=%s", emit(str(row["text_id"]), "freetext", "log", "operator"))
     return True
