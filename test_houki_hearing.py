@@ -249,9 +249,9 @@ class TestChoiceClosedSets(unittest.TestCase):
             "遺産が少ない。", "遺産を分散させたくない。", "債務超過のため。",
             "その他"))
 
-    def test_shokugyou_removed_from_writable(self):
-        # 止血: App 40 に「職業」実欄が存在しない（実測）ため書込集合から除外
-        self.assertNotIn("職業", store.HEARING_WRITABLE_FIELDS)
+    def test_shokugyou_in_writable_but_gated_by_field_availability(self):
+        # HOUKI-SHOKUGYO-1: 書込集合に復帰（欄の有無は upsert 直前に hub/houki_shokugyo.available で検査）
+        self.assertIn("職業", store.HEARING_WRITABLE_FIELDS)
 
     def test_split_drops_out_of_set_choice_without_date_side_effects(self):
         out, problems, choice = store.split_valid_fields(
@@ -1595,6 +1595,12 @@ class TestChoiceFieldGuardFlow(_HearingBase):
         self.assertEqual(self.fake.field(rid, "続柄"), "子")
 
     def test_shokugyou_dropped_others_written_no_crash(self):
+        # HOUKI-SHOKUGYO-1: 欄が無い（可用性 False）ときは従来どおり 職業 だけ落とす
+        from hub import houki_shokugyo
+        houki_shokugyo.clear_cache()
+        self._shokugyo_patch = patch.object(houki_shokugyo, "available", AsyncMock(return_value=False))
+        self._shokugyo_patch.start()
+        self.addCleanup(self._shokugyo_patch.stop)
         send, _q, _c, model = self.run_turn_with_model(
             [_tool_response({"phase": "6_applicant",
                              "fields": {"顧客名": "山田花子",
