@@ -326,8 +326,9 @@ class TestPins(unittest.TestCase):
         allow = (REPO / "redaction_sink_allowlist.json").read_text(encoding="utf-8")
         self.assertNotIn("houki_koseki", allow)
         src = (REPO / "main.py").read_text(encoding="utf-8").split("\n")
-        self.assertIn("app.include_router(houki_koseki_router)", "\n".join(src[-12:]))
-        self.assertIn("register_houki_koseki_job()", "\n".join(src[-12:]))
+        # HOUKI-E2E-1（統合）: 後続の末尾追記が並ぶため、窓を末尾追記ブロック全体（check_timing_config 以降）へ広げる（結線の存在の pin は不変）
+        self.assertIn("app.include_router(houki_koseki_router)", "\n".join(src[src.index("send_ledger.check_timing_config()"):]))
+        self.assertIn("register_houki_koseki_job()", "\n".join(src[src.index("send_ledger.check_timing_config()"):]))   # 同上
         # 弁護士専権欄・status は書かない
         msrc = (REPO / "hub" / "houki_koseki_checklist.py").read_text(encoding="utf-8")
         self.assertEqual(msrc.count("update_record("), 1)

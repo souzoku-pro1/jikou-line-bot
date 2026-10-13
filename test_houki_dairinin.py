@@ -268,7 +268,8 @@ class TestPins(unittest.TestCase):
         allow = (REPO / "redaction_sink_allowlist.json").read_text(encoding="utf-8")
         self.assertNotIn("dairinin", allow)
         src = (REPO / "main.py").read_text(encoding="utf-8").split("\n")
-        self.assertIn("app.include_router(dairinin_router)", "\n".join(src[-12:]))
+        # HOUKI-E2E-1（統合）: 後続の末尾追記が並ぶため、窓を末尾追記ブロック全体（check_timing_config 以降）へ広げる（結線の存在の pin は不変）
+        self.assertIn("app.include_router(dairinin_router)", "\n".join(src[src.index("send_ledger.check_timing_config()"):]))
 
 
 if __name__ == "__main__":

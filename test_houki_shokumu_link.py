@@ -179,7 +179,8 @@ class TestPins(unittest.TestCase):
             self.assertEqual(scan_source((REPO / name).read_text(encoding="utf-8"), name), [], name)
         self.assertNotIn("houki_shokumu", allow)
         msrc = (REPO / "main.py").read_text(encoding="utf-8").split("\n")
-        self.assertIn("app.include_router(houki_shokumu_router)", "\n".join(msrc[-6:]))
+        # HOUKI-E2E-1（統合）: 後続の末尾追記が並ぶため、窓を末尾追記ブロック全体（check_timing_config 以降）へ広げる（結線の存在の pin は不変）
+        self.assertIn("app.include_router(houki_shokumu_router)", "\n".join(msrc[msrc.index("send_ledger.check_timing_config()"):]))
         self.assertEqual(shokumu_plan.PLAN_UNIT, "相続放棄")
 
 
