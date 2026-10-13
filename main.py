@@ -2361,3 +2361,11 @@ send_ledger.check_timing_config()
 # ── HOUKI-DAIRININ-1（QUEUE-2026-10-12-C C-3）: 代理人目録の生成受け口（/souzoku-houki/dairinin/{secret}）。末尾追記。
 from dairinin_webhook import router as dairinin_router  # noqa: E402
 app.include_router(dairinin_router)
+
+# ── HOUKI-KOSEKI-CHECKLIST-1（QUEUE-2026-10-12-C C-4）: 受任時の必要戸籍チェックリスト初期行（定期走査+受け口）と
+#    連続戸籍充足の候補通知。末尾追記。走査ジョブは常に登録し、実行可否は env HOUKI_KOSEKI_CHECKLIST_DISABLED
+#    （既定 有効）。start_all は既存 startup 経路が呼ぶ。
+from houki_koseki_webhook import router as houki_koseki_router  # noqa: E402
+app.include_router(houki_koseki_router)
+from hub.houki_koseki_checklist import register_houki_koseki_job  # noqa: E402
+register_houki_koseki_job()
