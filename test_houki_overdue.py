@@ -197,7 +197,9 @@ class TestPins(unittest.TestCase):
             self.assertEqual(scan_source((REPO / name).read_text(encoding="utf-8"), name), [], name)
         self.assertNotIn("houki_overdue", allow)
         msrc = (REPO / "main.py").read_text(encoding="utf-8").split("\n")
-        tail = "\n".join(msrc[-8:])
+        # EDGE-1（統合 feature/edge-tests-1）: Q 系列の末尾追記が後ろに並ぶため、窓を末尾追記ブロック全体
+        # （check_timing_config 以降）へ広げる（結線の存在の pin は不変・HOUKI-E2E-1 と同じ追随）
+        tail = "\n".join(msrc[msrc.index("send_ledger.check_timing_config()"):])
         self.assertIn("include_before_catch_all(app, houki_overdue_router)", tail)
         self.assertIn("app.router.on_startup.append(register_houki_overdue_job)", tail)
 
