@@ -2357,3 +2357,7 @@ send_ledger.register_recover_job()
 send_ledger.check_dialect_at_startup()
 # fix3 BQ-09: 時間設定の整合（heartbeat < 送信 timeout < deadline < 回収閾値）。不整合は警告+既定値
 send_ledger.check_timing_config()
+
+# ── JIKOU-FAX-2（QUEUE-2026-10-13-E E-3）: FAX 送信の承認画面（/app/fax/{record_id}）の結線。末尾追記。
+from hub.webapp_fax_view import router as fax_view_router  # noqa: E402
+include_before_catch_all(app, fax_view_router)
