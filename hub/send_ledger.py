@@ -84,6 +84,7 @@ import datetime
 import hashlib
 import logging
 import os
+import time
 import uuid
 import weakref
 from dataclasses import dataclass, field, replace
@@ -116,6 +117,32 @@ PURPOSES = (PURPOSE_REPLY, PURPOSE_FIRST_REPLY, PURPOSE_URGENT, PURPOSE_IMAGE_RE
             PURPOSE_IMAGE_RESULT, PURPOSE_FOLLOW, PURPOSE_RECEIPT_NUMBER, PURPOSE_OTHER)
 # §8(e): follow あいさつは「初回返信判定の対象」外
 FIRST_REPLY_EXCLUDED = frozenset({PURPOSE_FOLLOW})
+
+# ── JIKOU-SEND-PURPOSE-2（QUEUE-2026-10-13-E E-2）: purpose 正式移行の準備（flag・既定 OFF）。
+#    凍結の閉集合 PURPOSES は不変。V2 の集合は別名（PURPOSES_V2）。種別（inbound_event_id の接頭辞）→ 新 purpose 名は
+#    alembic f8b0c2d4e6a8 の KINDS と同一（テストで pin）。正本: docs/send_ledger_purpose_migration.md
+PURPOSE_V2_ENV = "JIKOU_SEND_PURPOSE_V2"
+PURPOSE_V2_REVISION = "f8b0c2d4e6a8"
+# 本 revision 以降の alembic revision（alembic_version にどれかがあれば CHECK は V2 集合＝新 purpose を書いてよい）。
+# 新しい migration を足したらここにも足す（test_jikou_send_purpose_2 が chain と突き合わせる）
+PURPOSE_V2_REVISIONS = frozenset({PURPOSE_V2_REVISION})
+PURPOSE_KINDS = {
+    "pending_notice": "pending_notice",
+    "draft_notice": "draft_notice",
+    "approval_blocked": "approval_blocked",
+    "exemplar_promotion": "exemplar_promotion",
+    "j5_notice": "j5_notice",
+    "jikou_metrics_weekly": "jikou_metrics_weekly",
+    "houki_jukuryo_14": "houki_jukuryo_14",
+    "houki_jukuryo_7": "houki_jukuryo_7",
+    "houki_jukuryo_unset": "houki_jukuryo_unset",
+    "houki_overdue": "houki_overdue",
+    "houki_reply": "houki_reply",
+    "fax": "fax",
+    "send_ledger_down": "send_ledger_down",
+}
+PURPOSES_V2 = PURPOSES + tuple(PURPOSE_KINDS.values())
+PURPOSE_V2_READY_TTL = 600.0
 
 STATE_PENDING = "pending"
 STATE_STARTED = "started"
@@ -673,6 +700,7 @@ async def begin(business: str, channel: str, user_id: str, text: str):
         return None
     ctx = _ctx.get()
     purpose_ = (ctx.purpose if ctx and ctx.purpose in PURPOSES else PURPOSE_REPLY)
+    purpose_ = await effective_purpose(purpose_, ctx.inbound_event_id if ctx else None)  # JIKOU-SEND-PURPOSE-2
     actor = (ctx.actor if ctx and ctx.actor in ACTORS else ACTOR_BOT)
     event_id = ctx.inbound_event_id if ctx else None
     seq = 1
@@ -699,7 +727,7 @@ async def begin(business: str, channel: str, user_id: str, text: str):
                     send_operation.c.business == business,
                     send_operation.c.channel == channel,
                     send_operation.c.inbound_event_id == event_id,
-                    send_operation.c.purpose == purpose_,
+                    send_operation.c.purpose.in_(equivalent_purposes(purpose_, event_id)),  # JIKOU-SEND-PURPOSE-2: 両表現
                     send_operation.c.inbound_seq == seq))).first()
             if existing is not None and existing.state == STATE_SENT:
                 return DUPLICATE_SENT
@@ -1170,3 +1198,98 @@ def human_explicit_decision(explicit_confirm: bool) -> Decision:
     bot / approved_draft 列の適用は Q1c（flag JIKOU_SEND_POLICY_V2）。"""
     return decide_send(ACTOR_HUMAN, paused=UNKNOWN, stoplisted=UNKNOWN, human_mode=UNKNOWN,
                        attending=True, stage_known=False, explicit_confirm=bool(explicit_confirm))
+
+
+# ── JIKOU-SEND-PURPOSE-2（QUEUE-2026-10-13-E E-2）: 両方式（other+接頭辞／新 purpose）の正規化・照合・flag。末尾追記。
+_v2_ready_cache: list = [0.0, False]       # [monotonic, ready]
+
+
+def purpose_v2_enabled() -> bool:
+    return os.environ.get(PURPOSE_V2_ENV, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def kind_of(inbound_event_id) -> str | None:
+    """inbound_event_id の接頭辞（最初の ':' の前）が既知の種別ならそれ（無ければ None）。"""
+    s = str(inbound_event_id or "")
+    i = s.find(":")
+    if i <= 0:
+        return None
+    k = s[:i]
+    return k if k in PURPOSE_KINDS else None
+
+
+def canonical_purpose(purpose: str, inbound_event_id) -> str:
+    """other＋既知接頭辞 → 種別名。それ以外はそのまま（旧表現・新表現を同じ値に正規化）。"""
+    if purpose == PURPOSE_OTHER:
+        k = kind_of(inbound_event_id)
+        if k:
+            return PURPOSE_KINDS[k]
+    return str(purpose)
+
+
+def canonical_key(business: str, channel: str, purpose: str, inbound_event_id, inbound_seq: int = 1) -> tuple:
+    """両方式を同一 key として照合するための正規化 key。"""
+    return (str(business), str(channel), canonical_purpose(purpose, inbound_event_id),
+            str(inbound_event_id or ""), int(inbound_seq or 1))
+
+
+def same_key(row_a, row_b) -> bool:
+    """send_operation の 2 行（dict か Row）が同じ操作 key か（purpose の書式が違っても True）。"""
+    def _g(r, k):
+        try:
+            return r[k]
+        except (KeyError, TypeError, IndexError):
+            return getattr(r, k, None)
+    ka = canonical_key(_g(row_a, "business"), _g(row_a, "channel"), _g(row_a, "purpose"), _g(row_a, "inbound_event_id"),
+                       _g(row_a, "inbound_seq") or 1)
+    kb = canonical_key(_g(row_b, "business"), _g(row_b, "channel"), _g(row_b, "purpose"), _g(row_b, "inbound_event_id"),
+                       _g(row_b, "inbound_seq") or 1)
+    return ka == kb
+
+
+def equivalent_purposes(purpose: str, inbound_event_id) -> list:
+    """既存行検索に使う purpose の候補（種別名と other の両表現。該当しなければ [purpose]）。"""
+    canon = canonical_purpose(purpose, inbound_event_id)
+    out = [str(purpose)]
+    if canon != purpose:
+        out.append(canon)
+    if canon in PURPOSE_KINDS.values() and kind_of(inbound_event_id) and PURPOSE_OTHER not in out:
+        out.append(PURPOSE_OTHER)
+    return out
+
+
+def reset_purpose_v2_cache() -> None:
+    _v2_ready_cache[0], _v2_ready_cache[1] = 0.0, False
+
+
+async def purpose_v2_ready() -> bool:
+    """flag ON かつ migration f8b0c2d4e6a8（以降）が適用済みか（alembic_version を 10 分キャッシュで照会・失敗は False）。"""
+    if not purpose_v2_enabled():
+        return False
+    now = time.monotonic()
+    if _v2_ready_cache[0] and now - _v2_ready_cache[0] < PURPOSE_V2_READY_TTL:
+        return _v2_ready_cache[1]
+    ready = False
+    try:
+        async with session_scope() as s:
+            rows = (await s.execute(sa.text("SELECT version_num FROM alembic_version"))).scalars().all()
+        ready = any(str(r) in PURPOSE_V2_REVISIONS for r in rows)
+    except Exception:
+        logger.info("[SEND_LEDGER] purpose v2 readiness unknown (legacy purpose kept)")
+        ready = False
+    if not ready:
+        logger.info("[SEND_LEDGER] purpose v2 not ready (legacy purpose kept)")
+    _v2_ready_cache[0], _v2_ready_cache[1] = now, ready
+    return ready
+
+
+async def effective_purpose(purpose: str, inbound_event_id) -> str:
+    """記録する purpose: flag ON かつ適用済みなら other＋既知接頭辞を種別名に。OFF・未適用は従来どおり。"""
+    if purpose != PURPOSE_OTHER or not kind_of(inbound_event_id):
+        return str(purpose)
+    if not purpose_v2_enabled():
+        return str(purpose)
+    if not await purpose_v2_ready():
+        return str(purpose)
+    return canonical_purpose(purpose, inbound_event_id)
+
