@@ -1784,6 +1784,9 @@ _CREDITOR_COUNT_RE = re.compile(rf"(?<![{_NUMERAL_CHARS}])([{_NUMERAL_CHARS}]+)\
 
 # 判定不能の印（解釈できない数表現が 1 つでもあれば全体を不能とし、1〜2 社に倒さない）
 COUNT_UNKNOWN = None
+# EDGE-1（QUEUE-2026-10-14-G G-2 反例 #2）: 数を持たない「社数らしい」表現（数社・複数社・複数の業者）は
+# 0（=1〜2 社扱い）に倒さず判定不能にする（3 社以上の可能性があるため承認へ）。「各社」は社数表現ではないので対象外。
+_VAGUE_COUNT_RE = re.compile(r"数社|複数社|複数の(?:業者|会社|債権者|社)")
 
 
 def _parse_kanji_number(token: str) -> int | None:
@@ -1819,12 +1822,20 @@ def _parse_count_token(token: str) -> int | None:
     return None
 
 
+FEE_COUNT_MAX = 999            # EDGE-1: 社数の上限（漢数字の文法上限＝三桁と同じ）。超過は例外＝呼出側で承認へ
+
+
 def fee_total_yen(count: int) -> int:
-    """通算社数 count に対する弁護士報酬の合計（税込）。count<=0 は 0。
-    1→44,000 / 2→88,000 / 3→110,000 / 4→132,000。"""
-    n = max(int(count), 0)
-    base = min(n, FEE_BASE_MAX_COUNT) * FEE_BASE_YEN
-    extra = max(n - FEE_BASE_MAX_COUNT, 0) * FEE_EXTRA_YEN
+    """通算社数 count に対する弁護士報酬の合計（税込）。
+    1→44,000 / 2→88,000 / 3→110,000 / 4→132,000。
+    EDGE-1（QUEUE-2026-10-14-G G-2 反例 #1）: int 以外（bool・float・数字文字列）は TypeError、
+    1 未満・FEE_COUNT_MAX 超は ValueError。0 円や丸めた金額を黙って返さない（呼出側は例外を承認降格に倒す）。"""
+    if isinstance(count, bool) or not isinstance(count, int):
+        raise TypeError("fee_count_type")
+    if count < 1 or count > FEE_COUNT_MAX:
+        raise ValueError("fee_count_out_of_range")
+    base = min(count, FEE_BASE_MAX_COUNT) * FEE_BASE_YEN
+    extra = max(count - FEE_BASE_MAX_COUNT, 0) * FEE_EXTRA_YEN
     return base + extra
 
 
@@ -1835,6 +1846,8 @@ def _creditor_count_mentioned(text: str) -> int | None:
     fix2 BF-02: 社名（「三社電機」）との区別はしない＝安全側で社数として数える（3 扱い）。
     費用ガードの「3社以上の文脈」判定に使う（機構側・業務非依存）。"""
     norm = unicodedata.normalize("NFKC", str(text or ""))
+    if _VAGUE_COUNT_RE.search(norm):              # EDGE-1 反例 #2: 数社・複数社は判定不能（承認へ）
+        return COUNT_UNKNOWN
     best = 0
     for m in _CREDITOR_COUNT_RE.finditer(norm):
         n = _parse_count_token(m.group(1))
