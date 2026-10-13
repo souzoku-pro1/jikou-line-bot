@@ -636,12 +636,12 @@ async def run_healthcheck() -> list[str]:
         body = "\n".join(f"・{p}" for p in problems)
         if notice:
             body += f"\n（{notice}）"   # 通知本文に 1 行添える（異常件数には数えない）
-        sent_ok = await notify_admin_line(
+        # CONCURRENCY-1（G-3 反例 #3）: 2 プロセス同時起動でも 1 日 1 通（台帳 key・台帳不可は従来どおり）。7 行＝番地不変
+        sent_ok = await _notify_once_per_day(
             "【日次死活監視: 異常検知】\n"
             f"時刻: {now}\n"
             f"{body}\n"
             "対応手順は README「日次死活監視」を参照してください。",
-            throttle_key="",  # 日次実行なのでスロットルしない
         )
         # dead-man（統合形）: 業務通知の送信自体が失敗＝経路が死んでいる。
         # 例外相当の警告ログ＋可能な範囲の代替警報（顧客Botは絶対に使わない）。
@@ -705,3 +705,43 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     result = asyncio.run(run_healthcheck())
     raise SystemExit(1 if result else 0)
+
+
+# ── CONCURRENCY-1（QUEUE-2026-10-14-G G-3 反例 #3）: 異常通知の 1 日 1 通（プロセス横断・台帳 key）。末尾追記。 ──
+HEALTHCHECK_LEDGER_BUSINESS = "jikou"
+HEALTHCHECK_LEDGER_CHANNEL = "healthcheck"
+
+
+def _healthcheck_day_key() -> str:
+    """台帳の受信イベント ID（JST 日付のみ・値を含まない）。"""
+    return "healthcheck:" + datetime.now(_JST).strftime("%Y-%m-%d")
+
+
+async def _notify_once_per_day(text: str) -> bool:
+    """異常通知を send_ledger（受信イベント ID＝healthcheck:{JST 日付}・purpose=other）で 1 日 1 通にする。
+    同時刻に 2 プロセスで起動しても、Postgres の advisory lock と UNIQUE 制約で 2 通目は DUPLICATE（送らない）。
+    台帳が使えない（DB 未設定・障害＝begin が None）ときは従来どおり直接送る（fail-open: 監視通知を DB に依存させない）。
+    送信失敗は failed で残し、次のプロセス／次回の起動が再試行する（自動再送はしない）。戻り値=送れたか。"""
+    from hub import send_ledger
+    from hub.notify import get_admin_line_user_id
+    token = send_ledger.bind_inbound(_healthcheck_day_key())
+    try:
+        with send_ledger.purpose(send_ledger.PURPOSE_OTHER):
+            op = await send_ledger.begin(HEALTHCHECK_LEDGER_BUSINESS, HEALTHCHECK_LEDGER_CHANNEL,
+                                         get_admin_line_user_id() or "", text)
+    except Exception:
+        op = None
+    finally:
+        send_ledger.unbind(token)
+    if op is send_ledger.DUPLICATE_SENT or op is send_ledger.DUPLICATE_UNCONFIRMED:
+        logger.info("healthcheck notice skipped (already sent today per ledger)")
+        return True
+    if not isinstance(op, send_ledger.Operation):
+        return await notify_admin_line(text, throttle_key="")          # 台帳なし＝従来どおり（fail-open）
+    try:
+        ok = await notify_admin_line(text, throttle_key="")
+    except Exception:
+        await send_ledger.finish(op, send_ledger.STATE_UNCONFIRMED)
+        raise
+    await send_ledger.finish(op, send_ledger.STATE_SENT if ok else send_ledger.STATE_FAILED)
+    return ok
