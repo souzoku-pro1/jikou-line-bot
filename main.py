@@ -2377,3 +2377,9 @@ include_before_catch_all(app, houki_jijou_router)
 # ── HOUKI-SHOKUMU-LINK-1（QUEUE-2026-10-13-D D-6）: App 40 → 職務上請求の請求案の受け口（flag OFF は I/O ゼロ）。末尾追記。
 from houki_shokumu_webhook import router as houki_shokumu_router  # noqa: E402
 app.include_router(houki_shokumu_router)
+
+# ── HOUKI-JUKURYO-3（QUEUE-2026-10-13-D D-7）: 期限超過×未提出の一覧（/app/houki/overdue）と日次の件数通知。末尾追記。
+from hub.houki_overdue import register_houki_overdue_job  # noqa: E402
+from hub.webapp_houki_overdue_view import router as houki_overdue_router  # noqa: E402
+include_before_catch_all(app, houki_overdue_router)
+app.router.on_startup.append(register_houki_overdue_job)   # 起動時に daily 登録（import 時にループを要求しない）
