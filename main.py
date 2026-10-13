@@ -2373,3 +2373,7 @@ register_houki_koseki_job()
 # ── HOUKI-JIJOU-1（QUEUE-2026-10-13-D D-5）: 上申書（事情説明書）の下書き・承認・生成画面（/app/houki/jijou）の結線。末尾追記。
 from hub.webapp_houki_jijou_view import router as houki_jijou_router  # noqa: E402
 include_before_catch_all(app, houki_jijou_router)
+
+# ── HOUKI-SHOKUMU-LINK-1（QUEUE-2026-10-13-D D-6）: App 40 → 職務上請求の請求案の受け口（flag OFF は I/O ゼロ）。末尾追記。
+from houki_shokumu_webhook import router as houki_shokumu_router  # noqa: E402
+app.include_router(houki_shokumu_router)
