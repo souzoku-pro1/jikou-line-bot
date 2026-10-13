@@ -2369,3 +2369,7 @@ from houki_koseki_webhook import router as houki_koseki_router  # noqa: E402
 app.include_router(houki_koseki_router)
 from hub.houki_koseki_checklist import register_houki_koseki_job  # noqa: E402
 register_houki_koseki_job()
+
+# ── HOUKI-JIJOU-1（QUEUE-2026-10-13-D D-5）: 上申書（事情説明書）の下書き・承認・生成画面（/app/houki/jijou）の結線。末尾追記。
+from hub.webapp_houki_jijou_view import router as houki_jijou_router  # noqa: E402
+include_before_catch_all(app, houki_jijou_router)
