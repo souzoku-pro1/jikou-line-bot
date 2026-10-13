@@ -2418,3 +2418,7 @@ include_before_catch_all(app, exemplar_view_router)
 # ── JIKOU-REPLY-Q4（QUEUE-2026-10-13-D D-3）: AI 下書きの承認・修正・却下画面（/app/drafts）の結線。末尾追記。
 from hub.webapp_drafts_view import router as drafts_view_router  # noqa: E402
 include_before_catch_all(app, drafts_view_router)
+
+# ── JIKOU-REPLY-Q6（QUEUE-2026-10-13-E E-1）: 返信計測（/app/reply/metrics・/app/reply/{record_id} より前に置く）と週次要約ジョブ（startup 登録）。末尾追記。
+from hub.webapp_reply_metrics_view import wire_all as wire_reply_metrics  # noqa: E402
+wire_reply_metrics(app)
