@@ -149,7 +149,8 @@ def guard_violations(text: str, ids, *, profile) -> list[str]:
         if i in NAME_CHECK_EXEMPT_IDS:
             styled = styled.replace(T.text(i), "")       # J-0/J-1 は名乗り検査を ID で免除（§10-3）
     v += cr.style_guard_violations(styled, route=profile.customer_style_route)
-    if pii_scan.residue_hits(text):
+    # JIKOU-REPLY-Q1b-fix2 BR-10: 凍結定型（閉集合・大野承認済み）には発見的な氏名検査を掛けない（確定パターンのみ）
+    if pii_scan.residue_hits(text, heuristics=False):
         v.append("pii_residue")
     if empty_reply_guard.empty_reply_labels(text) == [empty_reply_guard.LABEL_EMPTY]:
         v.append("empty_reply")                              # 語彙表は閉集合の定型には適用しない（検査は空文字のみ）
