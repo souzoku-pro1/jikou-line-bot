@@ -387,7 +387,10 @@ class TestPins(unittest.TestCase):
         self.assertEqual(sum("return prompt + human_note + exemplar_note" in l for l in csrc), 1)
         msrc = (REPO / "main.py").read_text(encoding="utf-8").split("\n")
         self.assertEqual(sum("send_policy.approved_draft_sent(record_id, user_id, ai_draft, category)" in l for l in msrc), 1)
-        self.assertIn("include_before_catch_all(app, exemplar_view_router)", "\n".join(msrc[-10:]))
+        # JIKOU-FOLLOWUP-1（QUEUE-2026-10-16-R F-1）が main.py 末尾へ追記したため、EOF 窓 pin を「各票の見出しコメント以降 3 行」
+        # へ移した（検査の意図＝結線は見出し直後の末尾追記ブロックにあり本文中に置かない、は不変）。
+        _h = next(i for i, line in enumerate(msrc) if line.startswith("# ── JIKOU-REPLY-Q3a（QUEUE-2026-10-12-C C-2）"))
+        self.assertIn("include_before_catch_all(app, exemplar_view_router)", "\n".join(msrc[_h:_h + 3]))
 
     def test_migration_chain_and_history_check(self):
         p = REPO / "alembic" / "versions" / "20261012_b2d4f6a8c0e1_reply_draft_approval.py"
