@@ -16,7 +16,7 @@ downgrade: 3 表を落とす（送信操作記録・会話には触れない）�
 
 Revision ID: f7b2c9d4e1a6
 Revises: e5f8a1b4c7d9
-Create Date: 2026-10-11（fix1 2026-10-12・Q3a 2026-10-12: 履歴 action に approved を追加＝同一 revision の更新）
+Create Date: 2026-10-11（fix1 2026-10-12・Q3a 2026-10-12: 履歴 action に approved を追加＝同一 revision の更新・fix2 2026-10-17: reply_exemplar.status と approved_by/at の NULL 許容・reply_chatlog_followup の text_version／owner_token／deadline_at／chatlog_record_id と state 7 値）
 """
 from typing import Sequence, Union
 
@@ -47,10 +47,12 @@ def upgrade() -> None:
         sa.Column("source_op_id", sa.Text, nullable=True),
         sa.Column("category_id", sa.Text, nullable=True),
         sa.Column("source_text_version", sa.Text, nullable=True),
-        sa.Column("approved_by", sa.Text, nullable=False, server_default="human"),
-        sa.Column("approved_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("approved_by", sa.Text, nullable=True),
+        sa.Column("approved_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("active", sa.Boolean, nullable=False, server_default=sa.true()),
+        sa.Column("status", sa.Text, nullable=False, server_default="pending_review"),
         sa.CheckConstraint("stage IN ('相談', '受任後')", name="ck_reply_exemplar_stage"),
+        sa.CheckConstraint("status IN ('pending_review', 'approved', 'retired')", name="ck_reply_exemplar_status"),
     )
     op.create_index("ix_reply_exemplar_lookup", "reply_exemplar",
                     ["business", "stage", "created_at"])
@@ -63,7 +65,7 @@ def upgrade() -> None:
         sa.Column("actor", sa.Text, nullable=False),
         sa.Column("at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("note", sa.Text, nullable=True),
-        sa.CheckConstraint("action IN ('created', 'used', 'deactivated', 'approved')",   # JIKOU-REPLY-Q3a (a)
+        sa.CheckConstraint("action IN ('created', 'used', 'deactivated', 'approved')",   # JIKOU-REPLY-Q3a (a)・fix2 BR-10
                            name="ck_reply_exemplar_history_action"),
     )
     op.create_index("ix_reply_exemplar_history_ex", "reply_exemplar_history", ["exemplar_id"])
@@ -75,13 +77,18 @@ def upgrade() -> None:
         sa.Column("approval_record_id", sa.Text, nullable=False),
         sa.Column("line_user_hash", sa.Text, nullable=False),
         sa.Column("text", sa.Text, nullable=True),
+        sa.Column("text_version", sa.Text, nullable=True),
         sa.Column("state", sa.Text, nullable=False),
         sa.Column("attempts", sa.Integer, nullable=False, server_default="0"),
         sa.Column("last_result", sa.Text, nullable=True),
+        sa.Column("owner_token", sa.Text, nullable=True),
+        sa.Column("deadline_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("chatlog_record_id", sa.Text, nullable=True),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("done_at", sa.DateTime(timezone=True), nullable=True),
-        sa.CheckConstraint("state IN ('pending', 'done', 'exhausted')", name="ck_reply_followup_state"),
+        sa.CheckConstraint("state IN ('prepared', 'pending', 'unconfigured', 'in_progress', 'done', 'closed', 'exhausted')",
+                           name="ck_reply_followup_state"),
     )
     op.create_index("ix_reply_followup_state", "reply_chatlog_followup", ["state", "created_at"])
 

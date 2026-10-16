@@ -156,10 +156,15 @@ class _DbMixin(unittest.TestCase):
         return _run(_q())
 
     def save(self, reply="費用は【費用のご案内】のとおりです。", inbound="費用はいくらですか", category="費用の定型案内",
-             stage=rx.STAGE_CONSULT) -> int:
+             stage=rx.STAGE_CONSULT, approve=True) -> int:
+        """JIKOU-REPLY-Q1b-fix2 BR-10: 保存直後は pending_review で参考文例に使われないため、参考文例のテストは人の承認
+        （approve_exemplar）を経た手本として用意する。approve=False は確認待ちのまま（承認画面の遷移テスト用）。"""
         self.assertEqual(_run(rx.save_exemplar(business="jikou", inbound_text=inbound, human_reply=reply,
                                                 stage=stage, category_id=category)), "saved")
-        return max(r["id"] for r in self._rows(rx.reply_exemplar))
+        xid = max(r["id"] for r in self._rows(rx.reply_exemplar))
+        if approve:
+            self.assertTrue(_run(rx.approve_exemplar(xid, actor="human")))
+        return xid
 
 
 # ── 1. 画面（_gate・承認・退役・履歴・PII） ───────────────────────────────────────
@@ -176,10 +181,20 @@ class TestExemplarView(_DbMixin):
         self.assertEqual(paths, ["/app/exemplars", "/app/{_rest:path}"])
 
     def test_retire_and_approve_with_history_and_no_pii(self):
-        xid = self.save(reply="試験 太郎様、費用は44,000円です。電話は090-1234-5678です", inbound="試験 太郎です")
+        xid = self.save(reply="試験 太郎様、費用は44,000円です。電話は090-1234-5678です", inbound="試験 太郎です",
+                        approve=False)
         r = _client.get("/app/exemplars", headers=_auth())
         self.assertEqual(r.status_code, 200)
-        self.assertIn("承認済み", r.text)
+        # fix2 BR-10: 保存直後は「確認待ち」（人がこの画面で匿名化を確認して承認するまで参考文例に使われない）
+        self.assertIn('<span class="badge off">確認待ち</span>', r.text)
+        self.assertNotIn('<span class="badge">承認済み</span>', r.text)
+        self.assertEqual(_run(rx.prompt_note("jikou", "受付")), "")
+        r = _client.post("/app/exemplars/update", data={"exemplar_id": str(xid), "action": "approve"},
+                         headers=_auth(), follow_redirects=False)
+        self.assertEqual(r.headers["location"], "/app/exemplars?done=approved")
+        self.assertEqual(_run(rx.get_exemplar(xid))["status"], "approved")
+        r = _client.get("/app/exemplars", headers=_auth())
+        self.assertIn('<span class="badge">承認済み</span>', r.text)
         self.assertIn("費用の定型案内", r.text)
         self.assertNotIn("090-1234-5678", r.text)
         self.assertIn("〔電話〕", r.text)
@@ -199,7 +214,8 @@ class TestExemplarView(_DbMixin):
         row = _run(rx.get_exemplar(xid))
         self.assertTrue(row["active"])
         self.assertEqual(row["approved_by"], "human")
-        self.assertEqual([h["action"] for h in _run(rx.exemplar_history(xid))], ["created", "deactivated", "approved"])
+        self.assertEqual([h["action"] for h in _run(rx.exemplar_history(xid))],
+                         ["created", "approved", "deactivated", "approved"])          # fix2: 保存後の承認が 1 段増える
         self.assertEqual(_client.post("/app/exemplars/update", data={"exemplar_id": "x", "action": "approve"},
                                       headers=_auth(), follow_redirects=False).status_code, 400)
         self.assertEqual(_client.post("/app/exemplars/update", data={"exemplar_id": "1", "action": "delete"},
@@ -259,7 +275,8 @@ class TestPromptNote(_DbMixin):
         self.assertIn("挨拶の返信", seen["prompt"])
         rows = {r["id"]: r for r in self._rows(rx.reply_exemplar)}
         self.assertEqual((rows[a]["used_count"], rows[b]["used_count"]), (0, 1))
-        self.assertEqual([h["action"] for h in _run(rx.exemplar_history(b))], ["created", "used"])
+        self.assertEqual([h["action"] for h in _run(rx.exemplar_history(b))],
+                         ["created", "approved", "used"])                    # fix2 BR-10: save() が承認を 1 段挟む
 
     def test_demoted_reply_does_not_mark_used(self):
         b = self.save(reply="挨拶の返信", inbound="こんにちは", category="挨拶・雑談")
