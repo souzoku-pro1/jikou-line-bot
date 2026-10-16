@@ -391,7 +391,9 @@ class TestPins(unittest.TestCase):
         self.assertNotIn("jikou_followup", allow)
         self.assertNotIn("webapp_jikou_result_view", allow)
         src = (REPO / "main.py").read_text(encoding="utf-8").split("\n")
-        self.assertIn("wire_jikou_result(app)", "\n".join(src[-3:]))          # 末尾追記（3 行）
+        # 末尾追記（3 行）。JIKOU-PROGRESS-1（F-2）が同じ main.py 末尾へ追記したため、窓を「F-1 の見出しコメント以降 3 行」へ移した。
+        _h = next(i for i, line in enumerate(src) if line.startswith("# ── JIKOU-FOLLOWUP-1（QUEUE-2026-10-16-R F-1）"))
+        self.assertIn("wire_jikou_result(app)", "\n".join(src[_h:_h + 3]))
         fsrc = (REPO / "hub" / "jikou_followup.py").read_text(encoding="utf-8")
         body = fsrc.split('"""', 2)[2]
         for bad in ("line_channel", "push_text", "reply_with_push_fallback", "sa.delete", "delete_record"):

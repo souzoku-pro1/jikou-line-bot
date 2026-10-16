@@ -815,7 +815,10 @@ class TestPins(unittest.TestCase):
 
     def test_wiring_is_one_line_replacements_and_tail_only(self):
         src = (REPO / "main.py").read_text(encoding="utf-8").split("\n")
-        self.assertIn("include_before_catch_all(app, pending_view_router)", "\n".join(src[-60:]))
+        # JIKOU-FOLLOWUP-1／JIKOU-PROGRESS-1（QUEUE-2026-10-16-R F-1／F-2）が main.py 末尾へ追記したため、EOF 窓 pin を
+        # 「本票の見出しコメント以降 8 行」へ移した（検査の意図＝結線は見出し直後の末尾追記ブロックにあり本文中に置かない、は不変）。
+        _h = next(i for i, line in enumerate(src) if line.startswith("# ── JIKOU-REPLY-Q1c（QUEUE-2026-10-12-C C-1）"))
+        self.assertIn("include_before_catch_all(app, pending_view_router)", "\n".join(src[_h:_h + 8]))
         self.assertEqual(sum("_inbound_stop_kind(user_id, app21_record)" in l for l in src), 1)
         self.assertEqual(sum("send_policy.demoted_ack(" in l for l in src), 1)
         self.assertEqual(sum("send_policy.empty_reply_violations(cleaned)" in l for l in src), 1)
