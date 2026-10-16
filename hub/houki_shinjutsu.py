@@ -446,14 +446,16 @@ def _circle_cell(doc, addr: tuple, digit: str) -> None:
     hits[0].text = hits[0].text.replace(digit, _CIRCLED[digit])
 
 
-def build_shinjutsu_docx(fill: dict, circles: dict) -> bytes:
+def build_shinjutsu_docx(fill: dict, circles: dict, shokugyo: str = "") -> bytes:
     """テンプレへ丸数字置換→fill_runs（run 単位・rPr 保持）の順で適用。
 
     丸数字が先: 対象数字の一意性は SHA pin 済みテンプレに対して検査する
-    （差し込み値に全角数字が含まれてもセル内一意性が壊れない順序）。"""
+    （差し込み値に全角数字が含まれてもセル内一意性が壊れない順序）。
+    HOUKI-SHOKUGYO-1: shokugyo が非空なら「職業」ラベル右のセルへ差し込む（雛形不変・期待列にも同じ適用）。"""
     doc = Document(TEMPLATE_PATH)
     for group, digit in circles.items():
         _circle_cell(doc, _CIRCLE_CELLS[group], digit)
+    _fill_shokugyo_cell(doc, shokugyo)
     for p in _walk_paragraphs(doc):
         if "{{" in p.text:
             fill_runs(p, fill)
@@ -462,7 +464,7 @@ def build_shinjutsu_docx(fill: dict, circles: dict) -> bytes:
     return buf.getvalue()
 
 
-def expected_paragraph_texts(fill: dict, circles: dict) -> list[str]:
+def expected_paragraph_texts(fill: dict, circles: dict, shokugyo: str = "") -> list[str]:
     """凍結検証の期待列: テンプレ全段落（本文+テーブルセル）へ同一の差し込み+
     sanctioned substitution（許可グループの許可数字のみ丸数字化）を適用。
     それ以外の本文はテンプレ逐語のまま＝完全一致検査で凍結を保証する。"""
@@ -478,6 +480,7 @@ def expected_paragraph_texts(fill: dict, circles: dict) -> list[str]:
     # 完全一致検査で検出される）
     for group, digit in circles.items():
         _circle_cell(tdoc, _CIRCLE_CELLS[group], digit)
+    _fill_shokugyo_cell(tdoc, shokugyo)
     for p in _walk_paragraphs(tdoc):
         for r in p.runs:
             if "{{" in r.text:
@@ -489,11 +492,11 @@ def expected_paragraph_texts(fill: dict, circles: dict) -> list[str]:
 
 
 def verify_shinjutsu_docx(docx_bytes: bytes, fill: dict,
-                          circles: dict) -> None:
+                          circles: dict, shokugyo: str = "") -> None:
     """生成物の全段落がテンプレ由来の期待列と完全一致・プレースホルダ残存
     なし・丸数字は 1 グループ 1 個のみ（弁護士決定の構造検査）。"""
     got = [p.text for p in _walk_paragraphs(Document(io.BytesIO(docx_bytes)))]
-    if got != expected_paragraph_texts(fill, circles):
+    if got != expected_paragraph_texts(fill, circles, shokugyo):
         raise ShinjutsuIntegrityError("body mismatch against template")
     joined = "\n".join(got)
     if "{{" in joined or "}}" in joined:
@@ -509,6 +512,30 @@ def generate(record: dict, today: datetime.date | None = None) -> bytes:
     verify_template_integrity()
     circles, _reasons = _circles(record)   # 拒否判定は build_fill_data に集約
     fill = build_fill_data(record, today=today)
-    docx_bytes = build_shinjutsu_docx(fill, circles)
-    verify_shinjutsu_docx(docx_bytes, fill, circles)
+    shokugyo = shokugyo_value(record)      # HOUKI-SHOKUGYO-1（空なら従来と同一の生成物）
+    docx_bytes = build_shinjutsu_docx(fill, circles, shokugyo)
+    verify_shinjutsu_docx(docx_bytes, fill, circles, shokugyo)
     return docx_bytes
+
+
+# ── HOUKI-SHOKUGYO-1（QUEUE-2026-10-13-D D-8）: 職業セルの差し込み（雛形不変・sanctioned substitution）。末尾追記。
+_SHOKUGYO_CELL = (4, 2, 5)          # 「職業」ラベル（table 4・row 2・cell 4）の右セル（空・4 段落）
+_SHOKUGYO_PARAGRAPH = 1             # ラベルと同じ段落位置（2 段落目）
+
+
+def shokugyo_value(record: dict) -> str:
+    from hub.houki_shokugyo import value_for_docx
+    return value_for_docx(record)
+
+
+def _fill_shokugyo_cell(doc, value: str) -> None:
+    """職業ラベル右のセルへ値を差し込む（空なら何もしない＝従来と同一の生成物）。
+    セルの構造（空の 4 段落・run なし）が崩れていれば IntegrityError（雛形の想定崩れ）。"""
+    if not value:
+        return
+    ti, ri, ci = _SHOKUGYO_CELL
+    cell = _Cell(doc.tables[ti].rows[ri]._tr.tc_lst[ci], doc.tables[ti])
+    paras = cell.paragraphs
+    if len(paras) <= _SHOKUGYO_PARAGRAPH or any(p.text for p in paras):
+        raise ShinjutsuIntegrityError("shokugyo cell structure mismatch")
+    paras[_SHOKUGYO_PARAGRAPH].add_run(str(value))

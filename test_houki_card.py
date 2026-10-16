@@ -44,7 +44,8 @@ class TestCardItems(unittest.TestCase):
 
     def test_fields_cover_all_writable_except_not_asked(self):
         covered = {f for it in hc.CARD_ITEMS for f in it.fields}
-        expected = set(store.HEARING_WRITABLE_FIELDS) - {"未成年後見関与"}
+        # HOUKI-SHOKUGYO-1: 職業 は v1 カードに項目が無い（v2 で追加予定・書込経路だけ接続）
+        expected = set(store.HEARING_WRITABLE_FIELDS) - {"未成年後見関与", "職業"}
         self.assertEqual(expected - covered, set())               # 漏れなし
         self.assertEqual(covered - set(store.HEARING_WRITABLE_FIELDS), {"債権者一覧"})
         self.assertNotIn("未成年後見関与", covered)

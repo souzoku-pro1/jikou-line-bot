@@ -43,13 +43,12 @@ APP_HOUKI_CASE = kintone.KintoneApp(
 # （H0-APP-2 の実フィールドコード。弁護士専権・サーバ計算欄は含めない）
 HEARING_WRITABLE_FIELDS: frozenset = frozenset({
     # 申述人（正本 §2.1 phase7 + 様式必須のふりがな）
-    # HEARING-FIX1 止血: 「職業」は App 40 に実欄が存在しない（form fields
-    # API 実測 87 欄に不在）ため除外——含めたまま書くと create/update 全体が
-    # kintone に拒否され会話が全断していた。復帰条件: 大野が CU で職業欄を
-    # 追加したら小票で本集合へ復帰し、H7C 申述書の {{職業欄}} マッピングにも
-    # 接続する（H7C 完了報告の不足フィールド一覧参照）
+    # HOUKI-SHOKUGYO-1: 「職業」を復帰（HEARING-FIX1 の止血を解除）。欄の有無は書込直前に
+    # hub/houki_shokugyo.available（form fields・1 時間キャッシュ・失敗は無い側）で検査し、
+    # 無い間は 職業 だけ落として他欄を書く（会話は止めない）。申述書の差し込みは
+    # hub/houki_shinjutsu の職業セル（雛形不変）
     "顧客名", "furigana", "生年月日", "住所", "電話番号", "メールアドレス",
-    "本人区分", "未成年後見関与",
+    "職業", "本人区分", "未成年後見関与",
     # 被相続人（phase1）
     "被相続人氏名", "被相続人ふりがな", "被相続人本籍", "被相続人最後の住所",
     "続柄", "続柄その他",
@@ -394,6 +393,8 @@ async def upsert_case_fields(user_id: str, fields: dict,
       は**送出**する（収束＝再取得・再検証・再試行は apply_hearing_fields が
       担う。単発の低レベル書込としては作用 0）
     """
+    from hub import houki_shokugyo
+    fields = await houki_shokugyo.strip_if_unavailable(fields)   # HOUKI-SHOKUGYO-1: 欄が無ければ 職業 を落とす
     if existing is None:
         # HOUKI-STORE-FIX1: hub.kintone へは plain 値（_wrap が包む契約）
         payload = dict(fields)
