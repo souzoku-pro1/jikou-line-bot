@@ -59,9 +59,12 @@ ALLOWED_FROM_IMPORTS = {
                       "houki_phone_triage", "image_intake"}),
     # H3: 送信は reply_with_push_fallback のみ解禁（呼び出し規則で
     # HOUKI_CHANNEL 限定・push_text は禁止のまま）
+    # HOUKI-SEND-LEDGER-1（票由来）: 送信台帳の入口 2 名（受信の会話更新・返信の台帳文脈）を追加。
+    # 台帳の作用は hub/line_channel 内に閉じる（houki_bot は send_ledger を import しない）
     "hub.line_channel": frozenset({"HOUKI_CHANNEL", "verify_line_signature",
                                    "houki_channel_disabled_reason",
-                                   "reply_with_push_fallback"}),
+                                   "reply_with_push_fallback",
+                                   "touch_houki_inbound", "houki_reply_context"}),
     "hub.redact": frozenset({"emit"}),
     # H3: 停止リスト共用（照会のみ）
     "hub.autoreply_stoplist": frozenset({"is_suppressed"}),
@@ -309,7 +312,8 @@ class TestClosedSetsPinned(unittest.TestCase):
         self.assertEqual(ALLOWED_FROM_IMPORTS["hub.line_channel"],
                          frozenset({"HOUKI_CHANNEL", "verify_line_signature",
                                     "houki_channel_disabled_reason",
-                                    "reply_with_push_fallback"}))
+                                    "reply_with_push_fallback",
+                                    "touch_houki_inbound", "houki_reply_context"}))   # HOUKI-SEND-LEDGER-1 票由来
         self.assertEqual(ALLOWED_FROM_IMPORTS["hub.autoreply_stoplist"],
                          frozenset({"is_suppressed"}))
         self.assertEqual(len(ALLOWED_FROM_IMPORTS["hub.houki_profile"]), 11)

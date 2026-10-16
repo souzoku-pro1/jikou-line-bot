@@ -42,7 +42,7 @@ from hub.houki_profile import (
     style_guard_violations,
 )
 from hub.autoreply_stoplist import is_suppressed
-from hub.line_channel import HOUKI_CHANNEL, reply_with_push_fallback
+from hub.line_channel import HOUKI_CHANNEL, houki_reply_context, reply_with_push_fallback
 from hub.redact import emit
 
 logger = logging.getLogger("houki_bot.hearing")
@@ -217,8 +217,16 @@ async def _converse(user_id: str, record: dict | None,
 
 
 async def handle_houki_hearing(reply_token: str, user_id: str,
-                               user_text: str) -> None:
-    """相続放棄ヒアリングのメインエントリ（router から BackgroundTasks で実行）。"""
+                               user_text: str, event_id: str = "") -> None:
+    """相続放棄ヒアリングのメインエントリ（router から BackgroundTasks で実行）。
+    HOUKI-SEND-LEDGER-1: 返信は送信台帳に purpose=other・受信イベント ID=houki_reply:{event_id} で記録する
+    （相談者から見える挙動は不変・送信の有無・文面・順序は従来どおり）。"""
+    with houki_reply_context(event_id):
+        await _handle_houki_hearing_body(reply_token, user_id, user_text)
+
+
+async def _handle_houki_hearing_body(reply_token: str, user_id: str,
+                                     user_text: str) -> None:
     if autoreply_paused():
         logger.info("[HOUKI_HEARING] paused (global brake) userId=%s...",
                     emit(user_id[:10], "record_id", "log", "operator"))
