@@ -205,8 +205,11 @@ async def promoted_source_ids(business: str = BUSINESS) -> set:
 
 
 def is_candidate(exemplar: dict, candidates: dict, promoted_sources: set) -> bool:
-    """手本が「定型に昇格」できる条件（純関数）: active・分類あり・閾値到達 category・未昇格。"""
+    """手本が「定型に昇格」できる条件（純関数）: 承認済み（status=approved・active）・分類あり・閾値到達 category・未昇格。
+    JIKOU-REPLY-Q1b-fix2 BR-10: 確認待ち（pending_review）の手本は人が匿名化を確認するまで候補にしない。"""
     if not exemplar or not exemplar.get("active"):
+        return False
+    if exemplar.get("status", reply_exemplar.STATUS_APPROVED) != reply_exemplar.STATUS_APPROVED:
         return False
     cat = exemplar.get("category_id")
     if not cat or cat in DRAFT_ONLY_CATEGORIES or cat not in (candidates or {}):
