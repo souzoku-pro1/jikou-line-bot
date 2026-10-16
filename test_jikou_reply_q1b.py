@@ -311,7 +311,9 @@ class TestExplicitSend(_DbMixin):
         self.assertEqual((ex[0]["business"], ex[0]["stage"], ex[0]["creditor_name"], ex[0]["source_op_id"]),
                          ("jikou", "受任後", "アコム", OP))
         self.assertEqual(ex[0]["source_text_version"], sl.text_version(TEXT))
-        self.assertEqual((ex[0]["approved_by"], bool(ex[0]["active"]), ex[0]["category_id"]), ("human", True, None))
+        # JIKOU-REPLY-Q3a: 手本の分類 ID は App 29 のカテゴリ（Q1b では NULL だった）
+        self.assertEqual((ex[0]["approved_by"], bool(ex[0]["active"]), ex[0]["category_id"]),
+                         ("human", True, "費用の定型案内"))
         self.assertIsNotNone(ex[0]["approved_at"])
         self.assertIn("44,000円", ex[0]["human_reply"])
         self.assertIn("アコム", ex[0]["inbound_text"])
@@ -895,7 +897,7 @@ class TestAnonymize(unittest.TestCase):
                           "category_id", "source_text_version", "approved_by", "approved_at", "active"})
         self.assertEqual({c.name for c in rx.reply_exemplar_history.columns},
                          {"history_id", "exemplar_id", "action", "actor", "at", "note"})
-        self.assertEqual(rx.ACTIONS, ("created", "used", "deactivated"))
+        self.assertEqual(rx.ACTIONS, ("created", "used", "deactivated", "approved"))   # JIKOU-REPLY-Q3a: 再承認
         self.assertEqual({c.name for c in rf.reply_chatlog_followup.columns},
                          {"op_id", "business", "kind", "approval_record_id", "line_user_hash", "text",
                           "state", "attempts", "last_result", "created_at", "updated_at", "done_at"})
