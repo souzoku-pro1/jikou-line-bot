@@ -218,8 +218,11 @@ FROZEN_SHA = {
         "52a8e0fefb8920f4189908aa9c62a068c0f4357148a8d8c2bbcb391a6be9c9a6",
     # JIKOU-FEE-RULE-1（大野裁定 2026-10-11）: 費用の社数規則（【費用の定型案内】の
     # 整合ルール・FAQ 第2弾の追加依頼）を prompt 本文に反映 → 再 pin
+    # JIKOU-REPLY-Q1c（QUEUE-2026-10-12-C C-1 (b)・凍結解除はこの 1 項のみ）: 【会話スタイル】に
+    # 「答えられない問いは reply を空文字にする（確認のうえご連絡します等を書かない）」を 1 行追加 → 再 pin
+    # 旧値 89fd82e1…f0dd4
     "customer_prompt_base":
-        "89fd82e178692d69fda80381c35b297cb59b79fd6a29531d4ed27e03689f0dd4",
+        "a0835fe327c392aee9111b2fbf75cbf08a08a07c2578b2ad3c2c601637f39263",
     "hearing_template_blocks":
         "24103a7b21a889319c8b9eefb9f15bbf35f1c9b065ef459903b27ff6c990159e",
     # JIKOU-FEE-RULE-1（大野裁定 2026-10-11）: 法テラス標準回答に「3社目からは1社あたり

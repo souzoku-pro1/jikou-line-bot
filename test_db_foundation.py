@@ -942,7 +942,8 @@ class TestSendLedgerMigration(unittest.TestCase):
             up = alembic("upgrade", "d1e4f7a0b3c6")
             self.assertEqual(up.returncode, 0, f"stderr={up.stderr[-800:]}")
             self.assertFalse(set(send_ledger.TABLE_NAMES) & tables())
-            up = alembic("upgrade", "head")
+            # JIKOU-REPLY-Q1b: head が f7b2c9d4e1a6 へ進んだため本 revision までを明示（検証内容は不変）
+            up = alembic("upgrade", self.SEND_LEDGER)
             self.assertEqual(up.returncode, 0, f"stderr={up.stderr[-800:]}")
             self.assertIn(self.SEND_LEDGER, alembic("current").stdout)
             self.assertTrue(set(send_ledger.TABLE_NAMES) <= tables())
@@ -968,3 +969,246 @@ class TestSendLedgerMigration(unittest.TestCase):
         finally:
             shutil.rmtree(d, ignore_errors=True)
 
+
+class TestReplyExemplarMigration(unittest.TestCase):
+    """JIKOU-REPLY-Q1b: 手本集の migration（f7b2c9d4e1a6）が e5f8a1b4c7d9 の後ろに 1 本で繋がり、
+    up→down が往復し、head で列集合が hub/reply_exemplar.metadata と一致すること。downgrade は
+    本表だけを落とし、send_ledger の表は残る。"""
+
+    SEND_LEDGER = "e5f8a1b4c7d9"
+    REPLY_EXEMPLAR = "f7b2c9d4e1a6"
+    REPLY_PENDING = "a1c3e5f7b9d2"      # JIKOU-REPLY-Q1c: 対応待ち（f7b2 の後ろ）
+    DRAFT_APPROVAL = "b2d4f6a8c0e1"     # JIKOU-REPLY-Q3a: 下書き照合（a1c3 の後ろ）
+    REPLY_DRAFT = "c3e5a7b9d1f3"        # JIKOU-REPLY-Q3b: AI 下書き（b2d4 の後ろ）
+    DRAFT_OUTCOME = "d4f6b8c0e2a4"      # JIKOU-REPLY-Q4: reply_draft_approval.outcome（c3e5 の後ろ）
+    PROMOTED_TEXT = "e6a8c0d2f4b6"      # JIKOU-REPLY-Q5: 昇格定型（d4f6 の後ろ・head）
+
+    def test_reply_exemplar_migration_round_trip(self):
+        import sqlite3
+        import tempfile
+        from hub import reply_exemplar, reply_followup, send_ledger
+        d = tempfile.mkdtemp(prefix="reply_exemplar_mig_")
+        dbfile = f"{d}/mig.db"
+        alembic, tables, unique_cols, nullable = TestAlembicScaffold._brain_mig_tools(dbfile)
+        try:
+            up = alembic("upgrade", self.SEND_LEDGER)
+            self.assertEqual(up.returncode, 0, f"stderr={up.stderr[-800:]}")
+            self.assertNotIn(reply_exemplar.TABLE_NAME, tables())
+            up = alembic("upgrade", self.REPLY_EXEMPLAR)
+            self.assertEqual(up.returncode, 0, f"stderr={up.stderr[-800:]}")
+            self.assertIn(self.REPLY_EXEMPLAR, alembic("current").stdout)
+            # fix1 BR-08/BR-09: 3 表（手本・履歴・App 28 記録未了）が同一 revision で作られ、列集合が metadata と一致
+            self.assertTrue({reply_exemplar.TABLE_NAME, reply_exemplar.HISTORY_TABLE_NAME,
+                             reply_followup.TABLE_NAME} <= tables())
+            # JIKOU-REPLY-Q1c: head（a1c3e5f7b9d2）で対応待ち 2 表が増え、列集合が hub/reply_pending.metadata と一致
+            from hub import reply_pending
+            self.assertNotIn(reply_pending.TABLE_NAME, tables())
+            up = alembic("upgrade", self.REPLY_PENDING)
+            self.assertEqual(up.returncode, 0, f"stderr={up.stderr[-800:]}")
+            self.assertIn(self.REPLY_PENDING, alembic("current").stdout)
+            self.assertTrue(set(reply_pending.TABLE_NAMES) <= tables())
+            # JIKOU-REPLY-Q3a: head（b2d4f6a8c0e1）で reply_draft_approval が増え、列集合が metadata と一致
+            self.assertNotIn(reply_exemplar.DRAFT_TABLE_NAME, tables())
+            up = alembic("upgrade", self.DRAFT_APPROVAL)
+            self.assertEqual(up.returncode, 0, f"stderr={up.stderr[-800:]}")
+            self.assertIn(self.DRAFT_APPROVAL, alembic("current").stdout)
+            self.assertIn(reply_exemplar.DRAFT_TABLE_NAME, tables())
+            # JIKOU-REPLY-Q3b: head（c3e5a7b9d1f3）で reply_draft 2 表が増え、列集合が hub/reply_draft.metadata と一致
+            from hub import reply_draft
+            self.assertNotIn(reply_draft.TABLE_NAME, tables())
+            up = alembic("upgrade", self.REPLY_DRAFT)
+            self.assertEqual(up.returncode, 0, f"stderr={up.stderr[-800:]}")
+            self.assertIn(self.REPLY_DRAFT, alembic("current").stdout)
+            self.assertTrue(set(reply_draft.TABLE_NAMES) <= tables())
+            # JIKOU-REPLY-Q4: d4f6b8c0e2a4 で reply_draft_approval に outcome 列（列集合が metadata と一致）
+            up = alembic("upgrade", self.DRAFT_OUTCOME)
+            self.assertEqual(up.returncode, 0, f"stderr={up.stderr[-800:]}")
+            self.assertIn(self.DRAFT_OUTCOME, alembic("current").stdout)
+            # JIKOU-REPLY-Q5: head（e6a8c0d2f4b6）で昇格定型 2 表（列集合が hub/jikou_reply_promote.metadata と一致）
+            from hub import jikou_reply_promote
+            up = alembic("upgrade", "head")
+            self.assertEqual(up.returncode, 0, f"stderr={up.stderr[-800:]}")
+            self.assertIn(self.PROMOTED_TEXT, alembic("current").stdout)
+            self.assertTrue(set(jikou_reply_promote.TABLE_NAMES) <= tables())
+            con = sqlite3.connect(dbfile)
+            try:
+                for t in jikou_reply_promote.TABLE_NAMES:
+                    got = {r[1] for r in con.execute(f'PRAGMA table_info("{t}")')}
+                    self.assertEqual(got, {c.name for c in jikou_reply_promote.metadata.tables[t].columns}, t)
+            finally:
+                con.close()
+            down = alembic("downgrade", self.DRAFT_OUTCOME)
+            self.assertEqual(down.returncode, 0, f"stderr={down.stderr[-800:]}")
+            self.assertFalse(set(jikou_reply_promote.TABLE_NAMES) & tables())
+            con = sqlite3.connect(dbfile)
+            try:
+                cols = {r[1] for r in con.execute(f'PRAGMA table_info("{reply_exemplar.DRAFT_TABLE_NAME}")')}
+                self.assertEqual(cols, {c.name for c in reply_exemplar.reply_draft_approval.columns})
+            finally:
+                con.close()
+            down = alembic("downgrade", self.REPLY_DRAFT)
+            self.assertEqual(down.returncode, 0, f"stderr={down.stderr[-800:]}")
+            con = sqlite3.connect(dbfile)
+            try:
+                for t in reply_draft.TABLE_NAMES:
+                    got = {r[1] for r in con.execute(f'PRAGMA table_info("{t}")')}
+                    self.assertEqual(got, {c.name for c in reply_draft.metadata.tables[t].columns}, t)
+                nn = nullable(con, reply_draft.TABLE_NAME)
+                self.assertFalse(nn["draft_text"])
+                self.assertTrue(nn["pending_id"])
+                self.assertTrue(nn["final_text"])
+            finally:
+                con.close()
+            down = alembic("downgrade", self.DRAFT_APPROVAL)
+            self.assertEqual(down.returncode, 0, f"stderr={down.stderr[-800:]}")
+            self.assertFalse(set(reply_draft.TABLE_NAMES) & tables())
+            self.assertIn(reply_exemplar.DRAFT_TABLE_NAME, tables())
+            con = sqlite3.connect(dbfile)
+            try:
+                cols = {r[1] for r in con.execute(f'PRAGMA table_info("{reply_exemplar.DRAFT_TABLE_NAME}")')}
+                # JIKOU-REPLY-Q4: outcome 列は d4f6 で追加（b2d4 段階では無い）
+                self.assertEqual(cols, {c.name for c in reply_exemplar.reply_draft_approval.columns} - {"outcome"})
+                self.assertTrue(nullable(con, reply_exemplar.DRAFT_TABLE_NAME)["unmodified"])
+                self.assertFalse(nullable(con, reply_exemplar.DRAFT_TABLE_NAME)["draft_text_version"])
+            finally:
+                con.close()
+            down = alembic("downgrade", self.REPLY_PENDING)
+            self.assertEqual(down.returncode, 0, f"stderr={down.stderr[-800:]}")
+            self.assertNotIn(reply_exemplar.DRAFT_TABLE_NAME, tables())
+            con = sqlite3.connect(dbfile)
+            try:
+                for name, table in ((reply_pending.TABLE_NAME, reply_pending.reply_pending),
+                                    (reply_pending.HISTORY_TABLE_NAME, reply_pending.reply_pending_history)):
+                    cols = {r[1] for r in con.execute(f'PRAGMA table_info("{name}")')}
+                    self.assertEqual(cols, {c.name for c in table.columns}, name)
+                nn = nullable(con, reply_pending.TABLE_NAME)
+                self.assertFalse(nn["line_user_hash"])
+                self.assertFalse(nn["state"])
+                self.assertTrue(nn["inbound_event_id"])
+                self.assertTrue(nn["approval_record_id"])
+                idx = {r[1] for r in con.execute(f'PRAGMA index_list("{reply_pending.TABLE_NAME}")')}
+                self.assertTrue({"ix_reply_pending_state", "ix_reply_pending_user"} <= idx)
+                fks = {(r[2], r[3]) for r in con.execute("PRAGMA foreign_key_list(reply_pending_history)")}
+                self.assertIn(("reply_pending", "pending_id"), fks)
+            finally:
+                con.close()
+            down = alembic("downgrade", self.REPLY_EXEMPLAR)
+            self.assertEqual(down.returncode, 0, f"stderr={down.stderr[-800:]}")
+            for name in reply_pending.TABLE_NAMES:
+                self.assertNotIn(name, tables())
+            self.assertIn(self.REPLY_EXEMPLAR, alembic("current").stdout)
+            con = sqlite3.connect(dbfile)
+            try:
+                for name, table in ((reply_exemplar.TABLE_NAME, reply_exemplar.reply_exemplar),
+                                    (reply_exemplar.HISTORY_TABLE_NAME, reply_exemplar.reply_exemplar_history),
+                                    (reply_followup.TABLE_NAME, reply_followup.reply_chatlog_followup)):
+                    cols = {r[1] for r in con.execute(f'PRAGMA table_info("{name}")')}
+                    self.assertEqual(cols, {c.name for c in table.columns}, name)
+                nn = nullable(con, reply_exemplar.TABLE_NAME)
+                self.assertFalse(nn["human_reply"])
+                self.assertFalse(nn["stage"])
+                self.assertFalse(nn["approved_at"])
+                self.assertFalse(nn["active"])
+                self.assertTrue(nn["conversation_ref"])
+                self.assertTrue(nn["creditor_name"])
+                self.assertTrue(nn["category_id"])
+                self.assertTrue(nn["source_text_version"])
+                idx = {r[1] for r in con.execute(f'PRAGMA index_list("{reply_exemplar.TABLE_NAME}")')}
+                self.assertIn("ix_reply_exemplar_lookup", idx)
+                self.assertIn("ix_reply_exemplar_active", idx)
+                fks = {(r[2], r[3]) for r in con.execute("PRAGMA foreign_key_list(reply_exemplar_history)")}
+                self.assertIn(("reply_exemplar", "exemplar_id"), fks)          # (参照表, from 列)
+                self.assertFalse(nullable(con, reply_followup.TABLE_NAME)["state"])
+                self.assertTrue(nullable(con, reply_followup.TABLE_NAME)["text"])
+            finally:
+                con.close()
+            down = alembic("downgrade", self.SEND_LEDGER)
+            self.assertEqual(down.returncode, 0, f"stderr={down.stderr[-800:]}")
+            for name in (reply_exemplar.TABLE_NAME, reply_exemplar.HISTORY_TABLE_NAME, reply_followup.TABLE_NAME):
+                self.assertNotIn(name, tables())
+            self.assertTrue(set(send_ledger.TABLE_NAMES) <= tables())     # 下位の表は残る
+            self.assertIn(self.SEND_LEDGER, alembic("current").stdout)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_reply_exemplar_downgrade_is_refused_when_data_present(self):
+        """fix1 BR-09: データがあれば downgrade 禁止（手本・履歴・記録未了のいずれかに 1 行でもあれば拒否・表は残る）。"""
+        import sqlite3
+        import tempfile
+        from hub import reply_exemplar, reply_followup
+        d = tempfile.mkdtemp(prefix="reply_exemplar_mig_refuse_")
+        dbfile = f"{d}/mig.db"
+        alembic, tables, _unique_cols, _nullable = TestAlembicScaffold._brain_mig_tools(dbfile)
+        try:
+            self.assertEqual(alembic("upgrade", "head").returncode, 0)
+            con = sqlite3.connect(dbfile)
+            try:
+                con.execute("INSERT INTO reply_chatlog_followup (op_id, business, kind, approval_record_id, line_user_hash, "
+                            "text, state, attempts, created_at, updated_at) VALUES ('a', 'jikou', 'chatlog_human', '1', 'h', "
+                            "'t', 'pending', 0, '2026-10-12 00:00:00', '2026-10-12 00:00:00')")
+                con.commit()
+            finally:
+                con.close()
+            down = alembic("downgrade", self.SEND_LEDGER)
+            self.assertNotEqual(down.returncode, 0)
+            self.assertIn("reply_exemplar_downgrade_refused_data_present", down.stderr)
+            self.assertNotIn("'t'", down.stderr)                                   # 値は出さない
+            self.assertTrue({reply_exemplar.TABLE_NAME, reply_followup.TABLE_NAME} <= tables())
+            # JIKOU-REPLY-Q1c: head（a1c3）→ f7b2 は対応待ちが空なので通り、f7b2 → e5f8 で拒否される＝current は f7b2
+            self.assertIn(self.REPLY_EXEMPLAR, alembic("current").stdout)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_reply_pending_downgrade_is_refused_when_data_present(self):
+        """JIKOU-REPLY-Q1c: 対応待ち（reply_pending／履歴）に 1 行でもあれば downgrade を拒否（表は残る・値は出さない）。"""
+        import sqlite3
+        import tempfile
+        from hub import reply_pending
+        d = tempfile.mkdtemp(prefix="reply_pending_mig_refuse_")
+        dbfile = f"{d}/mig.db"
+        alembic, tables, _unique_cols, _nullable = TestAlembicScaffold._brain_mig_tools(dbfile)
+        try:
+            self.assertEqual(alembic("upgrade", "head").returncode, 0)
+            con = sqlite3.connect(dbfile)
+            try:
+                con.execute("INSERT INTO reply_pending (business, channel, inbound_event_id, line_user_hash, route, reason, "
+                            "category, state, notify_state, customer_send, attempts, created_at, updated_at) VALUES "
+                            "('jikou', 'jikou', 'ev-secret', 'h', 'customer', 'demoted', 'c', 'open', 'none', 'none', 0, "
+                            "'2026-10-12 00:00:00', '2026-10-12 00:00:00')")
+                con.commit()
+            finally:
+                con.close()
+            down = alembic("downgrade", self.REPLY_EXEMPLAR)
+            self.assertNotEqual(down.returncode, 0)
+            self.assertIn("reply_pending_downgrade_refused_data_present", down.stderr)
+            self.assertNotIn("ev-secret", down.stderr)
+            self.assertTrue(set(reply_pending.TABLE_NAMES) <= tables())
+            # JIKOU-REPLY-Q3a: head（b2d4）→ a1c3 は下書き照合が空なので通り、a1c3 → f7b2 で拒否＝current は a1c3
+            self.assertIn(self.REPLY_PENDING, alembic("current").stdout)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_reply_draft_approval_downgrade_is_refused_when_data_present(self):
+        """JIKOU-REPLY-Q3a: reply_draft_approval に 1 行でもあれば downgrade を拒否（本文は無い＝sha256 のみ）。"""
+        import sqlite3
+        import tempfile
+        from hub import reply_exemplar
+        d = tempfile.mkdtemp(prefix="reply_draft_mig_refuse_")
+        dbfile = f"{d}/mig.db"
+        alembic, tables, _unique_cols, _nullable = TestAlembicScaffold._brain_mig_tools(dbfile)
+        try:
+            self.assertEqual(alembic("upgrade", "head").returncode, 0)
+            con = sqlite3.connect(dbfile)
+            try:
+                con.execute("INSERT INTO reply_draft_approval (record_id, business, category, draft_text_version, "
+                            "created_at) VALUES ('77', 'jikou', 'c', 'deadbeef', '2026-10-12 00:00:00')")
+                con.commit()
+            finally:
+                con.close()
+            down = alembic("downgrade", self.REPLY_PENDING)
+            self.assertNotEqual(down.returncode, 0)
+            self.assertIn("reply_draft_approval_downgrade_refused_data_present", down.stderr)
+            self.assertIn(reply_exemplar.DRAFT_TABLE_NAME, tables())
+            self.assertIn(self.DRAFT_APPROVAL, alembic("current").stdout)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)

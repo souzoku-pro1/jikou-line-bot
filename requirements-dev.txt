@@ -7,3 +7,6 @@ cyclonedx-bom==7.3.0
 # TEST-SPEED-1: 全 suite の並列実行（python -m pytest -n auto）。execnet は xdist の実行基盤
 pytest-xdist==3.8.0
 execnet==2.1.2
+# EDGE-1（QUEUE-2026-10-14-G G-2）: 性質テスト（test_edge_1.py）。sortedcontainers は hypothesis の実行基盤
+hypothesis==6.169.0
+sortedcontainers==2.4.0
