@@ -218,8 +218,11 @@ FROZEN_SHA = {
         "52a8e0fefb8920f4189908aa9c62a068c0f4357148a8d8c2bbcb391a6be9c9a6",
     # JIKOU-FEE-RULE-1（大野裁定 2026-10-11）: 費用の社数規則（【費用の定型案内】の
     # 整合ルール・FAQ 第2弾の追加依頼）を prompt 本文に反映 → 再 pin
+    # JIKOU-FAQ-ADDON-PROMPT-1（司令塔票 2026-10-11）: 実 API 実測で「履歴なしの再来相談者の
+    # 追加依頼」が固定文を省いて承認降格した対処。FAQ 行に「【費用のご案内】の固定文（8行）を
+    # 必ず含める」1 文を明示（同一行・他行不変）→ 再 pin（89fd82… → d4d6ab…）
     "customer_prompt_base":
-        "89fd82e178692d69fda80381c35b297cb59b79fd6a29531d4ed27e03689f0dd4",
+        "d4d6abb8949d1953df12421cb5903126298162a1bb515925baae6993b11c646d",
     "hearing_template_blocks":
         "24103a7b21a889319c8b9eefb9f15bbf35f1c9b065ef459903b27ff6c990159e",
     # JIKOU-FEE-RULE-1（大野裁定 2026-10-11）: 法テラス標準回答に「3社目からは1社あたり
