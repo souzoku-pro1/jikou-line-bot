@@ -12,6 +12,8 @@ QUEUE-2026-10-13-E E-1。
   4) 債権者別: Q4 記録を reply_draft の会話（conversation_ref）→ reply_exemplar.creditor_name（同じ会話の
      手本に残る社名・最新）で引き当てる。社名はそのまま、不明は「（不明）」。承認率 =（asis+edited）/ 結果あり。
   5) 未返信: reply_pending の open 件数と最古の経過時間。
+  6) 案件結果（JIKOU-FOLLOWUP-1 (3)）: jikou_case_result（hub/jikou_followup）の債権者別 成立率と 発送→回答 日数の中央値・
+     発送済みで未記録の枠数。表が無い（migration 未適用）ときは空＋注記（他の集計は落とさない）。
 週次要約: ジョブ JIKOU_REPLY_METRICS_WEEKLY（register_daily 9 時 JST・月曜だけ送る＝HOUKI 系と同形式）。
 送信台帳 key jikou_metrics_weekly:{JST 週開始日=月曜}・hub/send_policy.send_business_notice（channel jikou_notice・
 purpose other・DUPLICATE は送らない）。全件数 0 の週は送らない。env JIKOU_REPLY_METRICS_DISABLED=1 で停止。
@@ -26,7 +28,7 @@ from dataclasses import dataclass, field
 
 import sqlalchemy as sa
 
-from hub import jikou_reply_promote, reply_draft, reply_exemplar, reply_pending, send_policy
+from hub import jikou_followup, jikou_reply_promote, reply_draft, reply_exemplar, reply_pending, send_policy
 from hub import scheduler as hub_scheduler
 from hub.db import session_scope
 from hub.redact import emit
@@ -102,6 +104,22 @@ class CreditorRow:
 
 
 @dataclass(frozen=True)
+class CaseResultRow:
+    """JIKOU-FOLLOWUP-1 (3): 案件結果（債権者別）。件数と率・日数のみ。"""
+    creditor: str
+    cases: int                 # 記録のある枠数（結果あり）
+    established: int
+    partial: int
+    not_established: int
+    no_answer: int
+    median_days: float | None  # 発送日→回答日の中央値（回答日のある結果のみ）
+
+    @property
+    def established_rate(self) -> float | None:
+        return ((self.established + self.partial) / self.cases) if self.cases else None
+
+
+@dataclass(frozen=True)
 class Metrics:
     as_of: datetime.datetime
     latency: tuple = ()
@@ -111,6 +129,8 @@ class Metrics:
     open_count: int = 0
     oldest_open_min: float | None = None
     notes: tuple = field(default_factory=tuple)
+    case_results: tuple = ()                 # JIKOU-FOLLOWUP-1 (3)
+    case_unanswered: int = 0                 # 発送済み・結果未記録の枠数
 
 
 # ── 純関数 ────────────────────────────────────────────────────────────────────
@@ -293,6 +313,36 @@ async def _open_summary(s, now: datetime.datetime) -> tuple:
     return len(rows), (max(ages) if ages else None)
 
 
+def _case_result_rows(rows: list[dict]) -> tuple:
+    """JIKOU-FOLLOWUP-1 (3): 債権者別の 成立率（成立+一部成立／結果あり）と 発送→回答 日数の中央値。"""
+    agg: dict = {}
+    for r in rows:
+        if r.get("result") is None:
+            continue
+        name = _clean_creditor(r.get("creditor_name"))
+        a = agg.setdefault(name, {"cases": 0, "established": 0, "partial": 0, "not_established": 0, "no_answer": 0,
+                                  "days": []})
+        a["cases"] += 1
+        a[r["result"]] = a.get(r["result"], 0) + 1
+        if r.get("shipped_on") and r.get("answered_on"):
+            a["days"].append(max(0, (r["answered_on"] - r["shipped_on"]).days))
+    out = [CaseResultRow(creditor=k, cases=v["cases"], established=v["established"], partial=v["partial"],
+                         not_established=v["not_established"], no_answer=v["no_answer"], median_days=median(v["days"]))
+           for k, v in agg.items()]
+    return tuple(sorted(out, key=lambda x: (-x.cases, x.creditor)))
+
+
+async def _case_results_safe() -> tuple:
+    """案件結果の表は別 migration（a9b1c3d5e7f0）。未適用・読取失敗は空＋注記（他の集計は落とさない・別セッション）。"""
+    try:
+        async with session_scope() as s:
+            rows = await jikou_followup.result_rows(s)
+    except Exception:
+        return (), 0, ("case_results_unavailable",)
+    unanswered = len([r for r in rows if r.get("shipped_on") and r.get("result") is None])
+    return _case_result_rows(rows), unanswered, ()
+
+
 async def collect(*, now: datetime.datetime | None = None) -> Metrics:
     """全指標を 1 回の読取で集める（例外は呼出側へ・書込ゼロ）。"""
     now = now or _now()
@@ -307,8 +357,10 @@ async def collect(*, now: datetime.datetime | None = None) -> Metrics:
         creditors = tuple(_creditor_rows(records, creditor_by_draft))
         promoted = tuple(await _promoted(s))
         open_count, oldest = await _open_summary(s, now)
+    case_results, case_unanswered, notes = await _case_results_safe()
     return Metrics(as_of=now, latency=latency, drafts=drafts, promoted=promoted, creditors=creditors,
-                   open_count=open_count, oldest_open_min=oldest)
+                   open_count=open_count, oldest_open_min=oldest, notes=notes, case_results=case_results,
+                   case_unanswered=case_unanswered)
 
 
 def has_any(m: Metrics) -> bool:

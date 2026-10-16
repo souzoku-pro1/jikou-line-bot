@@ -233,8 +233,12 @@ class TestPins(unittest.TestCase):
             self.assertEqual(scan_source((REPO / name).read_text(encoding="utf-8"), name), [], name)
         self.assertNotIn("webapp_drafts_view", allow)
         msrc = (REPO / "main.py").read_text(encoding="utf-8").split("\n")
-        self.assertIn("include_before_catch_all(app, drafts_view_router)", "\n".join(msrc[-6:]))
-        self.assertIn("include_before_catch_all(app, exemplar_view_router)", "\n".join(msrc[-10:]))
+        # JIKOU-FOLLOWUP-1（QUEUE-2026-10-16-R F-1）が main.py 末尾へ追記したため、EOF 窓 pin を「各票の見出しコメント以降 3 行」
+        # へ移した（検査の意図＝結線は見出し直後の末尾追記ブロックにあり本文中に置かない、は不変）。
+        _h = next(i for i, line in enumerate(msrc) if line.startswith("# ── JIKOU-REPLY-Q4（QUEUE-2026-10-13-D D-3）"))
+        self.assertIn("include_before_catch_all(app, drafts_view_router)", "\n".join(msrc[_h:_h + 3]))
+        _h = next(i for i, line in enumerate(msrc) if line.startswith("# ── JIKOU-REPLY-Q3a（QUEUE-2026-10-12-C C-2）"))
+        self.assertIn("include_before_catch_all(app, exemplar_view_router)", "\n".join(msrc[_h:_h + 3]))
         p = REPO / "alembic" / "versions" / "20261013_d4f6b8c0e2a4_draft_approval_outcome.py"
         src = p.read_text(encoding="utf-8")
         self.assertIn("revision: str = 'd4f6b8c0e2a4'", src)
