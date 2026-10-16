@@ -28,7 +28,7 @@ from dataclasses import dataclass
 
 import httpx
 
-from hub import send_ledger
+from hub import send_failclosed, send_ledger
 from hub.redact import emit
 
 logger = logging.getLogger("hub.line_channel")
@@ -113,6 +113,10 @@ async def reply_with_push_fallback(channel: LineChannelConfig,
     SEND_UNCONFIRMED（結果未確認の重複＝既存操作が pending/started/unconfirmed）／
     SEND_FAILED（最終的に非 2xx）。通信例外は従来どおり送出（記録は unconfirmed）。"""
     op = await send_ledger.begin(channel.name, channel.name, to, text)
+    if op is None and send_failclosed.enabled():
+        # JIKOU-SEND-FAILCLOSED-1: flag ON のときだけ台帳必須（記録できなければ送らない・障害通知 1 日 1 回）
+        await send_failclosed.on_ledger_unavailable(channel.name)
+        return send_ledger.SEND_FAILED
     if op is send_ledger.DUPLICATE_SENT:
         logger.info("[LINE] duplicate send skipped (send_ledger: already sent)")
         return send_ledger.SEND_SENT
@@ -179,6 +183,10 @@ async def push_text(channel: LineChannelConfig, to: str, text: str) -> bool | st
     `is True` 判定は SEND_UNCONFIRMED を失敗側へ倒す（None ではなく文字列にして、
     戻り値 None の mock・旧契約と混同しない）。"""
     op = await send_ledger.begin(channel.name, channel.name, to, text)
+    if op is None and send_failclosed.enabled():
+        # JIKOU-SEND-FAILCLOSED-1: flag ON のときだけ台帳必須（記録できなければ送らない・障害通知 1 日 1 回）
+        await send_failclosed.on_ledger_unavailable(channel.name)
+        return False
     if op is send_ledger.DUPLICATE_SENT:
         logger.info("[LINE_PUSH] duplicate send skipped (send_ledger: already sent)")
         return True
