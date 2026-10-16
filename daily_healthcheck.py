@@ -614,7 +614,7 @@ async def run_healthcheck() -> list[str]:
         # DB接続情報が例外本文に含まれ得るため分類のみ（RCF-M05流儀）
         problems.append(f"App36 decision監査の実行自体が失敗: {type(e).__name__}")
     try:
-        problems += await check_business_notify_liveness()  # 監視項目F（P1-102）
+        problems += await _check_f_and_ops_runbook_items()  # 監視項目F（P1-102）＋J〜M（OPS-RUNBOOK-1・1 行置換）
     except Exception as e:
         problems.append(f"業務通知dead-man監視の実行自体が失敗: {type(e).__name__}")
     # 監視項目G（P2-CHAIN-012）: LINE durable 滞留（received/processing）。
@@ -636,12 +636,12 @@ async def run_healthcheck() -> list[str]:
         body = "\n".join(f"・{p}" for p in problems)
         if notice:
             body += f"\n（{notice}）"   # 通知本文に 1 行添える（異常件数には数えない）
-        sent_ok = await notify_admin_line(
+        # CONCURRENCY-1（G-3 反例 #3）: 2 プロセス同時起動でも 1 日 1 通（台帳 key・台帳不可は従来どおり）。7 行＝番地不変
+        sent_ok = await _notify_once_per_day(
             "【日次死活監視: 異常検知】\n"
             f"時刻: {now}\n"
             f"{body}\n"
             "対応手順は README「日次死活監視」を参照してください。",
-            throttle_key="",  # 日次実行なのでスロットルしない
         )
         # dead-man（統合形）: 業務通知の送信自体が失敗＝経路が死んでいる。
         # 例外相当の警告ログ＋可能な範囲の代替警報（顧客Botは絶対に使わない）。
@@ -705,3 +705,215 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     result = asyncio.run(run_healthcheck())
     raise SystemExit(1 if result else 0)
+
+
+# ── CONCURRENCY-1（QUEUE-2026-10-14-G G-3 反例 #3）: 異常通知の 1 日 1 通（プロセス横断・台帳 key）。末尾追記。 ──
+HEALTHCHECK_LEDGER_BUSINESS = "jikou"
+HEALTHCHECK_LEDGER_CHANNEL = "healthcheck"
+
+
+def _healthcheck_day_key() -> str:
+    """台帳の受信イベント ID（JST 日付のみ・値を含まない）。"""
+    return "healthcheck:" + datetime.now(_JST).strftime("%Y-%m-%d")
+
+
+async def _notify_once_per_day(text: str) -> bool:
+    """異常通知を send_ledger（受信イベント ID＝healthcheck:{JST 日付}・purpose=other）で 1 日 1 通にする。
+    同時刻に 2 プロセスで起動しても、Postgres の advisory lock と UNIQUE 制約で 2 通目は DUPLICATE（送らない）。
+    台帳が使えない（DB 未設定・障害＝begin が None）ときは従来どおり直接送る（fail-open: 監視通知を DB に依存させない）。
+    送信失敗は failed で残し、次のプロセス／次回の起動が再試行する（自動再送はしない）。戻り値=送れたか。"""
+    from hub import send_ledger
+    from hub.notify import get_admin_line_user_id
+    token = send_ledger.bind_inbound(_healthcheck_day_key())
+    try:
+        with send_ledger.purpose(send_ledger.PURPOSE_OTHER):
+            op = await send_ledger.begin(HEALTHCHECK_LEDGER_BUSINESS, HEALTHCHECK_LEDGER_CHANNEL,
+                                         get_admin_line_user_id() or "", text)
+    except Exception:
+        op = None
+    finally:
+        send_ledger.unbind(token)
+    if op is send_ledger.DUPLICATE_SENT or op is send_ledger.DUPLICATE_UNCONFIRMED:
+        logger.info("healthcheck notice skipped (already sent today per ledger)")
+        return True
+    if not isinstance(op, send_ledger.Operation):
+        return await notify_admin_line(text, throttle_key="")          # 台帳なし＝従来どおり（fail-open）
+    try:
+        ok = await notify_admin_line(text, throttle_key="")
+    except Exception:
+        await send_ledger.finish(op, send_ledger.STATE_UNCONFIRMED)
+        raise
+    await send_ledger.finish(op, send_ledger.STATE_SENT if ok else send_ledger.STATE_FAILED)
+    return ok
+
+
+# ── OPS-RUNBOOK-1（QUEUE-2026-10-16-R F-6 (2)）: 追加の点検項目 J〜M。末尾追記（sink allowlist の番地 84/112/162/191/635/659 は不変）。
+# 呼出は run_healthcheck の監視項目F の 1 行を置換（_check_f_and_ops_runbook_items）。既存挙動（正常時は送らない・異常時のみ 1 通・
+# 同日 2 回目は台帳で skipped）は _notify_once_per_day のまま。閾値は本節の定数 1 か所（**要大野確認**）。
+SEND_LEDGER_UNCONFIRMED_ALERT_HOURS = 24      # 結果未確認（unconfirmed）がこの時間を超えて残っていれば警報
+SEND_LEDGER_STARTED_STUCK_MINUTES = 60        # started のままこの分数を超えていれば警報（回収ジョブの不稼働の疑い）
+SEND_FAILURE_RATE_ALERT = 0.2                 # 直近 24 時間の 失敗／(成功+失敗) がこの率以上で警報
+SEND_FAILURE_RATE_MIN_TOTAL = 5               # 率を見る最小母数
+REPLY_PENDING_OPEN_ALERT_HOURS = 24           # 対応待ち（open）の最古がこの時間を超えていれば警報
+HOUKI_DEADLINE_SOON_DAYS = 7                  # 熟慮期間の期限までこの日数以内で未提出の件数を警報
+CONNECTIVITY_TIMEOUT_SECONDS = 10.0
+_LINE_INFO_URL = "https://api.line.me/v2/bot/info"
+_TABLE_MISSING_MARKS = ("no such table", "does not exist", "undefinedtable", "relation ")
+
+
+def _db_configured() -> bool:
+    return bool(os.environ.get("DATABASE_URL"))
+
+
+def _is_table_missing(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return any(m in text for m in _TABLE_MISSING_MARKS)
+
+
+def _aware_utc(v):
+    if v is not None and getattr(v, "tzinfo", None) is None:
+        v = v.replace(tzinfo=timezone.utc)
+    return v
+
+
+async def check_send_ledger_health() -> list[str]:
+    """J: 送信台帳の滞留（unconfirmed・started）と直近 24 時間の送信失敗率。DB 未設定・表未適用は静かにスキップ。"""
+    if not _db_configured():
+        return []
+    import sqlalchemy as sa
+    from hub import send_ledger
+    from hub.db import session_scope
+    now = datetime.now(timezone.utc)
+    t = send_ledger.send_operation
+    try:
+        async with session_scope() as s:
+            rows = (await s.execute(sa.select(t.c.state, t.c.created_at, t.c.started_at).where(
+                t.c.state.in_(["unconfirmed", "started", "sent", "failed"])))).fetchall()
+    except Exception as e:
+        if _is_table_missing(e):
+            logger.info("send_ledger health check skipped (table missing)")
+            return []
+        raise
+    since = now - timedelta(hours=24)
+    unconfirmed = stuck = sent = failed = 0
+    for r in rows:
+        created, started = _aware_utc(r.created_at), _aware_utc(r.started_at)
+        if r.state == "unconfirmed":
+            if created is not None and created < now - timedelta(hours=SEND_LEDGER_UNCONFIRMED_ALERT_HOURS):
+                unconfirmed += 1
+        elif r.state == "started":
+            ref = started or created
+            if ref is not None and ref < now - timedelta(minutes=SEND_LEDGER_STARTED_STUCK_MINUTES):
+                stuck += 1
+        elif r.state == "sent" and created is not None and created >= since:
+            sent += 1
+        elif r.state == "failed" and created is not None and created >= since:
+            failed += 1
+    problems: list[str] = []
+    if unconfirmed:
+        problems.append(f"送信台帳: 結果未確認（unconfirmed）が {unconfirmed} 件、{SEND_LEDGER_UNCONFIRMED_ALERT_HOURS} 時間超のまま"
+                        "（/app/send_ops で確定してください・自動再送はしません）")
+    if stuck:
+        problems.append(f"送信台帳: started のまま {SEND_LEDGER_STARTED_STUCK_MINUTES} 分超が {stuck} 件"
+                        "（回収ジョブ SEND_LEDGER_RECOVER の稼働を確認・docs/runbook.md §1）")
+    total = sent + failed
+    if total >= SEND_FAILURE_RATE_MIN_TOTAL and failed / total >= SEND_FAILURE_RATE_ALERT:
+        problems.append(f"送信台帳: 直近 24 時間の送信失敗率 {round(failed / total * 100)}%（失敗 {failed}／{total}）"
+                        "（LINE 側の障害・トークン失効を確認・docs/runbook.md §4）")
+    return problems
+
+
+async def check_reply_pending_oldest() -> list[str]:
+    """K: 対応待ち（reply_pending・JIKOU-REPLY-Q1c）の open の最古経過。module／表が無い環境は静かにスキップ。"""
+    if not _db_configured():
+        return []
+    try:
+        from hub import reply_pending as rp
+    except ImportError:
+        return []
+    import sqlalchemy as sa
+    from hub.db import session_scope
+    t = rp.reply_pending
+    try:
+        async with session_scope() as s:
+            rows = (await s.execute(sa.select(t.c.created_at).where(t.c.state == rp.STATE_OPEN))).fetchall()
+    except Exception as e:
+        if _is_table_missing(e):
+            logger.info("reply_pending check skipped (table missing)")
+            return []
+        raise
+    if not rows:
+        return []
+    now = datetime.now(timezone.utc)
+    oldest = min(_aware_utc(r.created_at) for r in rows if r.created_at is not None)
+    hours = int((now - oldest).total_seconds() // 3600)
+    if hours >= REPLY_PENDING_OPEN_ALERT_HOURS:
+        return [f"対応待ち: 未処理 {len(rows)} 件・最古 約{hours} 時間（/app/pending から返信または不要に）"]
+    return []
+
+
+async def check_houki_deadline_soon() -> list[str]:
+    """L: 相続放棄の熟慮期間の期限まで HOUKI_DEADLINE_SOON_DAYS 日以内で未提出の件数（App 40 未設定は静かにスキップ）。"""
+    if not (os.environ.get("APP_HOUKI") and os.environ.get("TOKEN_HOUKI")):
+        return []
+    from hub import houki_jukuryo as hj
+    records = await hj.fetch_all_targets()
+    today = hj._today_jst()
+    soon = 0
+    for rec in records:
+        comp = hj.compute(rec, today)
+        if comp is not None and 0 <= comp.remaining <= HOUKI_DEADLINE_SOON_DAYS:
+            soon += 1
+    if soon:
+        return [f"相続放棄: 熟慮期間の期限まで {HOUKI_DEADLINE_SOON_DAYS} 日以内で申述提出日が空の案件が {soon} 件"
+                "（App 40／/app/houki/overdue を確認）"]
+    return []
+
+
+async def _line_info_ok(token: str) -> tuple[bool, str]:
+    async with httpx.AsyncClient(timeout=CONNECTIVITY_TIMEOUT_SECONDS) as client:
+        resp = await client.get(_LINE_INFO_URL, headers={"Authorization": f"Bearer {token}"})
+    return (200 <= resp.status_code < 300), str(resp.status_code)
+
+
+async def check_connectivity() -> list[str]:
+    """M: 疎通（DB: SELECT 1／LINE: 顧客・業務チャネルの bot/info）。kintone の疎通は監視項目B（フォーム設計の取得）が兼ねる。"""
+    problems: list[str] = []
+    if _db_configured():
+        try:
+            import sqlalchemy as sa
+            from hub.db import session_scope
+            async with session_scope() as s:
+                await s.execute(sa.text("SELECT 1"))
+        except Exception as e:
+            problems.append(f"DB 疎通: 接続に失敗（{type(e).__name__}）（docs/runbook.md §1）")
+    from hub.notify import business_token_env
+    for label, env in (("顧客", "LINE_CHANNEL_ACCESS_TOKEN"), ("業務", business_token_env())):
+        token = os.environ.get(env, "")
+        if not token:
+            continue
+        try:
+            ok, status = await _line_info_ok(token)
+        except Exception as e:
+            problems.append(f"LINE 疎通（{label}チャネル）: 接続に失敗（{type(e).__name__}）（docs/runbook.md §4）")
+            continue
+        if not ok:
+            problems.append(f"LINE 疎通（{label}チャネル）: HTTP {status}（トークン失効・権限を確認・docs/runbook.md §4）")
+    return problems
+
+
+async def _check_f_and_ops_runbook_items() -> list[str]:
+    """監視項目F（従来の分類文言を維持）＋ J〜M。各項目の例外は分類名のみで記録し、他の項目は続行する。"""
+    out: list[str] = []
+    try:
+        out += await check_business_notify_liveness()
+    except Exception as e:
+        out.append(f"業務通知dead-man監視の実行自体が失敗: {type(e).__name__}")
+    for label, fn in (("送信台帳", check_send_ledger_health), ("対応待ち", check_reply_pending_oldest),
+                      ("熟慮期間", check_houki_deadline_soon), ("疎通", check_connectivity)):
+        try:
+            out += await fn()
+        except Exception as e:
+            # DB接続情報が例外本文に含まれ得るため分類のみ（RCF-M05流儀）
+            out.append(f"{label}監視の実行自体が失敗: {type(e).__name__}")
+    return out
