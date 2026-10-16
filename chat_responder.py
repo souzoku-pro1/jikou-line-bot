@@ -1916,11 +1916,16 @@ def model_role(role: str | None) -> str | None:
     return "assistant" if role == ROLE_HUMAN else role
 
 
+_OP_MARKER_RE = re.compile(r"\n?\[op:[0-9a-f]{32}\]\s*$")   # JIKOU-REPLY-Q1b-fix2 BR-11: App 28 human 行の照合用マーカー
+
+
 def model_content(role: str | None, content) -> str:
-    """モデル入力用の本文（human 行は先頭に [事務所からの返信] マーカー・空は ""）。"""
+    """モデル入力用の本文（human 行は先頭に [事務所からの返信] マーカー・空は ""）。
+    fix2 BR-11: App 28 の human 行末尾の照合用マーカー `[op:…]` はモデルに見せない（除去）。"""
     text = str(content or "")
     if role == ROLE_HUMAN and text:
-        return f"{HUMAN_MARKER} {text}"
+        text = _OP_MARKER_RE.sub("", text)
+        return f"{HUMAN_MARKER} {text}" if text else ""
     return text
 
 
