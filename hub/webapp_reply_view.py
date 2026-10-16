@@ -39,6 +39,13 @@ fix1（Codex R-JIKOU-REPLY-Q1b-1 BR-01〜09・司令塔裁定: 人の明示送�
 - 順序（副作用）: [入力検査 → 明示確認 → ticket 検証 → 重複検査 → App 29 再取得と宛先照合 → 許可表 →
   LINE 送信（台帳 begin/finish） → App 28 記録（失敗は記録未了へ） → メモリ反映 → 手本保存]。
 - RV-10: ログは固定語彙＋emit のみ。本文・氏名・LINE userId はログに出さない。
+fix2（Codex R-Q1b-fix1 BR-10〜12・docs/jikou_reply_q1b_contract.md）:
+- BR-12: 送信の **前** に回収表（hub/reply_followup）へ prepared（本文・本文ハッシュ・宛先ハッシュ・op_id）を永続化し、送信後に
+  状態を進める。prepared を置けない（DB 不可）ときは台帳必須と同じく **送らない**。回収ジョブは台帳の状態と突合する。
+- BR-11: App 28 の本文欄にマーカー `[op:{op_id}]` を含めて書く（表示・モデル入力では除去）。回収は所有権（in_progress）を取り、
+  作成前に op_id で App 28 を検索する（成功応答喪失の修復）。
+- BR-10: 手本は pending_review で保存（人が匿名化を確認して承認するまで下書き参照に使わない）。
+- 冪等性は **操作（op_id）単位**（同一 inbound_event_id に対する人の別操作は別送信・司令塔裁定）。
 """
 
 import hmac
@@ -100,16 +107,20 @@ _LOG_NOTICES = {
     "skipped": "チャットログの role に「human」の選択肢が無いため記録を省略しました"
                "（kintone 側で選択肢を追加すると回収ジョブが記録します）。",
     "failed": "チャットログへの記録に失敗しました（送信は完了しています。回収ジョブが再試行します）。",
-    "unconfigured": "チャットログは未設定のため記録していません。",
+    "unconfigured": "チャットログは未設定のため記録していません（設定後に回収ジョブが記録します）。",
     # fix1 BR-08
     "pending_retry": "チャットログへの記録は未了です。回収ジョブ（5 分ごと）が再試行します。",
     "not_pending": "チャットログの記録は既に完了しています。",
     "destination_mismatch": "宛先の照合に失敗したためチャットログの記録を保留しています。",
     "exhausted": "チャットログの記録の再試行回数が上限に達しました。手動で記録してください。",
     "not_found": "",
+    # fix2 BR-11／BR-12
+    "recovered": "チャットログに既に同じ操作の記録があったため、新たに作成せず完了にしました。",
+    "waiting_ledger": "送信結果が台帳で確定するまでチャットログの記録を保留しています（送信確認待ちで確定してください）。",
+    "closed": "この操作は未送信として閉じました（チャットログには記録しません）。",
 }
 _EX_NOTICES = {
-    "saved": "手本として匿名化して保存しました。",
+    "saved": "手本として匿名化して保存しました（確認待ち。承認するまで下書きの参考には使われません）。",
     "rejected": "匿名化の残留検査に通らなかったため手本には保存していません。",
     "skipped": "手本の保存先（DB）が未設定のため保存していません。",
     "failed": "手本の保存に失敗しました（送信は完了しています）。",
@@ -187,7 +198,7 @@ async def _history_rows(user_id: str) -> list[dict]:
         msg = _v(r, "message")
         if msg in (IMAGE_HUMAN_HOLD_MARKER, IMAGE_HUMAN_CLOSED_MARKER):
             continue
-        out.append({"role": _v(r, "role"), "message": msg, "at": _v(r, "作成日時")})
+        out.append({"role": _v(r, "role"), "message": reply_followup.strip_op_marker(msg), "at": _v(r, "作成日時")})
     return out
 
 
@@ -214,10 +225,26 @@ async def write_human_chatlog(user_id: str, text: str) -> str:
     return "written"
 
 
+async def find_human_chatlog(user_id: str, op_id: str) -> str | None:
+    """fix2 BR-11: App 28 に同じ操作のマーカー `[op:{op_id}]` を持つ human 行があればそのレコード No.（成功応答喪失の修復）。
+    未設定・読取失敗は None（呼び出し側は作成へ進む＝従来どおり。二重作成の遮断は所有権が担う）。"""
+    if not (APP_CHATLOG.app_id() and APP_CHATLOG.token()) or not _OP_ID_RE.fullmatch(str(op_id)):
+        return None
+    try:
+        rows = await kintone.search_records(
+            APP_CHATLOG, f'line_user_id = "{user_id}" and role in ("{ROLE_HUMAN}") and '
+                         f'message like "%{reply_followup.op_marker(str(op_id))}%" order by $id asc limit 1',
+            fields=["$id"])
+    except Exception:
+        return None
+    rid = _v(rows[0], "$id") if rows else ""
+    return rid or None
+
+
 async def run_chatlog_followup() -> dict:
-    """BR-08: SEND_LEDGER_RECOVER に相乗りする回収（記録未了の App 28 human 行を冪等に再試行）。"""
-    return await reply_followup.run_followup(resolve_user_id=_resolve_user_id,
-                                             write_chatlog=write_human_chatlog)
+    """BR-08／fix2 BR-12: SEND_LEDGER_RECOVER に相乗りする回収（台帳と突合し、所有権つきで冪等に記録）。"""
+    return await reply_followup.run_followup(resolve_user_id=_resolve_user_id, write_chatlog=write_human_chatlog,
+                                             find_chatlog=find_human_chatlog, ledger_state=send_ledger.operation_state)
 
 
 def reflect_memory_history(user_id: str, text: str) -> bool:
@@ -384,9 +411,11 @@ async def reply_send(request: Request):
     if state == send_ledger.STATE_SENT:
         # BR-08: 送信済み・記録のみ再試行
         fu = await _safe_followup(op_id)
-        if fu is not None and fu["state"] == reply_followup.STATE_PENDING:
-            res = await reply_followup.retry_one(op_id, resolve_user_id=_resolve_user_id,
-                                                 write_chatlog=write_human_chatlog)
+        if fu is not None and fu["state"] in reply_followup.OPEN_STATES:
+            res = await reply_followup.process_one(op_id, resolve_user_id=_resolve_user_id,
+                                                   write_chatlog=write_human_chatlog,
+                                                   find_chatlog=find_human_chatlog,
+                                                   ledger_state=send_ledger.operation_state)
             return _redirect(back, "duplicate_sent", log=res)
         return _redirect(back, "duplicate_sent", log=("not_pending" if fu is not None else ""))
     if state is not None:
@@ -402,13 +431,25 @@ async def reply_send(request: Request):
     decision = send_ledger.human_explicit_decision(confirm)
     if not decision.allow:
         return _redirect(back, "blocked")
+    # fix2 BR-12: 送信の前に回収表へ prepared を置く（置けなければ台帳必須と同じく送らない）
+    prepared = await reply_followup.prepare(
+        op_id, business=BUSINESS, approval_record_id=record_id,
+        line_user_hash=send_ledger.line_user_hash(BUSINESS, user_id), text=text,
+        text_version=send_ledger.text_version(text))
+    if prepared in ("skipped", "failed"):
+        logger.warning("[REPLY] followup unavailable (fail-closed, not sent) record_id=%s",
+                       emit(record_id, "record_id", "log", "operator"))
+        return _redirect(back, "ledger_unavailable")
     result = await line_channel.push_text_explicit(line_channel.JIKOU_CHANNEL, op_id, user_id, text)
     if result.outcome == line_channel.PUSH_LEDGER_UNAVAILABLE:
         logger.warning("[REPLY] ledger unavailable (not sent) record_id=%s",
                        emit(record_id, "record_id", "log", "operator"))
+        await reply_followup.close(op_id, "ledger_unavailable")
         return _redirect(back, "ledger_unavailable")
     if result.outcome in (line_channel.PUSH_DUPLICATE_SENT, line_channel.PUSH_DUPLICATE_UNCONFIRMED):
         return _redirect(back, result.outcome)
+    if result.outcome == line_channel.PUSH_FAILED:
+        await reply_followup.close(op_id, "line_failed")          # 未送信で終端（回収しない）
     if result.outcome == line_channel.PUSH_UNCONFIRMED:
         logger.warning("[REPLY] explicit send unconfirmed (exception) record_id=%s",
                        emit(record_id, "record_id", "log", "operator"))
@@ -422,14 +463,15 @@ async def reply_send(request: Request):
         return _redirect(back, result.outcome)
     logger.info("[REPLY] explicit send ok record_id=%s",
                 emit(record_id, "record_id", "log", "operator"))
-    log_res = await write_human_chatlog(user_id, text)
-    if log_res in ("failed", "skipped"):
-        # BR-08: 記録未了を付帯情報に残す（回収ジョブが冪等に再試行）
+    log_res = await write_human_chatlog(user_id, reply_followup.with_op_marker(text, op_id))
+    if log_res == "written":
+        await reply_followup.complete(op_id)                      # fix2 BR-12: prepared → done
+    elif log_res in ("failed", "skipped", "unconfigured"):
+        # BR-08／fix2: 記録未了を回収表に残す（prepared → pending／unconfigured・回収ジョブが台帳と突合して冪等に再試行）
         marked = await reply_followup.mark_pending(
-            op_id, business=BUSINESS, approval_record_id=record_id,
-            line_user_hash=send_ledger.line_user_hash(BUSINESS, user_id), text=text,
-            last_result=log_res)
-        if marked in ("pending", "exists"):
+            op_id, last_result=log_res, business=BUSINESS, approval_record_id=record_id,
+            line_user_hash=send_ledger.line_user_hash(BUSINESS, user_id), text=text)
+        if marked in ("pending", "exists") and log_res != "unconfigured":
             log_res = "pending_retry"
     reflect_memory_history(user_id, text)
     ex_res = "off"

@@ -302,17 +302,26 @@ class TestExplicitSend(_DbMixin):
         self.create.assert_awaited_once()
         app, fields = self.create.await_args.args
         self.assertEqual(app.app_id_env, "APP_CHATLOG")
-        self.assertEqual(fields, {"line_user_id": USER, "role": "human", "message": TEXT,
+        # fix2 BR-11: 本文欄の末尾に照合用マーカー [op:{op_id}]（新欄なし・表示とモデル入力では除去）
+        self.assertEqual(fields, {"line_user_id": USER, "role": "human", "message": rf.with_op_marker(TEXT, OP),
                                   "category": "human_reply", "auto_sent": "no"})
-        self.assertEqual(self.followups(), [])                 # 記録未了なし
+        # fix2 BR-12: 回収表には送信前に prepared が置かれ、記録後に done（本文は保持しない・本文ハッシュは残る）
+        fu = self.followups()
+        self.assertEqual(len(fu), 1)
+        self.assertEqual((fu[0]["op_id"], fu[0]["state"], fu[0]["last_result"], fu[0]["text"],
+                          fu[0]["text_version"], fu[0]["owner_token"], fu[0]["deadline_at"]),
+                         (OP, "done", "written", None, sl.text_version(TEXT), None, None))
         # 手本: 匿名化済み・業者名保持・段階=受任後・op_id/本文ハッシュ紐付け・active・履歴 created
         ex = self.exemplars()
         self.assertEqual(len(ex), 1)
         self.assertEqual((ex[0]["business"], ex[0]["stage"], ex[0]["creditor_name"], ex[0]["source_op_id"]),
                          ("jikou", "受任後", "アコム", OP))
         self.assertEqual(ex[0]["source_text_version"], sl.text_version(TEXT))
-        self.assertEqual((ex[0]["approved_by"], bool(ex[0]["active"]), ex[0]["category_id"]), ("human", True, None))
-        self.assertIsNotNone(ex[0]["approved_at"])
+        # fix2 BR-10: 保存直後は pending_review（approved_by／approved_at は NULL・自動マスクだけで承認済みにしない）
+        self.assertEqual((ex[0]["approved_by"], bool(ex[0]["active"]), ex[0]["category_id"], ex[0]["status"]),
+                         (None, True, None, "pending_review"))
+        self.assertIsNone(ex[0]["approved_at"])
+        self.assertEqual(_run(rx.list_exemplars("jikou")), [])        # 承認まで下書き参照に出ない
         self.assertIn("44,000円", ex[0]["human_reply"])
         self.assertIn("アコム", ex[0]["inbound_text"])
         self.assertNotIn("090-1234-5678", ex[0]["inbound_text"])
@@ -331,7 +340,8 @@ class TestExplicitSend(_DbMixin):
     def test_same_operation_id_is_rejected_without_side_effects(self):
         self.post()
         r = self.post()
-        self.assertEqual(r.headers["location"], f"{PAGE}?done=duplicate_sent")
+        # fix2 BR-12: 回収行は記録済み（done）で必ず存在するため「記録は既に完了」の通知が付く（fix1 は行なし＝通知なし）
+        self.assertEqual(r.headers["location"], f"{PAGE}?done=duplicate_sent&log=not_pending")
         self.assertEqual(len(_FakeClient.calls), 1)
         self.assertEqual(len(self.ops()), 1)
         self.create.assert_awaited_once()
@@ -462,7 +472,8 @@ class TestExplicitSend(_DbMixin):
         with patch.dict(os.environ, {"DATABASE_URL": ""}):
             os.environ.pop("DATABASE_URL", None)
             db.reset_for_tests()
-            with self.assertLogs("hub.line_channel", level="WARNING") as cm:
+            # fix2 BR-12: 送信前に回収表へ prepared を置くため、DB なしの遮断は台帳より先に回収表の段で起きる（同じ fail-closed）
+            with self.assertLogs("hub.webapp_reply_view", level="WARNING") as cm:
                 r = self.post()
         self.assertEqual(r.headers["location"], f"{PAGE}?done=ledger_unavailable")
         self.assertEqual(_FakeClient.calls, [])
@@ -643,15 +654,21 @@ class TestExplicitSend(_DbMixin):
     def test_exemplar_lifecycle_used_and_deactivated_with_history(self):
         self.post()
         ex_id = self.exemplars()[0]["id"]
+        # fix2 BR-10: pending_review のままでは使えない（人の明示操作 approve_exemplar で approved にしてから）
+        self.assertFalse(_run(rx.mark_used(ex_id)))
+        self.assertTrue(_run(rx.approve_exemplar(ex_id, actor="human")))
+        self.assertFalse(_run(rx.approve_exemplar(ex_id, actor="human")))     # 二重承認は何もしない
         self.assertTrue(_run(rx.mark_used(ex_id)))
         self.assertEqual(len(_run(rx.list_exemplars("jikou", stage="受任後"))), 1)
         self.assertTrue(_run(rx.deactivate_exemplar(ex_id)))
         self.assertFalse(_run(rx.deactivate_exemplar(ex_id)))
         self.assertEqual(_run(rx.list_exemplars("jikou")), [])           # 無効は読まない・行は残る
         row = self.exemplars()[0]
-        self.assertEqual((row["used_count"], bool(row["active"])), (1, False))
+        self.assertEqual((row["used_count"], bool(row["active"]), row["status"], row["approved_by"]),
+                         (1, False, "retired", "human"))
+        self.assertIsNotNone(row["approved_at"])
         self.assertEqual([h["action"] for h in _run(rx.exemplar_history(ex_id))],
-                         ["created", "used", "deactivated"])
+                         ["created", "approved", "used", "deactivated"])
 
 
 # ── 3. 許可表 human 列（(f)） ────────────────────────────────────────────────────
@@ -892,14 +909,20 @@ class TestAnonymize(unittest.TestCase):
         self.assertEqual({c.name for c in rx.reply_exemplar.columns},
                          {"id", "business", "conversation_ref", "inbound_text", "human_reply",
                           "creditor_name", "stage", "created_at", "used_count", "source_op_id",
-                          "category_id", "source_text_version", "approved_by", "approved_at", "active"})
+                          "category_id", "source_text_version", "approved_by", "approved_at", "active",
+                          "status"})                                            # fix2 BR-10: status
         self.assertEqual({c.name for c in rx.reply_exemplar_history.columns},
                          {"history_id", "exemplar_id", "action", "actor", "at", "note"})
-        self.assertEqual(rx.ACTIONS, ("created", "used", "deactivated"))
+        self.assertEqual(rx.ACTIONS, ("created", "used", "deactivated", "approved"))   # fix2 BR-10
+        self.assertEqual(rx.STATUSES, ("pending_review", "approved", "retired"))
+        # fix2 BR-11／BR-12: 本文ハッシュ・所有権・照合したレコード No.・状態 7 値
         self.assertEqual({c.name for c in rf.reply_chatlog_followup.columns},
                          {"op_id", "business", "kind", "approval_record_id", "line_user_hash", "text",
-                          "state", "attempts", "last_result", "created_at", "updated_at", "done_at"})
-        self.assertEqual(rf.STATES, ("pending", "done", "exhausted"))
+                          "text_version", "state", "attempts", "last_result", "owner_token", "deadline_at",
+                          "chatlog_record_id", "created_at", "updated_at", "done_at"})
+        self.assertEqual(rf.STATES, ("prepared", "pending", "unconfigured", "in_progress", "done", "closed",
+                                     "exhausted"))
+        self.assertEqual(rf.OPEN_STATES, ("prepared", "pending", "unconfigured", "in_progress"))
         self.assertEqual(line_channel.PUSH_OUTCOMES, ("sent", "failed", "unconfirmed", "duplicate_sent",
                                                       "duplicate_unconfirmed", "ledger_unavailable"))
         self.assertEqual(pii_scan.MASKS, ("〔氏名〕", "〔住所〕", "〔電話〕", "〔メール〕", "〔口座〕",
