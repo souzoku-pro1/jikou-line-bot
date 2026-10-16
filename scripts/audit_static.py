@@ -266,6 +266,13 @@ def audit_send_paths(rel: str, tree, src_lines: list[str], module_src: str) -> l
 
 
 # ── (c) 削除 ────────────────────────────────────────────────────────────────
+def _is_disabled_delete_def(src_lines: list[str], i: int) -> bool:
+    """AUDIT-FIX-1: `def delete_record` が HTTP DELETE を送らず例外にするだけの無効化スタブなら物理削除ではない
+    （本文 12 行以内に "DELETE" の HTTP 動詞が無く raise がある）。関数名での除外ではなく本文で判定する。"""
+    body = "\n".join(src_lines[i: i + 12])
+    return ('"DELETE"' not in body and "'DELETE'" not in body) and "raise " in body
+
+
 def audit_deletes(rel: str, src_lines: list[str]) -> list[Finding]:
     out = []
     for i, line in enumerate(src_lines, start=1):
@@ -274,6 +281,8 @@ def audit_deletes(rel: str, src_lines: list[str]) -> list[Finding]:
             continue
         for pat, label in DELETE_PATTERNS:
             if pat.search(line):
+                if label == "kintone.delete_record" and s.startswith(("def ", "async def ")) and _is_disabled_delete_def(src_lines, i):
+                    break                                   # 無効化スタブ（物理削除の器ではない）
                 out.append(Finding(CATEGORY_C, rel, i, f"{label}: {s[:120]}"))
                 break
     return out
