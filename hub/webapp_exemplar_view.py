@@ -19,7 +19,7 @@ import re
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 
-from hub import reply_exemplar
+from hub import jikou_reply_promote, reply_exemplar
 from hub.webapp_auth import _gate
 
 router = APIRouter()
@@ -34,6 +34,11 @@ _NOTICES = {
     "not_changed": "状態は変わりませんでした（既に同じ状態です）。",
     "not_found": "対象が見つかりません。", "bad_input": "入力が不正です。",
     "db": "記録を読み書きできませんでした。",
+    # JIKOU-REPLY-Q5
+    "promoted": "定型に昇格しました（データ表に追加・bot が同じ分類の問いに自動送信します）。",
+    "not_candidate": "この手本は昇格の候補ではありません（無修正承認 3 回未満・下書きのみの分類・昇格済み）。",
+    "text_retired": "昇格定型を退役にしました（自動送信に使われません）。",
+    "text_reactivated": "昇格定型を再承認しました。",
 }
 
 
@@ -41,7 +46,8 @@ def _bad_request() -> Response:
     return Response(status_code=400)
 
 
-def _page(rows: list[dict], notice: str, show_all: bool) -> str:
+def _page(rows: list[dict], notice: str, show_all: bool, candidates: dict | None = None,
+          promoted_sources: set | None = None, texts: list[dict] | None = None) -> str:
     e = html.escape
     parts = [
         '<!DOCTYPE html><html lang="ja"><head><meta charset="utf-8">',
@@ -88,7 +94,29 @@ def _page(rows: list[dict], notice: str, show_all: bool) -> str:
         parts.append(f'<form method="post" action="{PAGE}/update">'
                      f'<input type="hidden" name="exemplar_id" value="{rid}">'
                      f'<button type="submit" name="action" value="{action}">{label}</button></form>')
+        if jikou_reply_promote.is_candidate(r, candidates or {}, promoted_sources or set()):   # JIKOU-REPLY-Q5 (a)
+            n = int((candidates or {}).get(r.get("category_id"), 0))
+            parts.append(f'<form method="post" action="{PAGE}/promote">'
+                         f'<input type="hidden" name="exemplar_id" value="{rid}">'
+                         f'<button type="submit">定型に昇格（無修正承認 {n} 回）</button></form>')
         parts.append("</div>")
+    # JIKOU-REPLY-Q5 (a)(c): 昇格定型（データ表）の一覧・退役・再承認
+    parts.append('<h1>昇格した定型（データ表）</h1>'
+                 '<p class="sub">無修正承認が 3 回に達した分類の手本を大野が昇格した定型です。bot は同じ分類の問いに'
+                 '（Q2 の定型表で該当が無いとき）この文をそのまま自動送信します。退役は削除せず履歴に残ります。</p>')
+    if not texts:
+        parts.append('<p class="empty">昇格した定型はありません</p>')
+    for t in texts or []:
+        active_t = t.get("status") == jikou_reply_promote.STATUS_ACTIVE
+        parts.append('<div class="item">'
+                     f'<span class="badge{"" if active_t else " off"}">{"有効" if active_t else "退役"}</span>'
+                     f'<span class="badge">{e(str(t["text_id"]))}</span><span class="badge">{e(str(t["category"]))}</span>'
+                     f'<div class="a">{e(str(t["text"]))}</div>'
+                     f'<div class="meta">版: {e(str(t["text_version"])[:16])}｜元の手本 ID: {e(str(t.get("source_exemplar_id") or ""))}'
+                     f'｜更新: {e(str(t.get("updated_at") or ""))}</div>'
+                     f'<form method="post" action="{PAGE}/text"><input type="hidden" name="text_id" value="{e(str(t["text_id"]))}">'
+                     f'<button type="submit" name="action" value="{"retire" if active_t else "reactivate"}">'
+                     f'{"退役にする" if active_t else "再承認する"}</button></form></div>')
     parts.append('<script src="/app/shell.js"></script></body></html>')
     return "".join(parts)
 
@@ -102,7 +130,8 @@ async def exemplars_page(request: Request):
     except Exception:
         rows = []
         notice = _NOTICES["db"]
-    return HTMLResponse(_page(rows, notice, show_all))
+    cands, sources, texts = await _promotion_context()
+    return HTMLResponse(_page(rows, notice, show_all, cands, sources, texts))
 
 
 async def exemplars_update(request: Request):
@@ -123,6 +152,47 @@ async def exemplars_update(request: Request):
     return RedirectResponse(f"{PAGE}?done={done}", status_code=303)
 
 
+async def _promotion_context() -> tuple:
+    """JIKOU-REPLY-Q5: 候補 category・昇格済み手本 ID・昇格定型（失敗は空＝ボタンを出さない）。"""
+    try:
+        return (await jikou_reply_promote.candidate_categories(BUSINESS),
+                await jikou_reply_promote.promoted_source_ids(BUSINESS),
+                await jikou_reply_promote.list_texts(BUSINESS))
+    except Exception:
+        return {}, set(), []
+
+
+async def exemplars_promote(request: Request):
+    """人の操作: 定型に昇格（候補のみ・PRG）。"""
+    form = await request.form()
+    xid = str(form.get("exemplar_id", ""))
+    if not _ID_RE.fullmatch(xid):
+        return _bad_request()
+    try:
+        tid = await jikou_reply_promote.promote(int(xid))
+    except Exception:
+        return RedirectResponse(f"{PAGE}?done=db", status_code=303)
+    return RedirectResponse(f"{PAGE}?done={'promoted' if tid else 'not_candidate'}", status_code=303)
+
+
+_TEXT_ACTIONS = {"retire": jikou_reply_promote.retire, "reactivate": jikou_reply_promote.reactivate}
+
+
+async def exemplars_text_update(request: Request):
+    """人の操作: 昇格定型の退役／再承認（PRG）。"""
+    form = await request.form()
+    tid = str(form.get("text_id", ""))
+    action = str(form.get("action", ""))
+    if not jikou_reply_promote._ID_RE.fullmatch(tid) or action not in _TEXT_ACTIONS:
+        return _bad_request()
+    try:
+        ok = await _TEXT_ACTIONS[action](tid)
+    except Exception:
+        return RedirectResponse(f"{PAGE}?done=db", status_code=303)
+    done = ("text_retired" if action == "retire" else "text_reactivated") if ok else "not_changed"
+    return RedirectResponse(f"{PAGE}?done={done}", status_code=303)
+
+
 async def api_exemplars(request: Request):
     try:
         rows = await reply_exemplar.list_for_view(BUSINESS, include_inactive=True)
@@ -134,3 +204,5 @@ async def api_exemplars(request: Request):
 router.add_api_route(PAGE, _gate(exemplars_page), methods=["GET"])
 router.add_api_route(f"{PAGE}/update", _gate(exemplars_update), methods=["POST"])
 router.add_api_route("/app/api/exemplars", _gate(api_exemplars), methods=["GET"])
+router.add_api_route(f"{PAGE}/promote", _gate(exemplars_promote), methods=["POST"])      # JIKOU-REPLY-Q5
+router.add_api_route(f"{PAGE}/text", _gate(exemplars_text_update), methods=["POST"])    # JIKOU-REPLY-Q5
