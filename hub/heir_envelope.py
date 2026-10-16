@@ -132,6 +132,9 @@ def _unit_for_case(case_app_id: str) -> str:
         mapping[jikou] = "時効援用"
     if souzoku:
         mapping[souzoku] = "相続一般"
+    houki = os.environ.get("APP_HOUKI", "").strip()      # HOUKI-SHOKUMU-LINK-1: App 40（相続放棄案件）
+    if houki:
+        mapping[houki] = "相続放棄"
     unit = mapping.get(case_app_id)
     if not unit:
         raise EnvelopePolicyError(
