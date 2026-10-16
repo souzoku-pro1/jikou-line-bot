@@ -2357,3 +2357,9 @@ send_ledger.register_recover_job()
 send_ledger.check_dialect_at_startup()
 # fix3 BQ-09: 時間設定の整合（heartbeat < 送信 timeout < deadline < 回収閾値）。不整合は警告+既定値
 send_ledger.check_timing_config()
+
+# ── HOUKI-JUKURYO-3（QUEUE-2026-10-13-D D-7）: 期限超過×未提出の一覧（/app/houki/overdue）と日次の件数通知。末尾追記。
+from hub.houki_overdue import register_houki_overdue_job  # noqa: E402
+from hub.webapp_houki_overdue_view import router as houki_overdue_router  # noqa: E402
+include_before_catch_all(app, houki_overdue_router)
+app.router.on_startup.append(register_houki_overdue_job)   # 起動時に daily 登録（import 時にループを要求しない）
