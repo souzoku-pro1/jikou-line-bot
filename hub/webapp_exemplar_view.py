@@ -7,7 +7,9 @@
 - 一覧（/app/exemplars）: 業務・category・段階・匿名化済み本文（相談者文と返信）・状態（承認済み／退役）・
   approved_by / approved_at・使用回数。原文・氏名・LINE userId は表に無い（匿名化済みのみ＝RV-10）。
 - 操作は 2 つ（理由は固定・自動送信の口は持たない）:
-  1. 「承認」= reply_exemplar.approve_exemplar（退役中 → 承認済み・approved_by=human・approved_at=now・履歴 approved）
+  1. 「承認」= reply_exemplar.approve_exemplar（確認待ち pending_review／退役中 → 承認済み・approved_by=human・approved_at=now・
+     履歴 approved）。JIKOU-REPLY-Q1b-fix2 BR-10: 保存直後の手本は pending_review（自動マスクだけで承認済みにしない）で、人がこの画面で
+     匿名化を確認して承認するまで参考文例に使われない。
   2. 「退役」= reply_exemplar.deactivate_exemplar（承認済み → 退役・履歴 deactivated）
   退役した手本は bot の参考文例に使われない（active のみ）。
 - 参照 API（/app/api/exemplars）: 件数と一覧（匿名化済み本文を含む・原文なし）。
@@ -28,6 +30,8 @@ PAGE = "/app/exemplars"
 BUSINESS = "jikou"
 _ID_RE = re.compile(r"^\d{1,12}$")
 _ACTIONS = {"approve": reply_exemplar.approve_exemplar, "retire": reply_exemplar.deactivate_exemplar}
+_STATUS_LABELS = {reply_exemplar.STATUS_APPROVED: "承認済み", reply_exemplar.STATUS_PENDING_REVIEW: "確認待ち",
+                  reply_exemplar.STATUS_RETIRED: "退役"}
 _NOTICES = {
     "approved": "承認しました（bot の参考文例に使われます）。",
     "retired": "退役にしました（参考文例に使われません）。",
@@ -78,9 +82,10 @@ def _page(rows: list[dict], notice: str, show_all: bool, candidates: dict | None
         parts.append('<p class="empty">手本はありません</p>')
     for r in rows:
         rid = int(r["id"])
-        active = bool(r["active"])
+        status = str(r.get("status") or reply_exemplar.STATUS_PENDING_REVIEW)        # fix2 BR-10: 状態は status で判定
+        active = status == reply_exemplar.STATUS_APPROVED
         parts.append('<div class="item">')
-        parts.append(f'<span class="badge{"" if active else " off"}">{"承認済み" if active else "退役"}</span>'
+        parts.append(f'<span class="badge{"" if active else " off"}">{_STATUS_LABELS.get(status, status)}</span>'
                      f'<span class="badge">{e(str(r.get("category_id") or "分類なし"))}</span>'
                      f'<span class="badge">{e(str(r["stage"]))}</span>'
                      f'<span class="badge">使用 {int(r["used_count"])} 回</span>')

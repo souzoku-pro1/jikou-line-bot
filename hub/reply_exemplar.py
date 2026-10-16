@@ -19,6 +19,11 @@ fix1（Codex R-JIKOU-REPLY-Q1b-1）:
 - DB 未設定（DATABASE_URL なし）は保存しない（skipped）。DB 例外は固定語彙のログだけ（failed）。
   手本の保存失敗は送信や App 28 記録に影響しない（呼び出し側で順序を固定）。
 - RV-10: 本表に LINE userId・原文は置かない。ログに本文・氏名を出さない。
+fix2（Codex R-Q1b-fix1 BR-10・司令塔裁定「自由文の手本は人が匿名化を確認するまで下書き参照に使わない」）:
+- 保存時の状態は **status=pending_review**（approved_by／approved_at は NULL）。自動マスクだけで承認済みにしない。
+- 下書き参照（list_exemplars＝Q3a 以降の参考文例・Q2 選択器・Q3b 下書き）は **status=approved のものだけ** を読む。
+- approved への遷移は人の明示操作（approve_exemplar）のみ。Q1b 単体では遷移の画面を持たない（Q3a の承認画面が接続する）。
+- 退役は status=retired（active=False）。mark_used は approved だけ。
 """
 
 import datetime
@@ -48,8 +53,12 @@ APPROVED_BY_HUMAN = "human"
 ACTION_CREATED = "created"
 ACTION_USED = "used"
 ACTION_DEACTIVATED = "deactivated"
-ACTION_APPROVED = "approved"          # JIKOU-REPLY-Q3a (a): 退役 → 承認済み（再承認）
+ACTION_APPROVED = "approved"          # JIKOU-REPLY-Q3a (a) 再承認・fix2 BR-10: 人の明示操作で承認済みへ（同じ語彙）
 ACTIONS = (ACTION_CREATED, ACTION_USED, ACTION_DEACTIVATED, ACTION_APPROVED)
+STATUS_PENDING_REVIEW = "pending_review"   # fix2 BR-10: 保存直後（人の匿名化確認待ち・下書き参照に使わない）
+STATUS_APPROVED = "approved"               # 人が確認して承認（下書き参照に使う）
+STATUS_RETIRED = "retired"                 # 退役（削除しない）
+STATUSES = (STATUS_PENDING_REVIEW, STATUS_APPROVED, STATUS_RETIRED)
 
 reply_exemplar = sa.Table(
     TABLE_NAME, metadata,
@@ -66,10 +75,12 @@ reply_exemplar = sa.Table(
     # fix1 BR-09
     sa.Column("category_id", sa.Text, nullable=True),
     sa.Column("source_text_version", sa.Text, nullable=True),
-    sa.Column("approved_by", sa.Text, nullable=False, server_default=APPROVED_BY_HUMAN),
-    sa.Column("approved_at", sa.DateTime(timezone=True), nullable=False),
+    sa.Column("approved_by", sa.Text, nullable=True),                  # fix2 BR-10: 承認まで NULL
+    sa.Column("approved_at", sa.DateTime(timezone=True), nullable=True),
     sa.Column("active", sa.Boolean, nullable=False, server_default=sa.true()),
+    sa.Column("status", sa.Text, nullable=False, server_default=STATUS_PENDING_REVIEW),   # fix2 BR-10
     sa.CheckConstraint("stage IN ('相談', '受任後')", name="ck_reply_exemplar_stage"),
+    sa.CheckConstraint("status IN ('pending_review', 'approved', 'retired')", name="ck_reply_exemplar_status"),
     sa.Index("ix_reply_exemplar_lookup", "business", "stage", "created_at"),
     sa.Index("ix_reply_exemplar_active", "business", "active"),
 )
@@ -141,7 +152,10 @@ async def save_exemplar(*, business: str, inbound_text: str, human_reply: str,
                         category_id: str | None = None,
                         approved_by: str = APPROVED_BY_HUMAN, active: bool = True) -> str:
     """匿名化して保存する。戻り値は固定語彙: saved / rejected（残留あり・保存しない・件数ログ）/
-    skipped（DB 未設定）/ bad_input / failed（DB 例外・固定語彙ログ）。"""
+    skipped（DB 未設定）/ bad_input / failed（DB 例外・固定語彙ログ）。
+    fix2 BR-10: 保存時の状態は常に pending_review（approved_by／approved_at は NULL）。approved_by は履歴 created の
+    actor（保存した主体）にだけ使う。active は後続票（Q4 の修正承認＝未承認候補 active=False）との互換のため列に写すが、
+    状態は常に pending_review（下書き参照の可否は status で決まる）。"""
     if stage not in STAGES or not str(human_reply or "").strip():
         return "bad_input"
     if not _db_configured():
@@ -165,7 +179,8 @@ async def save_exemplar(*, business: str, inbound_text: str, human_reply: str,
                 created_at=now, used_count=0, source_op_id=source_op_id or None,
                 category_id=category_id or None,
                 source_text_version=source_text_version or None,
-                approved_by=approved_by, approved_at=now, active=bool(active)))   # JIKOU-REPLY-Q4: 候補は False
+                approved_by=None, approved_at=None, active=bool(active),           # JIKOU-REPLY-Q4: 候補は active=False
+                status=STATUS_PENDING_REVIEW))                                       # fix2 BR-10: 保存時は常に確認待ち
             await _history(s, int(res.inserted_primary_key[0]), ACTION_CREATED, approved_by, now)
     except Exception:
         logger.warning("[REPLY_EXEMPLAR] save failed (fixed reason)")
@@ -173,12 +188,27 @@ async def save_exemplar(*, business: str, inbound_text: str, human_reply: str,
     return "saved"
 
 
-async def mark_used(exemplar_id: int, *, actor: str = "bot") -> bool:
-    """下書き生成で使ったら used_count を進め履歴を残す（Q3b の書込口）。"""
+async def approve_exemplar(exemplar_id: int, *, actor: str = APPROVED_BY_HUMAN) -> bool:
+    """fix2 BR-10: 人の明示操作で承認済みにする（pending_review／retired → approved・approved_by/at・active=True・
+    履歴 approved）。既に approved なら False。Q1b は画面を持たない（Q3a の承認画面が呼ぶ）。"""
     now = _now()
     async with session_scope() as s:
         r = await s.execute(sa.update(reply_exemplar).where(
-            reply_exemplar.c.id == int(exemplar_id), reply_exemplar.c.active.is_(True)).values(
+            reply_exemplar.c.id == int(exemplar_id), reply_exemplar.c.status != STATUS_APPROVED).values(
+            status=STATUS_APPROVED, active=True, approved_by=actor, approved_at=now))
+        if int(r.rowcount or 0) != 1:
+            return False
+        await _history(s, int(exemplar_id), ACTION_APPROVED, actor, now)
+    return True
+
+
+async def mark_used(exemplar_id: int, *, actor: str = "bot") -> bool:
+    """下書き生成で使ったら used_count を進め履歴を残す（Q3b の書込口・fix2: approved だけ）。"""
+    now = _now()
+    async with session_scope() as s:
+        r = await s.execute(sa.update(reply_exemplar).where(
+            reply_exemplar.c.id == int(exemplar_id), reply_exemplar.c.status == STATUS_APPROVED,
+            reply_exemplar.c.active.is_(True)).values(
             used_count=reply_exemplar.c.used_count + 1))
         if int(r.rowcount or 0) != 1:
             return False
@@ -191,8 +221,8 @@ async def deactivate_exemplar(exemplar_id: int, *, actor: str = APPROVED_BY_HUMA
     now = _now()
     async with session_scope() as s:
         r = await s.execute(sa.update(reply_exemplar).where(
-            reply_exemplar.c.id == int(exemplar_id), reply_exemplar.c.active.is_(True)).values(
-            active=False))
+            reply_exemplar.c.id == int(exemplar_id), reply_exemplar.c.status != STATUS_RETIRED).values(
+            active=False, status=STATUS_RETIRED))
         if int(r.rowcount or 0) != 1:
             return False
         await _history(s, int(exemplar_id), ACTION_DEACTIVATED, actor, now)
@@ -201,8 +231,10 @@ async def deactivate_exemplar(exemplar_id: int, *, actor: str = APPROVED_BY_HUMA
 
 async def list_exemplars(business: str, *, stage: str | None = None, limit: int = 5,
                          category_id: str | None = None) -> list[dict]:
-    """同じ業務（・段階・分類）の **active な** 手本を新しい順に最大 limit 件（Q3b の読取口）。"""
+    """同じ業務（・段階・分類）の **approved な** 手本を新しい順に最大 limit 件（Q3b の読取口・fix2 BR-10:
+    pending_review は読まない）。"""
     q = sa.select(reply_exemplar).where(reply_exemplar.c.business == business,
+                                        reply_exemplar.c.status == STATUS_APPROVED,
                                         reply_exemplar.c.active.is_(True))
     if stage:
         q = q.where(reply_exemplar.c.stage == stage)
@@ -279,17 +311,7 @@ async def list_for_view(business: str, *, include_inactive: bool = False, limit:
     return [_row(r) for r in rows]
 
 
-async def approve_exemplar(exemplar_id: int, *, actor: str = APPROVED_BY_HUMAN) -> bool:
-    """退役中の手本を承認済みに戻す（active=True・approved_by/at 更新・履歴 approved）。既に承認済みなら False。"""
-    now = _now()
-    async with session_scope() as s:
-        r = await s.execute(sa.update(reply_exemplar).where(
-            reply_exemplar.c.id == int(exemplar_id), reply_exemplar.c.active.is_(False)).values(
-            active=True, approved_by=actor, approved_at=now))
-        if int(r.rowcount or 0) != 1:
-            return False
-        await _history(s, int(exemplar_id), ACTION_APPROVED, actor, now)
-    return True
+# approve_exemplar は fix2 BR-10 で status ベース（pending_review／retired → approved）に一本化（上の定義・Q3a の再承認も同じ口）。
 
 
 class ExemplarNote(str):
