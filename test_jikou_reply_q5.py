@@ -65,6 +65,8 @@ class TestCandidateAndPromote(_PromoteMixin):
         self.assertTrue(pm.is_candidate(ex, {CAT: 3}, set()))
         self.assertFalse(pm.is_candidate(ex, {CAT: 3}, {xid}))                   # 昇格済み
         self.assertFalse(pm.is_candidate(dict(ex, active=False), {CAT: 3}, set()))
+        # JIKOU-REPLY-Q1b-fix2 BR-10: 確認待ち（pending_review）の手本は候補にしない
+        self.assertFalse(pm.is_candidate(dict(ex, status=rx.STATUS_PENDING_REVIEW), {CAT: 3}, set()))
         self.assertFalse(pm.is_candidate(dict(ex, category_id=None), {CAT: 3}, set()))
         # 下書きのみの分類は閾値に達しても候補にしない
         self.approvals(3, category="法的判断・見通し")

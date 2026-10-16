@@ -35,7 +35,8 @@ CAT = "手続きの一般的な流れ"
 
 
 def _exemplar(category: str = CAT, stage: str = rx.STAGE_ENGAGED, reply: str = "手続きは受任から 2〜4 週間程度です。") -> int:
-    """承認済み手本を 1 件保存し、その id を返す。"""
+    """承認済み手本を 1 件保存し、その id を返す。
+    JIKOU-REPLY-Q1b-fix2 BR-10: 保存直後は pending_review（下書き生成の参考にならない）ため、人の承認（approve_exemplar）を経て返す。"""
     import sqlalchemy as sa
     res = _run(rx.save_exemplar(business="jikou", inbound_text="どのくらいかかりますか", human_reply=reply,
                                 creditor_name=None, stage=stage, category_id=category))
@@ -44,7 +45,9 @@ def _exemplar(category: str = CAT, stage: str = rx.STAGE_ENGAGED, reply: str = "
     async def _max():
         async with db.session_scope() as s:
             return int((await s.execute(sa.select(sa.func.max(rx.reply_exemplar.c.id)))).scalar())
-    return _run(_max())
+    xid = _run(_max())
+    assert _run(rx.approve_exemplar(xid, actor="human"))
+    return xid
 
 
 class _Mixin(_DbMixin):

@@ -1109,7 +1109,10 @@ class TestReplyExemplarMigration(unittest.TestCase):
                 nn = nullable(con, reply_exemplar.TABLE_NAME)
                 self.assertFalse(nn["human_reply"])
                 self.assertFalse(nn["stage"])
-                self.assertFalse(nn["approved_at"])
+                # JIKOU-REPLY-Q1b-fix2 BR-10: approved_by／approved_at は人の承認まで NULL（保存時は status=pending_review）
+                self.assertTrue(nn["approved_at"])
+                self.assertTrue(nn["approved_by"])
+                self.assertFalse(nn["status"])
                 self.assertFalse(nn["active"])
                 self.assertTrue(nn["conversation_ref"])
                 self.assertTrue(nn["creditor_name"])
@@ -1122,6 +1125,9 @@ class TestReplyExemplarMigration(unittest.TestCase):
                 self.assertIn(("reply_exemplar", "exemplar_id"), fks)          # (参照表, from 列)
                 self.assertFalse(nullable(con, reply_followup.TABLE_NAME)["state"])
                 self.assertTrue(nullable(con, reply_followup.TABLE_NAME)["text"])
+                # JIKOU-REPLY-Q1b-fix2 BR-11／BR-12: 所有権・照合・本文ハッシュの列は NULL 許容
+                for col in ("text_version", "owner_token", "deadline_at", "chatlog_record_id"):
+                    self.assertTrue(nullable(con, reply_followup.TABLE_NAME)[col], col)
             finally:
                 con.close()
             down = alembic("downgrade", self.SEND_LEDGER)
