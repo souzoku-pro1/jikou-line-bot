@@ -21,7 +21,7 @@ import re
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 
-from hub import reply_pending, send_ledger
+from hub import reply_draft, reply_pending, send_ledger
 from hub.webapp_auth import _gate
 
 router = APIRouter()
@@ -47,7 +47,7 @@ def _bad_request() -> Response:
     return Response(status_code=400)
 
 
-def _page(rows: list[dict], attending: dict, notice: str) -> str:
+def _page(rows: list[dict], attending: dict, notice: str, drafts: dict | None = None) -> str:
     parts = [
         '<!DOCTYPE html><html lang="ja"><head><meta charset="utf-8">',
         '<meta name="viewport" content="width=device-width, initial-scale=1">',
@@ -58,7 +58,7 @@ def _page(rows: list[dict], attending: dict, notice: str) -> str:
         ".item{background:#fff;border:1px solid #d8dde5;border-radius:14px;padding:.75rem 1rem;margin:.6rem 0}"
         ".meta{color:#8a8f98;font-size:.78rem;margin-top:.3rem}.badge{display:inline-block;"
         "border-radius:999px;padding:.12rem .6rem;font-size:.78rem;background:#fff3d6;color:#8a6d00;margin-right:.35rem}"
-        ".att{background:#fde2e2;color:#8a1f1f}.link{font-size:.95rem;margin-top:.35rem}"
+        ".att{background:#fde2e2;color:#8a1f1f}.draft{background:#e2f5e6;color:#1f6b2e}.link{font-size:.95rem;margin-top:.35rem}"
         "form{display:inline-flex;gap:.5rem;flex-wrap:wrap;align-items:center;margin-top:.5rem;margin-right:.5rem}"
         "button{font-size:.95rem;padding:.5rem 1rem;border-radius:10px;border:1px solid #c8cdd5;"
         "background:#fff;min-height:44px}"
@@ -83,6 +83,9 @@ def _page(rows: list[dict], attending: dict, notice: str) -> str:
                   f'<span class="badge">{html.escape(_CUSTOMER_LABELS.get(r["customer_send"], r["customer_send"]))}</span>')
         if conv.get("attending"):
             badges += '<span class="badge att">対応中（bot 停止）</span>'
+        d = (drafts or {}).get(pid)
+        if d:
+            badges += ('<span class="badge draft">下書きあり' + ('' if d.get('guard_ok') else '（要修正）') + '</span>')  # JIKOU-REPLY-Q3b (c)
         parts.append(badges)
         if r.get("category"):
             parts.append(f'<div class="link">カテゴリ: {html.escape(str(r["category"]))}</div>')
@@ -115,6 +118,14 @@ async def _attending_map(rows: list[dict]) -> dict:
     return out
 
 
+async def _draft_map(rows: list[dict]) -> dict:
+    """JIKOU-REPLY-Q3b (c): 対応待ち ID → 下書きの要約（本文なし）。失敗は空（印なし）。"""
+    try:
+        return await reply_draft.latest_by_pending_ids([r["pending_id"] for r in rows])
+    except Exception:
+        return {}
+
+
 async def pending_page(request: Request):
     code = request.query_params.get("done", "")
     notice = _NOTICES.get(code, "") if code else ""
@@ -124,7 +135,8 @@ async def pending_page(request: Request):
     except Exception:
         rows, attending = [], {}
         notice = _NOTICES["db"]
-    return HTMLResponse(_page(rows, attending, notice))
+    drafts = await _draft_map(rows)
+    return HTMLResponse(_page(rows, attending, notice, drafts))
 
 
 async def pending_resolve(request: Request):
@@ -156,7 +168,9 @@ async def api_pending_open(request: Request):
         rows = await reply_pending.list_open(reply_pending.LIST_LIMIT)
     except Exception:
         return {"ok": False, "reason": "db", "count": 0, "items": []}
-    items = [{k: v for k, v in r.items() if k != "line_user_hash"} for r in rows]
+    drafts = await _draft_map(rows)
+    items = [dict({k: v for k, v in r.items() if k != "line_user_hash"}, draft=drafts.get(int(r["pending_id"])))
+             for r in rows]
     return {"ok": True, "count": len(items), "items": items}
 
 
