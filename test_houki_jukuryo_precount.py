@@ -92,6 +92,10 @@ class TestEntryHardening(unittest.TestCase):
         import logging
         saved_hook = sys.excepthook
         saved_root = (list(logging.getLogger().handlers), logging.getLogger().level)
+        # QUEUE-2026-10-12-C: スクリプトは依存ロガー（hub 等）の level も WARNING に上げる。復元しないと同じ
+        # worker の後続テスト（hub.* の INFO ログ捕捉）が順序依存で落ちる＝ここで保存して finally で戻す
+        _dep_names = ("httpx", "httpcore", "hub", "asyncio", "truststore")
+        saved_deps = {n: logging.getLogger(n).level for n in _dep_names}
         try:
             spec = importlib.util.spec_from_file_location("houki_precount_mod", SCRIPT)
             mod = importlib.util.module_from_spec(spec)
@@ -120,6 +124,8 @@ class TestEntryHardening(unittest.TestCase):
             for h in saved_root[0]:
                 root.addHandler(h)
             root.setLevel(saved_root[1])
+            for n, lv in saved_deps.items():
+                logging.getLogger(n).setLevel(lv)
 
     def test_script_has_no_write_or_send_calls(self):
         impl = REPO / "scripts" / "houki_jukuryo_precount_impl.py"

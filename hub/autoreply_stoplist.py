@@ -103,3 +103,31 @@ def count_suppressed(user_id: str) -> int:
     logger.info("[AUTOREPLY_STOPLIST] suppressed anon_id=%s nth=%d "
                 "suppressed_users=%d", anon, n, len(_suppressed_counts))
     return n
+
+
+# ── JIKOU-REPLY-Q1c (a): 照会結果の 3 値（許可表 V2 の「App 39 を確認できない」行＝unknown）。
+#    末尾追記（sink allowlist の行番号 pin を動かさない規約）。is_suppressed は不変（fail-open）。
+OUTCOME_STOPPED = "stopped"
+OUTCOME_CLEAR = "clear"
+OUTCOME_UNKNOWN = "unknown"
+OUTCOME_UNCONFIGURED = "unconfigured"
+OUTCOMES = (OUTCOME_STOPPED, OUTCOME_CLEAR, OUTCOME_UNKNOWN, OUTCOME_UNCONFIGURED)
+
+
+async def check(user_id: str) -> str:
+    """停止リスト照会の 3 値版: stopped／clear／unknown（照会失敗・計数と警報は is_suppressed と同じ）／
+    unconfigured（env 未設定・userId grammar 外）。hub/send_policy が V2 ON のときだけ使う。"""
+    if not _configured():
+        return OUTCOME_UNCONFIGURED
+    uid = str(user_id or "")
+    if not _LINE_USER_ID_RE.fullmatch(uid):
+        return OUTCOME_UNCONFIGURED
+    try:
+        rows = await kintone.search_records(
+            APP_AUTOREPLY_STOP, f'LINE_userId = "{uid}" limit 1',
+            fields=["$id"])
+    except Exception as e:
+        await _on_lookup_failure(type(e).__name__)
+        return OUTCOME_UNKNOWN
+    _failure_state["consecutive"] = 0
+    return OUTCOME_STOPPED if rows else OUTCOME_CLEAR

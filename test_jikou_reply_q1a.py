@@ -410,7 +410,10 @@ class TestThreeValuedCallers(_DbMixin):
         self.assertIn("_sl_res = await send_line_push(user_id, ai_draft)", src[1599])
         self.assertIn('if _sl_res == send_ledger.SEND_UNCONFIRMED: return {"ok": True, "skip": "send_unconfirmed_duplicate"}',
                       src[1600])
-        self.assertIn("await mark_approval_sent(record_id); await save_to_chatlog(", src[1601])
+        # JIKOU-REPLY-Q1c (a): 許可表 V2 で止まった承認済み下書きの分岐を src[1601] に 1 行置換で挿入
+        # （送信済み更新+記録は src[1602] へ・`if _ev:` 行と合成＝行数不変・allowlist 番地不変）
+        self.assertIn("if _sl_res == send_ledger.SEND_POLICY_STOPPED: return await _approval_policy_stopped(", src[1601])
+        self.assertIn("await mark_approval_sent(record_id); await save_to_chatlog(", src[1602])
 
     def test_states_distinguish_unconfirmed_for_callers_that_ignore_return(self):
         _FakeClient.raise_exc = RuntimeError("t")

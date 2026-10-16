@@ -65,6 +65,14 @@ JIKOU-REPLY-Q1b-fix1（Codex R-JIKOU-REPLY-Q1b-1）:
 - BR-01 の fail-closed（台帳が使えなければ送らない）は人の明示送信だけ（hub/line_channel
   .push_text_explicit）。本 module の bot 経路の fail-open 裁定は不変。
 
+JIKOU-REPLY-Q1c（QUEUE-2026-10-12-C C-1）:
+- (a) flag JIKOU_SEND_POLICY_V2=1 で bot／承認済み下書きの送信に許可表（decide_send）を適用する。停止条件は
+  hub/send_policy が送信前に集めて `policy()` で束ね、begin() が **共通排他の中** で会話の対応中と合わせて
+  判定する（不許可=PolicyStopped・行を作らない）。人の明示送信（human）は Q1b の列のまま。
+- (c) purpose=first_reply（J-0）は排他の中で「初回返信判定の対象」の在庫を数え、1 件でもあれば
+  FIRST_REPLY_ALREADY（送らない）。会話が無ければ送らない。
+- OFF（既定）のときは本票の分岐に入らない（既存経路の挙動は不変）。
+
 RV-10: 本表・ログ・例外に本文・氏名・LINE userId を載せない。line_user_hash は一方向
 （sha256）。文面は hash（text_version）だけを保存する。
 """
@@ -253,6 +261,8 @@ class SendContext:
     op_id: str | None = None
     seq: list = field(default_factory=lambda: [0])   # 受信イベント内の送信連番（共有）
     attend: bool = False     # fix1 BR-05: 着手と同じ tx で会話を対応中にする（人の明示送信）
+    # JIKOU-REPLY-Q1c (a): 許可表 V2 の停止条件（hub/send_policy が送信前に集める。None=適用しない）
+    policy: dict | None = None
 
 
 _ctx: contextvars.ContextVar = contextvars.ContextVar("send_ledger_ctx", default=None)
@@ -292,6 +302,18 @@ async def with_purpose(name: str, fn, *args, **kwargs):
     """`await with_purpose("receipt_number", send_fn, a, b)` の形で 1 行接続する。"""
     with purpose(name):
         return await fn(*args, **kwargs)
+
+
+@contextlib.contextmanager
+def policy(conditions: dict | None):
+    """JIKOU-REPLY-Q1c (a): 許可表 V2 の停止条件を束ねる（begin() が排他の中で decide_send に渡す）。
+    None なら適用しない（従来どおり）。"""
+    base = _ctx.get() or SendContext()
+    token = _ctx.set(replace(base, policy=(dict(conditions) if conditions is not None else None)))
+    try:
+        yield
+    finally:
+        _ctx.reset(token)
 
 
 @contextlib.asynccontextmanager
@@ -580,6 +602,41 @@ class _Duplicate:
 
 DUPLICATE_SENT = _Duplicate("sent")                 # 送信済みの重複（成功として扱う）
 DUPLICATE_UNCONFIRMED = _Duplicate("unconfirmed")   # 結果未確認の重複（成功として扱わない）
+# JIKOU-REPLY-Q1c (c): J-0 の在庫検査（排他の中）——会話に「初回返信判定の対象」の操作が既にある／会話が無い
+FIRST_REPLY_ALREADY = _Duplicate("first_reply_already")
+SEND_POLICY_STOPPED = "policy_stopped"              # 送信フックの戻り値（許可表 V2 で送らなかった）
+
+
+class PolicyStopped:
+    """JIKOU-REPLY-Q1c (a): 許可表 V2（§10-2）で送らない番兵（理由は固定語彙の列・行は作らない）。"""
+
+    def __init__(self, reasons):
+        self.reasons = tuple(reasons)
+
+    def __repr__(self) -> str:
+        return "<PolicyStopped " + ",".join(self.reasons) + ">"
+
+
+_FIRST_REPLY_LIVE = (STATE_PENDING, STATE_STARTED, STATE_SENT, STATE_UNCONFIRMED)
+
+
+async def _first_reply_count(s, conv_id: int) -> int:
+    return int((await s.execute(sa.select(sa.func.count()).select_from(send_operation).where(
+        send_operation.c.conversation_id == int(conv_id),
+        send_operation.c.first_reply_target.is_(True),
+        send_operation.c.state.in_(_FIRST_REPLY_LIVE)))).scalar() or 0)
+
+
+async def first_reply_count(business: str, user_id: str) -> int | None:
+    """R-J2 判定式の読取（送信前の事前判定用・確定は begin() の排他の中）。会話が無ければ None。"""
+    if not _db_configured():
+        return None
+    user_hash = line_user_hash(business, user_id)
+    async with session_scope() as s:
+        row = await _latest_conversation(s, business, user_hash)
+        if row is None:
+            return None
+        return await _first_reply_count(s, int(row.conversation_id))
 
 
 @dataclass
@@ -608,6 +665,8 @@ async def begin(business: str, channel: str, user_id: str, text: str):
     """送信着手: pending で記録 → 排他の中で [直近会話の参照 → 重複の検出 → started]。
     戻り値: Operation（push へ進む）／DUPLICATE_SENT／DUPLICATE_UNCONFIRMED（送らない）／
     None（記録なし＝素通り: DB 未設定・記録失敗の fail-open）。会話は作らない（BQ-03）。
+    JIKOU-REPLY-Q1c: flag V2 ON で停止条件（ctx.policy）が束ねられていれば排他の中で decide_send を通し、
+    不許可なら PolicyStopped（行を作らない）。purpose=first_reply は J-0 の在庫検査（FIRST_REPLY_ALREADY）。
     fix2 BQ-06: 着手ごとに owner_token を新規発行し、failed の再試行は attempt_no+1
     （前試行の所有者トークンは無効になる）。処理全体の期限 deadline_at を置く。"""
     if not _db_configured():
@@ -646,6 +705,21 @@ async def begin(business: str, channel: str, user_id: str, text: str):
                 return DUPLICATE_SENT
             if existing is not None and existing.state in _UNCONFIRMED_LIKE:
                 return DUPLICATE_UNCONFIRMED
+            # JIKOU-REPLY-Q1c (a): 許可表 V2（停止条件は送信前に束ねたもの・対応中は会話行から＝排他の中で再検査）
+            if ctx is not None and ctx.policy is not None and actor != ACTOR_HUMAN and policy_v2_enabled():
+                cond = ctx.policy
+                decision = decide_send(
+                    actor, paused=cond.get("paused", CLEAR), stoplisted=cond.get("stoplisted", CLEAR),
+                    human_mode=cond.get("human_mode", CLEAR),
+                    attending=(bool(row.attending) if row is not None else False),
+                    versions_match=bool(cond.get("versions_match", actor == ACTOR_BOT)))
+                if not decision.allow:
+                    logger.info("[SEND_LEDGER] policy v2 stopped (not allowed, no row)")
+                    return PolicyStopped(decision.reasons)
+            # JIKOU-REPLY-Q1c (c): J-0 は会話が無ければ送らず、「初回返信判定の対象」の操作が 1 件でもあれば送らない
+            if policy_v2_enabled() and purpose_ == PURPOSE_FIRST_REPLY and actor != ACTOR_HUMAN:
+                if conv_id is None or await _first_reply_count(s, conv_id) > 0:
+                    return FIRST_REPLY_ALREADY
             if ctx is not None and ctx.attend and actor == ACTOR_HUMAN:
                 # fix1 BR-05: 送信着手と同じ排他・同一 tx で対応中（attending・human_version+1）を確定。
                 # 会話が無ければ起こす（人の操作は受信が無くても会話を作る＝_attending と同じ）
@@ -970,9 +1044,26 @@ async def end_attending(business: str, user_id: str, *, channel: str | None = No
     return await _attending(business, user_id, False, channel=channel, now=now)
 
 
-async def _attending(business, user_id, on: bool, *, channel, now) -> dict:
+async def end_attending_by_hash(business: str, user_hash: str, *, channel: str | None = None,
+                                now=None) -> dict:
+    """JIKOU-REPLY-Q1c (d): 画面（/app/pending）からの対応終了。LINE userId を画面に出さないため
+    line_user_hash で指定する。"""
+    return await _attending(business, None, False, channel=channel, now=now, user_hash=user_hash)
+
+
+async def conversation_state_by_hash(business: str, user_hash: str) -> dict | None:
+    """JIKOU-REPLY-Q1c (d): 画面用（ハッシュ指定・本文なし）。"""
+    async with session_scope() as s:
+        row = await _latest_conversation(s, business, user_hash)
+    if row is None:
+        return None
+    return {"conversation_id": int(row.conversation_id), "ref": row.ref, "attending": bool(row.attending),
+            "attending_since": _iso(row.attending_since), "attending_until": _iso(row.attending_until)}
+
+
+async def _attending(business, user_id, on: bool, *, channel, now, user_hash: str | None = None) -> dict:
     now = now or _now()
-    user_hash = line_user_hash(business, user_id)
+    user_hash = user_hash or line_user_hash(business, user_id)
     async with _exclusive(business, user_hash, channel or business) as s:
         row = await _latest_conversation(s, business, user_hash)
         if row is None:

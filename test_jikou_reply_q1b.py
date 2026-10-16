@@ -964,7 +964,8 @@ class TestPins(unittest.TestCase):
         src = (REPO / "main.py").read_text(encoding="utf-8").split("\n")
         tagged = [i for i, l in enumerate(src) if "JIKOU-REPLY-Q1b" in l]
         self.assertGreaterEqual(len(tagged), 5)
-        self.assertIn("include_before_catch_all(app, reply_view_router)", "\n".join(src[-6:]))
+        # JIKOU-REPLY-Q1c: 末尾に /app/pending の結線節が続くため、探索範囲を末尾 80 行へ（追記のみ・順序不変）
+        self.assertIn("include_before_catch_all(app, reply_view_router)", "\n".join(src[-80:]))
         # fix1 BR-07: ヒアリング経路の送信前サニタイズと App 28 復元は 1 行置換（行数不変＝allowlist 番地不変）
         self.assertEqual(sum("sanitize_reply_without_human_marker(" in l for l in src), 1)
         self.assertEqual(sum("model_content(m.get(\"role\")" in l for l in src), 1)
