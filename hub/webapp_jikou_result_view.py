@@ -208,6 +208,7 @@ async def result_save(request: Request):
         return _redirect(rid, "db")
     if not entries:
         return _redirect(rid, "saved" if shipped is not None else "nothing")
+    await F.run_result_hooks(rid, record)          # JIKOU-PROGRESS-1: 債権者回答到着の下書き積み（送信はしない）
     copies = [await F.copy_result_to_kintone(rid, slot, entry) for slot, entry in entries.items()]
     logger.info("[JIKOU_RESULT] recorded case=%s slots=%s", emit(rid, "record_id", "log", "operator"),
                 emit(len(entries), "count", "log", "operator"))
