@@ -942,7 +942,8 @@ class TestSendLedgerMigration(unittest.TestCase):
             up = alembic("upgrade", "d1e4f7a0b3c6")
             self.assertEqual(up.returncode, 0, f"stderr={up.stderr[-800:]}")
             self.assertFalse(set(send_ledger.TABLE_NAMES) & tables())
-            up = alembic("upgrade", "head")
+            # SOUZOKU-2（QUEUE-2026-10-16-R G-5）で head が b0c1d2e3f4a5 へ進んだため、本 revision までを明示（既存パターン）
+            up = alembic("upgrade", self.SEND_LEDGER)
             self.assertEqual(up.returncode, 0, f"stderr={up.stderr[-800:]}")
             self.assertIn(self.SEND_LEDGER, alembic("current").stdout)
             self.assertTrue(set(send_ledger.TABLE_NAMES) <= tables())
@@ -960,6 +961,25 @@ class TestSendLedgerMigration(unittest.TestCase):
                 self.assertFalse(nullable(con, "send_operation")["state"])
             finally:
                 con.close()
+            # SOUZOKU-2: head（b0c1d2e3f4a5）で souzoku_intake 2 表（列集合が hub/souzoku_intake.metadata と一致）。downgrade で消え e5f8 の表は残る
+            from hub import souzoku_intake
+            self.assertFalse(set(souzoku_intake.TABLE_NAMES) & tables())
+            up = alembic("upgrade", "head")
+            self.assertEqual(up.returncode, 0, f"stderr={up.stderr[-800:]}")
+            self.assertIn("b0c1d2e3f4a5", alembic("current").stdout)
+            self.assertTrue(set(souzoku_intake.TABLE_NAMES) <= tables())
+            con = sqlite3.connect(dbfile)
+            try:
+                for name in souzoku_intake.TABLE_NAMES:
+                    cols = {r[1] for r in con.execute(f'PRAGMA table_info("{name}")')}
+                    self.assertEqual(cols, {c.name for c in souzoku_intake.metadata.tables[name].columns}, name)
+                self.assertIn(("inbound_event_id",), unique_cols(con, "souzoku_intake"))
+            finally:
+                con.close()
+            down = alembic("downgrade", self.SEND_LEDGER)
+            self.assertEqual(down.returncode, 0, f"stderr={down.stderr[-800:]}")
+            self.assertFalse(set(souzoku_intake.TABLE_NAMES) & tables())
+            self.assertTrue(set(send_ledger.TABLE_NAMES) <= tables())
             down = alembic("downgrade", "d1e4f7a0b3c6")
             self.assertEqual(down.returncode, 0, f"stderr={down.stderr[-800:]}")
             self.assertFalse(set(send_ledger.TABLE_NAMES) & tables())
