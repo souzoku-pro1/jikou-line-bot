@@ -287,6 +287,12 @@ class TestHealthcheckTwoProcesses(_DbMixin):
                 patch.object(dh, "check_unknown_providers", AsyncMock(return_value=[])),
                 patch.object(dh, "check_app36_confirmed_decisions", AsyncMock(return_value=[])),
                 patch.object(dh, "check_business_notify_liveness", AsyncMock(return_value=[])),
+                # PRE-REVIEW-1 #298 中: concurrency-fix-1（F-6）の監視項目 J〜M を取り込んだため、既存 3 テストと同じく
+                # 個別 check を無害化する（M の LINE bot/info は test env の dummy トークンで実 HTTP 401 になり問題件数が変わる）
+                patch.object(dh, "check_send_ledger_health", AsyncMock(return_value=[])),
+                patch.object(dh, "check_reply_pending_oldest", AsyncMock(return_value=[])),
+                patch.object(dh, "check_houki_deadline_soon", AsyncMock(return_value=[])),
+                patch.object(dh, "check_connectivity", AsyncMock(return_value=[])),
                 patch.object(dh, "notify_admin_line", notify),
                 patch.dict(os.environ, {DURABLE: "", "KINTONE_WEBHOOK_TOKEN_NEXT": "", "LINE_ADMIN_USER_ID": ADMIN})]
 
