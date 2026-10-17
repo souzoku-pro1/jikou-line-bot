@@ -36,6 +36,8 @@ def upgrade() -> None:
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
         sa.CheckConstraint("status IN ('active', 'retired')", name="ck_jikou_reply_text_status"),
+        # PRE-REVIEW-1 #280-2（本 revision は本番未適用のため同一 revision を更新）: 同じ手本の二重昇格を UNIQUE で遮断
+        sa.UniqueConstraint("business", "source_exemplar_id", name="uq_jikou_reply_text_source"),
     )
     op.create_index("ix_jikou_reply_text_cat", "jikou_reply_text", ["business", "category", "status"])
     op.create_table(
