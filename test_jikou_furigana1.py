@@ -17,9 +17,10 @@ import unittest
 from unittest.mock import patch
 
 # 環境変数の既定・App 21 fake・patch 基盤は HOTFIX-1 のテストと同一の正を使う
+from test_support_logcap import attach as _attach_logcap  # noqa: E402
 from test_jikou_hearing_hotfix import (  # noqa: E402
     ADDR, BIRTH, MAIL, NAME, PHONE, REPLY_HEAD, USER, VALUES,
-    _FlowBase, _LogCapture, _ModuleBase, _run, hu, main,
+    _FlowBase, _ModuleBase, _run, hu, main,
 )
 
 KANA = "やまだたろう"
@@ -71,13 +72,9 @@ class TestScript(unittest.TestCase):
 class TestFuriganaWrite(_ModuleBase):
     def setUp(self):
         super().setUp()
-        self.cap = _LogCapture()
-        root = logging.getLogger()
-        self._old_level = root.level
-        root.setLevel(logging.DEBUG)
-        root.addHandler(self.cap)
-        self.addCleanup(root.removeHandler, self.cap)
-        self.addCleanup(root.setLevel, self._old_level)
+        # TEST-FLAKY-1: root ではなく当該 logger（hub.hearing_update／hub.notify）に直付けして捕捉する（他テストが "hub" の
+        # level を変えても INFO が届く＝順序非依存）。否定の検査（値がどこにも出ない）のため root にも同じ Handler を付ける。
+        self.cap = _attach_logcap(self, ("hub.hearing_update", "hub.notify"), include_root=True)
 
     def test_b_furigana_written_only_when_empty_with_revision(self):
         self.fake.add("10", revision="5")
@@ -189,13 +186,9 @@ class TestFuriganaWrite(_ModuleBase):
 class TestFuriganaRedaction(_ModuleBase):
     def setUp(self):
         super().setUp()
-        self.cap = _LogCapture()
-        root = logging.getLogger()
-        self._old_level = root.level
-        root.setLevel(logging.DEBUG)
-        root.addHandler(self.cap)
-        self.addCleanup(root.removeHandler, self.cap)
-        self.addCleanup(root.setLevel, self._old_level)
+        # TEST-FLAKY-1: root ではなく当該 logger（hub.hearing_update／hub.notify）に直付けして捕捉する（他テストが "hub" の
+        # level を変えても INFO が届く＝順序非依存）。否定の検査（値がどこにも出ない）のため root にも同じ Handler を付ける。
+        self.cap = _attach_logcap(self, ("hub.hearing_update", "hub.notify"), include_root=True)
 
     def _assert_no_leak(self, ret, extra=()):
         text = self.notify.await_args.args[0]
