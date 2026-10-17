@@ -48,6 +48,7 @@ OPEN_STATES = (STATE_PREPARED, STATE_PENDING, STATE_UNCONFIGURED, STATE_IN_PROGR
 MAX_ATTEMPTS = 100
 BATCH_LIMIT = 20
 CLAIM_SECONDS = 300
+LEDGER_GRACE_SECONDS = 600            # fix3: prepared 行は台帳行が現れるまで（prepare→begin の窓）この秒数は閉じない
 # process_one の戻り値（閉集合）
 RESULT_WRITTEN = "written"
 RESULT_RECOVERED = "recovered"          # App 28 に既に同じ op_id の行があった（作成せず done）
@@ -286,8 +287,17 @@ async def process_one(op_id: str, *, resolve_user_id, write_chatlog, find_chatlo
             state = await ledger_state(op_id)
         except Exception:
             return RESULT_WAITING_LEDGER
-        if state in (None, _LEDGER_FAILED):
-            await close(op_id, "not_sent" if state is None else "ledger_failed")
+        if state is None:
+            # fix3（PRE-REVIEW-1 #272 低）: prepared は送信の **前** に置かれる。台帳行が無いのは「まだ begin していない」
+            # 可能性があるので、作成から LEDGER_GRACE_SECONDS の間は閉じずに待つ（prepare→begin の ms 窓で回収ジョブが
+            # 先に not_sent で閉じ、その後の記録未了が回収対象外になる穴を塞ぐ）
+            created = _aware(row.get("created_at"))
+            if created is not None and (now or _now()) - created < datetime.timedelta(seconds=LEDGER_GRACE_SECONDS):
+                return RESULT_WAITING_LEDGER
+            await close(op_id, "not_sent")
+            return RESULT_CLOSED
+        if state == _LEDGER_FAILED:
+            await close(op_id, "ledger_failed")
             return RESULT_CLOSED
         if state != _LEDGER_SENT:
             return RESULT_WAITING_LEDGER
@@ -322,7 +332,8 @@ async def process_one(op_id: str, *, resolve_user_id, write_chatlog, find_chatlo
     if result == RESULT_FAILED:
         attempts = int(row["attempts"]) + 1
         if attempts >= MAX_ATTEMPTS:
-            await _release(op_id, token, STATE_EXHAUSTED, attempts=attempts, last_result=RESULT_FAILED)
+            # fix3: 終端なので本文は保持しない（done／closed と同じ）
+            await _release(op_id, token, STATE_EXHAUSTED, attempts=attempts, last_result=RESULT_FAILED, text=None)
             logger.warning("[REPLY_FOLLOWUP] chatlog retry exhausted (max attempts)")
             return RESULT_EXHAUSTED
         await _release(op_id, token, STATE_PENDING, attempts=attempts, last_result=RESULT_FAILED)

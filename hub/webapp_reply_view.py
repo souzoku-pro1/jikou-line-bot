@@ -119,6 +119,15 @@ _LOG_NOTICES = {
     "waiting_ledger": "送信結果が台帳で確定するまでチャットログの記録を保留しています（送信確認待ちで確定してください）。",
     "closed": "この操作は未送信として閉じました（チャットログには記録しません）。",
 }
+# fix3: 主経路の process_one の結果 → 画面の通知語彙（それ以外＝回収ジョブ側が所有している等は「回収ジョブが再試行」）
+_MAIN_PATH_LOG = {
+    reply_followup.RESULT_WRITTEN: "written",
+    reply_followup.RESULT_RECOVERED: "recovered",
+    reply_followup.RESULT_UNCONFIGURED: "unconfigured",
+    reply_followup.RESULT_FAILED: "pending_retry",
+    reply_followup.RESULT_SKIPPED: "pending_retry",
+    reply_followup.RESULT_NOT_PENDING: "pending_retry",
+}
 _EX_NOTICES = {
     "saved": "手本として匿名化して保存しました（確認待ち。承認するまで下書きの参考には使われません）。",
     "rejected": "匿名化の残留検査に通らなかったため手本には保存していません。",
@@ -463,16 +472,13 @@ async def reply_send(request: Request):
         return _redirect(back, result.outcome)
     logger.info("[REPLY] explicit send ok record_id=%s",
                 emit(record_id, "record_id", "log", "operator"))
-    log_res = await write_human_chatlog(user_id, reply_followup.with_op_marker(text, op_id))
-    if log_res == "written":
-        await reply_followup.complete(op_id)                      # fix2 BR-12: prepared → done
-    elif log_res in ("failed", "skipped", "unconfigured"):
-        # BR-08／fix2: 記録未了を回収表に残す（prepared → pending／unconfigured・回収ジョブが台帳と突合して冪等に再試行）
-        marked = await reply_followup.mark_pending(
-            op_id, last_result=log_res, business=BUSINESS, approval_record_id=record_id,
-            line_user_hash=send_ledger.line_user_hash(BUSINESS, user_id), text=text)
-        if marked in ("pending", "exists") and log_res != "unconfigured":
-            log_res = "pending_retry"
+    # fix3（PRE-REVIEW-1 #272-1）: 主経路の App 28 書込も回収ジョブと同じ関門（claim → op_id 照合 → 書込 → done）を通す。
+    # 回収ジョブ（prepared も対象）と主経路が同じ op を同時に扱っても、所有権を取れた側だけが create する（二重作成なし）。
+    async def _same_user(_rid: str) -> str:
+        return user_id
+    res = await reply_followup.process_one(op_id, resolve_user_id=_same_user, write_chatlog=write_human_chatlog,
+                                           find_chatlog=find_human_chatlog, ledger_state=send_ledger.operation_state)
+    log_res = _MAIN_PATH_LOG.get(res, "pending_retry")
     reflect_memory_history(user_id, text)
     ex_res = "off"
     if want_exemplar:

@@ -31,6 +31,9 @@
   台帳の状態と突合する——台帳 sent → 記録、台帳 unconfirmed／started → 人の確定（confirm_by_human）を待つ、台帳 failed または
   台帳行なし → closed。自動再送はしない。
 - 同じ op_id の再 POST は「送信済み・記録のみ再試行」（LINE には触れない・同じ所有権規則）。
+- fix3（PRE-REVIEW-1 #272-1）: 送信直後の主経路の App 28 書込も **同じ関門**（claim → op_id 照合 → 書込 → done）を通す。
+  回収ジョブと主経路が同じ op を同時に扱っても所有権を取れた側だけが作成する。prepared 行は作成から 600 秒は台帳行が無くても
+  閉じない（prepare → begin の窓）。exhausted でも本文は保持しない。
 
 ## 3. 手本（reply_exemplar）
 

@@ -224,6 +224,40 @@ class TestOwnership(_FollowupMixin):
             self.assertEqual(self.followup(op)["state"], "done")
         self.assertEqual(len(_FakeClient.calls), 2)                                 # LINE 再送なし
 
+    def test_main_path_does_not_create_when_recover_job_owns_the_row(self):
+        """fix3（PRE-REVIEW-1 #272-1）: 送信直後に回収ジョブが同じ op を所有していれば、主経路は create しない（二重作成なし）。"""
+        seen = {}
+
+        class _ClaimDuringPush(_FakeClient):
+            async def post(self, url, headers=None, json=None):
+                r = await super().post(url, headers=headers, json=json)
+                seen["token"] = await rf.claim(OP)            # 回収ジョブが先に所有権を取った状況を再現
+                return r
+        with patch.object(rv.line_channel.httpx, "AsyncClient", _ClaimDuringPush):
+            r = self.post()
+        self.assertTrue(seen["token"])
+        self.assertEqual(r.headers["location"], f"{PAGE}?done=sent&log=pending_retry&ex=saved")
+        self.create.assert_not_awaited()                                            # 主経路は書かない
+        self.assertEqual(self.followup()["state"], "in_progress")
+        self.assertEqual(self.ops()[0]["state"], "sent")
+        # 所有者（回収ジョブ側）が書いて done にする → 作成は全体で 1 回
+        self._set_deadline_past()
+        _run(sl.run_recover_job())
+        self.create.assert_awaited_once()
+        self.assertEqual(self.followup()["state"], "done")
+
+    def test_exhausted_drops_text(self):
+        self._pending()
+
+        async def _bump():
+            async with db.session_scope() as s:
+                await s.execute(sa.update(rf.reply_chatlog_followup).values(attempts=rf.MAX_ATTEMPTS - 1))
+        _run(_bump())
+        self.form_fields.side_effect = RuntimeError("kintone down")
+        _run(sl.run_recover_job())
+        row = self.followup()
+        self.assertEqual((row["state"], row["text"], row["attempts"]), ("exhausted", None, rf.MAX_ATTEMPTS))
+
     def test_marker_is_stripped_for_display_and_model_input(self):
         marked = rf.with_op_marker("x", OP)
         self.assertEqual(marked, f"x\n[op:{OP}]")
@@ -283,21 +317,28 @@ class TestPreparedAndLedger(_FollowupMixin):
             with self.assertRaises(RuntimeError):
                 self.post()
         self.assertEqual(self.ops()[0]["state"], "sent")
-        self.assertEqual(self.followup()["state"], "prepared")
+        # fix3: 主経路も claim を経るため、書込中のクラッシュは in_progress（所有権つき）で残る。所有期限が過ぎれば回収ジョブが拾う
+        self.assertEqual(self.followup()["state"], "in_progress")
         self.create.assert_not_awaited()
+        _run(sl.run_recover_job())                                                  # 期限内: 触らない
+        self.create.assert_not_awaited()
+        self._set_deadline_past()
         _run(sl.run_recover_job())
         self.create.assert_awaited_once()
         self.assertEqual(self.create.await_args.args[1]["message"], rf.with_op_marker(TEXT, OP))
         self.assertEqual(self.followup()["state"], "done")
 
-    def test_mark_pending_failure_keeps_prepared_row(self):
+    def test_state_update_failure_after_record_failure_keeps_row_for_recovery(self):
+        """fix3: 記録失敗の後に状態更新（_release）まで失敗しても、行（本文・本文ハッシュ）は残り回収ジョブが拾う
+        （fix2 の mark_pending 失敗テストを主経路＝process_one の構造に合わせて書き換え）。"""
         self.form_fields.side_effect = RuntimeError("kintone down")
-        with patch.object(rf, "mark_pending", AsyncMock(return_value="failed")):
+        with patch.object(rf, "_release", AsyncMock(return_value=False)):
             r = self.post()
-        self.assertEqual(r.headers["location"], f"{PAGE}?done=sent&log=failed&ex=saved")
+        self.assertEqual(r.headers["location"], f"{PAGE}?done=sent&log=pending_retry&ex=saved")
         row = self.followup()
-        self.assertEqual((row["state"], row["text"], row["text_version"]), ("prepared", TEXT, sl.text_version(TEXT)))
+        self.assertEqual((row["state"], row["text"], row["text_version"]), ("in_progress", TEXT, sl.text_version(TEXT)))
         self.form_fields.side_effect = None
+        self._set_deadline_past()
         _run(sl.run_recover_job())
         self.create.assert_awaited_once()
         self.assertEqual(self.followup()["state"], "done")
@@ -347,7 +388,18 @@ class TestPreparedAndLedger(_FollowupMixin):
                   text=TEXT, text_version=sl.text_version(TEXT))
         self.assertEqual(_run(rf.prepare(OP3, **kw)), "prepared")
         self.assertEqual(_run(rf.prepare(OP3, **kw)), "exists")
+        # fix3: 置いた直後（prepare→begin の窓）は台帳行が無くても閉じない（waiting_ledger）
         _run(sl.run_recover_job())
+        self.create.assert_not_awaited()
+        self.assertEqual(self.followup(OP3)["state"], "prepared")
+        self.assertEqual(_run(rf.process_one(OP3, **_args())), "waiting_ledger")
+
+        async def _age():
+            async with db.session_scope() as s:
+                await s.execute(sa.update(rf.reply_chatlog_followup).where(rf.reply_chatlog_followup.c.op_id == OP3).values(
+                    created_at=rf._now() - datetime.timedelta(seconds=rf.LEDGER_GRACE_SECONDS + 1)))
+        _run(_age())
+        _run(sl.run_recover_job())                                                  # 猶予を過ぎて台帳なし → 未送信で閉じる
         self.create.assert_not_awaited()
         self.assertEqual((self.followup(OP3)["state"], self.followup(OP3)["last_result"]), ("closed", "not_sent"))
         self.assertFalse(_run(rf.close(OP3, "again")))                              # 終端は動かない
