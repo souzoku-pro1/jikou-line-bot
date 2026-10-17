@@ -28,6 +28,8 @@ R-PWA-1 fix1）:
 import ast
 import asyncio
 import logging
+
+from test_support_logcap import attached as _logcap_attached  # noqa: E402
 import os
 import unittest
 from pathlib import Path
@@ -601,18 +603,8 @@ class TestPiiSentinel(unittest.TestCase):
         sent_name = "SENTINEL-氏名-73AF"
         case = [_rec(**{"$id": "12", "氏名": sent_name})]
         persons = [_rec(**{"$id": "101", "氏名": sent_name})]
-        records = []
-
-        class _Cap(logging.Handler):
-            def emit(self, record):
-                records.append(record.getMessage())
-
-        cap = _Cap()
-        root = logging.getLogger()
-        root.addHandler(cap)
-        old_level = root.level
-        root.setLevel(logging.DEBUG)
-        try:
+        # TEST-FLAKY-1: root だけでなく hub／main の logger にも直付け（他テストが level／propagate を変えても見える）
+        with _logcap_attached(("hub", "main"), include_root=True) as cap:
             with patch.dict(os.environ, _ENV), \
                  patch.object(hub_kintone, "search_records",
                               AsyncMock(side_effect=[case, persons, [], [],
@@ -622,9 +614,7 @@ class TestPiiSentinel(unittest.TestCase):
                 r = _client.get("/app/api/souzoku/cases/12",
                                 headers=_auth_headers(),
                                 follow_redirects=False)
-        finally:
-            root.setLevel(old_level)
-            root.removeHandler(cap)
+        records = cap.messages()
         self.assertEqual(r.status_code, 200)
         self.assertIn(sent_name, r.text)                 # 表示へは流れる
         self.assertNotIn(sent_name, "\n".join(records))  # ログへは流れない
