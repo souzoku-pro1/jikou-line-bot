@@ -24,6 +24,7 @@ import logging
 import re
 
 import sqlalchemy as sa
+from sqlalchemy.exc import IntegrityError
 
 from hub import db, reply_exemplar
 from hub.db import DatabaseNotConfigured, session_scope
@@ -67,6 +68,8 @@ jikou_reply_text = sa.Table(
     sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
     sa.CheckConstraint("status IN ('active', 'retired')", name="ck_jikou_reply_text_status"),
     sa.Index("ix_jikou_reply_text_cat", "business", "category", "status"),
+    # PRE-REVIEW-1 #280-2: 同じ手本を 2 度昇格させない（連打・戻る→再送は 2 件目が UNIQUE 違反 → None）
+    sa.UniqueConstraint("business", "source_exemplar_id", name="uq_jikou_reply_text_source"),
 )
 
 jikou_reply_text_history = sa.Table(
@@ -231,18 +234,26 @@ async def promote(exemplar_id: int, *, actor: str = ACTOR_HUMAN, business: str =
     if not text:
         return None
     now = now or _now()
-    async with session_scope() as s:
-        rows = await _all_rows(s, business)
-        tid = next_id([r["text_id"] for r in rows])
-        tv = hashlib.sha256(text.encode("utf-8")).hexdigest()
-        await s.execute(sa.insert(jikou_reply_text).values(
-            text_id=tid, business=business, category=str(ex["category_id"]), text=text, text_version=tv,
-            source_exemplar_id=int(exemplar_id), status=STATUS_ACTIVE, created_at=now, updated_at=now))
-        version = compute_version(rows + [{"text_id": tid, "category": str(ex["category_id"]), "text_version": tv,
-                                           "status": STATUS_ACTIVE}])
-        await s.execute(sa.insert(jikou_reply_text_history).values(
-            text_id=tid, action=ACTION_PROMOTED, actor=actor, at=now, table_version=version,
-            note=f"source_exemplar={int(exemplar_id)};count={int(cands.get(ex['category_id'], 0))}"))
+    try:
+        async with session_scope() as s:
+            rows = await _all_rows(s, business)
+            # PRE-REVIEW-1 #280-2: 昇格済み判定を insert と同じ tx で再評価（別 tx の is_candidate だけでは連打で 2 行できた）
+            if any(r.get("source_exemplar_id") == int(exemplar_id) for r in rows):
+                return None
+            tid = next_id([r["text_id"] for r in rows])
+            tv = hashlib.sha256(text.encode("utf-8")).hexdigest()
+            await s.execute(sa.insert(jikou_reply_text).values(
+                text_id=tid, business=business, category=str(ex["category_id"]), text=text, text_version=tv,
+                source_exemplar_id=int(exemplar_id), status=STATUS_ACTIVE, created_at=now, updated_at=now))
+            version = compute_version(rows + [{"text_id": tid, "category": str(ex["category_id"]), "text_version": tv,
+                                               "status": STATUS_ACTIVE}])
+            await s.execute(sa.insert(jikou_reply_text_history).values(
+                text_id=tid, action=ACTION_PROMOTED, actor=actor, at=now, table_version=version,
+                note=f"source_exemplar={int(exemplar_id)};count={int(cands.get(ex['category_id'], 0))}"))
+    except IntegrityError:
+        # 並行の 2 件目（UNIQUE(business, source_exemplar_id) または text_id の衝突）＝昇格済み扱い
+        logger.info("[PROMOTE] duplicate promote skipped (unique)")
+        return None
     logger.info("[PROMOTE] promoted count_active=%s", emit(len([r for r in rows if r['status'] == STATUS_ACTIVE]) + 1,
                                                           "count", "log", "operator"))
     return tid
