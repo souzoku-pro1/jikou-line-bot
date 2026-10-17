@@ -605,6 +605,7 @@ DUPLICATE_UNCONFIRMED = _Duplicate("unconfirmed")   # 結果未確認の重複�
 # JIKOU-REPLY-Q1c (c): J-0 の在庫検査（排他の中）——会話に「初回返信判定の対象」の操作が既にある／会話が無い
 FIRST_REPLY_ALREADY = _Duplicate("first_reply_already")
 SEND_POLICY_STOPPED = "policy_stopped"              # 送信フックの戻り値（許可表 V2 で送らなかった）
+SEND_LEDGER_UNAVAILABLE = "ledger_unavailable"      # PRE-REVIEW-1 #279-1: require_ledger=True で台帳に記録できず送らなかった
 
 
 class PolicyStopped:
