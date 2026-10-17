@@ -701,12 +701,6 @@ def start_healthcheck_scheduler() -> None:
     hub_scheduler.start_all()  # 冪等（二重 startup でもタスクは1つ）
 
 
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-    result = asyncio.run(run_healthcheck())
-    raise SystemExit(1 if result else 0)
-
-
 # ── CONCURRENCY-1（QUEUE-2026-10-14-G G-3 反例 #3）: 異常通知の 1 日 1 通（プロセス横断・台帳 key）。末尾追記。 ──
 HEALTHCHECK_LEDGER_BUSINESS = "jikou"
 HEALTHCHECK_LEDGER_CHANNEL = "healthcheck"
@@ -917,3 +911,12 @@ async def _check_f_and_ops_runbook_items() -> list[str]:
             # DB接続情報が例外本文に含まれ得るため分類のみ（RCF-M05流儀）
             out.append(f"{label}監視の実行自体が失敗: {type(e).__name__}")
     return out
+
+
+# PRE-REVIEW-1 #298/#295（高）: `python daily_healthcheck.py` の直接起動は module の末尾で行う。CONCURRENCY-1 の
+# _notify_once_per_day 等が本ブロックの後ろに追記されていたため、スクリプト起動では定義前に run_healthcheck が走り
+# NameError になっていた（アプリ内 scheduler＝import 経由は無影響）。allowlist 番地（84〜659）は不変。
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+    result = asyncio.run(run_healthcheck())
+    raise SystemExit(1 if result else 0)
