@@ -196,8 +196,26 @@ class TestDraftsView(_DraftMixin):
         self.assertEqual(_texts(), [])
         d = _run(rd.get_draft(did))
         self.assertEqual(d["state"], rd.STATE_FAILED)
-        self.assertEqual(self.approvals()[0]["outcome"], dv.OUTCOME_ASIS)
+        # PRE-REVIEW-1 #279-3: 送られていない承認は outcome（承認率・無修正承認の母数）に数えない
+        self.assertEqual(self.approvals(), [])
         self.assertEqual([p["state"] for p in self.pending()], [rp.STATE_OPEN])
+
+    def test_ledger_unavailable_does_not_send_and_returns_draft_to_proposed(self):
+        """PRE-REVIEW-1 #279-1: 承認済み下書きの送信は台帳必須（人の明示送信と同じ fail-closed）。"""
+        did = self.make_draft()
+        f = self.open_form(did)
+        with patch.object(sl, "begin", AsyncMock(return_value=None)):
+            r = self.act(did, dict(f, action="send", text=self.gen.return_value, confirm="1"))
+        self.assertIn("done=ledger_unavailable", r.headers["location"])
+        self.assertEqual(_texts(), [])                                  # 送らない
+        self.assertEqual(_run(rd.get_draft(did))["state"], rd.STATE_PROPOSED)   # 承認前に戻す（再承認で送れる）
+        self.assertEqual(self.approvals(), [])
+        page = _client.get(f"{dv.PAGE}/{did}?done=ledger_unavailable", headers=_auth())
+        self.assertIn("台帳が使えないため送信できません", page.text)
+        r2 = self.act(did, dict(self.open_form(did), action="send", text=self.gen.return_value, confirm="1"))
+        self.assertIn("done=sent", r2.headers["location"])              # 台帳が戻れば送れる
+        self.assertEqual(len(_texts()), 1)
+        self.assertEqual(self.approvals()[0]["outcome"], dv.OUTCOME_ASIS)
 
     def test_line_failure_marks_failed(self):
         from test_jikou_reply_q1c import _FakeResp
@@ -207,6 +225,7 @@ class TestDraftsView(_DraftMixin):
         r = self.act(did, dict(f, action="send", text=self.gen.return_value, confirm="1"))
         self.assertIn("done=failed", r.headers["location"])
         self.assertEqual(_run(rd.get_draft(did))["state"], rd.STATE_FAILED)
+        self.assertEqual(self.approvals(), [])                          # PRE-REVIEW-1 #279-3: 失敗は承認に数えない
 
 
 class TestExemplarApi(_Mixin):

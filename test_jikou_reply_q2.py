@@ -18,6 +18,7 @@
 import datetime
 import hashlib
 import os
+import re
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -379,6 +380,15 @@ class TestFlow(_DbMixin):
         self.assertEqual(_texts(), [])
         self.assertTrue(self.approval.called)
         self.assertEqual(F.used_ids_from_history(hist), ("J-7",))
+        # PRE-REVIEW-1 #277-1: 差し込みのある定型（J-5a は先頭断片が 6 字）も最長の固定断片で使用済みと判定する
+        j5a = re.sub(r"【[^】]*】", "2020年1月", T.text("J-5a"))      # 差し込み 2 か所（基準年月・推奨年月）を埋めた送信文
+        self.assertIn("【基準年月】", T.text("J-5a"))
+        self.assertNotIn("【", j5a)
+        hist2 = cr.ChatHistory([{"role": "user", "content": "q"}, {"role": "assistant", "content": j5a}])
+        self.assertIn("J-5a", F.used_ids_from_history(hist2))
+        self.assertNotIn("J-5b", F.used_ids_from_history(hist2))
+        self.assertEqual(F._longest_fixed_fragment("最後の返済が【基準年月】より前だと確信があれば"), "より前だと確信があれば")
+        self.assertEqual(F._longest_fixed_fragment("短い【x】文"), "")
 
     def test_on_guard_rejection_is_fail_closed(self):
         self.on()
