@@ -30,7 +30,7 @@
 - 業務 LINE に「DB 疎通: 接続に失敗（OperationalError 等）」または「送信台帳: …」の警報。PWA（/app/…）で固定文言「記録を読み書きできませんでした」。
 - Railway ログ（`railway logs`）に `send_ledger` の `ledger unavailable` 系の固定語彙が連続。
 - 挙動: bot の自動返信は **fail-open**（DB が無くても送る・記録だけ落ちる）。大野の返信欄（/app/reply）と承認済み下書きの送信は **fail-closed**（送らない）。
-  JIKOU_SEND_FAILCLOSED=1 を入れている場合は bot 経路も送らない。
+  JIKOU_SEND_FAILCLOSED=1 を入れている場合は bot 経路も送らない（この env は PR #292 feature/jikou-send-failclosed-1 の merge 後に有効。merge 前は存在しない）。
 
 **止めるもの**
 - 原則止めない（bot は fail-open で動く）。相談者へ重複送信の恐れがある（Postgres が断続的に落ちている）ときだけ `AUTOREPLY_PAUSED=1`。
