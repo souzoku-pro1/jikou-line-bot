@@ -30,6 +30,7 @@ from hub.brain_ledger import metadata as brain_ledger_metadata  # noqa: E402（B
 from hub.send_ledger import metadata as send_ledger_metadata  # noqa: E402（JIKOU-REPLY-Q1a・送信操作記録）
 from hub.souzoku_intake import metadata as souzoku_intake_metadata  # noqa: E402（SOUZOKU-2・相続相談受付）
 from hub.souzoku_heirs import metadata as souzoku_heirs_metadata  # noqa: E402（SOUZOKU-3・相続人の確定）
+from hub.souzoku_assets import metadata as souzoku_assets_metadata  # noqa: E402（SOUZOKU-4・財産目録・協議書案）
 
 config = context.config
 
@@ -43,7 +44,7 @@ target_metadata = [Base.metadata, heartbeat_metadata, service_auth_metadata,
                    PersonMergeJournalBase.metadata, qa_store_metadata,
                    shindan_link_metadata, brain_ledger_metadata,
                    send_ledger_metadata,
-                   souzoku_intake_metadata, souzoku_heirs_metadata]
+                   souzoku_intake_metadata, souzoku_heirs_metadata, souzoku_assets_metadata]
 
 
 def run_migrations_offline() -> None:

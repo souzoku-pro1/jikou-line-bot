@@ -980,7 +980,8 @@ class TestSendLedgerMigration(unittest.TestCase):
             # SOUZOKU-3: head（c1d3e5f7a9b2）で souzoku_heirs 2 表（列集合が hub/souzoku_heirs.metadata と一致）。データがあれば downgrade 拒否
             from hub import souzoku_heirs
             self.assertFalse(set(souzoku_heirs.TABLE_NAMES) & tables())
-            up = alembic("upgrade", "head")
+            # SOUZOKU-4（QUEUE-2026-10-17-H H-5）で head が d2e4f6a8b0c3 へ進んだため c1d3 までを明示（既存パターン）
+            up = alembic("upgrade", "c1d3e5f7a9b2")
             self.assertEqual(up.returncode, 0, f"stderr={up.stderr[-800:]}")
             self.assertIn("c1d3e5f7a9b2", alembic("current").stdout)
             self.assertTrue(set(souzoku_heirs.TABLE_NAMES) <= tables())
@@ -995,6 +996,23 @@ class TestSendLedgerMigration(unittest.TestCase):
                 con.commit()
             finally:
                 con.close()
+            # SOUZOKU-4: head（d2e4f6a8b0c3）で souzoku_assets・souzoku_kyogisho（列集合が hub/souzoku_assets.metadata と一致）→ 往復
+            from hub import souzoku_assets
+            self.assertFalse(set(souzoku_assets.TABLE_NAMES) & tables())
+            up = alembic("upgrade", "head")
+            self.assertEqual(up.returncode, 0, f"stderr={up.stderr[-800:]}")
+            self.assertIn("d2e4f6a8b0c3", alembic("current").stdout)
+            self.assertTrue(set(souzoku_assets.TABLE_NAMES) <= tables())
+            con = sqlite3.connect(dbfile)
+            try:
+                for name in souzoku_assets.TABLE_NAMES:
+                    cols = {r[1] for r in con.execute(f'PRAGMA table_info("{name}")')}
+                    self.assertEqual(cols, {c.name for c in souzoku_assets.metadata.tables[name].columns}, name)
+            finally:
+                con.close()
+            down = alembic("downgrade", "c1d3e5f7a9b2")
+            self.assertEqual(down.returncode, 0, f"stderr={down.stderr[-800:]}")
+            self.assertFalse(set(souzoku_assets.TABLE_NAMES) & tables())
             down = alembic("downgrade", "b0c1d2e3f4a5")
             self.assertNotEqual(down.returncode, 0)
             self.assertIn("souzoku_heirs_downgrade_refused_data_present", down.stderr + down.stdout)

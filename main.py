@@ -2366,3 +2366,8 @@ app.include_router(souzoku_intake_router)
 #    関所 _gate・catch-all より前に結線）。末尾追記。
 from hub.webapp_souzoku_heirs_view import router as souzoku_heirs_router  # noqa: E402
 include_before_catch_all(app, souzoku_heirs_router)
+
+# ── SOUZOKU-4（QUEUE-2026-10-17-H H-5）: 財産目録・分割案・遺産分割協議書（案）の画面 /app/souzoku/{案件ID}/assets・/kyogisho
+#    （flag SOUZOKU_INTAKE_ENABLED 既定 OFF＝404・関所 _gate・App 添付なし）。末尾追記。
+from hub.webapp_souzoku_assets_view import router as souzoku_assets_router  # noqa: E402
+include_before_catch_all(app, souzoku_assets_router)
