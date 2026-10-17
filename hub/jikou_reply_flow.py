@@ -98,6 +98,15 @@ def _field(rec: dict, code: str) -> str:
     return str(((rec or {}).get(code) or {}).get("value") or "")
 
 
+_SLOT_SPLIT_RE = re.compile(r"【[^】]*】")
+
+
+def _longest_fixed_fragment(body: str, min_len: int = 8) -> str:
+    """差し込み（【…】）を除いた固定断片のうち最長のもの（min_len 未満しか無ければ ""）。"""
+    frags = [f for f in _SLOT_SPLIT_RE.split(str(body or "")) if len(f) >= min_len]
+    return max(frags, key=len) if frags else ""
+
+
 def used_ids_from_history(history: list[dict]) -> tuple:
     """会話履歴の assistant 行に定型の本文が逐語で含まれていれば使用済み（R-J4・履歴 10 往復の窓）。
     J-5 は会社を区別できないため本文一致で判定し、J-5 系は既定会社扱い（flow 側で company を付ける）。"""
@@ -106,11 +115,13 @@ def used_ids_from_history(history: list[dict]) -> tuple:
     for tid, e in T.TEXTS.items():
         body = e["text"]
         if not body or e["slots"]:
-            # 差し込みのある定型は固定部分（先頭の差し込み前）で照合
-            head = body.split("【", 1)[0]
-            if not head or len(head) < 8:
+            # 差し込みのある定型は **差し込みを除いた最長の固定断片**（8 字以上）で照合。
+            # PRE-REVIEW-1 #277-1: 先頭断片だけだと J-5a（先頭が「最後の返済が」6 字）が常に判定対象外になり、
+            # 同じ会社へ J-5a を繰り返し送れた（R-J4 会社ごと 1 回が効かない）
+            frag = _longest_fixed_fragment(body)
+            if not frag:
                 continue
-            if any(head in t for t in texts):
+            if any(frag in t for t in texts):
                 used.append(tid)
             continue
         if any(body in t for t in texts):

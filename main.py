@@ -2433,8 +2433,10 @@ async def _approval_policy_stopped(_ev, record_id: str, record: dict) -> dict:
                 emit(record_id, "record_id", "log", "operator"))
     await send_policy.approval_blocked(record_id, str(record.get("$revision", {}).get("value", "")), reasons)
     if _ev:
-        from hub.kintone_lane import mark_noop_done
-        await mark_noop_done(_ev, "skip_policy_v2")
+        # PRE-REVIEW-1 #275-1: ここは mark_sending の後（state=sending）なので received 専用の mark_noop_done ではなく
+        # sending→done の終端を使う（enum 外・状態不整合で webhook 500・行が sending で滞留していた）
+        from hub.kintone_lane import mark_stopped_after_sending
+        await mark_stopped_after_sending(_ev, "skip_policy_v2")
     return {"ok": True, "skip": "policy_stopped"}
 
 # ── JIKOU-REPLY-Q3a（QUEUE-2026-10-12-C C-2）: 手本の承認・退役画面（/app/exemplars）の結線。末尾追記。

@@ -356,11 +356,31 @@ async def process_record(record_id: str, record: dict | None = None) -> dict:
 
 
 # ── 定期走査 ─────────────────────────────────────────────────────────────────
+_SCAN_FIELDS = ["$id", "$revision", FIELD_STATUS, FIELD_KANKEI, FIELD_COMPLEX, FIELD_CONTINUOUS, TABLE]
+
+
+def scan_query(after_id: str | None = None, limit: int = SCAN_LIMIT) -> str:
+    cond = "status in (" + ", ".join(f'"{s}"' for s in ENGAGED_STATUSES) + ")"
+    if after_id:
+        cond += f" and $id > {int(after_id)}"
+    return f"{cond} order by $id asc limit {int(limit)}"
+
+
 async def fetch_engaged(limit: int = SCAN_LIMIT) -> list[dict]:
-    q = ("status in (" + ", ".join(f'"{s}"' for s in ENGAGED_STATUSES) + f") order by $id asc limit {int(limit)}")
-    return await kintone.search_records(APP_HOUKI_CASE, q,
-                                        fields=["$id", "$revision", FIELD_STATUS, FIELD_KANKEI, FIELD_COMPLEX,
-                                                FIELD_CONTINUOUS, TABLE])
+    """受任系レコードを $id asc・limit 件ごとに全件取得（$id > 最後の id で継続）。
+    PRE-REVIEW-1 #284-1: 固定 limit 100 の 1 回取得では 101 件目以降が永久に走査されなかった（houki_jukuryo.fetch_all_targets と同じ流儀）。"""
+    out: list[dict] = []
+    after: str | None = None
+    while True:
+        rows = await kintone.search_records(APP_HOUKI_CASE, scan_query(after, limit), fields=_SCAN_FIELDS)
+        out.extend(rows)
+        if len(rows) < int(limit):
+            return out
+        last = _v(rows[-1], "$id")
+        if not last.isdigit() or (after is not None and int(last) <= int(after)):
+            logger.warning("[HOUKI_KOSEKI] paging stopped (id not advancing)")
+            return out
+        after = last
 
 
 async def scan_once() -> dict:
