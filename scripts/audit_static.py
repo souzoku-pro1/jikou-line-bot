@@ -303,7 +303,9 @@ def audit_secrets(rel: str, tree, src_lines: list[str]) -> list[Finding]:
     for i, line in enumerate(src_lines, start=1):
         m = SECRET_ASSIGN_RE.search(line)
         if m and not SECRET_SAFE_LITERALS.search(line) and "os.environ" not in line and "getenv" not in line:
-            out.append(Finding(CATEGORY_D, rel, i, f"assignment: {line.strip()[:100]}"))
+            # PRE-REVIEW-1 #304-2: 該当行をそのまま報告へ写さない（本物の秘密値が pgv の md／json に転記されるため）。
+            # 名前と長さだけ（リテラル側 :301 と同じ伏せ方）
+            out.append(Finding(CATEGORY_D, rel, i, f"assignment: {m.group(1)}=…（{len(m.group(0))} 文字）"))
     return out
 
 
