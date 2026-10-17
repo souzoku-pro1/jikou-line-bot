@@ -113,8 +113,10 @@ async def dairinin_webhook(secret: str, request: Request):
         except houki_shinjutsu.ShinjutsuRejection as e:
             logger.info("[DAIRININ] rejected record_id=%s reasons=%s",
                         emit(record_id, "record_id", "log", "operator"), emit(len(e.reasons), "count", "log", "operator"))
+            # PRE-REVIEW-1 #283-2: 編集保存ごとに拒否が繰り返されても通知は種別×レコード単位でスロットル
             await _notify(f"【代理人目録】案件レコードNo.{record_id} は次の理由で生成しませんでした:\n・"
-                          + "\n・".join(e.reasons) + "\nkintone で入力・確定後、もう一度実行してください。")
+                          + "\n・".join(e.reasons) + "\nkintone で入力・確定後、もう一度実行してください。",
+                          f"dairinin_rejected:{record_id}")
             return JSONResponse(status_code=200, content={"ok": True, "skip": "rejected", "reasons": e.reasons})
         missing = houki_dairinin.missing_office_envs()
         if missing:
@@ -133,14 +135,15 @@ async def dairinin_webhook(secret: str, request: Request):
         except Exception:
             logger.error("[DAIRININ] attach failed record_id=%s", emit(record_id, "record_id", "log", "operator"))
             await _notify(f"【代理人目録・要確認】案件レコードNo.{record_id} の代理人目録は生成できましたが、kintone への"
-                          "添付に失敗しました。もう一度実行してください（添付欄が空のままなら再生成されます）。")
+                          "添付に失敗しました。もう一度実行してください（添付欄が空のままなら再生成されます）。",
+                          f"dairinin_attach_failed:{record_id}")
             return JSONResponse(status_code=500, content={"error": "attach_failed"})
         logger.info("[DAIRININ] attached record_id=%s bytes=%s", emit(record_id, "record_id", "log", "operator"),
                     emit(len(docx_bytes), "count", "log", "operator"))
     except houki_dairinin.DairininIntegrityError:
         logger.error("[DAIRININ] integrity error (template/body mismatch)")
         await _notify(f"【代理人目録・要確認】案件レコードNo.{record_id} の生成でテンプレート完全性検証に失敗しました"
-                      "（添付していません）。")
+                      "（添付していません）。", f"dairinin_integrity:{record_id}")
         return JSONResponse(status_code=500, content={"error": "integrity_error"})
     except Exception as e:
         logger.error("[DAIRININ] error record_id=%s: %s", emit(record_id, "record_id", "log", "operator"),
