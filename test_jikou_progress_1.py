@@ -29,6 +29,7 @@ from hub import jikou_progress as P  # noqa: E402
 from hub import jikou_reply_texts as T  # noqa: E402
 from hub import kintone  # noqa: E402
 from hub import reply_draft as rd  # noqa: E402
+from hub import reply_pending as rp  # noqa: E402
 from hub import scheduler as hub_scheduler  # noqa: E402
 from hub import send_ledger as sl  # noqa: E402
 from hub import webapp_drafts_view as dv  # noqa: E402
@@ -214,6 +215,9 @@ class TestHook(_Mixin):
 
 class TestApproveViaQ4(_Mixin):
     def test_no_send_without_approval_then_q4_sends_once(self):
+        _run(rp.register(business="jikou", channel="jikou", line_user_hash=sl.line_user_hash("jikou", USER),
+                         route="inbound", reason="demoted", inbound_event_id="ev-open", conversation_id=None,
+                         category=None, approval_record_id=None))               # 同じ相談者の open 対応待ち
         self.assertEqual(_run(P.enqueue(P.EVENT_SHIPPED, CASE, USER, {"発送日": "2026年10月1日", "社数": 2}, now=NOW)), P.QUEUED)
         did = int(self.progress_drafts()[0]["draft_id"])
         self.assertEqual(_texts(), [])                                                       # 積んだだけでは送らない
@@ -235,6 +239,8 @@ class TestApproveViaQ4(_Mixin):
         d = _run(rd.get_draft(did))
         self.assertEqual((d["state"], d["approval_kind"]), (rd.STATE_SENT, rd.KIND_ASIS))
         self.assertEqual(self.approvals(), [])                                               # AI 下書きの統計に入れない
+        # PRE-REVIEW-1 #301-1: 進捗連絡の承認送信は同じ相談者の対応待ちを閉じない
+        self.assertEqual([p["state"] for p in self.pending()], [rp.STATE_OPEN])
         self.assertEqual(self.chatlog.call_args_list[-1].args[1:3], ("assistant", text))
         r2 = self.act(did, dict(f, action="send", text=text, confirm="1"))
         self.assertIn("done=already", r2.headers["location"])

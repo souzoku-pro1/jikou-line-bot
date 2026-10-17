@@ -63,6 +63,7 @@ _DONE = {
     "blocked": "許可表により送信できません（人対応中・対応中・停止設定）。返信欄（/app/reply）からご返信ください。",
     "unconfirmed": "送信結果を確認できませんでした。送信確認待ちで結果を確定してください（自動再送はしません）。",
     "failed": "LINE への送信に失敗しました。送信されていません。",
+    "ledger_unavailable": "台帳が使えないため送信できません。時間をおいて再試行してください（下書きは承認前に戻しました）。",
     "db": "記録を読み書きできませんでした。",
 }
 
@@ -340,10 +341,15 @@ async def draft_act(request: Request):
     if not ok:
         return _redirect(did, "already")                   # CAS: 二重クリック・戻る→再送は副作用なし
     progress = _is_progress(d)
-    if not progress:                                      # JIKOU-PROGRESS-1: 進捗連絡は AI 下書きの結果統計・昇格計数に入れない
-        await _record_outcome(int(did), category, str(d["draft_text"]), OUTCOME_EDITED if edited else OUTCOME_ASIS)
+    # PRE-REVIEW-1 #279-3: outcome（approved_asis／edited）は送信成功の後に記録する（許可表停止・LINE 失敗を承認に数えない）
+    # PRE-REVIEW-1 #279-1: 台帳必須（require_ledger）。begin が None なら送らず、下書きを承認前（proposed）へ戻す
     async with send_ledger.approved_draft(f"{RECORD_PREFIX}{did}:{op_id}"):
-        res = await line_channel.push_text(line_channel.JIKOU_CHANNEL, user_id, text)
+        res = await line_channel.push_text(line_channel.JIKOU_CHANNEL, user_id, text, require_ledger=True)
+    if res == send_ledger.SEND_LEDGER_UNAVAILABLE:
+        await reply_draft.set_state(int(did), reply_draft.STATE_PROPOSED, actor=reply_draft.ACTOR_BOT,
+                                    from_states=(reply_draft.STATE_APPROVED,), note="ledger_unavailable")
+        logger.warning("[DRAFTS] ledger unavailable (not sent) draft_id=%s", emit(did, "record_id", "log", "operator"))
+        return _redirect(did, "ledger_unavailable")
     if res == send_ledger.SEND_POLICY_STOPPED:
         await reply_draft.set_state(int(did), reply_draft.STATE_FAILED, actor=reply_draft.ACTOR_BOT,
                                     from_states=(reply_draft.STATE_APPROVED,), note="policy_stopped")
@@ -356,6 +362,8 @@ async def draft_act(request: Request):
         return _redirect(did, "failed")
     await reply_draft.set_state(int(did), reply_draft.STATE_SENT, actor=reply_draft.ACTOR_BOT,
                                 from_states=(reply_draft.STATE_APPROVED,))
+    if not progress:                                      # JIKOU-PROGRESS-1: 進捗連絡は AI 下書きの結果統計・昇格計数に入れない
+        await _record_outcome(int(did), category, str(d["draft_text"]), OUTCOME_EDITED if edited else OUTCOME_ASIS)
     logger.info("[DRAFTS] approved draft sent draft_id=%s edited=%s", emit(did, "record_id", "log", "operator"),
                 emit(int(edited), "count", "log", "operator"))
     import chat_responder as cr
@@ -363,10 +371,13 @@ async def draft_act(request: Request):
         await cr.save_to_chatlog(user_id, "assistant", text, category or "その他判断系", "yes")
     except Exception:
         logger.warning("[DRAFTS] chatlog write failed (fixed reason)")
-    try:
-        await send_policy.approved_draft_sent(f"{RECORD_PREFIX}{did}", user_id, text, category)
-    except Exception:
-        logger.warning("[DRAFTS] post-send hooks failed (fixed reason)")
+    if not progress:
+        # PRE-REVIEW-1 #301-1（JIKOU-PROGRESS-1）: 進捗連絡（入金確認・発送完了・結果）は相談者の質問への回答ではないので、
+        # 同じ相談者の対応待ちを閉じない（approved_draft_sent は resolve_for_user と無修正承認の計数を伴う）
+        try:
+            await send_policy.approved_draft_sent(f"{RECORD_PREFIX}{did}", user_id, text, category)
+        except Exception:
+            logger.warning("[DRAFTS] post-send hooks failed (fixed reason)")
     if edited and not progress:                           # 進捗連絡の修正文は手本候補にしない（定型の改定は要承認表の差し替え）
         await _save_candidate(user_id, rec, text, f"{RECORD_PREFIX}{did}:{op_id}", category, int(did))
     return _redirect(did, "sent_edited" if edited else "sent")

@@ -10,6 +10,7 @@
 - migration e6a8c0d2f4b6（d4f6 の後ろ）。pin: 新 module の sink 違反ゼロ・allowlist 追加ゼロ・PII なし。
 """
 
+import asyncio
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -98,6 +99,17 @@ class TestCandidateAndPromote(_PromoteMixin):
         self.assertIsNone(_run(pm.pick_for_category("費用の定型案内")))
         self.assertIsNone(_run(pm.pick_for_category("法的判断・見通し")))
         self.assertEqual(pm.next_id([]), "J-U1")
+        # PRE-REVIEW-1 #280-2: 並行の連打でも 1 行（同一 tx の再評価＋UNIQUE(business, source_exemplar_id)）
+        x3 = _exemplar(reply="三つ目の手本の返信です。")
+
+        async def _race():
+            return await asyncio.gather(pm.promote(x3), pm.promote(x3), pm.promote(x3))
+        res = _run(_race())
+        self.assertEqual(sorted(r for r in res if r), ["J-U3"])            # 3 連打で 1 行だけ
+        self.assertEqual([r["text_id"] for r in self.texts()], ["J-U1", "J-U2", "J-U3"])
+        self.assertIn("uq_jikou_reply_text_source", {c.name for c in pm.jikou_reply_text.constraints})
+        self.assertIn("uq_jikou_reply_text_source",
+                      (REPO / "alembic" / "versions" / "20261013_e6a8c0d2f4b6_jikou_reply_text.py").read_text(encoding="utf-8"))
         self.assertEqual(pm.next_id(["J-U7", "J-U12", "x"]), "J-U13")
 
     def test_retire_and_reactivate_with_history(self):
