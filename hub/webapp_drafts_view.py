@@ -63,6 +63,7 @@ _DONE = {
     "blocked": "許可表により送信できません（人対応中・対応中・停止設定）。返信欄（/app/reply）からご返信ください。",
     "unconfirmed": "送信結果を確認できませんでした。送信確認待ちで結果を確定してください（自動再送はしません）。",
     "failed": "LINE への送信に失敗しました。送信されていません。",
+    "ledger_unavailable": "台帳が使えないため送信できません。時間をおいて再試行してください（下書きは承認前に戻しました）。",
     "db": "記録を読み書きできませんでした。",
 }
 
@@ -322,9 +323,15 @@ async def draft_act(request: Request):
                                      approval_kind=kind, final_text=text, op_id=f"{RECORD_PREFIX}{did}:{op_id}")
     if not ok:
         return _redirect(did, "already")                   # CAS: 二重クリック・戻る→再送は副作用なし
-    await _record_outcome(int(did), category, str(d["draft_text"]), OUTCOME_EDITED if edited else OUTCOME_ASIS)
+    # PRE-REVIEW-1 #279-3: outcome（approved_asis／edited）は送信成功の後に記録する（許可表停止・LINE 失敗を承認に数えない）
+    # PRE-REVIEW-1 #279-1: 台帳必須（require_ledger）。begin が None なら送らず、下書きを承認前（proposed）へ戻す
     async with send_ledger.approved_draft(f"{RECORD_PREFIX}{did}:{op_id}"):
-        res = await line_channel.push_text(line_channel.JIKOU_CHANNEL, user_id, text)
+        res = await line_channel.push_text(line_channel.JIKOU_CHANNEL, user_id, text, require_ledger=True)
+    if res == send_ledger.SEND_LEDGER_UNAVAILABLE:
+        await reply_draft.set_state(int(did), reply_draft.STATE_PROPOSED, actor=reply_draft.ACTOR_BOT,
+                                    from_states=(reply_draft.STATE_APPROVED,), note="ledger_unavailable")
+        logger.warning("[DRAFTS] ledger unavailable (not sent) draft_id=%s", emit(did, "record_id", "log", "operator"))
+        return _redirect(did, "ledger_unavailable")
     if res == send_ledger.SEND_POLICY_STOPPED:
         await reply_draft.set_state(int(did), reply_draft.STATE_FAILED, actor=reply_draft.ACTOR_BOT,
                                     from_states=(reply_draft.STATE_APPROVED,), note="policy_stopped")
@@ -337,6 +344,7 @@ async def draft_act(request: Request):
         return _redirect(did, "failed")
     await reply_draft.set_state(int(did), reply_draft.STATE_SENT, actor=reply_draft.ACTOR_BOT,
                                 from_states=(reply_draft.STATE_APPROVED,))
+    await _record_outcome(int(did), category, str(d["draft_text"]), OUTCOME_EDITED if edited else OUTCOME_ASIS)
     logger.info("[DRAFTS] approved draft sent draft_id=%s edited=%s", emit(did, "record_id", "log", "operator"),
                 emit(int(edited), "count", "log", "operator"))
     import chat_responder as cr
