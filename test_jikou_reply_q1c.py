@@ -627,9 +627,43 @@ class TestApprovalWebhook(_DbMixin):
                 "line_user_id": {"value": USER}, "AI下書き": {"value": "下書き"},
                 "カテゴリ": {"value": "c"}, "$revision": {"value": "3"}}
 
-    def _post(self, rid="7"):
+    def _post(self, rid="7", event_id=None):
         body = {"record": {"$id": {"value": rid}, "ステータス2": {"value": "承認済"}, "送信済み": {"value": "no"}}}
+        if event_id is not None:
+            body["id"] = event_id                               # kintone lane（durable dedup）ON 用の通知 ID
         return _client.post("/webhook/kintone/approval?token=kintone-token", json=body)
+
+    def test_on_lane_enabled_policy_stop_terminates_event_without_error(self):
+        """PRE-REVIEW-1 #275-1: durable lane ON（KINTONE_EVENT_DEDUP_ENABLED）で許可表 V2 に止まっても webhook は 200・
+        inbound_event は sending→done（last_error=skip_policy_v2）・LINE write 0。"""
+        self.on()
+        self.env({"KINTONE_EVENT_DEDUP_ENABLED": "1"})
+        self.touch("e1")
+        _run(sl.set_attending("jikou", USER))
+        from hub.inbound_event import InboundEvent
+        from hub import kintone_lane as kl
+        with patch.object(main, "mark_approval_sent", AsyncMock()), \
+             patch.object(main, "save_to_chatlog", AsyncMock()), \
+             patch.object(main.hub_kintone, "get_record", AsyncMock(return_value=self._record())):
+            r1 = self._post(event_id="ev-stop-1")
+            r2 = self._post(event_id="ev-stop-2")
+            r3 = self._post(event_id="ev-stop-1")               # 同じ通知 ID の再配送は duplicate skip
+        self.assertEqual((r1.status_code, r1.json().get("skip")), (200, "policy_stopped"))
+        self.assertEqual((r2.status_code, r2.json().get("skip")), (200, "policy_stopped"))
+        self.assertEqual(r3.status_code, 200)
+        self.assertNotEqual(r3.json().get("skip"), "policy_stopped")
+        self.assertEqual([j["to"] for u, j in _FakeClient.calls if "push" in u], [])
+
+        async def _rows():
+            async with db.session_scope() as s:
+                return [(e.state, e.last_error) for e in (await s.execute(
+                    sa.select(InboundEvent).where(InboundEvent.provider == "kintone").order_by(InboundEvent.id))).scalars()]
+        self.assertEqual(_run(_rows()), [("done", "skip_policy_v2"), ("done", "skip_policy_v2")])
+        self.assertIn("skip_policy_v2", kl.STOP_AFTER_SENDING_REASONS)
+        self.assertIn("skip_autoreply_stopped", kl.NOOP_REASONS)    # main.py:1586 の既存 skip 分岐も enum 内
+        self.assertEqual(self.biz.await_count, 1)                  # 同じ承認版は 1 通（lane ON でも不変）
+        with self.assertRaises(ValueError):
+            _run(kl.mark_stopped_after_sending("x", "skip_not_approved"))   # received 用の理由は使えない
 
     def test_on_attending_blocks_approved_draft_and_notifies_once_per_revision(self):
         self.on()
