@@ -268,6 +268,26 @@ class TestCandidateAndScan(_KintoneMixin):
         counts = _run(kc.scan_once())
         self.assertEqual(counts["candidate"], 0)                 # 2 周目は duplicate
 
+    def test_scan_pages_past_the_first_100_records(self):
+        """PRE-REVIEW-1 #284-1: 受任系が 100 件を超えても $id > 最後の id で継続取得し、101 件目以降も走査する。"""
+        page1 = [_rec(続柄="子", **{"$id": str(i)}, 書類チェック=[_row(kc.DOC_DEATH_KOSEKI, state="未")])
+                 for i in range(1, kc.SCAN_LIMIT + 1)]
+        page2 = [_rec(続柄="", **{"$id": str(kc.SCAN_LIMIT + 1)})]      # 101 件目: 続柄なし → 個別確定
+        self.search.side_effect = [page1, page2]
+        counts = _run(kc.scan_once())
+        self.assertEqual(counts["records"], kc.SCAN_LIMIT + 1)
+        self.assertEqual(counts["individual"], 1)
+        self.assertEqual(self.search.await_count, 2)
+        q1, q2 = (c.args[1] for c in self.search.await_args_list)
+        self.assertNotIn("$id >", q1)
+        self.assertIn(f"$id > {kc.SCAN_LIMIT}", q2)
+        self.assertIn(f"limit {kc.SCAN_LIMIT}", q2)
+        # id が進まない応答では打ち切る（無限ループしない）
+        self.search.side_effect = [page1, page1]
+        counts = _run(kc.scan_once())
+        self.assertEqual(counts["records"], kc.SCAN_LIMIT * 2)
+        self.assertEqual(self.search.await_count, 4)
+
     def test_scan_unconfigured_or_fetch_failure_is_silent(self):
         with patch.dict(os.environ, {"APP_HOUKI": "", "TOKEN_HOUKI": ""}):
             self.assertEqual(_run(kc.scan_once()), {"skipped": "unconfigured"})
