@@ -2361,3 +2361,8 @@ send_ledger.check_timing_config()
 # ── SOUZOKU-2（QUEUE-2026-10-16-R G-5）: 相続相談 受付フォーム（/souzoku-intake・flag SOUZOKU_INTAKE_ENABLED 既定 OFF＝404）の結線。末尾追記。
 from souzoku_intake_form import router as souzoku_intake_router  # noqa: E402
 app.include_router(souzoku_intake_router)
+
+# ── SOUZOKU-3（QUEUE-2026-10-17-H H-4）: 相続人の確定画面 /app/souzoku/{案件ID}/heirs（flag SOUZOKU_INTAKE_ENABLED 既定 OFF＝404・
+#    関所 _gate・catch-all より前に結線）。末尾追記。
+from hub.webapp_souzoku_heirs_view import router as souzoku_heirs_router  # noqa: E402
+include_before_catch_all(app, souzoku_heirs_router)
