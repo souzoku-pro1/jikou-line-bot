@@ -49,5 +49,10 @@ def text(text_id: str) -> str:
     return str((TEXTS.get(text_id) or {}).get("text") or "")
 
 
+def all_approved() -> bool:
+    """PRE-REVIEW-1 #307-2: flag ON でも要承認の文言が 1 件でも残っていれば受付画面を出さない（status の関所）。"""
+    return verify_pin() and all(e.get("status") == STATUS_APPROVED for e in TEXTS.values())
+
+
 def approval_table() -> list[dict]:
     return [{"id": i, "label": e["label"], "status": e["status"], "text": e["text"]} for i, e in TEXTS.items()]

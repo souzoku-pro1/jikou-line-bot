@@ -25,6 +25,7 @@ import unicodedata
 import uuid
 
 import sqlalchemy as sa
+from sqlalchemy.exc import IntegrityError
 
 from hub import send_ledger
 from hub.db import DatabaseNotConfigured, session_scope
@@ -174,6 +175,9 @@ def status_for(data: dict) -> str:
     return STATUS_OUT_OF_SCOPE if data.get("dispute") == DISPUTE_OUT_OF_SCOPE else STATUS_RECEIVED
 
 
+NONCE_RE = re.compile(r"^[0-9a-f]{32}$")
+
+
 def ledger_key(intake_id: str) -> str:
     return f"{LEDGER_KIND}:{intake_id}"
 
@@ -187,22 +191,40 @@ def notice_text(data: dict, status: str) -> str:
 
 
 # ── 表 ───────────────────────────────────────────────────────────────────────
-async def save(data: dict, *, source: str = SOURCE_WEB, line_user_hash: str | None = None, now=None) -> str:
-    """1 件保存（履歴 created）。戻り値 intake_id。DB 未設定は DatabaseNotConfigured。"""
+async def find_by_event(event_id: str) -> dict | None:
+    async with session_scope() as s:
+        row = (await s.execute(sa.select(souzoku_intake).where(souzoku_intake.c.inbound_event_id == event_id))).first()
+    return dict(row._mapping) if row is not None else None
+
+
+async def save(data: dict, *, source: str = SOURCE_WEB, line_user_hash: str | None = None, now=None,
+               nonce: str | None = None) -> str:
+    """1 件保存（履歴 created）。戻り値 intake_id。DB 未設定は DatabaseNotConfigured。
+    PRE-REVIEW-1 #307-1: 冪等キーは画面が発行した nonce（inbound_event_id=souzoku_intake:{nonce}・UNIQUE）。同じ nonce の
+    再送（F5・戻る→再送信・二重クリック・応答消失後の再送）は IntegrityError → 既存行を返す（行・通知とも増えない）。
+    nonce が無い呼び出し（API 等）は従来どおり intake_id を鍵にする。"""
     if not os.environ.get("DATABASE_URL"):
         raise DatabaseNotConfigured("DATABASE_URL is not set")
     now = now or _now()
     intake_id = uuid.uuid4().hex
     status = status_for(data)
-    async with session_scope() as s:
-        await s.execute(sa.insert(souzoku_intake).values(
-            intake_id=intake_id, business=BUSINESS, source=source, line_user_hash=line_user_hash,
-            deceased_name=data["deceased_name"], deceased_kana=data["deceased_kana"], death_on=data["death_on"],
-            heirs_json=json.dumps(data["heirs"], ensure_ascii=False), heirs_total=int(data["heirs_total"]),
-            will_status=data["will_status"], property_types=",".join(data["property_types"]), dispute=data["dispute"],
-            status=status, notify_state=NOTIFY_NONE, inbound_event_id=ledger_key(intake_id), created_at=now, updated_at=now))
-        await s.execute(sa.insert(souzoku_intake_history).values(
-            intake_id=intake_id, field="status", from_value=None, to_value=status, actor="system", at=now))
+    event_id = ledger_key(nonce if nonce else intake_id)
+    try:
+        async with session_scope() as s:
+            await s.execute(sa.insert(souzoku_intake).values(
+                intake_id=intake_id, business=BUSINESS, source=source, line_user_hash=line_user_hash,
+                deceased_name=data["deceased_name"], deceased_kana=data["deceased_kana"], death_on=data["death_on"],
+                heirs_json=json.dumps(data["heirs"], ensure_ascii=False), heirs_total=int(data["heirs_total"]),
+                will_status=data["will_status"], property_types=",".join(data["property_types"]), dispute=data["dispute"],
+                status=status, notify_state=NOTIFY_NONE, inbound_event_id=event_id, created_at=now, updated_at=now))
+            await s.execute(sa.insert(souzoku_intake_history).values(
+                intake_id=intake_id, field="status", from_value=None, to_value=status, actor="system", at=now))
+    except IntegrityError:
+        existing = await find_by_event(event_id)
+        if existing is None:
+            raise
+        logger.info("[SOUZOKU_INTAKE] duplicate submit (same nonce) count=%s", emit(1, "count", "log", "operator"))
+        return existing["intake_id"]
     logger.info("[SOUZOKU_INTAKE] saved status=%s heirs=%s", emit(status, "freetext", "log", "operator"),
                 emit(int(data["heirs_total"]), "count", "log", "operator"))
     return intake_id
@@ -271,12 +293,18 @@ async def send_notice(intake_id: str, text: str) -> str:
         send_ledger.unbind(token)
 
 
-async def receive(data: dict, *, source: str = SOURCE_WEB, line_user_hash: str | None = None, now=None) -> tuple[str, str, str]:
-    """保存 → 通知（1 通・台帳 key）→ notify_state の記録。戻り値 (intake_id, status, notify_state)。"""
-    intake_id = await save(data, source=source, line_user_hash=line_user_hash, now=now)
+async def receive(data: dict, *, source: str = SOURCE_WEB, line_user_hash: str | None = None, now=None,
+                  nonce: str | None = None) -> tuple[str, str, str]:
+    """保存 → 通知（1 通・台帳 key）→ notify_state の記録。戻り値 (intake_id, status, notify_state)。
+    PRE-REVIEW-1 #307-1: 同じ nonce の再送は既存行をそのまま返す（通知を送らない・notify_state も触らない）。"""
+    before = await find_by_event(ledger_key(nonce)) if nonce else None
+    intake_id = await save(data, source=source, line_user_hash=line_user_hash, now=now, nonce=nonce)
+    if before is not None and before["intake_id"] == intake_id:
+        return intake_id, before["status"], before["notify_state"]
     status = status_for(data)
     try:
-        state = await send_notice(intake_id, notice_text(data, status))
+        # 台帳の受信イベント ID は行の inbound_event_id と同じ鍵（nonce があれば nonce）
+        state = await send_notice(nonce or intake_id, notice_text(data, status))
     except Exception:
         logger.warning("[SOUZOKU_INTAKE] notice failed (fixed reason)")
         state = NOTIFY_FAILED

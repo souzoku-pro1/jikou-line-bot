@@ -10,13 +10,14 @@
 """
 
 import html
+import secrets
 import logging
 import os
 import time
 from collections import OrderedDict
 
 from fastapi import APIRouter, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 from hub import souzoku_intake as S
 from hub import souzoku_intake_texts as T
@@ -40,6 +41,7 @@ _ERROR_LABELS = {
     "will_status": "遺言の有無を選んでください。",
     "property_types": "主な財産の種類を 1 つ以上選んでください。",
     "dispute": "相続人の間の争いの有無を選んでください。",
+    "nonce": "フォームを開き直してから送信してください。",
 }
 _PAGE_STYLE = ("body{font-family:sans-serif;background:#eef1f5;color:#222;margin:0;padding:1rem}.card{max-width:640px;margin:0 auto;"
                "background:#fff;border-radius:14px;padding:1rem 1.2rem}h1{font-size:1.2rem}fieldset{border:1px solid #d8dde5;"
@@ -94,7 +96,16 @@ def reset_rate_limit_for_tests() -> None:
     _buckets.clear()
 
 
-def _form_html(errors: list[str]) -> str:
+_DISPUTE_CODES = {"ある": "a", "ない": "n", "わからない": "u"}
+_DISPUTE_FROM_CODE = {v: k for k, v in _DISPUTE_CODES.items()}
+_DONE_STATUSES = (S.STATUS_RECEIVED, S.STATUS_OUT_OF_SCOPE)
+
+
+def _new_nonce() -> str:
+    return secrets.token_hex(16)
+
+
+def _form_html(errors: list[str], nonce: str | None = None) -> str:
     e = html.escape
     parts = ["<h1>相続のご相談 受付</h1>",
              '<p class="note">6 つの質問にお答えください。お名前以外の個人情報は、この画面では入力しません。</p>']
@@ -118,6 +129,8 @@ def _form_html(errors: list[str]) -> str:
     parts.append('<fieldset><legend>6. 相続人の間で遺産の分け方に争いはありますか</legend>' +
                  "".join(f'<label><input type="radio" name="dispute" value="{e(o)}" required> {e(o)}</label>' for o in DISPUTE_OPTIONS) +
                  "</fieldset>")
+    # PRE-REVIEW-1 #307-1: 冪等キー（画面ごとに 1 つ・再送は同じ nonce＝2 件目を作らない）
+    parts.append(f'<input type="hidden" name="nonce" value="{html.escape(nonce or _new_nonce())}">')
     parts.append('<button type="submit">送信する</button></form>')
     return "".join(parts)
 
@@ -146,8 +159,14 @@ def _content_ok(request: Request) -> bool:
 async def intake_entry(request: Request):
     if not S.enabled():
         return _not_found()
+    if not T.all_approved():
+        # PRE-REVIEW-1 #307-2: flag ON でも要承認の文言が残る間は受付画面を出さない（固定文・保存も通知もしない）
+        return _page("準備中", "<h1>準備中です</h1><p>受付の準備が整うまでお待ちください。</p>", 503)
     if request.method == "GET":
-        return _page("相続のご相談 受付", _form_html([]))
+        done = request.query_params.get("done", "")
+        if done in _DONE_STATUSES:                           # PRG の結果画面（status と争いの区分だけ・PII なし）
+            return _page("相続のご相談 受付", _result_html(done, _DISPUTE_FROM_CODE.get(request.query_params.get("d", ""), "")))
+        return _page("相続のご相談 受付", _form_html([], _new_nonce()))
     if request.method != "POST":
         return _not_found()
     if rate_exceeded(_rate_key(request)):
@@ -157,10 +176,13 @@ async def intake_entry(request: Request):
     form = await request.form()
     plain = {k: form.getlist(k) if k == "property_types" else form.get(k) for k in form.keys()}
     data, errors = S.validate(plain)
+    nonce = str(form.get("nonce") or "")
+    if not S.NONCE_RE.fullmatch(nonce):
+        errors = list(errors) + ["nonce"]
     if errors:
-        return _page("相続のご相談 受付", _form_html(errors), 400)
+        return _page("相続のご相談 受付", _form_html(errors, _new_nonce()), 400)
     try:
-        intake_id, status, state = await S.receive(data)
+        intake_id, status, state = await S.receive(data, nonce=nonce)
     except DatabaseNotConfigured:
         logger.warning("[SOUZOKU_INTAKE] db not configured (intake not saved)")
         return _page("エラーが発生しました", "<h1>エラーが発生しました</h1><p>申し訳ありません。時間をおいて再度お試しください。</p>", 500)
@@ -169,7 +191,8 @@ async def intake_entry(request: Request):
         return _page("エラーが発生しました", "<h1>エラーが発生しました</h1><p>申し訳ありません。時間をおいて再度お試しください。</p>", 500)
     logger.info("[SOUZOKU_INTAKE] received status=%s notify=%s", emit(status, "freetext", "log", "operator"),
                 emit(state, "freetext", "log", "operator"))
-    return _page("相続のご相談 受付", _result_html(status, data["dispute"]))
+    # PRE-REVIEW-1 #307-1: PRG（303 → 結果画面）。再読み込み・戻るで POST が再送されない
+    return RedirectResponse(f"{PATH}?done={status}&d={_DISPUTE_CODES.get(data['dispute'], '')}", status_code=303)
 
 
 async def intake_alias_not_found(request: Request):

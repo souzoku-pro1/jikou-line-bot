@@ -48,6 +48,17 @@ from test_sink_ast_policy import scan_source  # noqa: E402
 REPO = Path(__file__).parent
 _client = TestClient(main.app)
 ADMIN = "U" + "c" * 32
+_LAST = {"nonce": ""}
+
+
+def _post(data: dict, nonce: str | None = None, **kw):
+    """PRE-REVIEW-1 #307-1: 画面が発行する nonce（冪等キー）を付けて POST。省略時は送信ごとに新しい nonce。"""
+    import secrets as _secrets
+    n = nonce if nonce is not None else _secrets.token_hex(16)
+    _LAST["nonce"] = n
+    return _client.post(F.PATH, data={**data, "nonce": n}, **kw)
+
+
 GOOD = {"deceased_name": "山田 太郎", "deceased_kana": "ヤマダ　タロウ", "death_on": "2026-09-01", "heirs_配偶者": "1", "heirs_子": "2",
         "will_status": "なし", "property_types": ["不動産", "預貯金"], "dispute": "ない"}
 
@@ -68,7 +79,7 @@ class TestOffByDefault(unittest.TestCase):
             self.assertEqual(r.status_code, 404, m)
         self.assertEqual(_client.get(F.PATH + "/").status_code, 404)
         self.assertEqual(_client.get(F.PATH + "/x").status_code, 404)
-        self.assertEqual(_client.post(F.PATH, data=GOOD).status_code, 404)
+        self.assertEqual(_post(GOOD).status_code, 404)
 
 
 class TestPure(unittest.TestCase):
@@ -125,7 +136,9 @@ class _Db(unittest.TestCase):
                 await c.run_sync(S.metadata.create_all)
         _run(_create())
         self.push = AsyncMock(return_value=True)
-        self._p = [patch.object(S, "push_line_message", self.push)]
+        # PRE-REVIEW-1 #307-2: 文言が要承認のままだと受付画面は 503 になる（test_not_approved_texts_block_intake）。
+        # 他のテストは承認済み扱いで本体の挙動を検査する
+        self._p = [patch.object(S, "push_line_message", self.push), patch.object(T, "all_approved", lambda: True)]
         for p in self._p:
             p.start()
 
@@ -156,7 +169,7 @@ class TestIntakeFlow(_Db):
         self.assertEqual(r.status_code, 200)
         for q in ("お名前", "亡くなられた日", "続柄と人数", "遺言の有無", "財産の種類", "争い"):
             self.assertIn(q, r.text)
-        r = _client.post(F.PATH, data=GOOD)
+        r = _post(GOOD)
         self.assertEqual(r.status_code, 200)
         self.assertIn(T.text("S-1"), r.text)
         self.assertNotIn("山田", r.text)                                   # 非反射
@@ -173,21 +186,65 @@ class TestIntakeFlow(_Db):
         ops = self.ops()
         self.assertEqual(len(ops), 1)
         self.assertEqual((ops[0]["business"], ops[0]["channel"], ops[0]["purpose"], ops[0]["state"], ops[0]["inbound_event_id"]),
-                         ("souzoku", "souzoku_notice", sl.PURPOSE_OTHER, sl.STATE_SENT, f"souzoku_intake:{row['intake_id']}"))
+                         ("souzoku", "souzoku_notice", sl.PURPOSE_OTHER, sl.STATE_SENT, f"souzoku_intake:{_LAST['nonce']}"))
+        self.assertEqual(row["inbound_event_id"], f"souzoku_intake:{_LAST['nonce']}")   # PRE-REVIEW-1 #307-1: 冪等キー＝nonce
+
+    def test_same_nonce_resubmit_does_not_duplicate_and_post_redirects(self):
+        """PRE-REVIEW-1 #307-1: PRG（303）＋同じ nonce の再送（F5・戻る→再送信・二重クリック）は行も通知も増えない。"""
+        r = _post(GOOD, follow_redirects=False)
+        self.assertEqual(r.status_code, 303)
+        self.assertEqual(r.headers["location"], f"{F.PATH}?done={S.STATUS_RECEIVED}&d=n")
+        self.assertNotIn("山田", r.headers["location"])
+        page = _client.get(r.headers["location"])
+        self.assertEqual(page.status_code, 200)
+        self.assertIn(T.text("S-1"), page.text)
+        nonce = _LAST["nonce"]
+        r2 = _post(GOOD, nonce=nonce, follow_redirects=False)
+        self.assertEqual((r2.status_code, r2.headers["location"]), (303, r.headers["location"]))
+        self.assertEqual(len(self.rows()), 1)
+        self.assertEqual(self.push.await_count, 1)
+        self.assertEqual(len(self.ops()), 1)
+        # 入力を変えても同じ nonce なら 2 件目にならない（既存行の結果へ）
+        r3 = _post(dict(GOOD, dispute="ある"), nonce=nonce, follow_redirects=False)
+        self.assertEqual(r3.status_code, 303)
+        self.assertEqual(len(self.rows()), 1)
+        self.assertEqual(self.rows()[0]["status"], S.STATUS_RECEIVED)
+        # nonce なし／不正は保存しない（固定文）
+        r4 = _client.post(F.PATH, data=GOOD)
+        self.assertEqual(r4.status_code, 400)
+        self.assertIn(F._ERROR_LABELS["nonce"], r4.text)
+        self.assertEqual(_post(GOOD, nonce="zz").status_code, 400)
+        self.assertEqual(len(self.rows()), 1)
+        # 結果画面は status と区分だけ（不正値は素のフォーム）
+        self.assertIn("送信する", _client.get(F.PATH + "?done=bogus").text)
+        self.assertIn('name="nonce"', _client.get(F.PATH).text)
+
+    def test_not_approved_texts_block_intake(self):
+        """PRE-REVIEW-1 #307-2: flag ON でも要承認の文言が残る間は 503 固定文（保存も通知もしない）。"""
+        with patch.object(T, "all_approved", lambda: False):
+            self.assertEqual(_client.get(F.PATH).status_code, 503)
+            r = _post(GOOD)
+        self.assertEqual(r.status_code, 503)
+        self.assertIn("準備中", r.text)
+        self.assertEqual(self.rows(), [])
+        self.assertEqual(self.push.await_count, 0)
+        # 現状の表（S-1〜S-3 needs_approval）では本物の all_approved は False（setUp の patch 外で評価）
+        self.assertFalse(all(e["status"] == T.STATUS_APPROVED for e in T.TEXTS.values()))
+        self.assertIn("def all_approved", (REPO / "hub" / "souzoku_intake_texts.py").read_text(encoding="utf-8"))
 
     def test_dispute_ends_with_out_of_scope_text_and_record(self):
-        r = _client.post(F.PATH, data=dict(GOOD, dispute="ある"))
+        r = _post(dict(GOOD, dispute="ある"))
         self.assertEqual(r.status_code, 200)
         self.assertIn(T.text("S-2"), r.text)
         self.assertNotIn(T.text("S-1"), r.text)
         row = self.rows()[0]
         self.assertEqual(row["status"], S.STATUS_OUT_OF_SCOPE)
         self.assertIn("対象外（争いあり）", self.push.await_args.args[1])
-        r = _client.post(F.PATH, data=dict(GOOD, dispute="わからない"))
+        r = _post(dict(GOOD, dispute="わからない"))
         self.assertIn(T.text("S-3"), r.text)
 
     def test_validation_errors_are_fixed_text_and_not_saved(self):
-        r = _client.post(F.PATH, data=dict(GOOD, deceased_kana="Yamada<script>", death_on="2030-01-01"))
+        r = _post(dict(GOOD, deceased_kana="Yamada<script>", death_on="2030-01-01"))
         self.assertEqual(r.status_code, 400)
         self.assertIn(F._ERROR_LABELS["deceased_kana"], r.text)
         self.assertIn(F._ERROR_LABELS["death_on"], r.text)
@@ -201,24 +258,24 @@ class TestIntakeFlow(_Db):
 
     def test_rate_limit_and_db_unset(self):
         for _ in range(C.INTAKE_RATE_LIMIT):
-            self.assertEqual(_client.post(F.PATH, data=GOOD, headers={"X-Real-IP": "9.9.9.9"}).status_code, 200)
-        self.assertEqual(_client.post(F.PATH, data=GOOD, headers={"X-Real-IP": "9.9.9.9"}).status_code, 429)
+            self.assertEqual(_post(GOOD, headers={"X-Real-IP": "9.9.9.9"}).status_code, 200)
+        self.assertEqual(_post(GOOD, headers={"X-Real-IP": "9.9.9.9"}).status_code, 429)
         self.assertEqual(len(self.rows()), C.INTAKE_RATE_LIMIT)
         F.reset_rate_limit_for_tests()
         with patch.dict(os.environ, {"DATABASE_URL": ""}):
             db.reset_for_tests()
-            r = _client.post(F.PATH, data=GOOD)
+            r = _post(GOOD)
         self.assertEqual(r.status_code, 500)
         self.assertIn("エラーが発生しました", r.text)
 
     def test_notice_failure_is_recorded_not_raised(self):
         self.push.return_value = False
-        r = _client.post(F.PATH, data=GOOD)
+        r = _post(GOOD)
         self.assertEqual(r.status_code, 200)
         self.assertEqual(self.rows()[0]["notify_state"], S.NOTIFY_FAILED)
         self.push.return_value = True
         with patch.dict(os.environ, {"DISPATCHBOT_CHANNEL_ACCESS_TOKEN": ""}):
-            _client.post(F.PATH, data=GOOD)
+            _post(GOOD)
         self.assertEqual(self.rows()[-1]["notify_state"], S.NOTIFY_FAILED)        # token 未設定: 台帳行を作らず failed
 
 
