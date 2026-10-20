@@ -18,6 +18,9 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml.ns import qn
 from docx.shared import Mm, Pt
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+from hub.redact import emit  # noqa: E402
+
 _FIXED_ZIP_TIME = (1980, 1, 1, 0, 0, 0)
 FONT_JA = "ＭＳ 明朝"
 OUT_DEFAULT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "docx_templates", "souzoku", "遺産分割協議書.docx")
@@ -97,7 +100,9 @@ def main(argv) -> int:
     os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
     with open(out, "wb") as f:
         f.write(data)
-    print(f"written bytes={len(data)} sha256={hashlib.sha256(data).hexdigest()}")
+    # sink 規律（test_sink_ast_policy）: print 引数は定数+emit() のみ（出力先 path は argv 由来のため出さない）。
+    print("written: docx_templates/souzoku/遺産分割協議書.docx (or argv[1])")
+    print("TEMPLATE_SHA256 =", emit(hashlib.sha256(data).hexdigest(), "record_id", "log", "operator"))
     return 0
 
 
