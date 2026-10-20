@@ -29,6 +29,7 @@ from hub.shindan_link import metadata as shindan_link_metadata  # noqa: E402（S
 from hub.brain_ledger import metadata as brain_ledger_metadata  # noqa: E402（BRAIN-A1-LEDGER-1・案件脳台帳）
 from hub.send_ledger import metadata as send_ledger_metadata  # noqa: E402（JIKOU-REPLY-Q1a・送信操作記録）
 from hub.souzoku_intake import metadata as souzoku_intake_metadata  # noqa: E402（SOUZOKU-2・相続相談受付）
+from hub.souzoku_heirs import metadata as souzoku_heirs_metadata  # noqa: E402（SOUZOKU-3・相続人の確定）
 
 config = context.config
 
@@ -42,7 +43,7 @@ target_metadata = [Base.metadata, heartbeat_metadata, service_auth_metadata,
                    PersonMergeJournalBase.metadata, qa_store_metadata,
                    shindan_link_metadata, brain_ledger_metadata,
                    send_ledger_metadata,
-                   souzoku_intake_metadata]
+                   souzoku_intake_metadata, souzoku_heirs_metadata]
 
 
 def run_migrations_offline() -> None:

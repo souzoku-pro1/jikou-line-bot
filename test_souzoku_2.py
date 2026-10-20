@@ -308,7 +308,9 @@ class TestPins(unittest.TestCase):
             self.assertEqual(scan_source((REPO / name).read_text(encoding="utf-8"), name), [], name)
             self.assertNotIn(name.split("/")[-1][:-3], allow)
         src = (REPO / "main.py").read_text(encoding="utf-8").split("\n")
-        self.assertIn("app.include_router(souzoku_intake_router)", "\n".join(src[-3:]))
+        # SOUZOKU-3（H-4）で末尾に heirs 画面の結線が 4 行追記されたため、EOF 窓 3 行→見出し基準（SOUZOKU-2 ブロック以降）に変更
+        start = next(i for i, l in enumerate(src) if "SOUZOKU-2（QUEUE-2026-10-16-R G-5）" in l)
+        self.assertIn("app.include_router(souzoku_intake_router)", "\n".join(src[start:]))
         for name in ("hub/souzoku_intake.py", "souzoku_intake_form.py"):
             body = (REPO / name).read_text(encoding="utf-8").split('"""', 2)[2]
             for bad in ("line_channel", "push_text(", "reply_with_push_fallback", "kintone"):

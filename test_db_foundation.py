@@ -964,7 +964,8 @@ class TestSendLedgerMigration(unittest.TestCase):
             # SOUZOKU-2: head（b0c1d2e3f4a5）で souzoku_intake 2 表（列集合が hub/souzoku_intake.metadata と一致）。downgrade で消え e5f8 の表は残る
             from hub import souzoku_intake
             self.assertFalse(set(souzoku_intake.TABLE_NAMES) & tables())
-            up = alembic("upgrade", "head")
+            # SOUZOKU-3（QUEUE-2026-10-17-H H-4）で head が c1d3e5f7a9b2 へ進んだため b0c1 までを明示（既存パターン）
+            up = alembic("upgrade", "b0c1d2e3f4a5")
             self.assertEqual(up.returncode, 0, f"stderr={up.stderr[-800:]}")
             self.assertIn("b0c1d2e3f4a5", alembic("current").stdout)
             self.assertTrue(set(souzoku_intake.TABLE_NAMES) <= tables())
@@ -976,6 +977,36 @@ class TestSendLedgerMigration(unittest.TestCase):
                 self.assertIn(("inbound_event_id",), unique_cols(con, "souzoku_intake"))
             finally:
                 con.close()
+            # SOUZOKU-3: head（c1d3e5f7a9b2）で souzoku_heirs 2 表（列集合が hub/souzoku_heirs.metadata と一致）。データがあれば downgrade 拒否
+            from hub import souzoku_heirs
+            self.assertFalse(set(souzoku_heirs.TABLE_NAMES) & tables())
+            up = alembic("upgrade", "head")
+            self.assertEqual(up.returncode, 0, f"stderr={up.stderr[-800:]}")
+            self.assertIn("c1d3e5f7a9b2", alembic("current").stdout)
+            self.assertTrue(set(souzoku_heirs.TABLE_NAMES) <= tables())
+            con = sqlite3.connect(dbfile)
+            try:
+                for name in souzoku_heirs.TABLE_NAMES:
+                    cols = {r[1] for r in con.execute(f'PRAGMA table_info("{name}")')}
+                    self.assertEqual(cols, {c.name for c in souzoku_heirs.metadata.tables[name].columns}, name)
+                self.assertIn(("intake_id", "version"), unique_cols(con, "souzoku_heirs"))
+                con.execute("INSERT INTO souzoku_heirs(heirs_id, intake_id, business, version, input_json, result_json, result, status, "
+                            "law_table_version, created_at) VALUES ('h', 'i', 'souzoku', 1, '{}', '{}', 'determined', 'draft', 'v', '2026-10-17')")
+                con.commit()
+            finally:
+                con.close()
+            down = alembic("downgrade", "b0c1d2e3f4a5")
+            self.assertNotEqual(down.returncode, 0)
+            self.assertIn("souzoku_heirs_downgrade_refused_data_present", down.stderr + down.stdout)
+            con = sqlite3.connect(dbfile)
+            try:
+                con.execute("DELETE FROM souzoku_heirs")
+                con.commit()
+            finally:
+                con.close()
+            down = alembic("downgrade", "b0c1d2e3f4a5")
+            self.assertEqual(down.returncode, 0, f"stderr={down.stderr[-800:]}")
+            self.assertFalse(set(souzoku_heirs.TABLE_NAMES) & tables())
             down = alembic("downgrade", self.SEND_LEDGER)
             self.assertEqual(down.returncode, 0, f"stderr={down.stderr[-800:]}")
             self.assertFalse(set(souzoku_intake.TABLE_NAMES) & tables())
