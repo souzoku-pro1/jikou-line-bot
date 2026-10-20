@@ -2357,3 +2357,29 @@ send_ledger.register_recover_job()
 send_ledger.check_dialect_at_startup()
 # fix3 BQ-09: 時間設定の整合（heartbeat < 送信 timeout < deadline < 回収閾値）。不整合は警告+既定値
 send_ledger.check_timing_config()
+
+# ── HOUKI-DAIRININ-1（QUEUE-2026-10-12-C C-3）: 代理人目録の生成受け口（/souzoku-houki/dairinin/{secret}）。末尾追記。
+from dairinin_webhook import router as dairinin_router  # noqa: E402
+app.include_router(dairinin_router)
+
+# ── HOUKI-KOSEKI-CHECKLIST-1（QUEUE-2026-10-12-C C-4）: 受任時の必要戸籍チェックリスト初期行（定期走査+受け口）と
+#    連続戸籍充足の候補通知。末尾追記。走査ジョブは常に登録し、実行可否は env HOUKI_KOSEKI_CHECKLIST_DISABLED
+#    （既定 有効）。start_all は既存 startup 経路が呼ぶ。
+from houki_koseki_webhook import router as houki_koseki_router  # noqa: E402
+app.include_router(houki_koseki_router)
+from hub.houki_koseki_checklist import register_houki_koseki_job  # noqa: E402
+register_houki_koseki_job()
+
+# ── HOUKI-JIJOU-1（QUEUE-2026-10-13-D D-5）: 上申書（事情説明書）の下書き・承認・生成画面（/app/houki/jijou）の結線。末尾追記。
+from hub.webapp_houki_jijou_view import router as houki_jijou_router  # noqa: E402
+include_before_catch_all(app, houki_jijou_router)
+
+# ── HOUKI-SHOKUMU-LINK-1（QUEUE-2026-10-13-D D-6）: App 40 → 職務上請求の請求案の受け口（flag OFF は I/O ゼロ）。末尾追記。
+from houki_shokumu_webhook import router as houki_shokumu_router  # noqa: E402
+app.include_router(houki_shokumu_router)
+
+# ── HOUKI-JUKURYO-3（QUEUE-2026-10-13-D D-7）: 期限超過×未提出の一覧（/app/houki/overdue）と日次の件数通知。末尾追記。
+from hub.houki_overdue import register_houki_overdue_job  # noqa: E402
+from hub.webapp_houki_overdue_view import router as houki_overdue_router  # noqa: E402
+include_before_catch_all(app, houki_overdue_router)
+app.router.on_startup.append(register_houki_overdue_job)   # 起動時に daily 登録（import 時にループを要求しない）
