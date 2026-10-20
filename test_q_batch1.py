@@ -17,6 +17,8 @@
 
 import asyncio
 import logging
+
+from test_support_logcap import attached as _logcap_attached  # noqa: E402
 import os
 import shutil
 import tempfile
@@ -459,21 +461,11 @@ class TestPiiSentinel(_DbMixin):
         heirs = {"records": [_rec(**{"$id": "201", "氏名": "n",
                                      "戸籍確認済": "yes"})],
                  "excluded_cancelled_count": 0}
-        records = []
-
-        class _Cap(logging.Handler):
-            def emit(self, record):
-                records.append(record.getMessage())
-
-        cap = _Cap()
-        root = logging.getLogger()
-        root.addHandler(cap)
-        old = root.level
         # 本番の実効レベル=INFO 基準（DEBUG は aiosqlite 等が SQL 引数を内部
         # ログに含み得るが、本番では emit されない。アプリ自身のログ経路に
         # 質問・回答が載らないことを INFO 以上で実測する）
-        root.setLevel(logging.INFO)
-        try:
+        # TEST-FLAKY-1: root だけでなく hub／main の logger にも直付け（他テストが level／propagate を変えても見える）
+        with _logcap_attached(("hub", "main"), level=logging.INFO, include_root=True) as cap:
             with patch.dict(os.environ, _ENV), \
                  patch.object(wq, "_anthropic_client", lambda: stub), \
                  patch.object(wq.souzoku_dash, "_load_heirs",
@@ -484,11 +476,8 @@ class TestPiiSentinel(_DbMixin):
             with patch.dict(os.environ, _ENV):
                 h = _client.get("/app/api/q/history", headers=_auth_headers(),
                                 follow_redirects=False)
-        finally:
-            root.setLevel(old)
-            root.removeHandler(cap)
         self.assertEqual(r.status_code, 303)
-        logs = "\n".join(records)
+        logs = "\n".join(cap.messages())
         self.assertNotIn(sent_q, logs)
         self.assertNotIn(sent_a, logs)
         rec = h.json()["records"][0]

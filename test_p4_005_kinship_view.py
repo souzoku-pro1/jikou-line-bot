@@ -270,19 +270,11 @@ class TestApiBehavior(_ApiBase):
         sentinel = "STDERR_SENTINEL_dot断片<svg破損>"
         self.render.side_effect = KinshipRenderError(
             f"dot 実行エラー: {sentinel}")
-        records: list[str] = []
-
-        class _Capture(_logging.Handler):
-            def emit(self, record):
-                records.append(record.getMessage())
-
-        handler = _Capture(level=_logging.DEBUG)
-        root = _logging.getLogger()
-        root.addHandler(handler)
-        try:
+        # TEST-FLAKY-1: root だけでなく hub／main の logger にも直付け（本 module は logger を持たないことを下で静的 pin）
+        from test_support_logcap import attached as _logcap_attached
+        with _logcap_attached(("hub", "main"), include_root=True) as cap:
             r = self._get()
-        finally:
-            root.removeHandler(handler)
+        records = cap.messages()
         self.assertEqual(r.status_code, 200)
         data = r.json()
         self.assertEqual(data["status"], "unavailable")     # 閉集合内へ正規化

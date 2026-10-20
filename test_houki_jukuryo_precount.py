@@ -92,6 +92,11 @@ class TestEntryHardening(unittest.TestCase):
         import logging
         saved_hook = sys.excepthook
         saved_root = (list(logging.getLogger().handlers), logging.getLogger().level)
+        # TEST-FLAKY-1: スクリプトの import は "hub" 等の名前付き logger の level も WARNING に変える（本番では正しい）。
+        # テスト間に持ち越すと hub.* の INFO を捕捉する他テストが順序依存で落ちるため、名前付き logger の level も復元する
+        _named = ("httpx", "httpcore", "hub", "asyncio", "truststore", "scripts.houki_jukuryo_precount")
+        saved_named = {n: (logging.getLogger(n).level, list(logging.getLogger(n).handlers),
+                           logging.getLogger(n).propagate) for n in _named}
         try:
             spec = importlib.util.spec_from_file_location("houki_precount_mod", SCRIPT)
             mod = importlib.util.module_from_spec(spec)
@@ -120,6 +125,14 @@ class TestEntryHardening(unittest.TestCase):
             for h in saved_root[0]:
                 root.addHandler(h)
             root.setLevel(saved_root[1])
+            for n, (lvl, handlers, prop) in saved_named.items():
+                lg = logging.getLogger(n)
+                lg.setLevel(lvl)
+                for h in list(lg.handlers):
+                    lg.removeHandler(h)
+                for h in handlers:
+                    lg.addHandler(h)
+                lg.propagate = prop
 
     def test_script_has_no_write_or_send_calls(self):
         impl = REPO / "scripts" / "houki_jukuryo_precount_impl.py"
