@@ -979,7 +979,8 @@ class TestReplyExemplarMigration(unittest.TestCase):
     REPLY_EXEMPLAR = "f7b2c9d4e1a6"
     REPLY_PENDING = "a1c3e5f7b9d2"      # JIKOU-REPLY-Q1c: 対応待ち（f7b2 の後ろ）
     DRAFT_APPROVAL = "b2d4f6a8c0e1"     # JIKOU-REPLY-Q3a: 下書き照合（a1c3 の後ろ）
-    REPLY_DRAFT = "c3e5a7b9d1f3"        # JIKOU-REPLY-Q3b: AI 下書き（b2d4 の後ろ・head）
+    REPLY_DRAFT = "c3e5a7b9d1f3"        # JIKOU-REPLY-Q3b: AI 下書き（b2d4 の後ろ）
+    DRAFT_OUTCOME = "d4f6b8c0e2a4"      # JIKOU-REPLY-Q4: reply_draft_approval.outcome（c3e5 の後ろ・head）
 
     def test_reply_exemplar_migration_round_trip(self):
         import sqlite3
@@ -1014,10 +1015,22 @@ class TestReplyExemplarMigration(unittest.TestCase):
             # JIKOU-REPLY-Q3b: head（c3e5a7b9d1f3）で reply_draft 2 表が増え、列集合が hub/reply_draft.metadata と一致
             from hub import reply_draft
             self.assertNotIn(reply_draft.TABLE_NAME, tables())
-            up = alembic("upgrade", "head")
+            up = alembic("upgrade", self.REPLY_DRAFT)
             self.assertEqual(up.returncode, 0, f"stderr={up.stderr[-800:]}")
             self.assertIn(self.REPLY_DRAFT, alembic("current").stdout)
             self.assertTrue(set(reply_draft.TABLE_NAMES) <= tables())
+            # JIKOU-REPLY-Q4: head（d4f6b8c0e2a4）で reply_draft_approval に outcome 列（列集合が metadata と一致）
+            up = alembic("upgrade", "head")
+            self.assertEqual(up.returncode, 0, f"stderr={up.stderr[-800:]}")
+            self.assertIn(self.DRAFT_OUTCOME, alembic("current").stdout)
+            con = sqlite3.connect(dbfile)
+            try:
+                cols = {r[1] for r in con.execute(f'PRAGMA table_info("{reply_exemplar.DRAFT_TABLE_NAME}")')}
+                self.assertEqual(cols, {c.name for c in reply_exemplar.reply_draft_approval.columns})
+            finally:
+                con.close()
+            down = alembic("downgrade", self.REPLY_DRAFT)
+            self.assertEqual(down.returncode, 0, f"stderr={down.stderr[-800:]}")
             con = sqlite3.connect(dbfile)
             try:
                 for t in reply_draft.TABLE_NAMES:
@@ -1036,7 +1049,8 @@ class TestReplyExemplarMigration(unittest.TestCase):
             con = sqlite3.connect(dbfile)
             try:
                 cols = {r[1] for r in con.execute(f'PRAGMA table_info("{reply_exemplar.DRAFT_TABLE_NAME}")')}
-                self.assertEqual(cols, {c.name for c in reply_exemplar.reply_draft_approval.columns})
+                # JIKOU-REPLY-Q4: outcome 列は d4f6 で追加（b2d4 段階では無い）
+                self.assertEqual(cols, {c.name for c in reply_exemplar.reply_draft_approval.columns} - {"outcome"})
                 self.assertTrue(nullable(con, reply_exemplar.DRAFT_TABLE_NAME)["unmodified"])
                 self.assertFalse(nullable(con, reply_exemplar.DRAFT_TABLE_NAME)["draft_text_version"])
             finally:
