@@ -43,6 +43,7 @@ from hub import send_ledger as sl  # noqa: E402
 from hub import souzoku_constants as C  # noqa: E402
 from hub import souzoku_intake as S  # noqa: E402
 from hub import souzoku_intake_texts as T  # noqa: E402
+from hub import approved_texts as AT  # noqa: E402  TEXT-APPROVAL-GATE-1（H-0）
 from test_sink_ast_policy import scan_source  # noqa: E402
 
 REPO = Path(__file__).parent
@@ -138,9 +139,14 @@ class _Db(unittest.TestCase):
         self.push = AsyncMock(return_value=True)
         # PRE-REVIEW-1 #307-2: 文言が要承認のままだと受付画面は 503 になる（test_not_approved_texts_block_intake）。
         # 他のテストは承認済み扱いで本体の挙動を検査する
-        self._p = [patch.object(S, "push_line_message", self.push), patch.object(T, "all_approved", lambda: True)]
+        # TEXT-APPROVAL-GATE-1（H-0）: 表示は承認台帳（SHA 一致）だけが決める。「承認済み扱い」のテストは台帳にも S-1〜S-3 を
+        # 載せる（test_unapproved_texts_render_safe_text_and_notify_once が台帳なし＝安全文の経路を検査する）
+        approved = {k: AT.sha256_text(T.text(k)) for k in ("S-1", "S-2", "S-3")}
+        self._p = [patch.object(S, "push_line_message", self.push), patch.object(T, "all_approved", lambda: True),
+                   patch.dict(AT.APPROVED_SHA256, approved)]
         for p in self._p:
             p.start()
+        AT.reset_pending_for_tests()
 
     def tearDown(self):
         for p in self._p:
@@ -242,6 +248,22 @@ class TestIntakeFlow(_Db):
         self.assertIn("対象外（争いあり）", self.push.await_args.args[1])
         r = _post(dict(GOOD, dispute="わからない"))
         self.assertIn(T.text("S-3"), r.text)
+
+    def test_unapproved_texts_render_safe_text_and_notify_once(self):
+        # TEXT-APPROVAL-GATE-1（H-0）: 台帳に S-1 が無い（未承認）→ 結果画面は安全文・未承認本文は出ない・
+        # 業務 LINE へ「未承認文言の参照 key=S-1」が 1 日 1 回（台帳 key text_unapproved:{JST 日付}・2 回目は DUPLICATE）
+        notify = AsyncMock(return_value=True)
+        with patch.dict(AT.APPROVED_SHA256, {AT.SAFE_TEXT_KEY: AT.APPROVED_SHA256[AT.SAFE_TEXT_KEY]}, clear=True),                 patch("hub.notify.notify_admin_line", notify):
+            r = _client.get(F.PATH + f"?done={S.STATUS_RECEIVED}&d=n")
+            self.assertEqual(r.status_code, 200)
+            self.assertIn(AT.SAFE_TEXT, r.text)
+            self.assertNotIn(T.text("S-1"), r.text)
+            r2 = _client.get(F.PATH + f"?done={S.STATUS_RECEIVED}&d=n")
+            self.assertIn(AT.SAFE_TEXT, r2.text)
+        notify.assert_awaited_once()
+        self.assertIn("key=S-1", notify.await_args.args[0])
+        self.assertNotIn(T.text("S-1"), notify.await_args.args[0])
+        self.assertEqual(len([o for o in self.ops() if o["channel"] == AT.LEDGER_CHANNEL]), 1)
 
     def test_validation_errors_are_fixed_text_and_not_saved(self):
         r = _post(dict(GOOD, deceased_kana="Yamada<script>", death_on="2030-01-01"))
