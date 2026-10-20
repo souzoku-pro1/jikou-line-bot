@@ -1,0 +1,18 @@
+{
+  "gas-ingest-2026-07a": {
+    "caller": "gas-ingest",
+    "allowed_methods": ["POST"],
+    "allowed_paths": ["/koseki/ingest", "/registry/ingest", "/bank/ingest", "/sortation/ingest", "/valuation/ingest", "/scan"],
+    "status": "active",
+    "not_before": 1784127600,
+    "expires_at": 1798729200
+  },
+  "pc-watcher-2026-08a": {
+    "caller": "pc-watcher",
+    "allowed_methods": ["POST"],
+    "allowed_paths": ["/ocr/fixed-asset"],
+    "status": "active",
+    "not_before": 1786806000,
+    "expires_at": 1798729200
+  }
+}

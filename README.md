@@ -83,6 +83,7 @@ kintone
 | `LINE_ADMIN_USER_ID` | （任意）管理者通知先。未設定なら `ATTORNEY_LINE_USER_ID` に通知 |
 | `HEALTHCHECK_HOUR_JST` | （任意）日次死活監視の実行時刻（JST・デフォルト `7`） |
 | `HEALTHCHECK_DISABLED` | （任意）`1` で日次死活監視を無効化 |
+| `REGISTRY_EXPIRY_WARN_DAYS` | （任意）HMAC 鍵 registry の失効前警告の日数（デフォルト `14`・要大野確認） |
 
 ---
 
@@ -253,12 +254,43 @@ Anthropic からモデル廃止（deprecation / retirement）通知メールが�
 | モデルが Models API に存在しない | モデル廃止 | 上記「モデル廃止通知が来たときの運用手順」を実施 |
 | フィールドが存在しない / 型不一致 | kintone アプリのフィールドコード変更・削除 | kintone 側を戻すか、コード（`config.EXPECTED_KINTONE_SCHEMA` と参照箇所）を修正 |
 | 選択肢がない | kintone のドロップダウン選択肢の削除・改名 | 同上（コードが書き込む値は選択肢に存在しないと登録エラーになる） |
+| 【高】HMAC鍵registry: 有効鍵の全部が N 日以内に失効 / 【中】… が N 日以内に失効 | 署名鍵 `SERVICE_HMAC_KEY_REGISTRY` の `expires_at` 接近・失効（全鍵失効のまま再デプロイすると起動停止） | 下記「HMAC 鍵 registry の点検と延長」。閾値は `REGISTRY_EXPIRY_WARN_DAYS`（既定 14・要大野確認）。期限を持つ資格情報の一覧は `docs/credentials_expiry.md` |
 
 手動実行（異常があれば exit code 1）:
 
 ```bash
 railway run python daily_healthcheck.py
 ```
+
+### HMAC 鍵 registry の点検と延長（REGISTRY-EXPIRY-WARN-1）
+
+署名付き受信（GAS・事務所 PC watcher）の鍵は `SERVICE_HMAC_KEY_REGISTRY`（JSON）に入り、鍵ごとに `expires_at` を持つ。
+**全鍵が失効したまま再デプロイすると起動時検証で止まる**（2026-10-17 に 4 日間停止）。点検・延長・再構成は
+`scripts/registry_tool.py`（秘密値は表示しない）で行う。
+
+```bash
+# 点検（本番 env を読む・鍵 ID/状態/残日数/実効鍵数のみ表示・実効鍵 0 なら exit 1）
+railway run python scripts/registry_tool.py check
+
+# 延長（全 entry の expires_at を指定日 JST 0 時へ。%TEMP%/reg.json に書くだけ・空/不正/実効鍵 0 なら書かず exit 2）
+railway run python scripts/registry_tool.py extend --until 2027-07-01
+
+# 再構成（メタデータ template + reg_secret_<kid>.txt。secret が無い kid は生成＝送信側へ配布が要る）
+python scripts/registry_tool.py rebuild --template scripts/registry_template.example.json --secrets-dir "$HOME"
+```
+
+**set は別コマンドで、`&&` で直結しない**（`railway run` は子の失敗でも exit 0 を返しうる。2026-10-20 に
+`$(cat /tmp/…)` の空展開で registry が空文字で上書きされた）。出力先は Python 側で `%TEMP%` を解決しているので
+Git Bash の `$TEMP` と一致する（`/tmp` は使わない）。
+
+```bash
+railway variables --set "SERVICE_HMAC_KEY_REGISTRY=$(cat "$TEMP/reg.json")"
+rm "$TEMP/reg.json"
+railway run python scripts/registry_tool.py check     # effective_keys が期待どおりか
+```
+
+rotation（鍵の差し替え）は「新 kid を追加 → 送信側（GAS Script Properties `RV04C_KEY_ID`/`RV04C_SECRET_HEX`・watcher）を
+切替 → 旧 kid を `revoked`」の順。期限の一覧と担当は `docs/credentials_expiry.md`。
 
 ### Claude フォールバック警報が届いたとき
 

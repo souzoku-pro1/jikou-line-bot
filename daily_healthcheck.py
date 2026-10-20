@@ -628,6 +628,15 @@ async def run_healthcheck() -> list[str]:
             # DB接続情報が例外本文に含まれ得るため分類のみ（RCF-M05流儀）
             problems.append(f"LINE滞留監視の実行自体が失敗: {type(e).__name__}")
 
+    # 監視項目J（REGISTRY-EXPIRY-WARN-1・QUEUE-2026-10-20-J J-1）: HMAC 鍵 registry の失効前警告。
+    # 有効鍵 0 本/全部が N 日以内=高で毎日・余裕鍵が残る=中で週 1 回（JST 月曜）。鍵 ID と残日数のみ
+    # （秘密値は扱わない）。2026-10-17 の全鍵失効→起動停止（4 日）の再発防止。
+    try:
+        from hub.registry_expiry import healthcheck_problems as _registry_expiry_problems
+        problems += _registry_expiry_problems()
+    except Exception as e:
+        problems.append(f"HMAC鍵registry監視の実行自体が失敗: {type(e).__name__}")
+
     # RV-04c D2-M01: NEXT 残置 notice（警報ではない・problems に混ぜない）。
     notice = check_next_token_residual()
 
