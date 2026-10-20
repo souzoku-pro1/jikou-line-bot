@@ -11,6 +11,9 @@ QUEUE-2026-10-16-R F-5。実行: `python scripts/audit_static.py --repo <root> -
   (c) DELETE 文・物理削除 API（sa.delete・delete_record・DELETE FROM・drop_table・os.remove／unlink・shutil.rmtree）。
   (d) 秘密値らしき文字列リテラル（鍵の接頭辞・長い英数列・password／token／secret の直書き）。
   (e) 未使用の関数・モジュール候補（定義名が他所で一度も参照されない）。
+  (f) 相談者向け文言表（hub/*_texts.py）の status=needs_approval 項目を、Q4 経路以外の module の関数本体で
+      text/entry/TEXTS[...]/TEXTS.get の ID 定数で直接参照している箇所（TEXT-APPROVAL-GATE-1・H-0。
+      approved_texts の表示ゲート呼出の内側は除外・module レベルの配線は別途「配線」として列挙）。
 分類は「要修正」「誤検知」「判断保留」の 3 値。本スクリプトは **機械規則で仮分類**し（CLASSIFY_RULES）、最終分類は人が報告で確定する。
 sink 方針: print は定数のみ（結果はファイルへ書く）。
 """
@@ -75,6 +78,7 @@ CATEGORY_C = "c_delete"
 CATEGORY_D = "d_secret_literal"
 CATEGORY_E_FUNC = "e_unused_function"
 CATEGORY_E_MOD = "e_unused_module"
+CATEGORY_F = "f_unapproved_text_direct_ref"
 
 CLASS_FIX = "要修正"
 CLASS_FALSE = "誤検知"
@@ -309,6 +313,143 @@ def audit_secrets(rel: str, tree, src_lines: list[str]) -> list[Finding]:
     return out
 
 
+# ── (f) 未承認文言の直接参照（TEXT-APPROVAL-GATE-1・QUEUE-2026-10-20-HI H-0）────────────
+#    test_text_approval_gate.py の checker と同じ規則の自己完結コピー（本スクリプトは repo の import をしない規約・
+#    共通ヘルパ化は両ブランチ merge 後の小票）。
+TEXT_ACCESSORS = frozenset({"text", "entry", "get"})
+GATE_FUNCS = frozenset({"approved_or_safe", "approved_text", "gate_and_notify"})
+Q4_PATH_MODULES = frozenset({"hub/reply_draft.py", "hub/reply_draft_approval.py", "hub/jikou_progress.py",
+                             "hub/webapp_drafts_view.py"})
+TEXT_GATE_MODULES = frozenset({"hub/approved_texts.py"})
+
+
+def _is_needs_approval_node(node) -> bool:
+    if isinstance(node, ast.Constant):
+        return node.value == "needs_approval"
+    if isinstance(node, ast.Name):
+        return node.id == "STATUS_NEEDS_APPROVAL"
+    return isinstance(node, ast.Attribute) and node.attr == "STATUS_NEEDS_APPROVAL"
+
+
+def _needs_approval_ids(tree) -> set:
+    ids: set = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Dict):
+            continue
+        for k, v in zip(node.keys, node.values):
+            if not (isinstance(k, ast.Constant) and isinstance(k.value, str)):
+                continue
+            if isinstance(v, ast.Dict):
+                for kk, vv in zip(v.keys, v.values):
+                    if isinstance(kk, ast.Constant) and kk.value == "status" and _is_needs_approval_node(vv):
+                        ids.add(k.value)
+            elif isinstance(v, ast.Call):
+                if any(kw.arg == "status" and _is_needs_approval_node(kw.value) for kw in v.keywords):
+                    ids.add(k.value)
+    return ids
+
+
+def _texts_aliases(tree, module_names: set) -> tuple:
+    aliases: set = set()
+    direct: set = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                if a.name.split(".")[-1] in module_names:
+                    aliases.add(a.asname or a.name.split(".")[0])
+        elif isinstance(node, ast.ImportFrom):
+            mod = (node.module or "").split(".")
+            if mod and mod[-1] in module_names:
+                for a in node.names:
+                    if a.name in TEXT_ACCESSORS or a.name == "TEXTS":
+                        direct.add(a.asname or a.name)
+            elif node.module == "hub":
+                for a in node.names:
+                    if a.name in module_names:
+                        aliases.add(a.asname or a.name)
+    return aliases, direct
+
+
+def _text_accessor_id(node, aliases: set, direct: set):
+    def cs(n):
+        return n.value if isinstance(n, ast.Constant) and isinstance(n.value, str) else None
+    if isinstance(node, ast.Call) and node.args:
+        f = node.func
+        if isinstance(f, ast.Attribute) and f.attr in TEXT_ACCESSORS:
+            o = f.value
+            if isinstance(o, ast.Name) and o.id in aliases:
+                return cs(node.args[0])
+            if isinstance(o, ast.Attribute) and o.attr == "TEXTS" and isinstance(o.value, ast.Name) and o.value.id in aliases:
+                return cs(node.args[0])
+            if isinstance(o, ast.Name) and o.id == "TEXTS" and "TEXTS" in direct:
+                return cs(node.args[0])
+        if isinstance(f, ast.Name) and f.id in direct and f.id in TEXT_ACCESSORS:
+            return cs(node.args[0])
+    if isinstance(node, ast.Subscript):
+        v = node.value
+        if (isinstance(v, ast.Attribute) and v.attr == "TEXTS" and isinstance(v.value, ast.Name) and v.value.id in aliases) \
+                or (isinstance(v, ast.Name) and v.id == "TEXTS" and "TEXTS" in direct):
+            return cs(node.slice)
+    return None
+
+
+def _is_gate_call(node) -> bool:
+    if not isinstance(node, ast.Call):
+        return False
+    f = node.func
+    name = f.attr if isinstance(f, ast.Attribute) else (f.id if isinstance(f, ast.Name) else "")
+    return name in GATE_FUNCS
+
+
+def audit_text_approval(repo: Path, files: list[Path]) -> list[Finding]:
+    """(f): 文言表の needs_approval ID を、Q4 経路以外の module が関数本体で直接参照していないか。
+    module レベルの参照（配線）は違反ではなく「判断保留」で列挙する（送信経路の設計確認用）。"""
+    out: list[Finding] = []
+    ids_by_module: dict = {}
+    texts_rel: set = set()
+    for p in files:
+        rel = p.relative_to(repo).as_posix()
+        if not rel.endswith("_texts.py"):
+            continue
+        try:
+            tree = ast.parse(p.read_text(encoding="utf-8", errors="replace"))
+        except SyntaxError:
+            continue
+        texts_rel.add(rel)
+        ids = _needs_approval_ids(tree)
+        if ids:
+            ids_by_module[p.stem] = ids
+    if not ids_by_module:
+        return out
+    all_ids: set = set().union(*ids_by_module.values())
+    for p in files:
+        rel = p.relative_to(repo).as_posix()
+        if rel in texts_rel or rel in TEXT_GATE_MODULES or rel in Q4_PATH_MODULES or rel.startswith("scripts/"):
+            continue
+        try:
+            tree = ast.parse(p.read_text(encoding="utf-8", errors="replace"))
+        except SyntaxError:
+            continue
+        aliases, direct = _texts_aliases(tree, set(ids_by_module))
+        if not aliases and not direct:
+            continue
+
+        def visit(node, in_func, under_gate):
+            is_func = isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            tid = _text_accessor_id(node, aliases, direct)
+            if tid is not None and tid in all_ids and not under_gate:
+                if in_func:
+                    out.append(Finding(CATEGORY_F, rel, node.lineno, f"direct: {tid}"))
+                else:
+                    out.append(Finding(CATEGORY_F, rel, node.lineno, f"module-level: {tid}"))
+            gate = under_gate or _is_gate_call(node)
+            for child in ast.iter_child_nodes(node):
+                visit(child, in_func or is_func, gate)
+
+        visit(tree, False, False)
+    return out
+
+
 # ── (e) 未使用候補 ───────────────────────────────────────────────────────────
 def _token_counts(text: str) -> dict:
     out: dict = {}
@@ -444,6 +585,11 @@ def classify(f: Finding) -> None:
             f.classification, f.reason = CLASS_HOLD, "秘密値らしき文字列（固定 pin／テスト値の可能性・要目視）"
     elif f.category == CATEGORY_E_FUNC:
         f.classification, f.reason = CLASS_HOLD, "未使用候補（動的参照・外部入口の可能性・削除は大野判断）"
+    elif f.category == CATEGORY_F:
+        if f.detail.startswith("module-level"):
+            f.classification, f.reason = CLASS_HOLD, "module レベルの配線（送信経路が status で fail-closed か・承認台帳経由にすべきかを設計で確認）"
+        else:
+            f.classification, f.reason = CLASS_FIX, "未承認文言の直接参照（approved_texts.approved_or_safe／gate_and_notify を通すこと・TEXT-APPROVAL-GATE-1）"
     elif f.category == CATEGORY_E_MOD:
         name = f.file.split("/")[-1]
         if name.startswith(STANDALONE_MODULE_PREFIXES):
@@ -473,6 +619,7 @@ def run(repo: Path) -> list[Finding]:
         findings += audit_deletes(rel, lines)
         findings += audit_secrets(rel, tree, lines)
     findings += audit_unused(repo, files, all_files)
+    findings += audit_text_approval(repo, files)
     for f in findings:
         if not f.reason:
             classify(f)
@@ -493,11 +640,11 @@ def to_markdown(findings: list[Finding], title: str) -> str:
     lines = [f"# {title}", ""]
     lines.append("| 区分 | 件数 | 要修正 | 誤検知 | 判断保留 |")
     lines.append("|---|---|---|---|---|")
-    for cat in (CATEGORY_A, CATEGORY_B, CATEGORY_C, CATEGORY_D, CATEGORY_E_FUNC, CATEGORY_E_MOD):
+    for cat in (CATEGORY_A, CATEGORY_B, CATEGORY_C, CATEGORY_D, CATEGORY_E_FUNC, CATEGORY_E_MOD, CATEGORY_F):
         c = summ.get(cat, {CLASS_FIX: 0, CLASS_FALSE: 0, CLASS_HOLD: 0, "total": 0})
         lines.append(f"| {cat} | {c['total']} | {c[CLASS_FIX]} | {c[CLASS_FALSE]} | {c[CLASS_HOLD]} |")
     lines.append("")
-    for cat in (CATEGORY_A, CATEGORY_B, CATEGORY_C, CATEGORY_D, CATEGORY_E_FUNC, CATEGORY_E_MOD):
+    for cat in (CATEGORY_A, CATEGORY_B, CATEGORY_C, CATEGORY_D, CATEGORY_E_FUNC, CATEGORY_E_MOD, CATEGORY_F):
         rows = [f for f in findings if f.category == cat]
         lines.append(f"## {cat}（{len(rows)} 件）")
         lines.append("")

@@ -183,5 +183,34 @@ class TestReportAndPins(unittest.TestCase):
         self.assertTrue(all(f.reason for f in findings))
 
 
+
+class TestTextApprovalGate(_Repo):
+    """(f) TEXT-APPROVAL-GATE-1（H-0）: needs_approval 文言の直接参照を検出・ゲート経由と Q4 経路は検出しない。"""
+    TEXTS = ("STATUS_NEEDS_APPROVAL = 'needs_approval'\n"
+             "TEXTS = {'S-1': {'label': 'a', 'status': STATUS_NEEDS_APPROVAL, 'text': 'x'},\n"
+             "         'S-9': {'label': 'b', 'status': 'approved', 'text': 'y'}}\n"
+             "def text(i):\n    return TEXTS[i]['text']\n")
+
+    def test_direct_reference_is_fix_and_module_level_is_hold(self):
+        self.put("hub/souzoku_intake_texts.py", self.TEXTS)
+        self.put("souzoku_intake_form.py",
+                 "from hub import souzoku_intake_texts as T\nX = T.text('S-1')\n"
+                 "def render():\n    return T.text('S-1') + T.text('S-9')\n")
+        f = self.of(self.run_audit(), A.CATEGORY_F)
+        self.assertEqual(sorted((x.detail, x.classification) for x in f),
+                         [("direct: S-1", A.CLASS_FIX), ("module-level: S-1", A.CLASS_HOLD)])
+
+    def test_gate_and_q4_module_are_clean(self):
+        self.put("hub/souzoku_intake_texts.py", self.TEXTS)
+        self.put("souzoku_intake_form.py",
+                 "from hub import souzoku_intake_texts as T\nfrom hub import approved_texts\n"
+                 "def render():\n    return approved_texts.approved_or_safe('S-1', T.text('S-1'))\n")
+        self.put("hub/jikou_progress.py", "from hub import souzoku_intake_texts as T\ndef b():\n    return T.text('S-1')\n")
+        self.assertEqual(self.of(self.run_audit(), A.CATEGORY_F), [])
+
+    def test_no_texts_module_no_findings(self):
+        self.put("hub/x.py", "def a():\n    return 'S-1'\n")
+        self.assertEqual(self.of(self.run_audit(), A.CATEGORY_F), [])
+
 if __name__ == "__main__":
     unittest.main()
