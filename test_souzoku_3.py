@@ -312,7 +312,9 @@ class TestPins(unittest.TestCase):
         self.assertIn("souzoku_heirs_metadata", (REPO / "alembic" / "env.py").read_text(encoding="utf-8"))
         msrc = (REPO / "main.py").read_text(encoding="utf-8").splitlines()
         self.assertEqual(sum("include_before_catch_all(app, souzoku_heirs_router)" in l for l in msrc), 1)
-        self.assertIn("include_before_catch_all(app, souzoku_heirs_router)", msrc[-1].strip())      # 末尾追記
+        # SOUZOKU-4（H-5）が末尾に追記するため、EOF 行ではなく SOUZOKU-3 の見出し以降に結線があることを pin
+        start = next(i for i, l in enumerate(msrc) if "SOUZOKU-3（QUEUE-2026-10-17-H H-4）" in l)
+        self.assertIn("include_before_catch_all(app, souzoku_heirs_router)", "\n".join(msrc[start:]))
         for name in ("hub/souzoku_heirs.py", "hub/souzoku_law_constants.py", "hub/webapp_souzoku_heirs_view.py"):
             self.assertEqual(scan_source((REPO / name).read_text(encoding="utf-8"), name), [], name)
         allow = (REPO / "redaction_sink_allowlist.json").read_text(encoding="utf-8")
