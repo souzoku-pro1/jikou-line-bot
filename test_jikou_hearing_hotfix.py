@@ -570,31 +570,16 @@ FOREIGN_KEY = "被相続人氏名"
 FOREIGN_VALUE = "鈴木花子"
 
 
-class _LogCapture(logging.Handler):
-    def __init__(self):
-        super().__init__(level=logging.DEBUG)
-        self.records: list[logging.LogRecord] = []
-
-    def emit(self, record):
-        self.records.append(record)
-
-    def text(self) -> str:
-        return "\n".join(r.getMessage() for r in self.records)
-
-    def errors(self):
-        return [r for r in self.records if r.levelno >= logging.ERROR]
+from test_support_logcap import LogCapture as _LogCapture  # noqa: E402  TEST-FLAKY-1: 共通 helper（records／text／errors は同じ口）
+from test_support_logcap import attach as _attach_logcap  # noqa: E402
 
 
 class TestFix1ForeignKeysAndNotify(_ModuleBase):
     def setUp(self):
         super().setUp()
-        self.cap = _LogCapture()
-        root = logging.getLogger()
-        self._old_level = root.level
-        root.setLevel(logging.DEBUG)
-        root.addHandler(self.cap)
-        self.addCleanup(root.removeHandler, self.cap)
-        self.addCleanup(root.setLevel, self._old_level)
+        # TEST-FLAKY-1: root ではなく当該 logger（hub.hearing_update／hub.notify）に直付けして捕捉する（他テストが "hub" の
+        # level を変えても INFO が届く＝順序非依存）。否定の検査（値がどこにも出ない）のため root にも同じ Handler を付ける。
+        self.cap = _attach_logcap(self, ("hub.hearing_update", "hub.notify"), include_root=True)
 
     def test_constants_pinned(self):
         # JIKOU-FURIGANA-1（大野裁定 2026-10-08）: "furigana": "ふりがな" を 顧客名 の

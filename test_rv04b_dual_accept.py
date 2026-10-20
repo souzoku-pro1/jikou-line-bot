@@ -333,16 +333,10 @@ class TestRegistryFailFast(unittest.TestCase):
         sent_secret = "SENTINEL-SECRET-5C4E"
         reg = json.dumps({sent_kid: {"secret": sent_secret, "caller": 7}})  # 型不正×sentinel
 
-        records = []
-
-        class _Cap(logging.Handler):
-            def emit(self, record):
-                records.append(record.getMessage())
-
-        cap = _Cap()
-        root = logging.getLogger()
-        root.addHandler(cap)
-        try:
+        # TEST-FLAKY-1: root だけでなく hub.service_auth／main の logger にも直付け（level は従来どおり触らない＝NOTSET のまま
+        # root 既定 WARNING 基準ではなく、捕捉器は DEBUG で全部拾う）
+        from test_support_logcap import attached as _logcap_attached
+        with _logcap_attached(("hub.service_auth", "main"), include_root=True) as cap:
             with patch.dict(os.environ, {**self._SCHED_OFF, **_INGEST_ENV,
                                          _FLAG: "1", _REGENV: reg}):
                 with self.assertRaises(svc.ServiceAuthConfigError) as ctx:
@@ -354,12 +348,10 @@ class TestRegistryFailFast(unittest.TestCase):
                 h["Content-Type"] = ct
                 nr_client = TestClient(main.app, raise_server_exceptions=False)
                 r = nr_client.post(path, content=body, headers=h)
-        finally:
-            root.removeHandler(cap)
         self.assertEqual(r.status_code, 503)
         exc_repr = repr(ctx.exception)
         exc_tb = "".join(tb.format_exception(ctx.exception))  # from None で詳細連鎖なし
-        logs = "\n".join(records)
+        logs = "\n".join(cap.messages())
         for sentinel in (sent_kid, sent_secret):
             self.assertNotIn(sentinel, exc_repr)   # 起動例外 repr
             self.assertNotIn(sentinel, exc_tb)     # 整形 traceback（連鎖抑止の確認）
