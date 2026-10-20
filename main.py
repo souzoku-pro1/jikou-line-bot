@@ -112,10 +112,10 @@ async def _on_startup():
     # SERVICE_HMAC_KEY_REGISTRY が壊れ JSON/構造違反なら ServiceAuthConfigError を
     # そのまま送出して起動を失敗させる（署名リクエスト毎の沈黙 500 の排除）。
     # flag OFF は registry 非参照＝現行挙動不変。
-    from hub.service_auth import (validate_registry_startup,
+    from hub.service_auth import (startup_service_auth,
                                   validate_legacy_disabled_paths_startup,
                                   validate_signed_required_paths_startup)
-    validate_registry_startup()
+    await startup_service_auth()   # J-2: 既定は degraded 継続（STRICT=1 で従来 fail-fast）
     # RV-04c H07: 旧 query 停止 path list の起動時 strict 検証（異常形は固定文言で起動停止）。
     validate_legacy_disabled_paths_startup()
     # RV02-ENFORCE: 署名必須 path 集合の起動時 strict 検証（dual-accept と独立に実効のため
@@ -196,7 +196,7 @@ async def health():
     dot_path = shutil.which("dot")
     status["graphviz"] = f"ok ({dot_path})" if dot_path else \
         "NG: dot バイナリなし（関係図の描画のみ不可・他機能は正常）"
-    return {"status": "ok", "deps": status}
+    return _health_with_service_auth({"status": "ok", "deps": status})   # J-2: 行数不変で付加
 
 
 # 必須 env の import 時 fail-fast は従来どおり維持（値の実使用は
@@ -2357,3 +2357,13 @@ send_ledger.register_recover_job()
 send_ledger.check_dialect_at_startup()
 # fix3 BQ-09: 時間設定の整合（heartbeat < 送信 timeout < deadline < 回収閾値）。不整合は警告+既定値
 send_ledger.check_timing_config()
+
+
+# ── STARTUP-FAILSAFE-1（QUEUE-2026-10-20-J J-2）: /health に service_auth の状態（ok/degraded・秘密値なし）を
+#    付加する。handler 本体は行数不変（sink allowlist の file:line 番地を動かさない）・本節は末尾追記。
+from hub.service_auth import service_auth_state as _service_auth_state  # noqa: E402
+
+
+def _health_with_service_auth(body: dict) -> dict:
+    body["service_auth"] = _service_auth_state()
+    return body

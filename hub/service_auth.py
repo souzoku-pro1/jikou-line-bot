@@ -26,7 +26,7 @@ import logging
 import os
 import re
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import sqlalchemy as sa
 from fastapi import HTTPException, Request       # RV-04b 結線層で使用
@@ -220,10 +220,10 @@ def validate_registry_startup() -> int:
     〔key_id・フィールド名・registry 断片〕を連鎖表示させない）。"""
     if not dual_accept_enabled() and not signed_required_paths():
         return 0
-    try:
-        return len(load_registry_strict())
-    except ServiceAuthConfigError:
-        raise ServiceAuthConfigError(_CONFIG_ERROR_FIXED_MSG) from None
+    # STARTUP-FAILSAFE-1（QUEUE-2026-10-20-J J-2）: 既定は全鍵失効・registry 空・JSON 不正でも起動を
+    # 止めず、署名経路だけを 401 に固定する（実装は末尾 _startup_registry_check）。
+    # SERVICE_AUTH_STARTUP_STRICT=1 で従来の fail-fast（固定文言の ServiceAuthConfigError）に戻る。
+    return _startup_registry_check()
 
 
 def _parse_legacy_disabled_strict(raw: str, *, known: frozenset | None = None,
@@ -597,7 +597,7 @@ async def _enforce_signed_request(request: Request) -> None:
     try:
         registry = load_registry_strict()
     except ServiceAuthConfigError:
-        status, reason = 503, "registry_config_error"
+        status, reason = _config_error_response()   # J-2: 既定 401 degraded・STRICT=1 は従来 503
     else:
         eff = effective_signed_path(request.scope)
         status, reason = await verify_request(request.headers, raw,
@@ -722,3 +722,149 @@ def optional_signature_guard():
         await authorize_optionally_signed(request)
 
     return _guard
+
+
+# ══════════════════════════════════════════════════════════════
+# STARTUP-FAILSAFE-1（QUEUE-2026-10-20-J J-2・2026-10-21）: 全鍵失効で全停止しない。
+#   背景: 2026-10-17 00:10 JST、registry の全鍵が expires_at 超過のまま再デプロイ→起動時 fail-fast で
+#   本番が 4 日間停止（LINE 受信も道連れ）。司令塔裁定: 署名経路（戸籍取込み等）は頻度が低く、LINE 受信を
+#   道連れにする設計は過剰→**新挙動を既定**とする。
+#   - 起動: registry が 空／JSON・構造不正／実効鍵 0 でも起動を続け、状態を degraded として保持。
+#   - 署名経路（_enforce_signed_request＝dual-accept の署名ヘッダ在・署名必須 path）は 401 に固定
+#     （reason=service_auth_degraded・detail は従来の固定文字列）。LINE webhook・/app・/health は従来どおり。
+#   - 起動ログ（固定文言＋理由コード）と業務 LINE に 1 回通知（台帳 key service_auth_degraded:{JST 日付}・
+#     台帳不可は直接送る fail-open・daily_healthcheck の CONCURRENCY-1 と同型）。
+#   - SERVICE_AUTH_STARTUP_STRICT=1 で従来挙動（起動停止・請求時 503 registry_config_error）に戻せる。
+#   本節は末尾追記（sink allowlist の file:line 番地を動かさない）。
+# ══════════════════════════════════════════════════════════════
+
+_STRICT_ENV = "SERVICE_AUTH_STARTUP_STRICT"
+DEGRADED_REGISTRY_EMPTY = "registry_empty"
+DEGRADED_REGISTRY_INVALID = "registry_invalid"
+DEGRADED_NO_EFFECTIVE_KEYS = "no_effective_keys"
+DEGRADED_REASONS = (DEGRADED_REGISTRY_EMPTY, DEGRADED_REGISTRY_INVALID, DEGRADED_NO_EFFECTIVE_KEYS)
+REASON_DEGRADED = "service_auth_degraded"          # 請求時の decision reason（固定コード）
+DEGRADED_LEDGER_BUSINESS = "jikou"
+DEGRADED_LEDGER_CHANNEL = "service_auth"
+_JST = timezone(timedelta(hours=9))
+
+_degraded_reason: str | None = None    # 起動時に確定（None=ok）。/health と通知が参照する
+
+
+def startup_strict_enabled() -> bool:
+    """SERVICE_AUTH_STARTUP_STRICT=1 で従来の fail-fast（既定 OFF＝degraded 継続）。"""
+    return os.environ.get(_STRICT_ENV, "").strip().lower() in _FLAG_TRUE
+
+
+def classify_registry(*, env_var: str = _REGISTRY_ENV, now: int | None = None) -> str | None:
+    """registry の状態を固定コードで返す（None=正常）。load_registry_strict の 4 象限と同じ判定・
+    秘密値や断片は含めない。"""
+    raw = os.environ.get(env_var, "").strip()
+    if not raw:
+        return DEGRADED_REGISTRY_EMPTY
+    try:
+        reg = parse_registry(raw)
+    except ServiceAuthConfigError:
+        return DEGRADED_REGISTRY_INVALID
+    now = now if now is not None else int(_utcnow().timestamp())
+    if _effective_key_count(reg, now) == 0:
+        return DEGRADED_NO_EFFECTIVE_KEYS
+    return None
+
+
+def service_auth_state() -> dict:
+    """/health 用の状態（秘密値なし）。署名基盤を使わない設定は ok（signing=off）。
+    起動後に env が変わることは Railway では再デプロイを伴うため、起動時の判定（_degraded_reason）を正とし、
+    未起動（テスト等）なら現在の env から判定する。"""
+    if not dual_accept_enabled() and not signed_required_paths():
+        return {"status": "ok", "signing": "off"}
+    reason = _degraded_reason if _degraded_reason is not None else classify_registry()
+    if reason is None:
+        return {"status": "ok", "signing": "on"}
+    return {"status": "degraded", "signing": "on", "reason": reason}
+
+
+def _config_error_response() -> tuple[int, str]:
+    """請求時に registry が読めないときの (status, reason)。既定は 401 固定（署名経路 停止中）・
+    STRICT=1 は従来の 503 registry_config_error。"""
+    if startup_strict_enabled():
+        return 503, "registry_config_error"
+    return 401, REASON_DEGRADED
+
+
+def _startup_registry_check() -> int:
+    """validate_registry_startup の本体（署名基盤を使う設定のときだけ呼ばれる）。
+    正常: 実効鍵数を返し degraded を解除。異常: STRICT=1 なら従来の固定文言で raise・既定は degraded を
+    記録して 0 を返す（起動継続）。"""
+    global _degraded_reason
+    reason = classify_registry()
+    if reason is None:
+        _degraded_reason = None
+        return len(load_registry_strict())
+    if startup_strict_enabled():
+        raise ServiceAuthConfigError(_CONFIG_ERROR_FIXED_MSG) from None
+    _degraded_reason = reason
+    logger.error("service-auth degraded: signed routes fixed to 401 reason=%s "
+                 "(LINE webhook / app / health unaffected; see README HMAC registry)",
+                 emit(reason, "record_id", "log", "operator"))
+    return 0
+
+
+def degraded_reason() -> str | None:
+    return _degraded_reason
+
+
+def _degraded_day_key(now=None) -> str:
+    now = now or datetime.now(_JST)
+    return "service_auth_degraded:" + now.astimezone(_JST).strftime("%Y-%m-%d")
+
+
+def degraded_notice_text(reason: str) -> str:
+    """業務 LINE への固定文言（理由コードのみ・秘密値なし）。"""
+    return ("【署名経路 停止中】HMAC 鍵 registry の状態により、署名付き受信（GAS／事務所 PC watcher）を "
+            "401 で停止しています。\n"
+            f"理由コード: {reason}\n"
+            "LINE 受信・/app・/health は稼働中です。\n"
+            "対処: railway run python scripts/registry_tool.py check → extend/rebuild → set は別コマンド"
+            "（README「HMAC 鍵 registry の点検と延長」）。")
+
+
+async def notify_degraded_once(reason: str) -> bool:
+    """degraded を業務 LINE へ 1 日 1 回通知する。台帳 key=service_auth_degraded:{JST 日付}（プロセス横断）。
+    台帳が使えない（DB 未設定・障害）ときは直接送る（fail-open: 監視通知を DB に依存させない）。"""
+    from hub import send_ledger
+    from hub.notify import get_admin_line_user_id, notify_admin_line
+    text = degraded_notice_text(reason)
+    token = send_ledger.bind_inbound(_degraded_day_key())
+    try:
+        with send_ledger.purpose(send_ledger.PURPOSE_OTHER):
+            op = await send_ledger.begin(DEGRADED_LEDGER_BUSINESS, DEGRADED_LEDGER_CHANNEL,
+                                         get_admin_line_user_id() or "", text)
+    except Exception:
+        op = None
+    finally:
+        send_ledger.unbind(token)
+    if op is send_ledger.DUPLICATE_SENT or op is send_ledger.DUPLICATE_UNCONFIRMED:
+        logger.info("service-auth degraded notice skipped (already sent today per ledger)")
+        return True
+    if not isinstance(op, send_ledger.Operation):
+        return await notify_admin_line(text, throttle_key="service_auth_degraded:startup")
+    try:
+        ok = await notify_admin_line(text, throttle_key="service_auth_degraded:startup")
+    except Exception:
+        await send_ledger.finish(op, send_ledger.STATE_UNCONFIRMED)
+        raise
+    await send_ledger.finish(op, send_ledger.STATE_SENT if ok else send_ledger.STATE_FAILED)
+    return ok
+
+
+async def startup_service_auth() -> int:
+    """main._on_startup から呼ぶ入口（validate_registry_startup の置換・同じ戻り値）。
+    degraded なら業務 LINE へ 1 回通知する（通知失敗で起動は止めない）。"""
+    n = validate_registry_startup()
+    if _degraded_reason is not None:
+        try:
+            await notify_degraded_once(_degraded_reason)
+        except Exception:
+            logger.error("service-auth degraded notice failed (request failed)")
+    return n
