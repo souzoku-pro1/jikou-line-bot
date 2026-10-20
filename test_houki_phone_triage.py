@@ -36,6 +36,12 @@ from hub import notify as notify_mod  # noqa: E402
 TODAY = datetime.date(2026, 8, 30)
 
 
+def _d(days: int) -> str:
+    """TODAY 基準の相対日付（ISO）。TEST-TIMEBOMB-1（QUEUE-2026-10-20-J J-4）: 固定日付のままだと
+    実日付の経過で社内締切（3 か月）が 30 日以内に入り「熟慮期間の残りが短い」が付いて落ちる。"""
+    return (TODAY + datetime.timedelta(days=days)).isoformat()
+
+
 def _run(coro):
     return asyncio.run(coro)
 
@@ -51,9 +57,9 @@ def _rec(**values) -> dict:
 def _clean_values(**over) -> dict:
     """どのルールにも該当しない基準形（不要寄り）。over で上書き。"""
     base = dict(
-        死亡日_申告="2026-08-20",
-        死亡を知った日_申告="2026-08-21",
-        相続人と知った日_申告="2026-08-21",
+        死亡日_申告=_d(-10),             # TODAY の 10 日前（旧 2026-08-20・相対化=J-4）
+        死亡を知った日_申告=_d(-9),
+        相続人と知った日_申告=_d(-9),
         財産処分有無="なし", 訴訟督促有無="なし", 未成年後見関与="なし",
         本人区分="本人", 相続順位="子",
     )
@@ -321,6 +327,13 @@ class _TriageBase(_StoreBase):
 
     def setUp(self):
         super().setUp()
+        # TEST-TIMEBOMB-1（J-4）: run_phone_triage は today 引数を持たず module の _today_jst() を使う。
+        # 実日付に依存すると固定の申告日から計算する社内締切との距離が日々変わり、2026-10-20 以降は
+        # 「熟慮期間の残りが短い」が付いて 7 件が落ちた。基準日を TODAY に固定し検査の意図（基準形は
+        # 不要寄り・危険類型の有無で推奨度が変わる）を日付に依らず保つ。
+        self._tp = patch.object(tri, "_today_jst", lambda: TODAY)
+        self._tp.start()
+        self.addCleanup(self._tp.stop)
         if self.PATCH_NOTIFY:
             self.notify = AsyncMock(return_value=True)
             self._np = patch.object(tri.notify, "notify_admin_line",
