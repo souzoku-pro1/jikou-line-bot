@@ -981,7 +981,8 @@ class TestReplyExemplarMigration(unittest.TestCase):
     DRAFT_APPROVAL = "b2d4f6a8c0e1"     # JIKOU-REPLY-Q3a: 下書き照合（a1c3 の後ろ）
     REPLY_DRAFT = "c3e5a7b9d1f3"        # JIKOU-REPLY-Q3b: AI 下書き（b2d4 の後ろ）
     DRAFT_OUTCOME = "d4f6b8c0e2a4"      # JIKOU-REPLY-Q4: reply_draft_approval.outcome（c3e5 の後ろ）
-    PROMOTED_TEXT = "e6a8c0d2f4b6"      # JIKOU-REPLY-Q5: 昇格定型（d4f6 の後ろ・head）
+    PROMOTED_TEXT = "e6a8c0d2f4b6"      # JIKOU-REPLY-Q5: 昇格定型（d4f6 の後ろ）
+    CASE_RESULT = "a9b1c3d5e7f0"        # JIKOU-FOLLOWUP-1: 案件結果（e6a8 の後ろ・head）
 
     def test_reply_exemplar_migration_round_trip(self):
         import sqlite3
@@ -1024,9 +1025,10 @@ class TestReplyExemplarMigration(unittest.TestCase):
             up = alembic("upgrade", self.DRAFT_OUTCOME)
             self.assertEqual(up.returncode, 0, f"stderr={up.stderr[-800:]}")
             self.assertIn(self.DRAFT_OUTCOME, alembic("current").stdout)
-            # JIKOU-REPLY-Q5: head（e6a8c0d2f4b6）で昇格定型 2 表（列集合が hub/jikou_reply_promote.metadata と一致）
+            # JIKOU-REPLY-Q5: e6a8c0d2f4b6 で昇格定型 2 表（列集合が hub/jikou_reply_promote.metadata と一致）。
+            # JIKOU-FOLLOWUP-1 で head が a9b1 へ進んだため、本 revision までを明示（既存パターン）。
             from hub import jikou_reply_promote
-            up = alembic("upgrade", "head")
+            up = alembic("upgrade", self.PROMOTED_TEXT)
             self.assertEqual(up.returncode, 0, f"stderr={up.stderr[-800:]}")
             self.assertIn(self.PROMOTED_TEXT, alembic("current").stdout)
             self.assertTrue(set(jikou_reply_promote.TABLE_NAMES) <= tables())
@@ -1037,6 +1039,29 @@ class TestReplyExemplarMigration(unittest.TestCase):
                     self.assertEqual(got, {c.name for c in jikou_reply_promote.metadata.tables[t].columns}, t)
             finally:
                 con.close()
+            # JIKOU-FOLLOWUP-1: head（a9b1c3d5e7f0）で案件結果 2 表（列集合が hub/jikou_followup.metadata と一致）。
+            # downgrade で 2 表が消え、e6a8 の表は残る
+            from hub import jikou_followup
+            self.assertFalse(set(jikou_followup.TABLE_NAMES) & tables())
+            up = alembic("upgrade", "head")
+            self.assertEqual(up.returncode, 0, f"stderr={up.stderr[-800:]}")
+            self.assertIn(self.CASE_RESULT, alembic("current").stdout)
+            self.assertTrue(set(jikou_followup.TABLE_NAMES) <= tables())
+            con = sqlite3.connect(dbfile)
+            try:
+                for t in jikou_followup.TABLE_NAMES:
+                    got = {r[1] for r in con.execute(f'PRAGMA table_info("{t}")')}
+                    self.assertEqual(got, {c.name for c in jikou_followup.metadata.tables[t].columns}, t)
+                nn = nullable(con, jikou_followup.TABLE_NAME)
+                self.assertFalse(nn["case_record_id"])
+                self.assertTrue(nn["result"])
+                self.assertTrue(nn["shipped_on"])
+            finally:
+                con.close()
+            down = alembic("downgrade", self.PROMOTED_TEXT)
+            self.assertEqual(down.returncode, 0, f"stderr={down.stderr[-800:]}")
+            self.assertFalse(set(jikou_followup.TABLE_NAMES) & tables())
+            self.assertTrue(set(jikou_reply_promote.TABLE_NAMES) <= tables())
             down = alembic("downgrade", self.DRAFT_OUTCOME)
             self.assertEqual(down.returncode, 0, f"stderr={down.stderr[-800:]}")
             self.assertFalse(set(jikou_reply_promote.TABLE_NAMES) & tables())

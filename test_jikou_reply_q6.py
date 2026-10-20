@@ -301,7 +301,10 @@ class TestPins(unittest.TestCase):
         self.assertNotIn("jikou_reply_metrics", allow)
         self.assertNotIn("webapp_reply_metrics_view", allow)
         src = (REPO / "main.py").read_text(encoding="utf-8").split("\n")
-        self.assertIn("wire_reply_metrics(app)", "\n".join(src[-3:]))                # 末尾追記（3 行・Q3a/Q4 の窓 pin と両立）
+        # 末尾追記（3 行）。JIKOU-FOLLOWUP-1（QUEUE-2026-10-16-R F-1）が同じ main.py 末尾へ追記したため、窓を「Q6 の見出し
+        # コメント以降 3 行」へ移した（検査の意図＝Q6 の結線は見出し直後の 2 行だけで本文中に置かない、は不変）。
+        q6 = next(i for i, line in enumerate(src) if line.startswith("# ── JIKOU-REPLY-Q6（QUEUE-2026-10-13-E E-1）"))
+        self.assertIn("wire_reply_metrics(app)", "\n".join(src[q6:q6 + 3]))
         vsrc = (REPO / "hub" / "webapp_reply_metrics_view.py").read_text(encoding="utf-8")
         self.assertIn("app.router.on_startup.append(M.register_jikou_metrics_job)", vsrc)
         self.assertIn(M.register_jikou_metrics_job, main.app.router.on_startup)

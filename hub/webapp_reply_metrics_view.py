@@ -93,6 +93,24 @@ def _page(m, notice: str) -> str:
             parts.append(f'<tr><td>{e(c.creditor)}</td><td class="num">{int(c.drafts)}</td><td class="num">{int(c.decided)}</td>'
                          f'<td class="num">{e(M.fmt_rate(c.approval_rate))}</td></tr>')
         parts.append("</table>")
+    # 6) 案件結果（JIKOU-FOLLOWUP-1 (3)）
+    parts.append("<h2>案件結果（債権者別・時効援用通知の発送後）</h2>"
+                 f'<p class="sub">発送済みで結果未記録の枠: {int(m.case_unanswered)}。記録は /app/jikou/result/（案件 No.）から。</p>')
+    if "case_results_unavailable" in m.notes:
+        parts.append('<p class="empty">案件結果の表を読めませんでした（migration 未適用の可能性）</p>')
+    elif not m.case_results:
+        parts.append('<p class="empty">記録された案件結果はありません</p>')
+    else:
+        parts.append("<table><tr><th>債権者</th><th class=\"num\">結果あり</th><th class=\"num\">成立</th>"
+                     "<th class=\"num\">一部成立</th><th class=\"num\">不成立</th><th class=\"num\">回答なし</th>"
+                     "<th class=\"num\">成立率</th><th class=\"num\">回答まで（中央値）</th></tr>")
+        for c in m.case_results:
+            md = "—" if c.median_days is None else f"{int(round(c.median_days))}日"
+            parts.append(f'<tr><td>{e(c.creditor)}</td><td class="num">{int(c.cases)}</td><td class="num">{int(c.established)}</td>'
+                         f'<td class="num">{int(c.partial)}</td><td class="num">{int(c.not_established)}</td>'
+                         f'<td class="num">{int(c.no_answer)}</td><td class="num">{e(M.fmt_rate(c.established_rate))}</td>'
+                         f'<td class="num">{e(md)}</td></tr>')
+        parts.append("</table>")
     parts.append('<script src="/app/shell.js"></script></body></html>')
     return "".join(parts)
 
@@ -110,6 +128,11 @@ def _json(m) -> dict:
                      for p in m.promoted],
         "creditors": [{"creditor": c.creditor, "drafts": c.drafts, "decided": c.decided, "approved": c.approved,
                        "approval_rate": c.approval_rate} for c in m.creditors],
+        "case_results": [{"creditor": c.creditor, "cases": c.cases, "established": c.established, "partial": c.partial,
+                          "not_established": c.not_established, "no_answer": c.no_answer,
+                          "established_rate": c.established_rate, "median_days": c.median_days} for c in m.case_results],
+        "case_unanswered": int(m.case_unanswered),
+        "notes": list(m.notes),
     }
 
 
