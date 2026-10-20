@@ -95,6 +95,7 @@ def _page(record_id: str, items: list[dict], shipped: dict, notice: str) -> str:
              f"<h1>時効援用 案件結果 No.{e(record_id)}</h1>",
              '<p class="sub">債権者ごとの回答結果を記録します（人の入力のみ・相談者への送信はありません）。'
              f'<a href="/app/jikou/cert/{e(record_id)}">完了報告書</a>｜'      # JIKOU-CERT-1
+             f'<a href="/app/jikou/receipt/{e(record_id)}">領収書</a>｜'        # JIKOU-RECEIPT-1
              '<a href="/app/reply/metrics">返信計測</a>｜<a href="/app/pending">対応待ち</a></p>']
     if notice:
         parts.append(f'<p class="notice">{e(notice)}</p>')
