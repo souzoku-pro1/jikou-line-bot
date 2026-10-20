@@ -21,6 +21,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 from hub import souzoku_intake as S
 from hub import souzoku_intake_texts as T
+from hub import approved_texts  # TEXT-APPROVAL-GATE-1（H-0）: 相談者向け文言は承認台帳経由でしか描画しない
 from hub.db import DatabaseNotConfigured
 from hub.redact import emit
 from hub.souzoku_constants import (DISPUTE_OPTIONS, HEIR_RELATIONS, INTAKE_MAX_BODY_BYTES, INTAKE_RATE_LIMIT,
@@ -135,13 +136,15 @@ def _form_html(errors: list[str], nonce: str | None = None) -> str:
     return "".join(parts)
 
 
-def _result_html(status: str, dispute: str) -> str:
+async def _result_html(status: str, dispute: str) -> str:
+    """TEXT-APPROVAL-GATE-1（H-0）: S-1〜S-3 は承認台帳（hub/approved_texts.APPROVED_SHA256）に本文 SHA が載るまで
+    安全文に置き換わり、業務 LINE へ 1 日 1 回「未承認文言の参照 key=…」が届く（文言表の status 印とは独立の機械的な関所）。"""
     e = html.escape
     if status == S.STATUS_OUT_OF_SCOPE:
-        return "<h1>ご入力ありがとうございました</h1><p>" + e(T.text("S-2")) + "</p>"
-    body = "<h1>受け付けました</h1><p>" + e(T.text("S-1")) + "</p>"
+        return "<h1>ご入力ありがとうございました</h1><p>" + e(await approved_texts.gate_and_notify("S-2", T.text("S-2"))) + "</p>"
+    body = "<h1>受け付けました</h1><p>" + e(await approved_texts.gate_and_notify("S-1", T.text("S-1"))) + "</p>"
     if dispute == "わからない":
-        body += '<p class="note">' + e(T.text("S-3")) + "</p>"
+        body += '<p class="note">' + e(await approved_texts.gate_and_notify("S-3", T.text("S-3"))) + "</p>"
     return body
 
 
@@ -165,7 +168,7 @@ async def intake_entry(request: Request):
     if request.method == "GET":
         done = request.query_params.get("done", "")
         if done in _DONE_STATUSES:                           # PRG の結果画面（status と争いの区分だけ・PII なし）
-            return _page("相続のご相談 受付", _result_html(done, _DISPUTE_FROM_CODE.get(request.query_params.get("d", ""), "")))
+            return _page("相続のご相談 受付", await _result_html(done, _DISPUTE_FROM_CODE.get(request.query_params.get("d", ""), "")))
         return _page("相続のご相談 受付", _form_html([], _new_nonce()))
     if request.method != "POST":
         return _not_found()
