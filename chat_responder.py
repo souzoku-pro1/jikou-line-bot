@@ -553,7 +553,7 @@ _SYSTEM_PROMPT_BASE = """\
 - 用語:「時効の更新」を使用（「時効の延長」は禁止）
 - 記録にない進捗・日付・金額の創作は禁止
 - 書類の写真をお願いするときは定型文言（「お手元の書類の全ページを写真に撮って、このLINEに送っていただけますか。」または「差押えに関する書類の写真をこのLINEにお送りいただけますか」）をそのまま使う。自由な言い回しでの写真依頼はサーバー側で承認制に降格される。収集済み項目に「書類写真: 受領済み」がある場合は再依頼しない
-- 断定語（確実に/絶対に/間違いなく/必ず 等）・行動指示語（払わないで/無視して/連絡しないで/放置して 等）は使用禁止。例外は2つのみ: (1)【FAQ】記載の受任後顧客への定型指示（電話対応・督促状対応）をそのまま使う場合 (2)「絶対に大丈夫とは言えません」のような否定の形
+- 断定語（確実に/絶対に/間違いなく/必ず 等）・行動指示語（払わないで/無視して/連絡しないで/放置して 等）は使用禁止。例外は2つのみ: (1)【FAQ】記載の受任後顧客への定型指示（電話対応・督促状対応）をそのまま使う場合 (2)「絶対に大丈夫とは言えません」のような否定の形\n- 本プロンプトの定型・FAQ・顧客情報で答えられない問い（確認してから連絡する、担当者に申し伝える、改めて案内する、としか書けない場合）は reply を空文字にする。「確認のうえご連絡します」「申し伝えます」「担当者よりご連絡します」のような返事は書かない（サーバー側で送信されず、弁護士に通知される）
 
 <<STYLE_SECTION>>
 
@@ -1575,7 +1575,7 @@ async def handle_claude_outage(
     PENDING_REPLY と逐語一致（test_business_profile で pin）。
     """
     p = profile or JIKOU_PROFILE
-    await reply_func(reply_token, p.pending_reply)
+    _sent = await send_policy.outage_ack(user_id, reply_token, reply_func, p.pending_reply, category=OUTAGE_CATEGORY)  # JIKOU-REPLY-Q1c
     approval_id = await save_to_approval_queue(
         user_id=user_id,
         customer_name=customer_name,
@@ -1585,9 +1585,9 @@ async def handle_claude_outage(
         reason=f"Claude応答不能（要手動対応）: {error[:200]}",
     )
     await save_to_chatlog(user_id, "user", user_message, OUTAGE_CATEGORY, "no")
-    await save_to_chatlog(user_id, "assistant", p.pending_reply,
+    if _sent: await save_to_chatlog(user_id, "assistant", _sent,  # JIKOU-REPLY-Q1c: 送った文だけ記録（無言なら記録なし）
                           OUTAGE_CATEGORY, "yes")
-    await _notify_attorney(user_id, customer_name, approval_id, OUTAGE_CATEGORY)
+    await _notify_attorney(user_id, customer_name, approval_id, OUTAGE_CATEGORY); await send_policy.attach_approval(user_id, approval_id)  # JIKOU-REPLY-Q1c (d)
     logger.info("[OUTAGE] queued user_id=%s approval_id=%s",
                 emit(user_id, "external_ref", "log", "operator"),
                 emit(approval_id, "record_id", "log", "operator"))
@@ -1672,7 +1672,7 @@ async def handle_customer_message(
         logger.exception("compose_reply failed for user_id=%s", user_id)
         # 一時的なエラー（レート制限等）は定型文を返して終了
         # （H2-fix1 [01]: 障害系の両経路とも profile の pending_reply を使う）
-        await reply_func(reply_token, p.pending_reply)
+        await send_policy.outage_ack(user_id, reply_token, reply_func, p.pending_reply)  # JIKOU-REPLY-Q1c: ON は無言+対応待ち
         return
 
     # AUTOREPLY-GEN2 要件1: 送信直前サニタイズ（markdown 平文化・許可外
@@ -1695,8 +1695,8 @@ async def handle_customer_message(
 
     # サーバー側二重チェック（カテゴリ許可リスト＋禁止語・必須文言・留保文言
     # ＋GEN2: プレースホルダ/長さ/質問数/法テラス標準回答）
-    guard = apply_server_guards(result, history, user_message,
-                                sanitize_fatal=sanitize_fatal, profile=p)
+    guard = send_policy.apply_v2(apply_server_guards(result, history, user_message,  # JIKOU-REPLY-Q1c (b): 空返事は自動送信しない（V2 OFF は空文字のみ降格）
+                                sanitize_fatal=sanitize_fatal, profile=p), reply_text)
     if guard.demotion_reasons:
         logger.info("[GUARD] demoted user_id=%s reasons=%s",
                     emit(user_id, "external_ref", "log", "operator"),
@@ -1728,14 +1728,14 @@ async def handle_customer_message(
         # 法テラスは専用文面。GEN2 要件5: それ以外はカテゴリ別の文脈化定型
         # ——大野の文言確定=PENDING_CONTEXT_ENABLED までは現行文言）
         ack_text = guard.immediate_notice_text \
-            or pending_reply_for(category, profile=p)
+            or await send_policy.pending_ack(user_id, approval_id, category, guard, profile=p)  # JIKOU-REPLY-Q1c (b)(c)(d)
         # JIKOU-REPLY-Q1a: 送信操作記録の用途（緊急の即時定型=urgent・他=reply）。
         # 送信の有無・文面・順序は不変（記録と排他の追加のみ）
         from hub import send_ledger as _send_ledger
-        await _send_ledger.with_purpose(
-            "urgent" if p.urgent_notice_kinds.get(guard.immediate_notice, "") else "reply",
+        if ack_text: await _send_ledger.with_purpose(  # JIKOU-REPLY-Q1c: 無言（""）は送らない
+            send_policy.ack_purpose(p, guard, ack_text),  # JIKOU-REPLY-Q1c: urgent / first_reply（J-0）/ reply
             reply_func, reply_token, ack_text)
-        await save_to_chatlog(user_id, "assistant", ack_text, category, "yes")
+        if ack_text: await save_to_chatlog(user_id, "assistant", ack_text, category, "yes")  # JIKOU-REPLY-Q1c
         # 弁護士へ承認依頼通知（希死念慮・差押え切迫は【緊急・要即時対応】）
         await _notify_attorney(
             user_id, customer_name, approval_id, category,
@@ -1965,3 +1965,10 @@ def sanitize_reply_without_human_marker(text: str, **kwargs) -> tuple[str, list[
     if stripped != raw:
         issues = list(issues) + ["human_marker_removed"]
     return out, issues, fatal
+
+
+# ── JIKOU-REPLY-Q1c（QUEUE-2026-10-12-C C-1）: 許可表 V2・空返事の無言化・J-0・対応待ちの結線。
+#    末尾追記（sink allowlist の行番号 pin を動かさない規約・本文中は 1 行置換のみ）。
+#    hub/send_policy は chat_responder を遅延 import する（循環なし）。flag OFF（既定）では各関数が
+#    従来の値・従来の呼び出しをそのまま返す（挙動不変・test_jikou_reply_q1c が pin）。
+from hub import send_policy  # noqa: E402

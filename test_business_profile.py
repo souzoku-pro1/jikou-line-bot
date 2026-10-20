@@ -182,9 +182,11 @@ class TestJikouProfileIsVerbatimBundle(unittest.TestCase):
         # JIKOU-FEE-RULE-1（大野裁定 2026-10-11）: system_prompt_template（費用の社数
         # 規則）・mandatory_reply_text / immediate_notice_texts（法テラス標準回答）の
         # 改定に伴う再 pin（024773… → 3400bf…）。他の束は不変
+        # JIKOU-REPLY-Q1c（QUEUE-2026-10-12-C C-1 (b)）: system_prompt_template に「答えられない問いは
+        # reply を空文字にする」の 1 項を追加（凍結解除はこの 1 項のみ）→ 再 pin（3400bf… → 752dfb…）
         self.assertEqual(
             hashlib.sha256(payload.encode("utf-8")).hexdigest(),
-            "3400bf7564881e4a8bdbff8c3d6a6577c1bb240d3294b4bfd19732ef72040c63")
+            "752dfbe8dceddf1d2967c9510452d9f282557719e1ca3c0f4cdce2c0045ec73e")
 
 
 class TestDefaultEqualsJikouProfile(unittest.TestCase):
