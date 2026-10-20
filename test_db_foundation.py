@@ -982,7 +982,8 @@ class TestReplyExemplarMigration(unittest.TestCase):
     REPLY_DRAFT = "c3e5a7b9d1f3"        # JIKOU-REPLY-Q3b: AI 下書き（b2d4 の後ろ）
     DRAFT_OUTCOME = "d4f6b8c0e2a4"      # JIKOU-REPLY-Q4: reply_draft_approval.outcome（c3e5 の後ろ）
     PROMOTED_TEXT = "e6a8c0d2f4b6"      # JIKOU-REPLY-Q5: 昇格定型（d4f6 の後ろ）
-    CASE_RESULT = "a9b1c3d5e7f0"        # JIKOU-FOLLOWUP-1: 案件結果（e6a8 の後ろ・head）
+    CASE_RESULT = "a9b1c3d5e7f0"        # JIKOU-FOLLOWUP-1: 案件結果（e6a8 の後ろ）
+    CERT_DOC = "b3c5d7e9f1a2"           # JIKOU-CERT-1: 完了報告書の保管（a9b1 の後ろ・head）
 
     def test_reply_exemplar_migration_round_trip(self):
         import sqlite3
@@ -1043,7 +1044,7 @@ class TestReplyExemplarMigration(unittest.TestCase):
             # downgrade で 2 表が消え、e6a8 の表は残る
             from hub import jikou_followup
             self.assertFalse(set(jikou_followup.TABLE_NAMES) & tables())
-            up = alembic("upgrade", "head")
+            up = alembic("upgrade", self.CASE_RESULT)      # JIKOU-CERT-1: head が進んだため本 revision までを明示
             self.assertEqual(up.returncode, 0, f"stderr={up.stderr[-800:]}")
             self.assertIn(self.CASE_RESULT, alembic("current").stdout)
             self.assertTrue(set(jikou_followup.TABLE_NAMES) <= tables())
@@ -1058,6 +1059,39 @@ class TestReplyExemplarMigration(unittest.TestCase):
                 self.assertTrue(nn["shipped_on"])
             finally:
                 con.close()
+            # JIKOU-CERT-1: head（b3c5d7e9f1a2）で jikou_cert_doc（列集合が hub/jikou_cert.metadata と一致・UNIQUE(業務,案件,枠,版)）。
+            # データありの downgrade は拒否（RV-08）→ 空にして往復（a9b1 の表は残る）
+            from hub import jikou_cert
+            self.assertNotIn(jikou_cert.TABLE_NAME, tables())
+            up = alembic("upgrade", "head")
+            self.assertEqual(up.returncode, 0, f"stderr={up.stderr[-800:]}")
+            self.assertIn(self.CERT_DOC, alembic("current").stdout)
+            self.assertIn(jikou_cert.TABLE_NAME, tables())
+            con = sqlite3.connect(dbfile)
+            try:
+                got = {r[1] for r in con.execute(f'PRAGMA table_info("{jikou_cert.TABLE_NAME}")')}
+                self.assertEqual(got, {c.name for c in jikou_cert.metadata.tables[jikou_cert.TABLE_NAME].columns})
+                self.assertIn(("business", "case_record_id", "slot", "version"),
+                              {tuple(c) for c in unique_cols(con, jikou_cert.TABLE_NAME)})
+                con.execute("INSERT INTO jikou_cert_doc (doc_id, business, case_record_id, slot, version, docx, pdf, sha256_docx, "
+                            "sha256_pdf, texts_version, template_sha256, created_by, created_at) VALUES "
+                            "('d1', 'jikou', '1', 1, 1, x'00', x'00', 'a', 'b', 'v', 't', 'human', '2026-10-21 00:00:00')")
+                con.commit()
+            finally:
+                con.close()
+            down = alembic("downgrade", self.CASE_RESULT)
+            self.assertNotEqual(down.returncode, 0)            # データありは拒否
+            self.assertIn(jikou_cert.TABLE_NAME, tables())
+            con = sqlite3.connect(dbfile)
+            try:
+                con.execute("DELETE FROM jikou_cert_doc")
+                con.commit()
+            finally:
+                con.close()
+            down = alembic("downgrade", self.CASE_RESULT)
+            self.assertEqual(down.returncode, 0, f"stderr={down.stderr[-800:]}")
+            self.assertNotIn(jikou_cert.TABLE_NAME, tables())
+            self.assertTrue(set(jikou_followup.TABLE_NAMES) <= tables())
             down = alembic("downgrade", self.PROMOTED_TEXT)
             self.assertEqual(down.returncode, 0, f"stderr={down.stderr[-800:]}")
             self.assertFalse(set(jikou_followup.TABLE_NAMES) & tables())
