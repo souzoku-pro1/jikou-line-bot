@@ -37,7 +37,7 @@ import os
 import re
 import time
 
-from hub import empty_reply_guard, kintone, reply_pending, send_ledger
+from hub import empty_reply_guard, jikou_reply_texts, kintone, reply_pending, send_ledger
 from hub.redact import emit
 
 logger = logging.getLogger("hub.send_policy")
@@ -49,7 +49,7 @@ CONDITION_TTL_SECONDS = 30.0             # 停止条件の照会結果の再利�
 _JST = datetime.timezone(datetime.timedelta(hours=9))
 
 # J-0（初回受付・1 会話 1 回・司令塔仮置き・大野承認待ち）。文言変更は本定数と test の sha pin を同時に更新する
-J0_TEXT = "ご連絡ありがとうございます。内容を確認のうえ、弁護士からこの LINE でご返信いたします。"
+J0_TEXT = jikou_reply_texts.text("J-0")   # JIKOU-REPLY-Q2: データ表（hub/jikou_reply_texts）が正・値は C-1 と同一
 J0_TEXT_SHA256 = hashlib.sha256(J0_TEXT.encode("utf-8")).hexdigest()
 
 # 業務 LINE への固定文言（PII なし・App 29 No. とカテゴリは統制値）
