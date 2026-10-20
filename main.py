@@ -2357,3 +2357,7 @@ send_ledger.register_recover_job()
 send_ledger.check_dialect_at_startup()
 # fix3 BQ-09: 時間設定の整合（heartbeat < 送信 timeout < deadline < 回収閾値）。不整合は警告+既定値
 send_ledger.check_timing_config()
+
+# ── SOUZOKU-2（QUEUE-2026-10-16-R G-5）: 相続相談 受付フォーム（/souzoku-intake・flag SOUZOKU_INTAKE_ENABLED 既定 OFF＝404）の結線。末尾追記。
+from souzoku_intake_form import router as souzoku_intake_router  # noqa: E402
+app.include_router(souzoku_intake_router)
