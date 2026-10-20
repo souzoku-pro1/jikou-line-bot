@@ -207,3 +207,17 @@ async def get_form_fields(app: KintoneApp) -> dict:
         f"{_base_url()}/k/v1/app/form/fields.json", app, params={"app": app.app_id()}
     )
     return resp.json().get("properties", {})
+
+
+async def update_status(app: KintoneApp, record_id: str, action: str, revision: str | None = None,
+                        assignee: str | None = None) -> None:
+    """プロセス管理のステータス更新（PUT /k/v1/record/status.json）。JIKOU-STAGE-APP-1（QUEUE-2026-10-20-HI I-4'）。
+    action はアプリ側に定義したアクション名（例「報告済にする」）。revision を渡すと CAS（不一致は kintone が 409）。
+    書き込みと同じ流儀でリトライしない。"""
+    body: dict = {"app": app.app_id(), "id": record_id, "action": action}
+    if revision is not None:
+        body["revision"] = revision
+    if assignee:
+        body["assignee"] = assignee
+    await _write("PUT", f"{_base_url()}/k/v1/record/status.json", app, body)
+
