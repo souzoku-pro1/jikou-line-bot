@@ -36,6 +36,7 @@ from hub.jikou_reply_promote import metadata as jikou_reply_promote_metadata  # 
 from hub.jikou_followup import metadata as jikou_followup_metadata  # noqa: E402（JIKOU-FOLLOWUP-1・案件結果）
 from hub.jikou_cert import metadata as jikou_cert_metadata  # noqa: E402（JIKOU-CERT-1・完了報告書）
 from hub.jikou_receipt import metadata as jikou_receipt_metadata  # noqa: E402（JIKOU-RECEIPT-1・領収書）
+from hub.jikou_report_link import metadata as jikou_report_link_metadata  # noqa: E402（JIKOU-STAGE-APP-1・本人専用 URL）
 
 config = context.config
 
@@ -50,7 +51,8 @@ target_metadata = [Base.metadata, heartbeat_metadata, service_auth_metadata,
                    shindan_link_metadata, brain_ledger_metadata,
                    send_ledger_metadata, reply_exemplar_metadata, reply_followup_metadata,
                    reply_pending_metadata, reply_draft_metadata, jikou_reply_promote_metadata,
-                   jikou_followup_metadata, jikou_cert_metadata, jikou_receipt_metadata]
+                   jikou_followup_metadata, jikou_cert_metadata, jikou_receipt_metadata,
+                   jikou_report_link_metadata]
 
 
 def run_migrations_offline() -> None:
