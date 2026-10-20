@@ -283,8 +283,21 @@ _QUADRANTS = [
 
 
 class TestRegistryFailFast(unittest.TestCase):
+    """RP1114-H01/M01 の fail-fast 契約（4 象限で起動停止・請求時 503・固定文言）。
+    STARTUP-FAILSAFE-1（QUEUE-2026-10-20-J J-2）で**既定挙動**は「起動継続＋署名経路 401（degraded）」に
+    変わったため、本クラスは SERVICE_AUTH_STARTUP_STRICT=1（従来挙動）の下で同じ契約を pin する
+    （検査の意図＝strict 時の 4 象限・固定文言・500 を出さない、は不変）。既定挙動の契約は
+    test_startup_failsafe.py が pin する。"""
     _BROKEN = '{"kid": {broken'   # JSON parse error を起こす値
     _SCHED_OFF = {"HEALTHCHECK_DISABLED": "1", "RETURN_DEADLINE_DISABLED": "1"}
+
+    def setUp(self):
+        # J-2: 従来の fail-fast を検査するクラスなので strict を立てる（既定 OFF＝degraded 継続）
+        p = patch.dict(os.environ, {"SERVICE_AUTH_STARTUP_STRICT": "1"})
+        p.start()
+        self.addCleanup(p.stop)
+        svc._degraded_reason = None
+        self.addCleanup(lambda: setattr(svc, "_degraded_reason", None))
 
     def _apply_quadrant(self, value):
         """_REGENV へ象限値を適用（None=欠損）。patch.dict 内で呼ぶこと。"""

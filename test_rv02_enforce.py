@@ -481,11 +481,19 @@ class TestStrictParserAndStartup(unittest.TestCase):
                          "legacy disabled paths configuration invalid")
 
     def test_registry_startup_validated_when_required_set_nonempty(self):
-        # flag OFF でも REQ 非空なら壊れ registry は起動停止（fail-fast の象限拡張）
-        with patch.dict(os.environ, {_REQ: "/scan", _REGENV: "not-json"}):
+        # flag OFF でも REQ 非空なら壊れ registry は起動時検証の対象（fail-fast の象限拡張）。
+        # STARTUP-FAILSAFE-1（J-2）で既定挙動は「起動継続＋degraded（署名経路 401）」に変わったため、
+        # 従来の起動停止は SERVICE_AUTH_STARTUP_STRICT=1 のときに pin する（検査の意図＝象限の拡張は不変）。
+        with patch.dict(os.environ, {_REQ: "/scan", _REGENV: "not-json",
+                                     "SERVICE_AUTH_STARTUP_STRICT": "1"}):
             os.environ.pop(_FLAG, None)
             with self.assertRaises(ServiceAuthConfigError):
                 svc.validate_registry_startup()
+        with patch.dict(os.environ, {_REQ: "/scan", _REGENV: "not-json"}):
+            os.environ.pop(_FLAG, None)
+            os.environ.pop("SERVICE_AUTH_STARTUP_STRICT", None)
+            self.assertEqual(svc.validate_registry_startup(), 0)        # 起動継続
+            self.assertEqual(svc.degraded_reason(), svc.DEGRADED_REGISTRY_INVALID)
         # 両 env 未設定なら従来どおり何もしない（壊れ registry でも 0）
         with patch.dict(os.environ, {_REGENV: "not-json"}):
             os.environ.pop(_FLAG, None)
