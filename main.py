@@ -2383,3 +2383,7 @@ from hub.houki_overdue import register_houki_overdue_job  # noqa: E402
 from hub.webapp_houki_overdue_view import router as houki_overdue_router  # noqa: E402
 include_before_catch_all(app, houki_overdue_router)
 app.router.on_startup.append(register_houki_overdue_job)   # 起動時に daily 登録（import 時にループを要求しない）
+
+# ── HOUKI-TEISHUTSU-1（QUEUE-2026-10-16-R F-3）: 家裁提出パッケージ（/app/houki/submit・提出前チェック・送付状・提出日の記録）の結線。末尾追記。
+from hub.webapp_houki_submit_view import router as houki_submit_router  # noqa: E402
+include_before_catch_all(app, houki_submit_router)
