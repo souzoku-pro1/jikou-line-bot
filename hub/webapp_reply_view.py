@@ -500,7 +500,9 @@ async def reply_send(request: Request):
     if result.outcome in (line_channel.PUSH_DUPLICATE_SENT, line_channel.PUSH_DUPLICATE_UNCONFIRMED):
         return _redirect(back, result.outcome)
     if result.outcome == line_channel.PUSH_FAILED:
-        await reply_followup.close(op_id, "line_failed")          # 未送信で終端（回収しない）
+        # 未送信で終端（回収しない）。fix6 BR-18: 読んだ世代と一致し、同一 tx の台帳再読取でも failed のときだけ閉じる
+        fu = await _safe_followup(op_id)
+        await reply_followup.close(op_id, "line_failed", expected_version=int((fu or {}).get("row_version", 0)))
     if result.outcome == line_channel.PUSH_UNCONFIRMED:
         logger.warning("[REPLY] explicit send unconfirmed (exception) record_id=%s",
                        emit(record_id, "record_id", "log", "operator"))

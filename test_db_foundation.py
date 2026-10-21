@@ -978,6 +978,7 @@ class TestReplyExemplarMigration(unittest.TestCase):
     SEND_LEDGER = "e5f8a1b4c7d9"
     REPLY_EXEMPLAR = "f7b2c9d4e1a6"
     REPLY_FOLLOWUP_STATE = "a7c9e1f3b5d7"   # JIKOU-REPLY-Q1b-fix5 BR-17: reply_chatlog_followup.create_state（f7b2 の次）
+    REPLY_FOLLOWUP_VERSION = "c8e0a2b4d6f8"  # JIKOU-REPLY-Q1b-fix6 BR-18: reply_chatlog_followup.row_version（a7c9 の次）
 
     def test_reply_exemplar_migration_round_trip(self):
         import sqlite3
@@ -993,9 +994,12 @@ class TestReplyExemplarMigration(unittest.TestCase):
             up = alembic("upgrade", self.REPLY_EXEMPLAR)
             self.assertEqual(up.returncode, 0, f"stderr={up.stderr[-800:]}")
             self.assertIn(self.REPLY_EXEMPLAR, alembic("current").stdout)
-            up = alembic("upgrade", "head")                   # fix5: a7c9（create_state 追加）まで進める
+            up = alembic("upgrade", self.REPLY_FOLLOWUP_STATE)   # fix5: a7c9（create_state 追加）
             self.assertEqual(up.returncode, 0, f"stderr={up.stderr[-800:]}")
             self.assertIn(self.REPLY_FOLLOWUP_STATE, alembic("current").stdout)
+            up = alembic("upgrade", self.REPLY_FOLLOWUP_VERSION)  # fix6: c8e0（row_version 追加）まで進める
+            self.assertEqual(up.returncode, 0, f"stderr={up.stderr[-800:]}")
+            self.assertIn(self.REPLY_FOLLOWUP_VERSION, alembic("current").stdout)
             # fix1 BR-08/BR-09: 3 表（手本・履歴・App 28 記録未了）が同一 revision で作られ、列集合が metadata と一致（head で）
             self.assertTrue({reply_exemplar.TABLE_NAME, reply_exemplar.HISTORY_TABLE_NAME,
                              reply_followup.TABLE_NAME} <= tables())
@@ -1029,6 +1033,7 @@ class TestReplyExemplarMigration(unittest.TestCase):
                 for col in ("text_version", "owner_token", "deadline_at", "chatlog_record_id"):
                     self.assertTrue(nullable(con, reply_followup.TABLE_NAME)[col], col)
                 self.assertFalse(nullable(con, reply_followup.TABLE_NAME)["create_state"])   # fix5: NOT NULL・既定 none
+                self.assertFalse(nullable(con, reply_followup.TABLE_NAME)["row_version"])    # fix6: NOT NULL・既定 0
             finally:
                 con.close()
             down = alembic("downgrade", self.SEND_LEDGER)
