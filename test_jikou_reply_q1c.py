@@ -876,7 +876,8 @@ class TestPins(unittest.TestCase):
         p = REPO / "alembic" / "versions" / "20261012_a1c3e5f7b9d2_reply_pending.py"
         src = p.read_text(encoding="utf-8")
         self.assertIn("revision: str = 'a1c3e5f7b9d2'", src)
-        self.assertIn("down_revision: Union[str, Sequence[str], None] = 'f7b2c9d4e1a6'", src)
+        # Q1b-fix5: a7c9e1f3b5d7（reply_chatlog_followup.create_state）が f7b2 の次に入ったため、a1c3 はその後ろ（鎖は 1 本）
+        self.assertIn("down_revision: Union[str, Sequence[str], None] = 'c8e0a2b4d6f8'", src)   # fix6: row_version の次
         self.assertIn("reply_pending_downgrade_refused_data_present", src)
         self.assertIn("データがあれば downgrade 禁止", src)
         env = (REPO / "alembic" / "env.py").read_text(encoding="utf-8")
