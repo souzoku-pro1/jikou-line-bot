@@ -245,7 +245,12 @@ class TestFollowupTwoProcesses(_DbMixin):
 
     def test_sequential_two_runs_write_once(self):
         self.assertEqual(self._pending(), "pending")
-        write = AsyncMock(return_value=rf.RESULT_WRITTEN)
+
+        async def write(user_id, text, confirm_owner=None):             # Q1b-fix6 BR-18: 本物の write_human_chatlog と同じく作成直前に
+            if confirm_owner is not None and not await confirm_owner():     # owner 再確認（世代 +1）を通す。呼ばずに written を返す
+                return rf.WRITE_NOT_OWNER                                   # フェイクは契約外（process_one は再確認済みの世代で終端する）
+            return rf.RESULT_WRITTEN
+        write = AsyncMock(side_effect=write)
         resolve = AsyncMock(return_value=USER)
         c1 = _run(rf.run_followup(resolve_user_id=resolve, write_chatlog=write))
         c2 = _run(rf.run_followup(resolve_user_id=resolve, write_chatlog=write))
@@ -261,6 +266,8 @@ class TestFollowupTwoProcesses(_DbMixin):
 
         async def write(user_id, text, confirm_owner=None):             # Q1b-fix4 BR-14: 第 3 引数（作成直前の owner 再確認）を受ける
             await gate.wait()                                           # 両者が pending を読み終えるまで待つ
+            if confirm_owner is not None and not await confirm_owner():     # Q1b-fix6 BR-18: 本物と同じく作成直前に owner 再確認（世代 +1）
+                return rf.WRITE_NOT_OWNER
             return rf.RESULT_WRITTEN
         resolve = AsyncMock(return_value=USER)
 
