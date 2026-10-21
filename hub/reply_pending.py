@@ -68,8 +68,12 @@ NOTIFY_STATES = (NOTIFY_NONE, NOTIFY_SENT, NOTIFY_THROTTLED, NOTIFY_FAILED, NOTI
                  NOTIFY_UNAVAILABLE)
 
 CUSTOMER_NONE = "none"
-CUSTOMER_J0_SENT = "j0_sent"
-CUSTOMER_STATES = (CUSTOMER_NONE, CUSTOMER_J0_SENT)
+CUSTOMER_J0_SENT = "j0_sent"                  # Q1c-fix1 BC-05: 台帳 finish(sent)=applied の後にだけ立つ
+CUSTOMER_J0_FAILED = "j0_failed"              # LINE 非 2xx（台帳 failed・送っていない）
+CUSTOMER_J0_UNCONFIRMED = "j0_unconfirmed"    # 結果不明（通信例外・late／skipped・戻り値なし）
+CUSTOMER_J0_STOPPED = "j0_stopped"            # 許可表・J-0 在庫検査・台帳不可で送らなかった（LINE write 0）
+CUSTOMER_STATES = (CUSTOMER_NONE, CUSTOMER_J0_SENT, CUSTOMER_J0_FAILED, CUSTOMER_J0_UNCONFIRMED,
+                   CUSTOMER_J0_STOPPED)
 
 RESOLVED_BY_HUMAN = "human"
 RESOLVED_BY_APPROVED_DRAFT = "approved_draft"
@@ -118,6 +122,45 @@ reply_pending_history = sa.Table(
     sa.Column("actor", sa.Text, nullable=False),
     sa.Column("at", sa.DateTime(timezone=True), nullable=False),
     sa.Index("ix_reply_pending_history_p", "pending_id"),
+)
+
+# ── JIKOU-REPLY-Q1c-fix1（Codex R-Q1c BC-03）: 対応待ちの保存失敗を受信イベント ID で永続キューに残す ──
+#    register() が失敗した受信（route／reason／ハッシュ／No. の閉集合値だけ・本文なし）を別セッションで 1 行置き、
+#    回収ジョブ（send_ledger の recover hook）が次回以降に register → 通知 を再処理する。鍵は 業務・チャネル・受信
+#    イベント ID（再配送は冪等）。DB 全停止中はこの表にも書けない（固定語彙ログ＋障害通知 1 日 1 回・App 28 の受信
+#    記録で人が回収）。migration d4f6a8b0c2e4（a1c3 の次）。処理済み行は消さない（RV-08・state=done）。
+RETRY_TABLE_NAME = "reply_pending_retry"
+RETRY_TABLE_NAMES = (RETRY_TABLE_NAME,)
+RETRY_QUEUED = "queued"
+RETRY_DONE = "done"
+RETRY_ABANDONED = "abandoned"
+RETRY_STATES = (RETRY_QUEUED, RETRY_DONE, RETRY_ABANDONED)
+RETRY_MAX_ATTEMPTS = 20          # register の再試行上限（5 分間隔の回収ジョブ × 20 ≒ 100 分）
+NOTIFY_RETRY_MAX = 3             # 通知の再試行上限（台帳 key は同じ＝送れても 1 通）
+RETRY_ERROR_REGISTER = "register_failed"
+
+reply_pending_retry = sa.Table(
+    RETRY_TABLE_NAME, metadata,
+    sa.Column("retry_id", _BIG, primary_key=True, autoincrement=True),
+    sa.Column("business", sa.Text, nullable=False),
+    sa.Column("channel", sa.Text, nullable=False),
+    sa.Column("inbound_event_id", sa.Text, nullable=False),
+    sa.Column("conversation_id", _BIG, nullable=True),
+    sa.Column("line_user_hash", sa.Text, nullable=False),
+    sa.Column("route", sa.Text, nullable=False),
+    sa.Column("reason", sa.Text, nullable=False),
+    sa.Column("category", sa.Text, nullable=True),
+    sa.Column("approval_record_id", sa.Text, nullable=True),
+    sa.Column("state", sa.Text, nullable=False, server_default=RETRY_QUEUED),
+    sa.Column("attempts", sa.Integer, nullable=False, server_default="0"),
+    sa.Column("last_error", sa.Text, nullable=True),
+    sa.Column("pending_id", _BIG, nullable=True),
+    sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+    sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
+    sa.Column("processed_at", sa.DateTime(timezone=True), nullable=True),
+    sa.CheckConstraint("state IN ('queued', 'done', 'abandoned')", name="ck_reply_pending_retry_state"),
+    sa.UniqueConstraint("business", "channel", "inbound_event_id", name="uq_reply_pending_retry_inbound"),
+    sa.Index("ix_reply_pending_retry_state", "state", "created_at"),
 )
 
 
@@ -352,3 +395,186 @@ async def history(pending_id: int) -> list[dict]:
             .order_by(reply_pending_history.c.history_id))).fetchall()
     return [{"field": r.field, "from": r.from_value, "to": r.to_value, "actor": r.actor,
              "at": _iso(r.at)} for r in rows]
+
+
+# ══════════════════════════════════════════════════════════════
+# JIKOU-REPLY-Q1c-fix1（Codex R-Q1c BC-03〜05）: 永続キュー・通知再試行・固定集合の解除・経過統計
+#   - 末尾追記。本文・氏名・LINE userId は表に置かない（閉集合値と件数のみ）。ログは固定語彙＋件数。
+# ══════════════════════════════════════════════════════════════
+async def enqueue_retry(*, business: str, channel: str, inbound_event_id: str | None, line_user_hash: str,
+                        route: str, reason: str, conversation_id: int | None = None, category: str | None = None,
+                        approval_record_id: str | None = None, now=None) -> bool:
+    """register() 失敗時の永続キュー（BC-03）。受信イベント ID が無い経路（非 durable）は置けない（False）。
+    既に同じ受信イベント ID の行があれば何もしない（True）。書込失敗は固定語彙ログ・False。"""
+    if not inbound_event_id or route not in ROUTES or reason not in REASONS:
+        return False
+    if not _db_configured():
+        return False
+    now = now or _now()
+    try:
+        async with session_scope() as s:
+            existing = (await s.execute(sa.select(reply_pending_retry.c.retry_id).where(
+                reply_pending_retry.c.business == business, reply_pending_retry.c.channel == channel,
+                reply_pending_retry.c.inbound_event_id == str(inbound_event_id)))).scalar()
+            if existing is not None:
+                return True
+            await s.execute(sa.insert(reply_pending_retry).values(
+                business=business, channel=channel, inbound_event_id=str(inbound_event_id),
+                conversation_id=conversation_id, line_user_hash=line_user_hash, route=route, reason=reason,
+                category=(category or None),
+                approval_record_id=(str(approval_record_id) if approval_record_id else None),
+                state=RETRY_QUEUED, attempts=0, last_error=RETRY_ERROR_REGISTER, created_at=now, updated_at=now))
+        logger.warning("[REPLY_PENDING] register failed; queued for retry count=%s",
+                       emit(1, "count", "log", "operator"))
+        return True
+    except Exception:
+        logger.error("[REPLY_PENDING] retry enqueue failed (receipt not recovered by job) count=%s",
+                     emit(1, "count", "log", "operator"))
+        return False
+
+
+def _retry_row(r) -> dict:
+    return {"retry_id": int(r.retry_id), "business": r.business, "channel": r.channel,
+            "inbound_event_id": r.inbound_event_id,
+            "conversation_id": (int(r.conversation_id) if r.conversation_id is not None else None),
+            "line_user_hash": r.line_user_hash, "route": r.route, "reason": r.reason,
+            "category": r.category or "", "approval_record_id": r.approval_record_id or "",
+            "state": r.state, "attempts": int(r.attempts), "last_error": r.last_error or "",
+            "pending_id": (int(r.pending_id) if r.pending_id is not None else None),
+            "created_at": r.created_at, "updated_at": r.updated_at, "processed_at": r.processed_at}
+
+
+async def list_retry_queue(limit: int = 50) -> list[dict]:
+    """再処理待ち（queued・試行上限未満）を古い順に。"""
+    async with session_scope() as s:
+        rows = (await s.execute(sa.select(reply_pending_retry).where(
+            reply_pending_retry.c.state == RETRY_QUEUED,
+            reply_pending_retry.c.attempts < RETRY_MAX_ATTEMPTS)
+            .order_by(reply_pending_retry.c.created_at.asc()).limit(int(limit)))).fetchall()
+    return [_retry_row(r) for r in rows]
+
+
+async def count_retry_queue() -> int:
+    async with session_scope() as s:
+        return int((await s.execute(sa.select(sa.func.count()).select_from(reply_pending_retry)
+                                    .where(reply_pending_retry.c.state == RETRY_QUEUED))).scalar() or 0)
+
+
+async def retry_done(retry_id: int, pending_id: int, *, now=None) -> bool:
+    """再処理成功: queued → done（pending_id を記録・行は残す）。"""
+    now = now or _now()
+    try:
+        async with session_scope() as s:
+            r = await s.execute(sa.update(reply_pending_retry).where(
+                reply_pending_retry.c.retry_id == int(retry_id),
+                reply_pending_retry.c.state == RETRY_QUEUED).values(
+                state=RETRY_DONE, pending_id=int(pending_id), processed_at=now, updated_at=now))
+            return int(r.rowcount or 0) == 1
+    except Exception:
+        logger.error("[REPLY_PENDING] retry_done failed (fixed reason)")
+        return False
+
+
+async def retry_bump(retry_id: int, *, now=None) -> bool:
+    """再処理失敗: attempts+1（上限に達したら abandoned・行は残す・固定理由）。"""
+    now = now or _now()
+    try:
+        async with session_scope() as s:
+            cur = (await s.execute(sa.select(reply_pending_retry.c.attempts).where(
+                reply_pending_retry.c.retry_id == int(retry_id)))).scalar()
+            if cur is None:
+                return False
+            nxt = int(cur) + 1
+            values = {"attempts": nxt, "updated_at": now, "last_error": RETRY_ERROR_REGISTER}
+            if nxt >= RETRY_MAX_ATTEMPTS:
+                values["state"] = RETRY_ABANDONED
+                logger.error("[REPLY_PENDING] retry abandoned (max attempts) count=%s",
+                             emit(1, "count", "log", "operator"))
+            r = await s.execute(sa.update(reply_pending_retry).where(
+                reply_pending_retry.c.retry_id == int(retry_id)).values(**values))
+            return int(r.rowcount or 0) == 1
+    except Exception:
+        logger.error("[REPLY_PENDING] retry_bump failed (fixed reason)")
+        return False
+
+
+async def list_notify_retry(limit: int = 50, *, max_attempts: int = NOTIFY_RETRY_MAX) -> list[dict]:
+    """通知の再試行対象: open かつ notify_state が failed／unavailable で attempts が上限未満（古い順）。"""
+    async with session_scope() as s:
+        rows = (await s.execute(sa.select(reply_pending).where(
+            reply_pending.c.state == STATE_OPEN,
+            reply_pending.c.notify_state.in_((NOTIFY_FAILED, NOTIFY_UNAVAILABLE)),
+            reply_pending.c.attempts < int(max_attempts))
+            .order_by(reply_pending.c.created_at.asc()).limit(int(limit)))).fetchall()
+    return [_row(r) for r in rows]
+
+
+async def bump_attempts(pending_id: int, *, now=None) -> bool:
+    now = now or _now()
+    try:
+        async with session_scope() as s:
+            r = await s.execute(sa.update(reply_pending).where(
+                reply_pending.c.pending_id == int(pending_id)).values(
+                attempts=reply_pending.c.attempts + 1, updated_at=now))
+            return int(r.rowcount or 0) == 1
+    except Exception:
+        logger.error("[REPLY_PENDING] bump_attempts failed (fixed reason)")
+        return False
+
+
+async def resolve_ids(pending_ids, *, resolved_by: str, business: str | None = None,
+                      line_user_hash: str | None = None, now=None) -> int:
+    """BC-04: 送信着手時点で固定した pending_id 集合だけを human_replied にする（open のものだけ・他は触らない）。
+    line_user_hash を渡したときはその相談者の行に限る（別人の ID が混じっても閉じない）。戻り値は閉じた件数。"""
+    if resolved_by not in (RESOLVED_BY_HUMAN, RESOLVED_BY_APPROVED_DRAFT):
+        return 0
+    ids = sorted({int(x) for x in (pending_ids or ()) if str(x).isdigit() or isinstance(x, int)})
+    if not ids or not _db_configured():
+        return 0
+    now = now or _now()
+    try:
+        async with session_scope() as s:
+            n = 0
+            for pid in ids:
+                cond = [reply_pending.c.pending_id == pid, reply_pending.c.state == STATE_OPEN]
+                if business is not None:
+                    cond.append(reply_pending.c.business == business)
+                if line_user_hash is not None:
+                    cond.append(reply_pending.c.line_user_hash == line_user_hash)
+                r = await s.execute(sa.update(reply_pending).where(*cond).values(
+                    state=STATE_HUMAN_REPLIED, resolved_at=now, resolved_by=resolved_by, updated_at=now))
+                if int(r.rowcount or 0) == 1:
+                    await _hist(s, pid, "state", STATE_OPEN, STATE_HUMAN_REPLIED, resolved_by, now)
+                    n += 1
+        if n:
+            logger.info("[REPLY_PENDING] resolved by human (fixed set) count=%s", emit(n, "count", "log", "operator"))
+        return n
+    except Exception:
+        logger.error("[REPLY_PENDING] resolve (fixed set) failed (fixed reason)")
+        return 0
+
+
+async def open_ids_for_user(business: str, line_user_hash: str) -> list[int]:
+    """BC-04: 送信着手時点の返信対象（open の pending_id・古い順）。"""
+    async with session_scope() as s:
+        rows = (await s.execute(sa.select(reply_pending.c.pending_id).where(
+            reply_pending.c.business == business, reply_pending.c.line_user_hash == line_user_hash,
+            reply_pending.c.state == STATE_OPEN).order_by(reply_pending.c.created_at.asc()))).scalars().all()
+    return [int(x) for x in rows]
+
+
+async def age_stats(*, threshold_minutes: int, now=None) -> dict:
+    """BC-03 (2): open の件数・閾値（分）超の件数・最長経過（分）。本文・ID は返さない。"""
+    now = now or _now()
+    async with session_scope() as s:
+        rows = (await s.execute(sa.select(reply_pending.c.created_at).where(
+            reply_pending.c.state == STATE_OPEN))).scalars().all()
+    ages = []
+    for v in rows:
+        if v is None:
+            continue
+        if v.tzinfo is None:
+            v = v.replace(tzinfo=datetime.timezone.utc)
+        ages.append(max(0, int((now - v).total_seconds() // 60)))
+    over = [a for a in ages if a >= int(threshold_minutes)]
+    return {"open_count": len(ages), "over_count": len(over), "oldest_minutes": (max(ages) if ages else 0)}

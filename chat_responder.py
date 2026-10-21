@@ -1743,10 +1743,10 @@ async def handle_customer_message(
         # JIKOU-REPLY-Q1a: 送信操作記録の用途（緊急の即時定型=urgent・他=reply）。
         # 送信の有無・文面・順序は不変（記録と排他の追加のみ）
         from hub import send_ledger as _send_ledger
-        if ack_text: await _send_ledger.with_purpose(  # JIKOU-REPLY-Q1c: 無言（""）は送らない
+        _ack_res = await send_policy.send_ack(user_id, ack_text, _send_ledger.with_purpose,  # JIKOU-REPLY-Q1c: 無言（""）は送らない／fix1 BC-05: 結果を受け取る
             send_policy.ack_purpose(p, guard, ack_text),  # JIKOU-REPLY-Q1c: urgent / first_reply（J-0）/ reply
-            reply_func, reply_token, ack_text)
-        if ack_text: await save_to_chatlog(user_id, "assistant", ack_text, category, "yes")  # JIKOU-REPLY-Q1c
+            reply_func, reply_token, ack_text) if ack_text else None
+        if await send_policy.ack_recorded(user_id, ack_text, _ack_res): await save_to_chatlog(user_id, "assistant", ack_text, category, "yes")  # JIKOU-REPLY-Q1c／fix1 BC-05: J-0 は sent のときだけ写す
         # 弁護士へ承認依頼通知（希死念慮・差押え切迫は【緊急・要即時対応】）
         await _notify_attorney(
             user_id, customer_name, approval_id, category,
