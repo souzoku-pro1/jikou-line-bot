@@ -492,6 +492,7 @@ async def reply_send(request: Request):
         # fix4 BR-15: 同 op_id の既存行が 終端／送信済み／本文・宛先不一致／台帳行あり → 送らず「新しい操作でやり直し」
         logger.info("[REPLY] operation rejected by followup table (not sent)")
         return _redirect(back, "op_rejected")
+    pd_targets = await send_policy.pending_targets(user_id)   # Q1c-fix1 BC-04: 送信着手時点の返信対象（open）を固定
     result = await line_channel.push_text_explicit(line_channel.JIKOU_CHANNEL, op_id, user_id, text)
     if result.outcome == line_channel.PUSH_LEDGER_UNAVAILABLE:
         logger.warning("[REPLY] ledger unavailable (not sent) record_id=%s",
@@ -526,7 +527,7 @@ async def reply_send(request: Request):
                                            find_chatlog=find_human_chatlog, ledger_state=send_ledger.operation_state)
     log_res = _MAIN_PATH_LOG.get(res, "pending_retry")
     reflect_memory_history(user_id, text)
-    pd_res = await send_policy.human_replied(user_id)   # JIKOU-REPLY-Q1c (d): 同じ相談者の対応待ちを閉じる
+    pd_res = await send_policy.human_replied(user_id, pd_targets)   # JIKOU-REPLY-Q1c (d)／fix1 BC-04: 固定した集合だけを閉じる（送信中の受信は open）
     ex_res = "off"
     if want_exemplar:
         ex_res = await _save_exemplar(user_id, _v(rec, "顧客メッセージ"), text, op_id,
