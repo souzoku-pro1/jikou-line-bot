@@ -46,6 +46,15 @@ fix2（Codex R-Q1b-fix1 BR-10〜12・docs/jikou_reply_q1b_contract.md）:
   作成前に op_id で App 28 を検索する（成功応答喪失の修復）。
 - BR-10: 手本は pending_review で保存（人が匿名化を確認して承認するまで下書き参照に使わない）。
 - 冪等性は **操作（op_id）単位**（同一 inbound_event_id に対する人の別操作は別送信・司令塔裁定）。
+fix4（Codex R-Q1b-fix2 BR-13〜15）:
+- BR-13: find_human_chatlog は 4 値 (found|absent|unavailable|unconfigured, record_id)。検索失敗は unavailable（「不存在」ではない）
+  → process_one は作成せず pending に残す（業務 LINE 通知は回収ジョブが 1 日 1 回）。マーカーは kintone の単語検索仕様に合わせ
+  `op_{op_id}`（記号 `[ ] : %` はキーワードから除かれる・`_` は単語の一部）。like は 1 単語の等価一致になるが、後段で本文末尾の
+  等価照合（reply_followup.marker_matches）まで行う。
+- BR-14: write_human_chatlog は作成呼出の **直前** に confirm_owner()（所有権の再確認・同一 tx）を呼び、False なら作成しない
+  （not_owner）。作成呼出後の例外は unknown（作成されたか不明＝回収側は照合で見つかるまで再作成しない）。作成呼出前の失敗だけ failed。
+- BR-15: prepare() が rejected（同 op_id の既存行が終端・送信済み・本文／宛先不一致・台帳行あり）なら送らず「新しい操作でやり直し」。
+  台帳 begin 失敗（ledger_unavailable）では回収行を閉じず prepared のまま残す（本文保持）＝同一 op_id・同一本文の再 POST で再開できる。
 """
 
 import hmac
@@ -72,6 +81,7 @@ APP_CHATLOG = kintone.KintoneApp("App 28 (チャットログ)", "APP_CHATLOG", "
 ROLE_HUMAN = "human"
 CATEGORY_HUMAN_REPLY = "human_reply"
 HISTORY_LIMIT = 20
+LOOKUP_LIMIT = 10                     # fix4 BR-13: op_id 照合で取り寄せる最大件数（後段で本文末尾を等価照合）
 MAX_TEXT_CHARS = 2000
 _RECORD_ID_RE = re.compile(r"^[0-9]{1,12}$")
 _OP_ID_RE = re.compile(r"^[0-9a-f]{32}$")
@@ -99,6 +109,9 @@ _DONE_NOTICES = {
                           "（自動再送はしません。チャットログ記録・手本保存は行っていません）。",
     "late": "この操作の結果は台帳で遅着と判定されました（別の処理が先に確定しています）。"
             "チャットログ記録・手本保存は行っていません。現在の台帳状態: ",
+    # fix4 BR-15
+    "op_rejected": "この操作 ID は再利用できません（送信済み・終了済み、または本文・宛先が前回と異なります）。"
+                   "画面を開き直して新しい操作でやり直してください。送信していません。",
 }
 _STATE_LABELS = {"sent": "送信済み", "unconfirmed": "送信確認待ち", "failed": "失敗",
                  "started": "着手済（確認中）", "pending": "着手前", "none": "不明"}
@@ -118,6 +131,11 @@ _LOG_NOTICES = {
     "recovered": "チャットログに既に同じ操作の記録があったため、新たに作成せず完了にしました。",
     "waiting_ledger": "送信結果が台帳で確定するまでチャットログの記録を保留しています（送信確認待ちで確定してください）。",
     "closed": "この操作は未送信として閉じました（チャットログには記録しません）。",
+    # fix4 BR-13／BR-14
+    "lookup_unavailable": "チャットログの既存記録の照合ができなかったため、記録を保留しました"
+                          "（二重記録を避けるため作成していません。回収ジョブが再試行します）。",
+    "unknown": "チャットログへの記録結果が不明です（記録された可能性があります）。二重記録を避けるため自動では再作成せず、"
+               "回収ジョブが既存記録の照合を続けます。",
 }
 # fix3: 主経路の process_one の結果 → 画面の通知語彙（それ以外＝回収ジョブ側が所有している等は「回収ジョブが再試行」）
 _MAIN_PATH_LOG = {
@@ -127,6 +145,8 @@ _MAIN_PATH_LOG = {
     reply_followup.RESULT_FAILED: "pending_retry",
     reply_followup.RESULT_SKIPPED: "pending_retry",
     reply_followup.RESULT_NOT_PENDING: "pending_retry",
+    reply_followup.RESULT_LOOKUP_UNAVAILABLE: "lookup_unavailable",
+    reply_followup.RESULT_UNKNOWN: "unknown",
 }
 _EX_NOTICES = {
     "saved": "手本として匿名化して保存しました（確認待ち。承認するまで下書きの参考には使われません）。",
@@ -212,42 +232,59 @@ async def _history_rows(user_id: str) -> list[dict]:
 
 
 # ── App 28 への human 行（b） ────────────────────────────────────────────────────
-async def write_human_chatlog(user_id: str, text: str) -> str:
-    """送信成功後の App 28 記録。戻り値は閉集合: written / skipped（role に human の選択肢なし・
-    件数ログ）/ failed（固定語彙ログ）/ unconfigured。"""
+async def write_human_chatlog(user_id: str, text: str, confirm_owner=None) -> str:
+    """送信成功後の App 28 記録。戻り値は閉集合: written / skipped（role に human の選択肢なし・件数ログ）/
+    failed（**作成呼出前**の失敗・固定語彙ログ）/ unconfigured / not_owner（fix4 BR-14: 作成直前の所有権再確認に失敗・作成していない）/
+    unknown（fix4 BR-14: 作成呼出後に応答喪失＝作成されたか不明。回収側は照合で見つかるまで再作成しない）。"""
     if not (APP_CHATLOG.app_id() and APP_CHATLOG.token()):
         return "unconfigured"
     try:
         props = await kintone.get_form_fields(APP_CHATLOG)
         options = (props.get("role") or {}).get("options") or {}
-        if ROLE_HUMAN not in options:
-            _skip_count["role_option_missing"] += 1
-            logger.info("[REPLY] chatlog human row skipped (role option missing) total=%s",
-                        emit(_skip_count["role_option_missing"], "count", "log", "operator"))
-            return "skipped"
+    except Exception:
+        logger.warning("[REPLY] chatlog human row write failed (fixed reason)")
+        return "failed"
+    if ROLE_HUMAN not in options:
+        _skip_count["role_option_missing"] += 1
+        logger.info("[REPLY] chatlog human row skipped (role option missing) total=%s",
+                    emit(_skip_count["role_option_missing"], "count", "log", "operator"))
+        return "skipped"
+    # fix4 BR-14: 外部作成の直前に「自分がまだ owner か」を同一 tx で再確認（失われていれば作成しない）
+    if confirm_owner is not None and not await confirm_owner():
+        logger.info("[REPLY] chatlog human row not created (ownership lost before create)")
+        return reply_followup.WRITE_NOT_OWNER
+    try:
         await kintone.create_record(APP_CHATLOG, {
             "line_user_id": user_id, "role": ROLE_HUMAN, "message": text,
             "category": CATEGORY_HUMAN_REPLY, "auto_sent": "no"})
     except Exception:
-        logger.warning("[REPLY] chatlog human row write failed (fixed reason)")
-        return "failed"
+        logger.warning("[REPLY] chatlog human row create result unknown (fixed reason)")
+        return reply_followup.RESULT_UNKNOWN
     return "written"
 
 
-async def find_human_chatlog(user_id: str, op_id: str) -> str | None:
-    """fix2 BR-11: App 28 に同じ操作のマーカー `[op:{op_id}]` を持つ human 行があればそのレコード No.（成功応答喪失の修復）。
-    未設定・読取失敗は None（呼び出し側は作成へ進む＝従来どおり。二重作成の遮断は所有権が担う）。"""
-    if not (APP_CHATLOG.app_id() and APP_CHATLOG.token()) or not _OP_ID_RE.fullmatch(str(op_id)):
-        return None
+async def find_human_chatlog(user_id: str, op_id: str) -> tuple[str, str | None]:
+    """fix2 BR-11／fix4 BR-13: App 28 に同じ操作のマーカー `op_{op_id}` を持つ human 行があるかを **4 値** で返す。
+    (found, record_id) / (absent, None) / (unavailable, None)＝検索失敗（不存在ではない・呼び出し側は作成しない）/
+    (unconfigured, None)。kintone の like は単語検索（記号はキーワードから除かれる）なので、マーカーは英数字と `_` のみとし
+    1 単語で検索、後段で本文末尾の等価照合（marker_matches）を行う（ヒットは直近 LOOKUP_LIMIT 件を照合）。"""
+    if not (APP_CHATLOG.app_id() and APP_CHATLOG.token()):
+        return reply_followup.LOOKUP_UNCONFIGURED, None
+    if not _OP_ID_RE.fullmatch(str(op_id)):
+        return reply_followup.LOOKUP_ABSENT, None
+    marker = reply_followup.op_marker(str(op_id))
     try:
         rows = await kintone.search_records(
             APP_CHATLOG, f'line_user_id = "{user_id}" and role in ("{ROLE_HUMAN}") and '
-                         f'message like "%{reply_followup.op_marker(str(op_id))}%" order by $id asc limit 1',
-            fields=["$id"])
+                         f'message like "{marker}" order by $id asc limit {LOOKUP_LIMIT}',
+            fields=["$id", "message"])
     except Exception:
-        return None
-    rid = _v(rows[0], "$id") if rows else ""
-    return rid or None
+        logger.warning("[REPLY] chatlog lookup unavailable (fixed reason)")
+        return reply_followup.LOOKUP_UNAVAILABLE, None
+    for r in rows:
+        if reply_followup.marker_matches(_v(r, "message"), str(op_id)) and _v(r, "$id"):
+            return reply_followup.LOOKUP_FOUND, _v(r, "$id")
+    return reply_followup.LOOKUP_ABSENT, None
 
 
 async def run_chatlog_followup() -> dict:
@@ -449,11 +486,16 @@ async def reply_send(request: Request):
         logger.warning("[REPLY] followup unavailable (fail-closed, not sent) record_id=%s",
                        emit(record_id, "record_id", "log", "operator"))
         return _redirect(back, "ledger_unavailable")
+    if prepared == "rejected":
+        # fix4 BR-15: 同 op_id の既存行が 終端／送信済み／本文・宛先不一致／台帳行あり → 送らず「新しい操作でやり直し」
+        logger.info("[REPLY] operation rejected by followup table (not sent)")
+        return _redirect(back, "op_rejected")
     result = await line_channel.push_text_explicit(line_channel.JIKOU_CHANNEL, op_id, user_id, text)
     if result.outcome == line_channel.PUSH_LEDGER_UNAVAILABLE:
         logger.warning("[REPLY] ledger unavailable (not sent) record_id=%s",
                        emit(record_id, "record_id", "log", "operator"))
-        await reply_followup.close(op_id, "ledger_unavailable")
+        # fix4 BR-15: 閉じない（本文保持・prepared のまま）＝同一 op_id・同一本文の再 POST で再開できる
+        await reply_followup.note_prepared(op_id, "ledger_unavailable")
         return _redirect(back, "ledger_unavailable")
     if result.outcome in (line_channel.PUSH_DUPLICATE_SENT, line_channel.PUSH_DUPLICATE_UNCONFIRMED):
         return _redirect(back, result.outcome)

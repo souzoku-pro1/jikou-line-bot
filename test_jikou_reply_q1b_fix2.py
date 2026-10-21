@@ -8,6 +8,8 @@
 - BR-12: 送信前 prepared／台帳と突合（sent→記録・unconfirmed→人の確定後・failed／台帳なし→closed）／mark_pending 失敗でも
          prepared が残る／unconfigured→設定後に記録
 - docs（契約）・migration の pin
+fix4（Codex R-Q1b-fix2 BR-13〜15）で意図を変えたテスト: 照合の検索失敗は「不存在」ではなく unavailable（作成しない）／
+マーカーは `op_{op_id}`（kintone 単語検索仕様）／同 op_id の prepare は照合して reprepared か rejected（旧 exists）。
 """
 import asyncio
 import concurrent.futures
@@ -164,7 +166,8 @@ class TestOwnership(_FollowupMixin):
     def test_marker_lookup_before_create_recovers_lost_success(self):
         """成功応答喪失: App 28 には既に行がある（マーカーで照合）→ 作成せず done。"""
         self._pending()
-        self.search.return_value = [{"$id": {"value": "777"}}]
+        # fix4 BR-13: 検索結果は本文末尾の等価照合（marker_matches）まで行う＝message も返す
+        self.search.return_value = [{"$id": {"value": "777"}, "message": {"value": rf.with_op_marker(TEXT, OP)}}]
         _run(sl.run_recover_job())
         self.create.assert_not_awaited()
         row = self.followup()
@@ -172,7 +175,9 @@ class TestOwnership(_FollowupMixin):
                          ("done", "recovered", "777", None))
         q = self.search.await_args.args[1]
         self.assertIn(f'line_user_id = "{USER}"', q)
-        self.assertIn(f"[op:{OP}]", q)
+        self.assertIn(f'message like "op_{OP}"', q)          # fix4: 英数字と _ のみの 1 単語・% なし（kintone の単語検索仕様）
+        self.assertNotIn("%", q)
+        self.assertNotIn("[op:", q)
         self.assertIn('role in ("human")', q)
 
     def test_done_update_failure_then_retry_does_not_create_again(self):
@@ -185,7 +190,8 @@ class TestOwnership(_FollowupMixin):
         _run(sl.run_recover_job())                                                  # 期限内: 触らない
         self.create.assert_awaited_once()
         self._set_deadline_past()
-        self.search.return_value = [{"$id": {"value": "778"}}]                      # 作成済みの行が照合で見つかる
+        self.search.return_value = [{"$id": {"value": "778"},
+                                     "message": {"value": rf.with_op_marker(TEXT, OP)}}]   # 作成済みの行が照合で見つかる
         _run(sl.run_recover_job())
         self.create.assert_awaited_once()                                           # 作成は増えない
         self.assertEqual((self.followup()["state"], self.followup()["chatlog_record_id"]), ("done", "778"))
@@ -260,11 +266,13 @@ class TestOwnership(_FollowupMixin):
 
     def test_marker_is_stripped_for_display_and_model_input(self):
         marked = rf.with_op_marker("x", OP)
-        self.assertEqual(marked, f"x\n[op:{OP}]")
+        self.assertEqual(marked, f"x\nop_{OP}")                                    # fix4: 英数字と _ のみ（kintone 単語検索）
         self.assertEqual(rf.strip_op_marker(marked), "x")
+        self.assertEqual(rf.strip_op_marker(f"x\n[op:{OP}]"), "x")                 # 旧形式は除去だけ受ける
         self.assertEqual(rf.strip_op_marker("x"), "x")
-        self.assertEqual(rf.strip_op_marker(f"[op:{OP}] の途中"), f"[op:{OP}] の途中")   # 末尾だけ
+        self.assertEqual(rf.strip_op_marker(f"op_{OP} の途中"), f"op_{OP} の途中")   # 末尾だけ
         self.assertEqual(cr.model_content("human", marked), f"{cr.HUMAN_MARKER} x")
+        self.assertEqual(cr.model_content("human", f"op_{OP}"), "")
         self.assertEqual(cr.model_content("human", f"[op:{OP}]"), "")
         self.assertEqual(cr.model_content("user", marked), marked)                  # user 行は触らない
         self.search.return_value = [{"role": {"value": "human"}, "message": {"value": marked},
@@ -272,16 +280,20 @@ class TestOwnership(_FollowupMixin):
         rows = _run(rv._history_rows(USER))
         self.assertEqual([r["message"] for r in rows], ["x"])
 
-    def test_find_human_chatlog_is_bound_and_fail_open_to_create(self):
-        self.assertIsNone(_run(rv.find_human_chatlog(USER, "zz")))                  # 不正 op_id: 検索しない
+    def test_find_human_chatlog_returns_four_values_and_unavailable_is_not_absent(self):
+        """fix4 BR-13 で意図を変更: fix2 は「読取失敗は None＝作成へ（fail-open・二重作成の遮断は所有権が担う）」を肯定していたが、
+        所有権は同一プロセス群の排他であって kintone 側の既存行の有無は保証しない。検索失敗（unavailable）は「不存在」ではないので
+        作成せず次回に回す（取得不能／不存在／存在／未設定の 4 値）。"""
+        self.assertEqual(_run(rv.find_human_chatlog(USER, "zz")), ("absent", None))    # 不正 op_id: 検索しない
         self.search.assert_not_awaited()
-        self.assertIsNone(_run(rv.find_human_chatlog(USER, OP)))                     # 見つからない
-        self.search.return_value = [{"$id": {"value": "5"}}]
-        self.assertEqual(_run(rv.find_human_chatlog(USER, OP)), "5")
+        self.assertEqual(_run(rv.find_human_chatlog(USER, OP)), ("absent", None))      # 見つからない
+        self.search.return_value = [{"$id": {"value": "5"}, "message": {"value": rf.with_op_marker("x", OP)}}]
+        self.assertEqual(_run(rv.find_human_chatlog(USER, OP)), ("found", "5"))
         self.search.side_effect = RuntimeError("down")
-        self.assertIsNone(_run(rv.find_human_chatlog(USER, OP)))                     # 読取失敗は None（作成へ）
+        self.assertEqual(_run(rv.find_human_chatlog(USER, OP)), ("unavailable", None))  # 読取失敗は unavailable（作成しない）
+        self.search.side_effect = None
         with patch.dict(os.environ, {"APP_CHATLOG": ""}):
-            self.assertIsNone(_run(rv.find_human_chatlog(USER, OP)))
+            self.assertEqual(_run(rv.find_human_chatlog(USER, OP)), ("unconfigured", None))
 
 
 # ── BR-12: 送信前 prepared・台帳との突合 ──────────────────────────────────────
@@ -387,7 +399,10 @@ class TestPreparedAndLedger(_FollowupMixin):
         kw = dict(business="jikou", approval_record_id=REC_ID, line_user_hash=sl.line_user_hash("jikou", USER),
                   text=TEXT, text_version=sl.text_version(TEXT))
         self.assertEqual(_run(rf.prepare(OP3, **kw)), "prepared")
-        self.assertEqual(_run(rf.prepare(OP3, **kw)), "exists")
+        # fix4 BR-15: 同 op_id・同ハッシュ・prepared・台帳行なし → 再準備（旧 fix2 の無条件 exists は廃止）
+        self.assertEqual(_run(rf.prepare(OP3, **kw)), "reprepared")
+        self.assertEqual(_run(rf.prepare(OP3, **dict(kw, text="別の本文", text_version=sl.text_version("別の本文")))),
+                         "rejected")
         # fix3: 置いた直後（prepare→begin の窓）は台帳行が無くても閉じない（waiting_ledger）
         _run(sl.run_recover_job())
         self.create.assert_not_awaited()
