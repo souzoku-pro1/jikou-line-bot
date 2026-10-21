@@ -106,6 +106,10 @@ async def _begin_with_policy(channel: LineChannelConfig, to: str, text: str):
         return await send_ledger.begin(channel.name, channel.name, to, text)
     with send_ledger.policy(cond):
         op = await send_ledger.begin(channel.name, channel.name, to, text)
+    if op is None:
+        # Q1c-fix1 BC-01: 台帳（＝会話状態）が確認できない＝許可表を評価できない → 送らない（fail-closed・行なし・通知 1 日 1 回）。
+        # Q1a の fail-open（begin None で送る）は V2 OFF・他業務・人の明示送信以外の経路に限る（cond is None の分岐）
+        return send_ledger.PolicyStopped(await send_policy.ledger_unavailable_stop())
     if isinstance(op, send_ledger.PolicyStopped):
         send_policy.record_stop(op.reasons)
     elif op is send_ledger.FIRST_REPLY_ALREADY:
