@@ -731,14 +731,15 @@ class TestPendingTableAndView(_DbMixin):
                                            reason="demoted")))
 
     def test_human_reply_resolves_all_open_for_user_only(self):
-        self._reg(inbound_event_id="ev1")
-        self._reg(inbound_event_id="ev2")
-        self._reg(user=USER2, inbound_event_id="ev3")
-        self.assertEqual(_run(sp.human_replied(USER)), 2)
+        a = self._reg(inbound_event_id="ev1")
+        b = self._reg(inbound_event_id="ev2")
+        c = self._reg(user=USER2, inbound_event_id="ev3")
+        # Q1c-fix1 BC-04: 解除は送信着手時点で固定した pending_id 集合だけ（別人の ID が混じっても閉じない）
+        self.assertEqual(_run(sp.human_replied(USER, (a, b, c))), 2)
         states = {r["line_user_hash"]: r["state"] for r in self.pending()}
         self.assertEqual(states[sl.line_user_hash("jikou", USER)], "human_replied")
         self.assertEqual(states[sl.line_user_hash("jikou", USER2)], "open")
-        self.assertEqual(_run(sp.human_replied(USER)), 0)
+        self.assertEqual(_run(sp.human_replied(USER, (a, b, c))), 0)
         self.assertEqual(_run(rp.count_open()), 1)
 
     def test_view_is_gated_and_closed(self):
@@ -802,7 +803,7 @@ class TestHearingHelpers(_DbMixin):
 
     def test_on_demoted_ack_is_silent_or_j0_and_drops_history(self):
         self.on()
-        send = AsyncMock()
+        send = AsyncMock(return_value=sl.SEND_SENT)   # Q1c-fix1 BC-05: J0_TEXT が返る（＝記録する）のは台帳結果が sent のときだけ
         self.assertEqual(_run(sp.demoted_ack(USER, "rt", "500", "その他判断系", send, cr.PENDING_REPLY)), "")
         send.assert_not_awaited()
         self.assertEqual(self.pending()[0]["route"], "hearing")
