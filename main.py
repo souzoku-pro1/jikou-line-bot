@@ -2413,6 +2413,10 @@ async def _approval_policy_stopped(_ev, record_id: str, record: dict) -> dict:
         await mark_stopped_after_sending(_ev, "skip_policy_v2")
     return {"ok": True, "skip": "policy_stopped"}
 
+# ── JIKOU-REPLY-Q1c-fix1（Codex R-Q1c BC-03）: 対応待ちの永続キュー再処理（回収ジョブに相乗り）と未返信の経過通知
+#    （1 日 2 回・件数と経過分のみ）の登録。末尾追記（pin 番地不変）。start_all は既存の startup（healthcheck／houki）が呼ぶ。
+send_policy.register_jobs()
+
 # ── JIKOU-REPLY-Q3a（QUEUE-2026-10-12-C C-2）: 手本の承認・退役画面（/app/exemplars）の結線。末尾追記。
 from hub.webapp_exemplar_view import router as exemplar_view_router  # noqa: E402
 include_before_catch_all(app, exemplar_view_router)
@@ -2424,7 +2428,3 @@ include_before_catch_all(app, drafts_view_router)
 # ── JIKOU-REPLY-Q6（QUEUE-2026-10-13-E E-1）: 返信計測（/app/reply/metrics・/app/reply/{record_id} より前に置く）と週次要約ジョブ（startup 登録）。末尾追記。
 from hub.webapp_reply_metrics_view import wire_all as wire_reply_metrics  # noqa: E402
 wire_reply_metrics(app)
-
-# ── JIKOU-REPLY-Q1c-fix1（Codex R-Q1c BC-03）: 対応待ちの永続キュー再処理（回収ジョブに相乗り）と未返信の経過通知
-#    （1 日 2 回・件数と経過分のみ）の登録。末尾追記（pin 番地不変）。start_all は既存の startup（healthcheck／houki）が呼ぶ。
-send_policy.register_jobs()
