@@ -210,6 +210,8 @@ async def push_text(channel: LineChannelConfig, to: str, text: str, *, require_l
     JIKOU-REPLY-Q1c (a): V2 ON で許可表に落ちた送信は send_ledger.SEND_POLICY_STOPPED（文字列＝`is True`
     判定は失敗側）。承認 webhook はこの値で送信済み更新へ進まない。"""
     op = await _begin_with_policy(channel, to, text)
+    if require_ledger and isinstance(op, send_ledger.PolicyStopped) and tuple(op.reasons) == (send_policy_ledger_unavailable(),):
+        op = None   # Q1c-fix1 BC-01: V2 ON の承認済み下書きで台帳不可（_begin_with_policy が PolicyStopped(ledger:unavailable) に倒した）＝下記の台帳必須の分岐へ
     if op is None and require_ledger:
         # PRE-REVIEW-1 #279-1（JIKOU-REPLY-Q4）: 承認済み下書きの送信は人の明示送信（push_text_explicit）と同じく台帳必須。
         # begin() が None（DB 未設定・記録失敗）なら送らない（bot 経路の fail-open は require_ledger=False のまま不変）
@@ -318,3 +320,10 @@ async def push_text_explicit(channel: LineChannelConfig, op_id: str, to: str,
         except Exception:
             state = None
     return ExplicitSendResult(PUSH_SENT if ok else PUSH_FAILED, led, state)
+
+
+def send_policy_ledger_unavailable() -> str:
+    """Q1c-fix1 BC-01 の停止理由（台帳不可）。require_ledger=True の呼出（Q4 の承認済み下書き）はこれを SEND_LEDGER_UNAVAILABLE に
+    写し、下書きを承認前へ戻す（failed にしない）。遅延 import（循環回避）。"""
+    from hub import send_policy
+    return send_policy.REASON_LEDGER_UNAVAILABLE
