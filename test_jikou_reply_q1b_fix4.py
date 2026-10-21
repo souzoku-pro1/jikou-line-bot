@@ -45,7 +45,8 @@ class _Fix4Mixin(_FollowupMixin):
         self.create.side_effect = None
         self.assertEqual(r.headers["location"], f"{PAGE}?done=sent&log=unknown&ex=saved")
         row = self.followup(op)
-        self.assertEqual((row["state"], row["last_result"], row["text"]), ("pending", "unknown", TEXT))
+        self.assertEqual((row["state"], row["last_result"], row["create_state"], row["text"]),
+                         ("pending", "unknown", "unknown", TEXT))
         return row
 
 
@@ -72,7 +73,8 @@ class TestLookupFourValues(_Fix4Mixin):
         self.search.side_effect = RuntimeError("down")
         _run(sl.run_recover_job())
         self.create.assert_awaited_once()                                           # 増えない
-        self.assertEqual((self.followup()["state"], self.followup()["last_result"]), ("pending", "unknown"))
+        row = self.followup()                                                       # fix5 BR-17: 診断理由は更新・確定状態は unknown のまま
+        self.assertEqual((row["state"], row["last_result"], row["create_state"]), ("pending", "lookup_unavailable", "unknown"))
         self.search.side_effect = None
         self.search.return_value = [_hit("901", rf.with_op_marker(TEXT, OP))]
         _run(sl.run_recover_job())
@@ -149,7 +151,7 @@ class TestLookupFourValues(_Fix4Mixin):
 class TestOwnershipKeepAlive(_Fix4Mixin):
     def test_heartbeat_extends_deadline_only_for_owner(self):
         self._pending()
-        token = _run(rf.claim(OP))
+        token = _run(rf.claim(OP))["owner_token"]
         before = rf._aware(self.followup()["deadline_at"])
         later = rf._now() + datetime.timedelta(seconds=120)
         self.assertTrue(_run(rf.heartbeat(OP, token, now=later)))
@@ -159,9 +161,11 @@ class TestOwnershipKeepAlive(_Fix4Mixin):
         self.assertFalse(_run(rf.heartbeat(OP, "not-the-owner", now=later)))
         self.assertEqual(rf._aware(self.followup()["deadline_at"]), after)
         self.assertFalse(_run(rf.confirm_owner_before_create(OP, "not-the-owner")))
-        self.assertEqual(self.followup()["last_result"], "failed")                  # 触らない
+        self.assertEqual((self.followup()["last_result"], self.followup()["create_state"]), ("failed", "none"))   # 触らない
         self.assertTrue(_run(rf.confirm_owner_before_create(OP, token)))
-        self.assertEqual(self.followup()["last_result"], "creating")
+        # fix5 BR-17: 確定状態 none→creating・診断理由（last_result）は触らない
+        self.assertEqual((self.followup()["last_result"], self.followup()["create_state"]), ("failed", "creating"))
+        self.assertFalse(_run(rf.confirm_owner_before_create(OP, token)))          # creating からは進ませない（単調）
 
     def test_heartbeat_task_keeps_extending_during_slow_create(self):
         self._pending()
@@ -223,7 +227,7 @@ class TestOwnershipKeepAlive(_Fix4Mixin):
     def test_creating_mark_left_by_crash_is_treated_as_unknown(self):
         """owner 再確認（creating）の直後にプロセス停止 → 期限切れ → 作成されたか不明として扱い再作成しない。"""
         self._pending()
-        token = _run(rf.claim(OP))
+        token = _run(rf.claim(OP))["owner_token"]
         self.assertTrue(_run(rf.confirm_owner_before_create(OP, token)))
         _run(sl.run_recover_job())                                                  # 期限内: 触らない
         self.create.assert_not_awaited()
@@ -308,7 +312,14 @@ class TestPrepareRevalidation(_Fix4Mixin):
         self.assertIsInstance(_run(_ledger_row()), sl.Operation)
         self.assertEqual(_run(rf.prepare(OP3, **kw)), "rejected")                   # 台帳に行あり → 未送信を確認できない
         self.assertEqual(self.followup(OP3)["state"], "prepared")
-        _run(rf.close(OP3, "test"))
+        # fix6: 台帳に行がある（sent）行は close できない → 終端は exhausted 相当の直接更新で作る
+        self.assertFalse(_run(rf.close(OP3, "test", expected_version=self.followup(OP3)["row_version"])))
+
+        async def _terminal():
+            async with db.session_scope() as s:
+                await s.execute(sa.update(rf.reply_chatlog_followup).where(rf.reply_chatlog_followup.c.op_id == OP3)
+                                .values(state="closed"))
+        _run(_terminal())
         self.assertEqual(_run(rf.prepare(OP3, **kw)), "rejected")
 
     def test_reprepare_refreshes_grace_window_and_resets_counters(self):
@@ -332,7 +343,7 @@ class TestPrepareRevalidation(_Fix4Mixin):
         self.assertEqual(rf.LOOKUP_RESULTS, ("found", "absent", "unavailable", "unconfigured"))
         self.assertEqual(rf.PREPARE_REJECT_REASONS,
                          ("terminal", "already_sent", "destination_mismatch", "text_mismatch", "ledger_exists"))
-        self.assertEqual((rf.RESULT_LOOKUP_UNAVAILABLE, rf.RESULT_UNKNOWN, rf.WRITE_NOT_OWNER, rf.LAST_CREATING),
+        self.assertEqual((rf.RESULT_LOOKUP_UNAVAILABLE, rf.RESULT_UNKNOWN, rf.WRITE_NOT_OWNER, rf.CREATE_CREATING),
                          ("lookup_unavailable", "unknown", "not_owner", "creating"))
         self.assertIn("op_rejected", rv._DONE_NOTICES)
         self.assertEqual({"lookup_unavailable", "unknown"} - set(rv._LOG_NOTICES), set())
