@@ -419,8 +419,9 @@ class TestPreparedAndLedger(_FollowupMixin):
         _run(sl.run_recover_job())                                                  # 猶予を過ぎて台帳なし → 未送信で閉じる
         self.create.assert_not_awaited()
         self.assertEqual((self.followup(OP3)["state"], self.followup(OP3)["last_result"]), ("closed", "not_sent"))
-        self.assertFalse(_run(rf.close(OP3, "again")))                              # 終端は動かない
-        self.assertFalse(_run(rf.complete(OP3)))
+        v = self.followup(OP3)["row_version"]
+        self.assertFalse(_run(rf.close(OP3, "again", expected_version=v)))          # 終端は動かない
+        self.assertFalse(_run(rf.complete(OP3, expected_version=v)))
 
     def test_mark_pending_without_prepared_row_inserts_pending(self):
         res = _run(rf.mark_pending(OP3, last_result="failed", business="jikou", approval_record_id=REC_ID,
