@@ -977,7 +977,8 @@ class TestReplyExemplarMigration(unittest.TestCase):
 
     SEND_LEDGER = "e5f8a1b4c7d9"
     REPLY_EXEMPLAR = "f7b2c9d4e1a6"
-    REPLY_PENDING = "a1c3e5f7b9d2"      # JIKOU-REPLY-Q1c: 対応待ち（f7b2 の後ろ・head）
+    REPLY_FOLLOWUP_STATE = "a7c9e1f3b5d7"   # JIKOU-REPLY-Q1b-fix5 BR-17: reply_chatlog_followup.create_state（f7b2 の次）
+    REPLY_PENDING = "a1c3e5f7b9d2"      # JIKOU-REPLY-Q1c: 対応待ち（a7c9 の後ろ・head。fix5 で f7b2 → a7c9 に付け替え）
 
     def test_reply_exemplar_migration_round_trip(self):
         import sqlite3
@@ -993,7 +994,10 @@ class TestReplyExemplarMigration(unittest.TestCase):
             up = alembic("upgrade", self.REPLY_EXEMPLAR)
             self.assertEqual(up.returncode, 0, f"stderr={up.stderr[-800:]}")
             self.assertIn(self.REPLY_EXEMPLAR, alembic("current").stdout)
-            # fix1 BR-08/BR-09: 3 表（手本・履歴・App 28 記録未了）が同一 revision で作られ、列集合が metadata と一致
+            up = alembic("upgrade", self.REPLY_FOLLOWUP_STATE)   # fix5: a7c9（create_state 追加）まで進める（Q1c の a1c3 はその後ろ）
+            self.assertEqual(up.returncode, 0, f"stderr={up.stderr[-800:]}")
+            self.assertIn(self.REPLY_FOLLOWUP_STATE, alembic("current").stdout)
+            # fix1 BR-08/BR-09: 3 表（手本・履歴・App 28 記録未了）が同一 revision で作られ、列集合が metadata と一致（head で）
             self.assertTrue({reply_exemplar.TABLE_NAME, reply_exemplar.HISTORY_TABLE_NAME,
                              reply_followup.TABLE_NAME} <= tables())
             # JIKOU-REPLY-Q1c: head（a1c3e5f7b9d2）で対応待ち 2 表が増え、列集合が hub/reply_pending.metadata と一致
@@ -1020,11 +1024,12 @@ class TestReplyExemplarMigration(unittest.TestCase):
                 self.assertIn(("reply_pending", "pending_id"), fks)
             finally:
                 con.close()
-            down = alembic("downgrade", self.REPLY_EXEMPLAR)
+            # Q1b-fix5: Q1b の列集合（create_state を含む）は a7c9 で検査するため、対応待ちだけを落として a7c9 に戻す
+            down = alembic("downgrade", self.REPLY_FOLLOWUP_STATE)
             self.assertEqual(down.returncode, 0, f"stderr={down.stderr[-800:]}")
             for name in reply_pending.TABLE_NAMES:
                 self.assertNotIn(name, tables())
-            self.assertIn(self.REPLY_EXEMPLAR, alembic("current").stdout)
+            self.assertIn(self.REPLY_FOLLOWUP_STATE, alembic("current").stdout)
             con = sqlite3.connect(dbfile)
             try:
                 for name, table in ((reply_exemplar.TABLE_NAME, reply_exemplar.reply_exemplar),
@@ -1054,6 +1059,7 @@ class TestReplyExemplarMigration(unittest.TestCase):
                 # JIKOU-REPLY-Q1b-fix2 BR-11／BR-12: 所有権・照合・本文ハッシュの列は NULL 許容
                 for col in ("text_version", "owner_token", "deadline_at", "chatlog_record_id"):
                     self.assertTrue(nullable(con, reply_followup.TABLE_NAME)[col], col)
+                self.assertFalse(nullable(con, reply_followup.TABLE_NAME)["create_state"])   # fix5: NOT NULL・既定 none
             finally:
                 con.close()
             down = alembic("downgrade", self.SEND_LEDGER)
@@ -1088,7 +1094,8 @@ class TestReplyExemplarMigration(unittest.TestCase):
             self.assertIn("reply_exemplar_downgrade_refused_data_present", down.stderr)
             self.assertNotIn("'t'", down.stderr)                                   # 値は出さない
             self.assertTrue({reply_exemplar.TABLE_NAME, reply_followup.TABLE_NAME} <= tables())
-            # JIKOU-REPLY-Q1c: head（a1c3）→ f7b2 は対応待ちが空なので通り、f7b2 → e5f8 で拒否される＝current は f7b2
+            # JIKOU-REPLY-Q1c: head（a1c3）→ a7c9 は対応待ちが空なので通り、a7c9 → f7b2 は create_state が none だけなので通り、
+            # f7b2 → e5f8 で拒否される＝current は f7b2
             self.assertIn(self.REPLY_EXEMPLAR, alembic("current").stdout)
         finally:
             shutil.rmtree(d, ignore_errors=True)
