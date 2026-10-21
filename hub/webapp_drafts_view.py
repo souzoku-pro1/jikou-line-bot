@@ -343,7 +343,7 @@ async def draft_act(request: Request):
     progress = _is_progress(d)
     # PRE-REVIEW-1 #279-3: outcome（approved_asis／edited）は送信成功の後に記録する（許可表停止・LINE 失敗を承認に数えない）
     # PRE-REVIEW-1 #279-1: 台帳必須（require_ledger）。begin が None なら送らず、下書きを承認前（proposed）へ戻す
-    async with send_ledger.approved_draft(f"{RECORD_PREFIX}{did}:{op_id}"):
+    async with send_ledger.approved_draft(f"{RECORD_PREFIX}{did}:{op_id}"), send_policy.fixed_targets(user_id):  # Q1c-fix1 BC-04: 着手時点の対応待ち集合を固定
         res = await line_channel.push_text(line_channel.JIKOU_CHANNEL, user_id, text, require_ledger=True)
     if res == send_ledger.SEND_LEDGER_UNAVAILABLE:
         await reply_draft.set_state(int(did), reply_draft.STATE_PROPOSED, actor=reply_draft.ACTOR_BOT,
