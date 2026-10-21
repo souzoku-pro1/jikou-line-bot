@@ -9,7 +9,7 @@ downgrade: 2 表を落とす。**データがあれば downgrade 禁止**（い�
 戻す必要があるときは先に大野が内容を確認し、行を退避してから）。
 
 Revision ID: a1c3e5f7b9d2
-Revises: a7c9e1f3b5d7（Q1b-fix5 で f7b2 から付け替え）
+Revises: c8e0a2b4d6f8（Q1b-fix5／fix6 で f7b2 → a7c9 → c8e0 に付け替え）
 Create Date: 2026-10-12
 """
 from typing import Sequence, Union
@@ -18,7 +18,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = 'a1c3e5f7b9d2'
-down_revision: Union[str, Sequence[str], None] = 'a7c9e1f3b5d7'   # Q1b-fix5 で f7b2 → a7c9 に付け替え
+down_revision: Union[str, Sequence[str], None] = 'c8e0a2b4d6f8'   # Q1b-fix5／fix6 で f7b2 → a7c9 → c8e0 に付け替え
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

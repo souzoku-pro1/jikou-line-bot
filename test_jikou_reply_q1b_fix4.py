@@ -312,7 +312,14 @@ class TestPrepareRevalidation(_Fix4Mixin):
         self.assertIsInstance(_run(_ledger_row()), sl.Operation)
         self.assertEqual(_run(rf.prepare(OP3, **kw)), "rejected")                   # 台帳に行あり → 未送信を確認できない
         self.assertEqual(self.followup(OP3)["state"], "prepared")
-        _run(rf.close(OP3, "test"))
+        # fix6: 台帳に行がある（sent）行は close できない → 終端は exhausted 相当の直接更新で作る
+        self.assertFalse(_run(rf.close(OP3, "test", expected_version=self.followup(OP3)["row_version"])))
+
+        async def _terminal():
+            async with db.session_scope() as s:
+                await s.execute(sa.update(rf.reply_chatlog_followup).where(rf.reply_chatlog_followup.c.op_id == OP3)
+                                .values(state="closed"))
+        _run(_terminal())
         self.assertEqual(_run(rf.prepare(OP3, **kw)), "rejected")
 
     def test_reprepare_refreshes_grace_window_and_resets_counters(self):
