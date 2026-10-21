@@ -213,3 +213,69 @@ async def _push_text_http(channel: LineChannelConfig, to: str, text: str) -> boo
         logger.error("[LINE_PUSH] ERROR: %s",
                      emit(resp.text, "vendor_raw", "log", "operator"))
     return bool(resp.is_success)
+
+
+# ── JIKOU-REPLY-Q1b: 大野の明示送信（PWA 返信欄） ─────────────────────────────
+PUSH_SENT = "sent"
+PUSH_FAILED = "failed"
+PUSH_UNCONFIRMED = "unconfirmed"
+PUSH_DUPLICATE_SENT = "duplicate_sent"
+PUSH_DUPLICATE_UNCONFIRMED = "duplicate_unconfirmed"
+PUSH_LEDGER_UNAVAILABLE = "ledger_unavailable"
+PUSH_OUTCOMES = (PUSH_SENT, PUSH_FAILED, PUSH_UNCONFIRMED, PUSH_DUPLICATE_SENT,
+                 PUSH_DUPLICATE_UNCONFIRMED, PUSH_LEDGER_UNAVAILABLE)
+LEDGER_APPLIED = "applied"
+LEDGER_LATE = "late"
+LEDGER_SKIPPED = "skipped"
+LEDGER_NONE = "none"
+
+
+@dataclass(frozen=True)
+class ExplicitSendResult:
+    """push_text_explicit の戻り値（閉集合）。outcome=送信の結果、ledger=finish の戻り値
+    （applied / late / skipped・begin 不能や重複は none）、state=late のとき照合した台帳の現在状態。"""
+    outcome: str
+    ledger: str = LEDGER_NONE
+    state: str | None = None
+
+
+async def push_text_explicit(channel: LineChannelConfig, op_id: str, to: str,
+                             text: str) -> ExplicitSendResult:
+    """大野の明示送信: 操作 ID を固定して送信操作記録を通す（主体=human・用途=reply）。
+    push_text と同じ [begin → guarded_http → finish] だが、**重複を成功と区別して返す**
+    （画面側が App 28 記録・手本保存を二重に行わないため）。
+    JIKOU-REPLY-Q1b-fix1（司令塔裁定: 人の明示送信は台帳必須＝fail-closed）:
+    - BR-01: begin() が None（DB 未設定・記録失敗）なら **送らず** ledger_unavailable を返す
+      （Q1a の bot 経路の fail-open は不変）。
+    - BR-02: finish() の戻り値（applied / late / skipped）を ledger に載せる。late は現在の台帳状態を
+      照合して state に載せる。呼び出し側は applied のときだけ成功処理を行う。
+    - BR-03: 本文ハッシュ（text_version）を着手時に固定し finish で照合する（不一致は late）。
+    - BR-05: human_reply 文脈（attend=True）＝begin() の同一 tx で会話を対応中にする。
+    通信例外・期限到達は記録を unconfirmed にして outcome=unconfirmed を返す（例外は再送出しない。
+    呼び出し側が「送信確認待ち」として扱う）。LINE には一度しか触れない（自動再送なし）。"""
+    tv = send_ledger.text_version(text)
+    async with send_ledger.human_reply(op_id):
+        op = await send_ledger.begin(channel.name, channel.name, to, text)
+    if op is None:
+        logger.warning("[LINE_PUSH] explicit send refused (send_ledger unavailable, fail-closed)")
+        return ExplicitSendResult(PUSH_LEDGER_UNAVAILABLE)
+    if op is send_ledger.DUPLICATE_SENT:
+        logger.info("[LINE_PUSH] explicit duplicate skipped (send_ledger: already sent)")
+        return ExplicitSendResult(PUSH_DUPLICATE_SENT)
+    if op is send_ledger.DUPLICATE_UNCONFIRMED:
+        logger.info("[LINE_PUSH] explicit duplicate skipped (send_ledger: unconfirmed)")
+        return ExplicitSendResult(PUSH_DUPLICATE_UNCONFIRMED)
+    try:
+        ok = await send_ledger.guarded_http(op, _push_text_http(channel, to, text))
+    except Exception:
+        led = await send_ledger.finish(op, send_ledger.STATE_UNCONFIRMED, text_version=tv)
+        return ExplicitSendResult(PUSH_UNCONFIRMED, led)
+    led = await send_ledger.finish(
+        op, send_ledger.STATE_SENT if ok else send_ledger.STATE_FAILED, text_version=tv)
+    state = None
+    if led == LEDGER_LATE:
+        try:
+            state = await send_ledger.operation_state(op.op_id)
+        except Exception:
+            state = None
+    return ExplicitSendResult(PUSH_SENT if ok else PUSH_FAILED, led, state)
