@@ -259,7 +259,7 @@ class TestFollowupTwoProcesses(_DbMixin):
         self.assertEqual(self._pending(), "pending")
         gate = asyncio.Event()
 
-        async def write(user_id, text):
+        async def write(user_id, text, confirm_owner=None):             # Q1b-fix4 BR-14: 第 3 引数（作成直前の owner 再確認）を受ける
             await gate.wait()                                           # 両者が pending を読み終えるまで待つ
             return rf.RESULT_WRITTEN
         resolve = AsyncMock(return_value=USER)
