@@ -18,8 +18,23 @@ Codex R-JIKOU-REPLY-Q1b-1 BR-08・R-Q1b-fix1 BR-11（App 28 二重作成）・BR
 - 自動再送はしない（LINE には触れない）。role 選択肢なし（skipped）・未設定（unconfigured）は試行回数に数えない。
 - 同じ操作 ID の再 POST（画面）は「送信済み・記録のみ再試行」に分岐し、process_one() を直接呼ぶ（所有権は同じ規則）。
 - RV-10: ログは固定語彙＋件数のみ。本文は App 28 に書くまで保持し、done で NULL にする。
+- fix4（Codex R-Q1b-fix2 BR-13〜15）:
+  BR-13 照合は 4 値（found／absent／unavailable／unconfigured）。**取得不能（unavailable）は「不存在」ではない**ので作成せず、
+  回収行を pending（last_result=lookup_unavailable）に残して次回に回す。業務 LINE への通知は 1 日 1 回（台帳 key
+  reply_followup_hold:{JST 日付}・notify_holds_once）。
+  BR-14 回収中は heartbeat（send_ledger と同じ流儀）で owner の deadline を延ばし、**外部作成の直前**に「自分がまだ owner か」を
+  同一 tx の条件付き UPDATE で再確認する（confirm_owner_before_create・同時に last_result=creating を置く）。失われていれば作成しない。
+  作成呼出後に応答を失った行（write が unknown／creating のまま期限切れ）は last_result=unknown として残し、**期限切れだけを根拠に
+  再作成しない**（op_id 照合で既存が見つかるまで作成しない）。
+  BR-15 prepare() は同 op_id の既存行を 業務・宛先ハッシュ・本文ハッシュ・状態 で照合し、未送信を確実に確認できる（台帳行なし・
+  prepared・ハッシュ一致）ときだけ同一 tx で再準備（reprepared）。終端・送信済み・不一致・台帳行ありは rejected（呼出側は送らない）。
+  台帳 begin 失敗の経路では回収行を閉じず prepared のまま残す（本文保持）＝同一 op_id・同一本文の再 POST で再開できる。
+  マーカーは kintone の単語検索仕様（`[ ] : %` 等の記号はキーワードから除かれ、`_` は単語の一部）に合わせ `op_{op_id}`
+  （英数字と `_` のみ・本文末尾に 1 行）。like 検索の後段で本文末尾の等価照合（marker_matches）を行う。
 """
 
+import asyncio
+import contextlib
 import datetime
 import logging
 import re
@@ -48,6 +63,8 @@ OPEN_STATES = (STATE_PREPARED, STATE_PENDING, STATE_UNCONFIGURED, STATE_IN_PROGR
 MAX_ATTEMPTS = 100
 BATCH_LIMIT = 20
 CLAIM_SECONDS = 300
+HEARTBEAT_SECONDS = 60                # fix4 BR-14: 回収中の所有期限の延長間隔（CLAIM_SECONDS より十分短く）
+LEDGER_GRACE_SECONDS = 600            # fix3: prepared 行は台帳行が現れるまで（prepare→begin の窓）この秒数は閉じない
 # process_one の戻り値（閉集合）
 RESULT_WRITTEN = "written"
 RESULT_RECOVERED = "recovered"          # App 28 に既に同じ op_id の行があった（作成せず done）
@@ -60,11 +77,32 @@ RESULT_DESTINATION_MISMATCH = "destination_mismatch"
 RESULT_EXHAUSTED = "exhausted"
 RESULT_WAITING_LEDGER = "waiting_ledger"   # 台帳が未確定（人の確定待ち）
 RESULT_CLOSED = "closed"                   # 台帳 failed／なし＝未送信
+RESULT_LOOKUP_UNAVAILABLE = "lookup_unavailable"   # fix4 BR-13: App 28 の照合が取得不能（不存在ではない）→ 作成せず次回へ
+RESULT_UNKNOWN = "unknown"                 # fix4 BR-14: 作成呼出後に応答喪失（作成されたか不明）→ 照合で見つかるまで作成しない
+WRITE_NOT_OWNER = "not_owner"              # fix4 BR-14: write_chatlog が作成直前の owner 再確認に失敗（作成していない）
+LAST_CREATING = "creating"                 # fix4 BR-14: owner 再確認〜作成呼出の間の印（この印のまま期限切れ＝unknown 扱い）
+# find_chatlog の戻り値（4 値・fix4 BR-13）
+LOOKUP_FOUND = "found"
+LOOKUP_ABSENT = "absent"
+LOOKUP_UNAVAILABLE = "unavailable"
+LOOKUP_UNCONFIGURED = "unconfigured"
+LOOKUP_RESULTS = (LOOKUP_FOUND, LOOKUP_ABSENT, LOOKUP_UNAVAILABLE, LOOKUP_UNCONFIGURED)
+# prepare() の rejected 理由（閉集合・ログは固定文言）
+PREPARE_REJECT_REASONS = ("terminal", "already_sent", "destination_mismatch", "text_mismatch", "ledger_exists")
+# 1 日 1 回の業務 LINE 通知（台帳 key）
+LEDGER_BUSINESS = "jikou"
+LEDGER_CHANNEL = "reply_followup"
+_JST = datetime.timezone(datetime.timedelta(hours=9))
+HOLD_NOTICE_TEXT = ("【チャットログ記録の保留】事務所からの返信のチャットログ（App 28）記録で、既存記録の照合ができない、"
+                    "または記録結果が不明の操作があります。二重記録を避けるため自動では作成せず、回収ジョブが照合を続けます。\n"
+                    "件数: {count}\n"
+                    "確認: 回収表 reply_chatlog_followup の state=pending・last_result=lookup_unavailable／unknown の行。"
+                    "kintone に同じ操作の記録（本文末尾の op_ マーカー）があれば次回の照合で完了になります。")
 # 台帳の状態語彙（hub/send_ledger と同じ・循環 import を避けるため文字列で持つ）
 _LEDGER_SENT = "sent"
 _LEDGER_FAILED = "failed"
-OP_MARKER_PREFIX = "[op:"
-OP_MARKER_RE = re.compile(r"\n?\[op:[0-9a-f]{32}\]\s*$")
+OP_MARKER_PREFIX = "op_"              # fix4: 英数字と _ のみ（kintone 単語検索で 1 単語として一致する）。旧 `[op:…]` は除去だけ受ける
+OP_MARKER_RE = re.compile(r"\n?(?:op_[0-9a-f]{32}|\[op:[0-9a-f]{32}\])\s*$")
 
 reply_chatlog_followup = sa.Table(
     TABLE_NAME, metadata,
@@ -110,7 +148,13 @@ def _db_configured() -> bool:
 
 # ── マーカー（BR-11 照合用・BR-07 の方式を流用） ──────────────────────────────────
 def op_marker(op_id: str) -> str:
-    return f"{OP_MARKER_PREFIX}{op_id}]"
+    return f"{OP_MARKER_PREFIX}{op_id}"
+
+
+def marker_matches(text: str, op_id: str) -> bool:
+    """fix4 BR-13: 検索結果の本文が **この op_id のマーカーで終わる** ことの等価照合（like は単語検索なので後段で厳密に判定）。"""
+    lines = str(text or "").rstrip().split("\n")
+    return bool(lines) and lines[-1].strip() == op_marker(str(op_id))
 
 
 def with_op_marker(text: str, op_id: str) -> str:
@@ -122,27 +166,81 @@ def strip_op_marker(text: str) -> str:
 
 
 # ── 書込（状態遷移はすべて条件付き UPDATE） ──────────────────────────────────────
+def _prepare_mismatch(row, business: str, line_user_hash: str, text_version: str | None) -> str | None:
+    """fix4 BR-15: 既存行との照合。None=再準備可（prepared・業務・宛先ハッシュ・本文ハッシュが一致）、それ以外は rejected の理由。"""
+    if row.state in (STATE_DONE, STATE_CLOSED, STATE_EXHAUSTED):
+        return "terminal"
+    if row.state != STATE_PREPARED:
+        return "already_sent"
+    if row.business != business or row.kind != KIND_CHATLOG_HUMAN or row.line_user_hash != line_user_hash:
+        return "destination_mismatch"
+    if not text_version or row.text_version != text_version:
+        return "text_mismatch"
+    return None
+
+
+def _log_prepare_rejected(reason: str) -> None:
+    if reason == "terminal":
+        logger.info("[REPLY_FOLLOWUP] prepare rejected (terminal state)")
+    elif reason == "already_sent":
+        logger.info("[REPLY_FOLLOWUP] prepare rejected (already sent)")
+    elif reason == "destination_mismatch":
+        logger.info("[REPLY_FOLLOWUP] prepare rejected (destination mismatch)")
+    elif reason == "text_mismatch":
+        logger.info("[REPLY_FOLLOWUP] prepare rejected (text mismatch)")
+    else:
+        logger.info("[REPLY_FOLLOWUP] prepare rejected (ledger row exists)")
+
+
 async def prepare(op_id: str, *, business: str, approval_record_id: str, line_user_hash: str, text: str,
                   text_version: str | None) -> str:
-    """BR-12: 送信の **前** に prepared を置く。戻り値: prepared / exists / skipped（DB なし）/ failed（固定語彙ログ）。"""
+    """BR-12: 送信の **前** に prepared を置く。
+    fix4 BR-15: 同 op_id の既存行は 業務・宛先ハッシュ・本文ハッシュ・状態 を照合し、**未送信を確実に確認できる**
+    （台帳に行なし・回収行 prepared・ハッシュ一致）ときだけ同一 tx で再準備する。
+    戻り値: prepared（新規）/ reprepared（再準備・送信可）/ rejected（終端・送信済み・不一致・台帳行あり＝送らない）/
+    skipped（DB なし）/ failed（固定語彙ログ）。"""
     if not _db_configured():
         return "skipped"
     now = _now()
+    t = reply_chatlog_followup
     try:
         async with session_scope() as s:
-            row = (await s.execute(sa.select(reply_chatlog_followup.c.state).where(
-                reply_chatlog_followup.c.op_id == str(op_id)))).first()
-            if row is not None:
-                return "exists"
-            await s.execute(sa.insert(reply_chatlog_followup).values(
-                op_id=str(op_id), business=business, kind=KIND_CHATLOG_HUMAN,
-                approval_record_id=str(approval_record_id), line_user_hash=line_user_hash,
-                text=text, text_version=text_version, state=STATE_PREPARED, attempts=0, last_result=None,
-                created_at=now, updated_at=now))
+            row = (await s.execute(sa.select(t).where(t.c.op_id == str(op_id)))).first()
+            if row is None:
+                await s.execute(sa.insert(t).values(
+                    op_id=str(op_id), business=business, kind=KIND_CHATLOG_HUMAN,
+                    approval_record_id=str(approval_record_id), line_user_hash=line_user_hash,
+                    text=text, text_version=text_version, state=STATE_PREPARED, attempts=0, last_result=None,
+                    created_at=now, updated_at=now))
+                return "prepared"
+            reason = _prepare_mismatch(row, business, line_user_hash, text_version)
+            if reason is None:
+                from hub.send_ledger import send_operation
+                led = (await s.execute(sa.select(send_operation.c.op_id).where(
+                    send_operation.c.op_id == str(op_id)))).first()
+                if led is not None:
+                    reason = "ledger_exists"
+            if reason is not None:
+                _log_prepare_rejected(reason)
+                return "rejected"
+            r = await s.execute(sa.update(t).where(t.c.op_id == str(op_id), t.c.state == STATE_PREPARED).values(
+                text=text, attempts=0, last_result=None, created_at=now, updated_at=now))
+            if int(r.rowcount or 0) != 1:
+                _log_prepare_rejected("terminal")
+                return "rejected"
     except Exception:
         logger.warning("[REPLY_FOLLOWUP] prepare failed (fixed reason)")
         return "failed"
-    return "prepared"
+    return "reprepared"
+
+
+async def note_prepared(op_id: str, reason: str) -> bool:
+    """fix4 BR-15: 台帳 begin 失敗など「送っていない」経路の印を prepared 行に残す（閉じない・本文は保持）。"""
+    try:
+        return await _set(op_id, STATE_PREPARED, last_result=str(reason))
+    except Exception:
+        logger.warning("[REPLY_FOLLOWUP] note prepared failed (fixed reason)")
+        return False
 
 
 async def _set(op_id: str, where_states, **values) -> bool:
@@ -263,6 +361,82 @@ async def _release(op_id: str, token: str, to_state: str, **values) -> bool:
         return int(r.rowcount or 0) == 1
 
 
+async def heartbeat(op_id: str, token: str, *, now=None) -> bool:
+    """fix4 BR-14: 回収中の所有期限を延ばす（所有者のみ）。戻り値=延長できたか（所有権を失っていれば False）。"""
+    now = now or _now()
+    t = reply_chatlog_followup
+    try:
+        async with session_scope() as s:
+            r = await s.execute(sa.update(t).where(t.c.op_id == str(op_id), t.c.state == STATE_IN_PROGRESS,
+                                                    t.c.owner_token == token).values(
+                deadline_at=now + datetime.timedelta(seconds=CLAIM_SECONDS), updated_at=now))
+            return int(r.rowcount or 0) == 1
+    except Exception:
+        logger.warning("[REPLY_FOLLOWUP] heartbeat failed (fixed reason)")
+        return False
+
+
+@contextlib.asynccontextmanager
+async def heartbeat_task(op_id: str, token: str):
+    """fix4 BR-14: 照合・外部作成を await している間、別タスクが HEARTBEAT_SECONDS ごとに heartbeat() を呼ぶ
+    （send_ledger.heartbeat_task と同じ流儀）。終了時に必ず cancel して待つ。ログは出さない。"""
+    interval = HEARTBEAT_SECONDS
+
+    async def _beat():
+        try:
+            while True:
+                await asyncio.sleep(interval)
+                await heartbeat(op_id, token)
+        except asyncio.CancelledError:
+            pass
+
+    task = asyncio.create_task(_beat())
+    try:
+        yield
+    finally:
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
+
+
+async def confirm_owner_before_create(op_id: str, token: str, *, now=None) -> bool:
+    """fix4 BR-14: **外部作成の直前**に「自分がまだ owner か」を同一 tx の条件付き UPDATE で再確認する。
+    同時に last_result=creating（作成呼出の印）と期限延長を置く。失われていれば False＝呼び出し側は作成しない。"""
+    now = now or _now()
+    t = reply_chatlog_followup
+    try:
+        async with session_scope() as s:
+            r = await s.execute(sa.update(t).where(t.c.op_id == str(op_id), t.c.state == STATE_IN_PROGRESS,
+                                                    t.c.owner_token == token).values(
+                last_result=LAST_CREATING, deadline_at=now + datetime.timedelta(seconds=CLAIM_SECONDS), updated_at=now))
+            return int(r.rowcount or 0) == 1
+    except Exception:
+        logger.warning("[REPLY_FOLLOWUP] owner recheck failed (fixed reason)")
+        return False
+
+
+async def _lookup(find_chatlog, user_id: str, op_id: str) -> tuple[str, str | None]:
+    """fix4 BR-13: find_chatlog の戻り値を 4 値 (status, record_id) に正規化する。例外は unavailable（不存在ではない）。
+    旧形式（record_id|None）も受ける（found／absent）。find_chatlog が無ければ absent（照合手段なし＝従来どおり作成へ）。"""
+    if find_chatlog is None:
+        return LOOKUP_ABSENT, None
+    try:
+        res = await find_chatlog(user_id, op_id)
+    except Exception:
+        return LOOKUP_UNAVAILABLE, None
+    if isinstance(res, tuple):
+        status = str(res[0]) if res else LOOKUP_UNAVAILABLE
+        rid = res[1] if len(res) > 1 and res[1] else None
+        if status not in LOOKUP_RESULTS:
+            status = LOOKUP_UNAVAILABLE
+        return status, (str(rid) if rid else None)
+    if res:
+        return LOOKUP_FOUND, str(res)
+    return LOOKUP_ABSENT, None
+
+
 async def _finish_done(op_id: str, token: str, *, record_id: str | None, last_result: str) -> bool:
     return await _release(op_id, token, STATE_DONE, text=None, done_at=_now(), last_result=last_result,
                           chatlog_record_id=(str(record_id) if record_id else None))
@@ -272,8 +446,10 @@ async def process_one(op_id: str, *, resolve_user_id, write_chatlog, find_chatlo
                       now=None) -> str:
     """1 件を処理する（冪等・所有権つき）。
     resolve_user_id(approval_record_id) -> line_user_id|None（App 29 から再解決）、
-    write_chatlog(user_id, text_with_marker) -> written / skipped / failed / unconfigured（または (結果, record_id)）、
-    find_chatlog(user_id, op_id) -> record_id|None（App 28 を op_id マーカーで検索）、
+    write_chatlog(user_id, text_with_marker, confirm_owner) -> written / skipped / failed（作成呼出前の失敗）/
+      unknown（作成呼出後に応答喪失）/ not_owner（confirm_owner が False＝作成していない）/ unconfigured（または (結果, record_id)）。
+      confirm_owner() は **外部作成の直前** に呼ぶこと（fix4 BR-14）、
+    find_chatlog(user_id, op_id) -> (found|absent|unavailable|unconfigured, record_id|None)（fix4 BR-13・4 値）、
     ledger_state(op_id) -> send_ledger の状態（None=台帳行なし）。戻り値は閉集合（RESULT_*）。"""
     row = await get_followup(op_id)
     if row is None:
@@ -286,8 +462,17 @@ async def process_one(op_id: str, *, resolve_user_id, write_chatlog, find_chatlo
             state = await ledger_state(op_id)
         except Exception:
             return RESULT_WAITING_LEDGER
-        if state in (None, _LEDGER_FAILED):
-            await close(op_id, "not_sent" if state is None else "ledger_failed")
+        if state is None:
+            # fix3（PRE-REVIEW-1 #272 低）: prepared は送信の **前** に置かれる。台帳行が無いのは「まだ begin していない」
+            # 可能性があるので、作成から LEDGER_GRACE_SECONDS の間は閉じずに待つ（prepare→begin の ms 窓で回収ジョブが
+            # 先に not_sent で閉じ、その後の記録未了が回収対象外になる穴を塞ぐ）
+            created = _aware(row.get("created_at"))
+            if created is not None and (now or _now()) - created < datetime.timedelta(seconds=LEDGER_GRACE_SECONDS):
+                return RESULT_WAITING_LEDGER
+            await close(op_id, "not_sent")
+            return RESULT_CLOSED
+        if state == _LEDGER_FAILED:
+            await close(op_id, "ledger_failed")
             return RESULT_CLOSED
         if state != _LEDGER_SENT:
             return RESULT_WAITING_LEDGER
@@ -302,16 +487,29 @@ async def process_one(op_id: str, *, resolve_user_id, write_chatlog, find_chatlo
     if not user_id or line_user_hash(row["business"], user_id) != row["line_user_hash"]:
         await _release(op_id, token, STATE_PENDING, last_result=RESULT_DESTINATION_MISMATCH)
         return RESULT_DESTINATION_MISMATCH
-    # BR-11: 作成前に op_id で照合（成功応答喪失の修復）
-    if find_chatlog is not None:
-        try:
-            existing = await find_chatlog(user_id, str(op_id))
-        except Exception:
-            existing = None
-        if existing:
-            await _finish_done(op_id, token, record_id=str(existing), last_result=RESULT_RECOVERED)
+    # fix4 BR-14: 作成呼出後に応答を失った行（unknown）／作成直前の印のまま期限切れになった行（creating）は再作成しない
+    unknown_before = row.get("last_result") in (RESULT_UNKNOWN, LAST_CREATING)
+    async with heartbeat_task(op_id, token):
+        # BR-11／fix4 BR-13: 作成前に op_id で照合（成功応答喪失の修復）。4 値で分岐し、取得不能は「不存在」扱いしない
+        status, existing = await _lookup(find_chatlog, user_id, str(op_id))
+        if status == LOOKUP_FOUND:
+            await _finish_done(op_id, token, record_id=existing, last_result=RESULT_RECOVERED)
             return RESULT_RECOVERED
-    result = await write_chatlog(user_id, with_op_marker(row["text"] or "", str(op_id)))
+        if status == LOOKUP_UNCONFIGURED:
+            await _release(op_id, token, STATE_UNCONFIGURED,
+                           last_result=(RESULT_UNKNOWN if unknown_before else RESULT_UNCONFIGURED))
+            return RESULT_UNCONFIGURED
+        if status == LOOKUP_UNAVAILABLE:
+            await _release(op_id, token, STATE_PENDING,
+                           last_result=(RESULT_UNKNOWN if unknown_before else RESULT_LOOKUP_UNAVAILABLE))
+            return RESULT_LOOKUP_UNAVAILABLE
+        if unknown_before:
+            await _release(op_id, token, STATE_PENDING, last_result=RESULT_UNKNOWN)
+            return RESULT_UNKNOWN
+
+        async def _confirm_owner() -> bool:
+            return await confirm_owner_before_create(op_id, token, now=now)
+        result = await write_chatlog(user_id, with_op_marker(row["text"] or "", str(op_id)), _confirm_owner)
     record_id = None
     if isinstance(result, tuple):
         result, record_id = result[0], result[1]
@@ -319,10 +517,17 @@ async def process_one(op_id: str, *, resolve_user_id, write_chatlog, find_chatlo
         if await _finish_done(op_id, token, record_id=record_id, last_result=RESULT_WRITTEN):
             return RESULT_WRITTEN
         return RESULT_NOT_PENDING
+    if result == WRITE_NOT_OWNER:
+        return RESULT_NOT_PENDING                   # 所有権を失っていた（作成していない・行は新しい owner のもの）
+    if result == RESULT_UNKNOWN:
+        await _release(op_id, token, STATE_PENDING, last_result=RESULT_UNKNOWN)
+        logger.warning("[REPLY_FOLLOWUP] chatlog create result unknown (kept, no auto re-create)")
+        return RESULT_UNKNOWN
     if result == RESULT_FAILED:
         attempts = int(row["attempts"]) + 1
         if attempts >= MAX_ATTEMPTS:
-            await _release(op_id, token, STATE_EXHAUSTED, attempts=attempts, last_result=RESULT_FAILED)
+            # fix3: 終端なので本文は保持しない（done／closed と同じ）
+            await _release(op_id, token, STATE_EXHAUSTED, attempts=attempts, last_result=RESULT_FAILED, text=None)
             logger.warning("[REPLY_FOLLOWUP] chatlog retry exhausted (max attempts)")
             return RESULT_EXHAUSTED
         await _release(op_id, token, STATE_PENDING, attempts=attempts, last_result=RESULT_FAILED)
@@ -364,4 +569,48 @@ async def run_followup(*, resolve_user_id, write_chatlog, find_chatlog=None, led
         logger.info("[REPLY_FOLLOWUP] retried=%s written=%s",
                     emit(sum(counts.values()), "count", "log", "operator"),
                     emit(counts.get(RESULT_WRITTEN, 0) + counts.get(RESULT_RECOVERED, 0), "count", "log", "operator"))
+    held = counts.get(RESULT_LOOKUP_UNAVAILABLE, 0) + counts.get(RESULT_UNKNOWN, 0)
+    if held:
+        try:
+            await notify_holds_once(held)
+        except Exception:
+            logger.warning("[REPLY_FOLLOWUP] hold notice failed (fixed reason)")
     return counts
+
+
+# ── fix4 BR-13: 保留（照合不能・結果不明）の業務 LINE 通知（1 日 1 回・台帳 key） ─────────────
+def _day_key(now: datetime.datetime | None = None) -> str:
+    now = now or datetime.datetime.now(_JST)
+    return "reply_followup_hold:" + now.astimezone(_JST).strftime("%Y-%m-%d")
+
+
+async def notify_holds_once(count: int) -> bool:
+    """照合不能／結果不明の回収行がある日に 1 回だけ業務 LINE へ通知する（台帳 key reply_followup_hold:{JST 日付}・
+    hub.approved_texts.notify_unapproved_once と同じ流儀）。件数のみ（op_id・本文・宛先は載せない）。
+    DUPLICATE は送らない。台帳不可は直接送る（throttle）。管理者 ID 未設定は何もしない（False）。"""
+    from hub import send_ledger
+    from hub.notify import get_admin_line_user_id, notify_admin_line
+    admin_id = get_admin_line_user_id() or ""
+    if not admin_id:
+        return False
+    text = HOLD_NOTICE_TEXT.format(count=int(count))
+    token = send_ledger.bind_inbound(_day_key())
+    try:
+        with send_ledger.purpose(send_ledger.PURPOSE_OTHER):
+            op = await send_ledger.begin(LEDGER_BUSINESS, LEDGER_CHANNEL, admin_id, text)
+    except Exception:
+        op = None
+    finally:
+        send_ledger.unbind(token)
+    if op is send_ledger.DUPLICATE_SENT or op is send_ledger.DUPLICATE_UNCONFIRMED:
+        logger.info("[REPLY_FOLLOWUP] hold notice skipped (already sent today per ledger)")
+        return True
+    if not isinstance(op, send_ledger.Operation):
+        return await notify_admin_line(text, throttle_key="reply_followup_hold:daily")
+    try:
+        ok = await notify_admin_line(text, throttle_key="reply_followup_hold:daily")
+    except Exception:
+        await send_ledger.finish(op, send_ledger.STATE_UNCONFIRMED)
+        raise
+    await send_ledger.finish(op, send_ledger.STATE_SENT if ok else send_ledger.STATE_FAILED)
+    return ok
