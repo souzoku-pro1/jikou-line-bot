@@ -31,6 +31,13 @@ Codex R-JIKOU-REPLY-Q1b-1 BR-08・R-Q1b-fix1 BR-11（App 28 二重作成）・BR
   台帳 begin 失敗の経路では回収行を閉じず prepared のまま残す（本文保持）＝同一 op_id・同一本文の再 POST で再開できる。
   マーカーは kintone の単語検索仕様（`[ ] : %` 等の記号はキーワードから除かれ、`_` は単語の一部）に合わせ `op_{op_id}`
   （英数字と `_` のみ・本文末尾に 1 行）。like 検索の後段で本文末尾の等価照合（marker_matches）を行う。
+- fix5（Codex R-Q1b-fix4 BR-16・17）:
+  BR-16 claim() は条件付き UPDATE と **同一トランザクション** で取得後の最新行を返す。process_one() は claim 前に読んだ行を
+  作成可否の判断（確定状態・診断理由・状態）に使わず、claim の戻り値だけを使う（claim 前の古い行で unknown を見落とさない）。
+  BR-17 列を分離: `create_state`＝**外部作成の確定状態**（none／creating／unknown／created・migration a7c9e1f3b5d7）、
+  `last_result`＝**直近の診断理由**（destination_mismatch・lookup_unavailable・failed・written 等）。宛先取得失敗などは診断理由だけを
+  更新し、確定状態は触らない。確定状態の遷移は単調（none→creating→unknown／created、unknown→created のみ）で、条件付き UPDATE
+  （CASE 式）が逆行・上書きを拒否する。
 """
 
 import asyncio
@@ -80,7 +87,15 @@ RESULT_CLOSED = "closed"                   # 台帳 failed／なし＝未送信
 RESULT_LOOKUP_UNAVAILABLE = "lookup_unavailable"   # fix4 BR-13: App 28 の照合が取得不能（不存在ではない）→ 作成せず次回へ
 RESULT_UNKNOWN = "unknown"                 # fix4 BR-14: 作成呼出後に応答喪失（作成されたか不明）→ 照合で見つかるまで作成しない
 WRITE_NOT_OWNER = "not_owner"              # fix4 BR-14: write_chatlog が作成直前の owner 再確認に失敗（作成していない）
-LAST_CREATING = "creating"                 # fix4 BR-14: owner 再確認〜作成呼出の間の印（この印のまま期限切れ＝unknown 扱い）
+# fix5 BR-17: 外部作成の確定状態（create_state 列・閉集合・単調遷移）
+CREATE_NONE = "none"
+CREATE_CREATING = "creating"               # owner 再確認〜作成呼出の間の印（この印のまま期限切れ＝unknown 扱い）
+CREATE_UNKNOWN = "unknown"                 # 作成呼出後に応答喪失（作成されたか不明）
+CREATE_CREATED = "created"                 # 作成できた／既存行を照合した
+CREATE_STATES = (CREATE_NONE, CREATE_CREATING, CREATE_UNKNOWN, CREATE_CREATED)
+CREATE_TRANSITIONS = {CREATE_CREATING: (CREATE_NONE,),
+                      CREATE_UNKNOWN: (CREATE_CREATING,),
+                      CREATE_CREATED: (CREATE_CREATING, CREATE_UNKNOWN)}
 # find_chatlog の戻り値（4 値・fix4 BR-13）
 LOOKUP_FOUND = "found"
 LOOKUP_ABSENT = "absent"
@@ -115,7 +130,8 @@ reply_chatlog_followup = sa.Table(
     sa.Column("text_version", sa.Text, nullable=True),           # fix2 BR-12: 承認された本文の sha256（台帳と同じ）
     sa.Column("state", sa.Text, nullable=False),
     sa.Column("attempts", sa.Integer, nullable=False, server_default="0"),
-    sa.Column("last_result", sa.Text, nullable=True),
+    sa.Column("last_result", sa.Text, nullable=True),            # fix5 BR-17: 直近の診断理由（確定状態は create_state）
+    sa.Column("create_state", sa.Text, nullable=False, server_default=CREATE_NONE),   # fix5 BR-17: 外部作成の確定状態
     sa.Column("owner_token", sa.Text, nullable=True),            # fix2 BR-11: 回収の所有権
     sa.Column("deadline_at", sa.DateTime(timezone=True), nullable=True),
     sa.Column("chatlog_record_id", sa.Text, nullable=True),      # fix2 BR-11: 照合で見つけた／作成した App 28 レコード No.
@@ -124,6 +140,7 @@ reply_chatlog_followup = sa.Table(
     sa.Column("done_at", sa.DateTime(timezone=True), nullable=True),
     sa.CheckConstraint("state IN ('prepared', 'pending', 'unconfigured', 'in_progress', 'done', 'closed', 'exhausted')",
                        name="ck_reply_followup_state"),
+    sa.CheckConstraint("create_state IN ('none', 'creating', 'unknown', 'created')", name="ck_reply_followup_create_state"),
     sa.Index("ix_reply_followup_state", "state", "created_at"),
 )
 
@@ -334,9 +351,10 @@ async def pending_ops(limit: int = BATCH_LIMIT) -> list[str]:
     return await open_ops(limit)
 
 
-async def claim(op_id: str, *, now=None) -> str | None:
+async def claim(op_id: str, *, now=None) -> dict | None:
     """BR-11: 回収の所有権を取る（prepared／pending／unconfigured、または期限切れ in_progress → in_progress）。
-    戻り値は owner_token（取れなければ None）。"""
+    fix5 BR-16: 条件付き UPDATE と **同一トランザクション** で取得後の最新行を読み戻して返す（dict・owner_token を含む）。
+    取れなければ None。呼び出し側は作成可否の判断にこの戻り値だけを使う（claim 前に読んだ行は使わない）。"""
     now = now or _now()
     token = uuid.uuid4().hex
     t = reply_chatlog_followup
@@ -348,7 +366,16 @@ async def claim(op_id: str, *, now=None) -> str | None:
                            sa.or_(t.c.deadline_at.is_(None), t.c.deadline_at < now)))).values(
             state=STATE_IN_PROGRESS, owner_token=token, deadline_at=now + datetime.timedelta(seconds=CLAIM_SECONDS),
             updated_at=now))
-        return token if int(r.rowcount or 0) == 1 else None
+        if int(r.rowcount or 0) != 1:
+            return None
+        row = (await s.execute(sa.select(t).where(t.c.op_id == str(op_id), t.c.owner_token == token))).first()
+        return dict(row._mapping) if row is not None else None
+
+
+def _create_state_to(to: str):
+    """fix5 BR-17: 確定状態の単調遷移を 1 文の CASE 式で表す（許される前状態からだけ to へ・それ以外は現在値のまま）。"""
+    t = reply_chatlog_followup
+    return sa.case((t.c.create_state.in_(list(CREATE_TRANSITIONS[to])), to), else_=t.c.create_state)
 
 
 async def _release(op_id: str, token: str, to_state: str, **values) -> bool:
@@ -403,14 +430,15 @@ async def heartbeat_task(op_id: str, token: str):
 
 async def confirm_owner_before_create(op_id: str, token: str, *, now=None) -> bool:
     """fix4 BR-14: **外部作成の直前**に「自分がまだ owner か」を同一 tx の条件付き UPDATE で再確認する。
-    同時に last_result=creating（作成呼出の印）と期限延長を置く。失われていれば False＝呼び出し側は作成しない。"""
+    fix5 BR-17: 同時に確定状態を none→creating へ進める（none 以外＝unknown／creating／created の行は作成に進ませない）。
+    期限も延長する。失われていれば False＝呼び出し側は作成しない。診断理由（last_result）は触らない。"""
     now = now or _now()
     t = reply_chatlog_followup
     try:
         async with session_scope() as s:
             r = await s.execute(sa.update(t).where(t.c.op_id == str(op_id), t.c.state == STATE_IN_PROGRESS,
-                                                    t.c.owner_token == token).values(
-                last_result=LAST_CREATING, deadline_at=now + datetime.timedelta(seconds=CLAIM_SECONDS), updated_at=now))
+                                                    t.c.owner_token == token, t.c.create_state == CREATE_NONE).values(
+                create_state=CREATE_CREATING, deadline_at=now + datetime.timedelta(seconds=CLAIM_SECONDS), updated_at=now))
             return int(r.rowcount or 0) == 1
     except Exception:
         logger.warning("[REPLY_FOLLOWUP] owner recheck failed (fixed reason)")
@@ -439,6 +467,7 @@ async def _lookup(find_chatlog, user_id: str, op_id: str) -> tuple[str, str | No
 
 async def _finish_done(op_id: str, token: str, *, record_id: str | None, last_result: str) -> bool:
     return await _release(op_id, token, STATE_DONE, text=None, done_at=_now(), last_result=last_result,
+                          create_state=_create_state_to(CREATE_CREATED),
                           chatlog_record_id=(str(record_id) if record_id else None))
 
 
@@ -450,11 +479,13 @@ async def process_one(op_id: str, *, resolve_user_id, write_chatlog, find_chatlo
       unknown（作成呼出後に応答喪失）/ not_owner（confirm_owner が False＝作成していない）/ unconfigured（または (結果, record_id)）。
       confirm_owner() は **外部作成の直前** に呼ぶこと（fix4 BR-14）、
     find_chatlog(user_id, op_id) -> (found|absent|unavailable|unconfigured, record_id|None)（fix4 BR-13・4 値）、
-    ledger_state(op_id) -> send_ledger の状態（None=台帳行なし）。戻り値は閉集合（RESULT_*）。"""
-    row = await get_followup(op_id)
-    if row is None:
+    ledger_state(op_id) -> send_ledger の状態（None=台帳行なし）。戻り値は閉集合（RESULT_*）。
+    fix5 BR-16: 作成可否の判断（確定状態 create_state・状態）は claim() が同一 tx で読み戻した行だけで行う。"""
+    # claim 前の読取は 存在・開状態・台帳との突合 にだけ使う（fix5 BR-16: 作成可否の判断には使わない）
+    row0 = await get_followup(op_id)
+    if row0 is None:
         return RESULT_NOT_FOUND
-    if row["state"] not in OPEN_STATES:
+    if row0["state"] not in OPEN_STATES:
         return RESULT_NOT_PENDING
     # BR-12: 台帳との突合（送信が確定していない行は記録しない・未送信は閉じる）
     if ledger_state is not None:
@@ -466,7 +497,7 @@ async def process_one(op_id: str, *, resolve_user_id, write_chatlog, find_chatlo
             # fix3（PRE-REVIEW-1 #272 低）: prepared は送信の **前** に置かれる。台帳行が無いのは「まだ begin していない」
             # 可能性があるので、作成から LEDGER_GRACE_SECONDS の間は閉じずに待つ（prepare→begin の ms 窓で回収ジョブが
             # 先に not_sent で閉じ、その後の記録未了が回収対象外になる穴を塞ぐ）
-            created = _aware(row.get("created_at"))
+            created = _aware(row0.get("created_at"))
             if created is not None and (now or _now()) - created < datetime.timedelta(seconds=LEDGER_GRACE_SECONDS):
                 return RESULT_WAITING_LEDGER
             await close(op_id, "not_sent")
@@ -476,19 +507,23 @@ async def process_one(op_id: str, *, resolve_user_id, write_chatlog, find_chatlo
             return RESULT_CLOSED
         if state != _LEDGER_SENT:
             return RESULT_WAITING_LEDGER
-    token = await claim(op_id, now=now)
-    if token is None:
+    # fix5 BR-16: 以降の判断は claim が同一 tx で読み戻した最新行だけで行う
+    row = await claim(op_id, now=now)
+    if row is None:
         return RESULT_NOT_PENDING
+    token = row["owner_token"]
+    # fix4 BR-14／fix5 BR-17: 確定状態が creating（作成直前の印のまま期限切れ）／unknown（応答喪失）の行は再作成しない。
+    # 以下の release は診断理由（last_result）だけを更新し、確定状態は creating→unknown の単調遷移以外は触らない
+    unknown_before = row.get("create_state") in (CREATE_CREATING, CREATE_UNKNOWN)
+    cs = {"create_state": _create_state_to(CREATE_UNKNOWN)} if unknown_before else {}
     from hub.send_ledger import line_user_hash
     try:
         user_id = await resolve_user_id(row["approval_record_id"])
     except Exception:
         user_id = None
     if not user_id or line_user_hash(row["business"], user_id) != row["line_user_hash"]:
-        await _release(op_id, token, STATE_PENDING, last_result=RESULT_DESTINATION_MISMATCH)
+        await _release(op_id, token, STATE_PENDING, last_result=RESULT_DESTINATION_MISMATCH, **cs)
         return RESULT_DESTINATION_MISMATCH
-    # fix4 BR-14: 作成呼出後に応答を失った行（unknown）／作成直前の印のまま期限切れになった行（creating）は再作成しない
-    unknown_before = row.get("last_result") in (RESULT_UNKNOWN, LAST_CREATING)
     async with heartbeat_task(op_id, token):
         # BR-11／fix4 BR-13: 作成前に op_id で照合（成功応答喪失の修復）。4 値で分岐し、取得不能は「不存在」扱いしない
         status, existing = await _lookup(find_chatlog, user_id, str(op_id))
@@ -496,15 +531,13 @@ async def process_one(op_id: str, *, resolve_user_id, write_chatlog, find_chatlo
             await _finish_done(op_id, token, record_id=existing, last_result=RESULT_RECOVERED)
             return RESULT_RECOVERED
         if status == LOOKUP_UNCONFIGURED:
-            await _release(op_id, token, STATE_UNCONFIGURED,
-                           last_result=(RESULT_UNKNOWN if unknown_before else RESULT_UNCONFIGURED))
+            await _release(op_id, token, STATE_UNCONFIGURED, last_result=RESULT_UNCONFIGURED, **cs)
             return RESULT_UNCONFIGURED
         if status == LOOKUP_UNAVAILABLE:
-            await _release(op_id, token, STATE_PENDING,
-                           last_result=(RESULT_UNKNOWN if unknown_before else RESULT_LOOKUP_UNAVAILABLE))
+            await _release(op_id, token, STATE_PENDING, last_result=RESULT_LOOKUP_UNAVAILABLE, **cs)
             return RESULT_LOOKUP_UNAVAILABLE
         if unknown_before:
-            await _release(op_id, token, STATE_PENDING, last_result=RESULT_UNKNOWN)
+            await _release(op_id, token, STATE_PENDING, last_result=RESULT_UNKNOWN, **cs)
             return RESULT_UNKNOWN
 
         async def _confirm_owner() -> bool:
@@ -520,7 +553,8 @@ async def process_one(op_id: str, *, resolve_user_id, write_chatlog, find_chatlo
     if result == WRITE_NOT_OWNER:
         return RESULT_NOT_PENDING                   # 所有権を失っていた（作成していない・行は新しい owner のもの）
     if result == RESULT_UNKNOWN:
-        await _release(op_id, token, STATE_PENDING, last_result=RESULT_UNKNOWN)
+        await _release(op_id, token, STATE_PENDING, last_result=RESULT_UNKNOWN,
+                       create_state=_create_state_to(CREATE_UNKNOWN))
         logger.warning("[REPLY_FOLLOWUP] chatlog create result unknown (kept, no auto re-create)")
         return RESULT_UNKNOWN
     if result == RESULT_FAILED:

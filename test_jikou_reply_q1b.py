@@ -920,7 +920,8 @@ class TestAnonymize(unittest.TestCase):
         self.assertEqual({c.name for c in rf.reply_chatlog_followup.columns},
                          {"op_id", "business", "kind", "approval_record_id", "line_user_hash", "text",
                           "text_version", "state", "attempts", "last_result", "owner_token", "deadline_at",
-                          "chatlog_record_id", "created_at", "updated_at", "done_at"})
+                          "chatlog_record_id", "created_at", "updated_at", "done_at",
+                          "create_state"})                                           # fix5 BR-17: 外部作成の確定状態（a7c9e1f3b5d7）
         self.assertEqual(rf.STATES, ("prepared", "pending", "unconfigured", "in_progress", "done", "closed",
                                      "exhausted"))
         self.assertEqual(rf.OPEN_STATES, ("prepared", "pending", "unconfigured", "in_progress"))
