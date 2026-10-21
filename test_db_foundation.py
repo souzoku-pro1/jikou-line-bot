@@ -979,7 +979,8 @@ class TestReplyExemplarMigration(unittest.TestCase):
     REPLY_EXEMPLAR = "f7b2c9d4e1a6"
     REPLY_FOLLOWUP_STATE = "a7c9e1f3b5d7"   # JIKOU-REPLY-Q1b-fix5 BR-17: reply_chatlog_followup.create_state（f7b2 の次）
     REPLY_FOLLOWUP_VERSION = "c8e0a2b4d6f8"  # JIKOU-REPLY-Q1b-fix6 BR-18: reply_chatlog_followup.row_version（a7c9 の次）
-    REPLY_PENDING = "a1c3e5f7b9d2"      # JIKOU-REPLY-Q1c: 対応待ち（c8e0 の後ろ・head。fix5／fix6 で f7b2 → a7c9 → c8e0 に付け替え）
+    REPLY_PENDING = "a1c3e5f7b9d2"      # JIKOU-REPLY-Q1c: 対応待ち（c8e0 の後ろ。fix5／fix6 で f7b2 → a7c9 → c8e0 に付け替え）
+    REPLY_PENDING_RETRY = "d4f6a8b0c2e4"  # JIKOU-REPLY-Q1c-fix1 BC-03: 対応待ちの保存失敗の永続キュー reply_pending_retry（a1c3 の次・head）
 
     def test_reply_exemplar_migration_round_trip(self):
         import sqlite3
@@ -1007,14 +1008,20 @@ class TestReplyExemplarMigration(unittest.TestCase):
             # JIKOU-REPLY-Q1c: head（a1c3e5f7b9d2）で対応待ち 2 表が増え、列集合が hub/reply_pending.metadata と一致
             from hub import reply_pending
             self.assertNotIn(reply_pending.TABLE_NAME, tables())
-            up = alembic("upgrade", "head")
+            up = alembic("upgrade", self.REPLY_PENDING)      # Q1c-fix1: head が d4f6 へ進んだため a1c3 までを明示（検証内容は不変）
             self.assertEqual(up.returncode, 0, f"stderr={up.stderr[-800:]}")
             self.assertIn(self.REPLY_PENDING, alembic("current").stdout)
             self.assertTrue(set(reply_pending.TABLE_NAMES) <= tables())
+            self.assertNotIn(reply_pending.RETRY_TABLE_NAME, tables())
+            up = alembic("upgrade", "head")                   # Q1c-fix1 BC-03: d4f6（reply_pending_retry）が head・鎖は 1 本
+            self.assertEqual(up.returncode, 0, f"stderr={up.stderr[-800:]}")
+            self.assertIn(self.REPLY_PENDING_RETRY, alembic("current").stdout)
+            self.assertIn(reply_pending.RETRY_TABLE_NAME, tables())
             con = sqlite3.connect(dbfile)
             try:
                 for name, table in ((reply_pending.TABLE_NAME, reply_pending.reply_pending),
-                                    (reply_pending.HISTORY_TABLE_NAME, reply_pending.reply_pending_history)):
+                                    (reply_pending.HISTORY_TABLE_NAME, reply_pending.reply_pending_history),
+                                    (reply_pending.RETRY_TABLE_NAME, reply_pending.reply_pending_retry)):
                     cols = {r[1] for r in con.execute(f'PRAGMA table_info("{name}")')}
                     self.assertEqual(cols, {c.name for c in table.columns}, name)
                 nn = nullable(con, reply_pending.TABLE_NAME)
@@ -1031,7 +1038,7 @@ class TestReplyExemplarMigration(unittest.TestCase):
             # Q1b-fix5: Q1b の列集合（create_state を含む）は a7c9 で検査するため、対応待ちだけを落として a7c9 に戻す
             down = alembic("downgrade", self.REPLY_FOLLOWUP_VERSION)
             self.assertEqual(down.returncode, 0, f"stderr={down.stderr[-800:]}")
-            for name in reply_pending.TABLE_NAMES:
+            for name in reply_pending.TABLE_NAMES + reply_pending.RETRY_TABLE_NAMES:   # Q1c-fix1: 永続キューも落ちる
                 self.assertNotIn(name, tables())
             self.assertIn(self.REPLY_FOLLOWUP_VERSION, alembic("current").stdout)
             con = sqlite3.connect(dbfile)

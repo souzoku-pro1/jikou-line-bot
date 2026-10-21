@@ -28,16 +28,21 @@ flag JIKOU_SEND_POLICY_V2（send_ledger.policy_v2_enabled・既定 OFF）:
 - 本 module は chat_responder を遅延 import する（chat_responder → hub の循環を避ける）。
 """
 
+import contextlib
 import contextvars
 import dataclasses
 import datetime
+import functools
 import hashlib
 import logging
 import os
 import re
 import time
 
+import sqlalchemy as sa
+
 from hub import empty_reply_guard, kintone, reply_pending, send_ledger
+from hub.db import session_scope as db_session_scope
 from hub.redact import emit
 
 logger = logging.getLogger("hub.send_policy")
@@ -150,15 +155,20 @@ async def bot_stop_reasons(user_id: str) -> tuple:
         return ()
     cond = await conditions(user_id)
     attending = False
+    unknown = False
     try:
         st = await send_ledger.conversation_state(BUSINESS, user_id)
         attending = bool(st and st.get("attending"))
     except Exception:
-        attending = False
+        unknown = True          # fix1 BC-01: 会話状態（対応中）が確認できない＝停止（fail-closed）
     d = send_ledger.decide_send(send_ledger.ACTOR_BOT, paused=cond["paused"],
                                 stoplisted=cond["stoplisted"], human_mode=cond["human_mode"],
                                 attending=attending)
-    return () if d.allow else tuple(d.reasons)
+    reasons = () if d.allow else tuple(d.reasons)
+    if unknown:
+        await outage_stop(REASON_ATTENDING_UNKNOWN)
+        reasons = reasons + (REASON_ATTENDING_UNKNOWN,)
+    return reasons
 
 
 # ── 空返事（(b)） ──────────────────────────────────────────────────────────────
@@ -274,6 +284,11 @@ async def _register_and_notify(user_id: str, *, route: str, reason: str, categor
         inbound_event_id=_ctx_event_id(), conversation_id=(conv or {}).get("conversation_id"),
         category=category, approval_record_id=approval_record_id)
     if pid is None:
+        # fix1 BC-03: 保存失敗は受信イベント ID を永続キューに残し、回収ジョブで register → 通知 を再処理
+        await reply_pending.enqueue_retry(
+            business=BUSINESS, channel=CUSTOMER_CHANNEL, inbound_event_id=_ctx_event_id(), line_user_hash=user_hash,
+            route=route, reason=reason, conversation_id=(conv or {}).get("conversation_id"), category=category,
+            approval_record_id=approval_record_id)
         return None
     logger.info("[SEND_POLICY] pending registered route=%s reason=%s", emit(route, "freetext", "log", "operator"),
                 emit(reason, "freetext", "log", "operator"))
@@ -288,11 +303,15 @@ async def _maybe_j0(user_id: str, pid: int, send) -> str:
     if not await first_reply_due(user_id):
         return ""
     with send_ledger.purpose(send_ledger.PURPOSE_FIRST_REPLY):
-        res = await send(J0_TEXT)
-    if res == send_ledger.SEND_POLICY_STOPPED:
-        return ""
-    await reply_pending.set_customer_send(pid, reply_pending.CUSTOMER_J0_SENT)
-    return J0_TEXT
+        try:
+            res = await send(J0_TEXT)
+        except Exception:
+            # fix1 BC-05: 通信例外＝結果不明（台帳は unconfirmed）。送信済みとは記録しない
+            await reply_pending.set_customer_send(pid, reply_pending.CUSTOMER_J0_UNCONFIRMED)
+            raise
+    state = j0_state_for(res)
+    await reply_pending.set_customer_send(pid, state)
+    return J0_TEXT if state == reply_pending.CUSTOMER_J0_SENT else ""
 
 
 # ── 各経路の入口（chat_responder／main の 1 行置換から呼ばれる） ─────────────────
@@ -309,7 +328,7 @@ async def pending_ack(user_id: str, approval_record_id: str | None, category: st
         return ""
     if not await first_reply_due(user_id):
         return ""
-    await reply_pending.set_customer_send(pid, reply_pending.CUSTOMER_J0_SENT)
+    _j0_pid.set(pid)        # fix1 BC-05: 送信結果（send_ack → ack_recorded）を見てから customer_send を記録する
     return J0_TEXT
 
 
@@ -419,16 +438,257 @@ async def approval_blocked(record_id: str, revision: str, reasons) -> str:
 
 
 async def approved_draft_sent(record_id: str, user_id: str) -> int:
-    """承認済み下書きの送信成功: 同じ相談者の対応待ちを human_replied（approved_draft）で閉じる。"""
+    """承認済み下書きの送信成功: **送信着手時点で固定した**対応待ち集合（fixed_targets が束ねたもの）だけを
+    human_replied（approved_draft）で閉じる（fix1 BC-04）。送信中に届いた受信は open のまま。固定集合が無ければ閉じない。"""
     if not enabled():
         return 0
-    return await reply_pending.resolve_for_user(
-        BUSINESS, send_ledger.line_user_hash(BUSINESS, user_id),
-        resolved_by=reply_pending.RESOLVED_BY_APPROVED_DRAFT)
+    ids = _fixed_targets.get()
+    _fixed_targets.set(None)
+    if not ids:
+        return 0
+    return await reply_pending.resolve_ids(
+        ids, resolved_by=reply_pending.RESOLVED_BY_APPROVED_DRAFT, business=BUSINESS,
+        line_user_hash=send_ledger.line_user_hash(BUSINESS, user_id))
 
 
-async def human_replied(user_id: str) -> int:
-    """大野の明示送信（/app/reply）の成功: 同じ相談者の対応待ちを human_replied で閉じる（flag 非依存＝
-    OFF に戻した後も残件を閉じられる）。"""
-    return await reply_pending.resolve_for_user(
-        BUSINESS, send_ledger.line_user_hash(BUSINESS, user_id), resolved_by=reply_pending.RESOLVED_BY_HUMAN)
+async def human_replied(user_id: str, pending_ids) -> int:
+    """大野の明示送信（/app/reply）の成功: **送信着手時点で固定した** pending_id 集合（pending_targets の戻り値）だけを
+    human_replied で閉じる（fix1 BC-04・flag 非依存＝OFF に戻した後も残件を閉じられる）。送信中に届いた受信は open のまま。"""
+    return await reply_pending.resolve_ids(
+        pending_ids, resolved_by=reply_pending.RESOLVED_BY_HUMAN, business=BUSINESS,
+        line_user_hash=send_ledger.line_user_hash(BUSINESS, user_id))
+
+
+# ══════════════════════════════════════════════════════════════
+# JIKOU-REPLY-Q1c-fix1（Codex R-Q1c BC-01〜05・司令塔裁定）: 末尾追記
+#   BC-01 V2 ON の bot／承認済み下書きは、会話状態（attending）または送信台帳が確認できないときは送らない（fail-closed）。
+#         hub/line_channel._begin_with_policy が begin()=None を PolicyStopped(ledger:unavailable) に倒し、
+#         bot_stop_reasons は会話状態の取得失敗を attending:unknown（停止）にする。業務 LINE へ障害通知 1 日 1 回
+#         （台帳 key policy_outage:{JST 日付}・台帳不可なら固定ログのみ）。Q1a の fail-open は V2 OFF の経路に限る。
+#   BC-03 対応待ちの保存失敗は永続キュー（reply_pending_retry）へ・通知失敗は台帳 key で再試行（run_pending_retry_job＝
+#         send_ledger の回収ジョブに相乗り）。未返信の経過通知（REPLY_PENDING_AGE_MIN 分超・1 日 2 回・件数と経過分のみ）。
+#   BC-04 承認・送信着手の時点で返信対象の pending_id 集合を固定（pending_targets／fixed_targets）。
+#   BC-05 J-0 の送信済み記録（customer_send=j0_sent）は台帳 finish=applied（SEND_SENT）の後にだけ。失敗・結果不明・停止は
+#         別状態。App 28 への写しは確定した文だけ（ack_recorded）。
+# ══════════════════════════════════════════════════════════════
+REASON_LEDGER_UNAVAILABLE = "ledger:unavailable"       # 台帳（＝会話状態）が確認できない
+REASON_ATTENDING_UNKNOWN = "attending:unknown"         # 受信入口で会話状態が確認できない
+OUTAGE_NOTICE_HEADER = "【自動送信を停止中・障害】"
+OUTAGE_NOTICE_TEXT = (f"{OUTAGE_NOTICE_HEADER}\n会話状態または送信台帳（DB）を確認できないため、bot と承認済み下書きの"
+                      "自動送信を止めています（相談者へは無言）。復旧後、対応待ち（/app/pending）と App 28 の受信記録を"
+                      "ご確認ください。本通知は本日これ以降省略します。")
+AGE_NOTICE_HEADER = "【対応待ち・未返信】"
+AGE_NOTICE_FOOTER = "/app/pending からご確認ください。"
+REPLY_PENDING_AGE_MIN_DEFAULT = 60                     # 要大野確認（env REPLY_PENDING_AGE_MIN で上書き可）
+REPLY_PENDING_AGE_MIN_ENV = "REPLY_PENDING_AGE_MIN"
+AGE_NOTICE_HOURS_JST = (9, 15)                         # 1 日 2 回（要大野確認・HOUKI 系ジョブと同じ hub/scheduler の daily）
+AGE_JOB_PREFIX = "JIKOU_REPLY_PENDING_AGE"
+
+_j0_pid: contextvars.ContextVar = contextvars.ContextVar("send_policy_j0_pid", default=None)
+_fixed_targets: contextvars.ContextVar = contextvars.ContextVar("send_policy_fixed_targets", default=None)
+_outage_notified: dict = {}      # JST 日付 → True（プロセス内の省略・正は台帳 key）
+
+
+def _jst_date(v=None) -> datetime.date:
+    if v is None:
+        return datetime.datetime.now(_JST).date()
+    if v.tzinfo is None:
+        v = v.replace(tzinfo=datetime.timezone.utc)
+    return v.astimezone(_JST).date()
+
+
+def outage_key(today: datetime.date | None = None) -> str:
+    return f"policy_outage:{(today or _jst_date()).isoformat()}"
+
+
+async def outage_stop(reason: str) -> None:
+    """BC-01: 停止の事実を固定語彙で記録し、業務 LINE へ障害通知を 1 日 1 回だけ送る（台帳不可なら固定ログのみ）。"""
+    logger.warning("[SEND_POLICY] auto send stopped (state or ledger unavailable, fail-closed) reason=%s",
+                   emit(reason, "freetext", "log", "operator"))
+    day = _jst_date().isoformat()
+    if _outage_notified.get(day):
+        return
+    state = await send_business_notice(outage_key(), OUTAGE_NOTICE_TEXT)
+    if state in (reply_pending.NOTIFY_SENT, reply_pending.NOTIFY_THROTTLED, reply_pending.NOTIFY_UNCONFIRMED):
+        _outage_notified.clear()
+        _outage_notified[day] = True
+
+
+def clear_outage_notice_cache() -> None:
+    _outage_notified.clear()
+
+
+async def ledger_unavailable_stop() -> tuple:
+    """hub/line_channel から: V2 ON の bot／承認済み下書きで begin() が None（台帳不可）＝送らない。理由を返す。"""
+    await outage_stop(REASON_LEDGER_UNAVAILABLE)
+    reasons = (REASON_LEDGER_UNAVAILABLE,)
+    record_stop(reasons)
+    return reasons
+
+
+# ── BC-05: J-0 の結果 → customer_send ────────────────────────────────────────────
+def j0_state_for(result) -> str:
+    """送信フックの戻り値（SEND_SENT／SEND_FAILED／SEND_UNCONFIRMED／SEND_POLICY_STOPPED・None）を閉集合へ。"""
+    if result == send_ledger.SEND_SENT:
+        return reply_pending.CUSTOMER_J0_SENT
+    if result == send_ledger.SEND_FAILED:
+        return reply_pending.CUSTOMER_J0_FAILED
+    if result == send_ledger.SEND_POLICY_STOPPED:
+        return reply_pending.CUSTOMER_J0_STOPPED
+    return reply_pending.CUSTOMER_J0_UNCONFIRMED
+
+
+async def send_ack(user_id: str, ack_text: str, with_purpose, purpose_name: str, fn, *args):
+    """顧客対応経路の応答送信（chat_responder の 1 行置換から）。通信例外は J-0 なら結果不明として記録して再送出。"""
+    try:
+        return await with_purpose(purpose_name, fn, *args)
+    except Exception:
+        pid = _j0_pid.get()
+        if enabled() and ack_text == J0_TEXT and pid is not None:
+            _j0_pid.set(None)
+            await reply_pending.set_customer_send(pid, reply_pending.CUSTOMER_J0_UNCONFIRMED)
+        raise
+
+
+async def ack_recorded(user_id: str, ack_text: str, result) -> bool:
+    """送った応答を App 28 に写すか。OFF: 従来どおり（ack_text があれば写す）。ON: 即時定型は従来どおり、
+    J-0 は台帳の結果が sent（finish=applied）のときだけ写し、customer_send を結果どおりに記録する。"""
+    if not ack_text:
+        return False
+    if not enabled() or ack_text != J0_TEXT:
+        return True
+    pid = _j0_pid.get()
+    _j0_pid.set(None)
+    state = j0_state_for(result)
+    if pid is not None:
+        await reply_pending.set_customer_send(pid, state)
+    return state == reply_pending.CUSTOMER_J0_SENT
+
+
+# ── BC-04: 返信対象の固定 ───────────────────────────────────────────────────────
+async def pending_targets(user_id: str) -> tuple:
+    """送信着手の直前に呼ぶ: その相談者の open の pending_id（読取失敗は ()＝何も閉じない）。"""
+    try:
+        return tuple(await reply_pending.open_ids_for_user(BUSINESS, send_ledger.line_user_hash(BUSINESS, user_id)))
+    except Exception:
+        return ()
+
+
+@contextlib.asynccontextmanager
+async def fixed_targets(user_id: str):
+    """承認 webhook の送信（main の 1 行置換: `async with send_ledger.approved_draft(...), send_policy.fixed_targets(user_id):`）。
+    入口で対応待ち集合を固定し、approved_draft_sent がその集合だけを閉じる（V2 OFF は空）。"""
+    _fixed_targets.set(await pending_targets(user_id) if enabled() else ())
+    yield
+
+
+# ── BC-03: 回収ジョブ（永続キューの再処理・通知の再試行）と経過通知 ──────────────────────
+def age_minutes() -> int:
+    raw = os.environ.get(REPLY_PENDING_AGE_MIN_ENV, "").strip()
+    return int(raw) if raw.isdigit() and int(raw) > 0 else REPLY_PENDING_AGE_MIN_DEFAULT
+
+
+def age_job_name(hour: int) -> str:
+    return f"{AGE_JOB_PREFIX}_{int(hour):02d}"
+
+
+async def _conversation_ref(conversation_id, user_hash: str) -> str:
+    try:
+        if conversation_id is not None:
+            async with db_session_scope() as s:
+                ref = (await s.execute(sa.select(send_ledger.conversation.c.ref).where(
+                    send_ledger.conversation.c.conversation_id == int(conversation_id)))).scalar()
+            if ref:
+                return str(ref)
+        st = await send_ledger.conversation_state_by_hash(BUSINESS, user_hash)
+        return str((st or {}).get("ref") or "")
+    except Exception:
+        return ""
+
+
+async def _notify_row(row: dict, created_at) -> str:
+    key = notice_key(await _conversation_ref(row.get("conversation_id"), row["line_user_hash"]),
+                     row["line_user_hash"], today=_jst_date(created_at))
+    return await send_business_notice(key, notice_text(row.get("approval_record_id") or None,
+                                                       row.get("category") or None))
+
+
+async def run_pending_retry_job() -> dict:
+    """send_ledger の回収ジョブに相乗り（interval）。(1) 永続キューの再処理（register → 通知）、(2) 通知の再試行
+    （台帳 key は登録日のまま＝送れても 1 通・上限 NOTIFY_RETRY_MAX）。例外は固定語彙で握る（他の hook を止めない）。"""
+    res = {"requeued": 0, "registered": 0, "register_failed": 0, "notify_retried": 0}
+    if not reply_pending._db_configured():
+        return res
+    try:
+        queue = await reply_pending.list_retry_queue()
+    except Exception:
+        logger.warning("[SEND_POLICY] retry queue read failed (fixed reason)")
+        queue = []
+    for q in queue:
+        res["requeued"] += 1
+        pid = await reply_pending.register(
+            business=q["business"], channel=q["channel"], line_user_hash=q["line_user_hash"], route=q["route"],
+            reason=q["reason"], inbound_event_id=q["inbound_event_id"], conversation_id=q["conversation_id"],
+            category=(q["category"] or None), approval_record_id=(q["approval_record_id"] or None))
+        if pid is None:
+            res["register_failed"] += 1
+            await reply_pending.retry_bump(q["retry_id"])
+            continue
+        res["registered"] += 1
+        await reply_pending.retry_done(q["retry_id"], pid)
+        state = await _notify_row({"conversation_id": q["conversation_id"], "line_user_hash": q["line_user_hash"],
+                                   "approval_record_id": q["approval_record_id"], "category": q["category"]},
+                                  q["created_at"])
+        await reply_pending.set_notify_state(pid, state)
+    try:
+        rows = await reply_pending.list_notify_retry()
+    except Exception:
+        logger.warning("[SEND_POLICY] notify retry read failed (fixed reason)")
+        rows = []
+    for r in rows:
+        res["notify_retried"] += 1
+        created = datetime.datetime.fromisoformat(r["created_at"]) if r.get("created_at") else None
+        state = await _notify_row(r, created)
+        await reply_pending.bump_attempts(r["pending_id"])
+        await reply_pending.set_notify_state(r["pending_id"], state)
+    if res["registered"] or res["notify_retried"]:
+        logger.info("[SEND_POLICY] pending retry job registered=%s notify_retried=%s",
+                    emit(res["registered"], "count", "log", "operator"),
+                    emit(res["notify_retried"], "count", "log", "operator"))
+    return res
+
+
+def age_notice_text(stats: dict, queued: int, threshold: int) -> str:
+    return (f"{AGE_NOTICE_HEADER}\n未返信の対応待ち {stats['open_count']} 件（{threshold} 分超 {stats['over_count']} 件・"
+            f"最長 {stats['oldest_minutes']} 分経過）・再処理待ち {queued} 件\n{AGE_NOTICE_FOOTER}")
+
+
+async def run_age_notice_job(hour: int, *, now=None) -> dict:
+    """BC-03 (2): REPLY_PENDING_AGE_MIN 分を超えて open のままの対応待ちを 1 日 2 回まとめて通知（件数と経過分のみ・PII なし）。
+    台帳 key `pending_age:{JST 日付}:{時}` で 1 枠 1 通。対象 0 件（再処理待ちも 0）なら送らない。"""
+    res = {"over_count": 0, "queued": 0, "notice": ""}
+    if not reply_pending._db_configured():
+        return res
+    try:
+        stats = await reply_pending.age_stats(threshold_minutes=age_minutes(), now=now)
+        queued = await reply_pending.count_retry_queue()
+    except Exception:
+        logger.warning("[SEND_POLICY] age notice read failed (fixed reason)")
+        return res
+    res.update(over_count=stats["over_count"], queued=queued)
+    if stats["over_count"] == 0 and queued == 0:
+        return res
+    day = _jst_date(now).isoformat()
+    res["notice"] = await send_business_notice(f"pending_age:{day}:{int(hour):02d}",
+                                               age_notice_text(stats, queued, age_minutes()))
+    return res
+
+
+def register_jobs() -> None:
+    """main の末尾から（冪等）: 回収ジョブへの相乗り＋経過通知の daily ジョブ（start_all は既存の startup が呼ぶ）。"""
+    from hub import scheduler as hub_scheduler
+    send_ledger.register_recover_hook(run_pending_retry_job)
+    for hour in AGE_NOTICE_HOURS_JST:
+        name = age_job_name(hour)
+        if not hub_scheduler.is_registered(name):
+            hub_scheduler.register_daily(name, hour, functools.partial(run_age_notice_job, hour))

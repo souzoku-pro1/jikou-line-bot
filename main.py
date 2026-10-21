@@ -217,12 +217,12 @@ REPLY_URL = "https://api.line.me/v2/bot/message/reply"
 PUSH_URL  = "https://api.line.me/v2/bot/message/push"
 
 
-async def _line_reply_with_fallback(reply_token: str, user_id: str, text: str) -> None:
+async def _line_reply_with_fallback(reply_token: str, user_id: str, text: str) -> str:  # JIKOU-REPLY-Q1c-fix1 BC-05: 3 値を返す
     """LINE Reply APIを試み、失敗（400等）したらPush APIにフォールバック。
 
     SOUZOKU-HOUKI-H1: 実装は hub/line_channel.reply_with_push_fallback へ
     逐語移設（時効チャネル JIKOU_CHANNEL=従来 env・ログ文言・順序とも不変）。"""
-    await hub_line_channel.reply_with_push_fallback(
+    return await hub_line_channel.reply_with_push_fallback(  # JIKOU-REPLY-Q1c-fix1 BC-05: 戻り値（SEND_SENT／FAILED／UNCONFIRMED／POLICY_STOPPED）を呼出元へ
         hub_line_channel.JIKOU_CHANNEL, reply_token, user_id, text)
 
 # OCR固定資産エンドポイント用の環境変数（起動時ではなくリクエスト時にチェック）
@@ -1597,7 +1597,7 @@ async def kintone_approval_webhook(request: Request):
     # LINE push 送信 → 送信済みフラグ更新 → チャットログ保存
     # RV-04c §4.2 phase 表: marker 後の失敗（例外・timeout）は sending 維持（failed 上書き禁止・
     # 不明は不明のまま §4.2 runbook へ）。例外は握らず伝播させ、state は sending に留める。
-    async with send_ledger.approved_draft(f"approval:{record_id}:{record.get('$revision', {}).get('value', '')}"): _sl_res = await send_line_push(user_id, ai_draft)  # JIKOU-REPLY-Q1a
+    async with send_ledger.approved_draft(f"approval:{record_id}:{record.get('$revision', {}).get('value', '')}"), send_policy.fixed_targets(user_id): _sl_res = await send_line_push(user_id, ai_draft)  # JIKOU-REPLY-Q1a／Q1c-fix1 BC-04: 送信着手時点の対応待ち集合を固定
     if _sl_res == send_ledger.SEND_UNCONFIRMED: return {"ok": True, "skip": "send_unconfirmed_duplicate"}  # JIKOU-REPLY-Q1a-fix1 BQ-01: 結果未確認の重複は送信済更新・記録へ進まない（sending 維持=§4.2 runbook）
     if _sl_res == send_ledger.SEND_POLICY_STOPPED: return await _approval_policy_stopped(_ev, record_id, record)  # JIKOU-REPLY-Q1c (a): 許可表 V2 で停止=送信済更新へ進まない（noop 終端+通知）
     await mark_approval_sent(record_id); await save_to_chatlog(user_id, "assistant", ai_draft, category, "yes"); await send_policy.approved_draft_sent(record_id, user_id)  # JIKOU-REPLY-Q1c (d): 送信成功で対応待ちを閉じる
@@ -2412,3 +2412,8 @@ async def _approval_policy_stopped(_ev, record_id: str, record: dict) -> dict:
         from hub.kintone_lane import mark_stopped_after_sending
         await mark_stopped_after_sending(_ev, "skip_policy_v2")
     return {"ok": True, "skip": "policy_stopped"}
+
+
+# ── JIKOU-REPLY-Q1c-fix1（Codex R-Q1c BC-03）: 対応待ちの永続キュー再処理（回収ジョブに相乗り）と未返信の経過通知
+#    （1 日 2 回・件数と経過分のみ）の登録。末尾追記（pin 番地不変）。start_all は既存の startup（healthcheck／houki）が呼ぶ。
+send_policy.register_jobs()
