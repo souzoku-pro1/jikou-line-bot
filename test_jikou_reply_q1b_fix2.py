@@ -149,7 +149,9 @@ class TestExemplarPendingReview(_FollowupMixin):
 class TestOwnership(_FollowupMixin):
     def test_claim_is_exclusive_and_expires(self):
         self._pending()
-        t1 = _run(rf.claim(OP))
+        c1 = _run(rf.claim(OP))                                                     # fix5 BR-16: 同一 tx で読み戻した行
+        self.assertEqual((c1["state"], c1["op_id"]), ("in_progress", OP))
+        t1 = c1["owner_token"]
         self.assertTrue(t1)
         self.assertIsNone(_run(rf.claim(OP)))                                       # 取れなければ何もしない
         row = self.followup()
@@ -160,7 +162,7 @@ class TestOwnership(_FollowupMixin):
         self.create.assert_not_awaited()
         later = rf._now() + datetime.timedelta(seconds=rf.CLAIM_SECONDS + 1)
         self.assertEqual(_run(rf.open_ops(now=later)), [OP])                        # deadline 経過は recover 対象
-        t3 = _run(rf.claim(OP, now=later))
+        t3 = (_run(rf.claim(OP, now=later)) or {}).get("owner_token")
         self.assertTrue(t3 and t3 != t1)
 
     def test_marker_lookup_before_create_recovers_lost_success(self):
@@ -417,8 +419,9 @@ class TestPreparedAndLedger(_FollowupMixin):
         _run(sl.run_recover_job())                                                  # 猶予を過ぎて台帳なし → 未送信で閉じる
         self.create.assert_not_awaited()
         self.assertEqual((self.followup(OP3)["state"], self.followup(OP3)["last_result"]), ("closed", "not_sent"))
-        self.assertFalse(_run(rf.close(OP3, "again")))                              # 終端は動かない
-        self.assertFalse(_run(rf.complete(OP3)))
+        v = self.followup(OP3)["row_version"]
+        self.assertFalse(_run(rf.close(OP3, "again", expected_version=v)))          # 終端は動かない
+        self.assertFalse(_run(rf.complete(OP3, expected_version=v)))
 
     def test_mark_pending_without_prepared_row_inserts_pending(self):
         res = _run(rf.mark_pending(OP3, last_result="failed", business="jikou", approval_record_id=REC_ID,
