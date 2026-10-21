@@ -105,6 +105,8 @@
 |---|---|
 | houki_overdue:{today.isoformat(...)} | hub/houki_overdue.py |
 | jikou_metrics_weekly:{week_start.isoformat(...)} | hub/jikou_reply_metrics.py |
+| {'reply_followup_hold:' + now.astimezone(_JST).strftime('%Y-%m-%d')} | hub/reply_followup.py |
+| {_day_key(...)} | hub/reply_followup.py |
 | {_marker_cat.rsplit(':', 1)[-1] if _marker_cat else ''} | hub/image_intake.py |
 | {event_id} | hub/image_analysis.py |
 | {event_id} | main.py |
