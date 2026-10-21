@@ -40,6 +40,11 @@
   未送信を確実に確認できる（台帳に行なし・回収行 prepared・ハッシュ一致）ときだけ同一 tx で再準備して送信可（reprepared）。
   終端（done／closed／exhausted）・送信済み・不一致・台帳行ありは rejected＝送らず「新しい操作でやり直し」。台帳 begin が失敗した
   経路では回収行を閉じず prepared のまま残す（本文保持）。
+- claim の読み戻し（fix5 BR-16）: `claim` は条件付き UPDATE と同一 tx で取得後の最新行を返す。`process_one` は claim 前に読んだ行を
+  作成可否の判断に使わない（存在・開状態・台帳突合にだけ使う）。
+- 列の分離（fix5 BR-17）: `create_state`＝外部作成の確定状態（none／creating／unknown／created・単調遷移 none→creating→unknown／created、
+  unknown→created のみ・条件付き UPDATE の CASE 式で逆行・上書きを拒否）、`last_result`＝直近の診断理由。宛先再取得の失敗・照合不能は
+  診断理由だけを更新し、確定状態は触らない（unknown が消えない）。
 - 突合（fix2 BR-12）: 回収ジョブ（SEND_LEDGER_RECOVER に相乗り）は prepared／pending／unconfigured／期限切れ in_progress を
   台帳の状態と突合する——台帳 sent → 記録、台帳 unconfirmed／started → 人の確定（confirm_by_human）を待つ、台帳 failed または
   台帳行なし → closed。自動再送はしない。
@@ -58,10 +63,11 @@
 
 ## 4. migration
 
-- Q1b の migration は **e5f8a1b4c7d9 → f7b2c9d4e1a6 の 1 段** だけ（reply_exemplar・reply_exemplar_history・
-  reply_chatlog_followup）。f7b2 は本番未適用のため fix1・fix2 とも同一 revision を更新している（merge 前に本番 current が
-  f7b2 でないことを確認）。
-- a1c3・b2d4 は後続票（Q1c 以降）の revision であり、本票の範囲外。
+- Q1b の migration は **e5f8a1b4c7d9 → f7b2c9d4e1a6 → a7c9e1f3b5d7 の 2 段**（f7b2: reply_exemplar・reply_exemplar_history・
+  reply_chatlog_followup／a7c9: fix5 BR-17 の `reply_chatlog_followup.create_state` 追加＋既存行の移行・downgrade は none 以外の値が
+  あれば拒否）。f7b2 は本番未適用のため fix1・fix2 とも同一 revision を更新している（merge 前に本番 current が f7b2 でないことを確認）。
+- a1c3・b2d4 は後続票（Q1c 以降）の revision であり、本票の範囲外。fix5 で a1c3 の down_revision は f7b2 → **a7c9** に付け替える
+  （前方 merge 時の適合・1 本の鎖を保つ）。
 - downgrade はデータがあれば拒否（RV-08）。
 
 ## 5. 不変条件（RV）
