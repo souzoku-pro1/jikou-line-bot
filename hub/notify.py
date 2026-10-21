@@ -232,6 +232,8 @@ def _log_throttled(throttle_key: str) -> None:
         logger.info("admin LINE notify throttled kind=hearing_update_ok")
     elif head == "hearing_update_review":
         logger.info("admin LINE notify throttled kind=hearing_update_review")
+    elif head == "reply_followup_hold":
+        logger.info("admin LINE notify throttled kind=reply_followup_hold")
     else:
         logger.info("admin LINE notify throttled kind=unknown_kind")
 
