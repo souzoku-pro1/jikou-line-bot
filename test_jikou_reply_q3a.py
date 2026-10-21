@@ -413,7 +413,7 @@ class TestPins(unittest.TestCase):
         p = REPO / "alembic" / "versions" / "20261012_b2d4f6a8c0e1_reply_draft_approval.py"
         src = p.read_text(encoding="utf-8")
         self.assertIn("revision: str = 'b2d4f6a8c0e1'", src)
-        self.assertIn("down_revision: Union[str, Sequence[str], None] = 'a1c3e5f7b9d2'", src)
+        self.assertIn("down_revision: Union[str, Sequence[str], None] = 'd4f6a8b0c2e4'", src)   # Q1c-fix1: 永続キュー d4f6 の後ろ（鎖は 1 本）
         self.assertIn("reply_draft_approval_downgrade_refused_data_present", src)
         f = (REPO / "alembic" / "versions" / "20261011_f7b2c9d4e1a6_reply_exemplar.py").read_text(encoding="utf-8")
         self.assertIn("'deactivated', 'approved'", f)
