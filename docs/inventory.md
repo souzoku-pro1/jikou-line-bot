@@ -81,6 +81,7 @@
 | HOUKI_KOSEKI_CHECKLIST | interval | 30.0 分ごと | functools.partial(scan_once) | hub/houki_koseki_checklist.py | — | {key} | 管理者 LINE（LINE_ADMIN_USER_ID・業務トークン）／管理者 LINE（notify_admin_line）／管理者 LINE（LINE_ADMIN_USER_ID） |
 | HOUKI_OVERDUE | daily | 毎日 9 時 JST | overdue_daily_check | hub/houki_overdue.py | — | houki_overdue:{today.isoformat(...)} | 管理者 LINE（LINE_ADMIN_USER_ID・業務トークン）／管理者 LINE（LINE_ADMIN_USER_ID） |
 | JIKOU_REPLY_METRICS_WEEKLY | daily | 毎日 9 時 JST | weekly_check | hub/jikou_reply_metrics.py | — | jikou_metrics_weekly:{week_start.isoformat(...)} | 業務 LINE（ATTORNEY_LINE_USER_ID・send_policy） |
+| JIKOU_REPLY_PENDING_AGE_{hour∈9／15:02d} | daily | 毎日 {hour∈9／15} 時 JST | functools.partial(run_age_notice_job, hour) | hub/send_policy.py | — | {key} | 業務 LINE（ATTORNEY_LINE_USER_ID・send_policy） |
 | RETURN_DEADLINE | daily | 毎日 env:RETURN_DEADLINE_HOUR_JST 時 JST | return_deadline_check | hub/return_deadline.py | — | — | 管理者 LINE（notify_admin_line） |
 | SEND_LEDGER_RECOVER | interval | 5.0 分ごと | run_recover_job | hub/send_ledger.py | — | — | 通知なし（DB／kintone のみ） |
 
@@ -174,6 +175,7 @@
 | PRINT_OFFSET_X_MM | hub/address_label.py(1) | 印字オフセット（プリンタ個体差のキャリブレーション・mm単位） |
 | PRINT_OFFSET_Y_MM | hub/address_label.py(1) | 印字オフセット（プリンタ個体差のキャリブレーション・mm単位） |
 | RAILWAY_PUBLIC_DOMAIN | hub/shindan_link.py(2) | Railway 注入の既存 platform 変数 |
+| REPLY_PENDING_AGE_MIN | hub/send_policy.py(2) | send_policy — JIKOU-REPLY-Q1c: 許可表 V2（bot／承認済み下書き列）の適用・空返事の無言化・J-0・対応待ちの結線 |
 | RETURN_DEADLINE_DISABLED | hub/return_deadline.py(1) | FastAPI startup から呼ぶ。RETURN_DEADLINE_DISABLED=1 で無効化できる。 |
 | RETURN_DEADLINE_HOUR_JST | hub/return_deadline.py(1) | FastAPI startup から呼ぶ。RETURN_DEADLINE_DISABLED=1 で無効化できる。 |
 | SEND_LEDGER_DEADLINE_MINUTES | hub/send_ledger.py(1) | send_ledger — JIKOU-REPLY-Q1a-SEND-BASE: 送信操作記録・会話・共通排他（§10-5・§12 Q1a） |
