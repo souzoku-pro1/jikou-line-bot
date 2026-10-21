@@ -377,10 +377,17 @@ class TestRetryQueueAndNotices(_Fix1Mixin):
         self.assertEqual(self.biz.await_count, 3)
 
     def test_jobs_are_registered_from_main_tail_idempotently(self):
-        self.assertEqual(sl._recover_hooks.count(sp.run_pending_retry_job), 1)
+        # main の末尾が登録する（静的 pin は TestPinsFix1）。他テスト（test_hub_scheduler 等）が stop_all() で scheduler の
+        # 登録表を消すことがあるため、Q1a の recover job と同じく冪等な register_jobs() を呼んでから確認する（-n auto の順序非依存）
+        self.assertEqual(sl._recover_hooks.count(sp.run_pending_retry_job), 1)   # hook のリストは消されない
+        sp.register_jobs()
+        sp.register_jobs()                                                        # 冪等（daily の二重登録 ValueError なし）
         for h in sp.AGE_NOTICE_HOURS_JST:
             self.assertTrue(hub_scheduler.is_registered(sp.age_job_name(h)), h)
-        sp.register_jobs()
+            job = hub_scheduler._jobs[sp.age_job_name(h)]
+            self.assertEqual((job.kind, job.hour_jst), ("daily", h))
+            self.assertIs(job.coro_factory.func, sp.run_age_notice_job)
+            self.assertEqual(job.coro_factory.args, (h,))
         self.assertEqual(sl._recover_hooks.count(sp.run_pending_retry_job), 1)
         self.assertEqual(sp.AGE_NOTICE_HOURS_JST, (9, 15))
         self.assertEqual(sp.age_job_name(9), "JIKOU_REPLY_PENDING_AGE_09")
