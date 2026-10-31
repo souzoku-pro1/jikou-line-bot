@@ -390,6 +390,9 @@ railway run alembic downgrade -1
 railway run alembic upgrade head --sql
 ```
 
+- PC-A（Windows）から本番へ適用するときの手順・案件脳 backfill の移行窓・psycopg async の
+  ProactorEventLoop 罠は `docs/runbooks/2026-10_brain-case-backfill-migration-window.md` を参照。
+
 開発（ローカル・DATABASE_URL を自分で設定した場合のみ）:
 
 ```
