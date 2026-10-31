@@ -221,8 +221,11 @@ FROZEN_SHA = {
     # JIKOU-REPLY-Q1c（QUEUE-2026-10-12-C C-1 (b)・凍結解除はこの 1 項のみ）: 【会話スタイル】に
     # 「答えられない問いは reply を空文字にする（確認のうえご連絡します等を書かない）」を 1 行追加 → 再 pin
     # 旧値 89fd82e1…f0dd4
+    # JIKOU-FAQ-ADDON-PROMPT-1（司令塔票 2026-10-11・main 67f992e）: FAQ 行に「【費用のご案内】の固定文（8行）を
+    # 必ず含める」1 文を明示（main 単独では 89fd82… → d4d6ab…）
+    # JIKOU-REPLY-Q1c-sync-main（2026-10-31）: 上記 2 つの凍結解除を共に含む本文で再 pin（a0835fe3… / d4d6abb8… → 908f9335…）
     "customer_prompt_base":
-        "a0835fe327c392aee9111b2fbf75cbf08a08a07c2578b2ad3c2c601637f39263",
+        "908f9335e0114eb4c35c59e89e4c79f81c7a54be3384dc9cb859e7e075d142a3",
     "hearing_template_blocks":
         "24103a7b21a889319c8b9eefb9f15bbf35f1c9b065ef459903b27ff6c990159e",
     # JIKOU-FEE-RULE-1（大野裁定 2026-10-11）: 法テラス標準回答に「3社目からは1社あたり
