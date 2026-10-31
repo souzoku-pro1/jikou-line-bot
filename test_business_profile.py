@@ -184,9 +184,12 @@ class TestJikouProfileIsVerbatimBundle(unittest.TestCase):
         # 改定に伴う再 pin（024773… → 3400bf…）。他の束は不変
         # JIKOU-REPLY-Q1c（QUEUE-2026-10-12-C C-1 (b)）: system_prompt_template に「答えられない問いは
         # reply を空文字にする」の 1 項を追加（凍結解除はこの 1 項のみ）→ 再 pin（3400bf… → 752dfb…）
+        # JIKOU-FAQ-ADDON-PROMPT-1（司令塔票 2026-10-11・main 67f992e）: FAQ「完了後の追加依頼の費用」行に
+        # 「固定文を必ず含める」1 文を明示（main 単独では 3400bf… → 2ff2f3…）
+        # JIKOU-REPLY-Q1c-sync-main（2026-10-31）: 両方を含む本文で再 pin（752dfb… / 2ff2f3… → ce329d3c…）。他の束は不変
         self.assertEqual(
             hashlib.sha256(payload.encode("utf-8")).hexdigest(),
-            "752dfbe8dceddf1d2967c9510452d9f282557719e1ca3c0f4cdce2c0045ec73e")
+            "ce329d3c1e28e3adff8d84561c46eb37b19d778288a140c8cc68a5110fca17b5")
 
 
 class TestDefaultEqualsJikouProfile(unittest.TestCase):
