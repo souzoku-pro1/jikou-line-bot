@@ -565,7 +565,8 @@ class TestPinsFix1(unittest.TestCase):
         base = cr._SYSTEM_PROMPT_BASE
         self.assertEqual(base.count("は reply を空文字にする"), 1)
         style = (REPO / "test_autoreply_style1.py").read_text(encoding="utf-8")
-        self.assertIn("a0835fe327c392aee9111b2fbf75cbf08a08a07c2578b2ad3c2c601637f39263", style)   # customer_prompt_base（限定解除後の pin）
+        # JIKOU-REPLY-Q1c-sync-main（2026-10-31）: main の JIKOU-FAQ-ADDON-PROMPT-1 と Q1c の 1 行が共存する本文の pin（旧 a0835fe3…）
+        self.assertIn("908f9335e0114eb4c35c59e89e4c79f81c7a54be3384dc9cb859e7e075d142a3", style)   # customer_prompt_base（限定解除後の pin）
         self.assertIn("52a8e0fefb8920f4189908aa9c62a068c0f4357148a8d8c2bbcb391a6be9c9a6", style)   # hearing_prompt_body は不変
         self.assertEqual(cr.PENDING_REPLY, "ありがとうございます。内容を確認の上、改めてご連絡いたします。\n"
                                             "少々お時間をいただく場合がございますが、何卒よろしくお願いいたします。")
