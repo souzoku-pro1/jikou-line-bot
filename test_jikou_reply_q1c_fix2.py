@@ -244,7 +244,7 @@ class TestNoticeKeyPersistence(_Fix2Mixin):
         self.assertTrue(_run(rp.set_notify_state(pid, rp.NOTIFY_SENT, owner="B")))                  # Q1c-fix4 BC-17: 完了書込は所有者 B が行う（owner 必須契約への追随）
         self.assertEqual(_run(rp.claim_notify(pid, "C")), (rp.CLAIM_DONE, ""))                      # 通知済みは再通知しない
         self.assertEqual(_run(rp.claim_notify(10 ** 9, "C")), (rp.CLAIM_NOT_FOUND, ""))
-        self.assertEqual(rp.CLAIM_RESULTS, ("ok", "busy", "done", "not_found"))
+        self.assertEqual(rp.CLAIM_RESULTS, ("ok", "busy", "done", "not_found", "closed"))   # fix4 BC-19: closed を追加
         self.assertEqual(rp.NOTIFY_CLAIM_LEASE_SECONDS, 300)
         # 直接の二重通知（同じ pending を 2 者が同時に通知）: claim を取れた 1 者だけが送る
         self.on()

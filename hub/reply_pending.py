@@ -634,7 +634,8 @@ CLAIM_OK = "ok"                           # 取得できた（この呼出だけ
 CLAIM_BUSY = "busy"                       # 他者がリース内で処理中
 CLAIM_DONE = "done"                       # 通知は既に sent／throttled／unconfirmed（再通知しない）
 CLAIM_NOT_FOUND = "not_found"
-CLAIM_RESULTS = (CLAIM_OK, CLAIM_BUSY, CLAIM_DONE, CLAIM_NOT_FOUND)
+CLAIM_CLOSED = "closed"                   # fix4 BC-19: 対応待ちが open でない（人の返信等で解決済み）＝業務通知を出さない
+CLAIM_RESULTS = (CLAIM_OK, CLAIM_BUSY, CLAIM_DONE, CLAIM_NOT_FOUND, CLAIM_CLOSED)
 _NOTIFY_RETRYABLE = (NOTIFY_NONE, NOTIFY_FAILED, NOTIFY_UNAVAILABLE)
 
 
@@ -664,17 +665,20 @@ async def claim_notify(pending_id: int, owner: str, *, lease_seconds: int = NOTI
     async with session_scope() as s:
         r = await s.execute(sa.update(reply_pending).where(
             reply_pending.c.pending_id == int(pending_id),
+            reply_pending.c.state == STATE_OPEN,               # fix4 BC-19: 一覧取得後に解決（human_replied 等）した行には送らない
             reply_pending.c.notify_state.in_(_NOTIFY_RETRYABLE),
             sa.or_(reply_pending.c.notify_owner.is_(None),
                    reply_pending.c.notify_claimed_at.is_(None),
                    reply_pending.c.notify_claimed_at < cut)).values(
             notify_owner=str(owner), notify_claimed_at=now))
         if int(r.rowcount or 0) != 1:
-            state = (await s.execute(sa.select(reply_pending.c.notify_state).where(
-                reply_pending.c.pending_id == int(pending_id)))).scalar()
-            if state is None:
+            row = (await s.execute(sa.select(reply_pending.c.state, reply_pending.c.notify_state).where(
+                reply_pending.c.pending_id == int(pending_id)))).first()
+            if row is None:
                 return CLAIM_NOT_FOUND, ""
-            return (CLAIM_BUSY if state in _NOTIFY_RETRYABLE else CLAIM_DONE), ""
+            if row.state != STATE_OPEN:
+                return CLAIM_CLOSED, ""
+            return (CLAIM_BUSY if row.notify_state in _NOTIFY_RETRYABLE else CLAIM_DONE), ""
         key = await _notice_key_in_tx(s, pending_id)
         if not key and computed_key:
             await s.execute(sa.update(reply_pending).where(

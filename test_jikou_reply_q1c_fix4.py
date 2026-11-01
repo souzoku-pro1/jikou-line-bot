@@ -126,5 +126,49 @@ class TestAttemptsBumpedAtCompletion(_Fix2Mixin):
         self.assertNotIn("reply_pending.bump_attempts(", src)                                     # 送信前の加算は無い
         self.assertEqual(src.count("set_notify_state(pid, state, owner=owner, bump=bump_attempts)"), 1)
 
+# ── 3. BC-19: 回収用 claim は state=open を再確認（一覧取得後に解決した行には送らない） ─────────────────────
+class TestClaimRechecksOpenState(_Fix2Mixin):
+    def test_row_resolved_after_listing_gets_no_business_push(self):
+        self.on()
+        pid = self.reg(inbound_event_id="e-h", notice_key=KEY_A)                                  # open・notify_state=none（回収対象）
+        listed = _run(rp.list_notify_retry(now=T0))
+        self.assertEqual([r["pending_id"] for r in listed], [pid])                               # 1) 一覧取得
+        self.assertEqual(_run(rp.resolve_ids((pid,), resolved_by=rp.RESOLVED_BY_HUMAN, business="jikou",
+                                             line_user_hash=sl.line_user_hash("jikou", USER))), 1)   # 2) 人の返信で human_replied
+        self.assertEqual(self.pending()[0]["state"], "human_replied")
+        r = listed[0]                                                                             # 3) 回収再開（取得済みの行で通知を試みる）
+        self.assertEqual(_run(sp._notify_pending(r["pending_id"], r["notice_key"], None, None, bump_attempts=True, now=T0)), "")
+        self.biz.assert_not_awaited()                                                             # 業務 push 0 回
+        self.assertEqual(_run(rp.claim_notify(pid, "X", now=T0)), (rp.CLAIM_CLOSED, ""))        # claim 不成立（closed）
+        row = self.pending()[0]
+        self.assertEqual((row["state"], row["notify_state"], row["notify_owner"], row["attempts"]), ("human_replied", "none", None, 0))
+        self.assertEqual([o for o in self.ops() if o["channel"] == "jikou_notice"], [])          # 台帳行も作らない
+        self.assertEqual(rp.CLAIM_RESULTS, ("ok", "busy", "done", "not_found", "closed"))
+        # not_needed（画面の操作）でも同じ
+        pid2 = self.reg(user=USER2, inbound_event_id="e-i", notice_key=KEY_A)
+        self.assertEqual(_run(rp.mark_not_needed(pid2)), "ok")
+        self.assertEqual(_run(rp.claim_notify(pid2, "Y", now=T0)), (rp.CLAIM_CLOSED, ""))
+        self.biz.assert_not_awaited()
+
+    def test_recovery_still_touches_only_business_notices(self):
+        # 裁定（前票と同じ）: fix4 後も回収は業務 LINE 通知に閉じる
+        self.on()
+        self.touch("e1")
+        for i in range(2):
+            self.reg(inbound_event_id=f"e-n{i}", notice_key=KEY_A)
+        reply_spy = AsyncMock(side_effect=AssertionError("customer reply must not be sent by recovery"))
+        push_spy = AsyncMock(side_effect=AssertionError("customer push must not be sent by recovery"))
+        with patch.object(line_channel, "reply_with_push_fallback", reply_spy), patch.object(line_channel, "push_text", push_spy):
+            res = _run(sp.run_pending_retry_job(now=T0))
+        self.assertEqual(res["notify_recovered"], 2)
+        reply_spy.assert_not_awaited()
+        push_spy.assert_not_awaited()
+        self.assertEqual(_FakeClient.calls, [])
+        self.assertEqual({o["channel"] for o in self.ops()}, {"jikou_notice"})
+        self.assertEqual({r["customer_send"] for r in self.pending()}, {"none"})
+        self.assertTrue(_run(sp.first_reply_due(USER)))
+        self.assertEqual(sorted(r["notify_state"] for r in self.pending()), ["sent", "throttled"])
+        self.assertEqual([r["attempts"] for r in self.pending()], [1, 1])                        # 確定時に 1 回だけ加算
+
 if __name__ == "__main__":
     unittest.main()
