@@ -90,6 +90,11 @@ ON のときだけ有効な事項は「V2 ON」と明記する。
   写さない（顧客に届いていない文を記録しない）。
 - main の送信ラッパー `_line_reply_with_fallback` は `reply_with_push_fallback` の 3 値（＋policy_stopped）を呼出元へ返す。
 - 1 回性の正は送信台帳（purpose=first_reply の在庫検査・排他の中）であり、customer_send は表示用の状態。
+- **fix2 BC-11（司令塔裁定・単位の訂正）**: J-0 は **「業務 × LINE 利用者」単位で 1 通**。会話単位ではない。送信台帳の在庫検査
+  （`send_ledger._first_reply_count`・送信前の `first_reply_due` と begin() の排他の中の両方）は `conversation` を join して
+  **同じ利用者（line_user_hash）の全会話**の「初回返信判定の対象」操作を数える＝**30 日無受信後の新会話でも J-0 は再送しない**
+  （`test_jikou_reply_q1c_fix2.TestJ0PerUser` が固定）。表・列の変更は無く migration 不要（§7）。会話を持たない操作（受信前の送信）は
+  利用者に結び付けられないため数えない。従来の記述「その会話に…」「1 会話 1 回」は本訂正に読み替える。
 - **fix2 BC-06**: `reply_with_push_fallback` が `SEND_SENT` を返すのは **台帳 finish() が applied**（または台帳で sent 確定済みの重複
   `DUPLICATE_SENT`）のときだけ。HTTP 2xx でも finish が late／skipped（遅着・確定失敗）なら `SEND_UNCONFIRMED` → `j0_unconfirmed`・
   App 28 へ写さない（台帳は started のまま＝回収ジョブが unconfirmed に移し、人が確定する）。記録なし（op None＝V2 OFF の fail-open・
@@ -103,7 +108,9 @@ ON のときだけ有効な事項は「V2 ON」と明記する。
   無言）に基づく **限定的な凍結解除** として承認済み。FROZEN_SHA の他の項目（ヒアリング prompt・PENDING_REPLY・即時定型・法テラス・
   費用固定文）は不変。
 - main の JIKOU-FAQ-ADDON-PROMPT-1（`67f992e`・QUEUE-2026-10-11-B Q-4・司令塔票で承認）による FAQ「完了後の追加依頼の費用」行への「固定文を必ず含める」1 文と、上記の 1 行追加は、main `b8ab474` 同期 merge（JIKOU-REPLY-Q1c-sync-main・2026-10-31）で同じ prompt 本文に共存する。**両方とも承認済みの凍結解除**であり、pin は両方を含む本文で再計算（customer_prompt_base `908f9335…`・集約 sha `ce329d3c…`）。他の凍結項目は不変。
-- J-0 文言（`send_policy.J0_TEXT`・sha pin）は司令塔仮置き・**大野承認待ち**。
+- J-0 文言（`send_policy.J0_TEXT`・sha pin）は司令塔仮置き・**大野承認待ち**（fix2 時点でも未承認のまま）。
+  **fix2 BC-11（凍結記録）: J-0 文言の大野承認は `JIKOU_SEND_POLICY_V2` を ON にする（V2 有効化）前の条件**とする。承認時は
+  `J0_TEXT` と test の sha pin を同時に更新する（変更が無ければ pin はそのまま）。
 
 ## 7. migration（fix1 BC-02）
 

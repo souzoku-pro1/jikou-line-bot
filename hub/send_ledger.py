@@ -71,6 +71,8 @@ JIKOU-REPLY-Q1c（QUEUE-2026-10-12-C C-1）:
   判定する（不許可=PolicyStopped・行を作らない）。人の明示送信（human）は Q1b の列のまま。
 - (c) purpose=first_reply（J-0）は排他の中で「初回返信判定の対象」の在庫を数え、1 件でもあれば
   FIRST_REPLY_ALREADY（送らない）。会話が無ければ送らない。
+  Q1c-fix2 BC-11（司令塔裁定）: 在庫は **会話単位ではなく 業務 × LINE 利用者（line_user_hash）単位** で数える（conversation を
+  join して同じ利用者の全会話の操作を対象にする）＝30 日無受信で新会話になっても J-0 は再送しない。表・列は変えない。
 - OFF（既定）のときは本票の分岐に入らない（既存経路の挙動は不変）。
 
 RV-10: 本表・ログ・例外に本文・氏名・LINE userId を載せない。line_user_hash は一方向
@@ -620,15 +622,21 @@ class PolicyStopped:
 _FIRST_REPLY_LIVE = (STATE_PENDING, STATE_STARTED, STATE_SENT, STATE_UNCONFIRMED)
 
 
-async def _first_reply_count(s, conv_id: int) -> int:
-    return int((await s.execute(sa.select(sa.func.count()).select_from(send_operation).where(
-        send_operation.c.conversation_id == int(conv_id),
+async def _first_reply_count(s, business: str, user_hash: str) -> int:
+    """「初回返信判定の対象」の在庫（pending／started／sent／unconfirmed）。Q1c-fix2 BC-11: 会話単位ではなく
+    **業務 × LINE 利用者（line_user_hash）単位**＝同じ利用者の全会話の操作を数える（30 日無受信後の新会話でも J-0 は再送しない）。
+    会話を持たない操作（conversation_id NULL・受信前の送信）は利用者に結び付けられないため数えない。"""
+    return int((await s.execute(sa.select(sa.func.count()).select_from(
+        send_operation.join(conversation, conversation.c.conversation_id == send_operation.c.conversation_id)).where(
+        conversation.c.business == business,
+        conversation.c.line_user_hash == user_hash,
         send_operation.c.first_reply_target.is_(True),
         send_operation.c.state.in_(_FIRST_REPLY_LIVE)))).scalar() or 0)
 
 
 async def first_reply_count(business: str, user_id: str) -> int | None:
-    """R-J2 判定式の読取（送信前の事前判定用・確定は begin() の排他の中）。会話が無ければ None。"""
+    """R-J2 判定式の読取（送信前の事前判定用・確定は begin() の排他の中）。会話が無ければ None。
+    Q1c-fix2 BC-11: 件数は利用者単位（_first_reply_count）。"""
     if not _db_configured():
         return None
     user_hash = line_user_hash(business, user_id)
@@ -636,7 +644,7 @@ async def first_reply_count(business: str, user_id: str) -> int | None:
         row = await _latest_conversation(s, business, user_hash)
         if row is None:
             return None
-        return await _first_reply_count(s, int(row.conversation_id))
+        return await _first_reply_count(s, business, user_hash)
 
 
 @dataclass
@@ -717,8 +725,9 @@ async def begin(business: str, channel: str, user_id: str, text: str):
                     logger.info("[SEND_LEDGER] policy v2 stopped (not allowed, no row)")
                     return PolicyStopped(decision.reasons)
             # JIKOU-REPLY-Q1c (c): J-0 は会話が無ければ送らず、「初回返信判定の対象」の操作が 1 件でもあれば送らない
+            # Q1c-fix2 BC-11: 在庫は 業務 × LINE 利用者 単位（同じ利用者の全会話）
             if policy_v2_enabled() and purpose_ == PURPOSE_FIRST_REPLY and actor != ACTOR_HUMAN:
-                if conv_id is None or await _first_reply_count(s, conv_id) > 0:
+                if conv_id is None or await _first_reply_count(s, business, user_hash) > 0:
                     return FIRST_REPLY_ALREADY
             if ctx is not None and ctx.attend and actor == ACTOR_HUMAN:
                 # fix1 BR-05: 送信着手と同じ排他・同一 tx で対応中（attending・human_version+1）を確定。

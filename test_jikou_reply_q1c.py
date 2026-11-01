@@ -416,9 +416,12 @@ class TestFirstReply(_DbMixin):
         _run(line_channel.push_text(JIKOU, USER, "通常の返信"))      # purpose=reply も対象
         self.assertFalse(_run(sp.first_reply_due(USER)))
         self.assertEqual(self._j0(), sl.SEND_POLICY_STOPPED)
+        # Q1c-fix2 BC-11（司令塔裁定）: J-0 は 業務 × LINE 利用者 単位で 1 通。30 日無受信後の新しい会話でも再送しない
         self.touch("e2", at=T0 + datetime.timedelta(days=40))   # 新しい会話
-        self.assertTrue(_run(sp.first_reply_due(USER)))
-        self.assertEqual(self._j0(), sl.SEND_SENT)
+        self.assertEqual(len(_run(sp._conversation(USER)) and [1]), 1)
+        self.assertFalse(_run(sp.first_reply_due(USER)))
+        self.assertEqual(self._j0(), sl.SEND_POLICY_STOPPED)
+        self.assertEqual(len(_FakeClient.calls), 1)                 # 通常の返信 1 回だけ（J-0 は出ていない）
 
     def test_follow_is_not_a_first_reply_target(self):
         self.on()

@@ -15,8 +15,9 @@ flag JIKOU_SEND_POLICY_V2（send_ledger.policy_v2_enabled・既定 OFF）:
       versions_match=False（安全側＝人対応中・対応中は送らず通知し、再承認待ちにする）。
   (b) 空返事（hub/empty_reply_guard）は自動送信せず無言。承認降格時の PENDING_REPLY（文脈化定型を含む）も
       送らない（即時定型 6 種は閉集合の承認済み文＝従来どおり送る）。障害・例外時も無言。
-  (c) J-0（初回 1 通・司令塔仮置き・大野承認待ち）: 無言にする場面で、その会話に「初回返信判定の対象」の
-      送信操作が 1 件も無い（pending/started/sent/unconfirmed いずれも 0 件）ときだけ 1 回送る。
+  (c) J-0（初回 1 通・司令塔仮置き・大野承認待ち）: 無言にする場面で、**その利用者（業務 × LINE 利用者・fix2 BC-11）**に
+      「初回返信判定の対象」の送信操作が 1 件も無い（pending/started/sent/unconfirmed いずれも 0 件）ときだけ 1 回送る。
+      30 日無受信後の新会話でも再送しない。
       判定は送信前（first_reply_due）と begin() の排他の中（purpose=first_reply の在庫検査）の二重。
       会話が無い（非 durable 経路）ときは送らない（1 回性を担保できない）。
   (d) 無言にした受信は hub/reply_pending（対応待ち）に永続化し、業務 LINE へ固定文言（App 29 No.・カテゴリ
@@ -54,7 +55,8 @@ CUSTOMER_CHANNEL = "jikou"               # 許可表 V2 を適用する顧客チ
 CONDITION_TTL_SECONDS = 30.0             # 停止条件の照会結果の再利用窓（受信入口と送信前で 2 度引かない）
 _JST = datetime.timezone(datetime.timedelta(hours=9))
 
-# J-0（初回受付・1 会話 1 回・司令塔仮置き・大野承認待ち）。文言変更は本定数と test の sha pin を同時に更新する
+# J-0（初回受付・業務 × LINE 利用者 単位で 1 回〔fix2 BC-11〕・司令塔仮置き・大野承認待ち＝V2 有効化前の条件）。
+# 文言変更は本定数と test の sha pin を同時に更新する
 J0_TEXT = "ご連絡ありがとうございます。内容を確認のうえ、弁護士からこの LINE でご返信いたします。"
 J0_TEXT_SHA256 = hashlib.sha256(J0_TEXT.encode("utf-8")).hexdigest()
 

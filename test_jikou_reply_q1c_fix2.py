@@ -585,5 +585,60 @@ class TestSymbolsOnlyReply(_Fix2Mixin):
         self.assertEqual(_texts(), [sp.J0_TEXT])
         self.assertEqual((self.pending()[-1]["route"], self.pending()[-1]["customer_send"]), ("hearing", "j0_sent"))
 
+# ── 6. BC-11: J-0 は 業務 × LINE 利用者 単位で 1 通（30 日無受信後の新会話でも再送しない） ─────────────────────
+class TestJ0PerUser(_Fix2Mixin):
+    def _conversations(self, user=USER) -> list:
+        h = sl.line_user_hash("jikou", user)
+        return [c for c in self._rows(sl.conversation) if c["line_user_hash"] == h]
+
+    def test_j0_not_resent_in_new_conversation_after_30_days_customer_route(self):
+        self.on()
+        self.touch("e1")
+        with patch.object(cr, "_call_compose_reply", AsyncMock(return_value=_compose("x", category="法的判断・見通し", auto_send=False))):
+            self.inbound()
+        self.assertEqual(_texts(), [sp.J0_TEXT])
+        self.assertEqual(self.pending()[0]["customer_send"], "j0_sent")
+        # 31 日後の受信 → 新しい会話（conversation 2 行目）。J-0 は利用者単位で送信済みなので再送しない（無言・対応待ちのみ）
+        self.touch("e2", at=T0 + datetime.timedelta(days=31))
+        self.assertEqual(len(self._conversations()), 2)
+        self.assertFalse(_run(sp.first_reply_due(USER)))
+        _FakeClient.calls.clear()
+        with patch.object(cr, "_call_compose_reply", AsyncMock(return_value=_compose("y", category="法的判断・見通し", auto_send=False))):
+            self.inbound()
+        self.assertEqual(_FakeClient.calls, [])
+        rows = self.pending()
+        self.assertEqual((len(rows), rows[1]["customer_send"], rows[1]["state"]), (2, "none", "open"))
+        self.assertEqual(self.assistant_logs(), [sp.J0_TEXT])                                   # 写しも 1 回だけ
+        # 台帳の在庫検査（排他の中）も利用者単位: purpose=first_reply の直接送信は止まる
+        with sl.purpose(sl.PURPOSE_FIRST_REPLY):
+            res, reasons = self.run_r(line_channel.reply_with_push_fallback(JIKOU, "rt", USER, sp.J0_TEXT))
+        self.assertEqual((res, reasons), (sl.SEND_POLICY_STOPPED, ("first_reply:already",)))
+        self.assertEqual(_run(sl.first_reply_count("jikou", USER)), 1)
+        # 別の利用者には影響しない（利用者単位）
+        self.touch("e3", user=USER2, at=T0 + datetime.timedelta(days=31))
+        self.assertTrue(_run(sp.first_reply_due(USER2)))
+
+    def test_ledger_count_joins_conversation_and_ignores_unattached_ops(self):
+        self.on()
+        self.touch("e1")
+        _run(line_channel.push_text(JIKOU, USER, "通常の返信"))                                   # 会話 1 の reply（対象）
+        self.touch("e2", at=T0 + datetime.timedelta(days=40))                                   # 会話 2
+        self.assertEqual(len(self._conversations()), 2)
+        self.assertEqual(_run(sl.first_reply_count("jikou", USER)), 1)                          # 会話をまたいで数える
+        self.assertFalse(_run(sp.first_reply_due(USER)))
+        # follow は対象外（従来どおり）・別利用者は数えない
+        _run(sl.with_purpose("follow", line_channel.push_text, JIKOU, USER, "あいさつ"))
+        self.assertEqual(_run(sl.first_reply_count("jikou", USER)), 1)
+        self.assertIsNone(_run(sl.first_reply_count("jikou", USER2)))                           # 会話なし＝None（J-0 は送らない）
+        src = (REPO / "hub" / "send_ledger.py").read_text(encoding="utf-8")
+        self.assertIn("send_operation.join(conversation", src)
+        self.assertNotIn("send_operation.c.conversation_id == int(conv_id),\n        send_operation.c.first_reply_target", src)
+
+    def test_docs_state_per_user_unit_and_j0_approval_as_v2_condition(self):
+        doc = (REPO / "docs" / "jikou_reply_q1c_contract.md").read_text(encoding="utf-8")
+        self.assertIn("業務 × LINE 利用者", doc)
+        self.assertIn("V2 有効化前の条件", doc)
+        self.assertNotIn("J-0（初回受付・1 会話 1 回", (REPO / "hub" / "send_policy.py").read_text(encoding="utf-8"))
+
 if __name__ == "__main__":
     unittest.main()
