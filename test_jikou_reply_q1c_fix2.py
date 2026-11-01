@@ -241,7 +241,7 @@ class TestNoticeKeyPersistence(_Fix2Mixin):
         self.assertEqual(_run(rp.claim_notify(pid, "B", now=now)), (rp.CLAIM_BUSY, ""))             # リース内は他者不可
         self.assertEqual(_run(rp.claim_notify(pid, "B", now=now + datetime.timedelta(seconds=rp.NOTIFY_CLAIM_LEASE_SECONDS + 1)))[0],
                          rp.CLAIM_OK)                                                                # リース超過で再取得
-        _run(rp.set_notify_state(pid, rp.NOTIFY_SENT))
+        self.assertTrue(_run(rp.set_notify_state(pid, rp.NOTIFY_SENT, owner="B")))                  # Q1c-fix4 BC-17: 完了書込は所有者 B が行う（owner 必須契約への追随）
         self.assertEqual(_run(rp.claim_notify(pid, "C")), (rp.CLAIM_DONE, ""))                      # 通知済みは再通知しない
         self.assertEqual(_run(rp.claim_notify(10 ** 9, "C")), (rp.CLAIM_NOT_FOUND, ""))
         self.assertEqual(rp.CLAIM_RESULTS, ("ok", "busy", "done", "not_found"))

@@ -256,16 +256,24 @@ async def _set(pending_id: int, field: str, to_value: str, actor: str, *, where_
     return True
 
 
-async def set_notify_state(pending_id: int, value: str, *, now=None, owner: str | None = None) -> bool:
-    """通知結果の記録。fix2 BC-07: 記録と同時に claim（notify_owner／notify_claimed_at）を解放する。
-    fix3 BC-14: owner を渡したときは **pending_id AND notify_owner = owner** の条件付き更新。0 件（リース切れ後に他者が claim した遅着）は
-    無変更で False（履歴も書かない）。owner なしは画面・テストなど通知経路外の記録用。"""
+def _require_owner(owner) -> str:
+    """fix4 BC-17: 通知結果・試行数を変える関数は owner 必須（None・空は拒否）。未所有行の管理操作は *_unowned を使う。"""
+    if owner is None or not str(owner):
+        raise TypeError("notify_owner is required (use *_unowned for rows without an owner)")
+    return str(owner)
+
+
+async def set_notify_state(pending_id: int, value: str, *, owner: str, now=None) -> bool:
+    """通知結果の記録（claim の所有者だけ）。fix2 BC-07: 記録と同時に claim（notify_owner／notify_claimed_at）を解放する。
+    fix3 BC-14／fix4 BC-17: **pending_id AND notify_owner = owner** の条件付き更新で、owner は必須（省略・None は TypeError）。
+    0 件（リース切れ後に他者が claim した遅着）は無変更で False（履歴も書かない）。"""
+    owner = _require_owner(owner)
     if value not in NOTIFY_STATES:
         return False
     try:
         return await _set(pending_id, "notify_state", value, RESOLVED_BY_BOT, now=now,
                           extra={"notify_owner": None, "notify_claimed_at": None},
-                          extra_where=([reply_pending.c.notify_owner == str(owner)] if owner is not None else None))
+                          extra_where=[reply_pending.c.notify_owner == owner])
     except Exception:
         logger.error("[REPLY_PENDING] notify_state update failed (fixed reason)")
         return False
@@ -535,15 +543,15 @@ async def list_notify_retry(limit: int = 50, *, max_attempts: int = NOTIFY_RETRY
     return [_row(r) for r in rows]
 
 
-async def bump_attempts(pending_id: int, *, now=None, owner: str | None = None) -> bool:
-    """fix3 BC-14: owner を渡したときは自分の claim が生きている行だけ進める（遅着は 0 件・無変更）。"""
+async def bump_attempts(pending_id: int, *, owner: str, now=None) -> bool:
+    """試行数を進める（claim の所有者だけ）。fix3 BC-14／fix4 BC-17: owner 必須（省略・None は TypeError）・遅着は 0 件・無変更。"""
+    owner = _require_owner(owner)
     now = now or _now()
     try:
         async with session_scope() as s:
-            cond = [reply_pending.c.pending_id == int(pending_id)]
-            if owner is not None:
-                cond.append(reply_pending.c.notify_owner == str(owner))
-            r = await s.execute(sa.update(reply_pending).where(*cond).values(
+            r = await s.execute(sa.update(reply_pending).where(
+                reply_pending.c.pending_id == int(pending_id),
+                reply_pending.c.notify_owner == owner).values(
                 attempts=reply_pending.c.attempts + 1, updated_at=now))
             return int(r.rowcount or 0) == 1
     except Exception:
@@ -685,4 +693,34 @@ async def release_notify_claim(pending_id: int, owner: str, *, now=None) -> bool
             return int(r.rowcount or 0) == 1
     except Exception:
         logger.error("[REPLY_PENDING] claim release failed (fixed reason)")
+        return False
+
+
+# ── fix4 BC-17: 未所有行への管理操作（notify_owner IS NULL のときだけ・通知経路では使わない） ──────────────────
+async def set_notify_state_unowned(pending_id: int, value: str, *, now=None) -> bool:
+    """未所有（notify_owner IS NULL）の行にだけ通知結果を書く管理操作（画面・テスト・運用の訂正用）。
+    claim 中の行（他者が所有）は触らない＝0 件で False。"""
+    if value not in NOTIFY_STATES:
+        return False
+    try:
+        return await _set(pending_id, "notify_state", value, RESOLVED_BY_HUMAN, now=now,
+                          extra={"notify_owner": None, "notify_claimed_at": None},
+                          extra_where=[reply_pending.c.notify_owner.is_(None)])
+    except Exception:
+        logger.error("[REPLY_PENDING] notify_state (unowned) update failed (fixed reason)")
+        return False
+
+
+async def bump_attempts_unowned(pending_id: int, *, now=None) -> bool:
+    """未所有（notify_owner IS NULL）の行の試行数を進める管理操作（上限到達の再現・運用の訂正用）。claim 中の行は触らない。"""
+    now = now or _now()
+    try:
+        async with session_scope() as s:
+            r = await s.execute(sa.update(reply_pending).where(
+                reply_pending.c.pending_id == int(pending_id),
+                reply_pending.c.notify_owner.is_(None)).values(
+                attempts=reply_pending.c.attempts + 1, updated_at=now))
+            return int(r.rowcount or 0) == 1
+    except Exception:
+        logger.error("[REPLY_PENDING] bump_attempts (unowned) failed (fixed reason)")
         return False

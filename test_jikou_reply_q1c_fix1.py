@@ -341,9 +341,9 @@ class TestRetryQueueAndNotices(_Fix1Mixin):
         self.assertEqual((self.pending()[0]["notify_state"], self.biz.await_count), ("sent", 1))
         # 上限: attempts が NOTIFY_RETRY_MAX に達した行は対象外（通知は増えない）
         pid = self.reg(user=USER2, inbound_event_id="e-cap")
-        _run(rp.set_notify_state(pid, rp.NOTIFY_FAILED))
+        _run(rp.set_notify_state_unowned(pid, rp.NOTIFY_FAILED))          # Q1c-fix4 BC-17: 通知経路外の管理操作は *_unowned（owner 必須契約への追随）
         for _ in range(rp.NOTIFY_RETRY_MAX):
-            _run(rp.bump_attempts(pid))
+            _run(rp.bump_attempts_unowned(pid))
         self.assertEqual(_run(sp.run_pending_retry_job())["notify_retried"], 0)
         self.assertEqual(self.biz.await_count, 1)
 
