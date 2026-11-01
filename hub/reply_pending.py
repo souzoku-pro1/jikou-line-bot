@@ -234,7 +234,7 @@ async def register(*, business: str, channel: str, line_user_hash: str, route: s
 
 
 async def _set(pending_id: int, field: str, to_value: str, actor: str, *, where_from=None,
-               extra: dict | None = None, now=None) -> bool:
+               extra: dict | None = None, now=None, extra_where=None) -> bool:
     now = now or _now()
     col = reply_pending.c[field]
     async with session_scope() as s:
@@ -245,6 +245,8 @@ async def _set(pending_id: int, field: str, to_value: str, actor: str, *, where_
         cond = [reply_pending.c.pending_id == int(pending_id)]
         if where_from is not None:
             cond.append(col.in_(tuple(where_from)))
+        if extra_where is not None:
+            cond.extend(list(extra_where))
         values = {field: to_value, "updated_at": now}
         values.update(extra or {})
         r = await s.execute(sa.update(reply_pending).where(*cond).values(**values))
@@ -254,13 +256,16 @@ async def _set(pending_id: int, field: str, to_value: str, actor: str, *, where_
     return True
 
 
-async def set_notify_state(pending_id: int, value: str, *, now=None) -> bool:
-    """通知結果の記録。fix2 BC-07: 記録と同時に claim（notify_owner／notify_claimed_at）を解放する。"""
+async def set_notify_state(pending_id: int, value: str, *, now=None, owner: str | None = None) -> bool:
+    """通知結果の記録。fix2 BC-07: 記録と同時に claim（notify_owner／notify_claimed_at）を解放する。
+    fix3 BC-14: owner を渡したときは **pending_id AND notify_owner = owner** の条件付き更新。0 件（リース切れ後に他者が claim した遅着）は
+    無変更で False（履歴も書かない）。owner なしは画面・テストなど通知経路外の記録用。"""
     if value not in NOTIFY_STATES:
         return False
     try:
         return await _set(pending_id, "notify_state", value, RESOLVED_BY_BOT, now=now,
-                          extra={"notify_owner": None, "notify_claimed_at": None})
+                          extra={"notify_owner": None, "notify_claimed_at": None},
+                          extra_where=([reply_pending.c.notify_owner == str(owner)] if owner is not None else None))
     except Exception:
         logger.error("[REPLY_PENDING] notify_state update failed (fixed reason)")
         return False
@@ -520,12 +525,15 @@ async def list_notify_retry(limit: int = 50, *, max_attempts: int = NOTIFY_RETRY
     return [_row(r) for r in rows]
 
 
-async def bump_attempts(pending_id: int, *, now=None) -> bool:
+async def bump_attempts(pending_id: int, *, now=None, owner: str | None = None) -> bool:
+    """fix3 BC-14: owner を渡したときは自分の claim が生きている行だけ進める（遅着は 0 件・無変更）。"""
     now = now or _now()
     try:
         async with session_scope() as s:
-            r = await s.execute(sa.update(reply_pending).where(
-                reply_pending.c.pending_id == int(pending_id)).values(
+            cond = [reply_pending.c.pending_id == int(pending_id)]
+            if owner is not None:
+                cond.append(reply_pending.c.notify_owner == str(owner))
+            r = await s.execute(sa.update(reply_pending).where(*cond).values(
                 attempts=reply_pending.c.attempts + 1, updated_at=now))
             return int(r.rowcount or 0) == 1
     except Exception:

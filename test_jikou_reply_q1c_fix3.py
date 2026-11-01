@@ -83,5 +83,39 @@ class TestClaimKeySameTransaction(_Fix2Mixin):
         self.assertNotIn("notice_key_of(", (REPO / "hub" / "send_policy.py").read_text(encoding="utf-8"))   # 送信経路は同一 tx の値だけ
 
 
+# ── 2. BC-14: 結果・試行数・claim 解放は owner 条件付き（遅着は無変更） ─────────────────────────
+class TestOwnerConditionedWrites(_Fix2Mixin):
+    def test_late_result_from_expired_owner_does_not_overwrite_new_owner(self):
+        pid = self.reg(inbound_event_id="e-o", notice_key=KEY_A)
+        t0 = datetime.datetime(2026, 11, 1, 3, 0, tzinfo=datetime.timezone.utc)
+        self.assertEqual(_run(rp.claim_notify(pid, "A", now=t0))[0], rp.CLAIM_OK)
+        t1 = t0 + datetime.timedelta(seconds=rp.NOTIFY_CLAIM_LEASE_SECONDS + 1)
+        self.assertEqual(_run(rp.claim_notify(pid, "B", now=t1))[0], rp.CLAIM_OK)                # A の期限切れ後に B が claim
+        self.assertFalse(_run(rp.bump_attempts(pid, owner="A")))                                 # 遅れて戻った A: 無変更
+        self.assertFalse(_run(rp.set_notify_state(pid, rp.NOTIFY_SENT, owner="A")))
+        row = self.pending()[0]
+        self.assertEqual((row["notify_state"], row["notify_owner"], row["attempts"]), ("none", "B", 0))   # B の状態は上書きされない
+        self.assertEqual([h["field"] for h in _run(rp.history(pid))], ["state"])                 # 履歴も書かない
+        self.assertTrue(_run(rp.bump_attempts(pid, owner="B")))
+        self.assertTrue(_run(rp.set_notify_state(pid, rp.NOTIFY_FAILED, owner="B")))             # B の完了は書けて claim を解放
+        row = self.pending()[0]
+        self.assertEqual((row["notify_state"], row["notify_owner"], row["notify_claimed_at"], row["attempts"]), ("failed", None, None, 1))
+        self.assertFalse(_run(rp.set_notify_state(pid, rp.NOTIFY_SENT, owner="B")))             # 解放後はもう書けない
+
+    def test_notify_pending_late_return_leaves_state_of_new_owner(self):
+        self.on()
+        pid = self.reg(inbound_event_id="e-p", notice_key=KEY_A)
+        taken: dict = {}
+
+        async def slow_send(key, text):                                                           # A の送信中にリースが切れ B が claim して完了した
+            taken["claim"] = await rp.claim_notify(pid, "B", now=datetime.datetime.now(datetime.timezone.utc)
+                                                   + datetime.timedelta(seconds=rp.NOTIFY_CLAIM_LEASE_SECONDS + 1))
+            self.assertTrue(await rp.set_notify_state(pid, rp.NOTIFY_THROTTLED, owner="B"))
+            return rp.NOTIFY_SENT
+        with patch.object(sp, "send_business_notice", slow_send):
+            self.assertEqual(_run(sp._notify_pending(pid, KEY_B, None, None)), rp.NOTIFY_SENT)   # A の戻り値は返るが…
+        self.assertEqual(taken["claim"][0], rp.CLAIM_OK)
+        self.assertEqual((self.pending()[0]["notify_state"], self.pending()[0]["notify_owner"]), ("throttled", None))   # …B の状態を上書きしない
+
 if __name__ == "__main__":
     unittest.main()

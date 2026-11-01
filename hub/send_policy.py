@@ -776,7 +776,9 @@ async def _notify_pending(pid: int, computed_key: str, approval_record_id, categ
         await reply_pending.release_notify_claim(pid, owner)
         return ""
     if bump_attempts:
-        await reply_pending.bump_attempts(pid)
+        await reply_pending.bump_attempts(pid, owner=owner)
     state = await send_business_notice(key, notice_text(approval_record_id, category))
-    await reply_pending.set_notify_state(pid, state)
+    # fix3 BC-14: 結果の記録と claim 解放は「自分が owner のまま」のときだけ（リース切れ後に他者が claim していれば遅着＝無変更）
+    if not await reply_pending.set_notify_state(pid, state, owner=owner):
+        logger.info("[SEND_POLICY] notice result arrived late (claim taken over; state unchanged)")
     return state
