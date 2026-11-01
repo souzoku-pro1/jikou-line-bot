@@ -649,10 +649,12 @@ async def _legacy_notice_key(row: dict, created_at) -> str:
                       row["line_user_hash"], today=_jst_date(created_at))
 
 
-async def run_pending_retry_job() -> dict:
+async def run_pending_retry_job(*, now=None) -> dict:
     """send_ledger の回収ジョブに相乗り（interval）。(1) 永続キューの再処理（register → 通知）、(2) 通知の再試行
-    （台帳 key は登録日のまま＝送れても 1 通・上限 NOTIFY_RETRY_MAX）。例外は固定語彙で握る（他の hook を止めない）。"""
-    res = {"requeued": 0, "registered": 0, "register_failed": 0, "notify_retried": 0}
+    （台帳 key は登録日のまま＝送れても 1 通・上限 NOTIFY_RETRY_MAX）。例外は固定語彙で握る（他の hook を止めない）。
+    fix3 BC-15: (2) は notify_state=none（登録後に初回通知へ至らなかった行・未所有またはリース切れ）も回収する（notify_recovered）。
+    回収は **業務 LINE 通知だけ**＝顧客向け送信・J-0 には触れない（司令塔裁定・test_jikou_reply_q1c_fix3 が固定）。"""
+    res = {"requeued": 0, "registered": 0, "register_failed": 0, "notify_retried": 0, "notify_recovered": 0}
     if not reply_pending._db_configured():
         return res
     try:
@@ -676,17 +678,19 @@ async def run_pending_retry_job() -> dict:
         await reply_pending.retry_done(q["retry_id"], pid)
         await _notify_pending(pid, key, (q["approval_record_id"] or None), (q["category"] or None))
     try:
-        rows = await reply_pending.list_notify_retry()
+        rows = await reply_pending.list_notify_retry(now=now)
     except Exception:
         logger.warning("[SEND_POLICY] notify retry read failed (fixed reason)")
         rows = []
     for r in rows:
         res["notify_retried"] += 1
+        if r.get("notify_state") == reply_pending.NOTIFY_NONE:
+            res["notify_recovered"] += 1
         created = datetime.datetime.fromisoformat(r["created_at"]) if r.get("created_at") else None
         # fix2 BC-07: 保存済みの通知キーで再試行（claim を取れた 1 者だけが送り、attempts を進める）
         key = r.get("notice_key") or await _legacy_notice_key(r, created)
         await _notify_pending(r["pending_id"], key, (r.get("approval_record_id") or None), (r.get("category") or None),
-                              bump_attempts=True)
+                              bump_attempts=True, now=now)
     if res["registered"] or res["notify_retried"]:
         logger.info("[SEND_POLICY] pending retry job registered=%s notify_retried=%s",
                     emit(res["registered"], "count", "log", "operator"),
@@ -755,7 +759,7 @@ def register_jobs() -> None:
 #         reply_pending.claim_notify（条件付き更新）を取れた 1 者だけが進む。
 # ══════════════════════════════════════════════════════════════
 async def _notify_pending(pid: int, computed_key: str, approval_record_id, category, *,
-                          bump_attempts: bool = False) -> str:
+                          bump_attempts: bool = False, now=None) -> str:
     """保存済みの通知キーで業務 LINE 通知する。claim（条件付き更新）を取れた 1 者だけが送って notify_state を記録する
     （取れなければ何もせず ""）。
     fix3 BC-13: 送信に使う key は **claim と同一トランザクションで読んだ永続キーだけ**（旧行の NULL 埋めも同一 tx・computed_key は
@@ -763,7 +767,7 @@ async def _notify_pending(pid: int, computed_key: str, approval_record_id, categ
     確定値が取れなければ claim を解放して送らない。"""
     owner = uuid.uuid4().hex
     try:
-        claim, key = await reply_pending.claim_notify(pid, owner, computed_key=computed_key)
+        claim, key = await reply_pending.claim_notify(pid, owner, computed_key=computed_key, now=now)
     except Exception:
         logger.warning("[SEND_POLICY] notice claim or key read failed (not sent; left for recovery)")
         return ""

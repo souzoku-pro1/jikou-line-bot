@@ -60,6 +60,11 @@ ON のときだけ有効な事項は「V2 ON」と明記する。
   claim も残らない＝送らずに回収へ戻す（`notice_key_of` も例外を送出・送信経路では使わない）。計算値が送信に渡ることはない。
 - **fix3 BC-14**: 結果（notify_state）・試行数（attempts）・claim 解放は **pending_id AND notify_owner = 自分** の条件付き更新
   （`set_notify_state(owner=)`／`bump_attempts(owner=)`）。リース切れ後に他者が claim していれば 0 件＝遅着として無変更（履歴も書かない）。
+- **fix3 BC-15（未通知行の回収）**: 回収ジョブ（`run_pending_retry_job`）の通知対象に **open かつ notify_state=none で未所有またはリース切れ**
+  の行を加える（`reply_pending.list_notify_retry`）＝キューからの登録（retry_done）直後の停止や初回 claim の DB エラーで通知に至らなかった
+  対応待ちを次回以降に拾う。送信は保存キーで送信台帳と照合（begin の重複判定）してから行い、送信済みなら 2 通目を出さず throttled を記録する。
+  **司令塔裁定: この回収は業務 LINE 通知だけ**で、顧客向け送信・J-0（customer_send・台帳の first_reply 在庫）には一切触れない
+  （`test_jikou_reply_q1c_fix3.TestRecoverUnnotifiedPending` が固定）。
 - **未返信の経過通知**: open のまま `REPLY_PENDING_AGE_MIN` 分（既定 60・env で上書き可・**要大野確認**）を超えた対応待ちを、
   業務 LINE へ **1 日 2 回**（JST `AGE_NOTICE_HOURS_JST`＝9 時・15 時・**要大野確認**・hub/scheduler の daily・HOUKI 系ジョブと同じ流儀）
   まとめて通知する。件数と経過分・再処理待ち件数のみ（PII なし）。台帳 key `pending_age:{JST 日付}:{時}` で 1 枠 1 通。

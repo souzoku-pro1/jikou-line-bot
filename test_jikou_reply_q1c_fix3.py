@@ -117,5 +117,102 @@ class TestOwnerConditionedWrites(_Fix2Mixin):
         self.assertEqual(taken["claim"][0], rp.CLAIM_OK)
         self.assertEqual((self.pending()[0]["notify_state"], self.pending()[0]["notify_owner"]), ("throttled", None))   # …B の状態を上書きしない
 
+# ── 3. BC-15: notify_state=none の対応待ちも回収（業務 LINE 通知のみ・顧客送信には触れない） ─────────────────────
+class TestRecoverUnnotifiedPending(_Fix2Mixin):
+    def _enqueue_via_register_failure(self, event_id: str = "e-q"):
+        async def _w():
+            tok = sl.bind_inbound(event_id)
+            try:
+                with patch.object(cr, "_call_compose_reply", AsyncMock(return_value=_compose("x", category="法的判断・見通し", auto_send=False))), \
+                     patch.object(rp, "register", AsyncMock(return_value=None)):
+                    await cr.handle_customer_message(user_id=USER, user_message="質問です", reply_token="rt",
+                                                     app21_record=self.app21.return_value, reply_func=self.reply_func())
+            finally:
+                sl.unbind(tok)
+        _run(_w())
+
+    def notice_ops(self) -> list:
+        return [(o["inbound_event_id"], o["state"], o["attempt_no"]) for o in self.ops() if o["channel"] == "jikou_notice"]
+
+    def test_stop_right_after_retry_done_is_recovered_with_exactly_one_notice(self):
+        self.on()
+        self.touch("e-q")
+        self._enqueue_via_register_failure("e-q")
+        self.assertEqual((len(self.retry_rows()), self.pending()), (1, []))
+        # 回収ジョブ: register → retry_done の直後に停止（初回通知に至らない）
+        with patch.object(sp, "_notify_pending", AsyncMock(side_effect=RuntimeError("process stopped"))):
+            with self.assertRaises(RuntimeError):
+                _run(sp.run_pending_retry_job())
+        rows = self.pending()
+        self.assertEqual((len(rows), rows[0]["notify_state"], rows[0]["notify_owner"], self.retry_rows()[0]["state"]),
+                         (1, "none", None, "done"))                                               # キューは done・通知は未着手
+        self.biz.assert_not_awaited()
+        self.assertIn(rows[0]["pending_id"], [r["pending_id"] for r in _run(rp.list_notify_retry())])   # 回収対象に載る
+        # 再起動後の回収ジョブ: 業務通知はちょうど 1 通
+        res = _run(sp.run_pending_retry_job())
+        self.assertEqual((res["requeued"], res["notify_retried"], res["notify_recovered"]), (0, 1, 1))
+        self.assertEqual(self.biz.await_count, 1)
+        row = self.pending()[0]
+        self.assertEqual((row["notify_state"], row["notify_owner"], row["attempts"], row["notice_key"]),
+                         ("sent", None, 1, self.retry_rows()[0]["notice_key"]))                   # 引き継いだ保存キーで送った
+        self.assertEqual(self.notice_ops(), [(row["notice_key"], "sent", 1)])
+        # もう一度: 対象なし・通知は増えない
+        self.assertEqual(_run(sp.run_pending_retry_job())["notify_retried"], 0)
+        self.assertEqual(self.biz.await_count, 1)
+
+    def test_initial_claim_db_error_leaves_none_row_that_job_recovers_once(self):
+        self.on()
+        self.touch("e1")
+        with patch.object(rp, "claim_notify", AsyncMock(side_effect=RuntimeError("db error at first claim"))):
+            self.customer(_compose("x", category="法的判断・見通し", auto_send=False))         # 登録はされ、初回 claim で DB エラー
+        row = self.pending()[0]
+        self.assertEqual((row["notify_state"], row["notify_owner"]), ("none", None))
+        self.biz.assert_not_awaited()
+        self.assertEqual(_texts(), [sp.J0_TEXT])                                                  # 顧客向け J-0 は通知の失敗と独立（従来どおり 1 通）
+        res = _run(sp.run_pending_retry_job())
+        self.assertEqual((res["notify_recovered"], self.biz.await_count, self.pending()[0]["notify_state"]), (1, 1, "sent"))
+
+    def test_crash_after_send_is_reconciled_with_ledger_not_resent(self):
+        self.on()
+        pid = self.reg(inbound_event_id="e-c", notice_key=KEY_A)
+        with patch.object(rp, "set_notify_state", AsyncMock(side_effect=RuntimeError("crash after send"))):
+            with self.assertRaises(RuntimeError):
+                _run(sp._notify_pending(pid, KEY_B, "500", "c"))                                  # HTTP は成功・結果の記録前に停止
+        row = self.pending()[0]
+        self.assertEqual((row["notify_state"], self.biz.await_count), ("none", 1))
+        self.assertIsNotNone(row["notify_owner"])                                                 # claim はリース内
+        self.assertEqual(_run(sp.run_pending_retry_job())["notify_retried"], 0)                   # リース内は拾わない
+        later = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=rp.NOTIFY_CLAIM_LEASE_SECONDS + 1)
+        res = _run(sp.run_pending_retry_job(now=later))                                           # リース切れ後に回収
+        self.assertEqual((res["notify_recovered"], self.biz.await_count), (1, 1))                 # 台帳照合: 送信済み＝2 通目なし
+        row = self.pending()[0]
+        self.assertEqual((row["notify_state"], row["notify_owner"]), ("throttled", None))
+        self.assertEqual(self.notice_ops(), [(KEY_A, "sent", 1)])
+        self.assertEqual(_run(rp.list_notify_retry(now=later)), [])
+
+    def test_recovery_never_touches_customer_sends_or_j0(self):
+        self.on()
+        self.touch("e1")
+        for i in range(3):                                                                        # none の対応待ちを複数（うち 1 件は旧行＝key NULL）
+            self.reg(inbound_event_id=f"e-n{i}", notice_key=(KEY_A if i else None))
+        reply_spy = AsyncMock(side_effect=AssertionError("customer reply must not be sent by recovery"))
+        push_spy = AsyncMock(side_effect=AssertionError("customer push must not be sent by recovery"))
+        with patch.object(line_channel, "reply_with_push_fallback", reply_spy), patch.object(line_channel, "push_text", push_spy):
+            res = _run(sp.run_pending_retry_job())
+        self.assertEqual(res["notify_recovered"], 3)
+        reply_spy.assert_not_awaited()
+        push_spy.assert_not_awaited()
+        self.assertEqual(_FakeClient.calls, [])                                                   # 顧客 LINE への HTTP なし
+        self.assertEqual({o["channel"] for o in self.ops()}, {"jikou_notice"})                     # 台帳の操作は業務通知だけ
+        self.assertEqual({r["customer_send"] for r in self.pending()}, {"none"})                  # J-0 の記録に触れない
+        self.assertTrue(_run(sp.first_reply_due(USER)))                                           # J-0 の在庫も不変
+        # 同じ保存キー（同じ相談者・同日）の 2 件目は台帳照合で throttled（1 会話 1 日 1 回）＝業務通知は key ごとに 1 通
+        self.assertEqual(sorted(r["notify_state"] for r in self.pending()), ["sent", "sent", "throttled"])
+        self.assertEqual(self.biz.await_count, 2)
+        src = (REPO / "hub" / "send_policy.py").read_text(encoding="utf-8")
+        job = src[src.index("async def run_pending_retry_job"):src.index("def age_notice_text")]
+        for banned in ("J0_TEXT", "reply_with_push_fallback", "push_text", "_maybe_j0", "set_customer_send", "PURPOSE_FIRST_REPLY"):
+            self.assertNotIn(banned, job, banned)
+
 if __name__ == "__main__":
     unittest.main()

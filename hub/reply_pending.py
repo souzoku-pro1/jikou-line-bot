@@ -514,13 +514,23 @@ async def retry_bump(retry_id: int, *, now=None) -> bool:
         return False
 
 
-async def list_notify_retry(limit: int = 50, *, max_attempts: int = NOTIFY_RETRY_MAX) -> list[dict]:
-    """通知の再試行対象: open かつ notify_state が failed／unavailable で attempts が上限未満（古い順）。"""
+async def list_notify_retry(limit: int = 50, *, max_attempts: int = NOTIFY_RETRY_MAX, now=None,
+                            lease_seconds: int | None = None) -> list[dict]:
+    """通知の再試行・回収対象（古い順・attempts が上限未満）:
+    - notify_state が failed／unavailable（従来の再試行）
+    - fix3 BC-15: notify_state が **none**（登録はされたが初回通知に至らなかった行＝retry_done 直後の停止・初回 claim の DB エラー）
+    いずれも **未所有またはリース切れ**（notify_owner が NULL／notify_claimed_at が NULL／リース超過）の行だけ（処理中の行は拾わない）。
+    送信は保存キーで送信台帳と照合（begin の重複判定）してから行うため、送信済みなら 2 通目は出ない。"""
+    now = now or _now()
+    cut = now - datetime.timedelta(seconds=int(NOTIFY_CLAIM_LEASE_SECONDS if lease_seconds is None else lease_seconds))
     async with session_scope() as s:
         rows = (await s.execute(sa.select(reply_pending).where(
             reply_pending.c.state == STATE_OPEN,
-            reply_pending.c.notify_state.in_((NOTIFY_FAILED, NOTIFY_UNAVAILABLE)),
-            reply_pending.c.attempts < int(max_attempts))
+            reply_pending.c.notify_state.in_((NOTIFY_FAILED, NOTIFY_UNAVAILABLE, NOTIFY_NONE)),
+            reply_pending.c.attempts < int(max_attempts),
+            sa.or_(reply_pending.c.notify_owner.is_(None),
+                   reply_pending.c.notify_claimed_at.is_(None),
+                   reply_pending.c.notify_claimed_at < cut))
             .order_by(reply_pending.c.created_at.asc()).limit(int(limit)))).fetchall()
     return [_row(r) for r in rows]
 
