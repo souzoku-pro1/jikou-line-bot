@@ -279,8 +279,11 @@ class TestPins(unittest.TestCase):
             self.assertEqual(scan_source((REPO / name).read_text(encoding="utf-8"), name), [], name)
         for mod in ("jikou_progress", "jikou_constants"):
             self.assertNotIn(mod, allow)
-        src = (REPO / "main.py").read_text(encoding="utf-8").split("\n")
-        self.assertIn("wire_jikou_progress(app)", "\n".join(src[-3:]))
+        # JIKOU-CERT-1（QUEUE-2026-10-20-HI I-1）: main.py 末尾への後続追記（cert／receipt／stage の結線）で EOF 窓（末尾 3 行）が
+        # 落ちるため、Q6 と同じ流儀で「見出しコメント＋結線行の実在」基準に（検査の意図＝進捗連絡の結線が main.py にある、は不変）
+        src = (REPO / "main.py").read_text(encoding="utf-8")
+        self.assertIn("from hub.jikou_progress import wire_all as wire_jikou_progress", src)
+        self.assertIn("wire_jikou_progress(app)", src)
         body = (REPO / "hub" / "jikou_progress.py").read_text(encoding="utf-8").split('"""', 2)[2]
         for bad in ("line_channel", "push_text", "reply_with_push_fallback", "httpx", "sa.delete", "update_record"):
             self.assertNotIn(bad, body)
