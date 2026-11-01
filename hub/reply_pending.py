@@ -635,7 +635,8 @@ CLAIM_BUSY = "busy"                       # 他者がリース内で処理中
 CLAIM_DONE = "done"                       # 通知は既に sent／throttled／unconfirmed（再通知しない）
 CLAIM_NOT_FOUND = "not_found"
 CLAIM_CLOSED = "closed"                   # fix4 BC-19: 対応待ちが open でない（人の返信等で解決済み）＝業務通知を出さない
-CLAIM_RESULTS = (CLAIM_OK, CLAIM_BUSY, CLAIM_DONE, CLAIM_NOT_FOUND, CLAIM_CLOSED)
+CLAIM_EXHAUSTED = "exhausted"             # fix5 BC-20: 試行数が上限（NOTIFY_RETRY_MAX）に達している＝再通知しない
+CLAIM_RESULTS = (CLAIM_OK, CLAIM_BUSY, CLAIM_DONE, CLAIM_NOT_FOUND, CLAIM_CLOSED, CLAIM_EXHAUSTED)
 _NOTIFY_RETRYABLE = (NOTIFY_NONE, NOTIFY_FAILED, NOTIFY_UNAVAILABLE)
 
 
@@ -659,6 +660,8 @@ async def claim_notify(pending_id: int, owner: str, *, lease_seconds: int = NOTI
     owner を書けた 1 者が CLAIM_OK。戻り値は (result, key)。
     fix3 BC-13: CLAIM_OK のとき key は **同一トランザクションで読んだ永続キー**。列追加前の旧行（NULL）は computed_key を同一 tx で
     埋めてから読む（既に値があれば上書きしない＝初回値が正）。読取・更新の例外は送出する（rollback＝claim も残らない）。
+    fix4 BC-19: state=open も条件（一覧取得後に解決した行は CLAIM_CLOSED）。
+    fix5 BC-20: attempts < NOTIFY_RETRY_MAX も条件（一覧取得後に他者が上限まで確定した行は CLAIM_EXHAUSTED＝送らない）。
     取れなかったときの key は ""。"""
     now = now or _now()
     cut = now - datetime.timedelta(seconds=int(lease_seconds))
@@ -667,18 +670,24 @@ async def claim_notify(pending_id: int, owner: str, *, lease_seconds: int = NOTI
             reply_pending.c.pending_id == int(pending_id),
             reply_pending.c.state == STATE_OPEN,               # fix4 BC-19: 一覧取得後に解決（human_replied 等）した行には送らない
             reply_pending.c.notify_state.in_(_NOTIFY_RETRYABLE),
+            reply_pending.c.attempts < int(NOTIFY_RETRY_MAX),  # fix5 BC-20: 一覧取得後に他者が上限まで確定した行には送らない
             sa.or_(reply_pending.c.notify_owner.is_(None),
                    reply_pending.c.notify_claimed_at.is_(None),
                    reply_pending.c.notify_claimed_at < cut)).values(
             notify_owner=str(owner), notify_claimed_at=now))
         if int(r.rowcount or 0) != 1:
-            row = (await s.execute(sa.select(reply_pending.c.state, reply_pending.c.notify_state).where(
+            row = (await s.execute(sa.select(reply_pending.c.state, reply_pending.c.notify_state,
+                                             reply_pending.c.attempts).where(
                 reply_pending.c.pending_id == int(pending_id)))).first()
             if row is None:
                 return CLAIM_NOT_FOUND, ""
             if row.state != STATE_OPEN:
                 return CLAIM_CLOSED, ""
-            return (CLAIM_BUSY if row.notify_state in _NOTIFY_RETRYABLE else CLAIM_DONE), ""
+            if row.notify_state not in _NOTIFY_RETRYABLE:
+                return CLAIM_DONE, ""
+            if int(row.attempts or 0) >= int(NOTIFY_RETRY_MAX):
+                return CLAIM_EXHAUSTED, ""
+            return CLAIM_BUSY, ""
         key = await _notice_key_in_tx(s, pending_id)
         if not key and computed_key:
             await s.execute(sa.update(reply_pending).where(

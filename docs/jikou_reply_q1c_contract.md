@@ -69,6 +69,9 @@ ON のときだけ有効な事項は「V2 ON」と明記する。
     送信後に停止した場合は次の回収が保存キーで送信台帳と照合して確定する（送信済みなら throttled・2 通目なし・そのとき +1）。
   - **fix4 BC-19**: 回収用 claim（`claim_notify`）の UPDATE は **state=open** を条件に含める。一覧取得後に人の返信（human_replied）や
     画面の「不要」（not_needed）で解決した行は claim 不成立（`CLAIM_CLOSED`）＝業務通知を出さない（台帳行も作らない）。
+  - **fix5 BC-20**: 回収用 claim（`claim_notify`）の UPDATE は **attempts < NOTIFY_RETRY_MAX** も条件に含める。同じ行を A・B が
+    一覧取得し、A が上限回目の失敗を確定（attempts=3）した後に B が古い一覧で再開しても claim 不成立（`CLAIM_EXHAUSTED`）＝送信関数を
+    呼ばずに終了する（送信 1 回・最終 attempts=3）。結果の閉集合は ok／busy／done／not_found／closed／exhausted。
 - **fix3 BC-15（未通知行の回収）**: 回収ジョブ（`run_pending_retry_job`）の通知対象に **open かつ notify_state=none で未所有またはリース切れ**
   の行を加える（`reply_pending.list_notify_retry`）＝キューからの登録（retry_done）直後の停止や初回 claim の DB エラーで通知に至らなかった
   対応待ちを次回以降に拾う。送信は保存キーで送信台帳と照合（begin の重複判定）してから行い、送信済みなら 2 通目を出さず throttled を記録する。

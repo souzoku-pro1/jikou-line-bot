@@ -143,7 +143,7 @@ class TestClaimRechecksOpenState(_Fix2Mixin):
         row = self.pending()[0]
         self.assertEqual((row["state"], row["notify_state"], row["notify_owner"], row["attempts"]), ("human_replied", "none", None, 0))
         self.assertEqual([o for o in self.ops() if o["channel"] == "jikou_notice"], [])          # 台帳行も作らない
-        self.assertEqual(rp.CLAIM_RESULTS, ("ok", "busy", "done", "not_found", "closed"))
+        self.assertEqual(rp.CLAIM_RESULTS, ("ok", "busy", "done", "not_found", "closed", "exhausted"))   # fix5 BC-20: exhausted を追加
         # not_needed（画面の操作）でも同じ
         pid2 = self.reg(user=USER2, inbound_event_id="e-i", notice_key=KEY_A)
         self.assertEqual(_run(rp.mark_not_needed(pid2)), "ok")
