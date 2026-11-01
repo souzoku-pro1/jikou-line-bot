@@ -504,5 +504,86 @@ class TestPendingTargetsFailClosed(_Fix2Mixin):
         self.assertEqual(states[arrived["b"]], ("open", None))
 
 
+# ── 5. BC-10: 空白・句読点・記号のみは空返事（V2 ON: 顧客送信ゼロ・対応待ち） ─────────────────────
+class TestSymbolsOnlyReply(_Fix2Mixin):
+    CODEX_CASES = ("。。。", "！？")                                                           # Codex の反例をそのまま
+    SYMBOL_CASES = ("…", "、", "。 、 …", "！?!", "!?", "・・・", "（）", "〜", "―", "　。　", " … ")
+    SPACE_CASES = ("   ", "　　", " 　 \n")
+
+    def test_classification_is_pure_and_closed_vocabulary(self):
+        for t in self.CODEX_CASES + self.SYMBOL_CASES:
+            with self.subTest(t=t):
+                self.assertEqual(eg.empty_reply_labels(t), [eg.LABEL_SYMBOLS_ONLY])
+                self.assertTrue(eg.symbols_only(t))
+        for t in self.SPACE_CASES:
+            with self.subTest(t=repr(t)):
+                self.assertEqual(eg.empty_reply_labels(t), [eg.LABEL_EMPTY])                   # 空白（半角・全角）だけは従来どおり「空の返信」
+        for t in ("はい。", "3", "ok", "受任から完了まで2〜4週間程度です。", "！はい！", "…はい…"):
+            with self.subTest(t=t):
+                self.assertFalse(eg.symbols_only(t))
+                self.assertNotIn(eg.LABEL_SYMBOLS_ONLY, eg.empty_reply_labels(t))
+        self.assertEqual(eg.LABEL_SYMBOLS_ONLY, "記号・空白のみ")
+
+    def test_off_keeps_symbol_replies_unchanged_and_on_demotes(self):
+        for t in self.CODEX_CASES:
+            g = sp.apply_v2(cr.apply_server_guards(_compose(t), [], "q"), t)
+            self.assertTrue(g.can_auto_send, t)                                                 # V2 OFF: 従来の挙動（語彙表を適用しない）
+            self.assertEqual(sp.empty_reply_violations(t), [], t)
+        with patch.dict(os.environ, {sl.POLICY_V2_ENV: "1"}):
+            for t in self.CODEX_CASES + self.SYMBOL_CASES:
+                g = sp.apply_v2(cr.apply_server_guards(_compose(t), [], "q"), t)
+                self.assertFalse(g.can_auto_send, t)
+                self.assertEqual(g.demotion_reasons[-1], sp.EMPTY_REPLY_REASON_PREFIX + eg.LABEL_SYMBOLS_ONLY, t)
+                self.assertEqual(g.immediate_notice, "none", t)
+                self.assertEqual(sp.empty_reply_violations(t), [sp.EMPTY_REPLY_REASON_PREFIX + eg.LABEL_SYMBOLS_ONLY], t)
+
+    def test_customer_route_symbol_reply_sends_nothing_and_queues(self):
+        self.on()
+        for i, t in enumerate(self.CODEX_CASES):
+            with self.subTest(t=t):
+                _FakeClient.calls.clear()
+                # 会話なし（J-0 の対象外）: 顧客送信ゼロ・対応待ち reason=empty_reply
+                user = "U" + ("%032x" % (0x100 + i))
+                with patch.object(cr, "_call_compose_reply", AsyncMock(return_value=_compose(t))):
+                    _run(cr.handle_customer_message(user_id=user, user_message="質問です", reply_token="rt",
+                                                    app21_record=self.app21.return_value, reply_func=self.reply_func()))
+                self.assertEqual(_FakeClient.calls, [])
+                row = self.pending()[-1]
+                self.assertEqual((row["route"], row["reason"], row["state"], row["customer_send"]),
+                                 ("customer", "empty_reply", "open", "none"))
+                self.assertNotIn(t, [c.args[2] for c in self.chatlog.await_args_list if c.args[1] == "assistant"])
+        # 会話あり（J-0 例外）: 送られるのは J-0 だけ・記号の返事は送らない（実コールバック経由）
+        self.touch("e1")
+        _FakeClient.calls.clear()
+        with patch.object(cr, "_call_compose_reply", AsyncMock(return_value=_compose("！？"))):
+            self.inbound()
+        self.assertEqual(_texts(), [sp.J0_TEXT])
+        self.assertEqual((self.pending()[-1]["reason"], self.pending()[-1]["customer_send"]), ("empty_reply", "j0_sent"))
+
+    def test_hearing_route_symbol_reply_sends_nothing_and_queues(self):
+        self.on()
+        self.app21.return_value = None                                                          # App 21 なし＝ヒアリング経路
+        for i, t in enumerate(self.CODEX_CASES):
+            with self.subTest(t=t):
+                user = "U" + ("%032x" % (0x200 + i))
+                main.conversation_histories.pop(user, None)
+                _FakeClient.calls.clear()
+                with patch.object(main, "ask_claude", AsyncMock(return_value=t)):               # Claude が記号だけを返した
+                    _run(main._process_line_event("rt", user, "質問です"))
+                self.assertEqual(_FakeClient.calls, [])                                         # 顧客送信ゼロ（会話なし＝J-0 も無し）
+                row = self.pending()[-1]
+                self.assertEqual((row["route"], row["reason"], row["state"]), ("hearing", "demoted", "open"))
+                self.assertEqual(self.approval.await_count, i + 1)                              # 承認キューへ（降格理由に空返事）
+                self.assertIn(eg.LABEL_SYMBOLS_ONLY, self.approval.await_args.kwargs["reason"])
+                self.assertNotIn(t, [c.args[2] for c in self.chatlog.await_args_list if c.args[1] == "assistant"])
+                main.conversation_histories.pop(user, None)
+        # 会話あり: J-0 だけ（実コールバック）
+        self.touch("e1")
+        _FakeClient.calls.clear()
+        with patch.object(main, "ask_claude", AsyncMock(return_value="。。。")):
+            self.inbound()
+        self.assertEqual(_texts(), [sp.J0_TEXT])
+        self.assertEqual((self.pending()[-1]["route"], self.pending()[-1]["customer_send"]), ("hearing", "j0_sent"))
+
 if __name__ == "__main__":
     unittest.main()

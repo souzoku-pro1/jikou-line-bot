@@ -30,6 +30,15 @@ ON のときだけ有効な事項は「V2 ON」と明記する。
 - **LINE アプリ（LINE Official Account Manager）から弁護士が直接返信した場合は attending を検出できない**（本サーバを経由しない）。
   これは仕様。対応中にしたいときは返信欄（/app/reply）から送るか、将来の検出手段（手動返信を webhook で拾えるか）は別票で調査。
 
+## 2b. 空返事の分類（fix2 BC-10）
+
+- `hub/empty_reply_guard.empty_reply_labels` は、空文字・空白（半角・全角 U+3000・改行）だけの返事を「空の返信」、**文字（Letter／Number／Mark）
+  が 1 つも無い返事**（句読点 。、…！？ の全半角・記号・区切り・制御／書式文字だけの組合せ。例 `。。。`／`！？`／`…`）を「記号・空白のみ」
+  （`LABEL_SYMBOLS_ONLY`）に分類する（純関数・本文は返さない）。
+- **V2 ON**: 顧客対応（`apply_v2`）・ヒアリング（`empty_reply_violations`）の双方で降格＝顧客送信ゼロ・対応待ち（reason=empty_reply／
+  ヒアリングは降格理由に空返事）。J-0 の条件を満たせば J-0 だけを送る（記号の返事は送らない）。
+- **V2 OFF**: 従来どおり（空文字だけ降格・記号のみは語彙表と同じく適用しない＝既存経路の挙動不変）。
+
 ## 3. 無言にした受信の回収（fix1 BC-03）
 
 - 対応待ち（`reply_pending`）の保存（`register`）に失敗した受信は、**受信イベント ID を鍵に永続キュー `reply_pending_retry`**

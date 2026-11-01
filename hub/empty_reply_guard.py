@@ -14,8 +14,10 @@
 """
 
 import re
+import unicodedata
 
 LABEL_EMPTY = "空の返信"
+LABEL_SYMBOLS_ONLY = "記号・空白のみ"       # Q1c-fix2 BC-10: 空白（半角・全角）・句読点・記号だけで文字が無い
 LABEL_PENDING_TEMPLATE = "確認中定型の写し"
 LABEL_FOLLOW_UP_PROMISE = "確認のうえ連絡の約束"
 LABEL_RELAY = "申し伝え"
@@ -61,11 +63,27 @@ def _pending_templates() -> tuple[str, ...]:
     return (cr.PENDING_REPLY,) + tuple(cr.PENDING_BY_CATEGORY.values())
 
 
+# Q1c-fix2 BC-10: 文字（Letter／Number／Mark）が 1 つも無い返事は空返事。空白（半角・全角 U+3000）・句読点（。、…！？ 全半角）・
+# 記号（Unicode カテゴリ P*／S*）・区切り（Z*）・制御／書式（Cc／Cf: ゼロ幅等）だけの組合せを対象にする。
+# 「…」「！？」「。。。」のような返事は意味を持たないため、V2 ON では無言・対応待ちにする（判定は純関数・本文は返さない）。
+_CONTENT_CATEGORIES = ("L", "N", "M")
+
+
+def symbols_only(text: str) -> bool:
+    """空でない文字列が、空白・句読点・記号・区切り・制御だけで構成されているか（文字・数字が 1 つも無い）。"""
+    s = str(text or "")
+    if not s.strip():
+        return False
+    return not any(unicodedata.category(ch)[0] in _CONTENT_CATEGORIES for ch in s)
+
+
 def empty_reply_labels(text: str) -> list[str]:
     """空返事ならラベルの列（固定語彙）、そうでなければ []。本文は返さない。"""
     s = str(text or "").strip()
     if not s:
         return [LABEL_EMPTY]
+    if symbols_only(s):
+        return [LABEL_SYMBOLS_ONLY]
     labels: list[str] = []
     for tpl in _pending_templates():
         if tpl and tpl.strip() and tpl.strip() in s:
