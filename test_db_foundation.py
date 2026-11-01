@@ -987,6 +987,7 @@ class TestReplyExemplarMigration(unittest.TestCase):
     PROMOTED_TEXT = "e6a8c0d2f4b6"      # JIKOU-REPLY-Q5: 昇格定型（d4f6 の後ろ・head）
     CASE_RESULT = "a9b1c3d5e7f0"        # JIKOU-FOLLOWUP-1: 案件結果（e6a8 の後ろ・head）
     CERT_DOC = "b3c5d7e9f1a2"           # JIKOU-CERT-1: 完了報告書の保管（a9b1 の後ろ・head）
+    RECEIPT = "c4d6e8f0a2b4"            # JIKOU-RECEIPT-1: 領収書・採番（b3c5 の後ろ・head）
 
     def test_reply_exemplar_migration_round_trip(self):
         import sqlite3
@@ -1083,7 +1084,7 @@ class TestReplyExemplarMigration(unittest.TestCase):
             # データありの downgrade は拒否（RV-08）→ 空にして往復（a9b1 の表は残る）
             from hub import jikou_cert
             self.assertNotIn(jikou_cert.TABLE_NAME, tables())
-            up = alembic("upgrade", "head")
+            up = alembic("upgrade", self.CERT_DOC)         # JIKOU-RECEIPT-1: head が進んだため本 revision までを明示
             self.assertEqual(up.returncode, 0, f"stderr={up.stderr[-800:]}")
             self.assertIn(self.CERT_DOC, alembic("current").stdout)
             self.assertIn(jikou_cert.TABLE_NAME, tables())
@@ -1099,6 +1100,35 @@ class TestReplyExemplarMigration(unittest.TestCase):
                 con.commit()
             finally:
                 con.close()
+            # JIKOU-RECEIPT-1: head（c4d6e8f0a2b4）で jikou_receipt・receipt_sequence（列集合一致・PK(business,year,seq)）。
+            # データありの downgrade は拒否 → 空にして往復（b3c5 の表は残る）
+            from hub import jikou_receipt
+            self.assertFalse(set(jikou_receipt.TABLE_NAMES) & tables())
+            up = alembic("upgrade", "head")
+            self.assertEqual(up.returncode, 0, f"stderr={up.stderr[-800:]}")
+            self.assertIn(self.RECEIPT, alembic("current").stdout)
+            self.assertTrue(set(jikou_receipt.TABLE_NAMES) <= tables())
+            con = sqlite3.connect(dbfile)
+            try:
+                for t in jikou_receipt.TABLE_NAMES:
+                    got = {r[1] for r in con.execute(f'PRAGMA table_info("{t}")')}
+                    self.assertEqual(got, {c.name for c in jikou_receipt.metadata.tables[t].columns}, t)
+                con.execute("INSERT INTO receipt_sequence (business, year, seq, allocated_at) VALUES ('jikou', 2026, 1, '2026-10-21 00:00:00')")
+                con.commit()
+            finally:
+                con.close()
+            down = alembic("downgrade", self.CERT_DOC)
+            self.assertNotEqual(down.returncode, 0)            # データありは拒否
+            con = sqlite3.connect(dbfile)
+            try:
+                con.execute("DELETE FROM receipt_sequence")
+                con.commit()
+            finally:
+                con.close()
+            down = alembic("downgrade", self.CERT_DOC)
+            self.assertEqual(down.returncode, 0, f"stderr={down.stderr[-800:]}")
+            self.assertFalse(set(jikou_receipt.TABLE_NAMES) & tables())
+            self.assertIn(jikou_cert.TABLE_NAME, tables())
             down = alembic("downgrade", self.CASE_RESULT)
             self.assertNotEqual(down.returncode, 0)            # データありは拒否
             self.assertIn(jikou_cert.TABLE_NAME, tables())

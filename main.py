@@ -2440,3 +2440,7 @@ wire_jikou_progress(app)
 # JIKOU-CERT-1（QUEUE-2026-10-20-HI I-1）: 完了報告書の生成・ダウンロード画面（人の明示操作のみ・末尾追記）
 from hub.webapp_jikou_cert_view import wire_all as wire_jikou_cert  # noqa: E402
 wire_jikou_cert(app)
+
+# JIKOU-RECEIPT-1（QUEUE-2026-10-20-HI I-2）: 領収書の発行・再発行・ダウンロード画面（人の明示操作のみ・末尾追記）
+from hub.webapp_jikou_receipt_view import wire_all as wire_jikou_receipt  # noqa: E402
+wire_jikou_receipt(app)
