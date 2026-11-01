@@ -553,7 +553,7 @@ _SYSTEM_PROMPT_BASE = """\
 - 用語:「時効の更新」を使用（「時効の延長」は禁止）
 - 記録にない進捗・日付・金額の創作は禁止
 - 書類の写真をお願いするときは定型文言（「お手元の書類の全ページを写真に撮って、このLINEに送っていただけますか。」または「差押えに関する書類の写真をこのLINEにお送りいただけますか」）をそのまま使う。自由な言い回しでの写真依頼はサーバー側で承認制に降格される。収集済み項目に「書類写真: 受領済み」がある場合は再依頼しない
-- 断定語（確実に/絶対に/間違いなく/必ず 等）・行動指示語（払わないで/無視して/連絡しないで/放置して 等）は使用禁止。例外は2つのみ: (1)【FAQ】記載の受任後顧客への定型指示（電話対応・督促状対応）をそのまま使う場合 (2)「絶対に大丈夫とは言えません」のような否定の形
+- 断定語（確実に/絶対に/間違いなく/必ず 等）・行動指示語（払わないで/無視して/連絡しないで/放置して 等）は使用禁止。例外は2つのみ: (1)【FAQ】記載の受任後顧客への定型指示（電話対応・督促状対応）をそのまま使う場合 (2)「絶対に大丈夫とは言えません」のような否定の形\n- 本プロンプトの定型・FAQ・顧客情報で答えられない問い（確認してから連絡する、担当者に申し伝える、改めて案内する、としか書けない場合）は reply を空文字にする。「確認のうえご連絡します」「申し伝えます」「担当者よりご連絡します」のような返事は書かない（サーバー側で送信されず、弁護士に通知される）
 
 <<STYLE_SECTION>>
 
@@ -861,7 +861,7 @@ def build_system_prompt(
     court_docs: str = "（未登録）",
     credit_check: str = "（未登録）",
     known_items: Optional[dict] = None,
-    profile: BusinessProfile | None = None, human_note: str = "",  # JIKOU-REPLY-Q1b: 履歴に human 行があるときの注記（空なら従来どおり）
+    profile: BusinessProfile | None = None, human_note: str = "", exemplar_note: str = "",  # JIKOU-REPLY-Q1b: human 注記／Q3a: 参考文例（空なら従来どおり）
 ) -> str:
     """顧客対応Claudeのシステムプロンプトを組み立てる。
 
@@ -890,7 +890,7 @@ def build_system_prompt(
             "\n上記は既に回答済み・受領済みの項目です。同じ内容を再度"
             "質問・依頼しないでください。"
         )
-    return prompt + human_note  # JIKOU-REPLY-Q1b: human_note は "" 既定＝customer_prompt_base の pin 不変
+    return prompt + human_note + exemplar_note  # JIKOU-REPLY-Q1b/Q3a: どちらも "" 既定＝customer_prompt_base の pin 不変
 
 
 # ── サーバー側ガード（自動送信前の二重チェック） ─────────────────────────────────
@@ -1380,7 +1380,7 @@ async def save_to_approval_queue(
                     emit(resp.status_code, "count", "log", "operator"),
                     emit(resp.text, "vendor_raw", "log", "operator"))
         return None
-    record_id = resp.json().get("id")
+    record_id = resp.json().get("id"); await reply_exemplar.record_draft(record_id, "jikou", category, ai_draft)  # JIKOU-REPLY-Q3a (c): 起票時の下書き sha256
     logger.info("[APP29] saved record_id=%s",
                 emit(record_id, "record_id", "log", "operator"))
     return record_id
@@ -1575,7 +1575,7 @@ async def handle_claude_outage(
     PENDING_REPLY と逐語一致（test_business_profile で pin）。
     """
     p = profile or JIKOU_PROFILE
-    await reply_func(reply_token, p.pending_reply)
+    _sent = await send_policy.outage_ack(user_id, reply_token, reply_func, p.pending_reply, category=OUTAGE_CATEGORY)  # JIKOU-REPLY-Q1c
     approval_id = await save_to_approval_queue(
         user_id=user_id,
         customer_name=customer_name,
@@ -1585,9 +1585,9 @@ async def handle_claude_outage(
         reason=f"Claude応答不能（要手動対応）: {error[:200]}",
     )
     await save_to_chatlog(user_id, "user", user_message, OUTAGE_CATEGORY, "no")
-    await save_to_chatlog(user_id, "assistant", p.pending_reply,
+    if _sent: await save_to_chatlog(user_id, "assistant", _sent,  # JIKOU-REPLY-Q1c: 送った文だけ記録（無言なら記録なし）
                           OUTAGE_CATEGORY, "yes")
-    await _notify_attorney(user_id, customer_name, approval_id, OUTAGE_CATEGORY)
+    await _notify_attorney(user_id, customer_name, approval_id, OUTAGE_CATEGORY); await send_policy.attach_approval(user_id, approval_id)  # JIKOU-REPLY-Q1c (d)
     logger.info("[OUTAGE] queued user_id=%s approval_id=%s",
                 emit(user_id, "external_ref", "log", "operator"),
                 emit(approval_id, "record_id", "log", "operator"))
@@ -1648,7 +1648,7 @@ async def handle_customer_message(
         court_docs=_field("裁判所書類"),
         credit_check=_field("信用情報確認"),
         known_items=known_items,
-        profile=p, human_note=human_history_note(history),  # JIKOU-REPLY-Q1b: 事務所（human）返信を前提にする注記
+        profile=p, human_note=human_history_note(history), exemplar_note=(_exn := await reply_exemplar.prompt_note(p.name, status)),  # JIKOU-REPLY-Q1b 注記／Q3a (b) 参考文例（0 件は ""）
     )
 
     # Claude で返信案を作成
@@ -1672,7 +1672,7 @@ async def handle_customer_message(
         logger.exception("compose_reply failed for user_id=%s", user_id)
         # 一時的なエラー（レート制限等）は定型文を返して終了
         # （H2-fix1 [01]: 障害系の両経路とも profile の pending_reply を使う）
-        await reply_func(reply_token, p.pending_reply)
+        await send_policy.outage_ack(user_id, reply_token, reply_func, p.pending_reply)  # JIKOU-REPLY-Q1c: ON は無言+対応待ち
         return
 
     # AUTOREPLY-GEN2 要件1: 送信直前サニタイズ（markdown 平文化・許可外
@@ -1695,8 +1695,8 @@ async def handle_customer_message(
 
     # サーバー側二重チェック（カテゴリ許可リスト＋禁止語・必須文言・留保文言
     # ＋GEN2: プレースホルダ/長さ/質問数/法テラス標準回答）
-    guard = apply_server_guards(result, history, user_message,
-                                sanitize_fatal=sanitize_fatal, profile=p)
+    guard = send_policy.apply_v2(apply_server_guards(result, history, user_message,  # JIKOU-REPLY-Q1c (b): 空返事は自動送信しない（V2 OFF は空文字のみ降格）
+                                sanitize_fatal=sanitize_fatal, profile=p), reply_text)
     if guard.demotion_reasons:
         logger.info("[GUARD] demoted user_id=%s reasons=%s",
                     emit(user_id, "external_ref", "log", "operator"),
@@ -1705,8 +1705,19 @@ async def handle_customer_message(
     # ユーザーメッセージをチャットログに保存
     await save_to_chatlog(user_id, "user", user_message, category, "no")
 
+    # JIKOU-REPLY-Q2 (e)（QUEUE-2026-10-13-D D-1）: V2 ON は閉集合の定型だけを自動送信する（R-J3）。選択器→描画器→
+    # 許可表 V2（reply_func の排他内）→ 台帳。該当なし・検査落ちは LLM 自由文を自動送信せず承認へ降格（無言+対応待ち=Q1c）。
+    # V2 OFF は本 if に入らない（従来経路のまま）。
+    if send_policy.enabled():
+        if await jikou_reply_flow.try_closed_set(user_id, user_message, app21_record, history, result, profile=p,
+                                                reply_token=reply_token, reply_func=reply_func, category=category):
+            return
+        if guard.can_auto_send:
+            guard = replace_dc(guard, can_auto_send=False, immediate_notice="none",
+                               demotion_reasons=list(guard.demotion_reasons) + [jikou_reply_flow.DEMOTION_REASON])
+
     if guard.can_auto_send:
-        await reply_func(reply_token, reply_text)
+        await reply_func(reply_token, reply_text); await reply_exemplar.mark_used_for(_exn, category)  # JIKOU-REPLY-Q3a (b): 使った手本を used に
         await save_to_chatlog(user_id, "assistant", reply_text, category, "yes")
         logger.info("[AUTO_SEND] user_id=%s len=%s",
                     emit(user_id, "external_ref", "log", "operator"),
@@ -1728,14 +1739,15 @@ async def handle_customer_message(
         # 法テラスは専用文面。GEN2 要件5: それ以外はカテゴリ別の文脈化定型
         # ——大野の文言確定=PENDING_CONTEXT_ENABLED までは現行文言）
         ack_text = guard.immediate_notice_text \
-            or pending_reply_for(category, profile=p)
+            or await send_policy.pending_ack(user_id, approval_id, category, guard, profile=p)  # JIKOU-REPLY-Q1c (b)(c)(d)
         # JIKOU-REPLY-Q1a: 送信操作記録の用途（緊急の即時定型=urgent・他=reply）。
         # 送信の有無・文面・順序は不変（記録と排他の追加のみ）
         from hub import send_ledger as _send_ledger
-        await _send_ledger.with_purpose(
-            "urgent" if p.urgent_notice_kinds.get(guard.immediate_notice, "") else "reply",
-            reply_func, reply_token, ack_text)
-        await save_to_chatlog(user_id, "assistant", ack_text, category, "yes")
+        _ack_res = await send_policy.send_ack(user_id, ack_text, _send_ledger.with_purpose,  # JIKOU-REPLY-Q1c: 無言（""）は送らない／fix1 BC-05: 結果を受け取る
+            send_policy.ack_purpose(p, guard, ack_text),  # JIKOU-REPLY-Q1c: urgent / first_reply（J-0）/ reply
+            reply_func, reply_token, ack_text) if ack_text else None
+        if await send_policy.ack_recorded(user_id, ack_text, _ack_res): await save_to_chatlog(user_id, "assistant", ack_text, category, "yes")  # JIKOU-REPLY-Q1c／fix1 BC-05: J-0 は sent のときだけ写す
+        await reply_draft.maybe_generate(user_id, user_message, history, category, status, profile=p)  # JIKOU-REPLY-Q3b: V2 ON・手本があれば AI 下書き（承認待ち・送信なし）
         # 弁護士へ承認依頼通知（希死念慮・差押え切迫は【緊急・要即時対応】）
         await _notify_attorney(
             user_id, customer_name, approval_id, category,
@@ -1772,6 +1784,9 @@ _CREDITOR_COUNT_RE = re.compile(rf"(?<![{_NUMERAL_CHARS}])([{_NUMERAL_CHARS}]+)\
 
 # 判定不能の印（解釈できない数表現が 1 つでもあれば全体を不能とし、1〜2 社に倒さない）
 COUNT_UNKNOWN = None
+# EDGE-1（QUEUE-2026-10-14-G G-2 反例 #2）: 数を持たない「社数らしい」表現（数社・複数社・複数の業者）は
+# 0（=1〜2 社扱い）に倒さず判定不能にする（3 社以上の可能性があるため承認へ）。「各社」は社数表現ではないので対象外。
+_VAGUE_COUNT_RE = re.compile(r"数社|複数社|複数の(?:業者|会社|債権者|社)")
 
 
 def _parse_kanji_number(token: str) -> int | None:
@@ -1807,12 +1822,20 @@ def _parse_count_token(token: str) -> int | None:
     return None
 
 
+FEE_COUNT_MAX = 999            # EDGE-1: 社数の上限（漢数字の文法上限＝三桁と同じ）。超過は例外＝呼出側で承認へ
+
+
 def fee_total_yen(count: int) -> int:
-    """通算社数 count に対する弁護士報酬の合計（税込）。count<=0 は 0。
-    1→44,000 / 2→88,000 / 3→110,000 / 4→132,000。"""
-    n = max(int(count), 0)
-    base = min(n, FEE_BASE_MAX_COUNT) * FEE_BASE_YEN
-    extra = max(n - FEE_BASE_MAX_COUNT, 0) * FEE_EXTRA_YEN
+    """通算社数 count に対する弁護士報酬の合計（税込）。
+    1→44,000 / 2→88,000 / 3→110,000 / 4→132,000。
+    EDGE-1（QUEUE-2026-10-14-G G-2 反例 #1）: int 以外（bool・float・数字文字列）は TypeError、
+    1 未満・FEE_COUNT_MAX 超は ValueError。0 円や丸めた金額を黙って返さない（呼出側は例外を承認降格に倒す）。"""
+    if isinstance(count, bool) or not isinstance(count, int):
+        raise TypeError("fee_count_type")
+    if count < 1 or count > FEE_COUNT_MAX:
+        raise ValueError("fee_count_out_of_range")
+    base = min(count, FEE_BASE_MAX_COUNT) * FEE_BASE_YEN
+    extra = max(count - FEE_BASE_MAX_COUNT, 0) * FEE_EXTRA_YEN
     return base + extra
 
 
@@ -1823,6 +1846,8 @@ def _creditor_count_mentioned(text: str) -> int | None:
     fix2 BF-02: 社名（「三社電機」）との区別はしない＝安全側で社数として数える（3 扱い）。
     費用ガードの「3社以上の文脈」判定に使う（機構側・業務非依存）。"""
     norm = unicodedata.normalize("NFKC", str(text or ""))
+    if _VAGUE_COUNT_RE.search(norm):              # EDGE-1 反例 #2: 数社・複数社は判定不能（承認へ）
+        return COUNT_UNKNOWN
     best = 0
     for m in _CREDITOR_COUNT_RE.finditer(norm):
         n = _parse_count_token(m.group(1))
@@ -1965,3 +1990,21 @@ def sanitize_reply_without_human_marker(text: str, **kwargs) -> tuple[str, list[
     if stripped != raw:
         issues = list(issues) + ["human_marker_removed"]
     return out, issues, fatal
+
+
+# ── JIKOU-REPLY-Q1c（QUEUE-2026-10-12-C C-1）: 許可表 V2・空返事の無言化・J-0・対応待ちの結線。
+#    末尾追記（sink allowlist の行番号 pin を動かさない規約・本文中は 1 行置換のみ）。
+#    hub/send_policy は chat_responder を遅延 import する（循環なし）。flag OFF（既定）では各関数が
+#    従来の値・従来の呼び出しをそのまま返す（挙動不変・test_jikou_reply_q1c が pin）。
+from hub import send_policy  # noqa: E402
+
+# ── JIKOU-REPLY-Q3a（QUEUE-2026-10-12-C C-2）: 承認済み手本の参考文例（prompt 末尾・0 件は ""）と無修正承認の計数。
+#    末尾追記（sink allowlist の行番号 pin を動かさない規約・本文中は 1 行置換のみ）。
+from hub import reply_exemplar  # noqa: E402
+
+# ── JIKOU-REPLY-Q2（QUEUE-2026-10-13-D D-1）: 選択器・描画器・閉集合送信の結線（V2 ON のみ）。末尾追記。
+from dataclasses import replace as replace_dc  # noqa: E402
+from hub import jikou_reply_flow  # noqa: E402
+
+# ── JIKOU-REPLY-Q3b（QUEUE-2026-10-13-D D-2）: 手本参考の AI 下書き（承認待ち・自動送信なし）。末尾追記。
+from hub import reply_draft  # noqa: E402

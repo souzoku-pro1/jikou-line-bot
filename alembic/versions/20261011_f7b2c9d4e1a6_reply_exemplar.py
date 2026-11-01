@@ -16,7 +16,7 @@ downgrade: 3 表を落とす（送信操作記録・会話には触れない）�
 
 Revision ID: f7b2c9d4e1a6
 Revises: e5f8a1b4c7d9
-Create Date: 2026-10-11（fix1 2026-10-12・fix2 2026-10-17: reply_exemplar.status と approved_by/at の NULL 許容・reply_chatlog_followup の text_version／owner_token／deadline_at／chatlog_record_id と state 7 値・history action に approved）
+Create Date: 2026-10-11（fix1 2026-10-12・Q3a 2026-10-12: 履歴 action に approved を追加＝同一 revision の更新・fix2 2026-10-17: reply_exemplar.status と approved_by/at の NULL 許容・reply_chatlog_followup の text_version／owner_token／deadline_at／chatlog_record_id と state 7 値）
 """
 from typing import Sequence, Union
 
@@ -65,7 +65,7 @@ def upgrade() -> None:
         sa.Column("actor", sa.Text, nullable=False),
         sa.Column("at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("note", sa.Text, nullable=True),
-        sa.CheckConstraint("action IN ('created', 'used', 'deactivated', 'approved')",
+        sa.CheckConstraint("action IN ('created', 'used', 'deactivated', 'approved')",   # JIKOU-REPLY-Q3a (a)・fix2 BR-10
                            name="ck_reply_exemplar_history_action"),
     )
     op.create_index("ix_reply_exemplar_history_ex", "reply_exemplar_history", ["exemplar_id"])

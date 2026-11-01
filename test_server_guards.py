@@ -371,7 +371,13 @@ class TestFeeRuleMultiCreditor(unittest.TestCase):
         """(a) 1〜4 社の合計と、固定文の例示・必須語の自己整合"""
         self.assertEqual([fee_total_yen(n) for n in (1, 2, 3, 4)],
                          [44000, 88000, 110000, 132000])
-        self.assertEqual(fee_total_yen(0), 0)
+        # EDGE-1（QUEUE-2026-10-14-G G-2 反例 #1）で pin 更新: 0 以下・型外は 0 円を返さず例外（承認降格に倒す）
+        for bad in (0, -1, 1000):
+            with self.assertRaises(ValueError):
+                fee_total_yen(bad)
+        for bad in ("3", 3.0, True, None):
+            with self.assertRaises(TypeError):
+                fee_total_yen(bad)
         self.assertIn("3社目からは1社あたり22,000円（税込）", FEE_GUIDE_TEXT)
         self.assertIn("3社 110,000円・4社 132,000円", FEE_GUIDE_TEXT)
         self.assertIn("2社までは 44,000円（税込）× 社数", FEE_GUIDE_TEXT)
@@ -462,10 +468,13 @@ class TestFeeRuleMultiCreditor(unittest.TestCase):
         self.assertNotIn("44,000円（税込）× 社数 と整合", _SYSTEM_PROMPT_BASE)
 
     def test_creditor_count_detector(self):
-        """「N社」の読取（NFKC・漢数字）。数を持たない表現は 0。
-        fix1 BF-01（Codex R-JIKOU-FEE-RULE-1）: 数字列全体を読む・途中からの部分一致禁止"""
+        """「N社」の読取（NFKC・漢数字）。数を持たない表現のうち「各社」は 0。
+        fix1 BF-01（Codex R-JIKOU-FEE-RULE-1）: 数字列全体を読む・途中からの部分一致禁止
+        EDGE-1（QUEUE-2026-10-14-G G-2 反例 #2）で pin 更新: 「複数社」「数社」は 0（1〜2 社扱い）でなく
+        判定不能（None＝承認降格）。3 社以上の可能性を 1〜2 社に倒さない（安全側）"""
         for text, n in (("三社", 3), ("３社", 3), ("3社", 3), ("10社", 10),
-                        ("1社あたり", 1), ("複数社", 0), ("数社", 0), ("各社", 0),
+                        ("1社あたり", 1), ("複数社", None), ("数社", None), ("各社", 0),
+                        ("十数社あります", None), ("複数の業者から", None),
                         ("", 0), ("会社です", 0),
                         # BF-01 回帰: 複合漢数字（旧実装は末尾 1 文字だけ読み 1/2/1 になった）
                         ("十一社", 11), ("十二社", 12), ("二十一社", 21), ("十社", 10),
