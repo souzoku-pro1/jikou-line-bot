@@ -96,9 +96,15 @@ def parse_ticket(ticket: str, draft_id: str, op_id: str) -> str | None:
 
 
 async def resolve_destination(draft: dict) -> tuple[str, dict | None]:
-    """下書き → 対応待ち → App 29 No. → line_user_id（サーバ内のみ）。解決できなければ ("", rec|None)。"""
+    """下書き → 対応待ち → App 29 No. → line_user_id（サーバ内のみ）。解決できなければ ("", rec|None)。
+    JIKOU-PROGRESS-1: 進捗連絡の下書き（conversation_ref=progress:{event}:{App 21 No.}・対応待ちなし）は App 21 の
+    LINEユーザーID で解決する（rec は None＝承認キューの表示なし）。"""
     pid = draft.get("pending_id")
     if pid is None:
+        from hub import jikou_progress
+        parsed = jikou_progress.parse_ref(draft.get("conversation_ref"))
+        if parsed is not None:
+            return await jikou_progress.user_id_for_case(parsed[1]), None
         return "", None
     try:
         pend = await reply_pending.get_pending(int(pid))
@@ -138,9 +144,19 @@ def _head(title: str) -> list[str]:
             f"<title>{html.escape(title)} - 案件管理（仮）</title>", _STYLE, "</head><body>"]
 
 
+def _is_progress(d: dict) -> bool:
+    from hub import jikou_progress
+    return jikou_progress.is_progress_ref(d.get("conversation_ref"))
+
+
 def _badges(d: dict) -> str:
     g = '<span class="badge ok">ガード合格</span>' if d.get("guard_ok") else '<span class="badge ng">要修正</span>'
     cat = f'<span class="badge">{html.escape(str(d.get("category") or "分類なし"))}</span>'
+    if _is_progress(d):                                   # JIKOU-PROGRESS-1: 定型（要承認）の進捗連絡＝AI 下書きではない
+        from hub import jikou_progress
+        ev, rid = jikou_progress.parse_ref(d.get("conversation_ref"))
+        cat += (f'<span class="badge">進捗連絡: {html.escape(jikou_progress.EVENT_LABELS.get(ev, ev))}'
+                f'（案件 No.{html.escape(rid)}）</span>')
     return cat + g
 
 
@@ -300,7 +316,8 @@ async def draft_act(request: Request):
         ok = await reply_draft.set_state(int(did), reply_draft.STATE_REJECTED, actor=reply_draft.ACTOR_HUMAN)
         if not ok:
             return _redirect(did, "already")
-        await _record_outcome(int(did), category, str(d["draft_text"]), OUTCOME_REJECTED)
+        if not _is_progress(d):                       # JIKOU-PROGRESS-1: 進捗連絡は AI 下書きの結果統計・昇格計数に入れない
+            await _record_outcome(int(did), category, str(d["draft_text"]), OUTCOME_REJECTED)
         logger.info("[DRAFTS] rejected draft_id=%s", emit(did, "record_id", "log", "operator"))
         return _redirect(did, "rejected")
     # send
@@ -323,6 +340,7 @@ async def draft_act(request: Request):
                                      approval_kind=kind, final_text=text, op_id=f"{RECORD_PREFIX}{did}:{op_id}")
     if not ok:
         return _redirect(did, "already")                   # CAS: 二重クリック・戻る→再送は副作用なし
+    progress = _is_progress(d)
     # PRE-REVIEW-1 #279-3: outcome（approved_asis／edited）は送信成功の後に記録する（許可表停止・LINE 失敗を承認に数えない）
     # PRE-REVIEW-1 #279-1: 台帳必須（require_ledger）。begin が None なら送らず、下書きを承認前（proposed）へ戻す
     async with send_ledger.approved_draft(f"{RECORD_PREFIX}{did}:{op_id}"), send_policy.fixed_targets(user_id):  # Q1c-fix1 BC-04: 着手時点の対応待ち集合を固定
@@ -344,7 +362,8 @@ async def draft_act(request: Request):
         return _redirect(did, "failed")
     await reply_draft.set_state(int(did), reply_draft.STATE_SENT, actor=reply_draft.ACTOR_BOT,
                                 from_states=(reply_draft.STATE_APPROVED,))
-    await _record_outcome(int(did), category, str(d["draft_text"]), OUTCOME_EDITED if edited else OUTCOME_ASIS)
+    if not progress:                                      # JIKOU-PROGRESS-1: 進捗連絡は AI 下書きの結果統計・昇格計数に入れない
+        await _record_outcome(int(did), category, str(d["draft_text"]), OUTCOME_EDITED if edited else OUTCOME_ASIS)
     logger.info("[DRAFTS] approved draft sent draft_id=%s edited=%s", emit(did, "record_id", "log", "operator"),
                 emit(int(edited), "count", "log", "operator"))
     import chat_responder as cr
@@ -352,11 +371,14 @@ async def draft_act(request: Request):
         await cr.save_to_chatlog(user_id, "assistant", text, category or "その他判断系", "yes")
     except Exception:
         logger.warning("[DRAFTS] chatlog write failed (fixed reason)")
-    try:
-        await send_policy.approved_draft_sent(f"{RECORD_PREFIX}{did}", user_id, text, category)
-    except Exception:
-        logger.warning("[DRAFTS] post-send hooks failed (fixed reason)")
-    if edited:
+    if not progress:
+        # PRE-REVIEW-1 #301-1（JIKOU-PROGRESS-1）: 進捗連絡（入金確認・発送完了・結果）は相談者の質問への回答ではないので、
+        # 同じ相談者の対応待ちを閉じない（approved_draft_sent は resolve_for_user と無修正承認の計数を伴う）
+        try:
+            await send_policy.approved_draft_sent(f"{RECORD_PREFIX}{did}", user_id, text, category)
+        except Exception:
+            logger.warning("[DRAFTS] post-send hooks failed (fixed reason)")
+    if edited and not progress:                           # 進捗連絡の修正文は手本候補にしない（定型の改定は要承認表の差し替え）
         await _save_candidate(user_id, rec, text, f"{RECORD_PREFIX}{did}:{op_id}", category, int(did))
     return _redirect(did, "sent_edited" if edited else "sent")
 
