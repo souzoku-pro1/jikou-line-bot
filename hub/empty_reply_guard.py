@@ -63,14 +63,16 @@ def _pending_templates() -> tuple[str, ...]:
     return (cr.PENDING_REPLY,) + tuple(cr.PENDING_BY_CATEGORY.values())
 
 
-# Q1c-fix2 BC-10: 文字（Letter／Number／Mark）が 1 つも無い返事は空返事。空白（半角・全角 U+3000）・句読点（。、…！？ 全半角）・
+# Q1c-fix2 BC-10: 基底文字が 1 つも無い返事は空返事。空白（半角・全角 U+3000）・句読点（。、…！？ 全半角）・
 # 記号（Unicode カテゴリ P*／S*）・区切り（Z*）・制御／書式（Cc／Cf: ゼロ幅等）だけの組合せを対象にする。
 # 「…」「！？」「。。。」のような返事は意味を持たないため、V2 ON では無言・対応待ちにする（判定は純関数・本文は返さない）。
-_CONTENT_CATEGORIES = ("L", "N", "M")
+# Q1c-fix3 BC-16: 内容ありの根拠は **基底文字（Letter／Number）** の有無だけ。結合記号（Mark: 異体字セレクタ U+FE0F・単独の濁点等）は
+# 単独では内容としない＝「☀️」（☀ + U+FE0F）や単独 U+FE0F は記号・空白のみ。結合記号を伴う通常の日本語は基底文字があるので内容あり。
+_CONTENT_CATEGORIES = ("L", "N")
 
 
 def symbols_only(text: str) -> bool:
-    """空でない文字列が、空白・句読点・記号・区切り・制御だけで構成されているか（文字・数字が 1 つも無い）。"""
+    """空でない文字列が、空白・句読点・記号・区切り・制御・結合記号だけで構成されているか（基底文字＝Letter／Number が 1 つも無い）。"""
     s = str(text or "")
     if not s.strip():
         return False

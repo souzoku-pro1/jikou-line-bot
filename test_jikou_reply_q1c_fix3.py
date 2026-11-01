@@ -214,5 +214,40 @@ class TestRecoverUnnotifiedPending(_Fix2Mixin):
         for banned in ("J0_TEXT", "reply_with_push_fallback", "push_text", "_maybe_j0", "set_customer_send", "PURPOSE_FIRST_REPLY"):
             self.assertNotIn(banned, job, banned)
 
+# ── 4. BC-16: 空返事判定は基底文字の有無（異体字セレクタ・単独結合記号は内容なし） ─────────────────────
+class TestBaseCharacterGuard(_Fix2Mixin):
+    PAIRS = (
+        ("☀", True),                        # ☀（記号のみ）
+        ("☀️", True),                  # ☀️（記号 + 異体字セレクタ U+FE0F）
+        ("️", True),                        # 単独 U+FE0F（結合記号だけ）
+        ("がんばります。", False),   # か゛んばります。（結合濁点を伴う通常の日本語＝内容あり）
+    )
+
+    def test_four_pairs_are_fixed(self):
+        import unicodedata
+        self.assertEqual(unicodedata.category("️"), "Mn")
+        for text, empty in self.PAIRS:
+            with self.subTest(text=text.encode("unicode_escape").decode()):
+                self.assertEqual(eg.symbols_only(text), empty)
+                self.assertEqual(eg.empty_reply_labels(text), [eg.LABEL_SYMBOLS_ONLY] if empty else [])
+        for text in ("゙", "́", "‍️", "☀️☀️", " ️ "):      # 結合記号・ZWJ だけの組合せ
+            with self.subTest(text=text.encode("unicode_escape").decode()):
+                self.assertEqual(eg.empty_reply_labels(text), [eg.LABEL_SYMBOLS_ONLY])
+        for text in ("☀ はい", "OK️", "3️⃣", "é", "é"):                     # 基底文字があれば内容あり
+            with self.subTest(text=text.encode("unicode_escape").decode()):
+                self.assertFalse(eg.symbols_only(text))
+        self.assertEqual(eg._CONTENT_CATEGORIES, ("L", "N"))
+
+    def test_v2_on_customer_route_variation_selector_reply_sends_nothing(self):
+        self.on()
+        with patch.object(cr, "_call_compose_reply", AsyncMock(return_value=_compose("☀️"))):
+            _run(cr.handle_customer_message(user_id=USER2, user_message="質問です", reply_token="rt",
+                                            app21_record=self.app21.return_value, reply_func=self.reply_func()))
+        self.assertEqual(_FakeClient.calls, [])
+        self.assertEqual((self.pending()[-1]["reason"], self.pending()[-1]["customer_send"]), ("empty_reply", "none"))
+        self.assertEqual(sp.empty_reply_violations("️"), [sp.EMPTY_REPLY_REASON_PREFIX + eg.LABEL_SYMBOLS_ONLY])
+        os.environ.pop(sl.POLICY_V2_ENV, None)
+        self.assertTrue(sp.apply_v2(cr.apply_server_guards(_compose("☀️"), [], "q"), "☀️").can_auto_send)   # OFF は従来
+
 if __name__ == "__main__":
     unittest.main()
