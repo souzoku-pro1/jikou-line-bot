@@ -991,8 +991,8 @@ class TestPins(unittest.TestCase):
         src = (REPO / "main.py").read_text(encoding="utf-8").split("\n")
         tagged = [i for i, l in enumerate(src) if "JIKOU-REPLY-Q1b" in l]
         self.assertGreaterEqual(len(tagged), 5)
-        # JIKOU-REPLY-Q1c: 末尾に /app/pending の結線節が続くため、探索範囲を末尾 80 行へ（追記のみ・順序不変）
-        self.assertIn("include_before_catch_all(app, reply_view_router)", "\n".join(src[-80:]))
+        # Q1c-fix2 BC-12: 「末尾 N 行」の文字列探索はやめ、結線が 1 箇所であることと **実ルート表での一致順** で検証する（下）
+        self.assertEqual(sum("include_before_catch_all(app, reply_view_router)" in l for l in src), 1)
         # fix1 BR-07: ヒアリング経路の送信前サニタイズと App 28 復元は 1 行置換（行数不変＝allowlist 番地不変）
         self.assertEqual(sum("sanitize_reply_without_human_marker(" in l for l in src), 1)
         self.assertEqual(sum("model_content(m.get(\"role\")" in l for l in src), 1)
@@ -1001,6 +1001,24 @@ class TestPins(unittest.TestCase):
         paths = [p for entry in main.app.router.routes for p in _paths_of(entry)
                  if p in ("/app/reply/{record_id}", "/app/{_rest:path}")]
         self.assertEqual(paths, ["/app/reply/{record_id}", "/app/{_rest:path}"])
+        # Q1c-fix2 BC-12: 実ルート表で GET /app/reply/123・POST /app/reply/123/send が catch-all（/app/{_rest:path}）より先に
+        # **一致** すること（Starlette の matches で先頭から走査し、最初に FULL 一致した経路が返信欄であること）
+        from starlette.routing import Match
+        for method, path in (("GET", f"/app/reply/{REC_ID}"), ("POST", f"/app/reply/{REC_ID}/send")):
+            scope = {"type": "http", "method": method, "path": path, "root_path": "", "headers": [], "query_string": b""}
+            first = None
+            for entry in main.app.router.routes:
+                try:
+                    hit = entry.matches(scope)[0] == Match.FULL
+                except Exception:
+                    hit = False
+                if hit:
+                    first = entry
+                    break
+            self.assertIsNotNone(first, path)
+            first_paths = _paths_of(first)                       # include_router の束（_IncludedRouter）なら中の path 一覧
+            self.assertTrue({"/app/reply/{record_id}", "/app/reply/{record_id}/send"} & set(first_paths), (path, first_paths))
+            self.assertNotIn("/app/{_rest:path}", first_paths, path)
 
     def test_migration_revision_chains_after_send_ledger_and_refuses_downgrade_with_data(self):
         p = REPO / "alembic" / "versions" / "20261011_f7b2c9d4e1a6_reply_exemplar.py"
