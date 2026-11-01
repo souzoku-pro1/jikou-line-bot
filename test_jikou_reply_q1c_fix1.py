@@ -27,6 +27,7 @@ from test_jikou_reply_q1c import (_DbMixin, _FakeClient, _FakeResp, _client, _co
 
 import chat_responder as cr  # noqa: E402
 import main  # noqa: E402
+from hub import approved_texts as AT  # noqa: E402
 from hub import line_channel  # noqa: E402
 from hub import reply_pending as rp  # noqa: E402
 from hub import scheduler as hub_scheduler  # noqa: E402
@@ -347,6 +348,11 @@ class TestRetryQueueAndNotices(_Fix1Mixin):
         self.assertEqual(self.biz.await_count, 1)
 
     def test_age_notice_twice_a_day_with_counts_only(self):
+        # Q1c-fix2 BC-08: 経過通知の本文は承認台帳の定型だけ。本テストは「承認済み」の状態（台帳に key と SHA がある）で従来の検証を行う
+        # （未承認＝送らない、は test_jikou_reply_q1c_fix2.TestAgeNoticeApprovedText）
+        p = patch.dict(AT.APPROVED_SHA256, {sp.AGE_NOTICE_TEXT_KEY: AT.sha256_text(sp.AGE_NOTICE_TEMPLATE)})
+        p.start()
+        self.addCleanup(p.stop)
         self.on()
         a = self.reg(inbound_event_id="e-old1", now=NOW - datetime.timedelta(minutes=90))
         b = self.reg(inbound_event_id="e-old2", now=NOW - datetime.timedelta(minutes=61))

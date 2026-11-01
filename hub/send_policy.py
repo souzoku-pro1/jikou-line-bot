@@ -42,7 +42,7 @@ import uuid
 
 import sqlalchemy as sa
 
-from hub import empty_reply_guard, kintone, reply_pending, send_ledger
+from hub import approved_texts, empty_reply_guard, kintone, reply_pending, send_ledger
 from hub.db import session_scope as db_session_scope
 from hub.redact import emit
 
@@ -481,6 +481,13 @@ OUTAGE_NOTICE_TEXT = (f"{OUTAGE_NOTICE_HEADER}\n会話状態または送信台�
                       "ご確認ください。本通知は本日これ以降省略します。")
 AGE_NOTICE_HEADER = "【対応待ち・未返信】"
 AGE_NOTICE_FOOTER = "/app/pending からご確認ください。"
+# fix2 BC-08: 経過通知の本文は承認台帳（hub/approved_texts.APPROVED_SHA256）に載った定型だけ。文字列組立はせず、数値スロットだけ差し込む。
+# 承認は司令塔の票で `AGE_NOTICE_TEXT_KEY: sha256(AGE_NOTICE_TEMPLATE)` を台帳へ追加（文面は pgv/q1c_fix2_texts_for_approval.md・大野承認待ち）。
+AGE_NOTICE_TEXT_KEY = "ops_age_notice_v1"
+AGE_NOTICE_TEMPLATE = (f"{AGE_NOTICE_HEADER}\n未返信の対応待ち {{{{open}}}} 件（{{{{threshold}}}} 分超 {{{{over}}}} 件・"
+                       f"最長 {{{{oldest}}}} 分経過）・再処理待ち {{{{queued}}}} 件\n{AGE_NOTICE_FOOTER}")
+AGE_NOTICE_SLOTS = ("{{open}}", "{{threshold}}", "{{over}}", "{{oldest}}", "{{queued}}")   # 数値のみ（本文・ID・氏名は無い）
+AGE_NOTICE_NEEDS_APPROVAL = "needs_approval"                                              # run_age_notice_job の notice 値（送っていない）
 REPLY_PENDING_AGE_MIN_DEFAULT = 60                     # 要大野確認（env REPLY_PENDING_AGE_MIN で上書き可）
 REPLY_PENDING_AGE_MIN_ENV = "REPLY_PENDING_AGE_MIN"
 AGE_NOTICE_HOURS_JST = (9, 15)                         # 1 日 2 回（要大野確認・HOUKI 系ジョブと同じ hub/scheduler の daily）
@@ -661,8 +668,17 @@ async def run_pending_retry_job() -> dict:
 
 
 def age_notice_text(stats: dict, queued: int, threshold: int) -> str:
-    return (f"{AGE_NOTICE_HEADER}\n未返信の対応待ち {stats['open_count']} 件（{threshold} 分超 {stats['over_count']} 件・"
-            f"最長 {stats['oldest_minutes']} 分経過）・再処理待ち {queued} 件\n{AGE_NOTICE_FOOTER}")
+    """fix2 BC-08: 承認台帳の定型 ops_age_notice_v1 に **数値だけ** 差し込む。定型が未承認（台帳に無い・本文 SHA 不一致）なら ""
+    ＝呼出側は送らない（needs_approval）。文字列の組立・自由文の連結はしない。"""
+    tpl = approved_texts.approved_text(AGE_NOTICE_TEXT_KEY, AGE_NOTICE_TEMPLATE)
+    if tpl is None:
+        return ""
+    values = {"{{open}}": stats["open_count"], "{{threshold}}": threshold, "{{over}}": stats["over_count"],
+              "{{oldest}}": stats["oldest_minutes"], "{{queued}}": queued}
+    out = tpl
+    for slot in AGE_NOTICE_SLOTS:
+        out = out.replace(slot, str(int(values[slot])))
+    return out
 
 
 async def run_age_notice_job(hour: int, *, now=None) -> dict:
@@ -680,9 +696,19 @@ async def run_age_notice_job(hour: int, *, now=None) -> dict:
     res.update(over_count=stats["over_count"], queued=queued)
     if stats["over_count"] == 0 and queued == 0:
         return res
+    text = age_notice_text(stats, queued, age_minutes())
+    if not text:
+        # fix2 BC-08: 定型が承認台帳に無い＝送らない（needs_approval）。未承認 key を台帳の仕組みに記録し、1 日 1 回だけ知らせる
+        logger.warning("[SEND_POLICY] age notice withheld (text needs approval; nothing sent)")
+        approved_texts.approved_or_safe(AGE_NOTICE_TEXT_KEY, AGE_NOTICE_TEMPLATE)
+        try:
+            await approved_texts.notify_unapproved_once()
+        except Exception:
+            logger.error("[SEND_POLICY] unapproved text notice failed (fixed reason)")
+        res["notice"] = AGE_NOTICE_NEEDS_APPROVAL
+        return res
     day = _jst_date(now).isoformat()
-    res["notice"] = await send_business_notice(f"pending_age:{day}:{int(hour):02d}",
-                                               age_notice_text(stats, queued, age_minutes()))
+    res["notice"] = await send_business_notice(f"pending_age:{day}:{int(hour):02d}", text)
     return res
 
 

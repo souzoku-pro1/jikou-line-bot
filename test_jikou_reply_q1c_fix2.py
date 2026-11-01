@@ -27,6 +27,7 @@ from test_jikou_reply_q1c_fix1 import _Fix1Mixin  # noqa: E402
 import chat_responder as cr  # noqa: E402
 import main  # noqa: E402
 from claude_gateway import ClaudeUnavailableError  # noqa: E402
+from hub import approved_texts as AT  # noqa: E402
 from hub import empty_reply_guard as eg  # noqa: E402
 from hub import line_channel  # noqa: E402
 from hub import reply_pending as rp  # noqa: E402
@@ -308,6 +309,68 @@ class TestNoticeKeyPersistence(_Fix2Mixin):
             self.assertIn(NOTICE, alembic("current").stdout)
         finally:
             shutil.rmtree(d, ignore_errors=True)
+
+
+# ── 3. BC-08: 経過通知は承認台帳の定型だけ（数値差し込みのみ・未承認は送らない） ─────────────────────
+class TestAgeNoticeApprovedText(_Fix2Mixin):
+    NOW = datetime.datetime(2026, 11, 1, 3, 0, tzinfo=datetime.timezone.utc)
+
+    def setUp(self):
+        super().setUp()
+        AT.reset_pending_for_tests()
+        self.addCleanup(AT.reset_pending_for_tests)
+
+    def _seed(self):
+        self.reg(inbound_event_id="e-old1", now=self.NOW - datetime.timedelta(minutes=90))
+        self.reg(inbound_event_id="e-old2", now=self.NOW - datetime.timedelta(minutes=61))
+        self.reg(user=USER2, inbound_event_id="e-new", now=self.NOW - datetime.timedelta(minutes=5))
+
+    def test_unapproved_template_sends_nothing_and_marks_needs_approval(self):
+        self.on()
+        self._seed()
+        self.assertNotIn(sp.AGE_NOTICE_TEXT_KEY, AT.APPROVED_SHA256)                                   # 大野承認待ち（台帳に無い）
+        self.assertEqual(sp.age_notice_text({"open_count": 3, "over_count": 2, "oldest_minutes": 90}, 0, 60), "")
+        admin = AsyncMock(return_value=True)
+        with patch("hub.notify.notify_admin_line", admin), self.assertLogs("hub.send_policy", level="WARNING") as cm:
+            res = _run(sp.run_age_notice_job(9, now=self.NOW))
+        self.assertEqual((res["over_count"], res["queued"], res["notice"]), (2, 0, sp.AGE_NOTICE_NEEDS_APPROVAL))
+        self.biz.assert_not_awaited()                                                                  # 業務 LINE へ経過通知は送らない
+        self.assertEqual([o for o in self.ops() if o["channel"] == "jikou_notice"], [])                 # 台帳行も作らない
+        self.assertIn("needs approval", "\n".join(cm.output))
+        # 未承認 key は台帳の仕組みで記録・通知（文面は key のみ・件数も本文も載せない）
+        self.assertEqual(AT.pending_unapproved_keys(), ())                                             # 通知後に消費済み
+        admin.assert_awaited_once()
+        self.assertIn("key=" + sp.AGE_NOTICE_TEXT_KEY, admin.await_args.args[0])
+        self.assertNotIn("対応待ち 3 件", admin.await_args.args[0])
+
+    def test_approved_template_substitutes_numbers_only(self):
+        self.on()
+        self._seed()
+        with patch.dict(AT.APPROVED_SHA256, {sp.AGE_NOTICE_TEXT_KEY: AT.sha256_text(sp.AGE_NOTICE_TEMPLATE)}):
+            text = sp.age_notice_text({"open_count": 3, "over_count": 2, "oldest_minutes": 90}, 1, 60)
+            self.assertEqual(text, "【対応待ち・未返信】\n未返信の対応待ち 3 件（60 分超 2 件・最長 90 分経過）・再処理待ち 1 件\n"
+                                   "/app/pending からご確認ください。")
+            res = _run(sp.run_age_notice_job(9, now=self.NOW))
+        self.assertEqual(res["notice"], rp.NOTIFY_SENT)
+        sent = self.biz.await_args.args[1]
+        self.assertEqual(sent, "【対応待ち・未返信】\n未返信の対応待ち 3 件（60 分超 2 件・最長 90 分経過）・再処理待ち 0 件\n"
+                               "/app/pending からご確認ください。")
+        self.assertNotIn("{{", sent)
+        # 本文を 1 文字でも変えると SHA が変わり再承認まで送らない
+        with patch.dict(AT.APPROVED_SHA256, {sp.AGE_NOTICE_TEXT_KEY: AT.sha256_text(sp.AGE_NOTICE_TEMPLATE + "。")}):
+            self.assertEqual(sp.age_notice_text({"open_count": 3, "over_count": 2, "oldest_minutes": 90}, 1, 60), "")
+
+    def test_template_is_fixed_and_slots_are_numeric_only(self):
+        # 定型の SHA（pgv/q1c_fix2_texts_for_approval.md に記載・承認票はこの値を台帳へ追加する）
+        self.assertEqual(AT.sha256_text(sp.AGE_NOTICE_TEMPLATE), "59da41fcf2545b9aaa19175ea18315388e5b1e6df1c65bdbccaccacfc879652d")
+        self.assertEqual(sp.AGE_NOTICE_SLOTS, ("{{open}}", "{{threshold}}", "{{over}}", "{{oldest}}", "{{queued}}"))
+        import re as _re
+        self.assertEqual(set(_re.findall(r"\{\{[a-z_]+\}\}", sp.AGE_NOTICE_TEMPLATE)), set(sp.AGE_NOTICE_SLOTS))
+        src = (REPO / "hub" / "send_policy.py").read_text(encoding="utf-8")
+        self.assertNotIn("f\"{AGE_NOTICE_HEADER}\\n未返信の対応待ち {stats", src)                        # 旧い文字列組立は残っていない
+        self.assertEqual(sp.AGE_NOTICE_TEXT_KEY, "ops_age_notice_v1")
+        # hub/approved_texts.py は TEXT-APPROVAL-GATE-1（0e80ea6）と同一内容（別 PR の merge で衝突しない）
+        self.assertEqual(set(AT.APPROVED_SHA256), {AT.SAFE_TEXT_KEY})
 
 
 if __name__ == "__main__":

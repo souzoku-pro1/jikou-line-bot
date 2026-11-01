@@ -50,6 +50,12 @@ ON のときだけ有効な事項は「V2 ON」と明記する。
   業務 LINE へ **1 日 2 回**（JST `AGE_NOTICE_HOURS_JST`＝9 時・15 時・**要大野確認**・hub/scheduler の daily・HOUKI 系ジョブと同じ流儀）
   まとめて通知する。件数と経過分・再処理待ち件数のみ（PII なし）。台帳 key `pending_age:{JST 日付}:{時}` で 1 枠 1 通。
   対象 0 件（再処理待ちも 0）なら送らない。
+  - **fix2 BC-08（司令塔裁定: 業務 LINE 向け経過通知も approved_texts 経由・例外なし）**: 本文は承認台帳
+    `hub/approved_texts.APPROVED_SHA256` に載った定型 **`ops_age_notice_v1`**（`send_policy.AGE_NOTICE_TEMPLATE`）だけ。文字列組立は
+    せず、数値スロット（{{open}}／{{threshold}}／{{over}}／{{oldest}}／{{queued}}）だけ差し込む。**未承認の間は送らない**
+    （`run_age_notice_job` の notice=`needs_approval`・台帳行なし・未承認 key は approved_texts の仕組みで 1 日 1 回だけ知らせる）。
+    文面と SHA は `pgv/q1c_fix2_texts_for_approval.md`（大野承認待ち）。`hub/approved_texts.py` は TEXT-APPROVAL-GATE-1（`0e80ea6`）
+    と同一内容を q1c に置いた（同じ blob＝別 PR の merge で衝突しない・台帳の追加は司令塔の票でのみ）。
 - **V2 ON の条件**: 本節の結線（永続キューの migration 適用・回収ジョブの登録・経過通知のジョブ登録）が完了していること。
   未完了のまま ON にすると、保存失敗した受信が回収されず無言のまま残る。
 
