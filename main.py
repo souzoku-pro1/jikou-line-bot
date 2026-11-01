@@ -2444,3 +2444,7 @@ wire_jikou_cert(app)
 # JIKOU-RECEIPT-1（QUEUE-2026-10-20-HI I-2）: 領収書の発行・再発行・ダウンロード画面（人の明示操作のみ・末尾追記）
 from hub.webapp_jikou_receipt_view import wire_all as wire_jikou_receipt  # noqa: E402
 wire_jikou_receipt(app)
+
+# JIKOU-STAGE-APP-1（QUEUE-2026-10-20-HI I-4'）: 時効案件進行アプリ（kintone）連携＝Webhook 受け口・本人専用 URL・写しジョブ（末尾追記）
+from hub.jikou_stage import wire_all as wire_jikou_stage  # noqa: E402
+wire_jikou_stage(app)

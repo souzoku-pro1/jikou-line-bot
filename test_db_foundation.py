@@ -988,6 +988,7 @@ class TestReplyExemplarMigration(unittest.TestCase):
     CASE_RESULT = "a9b1c3d5e7f0"        # JIKOU-FOLLOWUP-1: 案件結果（e6a8 の後ろ・head）
     CERT_DOC = "b3c5d7e9f1a2"           # JIKOU-CERT-1: 完了報告書の保管（a9b1 の後ろ・head）
     RECEIPT = "c4d6e8f0a2b4"            # JIKOU-RECEIPT-1: 領収書・採番（b3c5 の後ろ・head）
+    REPORT_LINK = "d5e7f9a1b3c5"        # JIKOU-STAGE-APP-1: 本人専用 URL（c4d6 の後ろ・head）
 
     def test_reply_exemplar_migration_round_trip(self):
         import sqlite3
@@ -1104,7 +1105,7 @@ class TestReplyExemplarMigration(unittest.TestCase):
             # データありの downgrade は拒否 → 空にして往復（b3c5 の表は残る）
             from hub import jikou_receipt
             self.assertFalse(set(jikou_receipt.TABLE_NAMES) & tables())
-            up = alembic("upgrade", "head")
+            up = alembic("upgrade", self.RECEIPT)          # JIKOU-STAGE-APP-1: head が進んだため本 revision までを明示
             self.assertEqual(up.returncode, 0, f"stderr={up.stderr[-800:]}")
             self.assertIn(self.RECEIPT, alembic("current").stdout)
             self.assertTrue(set(jikou_receipt.TABLE_NAMES) <= tables())
@@ -1117,6 +1118,33 @@ class TestReplyExemplarMigration(unittest.TestCase):
                 con.commit()
             finally:
                 con.close()
+            # JIKOU-STAGE-APP-1: head（d5e7f9a1b3c5）で jikou_report_link（列集合一致）。データありの downgrade は拒否 → 空にして往復
+            from hub import jikou_report_link
+            self.assertNotIn(jikou_report_link.TABLE_NAME, tables())
+            up = alembic("upgrade", "head")
+            self.assertEqual(up.returncode, 0, f"stderr={up.stderr[-800:]}")
+            self.assertIn(self.REPORT_LINK, alembic("current").stdout)
+            con = sqlite3.connect(dbfile)
+            try:
+                got = {r[1] for r in con.execute(f'PRAGMA table_info("{jikou_report_link.TABLE_NAME}")')}
+                self.assertEqual(got, {c.name for c in jikou_report_link.metadata.tables[jikou_report_link.TABLE_NAME].columns})
+                con.execute("INSERT INTO jikou_report_link (token, business, case_record_id, doc_id, created_at, expires_at) VALUES "
+                            "('t', 'jikou', '1', 'd', '2026-10-21 00:00:00', '2026-10-24 00:00:00')")
+                con.commit()
+            finally:
+                con.close()
+            down = alembic("downgrade", self.RECEIPT)
+            self.assertNotEqual(down.returncode, 0)            # データありは拒否
+            con = sqlite3.connect(dbfile)
+            try:
+                con.execute("DELETE FROM jikou_report_link")
+                con.commit()
+            finally:
+                con.close()
+            down = alembic("downgrade", self.RECEIPT)
+            self.assertEqual(down.returncode, 0, f"stderr={down.stderr[-800:]}")
+            self.assertNotIn(jikou_report_link.TABLE_NAME, tables())
+            self.assertTrue(set(jikou_receipt.TABLE_NAMES) <= tables())
             down = alembic("downgrade", self.CERT_DOC)
             self.assertNotEqual(down.returncode, 0)            # データありは拒否
             con = sqlite3.connect(dbfile)
