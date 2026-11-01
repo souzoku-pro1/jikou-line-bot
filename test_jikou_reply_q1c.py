@@ -850,7 +850,9 @@ class TestPins(unittest.TestCase):
 
     def test_wiring_is_one_line_replacements_and_tail_only(self):
         src = (REPO / "main.py").read_text(encoding="utf-8").split("\n")
-        self.assertIn("include_before_catch_all(app, pending_view_router)", "\n".join(src[-60:]))
+        # 前方 merge 適合（followup-1 以降）: 後続票（Q1c-fix1／Q3a／Q4／Q6／FOLLOWUP-1…）の末尾結線が増えたため窓を 60 → 120 行に
+        # （Q1c の結線が末尾追記であることの pin は不変）
+        self.assertIn("include_before_catch_all(app, pending_view_router)", "\n".join(src[-120:]))
         self.assertEqual(sum("_inbound_stop_kind(user_id, app21_record)" in l for l in src), 1)
         self.assertEqual(sum("send_policy.demoted_ack(" in l for l in src), 1)
         self.assertEqual(sum("send_policy.empty_reply_violations(cleaned)" in l for l in src), 1)
