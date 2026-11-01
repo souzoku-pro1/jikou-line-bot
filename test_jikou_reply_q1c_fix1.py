@@ -527,7 +527,11 @@ class TestPinsFix1(unittest.TestCase):
         self.assertIn("send_policy.fixed_targets(user_id)", src[1599])
         self.assertIn("_sl_res = await send_line_push(user_id, ai_draft)", src[1599])
         self.assertEqual(sum("return await hub_line_channel.reply_with_push_fallback(" in l for l in src), 1)
-        self.assertIn("send_policy.register_jobs()", "\n".join(src[-12:]))
+        # 前方 merge 適合（q6 以降）: 後続票（Q3a／Q4／Q6…）の末尾結線が後ろに並ぶため「末尾 12 行」ではなく
+        # 「Q1c の結線（pending_view_router）より後ろに 1 回」で固定する（結線の有無と位置は不変）
+        self.assertEqual(sum("send_policy.register_jobs()" in l for l in src), 1)
+        self.assertLess(next(i for i, l in enumerate(src) if "include_before_catch_all(app, pending_view_router)" in l),
+                        next(i for i, l in enumerate(src) if "send_policy.register_jobs()" in l))
         csrc = (REPO / "chat_responder.py").read_text(encoding="utf-8").split("\n")
         self.assertEqual(sum("send_policy.send_ack(" in l for l in csrc), 1)
         self.assertEqual(sum("send_policy.ack_recorded(" in l for l in csrc), 1)
