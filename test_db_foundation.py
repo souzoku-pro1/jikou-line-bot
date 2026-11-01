@@ -982,6 +982,7 @@ class TestReplyExemplarMigration(unittest.TestCase):
     REPLY_PENDING = "a1c3e5f7b9d2"      # JIKOU-REPLY-Q1c: 対応待ち（c8e0 の後ろ。fix5／fix6 で f7b2 → a7c9 → c8e0 に付け替え）
     REPLY_PENDING_RETRY = "d4f6a8b0c2e4"  # JIKOU-REPLY-Q1c-fix1 BC-03: 対応待ちの保存失敗の永続キュー reply_pending_retry（a1c3 の次）
     DRAFT_APPROVAL = "b2d4f6a8c0e1"     # JIKOU-REPLY-Q3a: 下書き照合（d4f6 の後ろ・head。Q1c-fix1 で a1c3 → d4f6 に付け替え）
+    REPLY_DRAFT = "c3e5a7b9d1f3"        # JIKOU-REPLY-Q3b: AI 下書き（b2d4 の後ろ・head）
 
     def test_reply_exemplar_migration_round_trip(self):
         import sqlite3
@@ -1026,9 +1027,31 @@ class TestReplyExemplarMigration(unittest.TestCase):
                 con.close()
             # JIKOU-REPLY-Q3a: head（b2d4f6a8c0e1・Q1c-fix1 で d4f6 の後ろ）で reply_draft_approval が増え、列集合が metadata と一致
             self.assertNotIn(reply_exemplar.DRAFT_TABLE_NAME, tables())
-            up = alembic("upgrade", "head")
+            up = alembic("upgrade", self.DRAFT_APPROVAL)
             self.assertEqual(up.returncode, 0, f"stderr={up.stderr[-800:]}")
             self.assertIn(self.DRAFT_APPROVAL, alembic("current").stdout)
+            self.assertIn(reply_exemplar.DRAFT_TABLE_NAME, tables())
+            # JIKOU-REPLY-Q3b: head（c3e5a7b9d1f3）で reply_draft 2 表が増え、列集合が hub/reply_draft.metadata と一致
+            from hub import reply_draft
+            self.assertNotIn(reply_draft.TABLE_NAME, tables())
+            up = alembic("upgrade", "head")
+            self.assertEqual(up.returncode, 0, f"stderr={up.stderr[-800:]}")
+            self.assertIn(self.REPLY_DRAFT, alembic("current").stdout)
+            self.assertTrue(set(reply_draft.TABLE_NAMES) <= tables())
+            con = sqlite3.connect(dbfile)
+            try:
+                for t in reply_draft.TABLE_NAMES:
+                    got = {r[1] for r in con.execute(f'PRAGMA table_info("{t}")')}
+                    self.assertEqual(got, {c.name for c in reply_draft.metadata.tables[t].columns}, t)
+                nn = nullable(con, reply_draft.TABLE_NAME)
+                self.assertFalse(nn["draft_text"])
+                self.assertTrue(nn["pending_id"])
+                self.assertTrue(nn["final_text"])
+            finally:
+                con.close()
+            down = alembic("downgrade", self.DRAFT_APPROVAL)
+            self.assertEqual(down.returncode, 0, f"stderr={down.stderr[-800:]}")
+            self.assertFalse(set(reply_draft.TABLE_NAMES) & tables())
             self.assertIn(reply_exemplar.DRAFT_TABLE_NAME, tables())
             con = sqlite3.connect(dbfile)
             try:
