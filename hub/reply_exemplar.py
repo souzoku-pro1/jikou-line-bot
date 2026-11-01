@@ -112,6 +112,7 @@ reply_draft_approval = sa.Table(
     sa.Column("unmodified", sa.Boolean, nullable=True),            # 無修正承認（NULL=未送信）
     sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
     sa.Column("sent_at", sa.DateTime(timezone=True), nullable=True),
+    sa.Column("outcome", sa.Text, nullable=True),                  # JIKOU-REPLY-Q4: approved_asis / approved_edited / rejected
     sa.Index("ix_reply_draft_approval_cat", "business", "category", "unmodified"),
 )
 PROMOTION_THRESHOLD = 3                 # 無修正承認がこの回数に達したら「凍結定型の候補」通知（昇格は Q5）
@@ -178,7 +179,8 @@ async def save_exemplar(*, business: str, inbound_text: str, human_reply: str,
                 created_at=now, used_count=0, source_op_id=source_op_id or None,
                 category_id=category_id or None,
                 source_text_version=source_text_version or None,
-                approved_by=None, approved_at=None, active=bool(active), status=STATUS_PENDING_REVIEW))
+                approved_by=None, approved_at=None, active=bool(active),           # JIKOU-REPLY-Q4: 候補は active=False
+                status=STATUS_PENDING_REVIEW))                                       # fix2 BR-10: 保存時は常に確認待ち
             await _history(s, int(res.inserted_primary_key[0]), ACTION_CREATED, approved_by, now)
     except Exception:
         logger.warning("[REPLY_EXEMPLAR] save failed (fixed reason)")
@@ -441,3 +443,24 @@ async def count_unmodified(business: str, category: str) -> int:
         return int((await s.execute(sa.select(sa.func.count()).select_from(reply_draft_approval).where(
             reply_draft_approval.c.business == business, reply_draft_approval.c.category == category,
             reply_draft_approval.c.unmodified.is_(True)))).scalar() or 0)
+
+
+# ── JIKOU-REPLY-Q4（QUEUE-2026-10-13-D D-3）: 下書きの処理種別（reply_draft_approval.outcome）。末尾追記。
+OUTCOME_APPROVED_ASIS = "approved_asis"
+OUTCOME_APPROVED_EDITED = "approved_edited"
+OUTCOME_REJECTED = "rejected"
+OUTCOMES = (OUTCOME_APPROVED_ASIS, OUTCOME_APPROVED_EDITED, OUTCOME_REJECTED)
+
+
+async def set_outcome(record_id, outcome: str) -> bool:
+    """record_draft 済みの行に種別を記録（閉集合外・行なし・DB 未設定は False）。"""
+    if outcome not in OUTCOMES or not record_id or not _db_configured():
+        return False
+    try:
+        async with session_scope() as s:
+            r = await s.execute(sa.update(reply_draft_approval).where(
+                reply_draft_approval.c.record_id == str(record_id)).values(outcome=outcome))
+            return int(r.rowcount or 0) == 1
+    except Exception:
+        logger.warning("[REPLY_EXEMPLAR] set_outcome failed (fixed reason)")
+        return False
