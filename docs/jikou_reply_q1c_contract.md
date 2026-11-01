@@ -109,7 +109,7 @@ ON のときだけ有効な事項は「V2 ON」と明記する。
   費用固定文）は不変。
 - main の JIKOU-FAQ-ADDON-PROMPT-1（`67f992e`・QUEUE-2026-10-11-B Q-4・司令塔票で承認）による FAQ「完了後の追加依頼の費用」行への「固定文を必ず含める」1 文と、上記の 1 行追加は、main `b8ab474` 同期 merge（JIKOU-REPLY-Q1c-sync-main・2026-10-31）で同じ prompt 本文に共存する。**両方とも承認済みの凍結解除**であり、pin は両方を含む本文で再計算（customer_prompt_base `908f9335…`・集約 sha `ce329d3c…`）。他の凍結項目は不変。
 - J-0 文言（`send_policy.J0_TEXT`・sha pin）は司令塔仮置き・**大野承認待ち**（fix2 時点でも未承認のまま）。
-  **fix2 BC-11（凍結記録）: J-0 文言の大野承認は `JIKOU_SEND_POLICY_V2` を ON にする（V2 有効化）前の条件**とする。承認時は
+  **fix2 BC-11（凍結記録）: J-0 文言の大野承認は V2 有効化前の条件**（`JIKOU_SEND_POLICY_V2` を ON にする前に承認を得る）とする。承認時は
   `J0_TEXT` と test の sha pin を同時に更新する（変更が無ければ pin はそのまま）。
 
 ## 7. migration（fix1 BC-02）
