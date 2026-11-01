@@ -62,6 +62,7 @@ from hub import line_channel  # noqa: E402
 from hub import pii_scan  # noqa: E402
 from hub import reply_exemplar as rx  # noqa: E402
 from hub import reply_followup as rf  # noqa: E402
+from hub import reply_pending as rp  # noqa: E402  Q1c-fix2 BC-09: 返信欄は対応待ち表を読めないと送らない（fail-closed）ため表を用意する
 from hub import send_ledger as sl  # noqa: E402
 from hub import webapp_reply_view as rv  # noqa: E402
 from hub.inbound_event import Base as InboundBase  # noqa: E402
@@ -165,6 +166,7 @@ class _DbMixin(unittest.TestCase):
                 await c.run_sync(sl.metadata.create_all)
                 await c.run_sync(rx.metadata.create_all)
                 await c.run_sync(rf.metadata.create_all)
+                await c.run_sync(rp.metadata.create_all)      # Q1c-fix2 BC-09（本番は migration a1c3／d4f6／b7d9 で存在する表）
                 await c.run_sync(InboundBase.metadata.create_all)
         _run(_create())
         _FakeClient.responses, _FakeClient.calls, _FakeClient.raise_exc = [], [], None

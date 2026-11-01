@@ -65,6 +65,12 @@ ON のときだけ有効な事項は「V2 ON」と明記する。
   `fixed_targets`）、送信成功（台帳 finish=applied）のときに **その集合だけ** を human_replied にする（`reply_pending.resolve_ids`・
   open のものだけ・同じ相談者の行に限る）。送信中に届いた受信は open のまま（次の返信で閉じる）。
 - bot の自動送信は対応待ちを閉じない（R-J14・不変）。画面の「不要にする」は 1 件ずつ（不変）。
+- **fix2 BC-09（0 件と読取失敗の区別）**: `send_policy.pending_targets` は 0 件を `()`、**DB 読取失敗を None** で返す（送信着手前に
+  1 回だけ即時再試行し、それでも読めなければ None）。None のときは **送信を進めない**（解除対象が分からないまま送ると既存の対応待ちが
+  未解決のまま残るため）。返信欄（/app/reply）は `pending_unavailable` で戻し回収行は prepared のまま（同じ操作で再開可）。承認 webhook
+  （V2 ON）は `fixed_targets` が印を立て、`hub/line_channel._begin_with_policy` が `PolicyStopped(("pending_targets:unavailable",))`
+  に倒す（LINE write 0・台帳行なし・承認は送信済み=no のまま・業務 LINE へ固定文言）。再試行で読めれば、着手時点の集合だけを閉じ、
+  送信中に届いた受信は open のまま（BC-04 と同じ）。
 
 ## 5. J-0（初回 1 通）の記録（fix1 BC-05）
 

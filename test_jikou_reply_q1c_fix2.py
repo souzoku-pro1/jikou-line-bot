@@ -373,5 +373,136 @@ class TestAgeNoticeApprovedText(_Fix2Mixin):
         self.assertEqual(set(AT.APPROVED_SHA256), {AT.SAFE_TEXT_KEY})
 
 
+# ── 4. BC-09: 対応待ちの読取失敗（None）は送信を進めない（返信欄・承認 webhook） ─────────────────────
+class TestPendingTargetsFailClosed(_Fix2Mixin):
+    def setUp(self):
+        super().setUp()
+        from test_jikou_reply_q1b import _FIELDS_WITH_HUMAN, _approval
+        from hub import kintone
+        self._kp = [patch.object(kintone, "get_record", AsyncMock(return_value=_approval())),
+                    patch.object(kintone, "search_records", AsyncMock(return_value=[])),
+                    patch.object(kintone, "get_form_fields", AsyncMock(return_value=_FIELDS_WITH_HUMAN)),
+                    patch.object(kintone, "create_record", AsyncMock(return_value="900"))]
+        for p in self._kp:
+            p.start()
+
+    def tearDown(self):
+        for p in self._kp:
+            p.stop()
+        super().tearDown()
+
+    def _flaky_then_real(self, fail_times: int):
+        real = rp.open_ids_for_user
+        calls = {"n": 0}
+
+        async def f(business, user_hash):
+            calls["n"] += 1
+            if calls["n"] <= fail_times:
+                raise RuntimeError("db read failed")
+            return await real(business, user_hash)
+        return f, calls
+
+    def _push_registering_b(self, arrived: dict):
+        async def push(channel, to, text):                                   # 送信中に受信 B が対応待ちに入る
+            arrived["b"] = await rp.register(business="jikou", channel="jikou", line_user_hash=sl.line_user_hash("jikou", USER),
+                                             route="customer", reason="demoted", inbound_event_id="ev-b", approval_record_id="7")
+            return True
+        return push
+
+    def test_pending_targets_distinguishes_zero_from_failure_and_retries_once(self):
+        self.assertEqual(_run(sp.pending_targets(USER)), ())                                    # 0 件
+        f, calls = self._flaky_then_real(1)
+        a = self.reg(inbound_event_id="ev-a")
+        with patch.object(rp, "open_ids_for_user", f):
+            self.assertEqual(_run(sp.pending_targets(USER)), (a,))                              # 1 回失敗 → 再試行で読めた
+        self.assertEqual(calls["n"], 2)
+        f, calls = self._flaky_then_real(2)
+        with patch.object(rp, "open_ids_for_user", f):
+            self.assertIsNone(_run(sp.pending_targets(USER)))                                   # 2 回とも失敗 → None
+        self.assertEqual(calls["n"], 2)
+        # fixed_targets: V2 ON で None なら印が立ち、抜けると消える／OFF は読まない
+        self.on()
+
+        async def _inside():
+            f2, _c = self._flaky_then_real(2)
+            with patch.object(rp, "open_ids_for_user", f2):
+                async with sp.fixed_targets(USER):
+                    flag = sp.targets_unavailable()
+            return flag, sp.targets_unavailable()
+        self.assertEqual(_run(_inside()), (True, False))
+        os.environ.pop(sl.POLICY_V2_ENV, None)
+        spy = AsyncMock(side_effect=RuntimeError("never"))
+
+        async def _off():
+            with patch.object(rp, "open_ids_for_user", spy):
+                async with sp.fixed_targets(USER):
+                    return sp.targets_unavailable()
+        self.assertFalse(_run(_off()))
+        spy.assert_not_awaited()
+        self.assertEqual(sp.REASON_TARGETS_UNAVAILABLE, "pending_targets:unavailable")
+
+    def test_reply_view_does_not_send_when_targets_unavailable_then_closes_only_fixed_set(self):
+        from test_jikou_reply_q1b import OP, REC_ID, _form
+        from hub import webapp_reply_view as rv
+        a = self.reg(inbound_event_id="ev-a")
+        f, calls = self._flaky_then_real(2)
+        with patch.object(rp, "open_ids_for_user", f):
+            r = _client.post(f"/app/reply/{REC_ID}/send", headers=_auth(), data=_form(), follow_redirects=False)
+        self.assertEqual((r.status_code, r.headers["location"]), (303, f"/app/reply/{REC_ID}?done=pending_unavailable"))
+        self.assertEqual(_FakeClient.calls, [])                                                 # 送っていない
+        self.assertEqual(self.pending()[0]["state"], "open")                                    # A は未解決のまま（送っていないので正しい）
+        from hub import reply_followup as rf
+        fu = [x for x in self._rows(rf.reply_chatlog_followup) if x["op_id"] == OP]
+        self.assertEqual([(x["state"], x["last_result"]) for x in fu], [("prepared", "pending_unavailable")])   # 同じ操作で再開できる
+        self.assertIn("pending_unavailable", (REPO / "hub" / "webapp_reply_view.py").read_text(encoding="utf-8"))
+        # 再 POST（同じ op_id・同じ本文）: 1 回失敗 → 再試行で読めた → 送信。着手時点の A だけ閉じ、送信中に届いた B は open
+        arrived: dict = {}
+        f, calls = self._flaky_then_real(1)
+        with patch.object(rp, "open_ids_for_user", f), \
+             patch.object(line_channel, "_push_text_http", self._push_registering_b(arrived)):
+            r = _client.post(f"/app/reply/{REC_ID}/send", headers=_auth(), data=_form(), follow_redirects=False)
+        self.assertEqual(r.status_code, 303)
+        self.assertTrue(r.headers["location"].startswith(f"/app/reply/{REC_ID}?done=sent"), r.headers["location"])
+        states = {x["pending_id"]: (x["state"], x["resolved_by"]) for x in self.pending()}
+        self.assertEqual(states[a], ("human_replied", "human"))
+        self.assertEqual(states[arrived["b"]], ("open", None))
+        self.assertEqual(calls["n"], 2)
+
+    def test_approval_webhook_stops_when_targets_unavailable_then_closes_only_fixed_set(self):
+        self.on()
+        self.env({"KINTONE_WEBHOOK_TOKEN": "kintone-token"})
+        os.environ.pop("KINTONE_EVENT_DEDUP_ENABLED", None)
+        record = {"ステータス2": {"value": "承認済"}, "送信済み": {"value": "no"}, "line_user_id": {"value": USER},
+                  "AI下書き": {"value": "下書き"}, "カテゴリ": {"value": "c"}, "$revision": {"value": "3"}}
+        body = {"record": {"$id": {"value": "7"}, "ステータス2": {"value": "承認済"}, "送信済み": {"value": "no"}}}
+        a = self.reg(inbound_event_id="ev-a")
+        mark_sent = AsyncMock()
+        f, calls = self._flaky_then_real(2)
+        with patch.object(main, "mark_approval_sent", mark_sent), patch.object(main, "save_to_chatlog", AsyncMock()), \
+             patch.object(main.hub_kintone, "get_record", AsyncMock(return_value=record)), \
+             patch.object(rp, "open_ids_for_user", f):
+            r = _client.post("/webhook/kintone/approval?token=kintone-token", json=body)
+        self.assertEqual((r.status_code, r.json().get("skip")), (200, "policy_stopped"))
+        self.assertEqual(_FakeClient.calls, [])                                                 # LINE write 0
+        mark_sent.assert_not_awaited()                                                          # 送信済み=no のまま（再承認で送れる）
+        self.assertEqual(self.pending()[0]["state"], "open")                                    # A は open のまま
+        self.assertEqual([o for o in self.ops() if o["channel"] == "jikou"], [])                 # 台帳行なし
+        self.assertIn("pending_targets:unavailable", self.biz.await_args.args[1])              # 業務 LINE へ理由つき固定文言
+        self.assertEqual(calls["n"], 2)
+        # 再試行で読めた: 送信し、着手時点の A だけ閉じる。送信中に届いた B は open
+        arrived: dict = {}
+        f, calls = self._flaky_then_real(1)
+        with patch.object(main, "mark_approval_sent", mark_sent), patch.object(main, "save_to_chatlog", AsyncMock()), \
+             patch.object(main.hub_kintone, "get_record", AsyncMock(return_value=record)), \
+             patch.object(rp, "open_ids_for_user", f), \
+             patch.object(line_channel, "_push_text_http", self._push_registering_b(arrived)):
+            r = _client.post("/webhook/kintone/approval?token=kintone-token", json=body)
+        self.assertEqual(r.json().get("record_id"), "7")
+        mark_sent.assert_awaited_once()
+        states = {x["pending_id"]: (x["state"], x["resolved_by"]) for x in self.pending()}
+        self.assertEqual(states[a], ("human_replied", "approved_draft"))
+        self.assertEqual(states[arrived["b"]], ("open", None))
+
+
 if __name__ == "__main__":
     unittest.main()

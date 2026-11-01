@@ -104,6 +104,12 @@ async def _begin_with_policy(channel: LineChannelConfig, to: str, text: str):
     cond = await send_policy.conditions_if_applicable(channel.name, to)
     if cond is None:
         return await send_ledger.begin(channel.name, channel.name, to, text)
+    if send_policy.targets_unavailable():
+        # Q1c-fix2 BC-09: 承認済み下書きの送信着手時に対応待ち集合（解除対象）が読めなかった＝送らない（LINE write 0・台帳行なし）。
+        # 承認は送信済み=no のまま（再承認で送れる）・対応待ちは open のまま残る・業務 LINE へ固定文言（_approval_policy_stopped）
+        reasons = (send_policy.REASON_TARGETS_UNAVAILABLE,)
+        send_policy.record_stop(reasons)
+        return send_ledger.PolicyStopped(reasons)
     with send_ledger.policy(cond):
         op = await send_ledger.begin(channel.name, channel.name, to, text)
     if op is None:

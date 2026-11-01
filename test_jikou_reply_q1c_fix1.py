@@ -451,7 +451,7 @@ class TestFixedTargets(_Fix1Mixin):
         self.assertEqual({x["pending_id"]: x["state"] for x in self.pending()}[c], "open")
         self.assertEqual(_run(sp.human_replied(USER, ())), 0)
         with patch.object(rp, "open_ids_for_user", AsyncMock(side_effect=RuntimeError("x"))):
-            self.assertEqual(_run(sp.pending_targets(USER)), ())        # 読取失敗は空＝何も閉じない
+            self.assertIsNone(_run(sp.pending_targets(USER)))          # Q1c-fix2 BC-09: 読取失敗は None（0 件の () と区別・呼出側は送らない）
         self.assertEqual([h["to"] for h in _run(rp.history(a))], ["open", "human_replied"])
 
     def test_reply_view_fixes_targets_before_explicit_send(self):

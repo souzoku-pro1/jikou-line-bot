@@ -495,6 +495,13 @@ AGE_JOB_PREFIX = "JIKOU_REPLY_PENDING_AGE"
 
 _j0_pid: contextvars.ContextVar = contextvars.ContextVar("send_policy_j0_pid", default=None)
 _fixed_targets: contextvars.ContextVar = contextvars.ContextVar("send_policy_fixed_targets", default=None)
+# fix2 BC-09: 承認 webhook の送信着手時に対応待ち集合が読めなかった印（hub/line_channel の送信前フックが見る）
+_targets_unavailable: contextvars.ContextVar = contextvars.ContextVar("send_policy_targets_unavailable", default=False)
+REASON_TARGETS_UNAVAILABLE = "pending_targets:unavailable"
+
+
+def targets_unavailable() -> bool:
+    return bool(_targets_unavailable.get())
 _outage_notified: dict = {}      # JST 日付 → True（プロセス内の省略・正は台帳 key）
 
 
@@ -575,20 +582,38 @@ async def ack_recorded(user_id: str, ack_text: str, result) -> bool:
 
 
 # ── BC-04: 返信対象の固定 ───────────────────────────────────────────────────────
-async def pending_targets(user_id: str) -> tuple:
-    """送信着手の直前に呼ぶ: その相談者の open の pending_id（読取失敗は ()＝何も閉じない）。"""
-    try:
-        return tuple(await reply_pending.open_ids_for_user(BUSINESS, send_ledger.line_user_hash(BUSINESS, user_id)))
-    except Exception:
-        return ()
+async def pending_targets(user_id: str) -> tuple | None:
+    """送信着手の直前に呼ぶ: その相談者の open の pending_id（0 件は ()）。
+    fix2 BC-09: **DB 読取失敗は None**（0 件と区別する）。送信着手前に 1 回だけ即時に再試行し、それでも読めなければ None。
+    呼出側は None のとき送信を進めない（解除対象が分からないまま送ると、既存の対応待ちが未解決のまま残るため）。"""
+    user_hash = send_ledger.line_user_hash(BUSINESS, user_id)
+    for attempt in (1, 2):
+        try:
+            return tuple(await reply_pending.open_ids_for_user(BUSINESS, user_hash))
+        except Exception:
+            if attempt == 1:
+                logger.warning("[SEND_POLICY] pending targets read failed; retrying once before send")
+    logger.warning("[SEND_POLICY] pending targets unavailable after retry (send not started)")
+    return None
 
 
 @contextlib.asynccontextmanager
 async def fixed_targets(user_id: str):
     """承認 webhook の送信（main の 1 行置換: `async with send_ledger.approved_draft(...), send_policy.fixed_targets(user_id):`）。
-    入口で対応待ち集合を固定し、approved_draft_sent がその集合だけを閉じる（V2 OFF は空）。"""
-    _fixed_targets.set(await pending_targets(user_id) if enabled() else ())
-    yield
+    入口で対応待ち集合を固定し、approved_draft_sent がその集合だけを閉じる（V2 OFF は空）。
+    fix2 BC-09: V2 ON で集合が読めない（pending_targets=None）ときは `targets_unavailable()` を立て、hub/line_channel の送信前フックが
+    PolicyStopped(pending_targets:unavailable) に倒す＝送らない（承認済み下書きは送信済み=no のまま・対応待ちは open のまま）。"""
+    if not enabled():
+        _fixed_targets.set(())
+        yield
+        return
+    targets = await pending_targets(user_id)
+    _fixed_targets.set(targets or ())
+    token = _targets_unavailable.set(targets is None)
+    try:
+        yield
+    finally:
+        _targets_unavailable.reset(token)
 
 
 # ── BC-03: 回収ジョブ（永続キューの再処理・通知の再試行）と経過通知 ──────────────────────
