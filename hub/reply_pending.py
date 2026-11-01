@@ -263,16 +263,20 @@ def _require_owner(owner) -> str:
     return str(owner)
 
 
-async def set_notify_state(pending_id: int, value: str, *, owner: str, now=None) -> bool:
+async def set_notify_state(pending_id: int, value: str, *, owner: str, now=None, bump: bool = False) -> bool:
     """通知結果の記録（claim の所有者だけ）。fix2 BC-07: 記録と同時に claim（notify_owner／notify_claimed_at）を解放する。
     fix3 BC-14／fix4 BC-17: **pending_id AND notify_owner = owner** の条件付き更新で、owner は必須（省略・None は TypeError）。
-    0 件（リース切れ後に他者が claim した遅着）は無変更で False（履歴も書かない）。"""
+    0 件（リース切れ後に他者が claim した遅着）は無変更で False（履歴も書かない）。
+    fix4 BC-18: bump=True のとき試行数（attempts+1）も **同じ条件付き更新・同一トランザクション** で進める（送信前には加算しない＝
+    加算直後の停止で未送信のまま上限に達して回収対象から外れることがない）。"""
     owner = _require_owner(owner)
     if value not in NOTIFY_STATES:
         return False
+    extra = {"notify_owner": None, "notify_claimed_at": None}
+    if bump:
+        extra["attempts"] = reply_pending.c.attempts + 1
     try:
-        return await _set(pending_id, "notify_state", value, RESOLVED_BY_BOT, now=now,
-                          extra={"notify_owner": None, "notify_claimed_at": None},
+        return await _set(pending_id, "notify_state", value, RESOLVED_BY_BOT, now=now, extra=extra,
                           extra_where=[reply_pending.c.notify_owner == owner])
     except Exception:
         logger.error("[REPLY_PENDING] notify_state update failed (fixed reason)")

@@ -779,10 +779,10 @@ async def _notify_pending(pid: int, computed_key: str, approval_record_id, categ
         logger.warning("[SEND_POLICY] notice key unavailable after claim (not sent; claim released)")
         await reply_pending.release_notify_claim(pid, owner)
         return ""
-    if bump_attempts:
-        await reply_pending.bump_attempts(pid, owner=owner)
+    # fix4 BC-18: 送信前には試行数を加算しない。送信後、結果の確定・claim 解放と同一トランザクションで attempts+1（bump_attempts）。
+    # 送信後に停止した場合は、次の回収が保存キーで送信台帳と照合（begin の重複判定）して確定する
     state = await send_business_notice(key, notice_text(approval_record_id, category))
     # fix3 BC-14: 結果の記録と claim 解放は「自分が owner のまま」のときだけ（リース切れ後に他者が claim していれば遅着＝無変更）
-    if not await reply_pending.set_notify_state(pid, state, owner=owner):
+    if not await reply_pending.set_notify_state(pid, state, owner=owner, bump=bump_attempts):
         logger.info("[SEND_POLICY] notice result arrived late (claim taken over; state unchanged)")
     return state

@@ -64,6 +64,9 @@ ON のときだけ有効な事項は「V2 ON」と明記する。
   （`set_notify_state(owner=)`／`bump_attempts(owner=)`）。リース切れ後に他者が claim していれば 0 件＝遅着として無変更（履歴も書かない）。
   - **fix4 BC-17**: 両関数は **owner 必須**（省略・None は TypeError）。未所有行（notify_owner IS NULL）への管理操作は
     `set_notify_state_unowned`／`bump_attempts_unowned`（所有中の行は触らない）に分け、通知経路では使わない。
+  - **fix4 BC-18**: 試行数（attempts）は **送信前に加算しない**。通知結果の確定・claim 解放と同じ条件付き更新・同一トランザクションで
+    +1 する（`set_notify_state(owner=, bump=True)`）。加算直後に停止しても未送信のまま上限に達して回収対象から外れることはなく、
+    送信後に停止した場合は次の回収が保存キーで送信台帳と照合して確定する（送信済みなら throttled・2 通目なし・そのとき +1）。
 - **fix3 BC-15（未通知行の回収）**: 回収ジョブ（`run_pending_retry_job`）の通知対象に **open かつ notify_state=none で未所有またはリース切れ**
   の行を加える（`reply_pending.list_notify_retry`）＝キューからの登録（retry_done）直後の停止や初回 claim の DB エラーで通知に至らなかった
   対応待ちを次回以降に拾う。送信は保存キーで送信台帳と照合（begin の重複判定）してから行い、送信済みなら 2 通目を出さず throttled を記録する。

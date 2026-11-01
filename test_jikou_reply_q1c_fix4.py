@@ -68,5 +68,63 @@ class TestOwnerRequired(_Fix2Mixin):
         self.assertNotIn("_unowned(", src)
 
 
+# ── 2. BC-18: 試行数の加算は送信前に行わず、確定・解放と同一トランザクション ─────────────────────────
+class TestAttemptsBumpedAtCompletion(_Fix2Mixin):
+    def _failed_row_with_attempts(self, n: int, event: str = "e-x"):
+        pid = self.reg(inbound_event_id=event, notice_key=KEY_A)
+        self.assertTrue(_run(rp.set_notify_state_unowned(pid, rp.NOTIFY_FAILED)))
+        for _ in range(n):
+            self.assertTrue(_run(rp.bump_attempts_unowned(pid)))
+        self.assertEqual(self.pending()[-1]["attempts"], n)
+        return pid
+
+    def test_stop_before_send_keeps_attempts_and_row_recoverable_then_exactly_one_send(self):
+        self.on()
+        pid = self._failed_row_with_attempts(rp.NOTIFY_RETRY_MAX - 1)                             # attempts=2
+        # 旧い加算点（claim 直後・台帳 begin 前）で停止を注入: 送信関数に入る前に落ちる
+        with patch.object(sp, "send_business_notice", AsyncMock(side_effect=RuntimeError("stopped before ledger begin"))):
+            with self.assertRaises(RuntimeError):
+                _run(sp.run_pending_retry_job(now=T0))
+        row = self.pending()[0]
+        self.assertEqual((row["attempts"], row["notify_state"]), (2, "failed"))                   # 加算されていない（未送信のまま上限に達しない）
+        self.assertIsNotNone(row["notify_owner"])                                                 # claim はリース内
+        self.biz.assert_not_awaited()
+        later = T0 + datetime.timedelta(seconds=rp.NOTIFY_CLAIM_LEASE_SECONDS + 1)
+        self.assertEqual([r["pending_id"] for r in _run(rp.list_notify_retry(now=later))], [pid])   # リース切れ後も回収対象
+        res = _run(sp.run_pending_retry_job(now=later))                                           # 復旧後: 送信はちょうど 1 回
+        self.assertEqual((res["notify_retried"], self.biz.await_count), (1, 1))
+        row = self.pending()[0]
+        self.assertEqual((row["notify_state"], row["attempts"], row["notify_owner"]), ("sent", 3, None))   # 確定と同時に attempts=3
+        self.assertEqual(_run(rp.list_notify_retry(now=later + datetime.timedelta(seconds=1))), [])     # 上限到達＝対象外
+        self.assertEqual(self.biz.await_count, 1)
+
+    def test_stop_after_send_is_settled_by_ledger_reconciliation_with_single_bump(self):
+        self.on()
+        pid = self._failed_row_with_attempts(rp.NOTIFY_RETRY_MAX - 1)                             # attempts=2
+        with patch.object(rp, "set_notify_state", AsyncMock(side_effect=RuntimeError("stopped after send"))):
+            with self.assertRaises(RuntimeError):
+                _run(sp.run_pending_retry_job(now=T0))
+        row = self.pending()[0]
+        self.assertEqual((row["attempts"], row["notify_state"], self.biz.await_count), (2, "failed", 1))   # 送ったが確定前に停止
+        later = T0 + datetime.timedelta(seconds=rp.NOTIFY_CLAIM_LEASE_SECONDS + 1)
+        res = _run(sp.run_pending_retry_job(now=later))                                           # 保存キーで台帳照合 → 送信済み
+        self.assertEqual((res["notify_retried"], self.biz.await_count), (1, 1))                   # 2 通目なし
+        row = self.pending()[0]
+        self.assertEqual((row["notify_state"], row["attempts"], row["notify_owner"]), ("throttled", 3, None))
+
+    def test_completion_bumps_in_same_conditional_update(self):
+        pid = self.reg(inbound_event_id="e-s", notice_key=KEY_A)
+        self.assertEqual(_run(rp.claim_notify(pid, "A", now=T0))[0], rp.CLAIM_OK)
+        later = T0 + datetime.timedelta(seconds=rp.NOTIFY_CLAIM_LEASE_SECONDS + 1)
+        self.assertEqual(_run(rp.claim_notify(pid, "B", now=later))[0], rp.CLAIM_OK)
+        self.assertFalse(_run(rp.set_notify_state(pid, rp.NOTIFY_SENT, owner="A", bump=True)))   # 遅着: 結果も attempts も無変更
+        self.assertEqual(self.pending()[0]["attempts"], 0)
+        self.assertTrue(_run(rp.set_notify_state(pid, rp.NOTIFY_SENT, owner="B", bump=True)))
+        row = self.pending()[0]
+        self.assertEqual((row["notify_state"], row["attempts"], row["notify_owner"]), ("sent", 1, None))
+        src = (REPO / "hub" / "send_policy.py").read_text(encoding="utf-8")
+        self.assertNotIn("reply_pending.bump_attempts(", src)                                     # 送信前の加算は無い
+        self.assertEqual(src.count("set_notify_state(pid, state, owner=owner, bump=bump_attempts)"), 1)
+
 if __name__ == "__main__":
     unittest.main()
