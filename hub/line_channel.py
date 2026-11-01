@@ -137,7 +137,10 @@ async def reply_with_push_fallback(channel: LineChannelConfig,
     SEND_UNCONFIRMED（結果未確認の重複＝既存操作が pending/started/unconfirmed）／
     SEND_FAILED（最終的に非 2xx）。通信例外は従来どおり送出（記録は unconfirmed）。
     JIKOU-REPLY-Q1c (a): flag V2 ON の顧客チャネルでは送信前に停止条件を束ね、begin() の排他の中の許可表で
-    止まれば送らず SEND_POLICY_STOPPED（J-0 の在庫検査で止まった場合も同じ）。OFF は従来どおり。"""
+    止まれば送らず SEND_POLICY_STOPPED（J-0 の在庫検査で止まった場合も同じ）。OFF は従来どおり。
+    Q1c-fix2 BC-06: SEND_SENT（送信済み）は **台帳 finish() が applied を返したとき、または台帳で sent 確定済みの重複**
+    （DUPLICATE_SENT）だけ。HTTP 2xx でも finish が late／skipped（遅着・確定失敗）なら SEND_UNCONFIRMED（J-0 の
+    customer_send は j0_unconfirmed・App 28 へ写さない）。記録なし（op None＝V2 OFF の fail-open・他業務）は従来どおり SEND_SENT。"""
     op = await _begin_with_policy(channel, to, text)
     if op is send_ledger.DUPLICATE_SENT:
         logger.info("[LINE] duplicate send skipped (send_ledger: already sent)")
@@ -156,8 +159,14 @@ async def reply_with_push_fallback(channel: LineChannelConfig,
     except BaseException:
         await send_ledger.finish(op, send_ledger.STATE_UNCONFIRMED)
         raise
-    await send_ledger.finish(op, send_ledger.STATE_SENT if ok else send_ledger.STATE_FAILED)
-    return send_ledger.SEND_SENT if ok else send_ledger.SEND_FAILED
+    led = await send_ledger.finish(op, send_ledger.STATE_SENT if ok else send_ledger.STATE_FAILED)
+    if not ok:
+        return send_ledger.SEND_FAILED
+    if op is None or led == "applied":
+        return send_ledger.SEND_SENT
+    # Q1c-fix2 BC-06: HTTP は成功したが台帳で確定できなかった（late＝遅着・skipped＝確定失敗）＝送信済みとは返さない
+    logger.warning("[LINE] sent but ledger outcome not applied (treated as unconfirmed)")
+    return send_ledger.SEND_UNCONFIRMED
 
 
 async def _reply_with_push_fallback_http(channel: LineChannelConfig,

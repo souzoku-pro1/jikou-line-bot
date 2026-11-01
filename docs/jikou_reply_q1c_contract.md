@@ -62,6 +62,11 @@ ON のときだけ有効な事項は「V2 ON」と明記する。
   写さない（顧客に届いていない文を記録しない）。
 - main の送信ラッパー `_line_reply_with_fallback` は `reply_with_push_fallback` の 3 値（＋policy_stopped）を呼出元へ返す。
 - 1 回性の正は送信台帳（purpose=first_reply の在庫検査・排他の中）であり、customer_send は表示用の状態。
+- **fix2 BC-06**: `reply_with_push_fallback` が `SEND_SENT` を返すのは **台帳 finish() が applied**（または台帳で sent 確定済みの重複
+  `DUPLICATE_SENT`）のときだけ。HTTP 2xx でも finish が late／skipped（遅着・確定失敗）なら `SEND_UNCONFIRMED` → `j0_unconfirmed`・
+  App 28 へ写さない（台帳は started のまま＝回収ジョブが unconfirmed に移し、人が確定する）。記録なし（op None＝V2 OFF の fail-open・
+  他業務）は従来どおり `SEND_SENT`。main の実コールバック（顧客対応・障害応答の `_reply_func`）は戻り値を返す
+  （`test_jikou_reply_q1c_fix2` が `main._process_line_event` 経由で固定）。
 
 ## 6. 凍結の扱い（司令塔裁定）
 
