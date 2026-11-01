@@ -985,6 +985,7 @@ class TestReplyExemplarMigration(unittest.TestCase):
     REPLY_DRAFT = "c3e5a7b9d1f3"        # JIKOU-REPLY-Q3b: AI 下書き（b2d4 の後ろ・head）
     DRAFT_OUTCOME = "d4f6b8c0e2a4"      # JIKOU-REPLY-Q4: reply_draft_approval.outcome（c3e5 の後ろ・head）
     PROMOTED_TEXT = "e6a8c0d2f4b6"      # JIKOU-REPLY-Q5: 昇格定型（d4f6 の後ろ・head）
+    SEND_PURPOSE_V2 = "f8b0c2d4e6a8"    # JIKOU-SEND-PURPOSE-2: purpose 正式移行（e6a8 の後ろ・head）
 
     def test_reply_exemplar_migration_round_trip(self):
         import sqlite3
@@ -1046,7 +1047,8 @@ class TestReplyExemplarMigration(unittest.TestCase):
             self.assertIn(self.DRAFT_OUTCOME, alembic("current").stdout)
             # JIKOU-REPLY-Q5: head（e6a8c0d2f4b6）で昇格定型 2 表（列集合が hub/jikou_reply_promote.metadata と一致）
             from hub import jikou_reply_promote
-            up = alembic("upgrade", "head")
+            # JIKOU-SEND-PURPOSE-2: head が f8b0c2d4e6a8 へ進んだため本 revision までを明示（検証内容は不変）
+            up = alembic("upgrade", self.PROMOTED_TEXT)
             self.assertEqual(up.returncode, 0, f"stderr={up.stderr[-800:]}")
             self.assertIn(self.PROMOTED_TEXT, alembic("current").stdout)
             self.assertTrue(set(jikou_reply_promote.TABLE_NAMES) <= tables())
@@ -1243,3 +1245,83 @@ class TestReplyExemplarMigration(unittest.TestCase):
             self.assertIn(self.DRAFT_APPROVAL, alembic("current").stdout)
         finally:
             shutil.rmtree(d, ignore_errors=True)
+
+
+class TestSendPurposeV2Migration(unittest.TestCase):
+    """JIKOU-SEND-PURPOSE-2（QUEUE-2026-10-13-E E-2）: purpose 正式移行 migration（f8b0c2d4e6a8）の往復。
+    up: CHECK を V2 集合へ広げ、other＋既知接頭辞の行を種別名へ書き換える（inbound_event_id は不変・未知接頭辞と
+    接頭辞なしは other のまま）。down: 逆変換して CHECK を戻す。sqlite での検証（Postgres は要実走・保留）。"""
+
+    PREV = "e6a8c0d2f4b6"
+    REV = "f8b0c2d4e6a8"
+
+    def test_send_purpose_v2_round_trip(self):
+        import sqlite3
+        import tempfile
+        from hub import send_ledger
+        d = tempfile.mkdtemp(prefix="send_purpose_v2_mig_")
+        dbfile = f"{d}/mig.db"
+        alembic, tables, unique_cols, nullable = TestAlembicScaffold._brain_mig_tools(dbfile)
+        rows = [("op1", "other", "houki_overdue:2026-10-13"), ("op2", "other", "pending_notice:abc:2026-10-13"),
+                ("op3", "other", "fax:21:1:0123456789abcdef"), ("op4", "other", "unknown:1"),
+                ("op5", "other", "ev-no-prefix"), ("op6", "reply", "ev2"), ("op7", "other", None)]
+
+        def insert(con, op_id, purpose, ev):
+            con.execute(
+                "INSERT INTO send_operation (op_id, business, channel, actor, purpose, first_reply_target, text_version, "
+                "inbound_event_id, inbound_seq, state, completed_after_human, attempt_no, created_at) "
+                "VALUES (?, 'jikou', 'c', 'bot', ?, 1, 'tv', ?, 1, 'sent', 0, 1, '2026-10-13 00:00:00')",
+                (op_id, purpose, ev))
+
+        def purposes(con):
+            return {r[0]: r[1] for r in con.execute("SELECT op_id, purpose FROM send_operation")}
+
+        try:
+            up = alembic("upgrade", self.PREV)
+            self.assertEqual(up.returncode, 0, f"stderr={up.stderr[-800:]}")
+            con = sqlite3.connect(dbfile)
+            try:
+                for r in rows:
+                    insert(con, *r)
+                con.commit()
+                with self.assertRaises(sqlite3.IntegrityError):          # 旧 CHECK: 新 purpose は入らない
+                    insert(con, "opx", "fax", "fax:1:1:x")
+                con.rollback()
+            finally:
+                con.close()
+            up = alembic("upgrade", self.REV)
+            self.assertEqual(up.returncode, 0, f"stderr={up.stderr[-800:]}")
+            self.assertIn(self.REV, alembic("current").stdout)
+            con = sqlite3.connect(dbfile)
+            try:
+                self.assertEqual(purposes(con), {"op1": "houki_overdue", "op2": "pending_notice", "op3": "fax",
+                                                 "op4": "other", "op5": "other", "op6": "reply", "op7": "other"})
+                evs = {r[0]: r[1] for r in con.execute("SELECT op_id, inbound_event_id FROM send_operation")}
+                self.assertEqual(evs["op1"], "houki_overdue:2026-10-13")      # inbound_event_id は不変
+                insert(con, "opx", "fax", "fax:1:1:x")                        # 新 CHECK: 新 purpose が入る
+                con.commit()
+                with self.assertRaises(sqlite3.IntegrityError):
+                    insert(con, "opy", "bogus", "b:1")
+                con.rollback()
+                con.execute("DELETE FROM send_operation WHERE op_id = 'opx'")
+                con.commit()
+                self.assertIn(("business", "channel", "inbound_event_id", "purpose", "inbound_seq"),
+                              unique_cols(con, "send_operation"))
+                cols = {r[1] for r in con.execute('PRAGMA table_info("send_operation")')}
+                self.assertEqual(cols, {c.name for c in send_ledger.send_operation.columns})
+            finally:
+                con.close()
+            down = alembic("downgrade", self.PREV)
+            self.assertEqual(down.returncode, 0, f"stderr={down.stderr[-800:]}")
+            self.assertIn(self.PREV, alembic("current").stdout)
+            con = sqlite3.connect(dbfile)
+            try:
+                self.assertEqual(purposes(con), {r[0]: r[1] for r in rows})   # 逆変換・行は残る
+                with self.assertRaises(sqlite3.IntegrityError):
+                    insert(con, "opx", "fax", "fax:1:1:x")
+                con.rollback()
+            finally:
+                con.close()
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
