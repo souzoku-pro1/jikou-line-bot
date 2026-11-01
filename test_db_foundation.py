@@ -980,7 +980,8 @@ class TestReplyExemplarMigration(unittest.TestCase):
     REPLY_FOLLOWUP_STATE = "a7c9e1f3b5d7"   # JIKOU-REPLY-Q1b-fix5 BR-17: reply_chatlog_followup.create_state（f7b2 の次）
     REPLY_FOLLOWUP_VERSION = "c8e0a2b4d6f8"  # JIKOU-REPLY-Q1b-fix6 BR-18: reply_chatlog_followup.row_version（a7c9 の次）
     REPLY_PENDING = "a1c3e5f7b9d2"      # JIKOU-REPLY-Q1c: 対応待ち（c8e0 の後ろ。fix5／fix6 で f7b2 → a7c9 → c8e0 に付け替え）
-    REPLY_PENDING_RETRY = "d4f6a8b0c2e4"  # JIKOU-REPLY-Q1c-fix1 BC-03: 対応待ちの保存失敗の永続キュー reply_pending_retry（a1c3 の次・head）
+    REPLY_PENDING_RETRY = "d4f6a8b0c2e4"  # JIKOU-REPLY-Q1c-fix1 BC-03: 対応待ちの保存失敗の永続キュー reply_pending_retry（a1c3 の次）
+    REPLY_PENDING_NOTICE = "b7d9f1a3c5e7"  # JIKOU-REPLY-Q1c-fix2 BC-07: reply_pending.notice_key／claim 列・retry.notice_key（d4f6 の次・head）
 
     def test_reply_exemplar_migration_round_trip(self):
         import sqlite3
@@ -1013,10 +1014,13 @@ class TestReplyExemplarMigration(unittest.TestCase):
             self.assertIn(self.REPLY_PENDING, alembic("current").stdout)
             self.assertTrue(set(reply_pending.TABLE_NAMES) <= tables())
             self.assertNotIn(reply_pending.RETRY_TABLE_NAME, tables())
-            up = alembic("upgrade", "head")                   # Q1c-fix1 BC-03: d4f6（reply_pending_retry）が head・鎖は 1 本
+            up = alembic("upgrade", self.REPLY_PENDING_RETRY)  # Q1c-fix1 BC-03: d4f6（reply_pending_retry）。Q1c-fix2 で head は b7d9 へ進んだため明示
             self.assertEqual(up.returncode, 0, f"stderr={up.stderr[-800:]}")
             self.assertIn(self.REPLY_PENDING_RETRY, alembic("current").stdout)
             self.assertIn(reply_pending.RETRY_TABLE_NAME, tables())
+            up = alembic("upgrade", "head")                   # Q1c-fix2 BC-07: b7d9（notice_key／claim 列）が head・鎖は 1 本・列集合は head で比較
+            self.assertEqual(up.returncode, 0, f"stderr={up.stderr[-800:]}")
+            self.assertIn(self.REPLY_PENDING_NOTICE, alembic("current").stdout)
             con = sqlite3.connect(dbfile)
             try:
                 for name, table in ((reply_pending.TABLE_NAME, reply_pending.reply_pending),

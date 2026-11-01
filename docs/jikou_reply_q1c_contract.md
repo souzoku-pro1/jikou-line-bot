@@ -39,6 +39,13 @@ ON のときだけ有効な事項は「V2 ON」と明記する。
   受信イベント ID が無い経路（非 durable）と DB 全停止中は永続化できない（固定語彙ログ＋§1 の障害通知・App 28 の受信記録で人が回収）。
 - 通知の失敗（notify_state=failed／unavailable）は同じジョブが **台帳 key（登録日の `pending_notice:{会話 ref}:{JST 日付}`）** で
   再試行する＝送れても 1 通（DUPLICATE_SENT → throttled）。上限 `NOTIFY_RETRY_MAX`（3）回。
+- **fix2 BC-07（通知キーの永続化と claim・migration `b7d9f1a3c5e7`）**: 通知キーは **登録時に 1 度だけ算出**して
+  `reply_pending.notice_key` に保存する（register に失敗したときは永続キュー `reply_pending_retry.notice_key` に置き、回収ジョブの
+  register がそのまま引き継ぐ）。以後の通知（再試行・再配送・キュー経由）はすべて保存値で行う＝会話参照の取得障害でハッシュ形へ
+  落ちる／キュー作成日と登録日が JST の日付をまたぐ、でも key は変わらず 2 通目は出ない。通知処理は
+  `reply_pending.claim_notify`（notify_owner／notify_claimed_at の条件付き更新・リース 300 秒）を取れた 1 者だけが進み、
+  `set_notify_state` が解放する（通知済み sent／throttled／unconfirmed の行は claim できない＝再通知しない）。
+  列追加前の旧行（notice_key NULL）だけ登録日の key を算出して保存してから使う。
 - **未返信の経過通知**: open のまま `REPLY_PENDING_AGE_MIN` 分（既定 60・env で上書き可・**要大野確認**）を超えた対応待ちを、
   業務 LINE へ **1 日 2 回**（JST `AGE_NOTICE_HOURS_JST`＝9 時・15 時・**要大野確認**・hub/scheduler の daily・HOUKI 系ジョブと同じ流儀）
   まとめて通知する。件数と経過分・再処理待ち件数のみ（PII なし）。台帳 key `pending_age:{JST 日付}:{時}` で 1 枠 1 通。
@@ -80,6 +87,10 @@ ON のときだけ有効な事項は「V2 ON」と明記する。
 ## 7. migration（fix1 BC-02）
 
 - 鎖は 1 本: e5f8（送信台帳）→ f7b2（手本）→ a7c9（create_state）→ c8e0（row_version）→ **a1c3**（対応待ち・Q1b-fix5／fix6 で
-  down_revision を c8e0 に付け替え）→ **d4f6**（永続キュー・fix1）。`alembic heads` は d4f6 のみ。
-- downgrade は a1c3（対応待ち・履歴）・d4f6（永続キュー）とも **データがあれば拒否**（RV-08・値は出さない）。
-- 本番適用は merge 前に `alembic upgrade head`（大野・保留一覧）。Q3a 以降の migration（b2d4 …）は前方 merge 時に d4f6 の後ろへ付け替える。
+  down_revision を c8e0 に付け替え）→ **d4f6**（永続キュー・fix1）→ **b7d9**（fix2 BC-07: `reply_pending.notice_key`／
+  `notify_owner`／`notify_claimed_at`・`reply_pending_retry.notice_key` の列追加）。`alembic heads` は b7d9 のみ。
+  票の「c8e0 の次」は main の head（c8e0）に対する q1c の鎖の意で、q1c 内では d4f6 の後ろに置く（鎖を 1 本に保つ）。
+- downgrade は a1c3（対応待ち・履歴）・d4f6（永続キュー）・b7d9（notice_key に値がある行）とも **データがあれば拒否**（RV-08・値は出さない）。
+- 本番適用は merge 前に `alembic upgrade head`（大野・保留一覧）。Q3a 以降の migration（b2d4 …）は前方 merge 時に b7d9 の後ろへ付け替える。
+- fix2 BC-11（J-0 の 利用者単位）は送信台帳の **読取条件の変更だけ**（conversation を join して line_user_hash で数える）で、
+  表・列の変更は無く migration は不要。

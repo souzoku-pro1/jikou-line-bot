@@ -38,6 +38,7 @@ REPO = Path(__file__).parent
 NOW = datetime.datetime(2026, 10, 21, 3, 0, tzinfo=datetime.timezone.utc)      # 12:00 JST
 RETRY = "d4f6a8b0c2e4"
 PENDING = "a1c3e5f7b9d2"
+NOTICE = "b7d9f1a3c5e7"          # Q1c-fix2 BC-07: notice_key／claim 列（d4f6 の次・head）
 
 
 def _begin_none_for(channels):
@@ -181,6 +182,7 @@ class TestMigrationChain(unittest.TestCase):
                 rev = down_of.get(rev)
             i = chain.index(RETRY)
             self.assertEqual(chain[i:i + 6], [RETRY, PENDING, "c8e0a2b4d6f8", "a7c9e1f3b5d7", "f7b2c9d4e1a6", "e5f8a1b4c7d9"])
+            self.assertEqual(chain[i - 1], NOTICE)                       # Q1c-fix2 BC-07: b7d9 は d4f6 の直後（鎖は 1 本のまま）
         finally:
             shutil.rmtree(d, ignore_errors=True)
         src = (REPO / "alembic" / "versions" / "20261012_a1c3e5f7b9d2_reply_pending.py").read_text(encoding="utf-8")
@@ -192,9 +194,9 @@ class TestMigrationChain(unittest.TestCase):
         dbfile = f"{d}/mig.db"
         alembic, tables, _unique_cols, nullable = TestAlembicScaffold._brain_mig_tools(dbfile)
         try:
-            up = alembic("upgrade", RETRY)                        # 後続票の head に依存しない（d4f6 まで）
+            up = alembic("upgrade", NOTICE)                       # Q1c-fix2 BC-07: 列集合（notice_key 列を含む）は b7d9 で比較
             self.assertEqual(up.returncode, 0, f"stderr={up.stderr[-800:]}")
-            self.assertIn(RETRY, alembic("current").stdout)
+            self.assertIn(NOTICE, alembic("current").stdout)
             self.assertIn(rp.RETRY_TABLE_NAME, tables())
             con = sqlite3.connect(dbfile)
             try:
@@ -209,6 +211,9 @@ class TestMigrationChain(unittest.TestCase):
                 con.commit()
             finally:
                 con.close()
+            down = alembic("downgrade", RETRY)                    # Q1c-fix2: notice_key にデータが無ければ b7d9 は落とせる（検証内容は fix1 のまま）
+            self.assertEqual(down.returncode, 0, f"stderr={down.stderr[-800:]}")
+            self.assertIn(RETRY, alembic("current").stdout)
             down = alembic("downgrade", PENDING)
             self.assertNotEqual(down.returncode, 0)
             self.assertIn("reply_pending_retry_downgrade_refused_data_present", down.stderr)

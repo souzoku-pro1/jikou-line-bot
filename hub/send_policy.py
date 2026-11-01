@@ -38,6 +38,7 @@ import logging
 import os
 import re
 import time
+import uuid
 
 import sqlalchemy as sa
 
@@ -279,22 +280,23 @@ async def _register_and_notify(user_id: str, *, route: str, reason: str, categor
                                approval_record_id: str | None) -> int | None:
     conv = await _conversation(user_id)
     user_hash = send_ledger.line_user_hash(BUSINESS, user_id)
+    # fix2 BC-07: 通知キーは **ここで 1 度だけ** 算出し、対応待ち行（登録できなければ永続キュー）に保存する。以後の通知
+    # （再試行・再配送・キュー経由の登録）はすべて保存値で行う＝会話参照の取得障害や日付またぎで key が変わらない
+    key = notice_key((conv or {}).get("ref", ""), user_hash, today=_jst_date())
     pid = await reply_pending.register(
         business=BUSINESS, channel=CUSTOMER_CHANNEL, line_user_hash=user_hash, route=route, reason=reason,
         inbound_event_id=_ctx_event_id(), conversation_id=(conv or {}).get("conversation_id"),
-        category=category, approval_record_id=approval_record_id)
+        category=category, approval_record_id=approval_record_id, notice_key=key)
     if pid is None:
         # fix1 BC-03: 保存失敗は受信イベント ID を永続キューに残し、回収ジョブで register → 通知 を再処理
         await reply_pending.enqueue_retry(
             business=BUSINESS, channel=CUSTOMER_CHANNEL, inbound_event_id=_ctx_event_id(), line_user_hash=user_hash,
             route=route, reason=reason, conversation_id=(conv or {}).get("conversation_id"), category=category,
-            approval_record_id=approval_record_id)
+            approval_record_id=approval_record_id, notice_key=key)
         return None
     logger.info("[SEND_POLICY] pending registered route=%s reason=%s", emit(route, "freetext", "log", "operator"),
                 emit(reason, "freetext", "log", "operator"))
-    state = await send_business_notice(notice_key((conv or {}).get("ref", ""), user_hash),
-                                       notice_text(approval_record_id, category))
-    await reply_pending.set_notify_state(pid, state)
+    await _notify_pending(pid, key, approval_record_id, category)
     return pid
 
 
@@ -606,11 +608,11 @@ async def _conversation_ref(conversation_id, user_hash: str) -> str:
         return ""
 
 
-async def _notify_row(row: dict, created_at) -> str:
-    key = notice_key(await _conversation_ref(row.get("conversation_id"), row["line_user_hash"]),
-                     row["line_user_hash"], today=_jst_date(created_at))
-    return await send_business_notice(key, notice_text(row.get("approval_record_id") or None,
-                                                       row.get("category") or None))
+async def _legacy_notice_key(row: dict, created_at) -> str:
+    """fix2 BC-07: notice_key 列が無い旧行（列追加前に登録された対応待ち／キュー）だけの救済。登録日の key を算出する
+    （新しい行は保存値を使うため呼ばれない）。"""
+    return notice_key(await _conversation_ref(row.get("conversation_id"), row["line_user_hash"]),
+                      row["line_user_hash"], today=_jst_date(created_at))
 
 
 async def run_pending_retry_job() -> dict:
@@ -626,20 +628,19 @@ async def run_pending_retry_job() -> dict:
         queue = []
     for q in queue:
         res["requeued"] += 1
+        # fix2 BC-07: キューに置いた通知キー（初回値）をそのまま対応待ち行へ引き継ぐ（旧キュー行は登録日の key を算出）
+        key = q.get("notice_key") or await _legacy_notice_key(q, q["created_at"])
         pid = await reply_pending.register(
             business=q["business"], channel=q["channel"], line_user_hash=q["line_user_hash"], route=q["route"],
             reason=q["reason"], inbound_event_id=q["inbound_event_id"], conversation_id=q["conversation_id"],
-            category=(q["category"] or None), approval_record_id=(q["approval_record_id"] or None))
+            category=(q["category"] or None), approval_record_id=(q["approval_record_id"] or None), notice_key=key)
         if pid is None:
             res["register_failed"] += 1
             await reply_pending.retry_bump(q["retry_id"])
             continue
         res["registered"] += 1
         await reply_pending.retry_done(q["retry_id"], pid)
-        state = await _notify_row({"conversation_id": q["conversation_id"], "line_user_hash": q["line_user_hash"],
-                                   "approval_record_id": q["approval_record_id"], "category": q["category"]},
-                                  q["created_at"])
-        await reply_pending.set_notify_state(pid, state)
+        await _notify_pending(pid, key, (q["approval_record_id"] or None), (q["category"] or None))
     try:
         rows = await reply_pending.list_notify_retry()
     except Exception:
@@ -648,9 +649,10 @@ async def run_pending_retry_job() -> dict:
     for r in rows:
         res["notify_retried"] += 1
         created = datetime.datetime.fromisoformat(r["created_at"]) if r.get("created_at") else None
-        state = await _notify_row(r, created)
-        await reply_pending.bump_attempts(r["pending_id"])
-        await reply_pending.set_notify_state(r["pending_id"], state)
+        # fix2 BC-07: 保存済みの通知キーで再試行（claim を取れた 1 者だけが送り、attempts を進める）
+        key = r.get("notice_key") or await _legacy_notice_key(r, created)
+        await _notify_pending(r["pending_id"], key, (r.get("approval_record_id") or None), (r.get("category") or None),
+                              bump_attempts=True)
     if res["registered"] or res["notify_retried"]:
         logger.info("[SEND_POLICY] pending retry job registered=%s notify_retried=%s",
                     emit(res["registered"], "count", "log", "operator"),
@@ -692,3 +694,28 @@ def register_jobs() -> None:
         name = age_job_name(hour)
         if not hub_scheduler.is_registered(name):
             hub_scheduler.register_daily(name, hour, functools.partial(run_age_notice_job, hour))
+
+
+# ══════════════════════════════════════════════════════════════
+# JIKOU-REPLY-Q1c-fix2（Codex R-Q1c-fix1 REJECT・BC-06〜BC-11・司令塔裁定）: 末尾追記
+#   BC-07 通知キーは登録時に 1 度だけ算出して保存し（reply_pending.notice_key・キュー → 登録で引き継ぐ）、通知は
+#         reply_pending.claim_notify（条件付き更新）を取れた 1 者だけが進む。
+# ══════════════════════════════════════════════════════════════
+async def _notify_pending(pid: int, computed_key: str, approval_record_id, category, *,
+                          bump_attempts: bool = False) -> str:
+    """保存済みの通知キーで業務 LINE 通知する。claim（条件付き更新）を取れた 1 者だけが送って notify_state を記録する
+    （取れなければ何もせず ""）。保存値が無い旧行（列追加前）は computed_key を保存してから使う（初回値が正）。"""
+    key = await reply_pending.notice_key_of(pid)
+    if not key:
+        await reply_pending.set_notice_key_if_missing(pid, computed_key)
+        key = await reply_pending.notice_key_of(pid) or computed_key
+    claim = await reply_pending.claim_notify(pid, uuid.uuid4().hex)
+    if claim != reply_pending.CLAIM_OK:
+        logger.info("[SEND_POLICY] notice not claimed (another holder or already notified) result=%s",
+                    emit(claim, "freetext", "log", "operator"))
+        return ""
+    if bump_attempts:
+        await reply_pending.bump_attempts(pid)
+    state = await send_business_notice(key, notice_text(approval_record_id, category))
+    await reply_pending.set_notify_state(pid, state)
+    return state

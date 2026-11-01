@@ -102,6 +102,10 @@ reply_pending = sa.Table(
     sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
     sa.Column("resolved_at", sa.DateTime(timezone=True), nullable=True),
     sa.Column("resolved_by", sa.Text, nullable=True),
+    # Q1c-fix2 BC-07（migration b7d9f1a3c5e7）: 通知キーの永続化（初回に 1 度だけ算出）と通知の claim（条件付き更新）
+    sa.Column("notice_key", sa.Text, nullable=True),
+    sa.Column("notify_owner", sa.Text, nullable=True),
+    sa.Column("notify_claimed_at", sa.DateTime(timezone=True), nullable=True),
     sa.CheckConstraint("state IN ('open', 'human_replied', 'auto_replied', 'not_needed')",
                        name="ck_reply_pending_state"),
     sa.CheckConstraint("route IN ('customer', 'hearing', 'inbound')", name="ck_reply_pending_route"),
@@ -158,6 +162,7 @@ reply_pending_retry = sa.Table(
     sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
     sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
     sa.Column("processed_at", sa.DateTime(timezone=True), nullable=True),
+    sa.Column("notice_key", sa.Text, nullable=True),      # Q1c-fix2 BC-07: キュー → 対応待ち登録 で引き継ぐ通知キー
     sa.CheckConstraint("state IN ('queued', 'done', 'abandoned')", name="ck_reply_pending_retry_state"),
     sa.UniqueConstraint("business", "channel", "inbound_event_id", name="uq_reply_pending_retry_inbound"),
     sa.Index("ix_reply_pending_retry_state", "state", "created_at"),
@@ -194,10 +199,10 @@ async def _hist(s, pending_id: int, field: str, from_value, to_value: str, actor
 async def register(*, business: str, channel: str, line_user_hash: str, route: str, reason: str,
                    inbound_event_id: str | None = None, conversation_id: int | None = None,
                    category: str | None = None, approval_record_id: str | None = None,
-                   now=None) -> int | None:
+                   now=None, notice_key: str | None = None) -> int | None:
     """対応待ちを 1 行登録して pending_id を返す。同じ受信イベント ID の行が既にあればその pending_id
-    （再配送の冪等）。DB 未設定・書込失敗は None（呼出側は顧客へ送らない＝無言のまま・固定語彙ログ）。
-    route / reason は閉集合外なら None（登録しない）。"""
+    （再配送の冪等・保存済みの notice_key はそのまま）。DB 未設定・書込失敗は None（呼出側は顧客へ送らない＝無言のまま・固定語彙ログ）。
+    route / reason は閉集合外なら None（登録しない）。fix2 BC-07: notice_key（業務 LINE 通知の台帳 key）は呼出側が初回に算出して渡す。"""
     if route not in ROUTES or reason not in REASONS:
         return None
     if not _db_configured():
@@ -218,7 +223,7 @@ async def register(*, business: str, channel: str, line_user_hash: str, route: s
                 reason=reason, category=(category or None),
                 approval_record_id=(str(approval_record_id) if approval_record_id else None),
                 state=STATE_OPEN, notify_state=NOTIFY_NONE, customer_send=CUSTOMER_NONE,
-                attempts=0, created_at=now, updated_at=now))
+                attempts=0, created_at=now, updated_at=now, notice_key=(str(notice_key) if notice_key else None)))
             pid = int(res.inserted_primary_key[0])
             await _hist(s, pid, "state", None, STATE_OPEN, RESOLVED_BY_BOT, now)
         return pid
@@ -250,10 +255,12 @@ async def _set(pending_id: int, field: str, to_value: str, actor: str, *, where_
 
 
 async def set_notify_state(pending_id: int, value: str, *, now=None) -> bool:
+    """通知結果の記録。fix2 BC-07: 記録と同時に claim（notify_owner／notify_claimed_at）を解放する。"""
     if value not in NOTIFY_STATES:
         return False
     try:
-        return await _set(pending_id, "notify_state", value, RESOLVED_BY_BOT, now=now)
+        return await _set(pending_id, "notify_state", value, RESOLVED_BY_BOT, now=now,
+                          extra={"notify_owner": None, "notify_claimed_at": None})
     except Exception:
         logger.error("[REPLY_PENDING] notify_state update failed (fixed reason)")
         return False
@@ -355,7 +362,8 @@ def _row(r) -> dict:
             "state": r.state, "notify_state": r.notify_state, "customer_send": r.customer_send,
             "attempts": int(r.attempts), "created_at": _iso(r.created_at),
             "updated_at": _iso(r.updated_at), "resolved_at": _iso(r.resolved_at),
-            "resolved_by": r.resolved_by or "", "has_inbound_event": bool(r.inbound_event_id)}
+            "resolved_by": r.resolved_by or "", "has_inbound_event": bool(r.inbound_event_id),
+            "notice_key": r.notice_key or ""}
 
 
 async def get_pending(pending_id: int) -> dict | None:
@@ -403,9 +411,10 @@ async def history(pending_id: int) -> list[dict]:
 # ══════════════════════════════════════════════════════════════
 async def enqueue_retry(*, business: str, channel: str, inbound_event_id: str | None, line_user_hash: str,
                         route: str, reason: str, conversation_id: int | None = None, category: str | None = None,
-                        approval_record_id: str | None = None, now=None) -> bool:
+                        approval_record_id: str | None = None, now=None, notice_key: str | None = None) -> bool:
     """register() 失敗時の永続キュー（BC-03）。受信イベント ID が無い経路（非 durable）は置けない（False）。
-    既に同じ受信イベント ID の行があれば何もしない（True）。書込失敗は固定語彙ログ・False。"""
+    既に同じ受信イベント ID の行があれば何もしない（True）。書込失敗は固定語彙ログ・False。
+    fix2 BC-07: notice_key（初回に算出した通知キー）を一緒に置き、回収ジョブの register へ引き継ぐ。"""
     if not inbound_event_id or route not in ROUTES or reason not in REASONS:
         return False
     if not _db_configured():
@@ -423,7 +432,8 @@ async def enqueue_retry(*, business: str, channel: str, inbound_event_id: str | 
                 conversation_id=conversation_id, line_user_hash=line_user_hash, route=route, reason=reason,
                 category=(category or None),
                 approval_record_id=(str(approval_record_id) if approval_record_id else None),
-                state=RETRY_QUEUED, attempts=0, last_error=RETRY_ERROR_REGISTER, created_at=now, updated_at=now))
+                state=RETRY_QUEUED, attempts=0, last_error=RETRY_ERROR_REGISTER, created_at=now, updated_at=now,
+                notice_key=(str(notice_key) if notice_key else None)))
         logger.warning("[REPLY_PENDING] register failed; queued for retry count=%s",
                        emit(1, "count", "log", "operator"))
         return True
@@ -441,7 +451,8 @@ def _retry_row(r) -> dict:
             "category": r.category or "", "approval_record_id": r.approval_record_id or "",
             "state": r.state, "attempts": int(r.attempts), "last_error": r.last_error or "",
             "pending_id": (int(r.pending_id) if r.pending_id is not None else None),
-            "created_at": r.created_at, "updated_at": r.updated_at, "processed_at": r.processed_at}
+            "created_at": r.created_at, "updated_at": r.updated_at, "processed_at": r.processed_at,
+            "notice_key": r.notice_key or ""}
 
 
 async def list_retry_queue(limit: int = 50) -> list[dict]:
@@ -578,3 +589,74 @@ async def age_stats(*, threshold_minutes: int, now=None) -> dict:
         ages.append(max(0, int((now - v).total_seconds() // 60)))
     over = [a for a in ages if a >= int(threshold_minutes)]
     return {"open_count": len(ages), "over_count": len(over), "oldest_minutes": (max(ages) if ages else 0)}
+
+
+# ══════════════════════════════════════════════════════════════
+# JIKOU-REPLY-Q1c-fix2（Codex R-Q1c-fix1 BC-07）: 通知キーの永続化と通知の claim（末尾追記・migration b7d9f1a3c5e7）
+#   - notice_key は登録時（初回）に 1 度だけ算出して保存し、再試行・再配送・キュー経由の登録はすべて保存値で通知する。
+#   - 通知処理は claim_notify（条件付き更新）を取れた 1 者だけが進む。リース超過（処理中に落ちた）は再取得できる。
+#   - set_notify_state が claim を解放する。本文・PII は持たない（key は不透明 ref／ハッシュ先頭 16 文字と JST 日付のみ）。
+# ══════════════════════════════════════════════════════════════
+NOTIFY_CLAIM_LEASE_SECONDS = 300          # 通知 1 回の処理上限（送信 timeout 240 秒より長く・回収間隔 5 分と同じ）
+CLAIM_OK = "ok"                           # 取得できた（この呼出だけが通知を進める）
+CLAIM_BUSY = "busy"                       # 他者がリース内で処理中
+CLAIM_DONE = "done"                       # 通知は既に sent／throttled／unconfirmed（再通知しない）
+CLAIM_NOT_FOUND = "not_found"
+CLAIM_ERROR = "error"
+CLAIM_RESULTS = (CLAIM_OK, CLAIM_BUSY, CLAIM_DONE, CLAIM_NOT_FOUND, CLAIM_ERROR)
+_NOTIFY_RETRYABLE = (NOTIFY_NONE, NOTIFY_FAILED, NOTIFY_UNAVAILABLE)
+
+
+async def notice_key_of(pending_id: int) -> str:
+    """保存済みの通知キー（無ければ ""・DB 例外は ""）。"""
+    try:
+        async with session_scope() as s:
+            v = (await s.execute(sa.select(reply_pending.c.notice_key).where(
+                reply_pending.c.pending_id == int(pending_id)))).scalar()
+        return str(v or "")
+    except Exception:
+        logger.error("[REPLY_PENDING] notice_key read failed (fixed reason)")
+        return ""
+
+
+async def set_notice_key_if_missing(pending_id: int, notice_key: str, *, now=None) -> bool:
+    """列追加前に登録された行（notice_key NULL）にだけ保存する（既にあれば触らない＝初回値が正）。"""
+    if not notice_key:
+        return False
+    now = now or _now()
+    try:
+        async with session_scope() as s:
+            r = await s.execute(sa.update(reply_pending).where(
+                reply_pending.c.pending_id == int(pending_id),
+                reply_pending.c.notice_key.is_(None)).values(notice_key=str(notice_key), updated_at=now))
+            return int(r.rowcount or 0) == 1
+    except Exception:
+        logger.error("[REPLY_PENDING] notice_key write failed (fixed reason)")
+        return False
+
+
+async def claim_notify(pending_id: int, owner: str, *, lease_seconds: int = NOTIFY_CLAIM_LEASE_SECONDS,
+                       now=None) -> str:
+    """通知処理の claim（条件付き更新）。notify_state が none／failed／unavailable で、未 claim かリース超過のときだけ
+    owner を書けた 1 者が CLAIM_OK。戻り値は CLAIM_RESULTS の閉集合。"""
+    now = now or _now()
+    cut = now - datetime.timedelta(seconds=int(lease_seconds))
+    try:
+        async with session_scope() as s:
+            r = await s.execute(sa.update(reply_pending).where(
+                reply_pending.c.pending_id == int(pending_id),
+                reply_pending.c.notify_state.in_(_NOTIFY_RETRYABLE),
+                sa.or_(reply_pending.c.notify_owner.is_(None),
+                       reply_pending.c.notify_claimed_at.is_(None),
+                       reply_pending.c.notify_claimed_at < cut)).values(
+                notify_owner=str(owner), notify_claimed_at=now))
+            if int(r.rowcount or 0) == 1:
+                return CLAIM_OK
+            state = (await s.execute(sa.select(reply_pending.c.notify_state).where(
+                reply_pending.c.pending_id == int(pending_id)))).scalar()
+        if state is None:
+            return CLAIM_NOT_FOUND
+        return CLAIM_BUSY if state in _NOTIFY_RETRYABLE else CLAIM_DONE
+    except Exception:
+        logger.error("[REPLY_PENDING] notify claim failed (fixed reason)")
+        return CLAIM_ERROR

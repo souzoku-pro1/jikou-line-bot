@@ -156,5 +156,159 @@ class TestRealCallbackSendResult(_Fix2Mixin):
         self.assertNotIn("async def _reply_func(token: str, text: str) -> None:", src)
 
 
+# ── 2. BC-07: 通知キーの永続化・引き継ぎ・claim ─────────────────────────────────────────
+class TestNoticeKeyPersistence(_Fix2Mixin):
+    def customer_bound(self, event_id: str, result: dict, user: str = USER):
+        async def _w():
+            tok = sl.bind_inbound(event_id)
+            try:
+                with patch.object(cr, "_call_compose_reply", AsyncMock(return_value=result)):
+                    await cr.handle_customer_message(user_id=user, user_message="質問です", reply_token="rt",
+                                                     app21_record=self.app21.return_value, reply_func=self.reply_func())
+            finally:
+                sl.unbind(tok)
+        _run(_w())
+
+    def notice_ops(self) -> list:
+        return [(o["inbound_event_id"], o["state"], o["attempt_no"]) for o in self.ops() if o["channel"] == "jikou_notice"]
+
+    def test_key_persisted_at_registration_and_reused_by_concurrent_retries_even_if_lookup_fails(self):
+        self.on()
+        self.touch("e1")
+        self.biz.return_value = False
+        self.customer(_compose("x", category="法的判断・見通し", auto_send=False))
+        row = self.pending()[0]
+        conv = _run(sl.conversation_state("jikou", USER))
+        h = sl.line_user_hash("jikou", USER)
+        self.assertEqual(row["notice_key"], sp.notice_key(conv["ref"], h, today=sp._jst_date()))   # 初回に算出して保存
+        self.assertEqual((row["notify_state"], row["notify_owner"]), ("failed", None))              # claim は解放済み
+        self.biz.return_value = True
+
+        async def _both():
+            # 回収ジョブ 2 つが並行し、会話参照の取得が落ちている（従来はハッシュへフォールバック＝別 key で 2 通目）
+            with patch.object(sp, "_conversation_ref", AsyncMock(side_effect=RuntimeError("x"))):
+                return await asyncio.gather(sp.run_pending_retry_job(), sp.run_pending_retry_job())
+        _run(_both())
+        self.assertEqual(self.biz.await_count, 2)                                                    # 初回（failed）+ 再試行 1 回＝2 通目は出ない
+        self.assertEqual(self.notice_ops(), [(row["notice_key"], "sent", 2)])                        # 同じ key の 1 操作を再試行
+        rows = self.pending()
+        self.assertEqual((rows[0]["notify_state"], rows[0]["notify_owner"], rows[0]["attempts"]), ("sent", None, 1))
+
+    def test_hash_fallback_key_at_registration_is_kept_on_retry(self):
+        self.on()
+        self.touch("e1")
+        self.biz.return_value = False
+        with patch.object(sp, "_conversation", AsyncMock(return_value=None)):                        # 登録時に会話参照が取れない
+            self.customer(_compose("x", category="法的判断・見通し", auto_send=False))
+        row = self.pending()[0]
+        h = sl.line_user_hash("jikou", USER)
+        self.assertEqual(row["notice_key"], sp.notice_key("", h, today=sp._jst_date()))              # ハッシュ形の key が初回値
+        self.biz.return_value = True
+        _run(sp.run_pending_retry_job())                                                             # 今は会話参照が取れるが、保存値を使う
+        self.assertEqual(self.notice_ops(), [(row["notice_key"], "sent", 2)])
+        self.assertEqual(self.biz.await_count, 2)                                                    # 初回（failed）+ 再試行 1 回
+
+    def test_queue_key_is_carried_to_pending_across_jst_date_boundary(self):
+        self.on()
+        self.touch("e-q")
+        d0 = datetime.date(2026, 10, 21)
+        h = sl.line_user_hash("jikou", USER)
+        with patch.object(sp, "_jst_date", side_effect=lambda v=None: d0), \
+             patch.object(rp, "register", AsyncMock(return_value=None)):
+            self.customer_bound("e-q", _compose("x", category="法的判断・見通し", auto_send=False))
+        q = self.retry_rows()[0]
+        conv = _run(sl.conversation_state("jikou", USER))
+        self.assertEqual(q["notice_key"], sp.notice_key(conv["ref"], h, today=d0))                   # キューに初回値を保存
+        self.assertEqual(self.biz.await_count, 0)
+        d1 = d0 + datetime.timedelta(days=1)
+        with patch.object(sp, "_jst_date", side_effect=lambda v=None: d1):                           # 翌日（JST）に回収
+            res = _run(sp.run_pending_retry_job())
+            self.assertEqual((res["registered"], self.biz.await_count), (1, 1))
+            row = self.pending()[0]
+            self.assertEqual((row["notice_key"], row["notify_state"]), (q["notice_key"], "sent"))    # 引き継いだ key で通知
+            # 同じ受信イベントの再配送（翌日）: 既存行の保存 key・通知済みなので claim は done＝2 通目なし
+            self.customer_bound("e-q", _compose("x", category="法的判断・見通し", auto_send=False))
+        self.assertEqual((self.biz.await_count, len(self.pending())), (1, 1))
+        self.assertEqual(self.notice_ops(), [(q["notice_key"], "sent", 1)])
+        self.assertNotEqual(sp.notice_key(conv["ref"], h, today=d1), q["notice_key"])               # 再算出していれば別 key＝2 通目が出ていた
+
+    def test_claim_is_conditional_update_released_by_state_write_and_direct_double_notify_sends_once(self):
+        pid = self.reg(inbound_event_id="e-c")
+        now = datetime.datetime.now(datetime.timezone.utc)
+        self.assertEqual(_run(rp.claim_notify(pid, "A", now=now)), rp.CLAIM_OK)
+        self.assertEqual(_run(rp.claim_notify(pid, "B", now=now)), rp.CLAIM_BUSY)                    # リース内は他者不可
+        self.assertEqual(_run(rp.claim_notify(pid, "B", now=now + datetime.timedelta(seconds=rp.NOTIFY_CLAIM_LEASE_SECONDS + 1))),
+                         rp.CLAIM_OK)                                                                # リース超過で再取得
+        _run(rp.set_notify_state(pid, rp.NOTIFY_SENT))
+        self.assertEqual(_run(rp.claim_notify(pid, "C")), rp.CLAIM_DONE)                             # 通知済みは再通知しない
+        self.assertEqual(_run(rp.claim_notify(10 ** 9, "C")), rp.CLAIM_NOT_FOUND)
+        self.assertEqual(rp.CLAIM_RESULTS, ("ok", "busy", "done", "not_found", "error"))
+        self.assertEqual(rp.NOTIFY_CLAIM_LEASE_SECONDS, 300)
+        # 直接の二重通知（同じ pending を 2 者が同時に通知）: claim を取れた 1 者だけが送る
+        self.on()
+        pid2 = self.reg(user=USER2, inbound_event_id="e-d", notice_key="pending_notice:refx:2026-10-21")
+
+        async def _both():
+            return await asyncio.gather(sp._notify_pending(pid2, "k", "500", "c"), sp._notify_pending(pid2, "k", "500", "c"))
+        res = _run(_both())
+        self.assertEqual(sorted(res), ["", rp.NOTIFY_SENT])
+        self.assertEqual(self.biz.await_count, 1)
+        self.assertEqual(self.notice_ops(), [("pending_notice:refx:2026-10-21", "sent", 1)])       # 保存値の key で送った
+        # 旧行（notice_key NULL）: 渡された算出値を保存してから使う
+        pid3 = self.reg(user=USER2, inbound_event_id="e-e")
+        self.assertEqual(_run(rp.notice_key_of(pid3)), "")
+        self.assertEqual(_run(sp._notify_pending(pid3, "pending_notice:legacy:2026-10-21", None, None)), rp.NOTIFY_SENT)
+        self.assertEqual(_run(rp.notice_key_of(pid3)), "pending_notice:legacy:2026-10-21")
+        self.assertFalse(_run(rp.set_notice_key_if_missing(pid3, "other")))                          # 初回値は上書きしない
+
+    def test_migration_adds_columns_and_refuses_downgrade_with_notice_key_data(self):
+        from test_db_foundation import TestAlembicScaffold
+        NOTICE, RETRY = "b7d9f1a3c5e7", "d4f6a8b0c2e4"
+        d = tempfile.mkdtemp(prefix="reply_pending_notice_mig_")
+        dbfile = f"{d}/mig.db"
+        alembic, tables, _u, nullable = TestAlembicScaffold._brain_mig_tools(dbfile)
+        try:
+            up = alembic("upgrade", NOTICE)
+            self.assertEqual(up.returncode, 0, f"stderr={up.stderr[-800:]}")
+            con = sqlite3.connect(dbfile)
+            try:
+                for name, table in ((rp.TABLE_NAME, rp.reply_pending), (rp.RETRY_TABLE_NAME, rp.reply_pending_retry)):
+                    cols = {r[1] for r in con.execute(f'PRAGMA table_info("{name}")')}
+                    self.assertEqual(cols, {c.name for c in table.columns}, name)
+                nn = nullable(con, rp.TABLE_NAME)
+                self.assertTrue(nn["notice_key"] and nn["notify_owner"] and nn["notify_claimed_at"])
+                con.execute("INSERT INTO reply_pending (business, channel, line_user_hash, route, reason, state, notify_state, "
+                            "customer_send, attempts, created_at, updated_at, notice_key) VALUES ('jikou', 'jikou', 'h', 'customer', "
+                            "'demoted', 'open', 'none', 'none', 0, '2026-11-01 00:00:00', '2026-11-01 00:00:00', 'pending_notice:secret-ref:2026-11-01')")
+                con.commit()
+            finally:
+                con.close()
+            down = alembic("downgrade", RETRY)
+            self.assertNotEqual(down.returncode, 0)
+            self.assertIn("reply_pending_notice_key_downgrade_refused_data_present", down.stderr)
+            self.assertNotIn("secret-ref", down.stderr)
+            self.assertIn(NOTICE, alembic("current").stdout)
+            con = sqlite3.connect(dbfile)
+            try:
+                con.execute("UPDATE reply_pending SET notice_key = NULL")
+                con.commit()
+            finally:
+                con.close()
+            down = alembic("downgrade", RETRY)
+            self.assertEqual(down.returncode, 0, f"stderr={down.stderr[-800:]}")
+            con = sqlite3.connect(dbfile)
+            try:
+                cols = {r[1] for r in con.execute(f'PRAGMA table_info("{rp.TABLE_NAME}")')}
+                self.assertFalse({"notice_key", "notify_owner", "notify_claimed_at"} & cols)
+                self.assertNotIn("notice_key", {r[1] for r in con.execute(f'PRAGMA table_info("{rp.RETRY_TABLE_NAME}")')})
+                self.assertEqual(con.execute("SELECT COUNT(*) FROM reply_pending").fetchone()[0], 1)   # 行は残る
+            finally:
+                con.close()
+            self.assertEqual(alembic("upgrade", "head").returncode, 0)
+            self.assertIn(NOTICE, alembic("current").stdout)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+
 if __name__ == "__main__":
     unittest.main()
