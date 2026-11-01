@@ -33,6 +33,13 @@ NOOP_REASONS = frozenset({
     "skip_record_not_found",   # refetch でレコード不在
     "skip_missing_fields",     # webhook body の必須 field 欠落
     "skip_missing_user_or_draft",  # user_id/AI下書き 欠落
+    # PRE-REVIEW-1 #275-1（JIKOU-REPLY-Q1c）: 既存 handler の skip 分岐と 1:1 にする（enum 外だと ValueError で webhook 500・行は滞留）
+    "skip_autoreply_stopped",  # 自動返信停止リスト（AUTOREPLY-STOPLIST-1・mark_sending の前）
+})
+# PRE-REVIEW-1 #275-1: mark_sending（sending）の **後** に止める正常終端（許可表 V2 で止めた＝LINE write 0）。
+# sending→done は mark_done と同じ遷移だが理由コードを last_error に残す。自由文字列禁止（enum 固定）。
+STOP_AFTER_SENDING_REASONS = frozenset({
+    "skip_policy_v2",          # JIKOU-REPLY-Q1c: 許可表 V2（対応中・停止設定・人対応中）で送らずに終端
 })
 
 _PROVIDER = "kintone"
@@ -137,6 +144,21 @@ async def mark_noop_done(event_id: str, reason: str) -> None:
                                     last_error=reason))
         if r.rowcount != 1:   # M02: 行消失・想定外 state は fail-closed
             raise KintoneLaneStateError("mark_noop_done rowcount!=1")
+
+
+async def mark_stopped_after_sending(event_id: str, reason: str) -> None:
+    """PRE-REVIEW-1 #275-1: sending の行を「送らずに終端」へ（sending→done・last_error=理由コード・LINE write 0）。
+    理由は STOP_AFTER_SENDING_REASONS の enum 固定。state が sending でない（並行操作等）は fail-closed で例外。"""
+    if reason not in STOP_AFTER_SENDING_REASONS:
+        raise ValueError(f"stop reason not in enum: {reason}")
+    async with session_scope() as s:
+        r = await s.execute(sa.update(InboundEvent)
+                            .where(InboundEvent.dedup_key == dedup_key(event_id),
+                                   InboundEvent.state == "sending")
+                            .values(state="done", processed_at=sa.func.now(),
+                                    last_error=reason))
+        if r.rowcount != 1:
+            raise KintoneLaneStateError("mark_stopped_after_sending rowcount!=1")
 
 
 async def mark_sending(event_id: str) -> bool:
