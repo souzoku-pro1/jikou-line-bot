@@ -592,71 +592,79 @@ async def age_stats(*, threshold_minutes: int, now=None) -> dict:
 
 
 # ══════════════════════════════════════════════════════════════
-# JIKOU-REPLY-Q1c-fix2（Codex R-Q1c-fix1 BC-07）: 通知キーの永続化と通知の claim（末尾追記・migration b7d9f1a3c5e7）
+# JIKOU-REPLY-Q1c-fix2（Codex R-Q1c-fix1 BC-07）／fix3（Codex R-Q1c-fix2 BC-13）: 通知キーの永続化と通知の claim（末尾追記・migration b7d9f1a3c5e7）
 #   - notice_key は登録時（初回）に 1 度だけ算出して保存し、再試行・再配送・キュー経由の登録はすべて保存値で通知する。
 #   - 通知処理は claim_notify（条件付き更新）を取れた 1 者だけが進む。リース超過（処理中に落ちた）は再取得できる。
-#   - set_notify_state が claim を解放する。本文・PII は持たない（key は不透明 ref／ハッシュ先頭 16 文字と JST 日付のみ）。
+#   - fix3 BC-13: 永続キーは **claim と同一トランザクション** で読み、その値だけで送る。読取・更新の例外は送出する（"" に潰さない＝
+#     rollback で claim も残らず、呼出側は送らずに回収へ戻す）。列追加前の旧行（NULL）の埋めも同一 tx。
+#   - 本文・PII は持たない（key は不透明 ref／ハッシュ先頭 16 文字と JST 日付のみ）。
 # ══════════════════════════════════════════════════════════════
 NOTIFY_CLAIM_LEASE_SECONDS = 300          # 通知 1 回の処理上限（送信 timeout 240 秒より長く・回収間隔 5 分と同じ）
 CLAIM_OK = "ok"                           # 取得できた（この呼出だけが通知を進める）
 CLAIM_BUSY = "busy"                       # 他者がリース内で処理中
 CLAIM_DONE = "done"                       # 通知は既に sent／throttled／unconfirmed（再通知しない）
 CLAIM_NOT_FOUND = "not_found"
-CLAIM_ERROR = "error"
-CLAIM_RESULTS = (CLAIM_OK, CLAIM_BUSY, CLAIM_DONE, CLAIM_NOT_FOUND, CLAIM_ERROR)
+CLAIM_RESULTS = (CLAIM_OK, CLAIM_BUSY, CLAIM_DONE, CLAIM_NOT_FOUND)
 _NOTIFY_RETRYABLE = (NOTIFY_NONE, NOTIFY_FAILED, NOTIFY_UNAVAILABLE)
 
 
+async def _notice_key_in_tx(s, pending_id: int):
+    """claim と同一トランザクションで永続キーを読む（NULL は None・例外は送出）。"""
+    return (await s.execute(sa.select(reply_pending.c.notice_key).where(
+        reply_pending.c.pending_id == int(pending_id)))).scalar()
+
+
 async def notice_key_of(pending_id: int) -> str:
-    """保存済みの通知キー（無ければ ""・DB 例外は ""）。"""
-    try:
-        async with session_scope() as s:
-            v = (await s.execute(sa.select(reply_pending.c.notice_key).where(
-                reply_pending.c.pending_id == int(pending_id)))).scalar()
-        return str(v or "")
-    except Exception:
-        logger.error("[REPLY_PENDING] notice_key read failed (fixed reason)")
-        return ""
-
-
-async def set_notice_key_if_missing(pending_id: int, notice_key: str, *, now=None) -> bool:
-    """列追加前に登録された行（notice_key NULL）にだけ保存する（既にあれば触らない＝初回値が正）。"""
-    if not notice_key:
-        return False
-    now = now or _now()
-    try:
-        async with session_scope() as s:
-            r = await s.execute(sa.update(reply_pending).where(
-                reply_pending.c.pending_id == int(pending_id),
-                reply_pending.c.notice_key.is_(None)).values(notice_key=str(notice_key), updated_at=now))
-            return int(r.rowcount or 0) == 1
-    except Exception:
-        logger.error("[REPLY_PENDING] notice_key write failed (fixed reason)")
-        return False
+    """保存済みの通知キー（NULL は ""）。fix3 BC-13: DB 例外は **送出** する（"" に潰さない）。送信経路は本関数を使わず、
+    claim_notify が同一 tx で返す値だけを使う（表示・テスト用の読取）。"""
+    async with session_scope() as s:
+        v = await _notice_key_in_tx(s, pending_id)
+    return str(v or "")
 
 
 async def claim_notify(pending_id: int, owner: str, *, lease_seconds: int = NOTIFY_CLAIM_LEASE_SECONDS,
-                       now=None) -> str:
+                       now=None, computed_key: str | None = None) -> tuple[str, str]:
     """通知処理の claim（条件付き更新）。notify_state が none／failed／unavailable で、未 claim かリース超過のときだけ
-    owner を書けた 1 者が CLAIM_OK。戻り値は CLAIM_RESULTS の閉集合。"""
+    owner を書けた 1 者が CLAIM_OK。戻り値は (result, key)。
+    fix3 BC-13: CLAIM_OK のとき key は **同一トランザクションで読んだ永続キー**。列追加前の旧行（NULL）は computed_key を同一 tx で
+    埋めてから読む（既に値があれば上書きしない＝初回値が正）。読取・更新の例外は送出する（rollback＝claim も残らない）。
+    取れなかったときの key は ""。"""
     now = now or _now()
     cut = now - datetime.timedelta(seconds=int(lease_seconds))
+    async with session_scope() as s:
+        r = await s.execute(sa.update(reply_pending).where(
+            reply_pending.c.pending_id == int(pending_id),
+            reply_pending.c.notify_state.in_(_NOTIFY_RETRYABLE),
+            sa.or_(reply_pending.c.notify_owner.is_(None),
+                   reply_pending.c.notify_claimed_at.is_(None),
+                   reply_pending.c.notify_claimed_at < cut)).values(
+            notify_owner=str(owner), notify_claimed_at=now))
+        if int(r.rowcount or 0) != 1:
+            state = (await s.execute(sa.select(reply_pending.c.notify_state).where(
+                reply_pending.c.pending_id == int(pending_id)))).scalar()
+            if state is None:
+                return CLAIM_NOT_FOUND, ""
+            return (CLAIM_BUSY if state in _NOTIFY_RETRYABLE else CLAIM_DONE), ""
+        key = await _notice_key_in_tx(s, pending_id)
+        if not key and computed_key:
+            await s.execute(sa.update(reply_pending).where(
+                reply_pending.c.pending_id == int(pending_id),
+                reply_pending.c.notice_key.is_(None),
+                reply_pending.c.notify_owner == str(owner)).values(notice_key=str(computed_key), updated_at=now))
+            key = await _notice_key_in_tx(s, pending_id)
+        return CLAIM_OK, str(key or "")
+
+
+async def release_notify_claim(pending_id: int, owner: str, *, now=None) -> bool:
+    """自分の claim だけを解放する（送らずに回収へ戻すとき）。他者の claim は触らない。"""
+    now = now or _now()
     try:
         async with session_scope() as s:
             r = await s.execute(sa.update(reply_pending).where(
                 reply_pending.c.pending_id == int(pending_id),
-                reply_pending.c.notify_state.in_(_NOTIFY_RETRYABLE),
-                sa.or_(reply_pending.c.notify_owner.is_(None),
-                       reply_pending.c.notify_claimed_at.is_(None),
-                       reply_pending.c.notify_claimed_at < cut)).values(
-                notify_owner=str(owner), notify_claimed_at=now))
-            if int(r.rowcount or 0) == 1:
-                return CLAIM_OK
-            state = (await s.execute(sa.select(reply_pending.c.notify_state).where(
-                reply_pending.c.pending_id == int(pending_id)))).scalar()
-        if state is None:
-            return CLAIM_NOT_FOUND
-        return CLAIM_BUSY if state in _NOTIFY_RETRYABLE else CLAIM_DONE
+                reply_pending.c.notify_owner == str(owner)).values(
+                notify_owner=None, notify_claimed_at=None, updated_at=now))
+            return int(r.rowcount or 0) == 1
     except Exception:
-        logger.error("[REPLY_PENDING] notify claim failed (fixed reason)")
-        return CLAIM_ERROR
+        logger.error("[REPLY_PENDING] claim release failed (fixed reason)")
+        return False

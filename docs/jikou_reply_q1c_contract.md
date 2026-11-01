@@ -55,6 +55,9 @@ ON のときだけ有効な事項は「V2 ON」と明記する。
   `reply_pending.claim_notify`（notify_owner／notify_claimed_at の条件付き更新・リース 300 秒）を取れた 1 者だけが進み、
   `set_notify_state` が解放する（通知済み sent／throttled／unconfirmed の行は claim できない＝再通知しない）。
   列追加前の旧行（notice_key NULL）だけ登録日の key を算出して保存してから使う。
+- **fix3 BC-13**: 送信に使う通知キーは **claim と同一トランザクションで読んだ永続キーだけ**（`reply_pending.claim_notify` が
+  (result, key) を返す）。旧行の NULL 埋めも同一 tx（既に値があれば上書きしない）。読取・更新の例外は "" に潰さず送出し、rollback で
+  claim も残らない＝送らずに回収へ戻す（`notice_key_of` も例外を送出・送信経路では使わない）。計算値が送信に渡ることはない。
 - **未返信の経過通知**: open のまま `REPLY_PENDING_AGE_MIN` 分（既定 60・env で上書き可・**要大野確認**）を超えた対応待ちを、
   業務 LINE へ **1 日 2 回**（JST `AGE_NOTICE_HOURS_JST`＝9 時・15 時・**要大野確認**・hub/scheduler の daily・HOUKI 系ジョブと同じ流儀）
   まとめて通知する。件数と経過分・再処理待ち件数のみ（PII なし）。台帳 key `pending_age:{JST 日付}:{時}` で 1 枠 1 通。

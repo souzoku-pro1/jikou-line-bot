@@ -236,14 +236,15 @@ class TestNoticeKeyPersistence(_Fix2Mixin):
     def test_claim_is_conditional_update_released_by_state_write_and_direct_double_notify_sends_once(self):
         pid = self.reg(inbound_event_id="e-c")
         now = datetime.datetime.now(datetime.timezone.utc)
-        self.assertEqual(_run(rp.claim_notify(pid, "A", now=now)), rp.CLAIM_OK)
-        self.assertEqual(_run(rp.claim_notify(pid, "B", now=now)), rp.CLAIM_BUSY)                    # リース内は他者不可
-        self.assertEqual(_run(rp.claim_notify(pid, "B", now=now + datetime.timedelta(seconds=rp.NOTIFY_CLAIM_LEASE_SECONDS + 1))),
+        # fix3 BC-13: claim_notify は (result, 同一 tx で読んだ永続キー) を返す
+        self.assertEqual(_run(rp.claim_notify(pid, "A", now=now))[0], rp.CLAIM_OK)
+        self.assertEqual(_run(rp.claim_notify(pid, "B", now=now)), (rp.CLAIM_BUSY, ""))             # リース内は他者不可
+        self.assertEqual(_run(rp.claim_notify(pid, "B", now=now + datetime.timedelta(seconds=rp.NOTIFY_CLAIM_LEASE_SECONDS + 1)))[0],
                          rp.CLAIM_OK)                                                                # リース超過で再取得
         _run(rp.set_notify_state(pid, rp.NOTIFY_SENT))
-        self.assertEqual(_run(rp.claim_notify(pid, "C")), rp.CLAIM_DONE)                             # 通知済みは再通知しない
-        self.assertEqual(_run(rp.claim_notify(10 ** 9, "C")), rp.CLAIM_NOT_FOUND)
-        self.assertEqual(rp.CLAIM_RESULTS, ("ok", "busy", "done", "not_found", "error"))
+        self.assertEqual(_run(rp.claim_notify(pid, "C")), (rp.CLAIM_DONE, ""))                      # 通知済みは再通知しない
+        self.assertEqual(_run(rp.claim_notify(10 ** 9, "C")), (rp.CLAIM_NOT_FOUND, ""))
+        self.assertEqual(rp.CLAIM_RESULTS, ("ok", "busy", "done", "not_found"))
         self.assertEqual(rp.NOTIFY_CLAIM_LEASE_SECONDS, 300)
         # 直接の二重通知（同じ pending を 2 者が同時に通知）: claim を取れた 1 者だけが送る
         self.on()
@@ -255,12 +256,15 @@ class TestNoticeKeyPersistence(_Fix2Mixin):
         self.assertEqual(sorted(res), ["", rp.NOTIFY_SENT])
         self.assertEqual(self.biz.await_count, 1)
         self.assertEqual(self.notice_ops(), [("pending_notice:refx:2026-10-21", "sent", 1)])       # 保存値の key で送った
-        # 旧行（notice_key NULL）: 渡された算出値を保存してから使う
+        # 旧行（notice_key NULL）: 渡された算出値を claim と同一 tx で保存してから使う
         pid3 = self.reg(user=USER2, inbound_event_id="e-e")
         self.assertEqual(_run(rp.notice_key_of(pid3)), "")
         self.assertEqual(_run(sp._notify_pending(pid3, "pending_notice:legacy:2026-10-21", None, None)), rp.NOTIFY_SENT)
         self.assertEqual(_run(rp.notice_key_of(pid3)), "pending_notice:legacy:2026-10-21")
-        self.assertFalse(_run(rp.set_notice_key_if_missing(pid3, "other")))                          # 初回値は上書きしない
+        pid4 = self.reg(user=USER2, inbound_event_id="e-f")
+        self.assertEqual(_run(rp.claim_notify(pid4, "Z1", computed_key="pending_notice:k1:2026-10-21")), (rp.CLAIM_OK, "pending_notice:k1:2026-10-21"))
+        self.assertTrue(_run(rp.release_notify_claim(pid4, "Z1")))
+        self.assertEqual(_run(rp.claim_notify(pid4, "Z2", computed_key="pending_notice:k2:2026-10-21")), (rp.CLAIM_OK, "pending_notice:k1:2026-10-21"))   # 初回値は上書きしない
 
     def test_migration_adds_columns_and_refuses_downgrade_with_notice_key_data(self):
         from test_db_foundation import TestAlembicScaffold

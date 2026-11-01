@@ -757,15 +757,23 @@ def register_jobs() -> None:
 async def _notify_pending(pid: int, computed_key: str, approval_record_id, category, *,
                           bump_attempts: bool = False) -> str:
     """保存済みの通知キーで業務 LINE 通知する。claim（条件付き更新）を取れた 1 者だけが送って notify_state を記録する
-    （取れなければ何もせず ""）。保存値が無い旧行（列追加前）は computed_key を保存してから使う（初回値が正）。"""
-    key = await reply_pending.notice_key_of(pid)
-    if not key:
-        await reply_pending.set_notice_key_if_missing(pid, computed_key)
-        key = await reply_pending.notice_key_of(pid) or computed_key
-    claim = await reply_pending.claim_notify(pid, uuid.uuid4().hex)
+    （取れなければ何もせず ""）。
+    fix3 BC-13: 送信に使う key は **claim と同一トランザクションで読んだ永続キーだけ**（旧行の NULL 埋めも同一 tx・computed_key は
+    その埋め値としてしか使わない）。claim／読取の例外は送らずに ""（rollback で claim も残らない＝回収ジョブが拾い直す）。
+    確定値が取れなければ claim を解放して送らない。"""
+    owner = uuid.uuid4().hex
+    try:
+        claim, key = await reply_pending.claim_notify(pid, owner, computed_key=computed_key)
+    except Exception:
+        logger.warning("[SEND_POLICY] notice claim or key read failed (not sent; left for recovery)")
+        return ""
     if claim != reply_pending.CLAIM_OK:
         logger.info("[SEND_POLICY] notice not claimed (another holder or already notified) result=%s",
                     emit(claim, "freetext", "log", "operator"))
+        return ""
+    if not key:
+        logger.warning("[SEND_POLICY] notice key unavailable after claim (not sent; claim released)")
+        await reply_pending.release_notify_claim(pid, owner)
         return ""
     if bump_attempts:
         await reply_pending.bump_attempts(pid)
