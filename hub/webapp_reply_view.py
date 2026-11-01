@@ -313,7 +313,7 @@ def reflect_memory_history(user_id: str, text: str) -> bool:
 
 
 async def _save_exemplar(user_id: str, inbound_text: str, text: str, op_id: str,
-                         customer_name: str) -> str:
+                         customer_name: str, category_id: str | None = None) -> str:
     creditor, stage = None, reply_exemplar.STAGE_CONSULT
     try:
         from chat_responder import classify_routing, get_app21_record
@@ -334,7 +334,7 @@ async def _save_exemplar(user_id: str, inbound_text: str, text: str, op_id: str,
         business=BUSINESS, inbound_text=inbound_text, human_reply=text,
         customer_name=customer_name, creditor_name=creditor, stage=stage,
         conversation_ref=ref, source_op_id=op_id,
-        source_text_version=send_ledger.text_version(text))
+        source_text_version=send_ledger.text_version(text), category_id=category_id)   # JIKOU-REPLY-Q3a
 
 
 # ── 画面 ────────────────────────────────────────────────────────────────────
@@ -531,7 +531,7 @@ async def reply_send(request: Request):
     ex_res = "off"
     if want_exemplar:
         ex_res = await _save_exemplar(user_id, _v(rec, "顧客メッセージ"), text, op_id,
-                                      _v(rec, "顧客名"))
+                                      _v(rec, "顧客名"), category_id=_v(rec, "カテゴリ"))   # JIKOU-REPLY-Q3a: 分類 ID=App 29 のカテゴリ
     return _redirect(back, "sent", log=log_res, ex=ex_res, pd=(str(pd_res) if pd_res else ""))
 
 

@@ -317,9 +317,10 @@ class TestExplicitSend(_DbMixin):
         self.assertEqual((ex[0]["business"], ex[0]["stage"], ex[0]["creditor_name"], ex[0]["source_op_id"]),
                          ("jikou", "受任後", "アコム", OP))
         self.assertEqual(ex[0]["source_text_version"], sl.text_version(TEXT))
+        # JIKOU-REPLY-Q3a: 手本の分類 ID は App 29 のカテゴリ（Q1b では NULL だった）
         # fix2 BR-10: 保存直後は pending_review（approved_by／approved_at は NULL・自動マスクだけで承認済みにしない）
         self.assertEqual((ex[0]["approved_by"], bool(ex[0]["active"]), ex[0]["category_id"], ex[0]["status"]),
-                         (None, True, None, "pending_review"))
+                         (None, True, "費用の定型案内", "pending_review"))
         self.assertIsNone(ex[0]["approved_at"])
         self.assertEqual(_run(rx.list_exemplars("jikou")), [])        # 承認まで下書き参照に出ない
         self.assertIn("44,000円", ex[0]["human_reply"])
@@ -913,7 +914,7 @@ class TestAnonymize(unittest.TestCase):
                           "status"})                                            # fix2 BR-10: status
         self.assertEqual({c.name for c in rx.reply_exemplar_history.columns},
                          {"history_id", "exemplar_id", "action", "actor", "at", "note"})
-        self.assertEqual(rx.ACTIONS, ("created", "used", "deactivated", "approved"))   # fix2 BR-10
+        self.assertEqual(rx.ACTIONS, ("created", "used", "deactivated", "approved"))   # JIKOU-REPLY-Q3a 再承認・fix2 BR-10
         self.assertEqual(rx.STATUSES, ("pending_review", "approved", "retired"))
         # fix2 BR-11／BR-12: 本文ハッシュ・所有権・照合したレコード No.・状態 7 値
         self.assertEqual({c.name for c in rf.reply_chatlog_followup.columns},

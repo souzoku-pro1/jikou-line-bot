@@ -861,7 +861,7 @@ def build_system_prompt(
     court_docs: str = "（未登録）",
     credit_check: str = "（未登録）",
     known_items: Optional[dict] = None,
-    profile: BusinessProfile | None = None, human_note: str = "",  # JIKOU-REPLY-Q1b: 履歴に human 行があるときの注記（空なら従来どおり）
+    profile: BusinessProfile | None = None, human_note: str = "", exemplar_note: str = "",  # JIKOU-REPLY-Q1b: human 注記／Q3a: 参考文例（空なら従来どおり）
 ) -> str:
     """顧客対応Claudeのシステムプロンプトを組み立てる。
 
@@ -890,7 +890,7 @@ def build_system_prompt(
             "\n上記は既に回答済み・受領済みの項目です。同じ内容を再度"
             "質問・依頼しないでください。"
         )
-    return prompt + human_note  # JIKOU-REPLY-Q1b: human_note は "" 既定＝customer_prompt_base の pin 不変
+    return prompt + human_note + exemplar_note  # JIKOU-REPLY-Q1b/Q3a: どちらも "" 既定＝customer_prompt_base の pin 不変
 
 
 # ── サーバー側ガード（自動送信前の二重チェック） ─────────────────────────────────
@@ -1380,7 +1380,7 @@ async def save_to_approval_queue(
                     emit(resp.status_code, "count", "log", "operator"),
                     emit(resp.text, "vendor_raw", "log", "operator"))
         return None
-    record_id = resp.json().get("id")
+    record_id = resp.json().get("id"); await reply_exemplar.record_draft(record_id, "jikou", category, ai_draft)  # JIKOU-REPLY-Q3a (c): 起票時の下書き sha256
     logger.info("[APP29] saved record_id=%s",
                 emit(record_id, "record_id", "log", "operator"))
     return record_id
@@ -1648,7 +1648,7 @@ async def handle_customer_message(
         court_docs=_field("裁判所書類"),
         credit_check=_field("信用情報確認"),
         known_items=known_items,
-        profile=p, human_note=human_history_note(history),  # JIKOU-REPLY-Q1b: 事務所（human）返信を前提にする注記
+        profile=p, human_note=human_history_note(history), exemplar_note=(_exn := await reply_exemplar.prompt_note(p.name, status)),  # JIKOU-REPLY-Q1b 注記／Q3a (b) 参考文例（0 件は ""）
     )
 
     # Claude で返信案を作成
@@ -1706,7 +1706,7 @@ async def handle_customer_message(
     await save_to_chatlog(user_id, "user", user_message, category, "no")
 
     if guard.can_auto_send:
-        await reply_func(reply_token, reply_text)
+        await reply_func(reply_token, reply_text); await reply_exemplar.mark_used_for(_exn, category)  # JIKOU-REPLY-Q3a (b): 使った手本を used に
         await save_to_chatlog(user_id, "assistant", reply_text, category, "yes")
         logger.info("[AUTO_SEND] user_id=%s len=%s",
                     emit(user_id, "external_ref", "log", "operator"),
@@ -1972,3 +1972,7 @@ def sanitize_reply_without_human_marker(text: str, **kwargs) -> tuple[str, list[
 #    hub/send_policy は chat_responder を遅延 import する（循環なし）。flag OFF（既定）では各関数が
 #    従来の値・従来の呼び出しをそのまま返す（挙動不変・test_jikou_reply_q1c が pin）。
 from hub import send_policy  # noqa: E402
+
+# ── JIKOU-REPLY-Q3a（QUEUE-2026-10-12-C C-2）: 承認済み手本の参考文例（prompt 末尾・0 件は ""）と無修正承認の計数。
+#    末尾追記（sink allowlist の行番号 pin を動かさない規約・本文中は 1 行置換のみ）。
+from hub import reply_exemplar  # noqa: E402
