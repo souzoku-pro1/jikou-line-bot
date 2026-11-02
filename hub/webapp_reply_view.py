@@ -112,6 +112,8 @@ _DONE_NOTICES = {
     # fix4 BR-15
     "op_rejected": "この操作 ID は再利用できません（送信済み・終了済み、または本文・宛先が前回と異なります）。"
                    "画面を開き直して新しい操作でやり直してください。送信していません。",
+    # Q1c-fix2 BC-09
+    "pending_unavailable": "対応待ち（解除対象）を読み取れないため送信できません。時間をおいて同じ操作で再試行してください。送信していません。",
 }
 _STATE_LABELS = {"sent": "送信済み", "unconfirmed": "送信確認待ち", "failed": "失敗",
                  "started": "着手済（確認中）", "pending": "着手前", "none": "不明"}
@@ -493,6 +495,13 @@ async def reply_send(request: Request):
         logger.info("[REPLY] operation rejected by followup table (not sent)")
         return _redirect(back, "op_rejected")
     pd_targets = await send_policy.pending_targets(user_id)   # Q1c-fix1 BC-04: 送信着手時点の返信対象（open）を固定
+    if pd_targets is None:
+        # Q1c-fix2 BC-09: 対応待ちの読取不能（1 回再試行後）＝解除対象が分からないまま送らない。回収行は prepared のまま（本文保持）
+        # ＝同一 op_id・同一本文の再 POST で再開できる（台帳不可と同じ扱い）
+        logger.warning("[REPLY] pending targets unavailable (not sent) record_id=%s",
+                       emit(record_id, "record_id", "log", "operator"))
+        await reply_followup.note_prepared(op_id, "pending_unavailable")
+        return _redirect(back, "pending_unavailable")
     result = await line_channel.push_text_explicit(line_channel.JIKOU_CHANNEL, op_id, user_id, text)
     if result.outcome == line_channel.PUSH_LEDGER_UNAVAILABLE:
         logger.warning("[REPLY] ledger unavailable (not sent) record_id=%s",
