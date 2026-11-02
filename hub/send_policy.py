@@ -15,8 +15,9 @@ flag JIKOU_SEND_POLICY_V2（send_ledger.policy_v2_enabled・既定 OFF）:
       versions_match=False（安全側＝人対応中・対応中は送らず通知し、再承認待ちにする）。
   (b) 空返事（hub/empty_reply_guard）は自動送信せず無言。承認降格時の PENDING_REPLY（文脈化定型を含む）も
       送らない（即時定型 6 種は閉集合の承認済み文＝従来どおり送る）。障害・例外時も無言。
-  (c) J-0（初回 1 通・司令塔仮置き・大野承認待ち）: 無言にする場面で、その会話に「初回返信判定の対象」の
-      送信操作が 1 件も無い（pending/started/sent/unconfirmed いずれも 0 件）ときだけ 1 回送る。
+  (c) J-0（初回 1 通・司令塔仮置き・大野承認待ち）: 無言にする場面で、**その利用者（業務 × LINE 利用者・fix2 BC-11）**に
+      「初回返信判定の対象」の送信操作が 1 件も無い（pending/started/sent/unconfirmed いずれも 0 件）ときだけ 1 回送る。
+      30 日無受信後の新会話でも再送しない。
       判定は送信前（first_reply_due）と begin() の排他の中（purpose=first_reply の在庫検査）の二重。
       会話が無い（非 durable 経路）ときは送らない（1 回性を担保できない）。
   (d) 無言にした受信は hub/reply_pending（対応待ち）に永続化し、業務 LINE へ固定文言（App 29 No.・カテゴリ
@@ -38,10 +39,11 @@ import logging
 import os
 import re
 import time
+import uuid
 
 import sqlalchemy as sa
 
-from hub import empty_reply_guard, kintone, reply_pending, send_ledger
+from hub import approved_texts, empty_reply_guard, kintone, reply_pending, send_ledger
 from hub.db import session_scope as db_session_scope
 from hub.redact import emit
 
@@ -53,7 +55,8 @@ CUSTOMER_CHANNEL = "jikou"               # 許可表 V2 を適用する顧客チ
 CONDITION_TTL_SECONDS = 30.0             # 停止条件の照会結果の再利用窓（受信入口と送信前で 2 度引かない）
 _JST = datetime.timezone(datetime.timedelta(hours=9))
 
-# J-0（初回受付・1 会話 1 回・司令塔仮置き・大野承認待ち）。文言変更は本定数と test の sha pin を同時に更新する
+# J-0（初回受付・業務 × LINE 利用者 単位で 1 回〔fix2 BC-11〕・司令塔仮置き・大野承認待ち＝V2 有効化前の条件）。
+# 文言変更は本定数と test の sha pin を同時に更新する
 J0_TEXT = "ご連絡ありがとうございます。内容を確認のうえ、弁護士からこの LINE でご返信いたします。"
 J0_TEXT_SHA256 = hashlib.sha256(J0_TEXT.encode("utf-8")).hexdigest()
 
@@ -279,22 +282,23 @@ async def _register_and_notify(user_id: str, *, route: str, reason: str, categor
                                approval_record_id: str | None) -> int | None:
     conv = await _conversation(user_id)
     user_hash = send_ledger.line_user_hash(BUSINESS, user_id)
+    # fix2 BC-07: 通知キーは **ここで 1 度だけ** 算出し、対応待ち行（登録できなければ永続キュー）に保存する。以後の通知
+    # （再試行・再配送・キュー経由の登録）はすべて保存値で行う＝会話参照の取得障害や日付またぎで key が変わらない
+    key = notice_key((conv or {}).get("ref", ""), user_hash, today=_jst_date())
     pid = await reply_pending.register(
         business=BUSINESS, channel=CUSTOMER_CHANNEL, line_user_hash=user_hash, route=route, reason=reason,
         inbound_event_id=_ctx_event_id(), conversation_id=(conv or {}).get("conversation_id"),
-        category=category, approval_record_id=approval_record_id)
+        category=category, approval_record_id=approval_record_id, notice_key=key)
     if pid is None:
         # fix1 BC-03: 保存失敗は受信イベント ID を永続キューに残し、回収ジョブで register → 通知 を再処理
         await reply_pending.enqueue_retry(
             business=BUSINESS, channel=CUSTOMER_CHANNEL, inbound_event_id=_ctx_event_id(), line_user_hash=user_hash,
             route=route, reason=reason, conversation_id=(conv or {}).get("conversation_id"), category=category,
-            approval_record_id=approval_record_id)
+            approval_record_id=approval_record_id, notice_key=key)
         return None
     logger.info("[SEND_POLICY] pending registered route=%s reason=%s", emit(route, "freetext", "log", "operator"),
                 emit(reason, "freetext", "log", "operator"))
-    state = await send_business_notice(notice_key((conv or {}).get("ref", ""), user_hash),
-                                       notice_text(approval_record_id, category))
-    await reply_pending.set_notify_state(pid, state)
+    await _notify_pending(pid, key, approval_record_id, category)
     return pid
 
 
@@ -508,6 +512,15 @@ OUTAGE_NOTICE_TEXT = (f"{OUTAGE_NOTICE_HEADER}\n会話状態または送信台�
                       "ご確認ください。本通知は本日これ以降省略します。")
 AGE_NOTICE_HEADER = "【対応待ち・未返信】"
 AGE_NOTICE_FOOTER = "/app/pending からご確認ください。"
+# fix2 BC-08: 経過通知の本文は承認台帳（hub/approved_texts.APPROVED_SHA256）に載った定型だけ。文字列組立はせず、数値スロットだけ差し込む。
+# 承認は司令塔の票で `AGE_NOTICE_TEXT_KEY: sha256(AGE_NOTICE_TEMPLATE)` を台帳へ追加（文面は pgv/q1c_fix2_texts_for_approval.md・大野承認待ち）。
+AGE_NOTICE_TEXT_KEY = "ops_age_notice_v1"
+AGE_NOTICE_TEMPLATE = (f"{AGE_NOTICE_HEADER}\n未返信の対応待ち {{{{open}}}} 件（{{{{threshold}}}} 分超 {{{{over}}}} 件・"
+                       f"最長 {{{{oldest}}}} 分経過）・再処理待ち {{{{queued}}}} 件\n{AGE_NOTICE_FOOTER}")
+AGE_NOTICE_SLOTS = ("{{open}}", "{{threshold}}", "{{over}}", "{{oldest}}", "{{queued}}")   # 数値のみ（本文・ID・氏名は無い）
+AGE_NOTICE_NEEDS_APPROVAL = "needs_approval"                                              # run_age_notice_job の notice 値（送っていない）
+JOB_STATUS_KEY = "status"                                                                 # TEXT-APPROVAL-2-fix1: 定期ジョブの入口ゲートの印
+JOB_DISABLED = "disabled"                                                                 # V2 OFF＝入口で停止（DB も台帳も触らず・送信関数を呼ばない）
 REPLY_PENDING_AGE_MIN_DEFAULT = 60                     # 要大野確認（env REPLY_PENDING_AGE_MIN で上書き可）
 REPLY_PENDING_AGE_MIN_ENV = "REPLY_PENDING_AGE_MIN"
 AGE_NOTICE_HOURS_JST = (9, 15)                         # 1 日 2 回（要大野確認・HOUKI 系ジョブと同じ hub/scheduler の daily）
@@ -515,6 +528,13 @@ AGE_JOB_PREFIX = "JIKOU_REPLY_PENDING_AGE"
 
 _j0_pid: contextvars.ContextVar = contextvars.ContextVar("send_policy_j0_pid", default=None)
 _fixed_targets: contextvars.ContextVar = contextvars.ContextVar("send_policy_fixed_targets", default=None)
+# fix2 BC-09: 承認 webhook の送信着手時に対応待ち集合が読めなかった印（hub/line_channel の送信前フックが見る）
+_targets_unavailable: contextvars.ContextVar = contextvars.ContextVar("send_policy_targets_unavailable", default=False)
+REASON_TARGETS_UNAVAILABLE = "pending_targets:unavailable"
+
+
+def targets_unavailable() -> bool:
+    return bool(_targets_unavailable.get())
 _outage_notified: dict = {}      # JST 日付 → True（プロセス内の省略・正は台帳 key）
 
 
@@ -595,20 +615,38 @@ async def ack_recorded(user_id: str, ack_text: str, result) -> bool:
 
 
 # ── BC-04: 返信対象の固定 ───────────────────────────────────────────────────────
-async def pending_targets(user_id: str) -> tuple:
-    """送信着手の直前に呼ぶ: その相談者の open の pending_id（読取失敗は ()＝何も閉じない）。"""
-    try:
-        return tuple(await reply_pending.open_ids_for_user(BUSINESS, send_ledger.line_user_hash(BUSINESS, user_id)))
-    except Exception:
-        return ()
+async def pending_targets(user_id: str) -> tuple | None:
+    """送信着手の直前に呼ぶ: その相談者の open の pending_id（0 件は ()）。
+    fix2 BC-09: **DB 読取失敗は None**（0 件と区別する）。送信着手前に 1 回だけ即時に再試行し、それでも読めなければ None。
+    呼出側は None のとき送信を進めない（解除対象が分からないまま送ると、既存の対応待ちが未解決のまま残るため）。"""
+    user_hash = send_ledger.line_user_hash(BUSINESS, user_id)
+    for attempt in (1, 2):
+        try:
+            return tuple(await reply_pending.open_ids_for_user(BUSINESS, user_hash))
+        except Exception:
+            if attempt == 1:
+                logger.warning("[SEND_POLICY] pending targets read failed; retrying once before send")
+    logger.warning("[SEND_POLICY] pending targets unavailable after retry (send not started)")
+    return None
 
 
 @contextlib.asynccontextmanager
 async def fixed_targets(user_id: str):
     """承認 webhook の送信（main の 1 行置換: `async with send_ledger.approved_draft(...), send_policy.fixed_targets(user_id):`）。
-    入口で対応待ち集合を固定し、approved_draft_sent がその集合だけを閉じる（V2 OFF は空）。"""
-    _fixed_targets.set(await pending_targets(user_id) if enabled() else ())
-    yield
+    入口で対応待ち集合を固定し、approved_draft_sent がその集合だけを閉じる（V2 OFF は空）。
+    fix2 BC-09: V2 ON で集合が読めない（pending_targets=None）ときは `targets_unavailable()` を立て、hub/line_channel の送信前フックが
+    PolicyStopped(pending_targets:unavailable) に倒す＝送らない（承認済み下書きは送信済み=no のまま・対応待ちは open のまま）。"""
+    if not enabled():
+        _fixed_targets.set(())
+        yield
+        return
+    targets = await pending_targets(user_id)
+    _fixed_targets.set(targets or ())
+    token = _targets_unavailable.set(targets is None)
+    try:
+        yield
+    finally:
+        _targets_unavailable.reset(token)
 
 
 # ── BC-03: 回収ジョブ（永続キューの再処理・通知の再試行）と経過通知 ──────────────────────
@@ -635,17 +673,23 @@ async def _conversation_ref(conversation_id, user_hash: str) -> str:
         return ""
 
 
-async def _notify_row(row: dict, created_at) -> str:
-    key = notice_key(await _conversation_ref(row.get("conversation_id"), row["line_user_hash"]),
-                     row["line_user_hash"], today=_jst_date(created_at))
-    return await send_business_notice(key, notice_text(row.get("approval_record_id") or None,
-                                                       row.get("category") or None))
+async def _legacy_notice_key(row: dict, created_at) -> str:
+    """fix2 BC-07: notice_key 列が無い旧行（列追加前に登録された対応待ち／キュー）だけの救済。登録日の key を算出する
+    （新しい行は保存値を使うため呼ばれない）。"""
+    return notice_key(await _conversation_ref(row.get("conversation_id"), row["line_user_hash"]),
+                      row["line_user_hash"], today=_jst_date(created_at))
 
 
-async def run_pending_retry_job() -> dict:
+async def run_pending_retry_job(*, now=None) -> dict:
     """send_ledger の回収ジョブに相乗り（interval）。(1) 永続キューの再処理（register → 通知）、(2) 通知の再試行
-    （台帳 key は登録日のまま＝送れても 1 通・上限 NOTIFY_RETRY_MAX）。例外は固定語彙で握る（他の hook を止めない）。"""
-    res = {"requeued": 0, "registered": 0, "register_failed": 0, "notify_retried": 0}
+    （台帳 key は登録日のまま＝送れても 1 通・上限 NOTIFY_RETRY_MAX）。例外は固定語彙で握る（他の hook を止めない）。
+    fix3 BC-15: (2) は notify_state=none（登録後に初回通知へ至らなかった行・未所有またはリース切れ）も回収する（notify_recovered）。
+    回収は **業務 LINE 通知だけ**＝顧客向け送信・J-0 には触れない（司令塔裁定・test_jikou_reply_q1c_fix3 が固定）。"""
+    res = {"requeued": 0, "registered": 0, "register_failed": 0, "notify_retried": 0, "notify_recovered": 0}
+    if not enabled():
+        # TEXT-APPROVAL-2-fix1: V2 OFF では定期ジョブは入口で停止（永続キューの再処理・通知の再試行・回収のいずれも行わない）
+        res[JOB_STATUS_KEY] = JOB_DISABLED
+        return res
     if not reply_pending._db_configured():
         return res
     try:
@@ -655,31 +699,33 @@ async def run_pending_retry_job() -> dict:
         queue = []
     for q in queue:
         res["requeued"] += 1
+        # fix2 BC-07: キューに置いた通知キー（初回値）をそのまま対応待ち行へ引き継ぐ（旧キュー行は登録日の key を算出）
+        key = q.get("notice_key") or await _legacy_notice_key(q, q["created_at"])
         pid = await reply_pending.register(
             business=q["business"], channel=q["channel"], line_user_hash=q["line_user_hash"], route=q["route"],
             reason=q["reason"], inbound_event_id=q["inbound_event_id"], conversation_id=q["conversation_id"],
-            category=(q["category"] or None), approval_record_id=(q["approval_record_id"] or None))
+            category=(q["category"] or None), approval_record_id=(q["approval_record_id"] or None), notice_key=key)
         if pid is None:
             res["register_failed"] += 1
             await reply_pending.retry_bump(q["retry_id"])
             continue
         res["registered"] += 1
         await reply_pending.retry_done(q["retry_id"], pid)
-        state = await _notify_row({"conversation_id": q["conversation_id"], "line_user_hash": q["line_user_hash"],
-                                   "approval_record_id": q["approval_record_id"], "category": q["category"]},
-                                  q["created_at"])
-        await reply_pending.set_notify_state(pid, state)
+        await _notify_pending(pid, key, (q["approval_record_id"] or None), (q["category"] or None))
     try:
-        rows = await reply_pending.list_notify_retry()
+        rows = await reply_pending.list_notify_retry(now=now)
     except Exception:
         logger.warning("[SEND_POLICY] notify retry read failed (fixed reason)")
         rows = []
     for r in rows:
         res["notify_retried"] += 1
+        if r.get("notify_state") == reply_pending.NOTIFY_NONE:
+            res["notify_recovered"] += 1
         created = datetime.datetime.fromisoformat(r["created_at"]) if r.get("created_at") else None
-        state = await _notify_row(r, created)
-        await reply_pending.bump_attempts(r["pending_id"])
-        await reply_pending.set_notify_state(r["pending_id"], state)
+        # fix2 BC-07: 保存済みの通知キーで再試行（claim を取れた 1 者だけが送り、attempts を進める）
+        key = r.get("notice_key") or await _legacy_notice_key(r, created)
+        await _notify_pending(r["pending_id"], key, (r.get("approval_record_id") or None), (r.get("category") or None),
+                              bump_attempts=True, now=now)
     if res["registered"] or res["notify_retried"]:
         logger.info("[SEND_POLICY] pending retry job registered=%s notify_retried=%s",
                     emit(res["registered"], "count", "log", "operator"),
@@ -688,14 +734,28 @@ async def run_pending_retry_job() -> dict:
 
 
 def age_notice_text(stats: dict, queued: int, threshold: int) -> str:
-    return (f"{AGE_NOTICE_HEADER}\n未返信の対応待ち {stats['open_count']} 件（{threshold} 分超 {stats['over_count']} 件・"
-            f"最長 {stats['oldest_minutes']} 分経過）・再処理待ち {queued} 件\n{AGE_NOTICE_FOOTER}")
+    """fix2 BC-08: 承認台帳の定型 ops_age_notice_v1 に **数値だけ** 差し込む。定型が未承認（台帳に無い・本文 SHA 不一致）なら ""
+    ＝呼出側は送らない（needs_approval）。文字列の組立・自由文の連結はしない。"""
+    tpl = approved_texts.approved_text(AGE_NOTICE_TEXT_KEY, AGE_NOTICE_TEMPLATE)
+    if tpl is None:
+        return ""
+    values = {"{{open}}": stats["open_count"], "{{threshold}}": threshold, "{{over}}": stats["over_count"],
+              "{{oldest}}": stats["oldest_minutes"], "{{queued}}": queued}
+    out = tpl
+    for slot in AGE_NOTICE_SLOTS:
+        out = out.replace(slot, str(int(values[slot])))
+    return out
 
 
 async def run_age_notice_job(hour: int, *, now=None) -> dict:
     """BC-03 (2): REPLY_PENDING_AGE_MIN 分を超えて open のままの対応待ちを 1 日 2 回まとめて通知（件数と経過分のみ・PII なし）。
     台帳 key `pending_age:{JST 日付}:{時}` で 1 枠 1 通。対象 0 件（再処理待ちも 0）なら送らない。"""
     res = {"over_count": 0, "queued": 0, "notice": ""}
+    if not enabled():
+        # TEXT-APPROVAL-2-fix1（Codex R-TA2 項目 3）: V2 OFF では入口で停止。承認台帳に定型が載っていても、期限超過の対応待ちが
+        # あっても、業務 LINE へは送らない（台帳行も作らない・送信関数を呼ばない）
+        res[JOB_STATUS_KEY] = JOB_DISABLED
+        return res
     if not reply_pending._db_configured():
         return res
     try:
@@ -707,9 +767,19 @@ async def run_age_notice_job(hour: int, *, now=None) -> dict:
     res.update(over_count=stats["over_count"], queued=queued)
     if stats["over_count"] == 0 and queued == 0:
         return res
+    text = age_notice_text(stats, queued, age_minutes())
+    if not text:
+        # fix2 BC-08: 定型が承認台帳に無い＝送らない（needs_approval）。未承認 key を台帳の仕組みに記録し、1 日 1 回だけ知らせる
+        logger.warning("[SEND_POLICY] age notice withheld (text needs approval; nothing sent)")
+        approved_texts.approved_or_safe(AGE_NOTICE_TEXT_KEY, AGE_NOTICE_TEMPLATE)
+        try:
+            await approved_texts.notify_unapproved_once()
+        except Exception:
+            logger.error("[SEND_POLICY] unapproved text notice failed (fixed reason)")
+        res["notice"] = AGE_NOTICE_NEEDS_APPROVAL
+        return res
     day = _jst_date(now).isoformat()
-    res["notice"] = await send_business_notice(f"pending_age:{day}:{int(hour):02d}",
-                                               age_notice_text(stats, queued, age_minutes()))
+    res["notice"] = await send_business_notice(f"pending_age:{day}:{int(hour):02d}", text)
     return res
 
 
@@ -721,3 +791,38 @@ def register_jobs() -> None:
         name = age_job_name(hour)
         if not hub_scheduler.is_registered(name):
             hub_scheduler.register_daily(name, hour, functools.partial(run_age_notice_job, hour))
+
+
+# ══════════════════════════════════════════════════════════════
+# JIKOU-REPLY-Q1c-fix2（Codex R-Q1c-fix1 REJECT・BC-06〜BC-11・司令塔裁定）: 末尾追記
+#   BC-07 通知キーは登録時に 1 度だけ算出して保存し（reply_pending.notice_key・キュー → 登録で引き継ぐ）、通知は
+#         reply_pending.claim_notify（条件付き更新）を取れた 1 者だけが進む。
+# ══════════════════════════════════════════════════════════════
+async def _notify_pending(pid: int, computed_key: str, approval_record_id, category, *,
+                          bump_attempts: bool = False, now=None) -> str:
+    """保存済みの通知キーで業務 LINE 通知する。claim（条件付き更新）を取れた 1 者だけが送って notify_state を記録する
+    （取れなければ何もせず ""）。
+    fix3 BC-13: 送信に使う key は **claim と同一トランザクションで読んだ永続キーだけ**（旧行の NULL 埋めも同一 tx・computed_key は
+    その埋め値としてしか使わない）。claim／読取の例外は送らずに ""（rollback で claim も残らない＝回収ジョブが拾い直す）。
+    確定値が取れなければ claim を解放して送らない。"""
+    owner = uuid.uuid4().hex
+    try:
+        claim, key = await reply_pending.claim_notify(pid, owner, computed_key=computed_key, now=now)
+    except Exception:
+        logger.warning("[SEND_POLICY] notice claim or key read failed (not sent; left for recovery)")
+        return ""
+    if claim != reply_pending.CLAIM_OK:
+        logger.info("[SEND_POLICY] notice not claimed (another holder or already notified) result=%s",
+                    emit(claim, "freetext", "log", "operator"))
+        return ""
+    if not key:
+        logger.warning("[SEND_POLICY] notice key unavailable after claim (not sent; claim released)")
+        await reply_pending.release_notify_claim(pid, owner)
+        return ""
+    # fix4 BC-18: 送信前には試行数を加算しない。送信後、結果の確定・claim 解放と同一トランザクションで attempts+1（bump_attempts）。
+    # 送信後に停止した場合は、次の回収が保存キーで送信台帳と照合（begin の重複判定）して確定する
+    state = await send_business_notice(key, notice_text(approval_record_id, category))
+    # fix3 BC-14: 結果の記録と claim 解放は「自分が owner のまま」のときだけ（リース切れ後に他者が claim していれば遅着＝無変更）
+    if not await reply_pending.set_notify_state(pid, state, owner=owner, bump=bump_attempts):
+        logger.info("[SEND_POLICY] notice result arrived late (claim taken over; state unchanged)")
+    return state
