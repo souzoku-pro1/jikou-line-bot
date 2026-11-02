@@ -332,7 +332,12 @@ class TestAgeNoticeApprovedText(_Fix2Mixin):
     def test_unapproved_template_sends_nothing_and_marks_needs_approval(self):
         self.on()
         self._seed()
-        self.assertNotIn(sp.AGE_NOTICE_TEXT_KEY, AT.APPROVED_SHA256)                                   # 大野承認待ち（台帳に無い）
+        # TEXT-APPROVAL-2（2026-11-02）で台帳に載ったため、「未承認」は台帳から key を外して再現する（検証内容は不変）
+        unapproved = {k: v for k, v in AT.APPROVED_SHA256.items() if k != sp.AGE_NOTICE_TEXT_KEY}
+        p = patch.dict(AT.APPROVED_SHA256, unapproved, clear=True)
+        p.start()
+        self.addCleanup(p.stop)
+        self.assertNotIn(sp.AGE_NOTICE_TEXT_KEY, AT.APPROVED_SHA256)                                   # 未承認の状態
         self.assertEqual(sp.age_notice_text({"open_count": 3, "over_count": 2, "oldest_minutes": 90}, 0, 60), "")
         admin = AsyncMock(return_value=True)
         with patch("hub.notify.notify_admin_line", admin), self.assertLogs("hub.send_policy", level="WARNING") as cm:
@@ -373,8 +378,9 @@ class TestAgeNoticeApprovedText(_Fix2Mixin):
         src = (REPO / "hub" / "send_policy.py").read_text(encoding="utf-8")
         self.assertNotIn("f\"{AGE_NOTICE_HEADER}\\n未返信の対応待ち {stats", src)                        # 旧い文字列組立は残っていない
         self.assertEqual(sp.AGE_NOTICE_TEXT_KEY, "ops_age_notice_v1")
-        # hub/approved_texts.py は TEXT-APPROVAL-GATE-1（0e80ea6）と同一内容（別 PR の merge で衝突しない）
-        self.assertEqual(set(AT.APPROVED_SHA256), {AT.SAFE_TEXT_KEY})
+        # 台帳の閉集合: TEXT-APPROVAL-GATE-1 の安全文 ＋ TEXT-APPROVAL-2（2026-11-02・大野承認）の ops_age_notice_v1（契約の追随）
+        self.assertEqual(set(AT.APPROVED_SHA256), {AT.SAFE_TEXT_KEY, sp.AGE_NOTICE_TEXT_KEY})
+        self.assertEqual(AT.APPROVED_SHA256[sp.AGE_NOTICE_TEXT_KEY], AT.sha256_text(sp.AGE_NOTICE_TEMPLATE))
 
 
 # ── 4. BC-09: 対応待ちの読取失敗（None）は送信を進めない（返信欄・承認 webhook） ─────────────────────

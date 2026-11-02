@@ -297,6 +297,7 @@ class TestRetryQueueAndNotices(_Fix1Mixin):
                                                line_user_hash="h", route="customer", reason="demoted")))
 
     def test_queue_is_abandoned_after_max_attempts(self):
+        self.on()                                                                  # TEXT-APPROVAL-2-fix1: 定期ジョブは V2 ON でのみ動く（入口ゲートへの追随・検証内容は不変）
         self.assertTrue(_run(rp.enqueue_retry(business="jikou", channel="jikou", inbound_event_id="e-a",
                                               line_user_hash=sl.line_user_hash("jikou", USER), route="inbound",
                                               reason="policy_stopped")))

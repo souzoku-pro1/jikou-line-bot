@@ -490,6 +490,8 @@ AGE_NOTICE_TEMPLATE = (f"{AGE_NOTICE_HEADER}\n未返信の対応待ち {{{{open}
                        f"最長 {{{{oldest}}}} 分経過）・再処理待ち {{{{queued}}}} 件\n{AGE_NOTICE_FOOTER}")
 AGE_NOTICE_SLOTS = ("{{open}}", "{{threshold}}", "{{over}}", "{{oldest}}", "{{queued}}")   # 数値のみ（本文・ID・氏名は無い）
 AGE_NOTICE_NEEDS_APPROVAL = "needs_approval"                                              # run_age_notice_job の notice 値（送っていない）
+JOB_STATUS_KEY = "status"                                                                 # TEXT-APPROVAL-2-fix1: 定期ジョブの入口ゲートの印
+JOB_DISABLED = "disabled"                                                                 # V2 OFF＝入口で停止（DB も台帳も触らず・送信関数を呼ばない）
 REPLY_PENDING_AGE_MIN_DEFAULT = 60                     # 要大野確認（env REPLY_PENDING_AGE_MIN で上書き可）
 REPLY_PENDING_AGE_MIN_ENV = "REPLY_PENDING_AGE_MIN"
 AGE_NOTICE_HOURS_JST = (9, 15)                         # 1 日 2 回（要大野確認・HOUKI 系ジョブと同じ hub/scheduler の daily）
@@ -655,6 +657,10 @@ async def run_pending_retry_job(*, now=None) -> dict:
     fix3 BC-15: (2) は notify_state=none（登録後に初回通知へ至らなかった行・未所有またはリース切れ）も回収する（notify_recovered）。
     回収は **業務 LINE 通知だけ**＝顧客向け送信・J-0 には触れない（司令塔裁定・test_jikou_reply_q1c_fix3 が固定）。"""
     res = {"requeued": 0, "registered": 0, "register_failed": 0, "notify_retried": 0, "notify_recovered": 0}
+    if not enabled():
+        # TEXT-APPROVAL-2-fix1: V2 OFF では定期ジョブは入口で停止（永続キューの再処理・通知の再試行・回収のいずれも行わない）
+        res[JOB_STATUS_KEY] = JOB_DISABLED
+        return res
     if not reply_pending._db_configured():
         return res
     try:
@@ -716,6 +722,11 @@ async def run_age_notice_job(hour: int, *, now=None) -> dict:
     """BC-03 (2): REPLY_PENDING_AGE_MIN 分を超えて open のままの対応待ちを 1 日 2 回まとめて通知（件数と経過分のみ・PII なし）。
     台帳 key `pending_age:{JST 日付}:{時}` で 1 枠 1 通。対象 0 件（再処理待ちも 0）なら送らない。"""
     res = {"over_count": 0, "queued": 0, "notice": ""}
+    if not enabled():
+        # TEXT-APPROVAL-2-fix1（Codex R-TA2 項目 3）: V2 OFF では入口で停止。承認台帳に定型が載っていても、期限超過の対応待ちが
+        # あっても、業務 LINE へは送らない（台帳行も作らない・送信関数を呼ばない）
+        res[JOB_STATUS_KEY] = JOB_DISABLED
+        return res
     if not reply_pending._db_configured():
         return res
     try:
