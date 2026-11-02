@@ -1,0 +1,73 @@
+"""TEXT-APPROVAL-2（Q1c 文言 2 件の承認反映・2026-11-02・大野承認・Fable 経由）
+
+固定する仕様:
+- 承認台帳 hub/approved_texts.APPROVED_SHA256 への追加は ops_age_notice_v1 の 1 行だけ（SHA 59da41fc…＝send_policy.AGE_NOTICE_TEMPLATE
+  の本文そのまま）。他キー（SAFE-1）は不変。
+- J-0 文言（send_policy.J0_TEXT）は本文そのまま承認＝J0_TEXT と sha pin（0f1c3ca2…）は不変。
+- 承認後、V2 ON なら run_age_notice_job は needs_approval ではなく送信（台帳を patch せずに確認）。未承認通知は出ない。
+- V2 OFF では対応待ちが登録されず対象 0 件＝経路が動かないことは不変。
+"""
+
+import datetime
+import unittest
+from unittest.mock import AsyncMock, patch
+
+from test_jikou_reply_q1c import (_run, USER2)  # noqa: E402
+from test_jikou_reply_q1c_fix2 import _Fix2Mixin  # noqa: E402
+
+from hub import approved_texts as AT  # noqa: E402
+from hub import reply_pending as rp  # noqa: E402
+from hub import send_policy as sp  # noqa: E402
+
+SHA_AGE = "59da41fcf2545b9aaa19175ea18315388e5b1e6df1c65bdbccaccacfc879652d"
+SHA_J0 = "0f1c3ca29956f4000aface287c8dc9aa7c6907e93c9b7f1267858a6c2212b03d"
+J0 = "ご連絡ありがとうございます。内容を確認のうえ、弁護士からこの LINE でご返信いたします。"
+AGE_SENT = ("【対応待ち・未返信】\n未返信の対応待ち 3 件（60 分超 2 件・最長 90 分経過）・再処理待ち 0 件\n"
+            "/app/pending からご確認ください。")
+
+
+class TestTextApproval2(_Fix2Mixin):
+    NOW = datetime.datetime(2026, 11, 2, 3, 0, tzinfo=datetime.timezone.utc)
+
+    def setUp(self):
+        super().setUp()
+        AT.reset_pending_for_tests()
+        self.addCleanup(AT.reset_pending_for_tests)
+
+    def test_ledger_has_exactly_the_approved_line_and_j0_pin_is_unchanged(self):
+        self.assertEqual(AT.APPROVED_SHA256["ops_age_notice_v1"], SHA_AGE)                        # 承認した SHA（全桁）
+        self.assertEqual(AT.sha256_text(sp.AGE_NOTICE_TEMPLATE), SHA_AGE)                          # 本文・テンプレートは変えていない
+        self.assertEqual(set(AT.APPROVED_SHA256), {AT.SAFE_TEXT_KEY, sp.AGE_NOTICE_TEXT_KEY})      # 追加は 1 行のみ
+        self.assertEqual(AT.APPROVED_SHA256[AT.SAFE_TEXT_KEY], AT.sha256_text(AT.SAFE_TEXT))       # 他キー不変
+        self.assertTrue(AT.is_approved(sp.AGE_NOTICE_TEXT_KEY, sp.AGE_NOTICE_TEMPLATE))
+        self.assertIsNone(AT.approved_text(sp.AGE_NOTICE_TEXT_KEY, sp.AGE_NOTICE_TEMPLATE + "。"))   # 1 文字違えば不一致＝再承認
+        self.assertEqual((sp.J0_TEXT, sp.J0_TEXT_SHA256), (J0, SHA_J0))                            # J-0 は本文そのまま承認（pin 不変）
+
+    def test_age_notice_is_sent_after_approval_without_patching_the_ledger(self):
+        self.on()                                                                                  # V2 ON
+        self.reg(inbound_event_id="e-old1", now=self.NOW - datetime.timedelta(minutes=90))
+        self.reg(inbound_event_id="e-old2", now=self.NOW - datetime.timedelta(minutes=61))
+        self.reg(user=USER2, inbound_event_id="e-new", now=self.NOW - datetime.timedelta(minutes=5))
+        self.assertEqual(sp.age_notice_text({"open_count": 3, "over_count": 2, "oldest_minutes": 90}, 0, 60), AGE_SENT)
+        admin = AsyncMock(return_value=True)
+        with patch("hub.notify.notify_admin_line", admin):
+            res = _run(sp.run_age_notice_job(9, now=self.NOW))
+        self.assertEqual((res["over_count"], res["queued"], res["notice"]), (2, 0, rp.NOTIFY_SENT))   # needs_approval ではなく送信
+        self.assertEqual(self.biz.await_count, 1)
+        self.assertEqual(self.biz.await_args.args[1], AGE_SENT)                                    # 数値差し込みのみ・スロット残なし
+        admin.assert_not_awaited()                                                                 # 未承認通知は出ない
+        self.assertEqual(AT.pending_unapproved_keys(), ())
+        self.assertEqual(len([o for o in self.ops() if o["channel"] == "jikou_notice"]), 1)        # 台帳 1 行
+        self.assertEqual(_run(sp.run_age_notice_job(9, now=self.NOW))["notice"], rp.NOTIFY_THROTTLED)   # 同じ枠は 1 通
+        self.assertEqual(self.biz.await_count, 1)
+
+    def test_v2_off_path_is_unchanged(self):
+        self.assertFalse(sp.enabled())                                                             # V2 OFF（既定）
+        res = _run(sp.run_age_notice_job(9, now=self.NOW))
+        self.assertEqual(res, {"over_count": 0, "queued": 0, "notice": ""})                        # 対応待ちは登録されない＝対象 0 件
+        self.biz.assert_not_awaited()
+        self.assertEqual(self.pending(), [])
+
+
+if __name__ == "__main__":
+    unittest.main()

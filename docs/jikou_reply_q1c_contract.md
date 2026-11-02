@@ -85,8 +85,10 @@ ON のときだけ有効な事項は「V2 ON」と明記する。
     `hub/approved_texts.APPROVED_SHA256` に載った定型 **`ops_age_notice_v1`**（`send_policy.AGE_NOTICE_TEMPLATE`）だけ。文字列組立は
     せず、数値スロット（{{open}}／{{threshold}}／{{over}}／{{oldest}}／{{queued}}）だけ差し込む。**未承認の間は送らない**
     （`run_age_notice_job` の notice=`needs_approval`・台帳行なし・未承認 key は approved_texts の仕組みで 1 日 1 回だけ知らせる）。
-    文面と SHA は `pgv/q1c_fix2_texts_for_approval.md`（大野承認待ち）。`hub/approved_texts.py` は TEXT-APPROVAL-GATE-1（`0e80ea6`）
-    と同一内容を q1c に置いた（同じ blob＝別 PR の merge で衝突しない・台帳の追加は司令塔の票でのみ）。
+    文面と SHA は `pgv/q1c_fix2_texts_for_approval.md`。`hub/approved_texts.py` は TEXT-APPROVAL-GATE-1（`0e80ea6`）
+    と同一内容を q1c に置いた（台帳の追加は司令塔の票でのみ）。
+    **TEXT-APPROVAL-2（2026-11-02・大野承認・Fable 経由）: `ops_age_notice_v1` の本文 SHA `59da41fcf2545b9aaa19175ea18315388e5b1e6df1c65bdbccaccacfc879652d` をそのまま承認し、
+    台帳に 1 行追加（承認済み）。** 以後、V2 ON なら経過通知は送られる（V2 OFF では経路が動かないことは不変）。
 - **V2 ON の条件**: 本節の結線（永続キューの migration 適用・回収ジョブの登録・経過通知のジョブ登録）が完了していること。
   未完了のまま ON にすると、保存失敗した受信が回収されず無言のまま残る。
 
@@ -130,9 +132,9 @@ ON のときだけ有効な事項は「V2 ON」と明記する。
   無言）に基づく **限定的な凍結解除** として承認済み。FROZEN_SHA の他の項目（ヒアリング prompt・PENDING_REPLY・即時定型・法テラス・
   費用固定文）は不変。
 - main の JIKOU-FAQ-ADDON-PROMPT-1（`67f992e`・QUEUE-2026-10-11-B Q-4・司令塔票で承認）による FAQ「完了後の追加依頼の費用」行への「固定文を必ず含める」1 文と、上記の 1 行追加は、main `b8ab474` 同期 merge（JIKOU-REPLY-Q1c-sync-main・2026-10-31）で同じ prompt 本文に共存する。**両方とも承認済みの凍結解除**であり、pin は両方を含む本文で再計算（customer_prompt_base `908f9335…`・集約 sha `ce329d3c…`）。他の凍結項目は不変。
-- J-0 文言（`send_policy.J0_TEXT`・sha pin）は司令塔仮置き・**大野承認待ち**（fix2 時点でも未承認のまま）。
-  **fix2 BC-11（凍結記録）: J-0 文言の大野承認は V2 有効化前の条件**（`JIKOU_SEND_POLICY_V2` を ON にする前に承認を得る）とする。承認時は
-  `J0_TEXT` と test の sha pin を同時に更新する（変更が無ければ pin はそのまま）。
+- J-0 文言（`send_policy.J0_TEXT`・sha pin `0f1c3ca29956f4000aface287c8dc9aa7c6907e93c9b7f1267858a6c2212b03d`）: **大野承認済み（TEXT-APPROVAL-2・2026-11-02・Fable 経由・本文そのまま）**。
+  **fix2 BC-11（凍結記録）: J-0 文言の大野承認は V2 有効化前の条件**（`JIKOU_SEND_POLICY_V2` を ON にする前に承認を得る）とし、
+  本承認で満たされた。承認時の変更は無いため `J0_TEXT` と test の sha pin は不変（文言を直す場合は両方を同時に更新して再承認）。
 
 ## 7. migration（fix1 BC-02）
 
