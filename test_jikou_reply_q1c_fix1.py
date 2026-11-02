@@ -27,6 +27,7 @@ from test_jikou_reply_q1c import (_DbMixin, _FakeClient, _FakeResp, _client, _co
 
 import chat_responder as cr  # noqa: E402
 import main  # noqa: E402
+from hub import approved_texts as AT  # noqa: E402
 from hub import line_channel  # noqa: E402
 from hub import reply_pending as rp  # noqa: E402
 from hub import scheduler as hub_scheduler  # noqa: E402
@@ -38,6 +39,7 @@ REPO = Path(__file__).parent
 NOW = datetime.datetime(2026, 10, 21, 3, 0, tzinfo=datetime.timezone.utc)      # 12:00 JST
 RETRY = "d4f6a8b0c2e4"
 PENDING = "a1c3e5f7b9d2"
+NOTICE = "b7d9f1a3c5e7"          # Q1c-fix2 BC-07: notice_key／claim 列（d4f6 の次・head）
 
 
 def _begin_none_for(channels):
@@ -181,6 +183,7 @@ class TestMigrationChain(unittest.TestCase):
                 rev = down_of.get(rev)
             i = chain.index(RETRY)
             self.assertEqual(chain[i:i + 6], [RETRY, PENDING, "c8e0a2b4d6f8", "a7c9e1f3b5d7", "f7b2c9d4e1a6", "e5f8a1b4c7d9"])
+            self.assertEqual(chain[i - 1], NOTICE)                       # Q1c-fix2 BC-07: b7d9 は d4f6 の直後（鎖は 1 本のまま）
         finally:
             shutil.rmtree(d, ignore_errors=True)
         src = (REPO / "alembic" / "versions" / "20261012_a1c3e5f7b9d2_reply_pending.py").read_text(encoding="utf-8")
@@ -192,9 +195,9 @@ class TestMigrationChain(unittest.TestCase):
         dbfile = f"{d}/mig.db"
         alembic, tables, _unique_cols, nullable = TestAlembicScaffold._brain_mig_tools(dbfile)
         try:
-            up = alembic("upgrade", RETRY)                        # 後続票の head に依存しない（d4f6 まで）
+            up = alembic("upgrade", NOTICE)                       # Q1c-fix2 BC-07: 列集合（notice_key 列を含む）は b7d9 で比較
             self.assertEqual(up.returncode, 0, f"stderr={up.stderr[-800:]}")
-            self.assertIn(RETRY, alembic("current").stdout)
+            self.assertIn(NOTICE, alembic("current").stdout)
             self.assertIn(rp.RETRY_TABLE_NAME, tables())
             con = sqlite3.connect(dbfile)
             try:
@@ -209,6 +212,9 @@ class TestMigrationChain(unittest.TestCase):
                 con.commit()
             finally:
                 con.close()
+            down = alembic("downgrade", RETRY)                    # Q1c-fix2: notice_key にデータが無ければ b7d9 は落とせる（検証内容は fix1 のまま）
+            self.assertEqual(down.returncode, 0, f"stderr={down.stderr[-800:]}")
+            self.assertIn(RETRY, alembic("current").stdout)
             down = alembic("downgrade", PENDING)
             self.assertNotEqual(down.returncode, 0)
             self.assertIn("reply_pending_retry_downgrade_refused_data_present", down.stderr)
@@ -291,6 +297,7 @@ class TestRetryQueueAndNotices(_Fix1Mixin):
                                                line_user_hash="h", route="customer", reason="demoted")))
 
     def test_queue_is_abandoned_after_max_attempts(self):
+        self.on()                                                                  # TEXT-APPROVAL-2-fix1: 定期ジョブは V2 ON でのみ動く（入口ゲートへの追随・検証内容は不変）
         self.assertTrue(_run(rp.enqueue_retry(business="jikou", channel="jikou", inbound_event_id="e-a",
                                               line_user_hash=sl.line_user_hash("jikou", USER), route="inbound",
                                               reason="policy_stopped")))
@@ -335,13 +342,18 @@ class TestRetryQueueAndNotices(_Fix1Mixin):
         self.assertEqual((self.pending()[0]["notify_state"], self.biz.await_count), ("sent", 1))
         # 上限: attempts が NOTIFY_RETRY_MAX に達した行は対象外（通知は増えない）
         pid = self.reg(user=USER2, inbound_event_id="e-cap")
-        _run(rp.set_notify_state(pid, rp.NOTIFY_FAILED))
+        _run(rp.set_notify_state_unowned(pid, rp.NOTIFY_FAILED))          # Q1c-fix4 BC-17: 通知経路外の管理操作は *_unowned（owner 必須契約への追随）
         for _ in range(rp.NOTIFY_RETRY_MAX):
-            _run(rp.bump_attempts(pid))
+            _run(rp.bump_attempts_unowned(pid))
         self.assertEqual(_run(sp.run_pending_retry_job())["notify_retried"], 0)
         self.assertEqual(self.biz.await_count, 1)
 
     def test_age_notice_twice_a_day_with_counts_only(self):
+        # Q1c-fix2 BC-08: 経過通知の本文は承認台帳の定型だけ。本テストは「承認済み」の状態（台帳に key と SHA がある）で従来の検証を行う
+        # （未承認＝送らない、は test_jikou_reply_q1c_fix2.TestAgeNoticeApprovedText）
+        p = patch.dict(AT.APPROVED_SHA256, {sp.AGE_NOTICE_TEXT_KEY: AT.sha256_text(sp.AGE_NOTICE_TEMPLATE)})
+        p.start()
+        self.addCleanup(p.stop)
         self.on()
         a = self.reg(inbound_event_id="e-old1", now=NOW - datetime.timedelta(minutes=90))
         b = self.reg(inbound_event_id="e-old2", now=NOW - datetime.timedelta(minutes=61))
@@ -440,7 +452,7 @@ class TestFixedTargets(_Fix1Mixin):
         self.assertEqual({x["pending_id"]: x["state"] for x in self.pending()}[c], "open")
         self.assertEqual(_run(sp.human_replied(USER, ())), 0)
         with patch.object(rp, "open_ids_for_user", AsyncMock(side_effect=RuntimeError("x"))):
-            self.assertEqual(_run(sp.pending_targets(USER)), ())        # 読取失敗は空＝何も閉じない
+            self.assertIsNone(_run(sp.pending_targets(USER)))          # Q1c-fix2 BC-09: 読取失敗は None（0 件の () と区別・呼出側は送らない）
         self.assertEqual([h["to"] for h in _run(rp.history(a))], ["open", "human_replied"])
 
     def test_reply_view_fixes_targets_before_explicit_send(self):
