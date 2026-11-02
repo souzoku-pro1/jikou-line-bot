@@ -309,7 +309,7 @@ class TestNoticeKeyPersistence(_Fix2Mixin):
                 self.assertEqual(con.execute("SELECT COUNT(*) FROM reply_pending").fetchone()[0], 1)   # 行は残る
             finally:
                 con.close()
-            self.assertEqual(alembic("upgrade", "head").returncode, 0)
+            self.assertEqual(alembic("upgrade", NOTICE).returncode, 0)   # head は後続 migration で変わり得るため b7d9 を明示
             self.assertIn(NOTICE, alembic("current").stdout)
         finally:
             shutil.rmtree(d, ignore_errors=True)
