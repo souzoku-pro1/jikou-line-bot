@@ -66,7 +66,7 @@ import uuid
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 
-from hub import kintone, line_channel, reply_exemplar, reply_followup, send_ledger
+from hub import kintone, line_channel, reply_exemplar, reply_followup, send_ledger, send_policy
 from hub.redact import emit
 from hub.webapp_auth import _gate, _sign
 
@@ -112,6 +112,8 @@ _DONE_NOTICES = {
     # fix4 BR-15
     "op_rejected": "この操作 ID は再利用できません（送信済み・終了済み、または本文・宛先が前回と異なります）。"
                    "画面を開き直して新しい操作でやり直してください。送信していません。",
+    # Q1c-fix2 BC-09
+    "pending_unavailable": "対応待ち（解除対象）を読み取れないため送信できません。時間をおいて同じ操作で再試行してください。送信していません。",
 }
 _STATE_LABELS = {"sent": "送信済み", "unconfirmed": "送信確認待ち", "failed": "失敗",
                  "started": "着手済（確認中）", "pending": "着手前", "none": "不明"}
@@ -405,7 +407,9 @@ def _notices(q) -> list[str]:
     done_text = _DONE_NOTICES.get(done, "")
     if done == "late" and done_text:
         done_text += _STATE_LABELS.get(q.get("state", ""), _STATE_LABELS["none"])
-    return [done_text, _LOG_NOTICES.get(q.get("log", ""), ""), _EX_NOTICES.get(q.get("ex", ""), "")]
+    pd = q.get("pd", "")
+    pd_text = f"同じ相談者の対応待ち {html.escape(pd)} 件を閉じました。" if pd.isdigit() else ""   # JIKOU-REPLY-Q1c (d)
+    return [done_text, _LOG_NOTICES.get(q.get("log", ""), ""), _EX_NOTICES.get(q.get("ex", ""), ""), pd_text]
 
 
 async def reply_page(request: Request):
@@ -490,6 +494,14 @@ async def reply_send(request: Request):
         # fix4 BR-15: 同 op_id の既存行が 終端／送信済み／本文・宛先不一致／台帳行あり → 送らず「新しい操作でやり直し」
         logger.info("[REPLY] operation rejected by followup table (not sent)")
         return _redirect(back, "op_rejected")
+    pd_targets = await send_policy.pending_targets(user_id)   # Q1c-fix1 BC-04: 送信着手時点の返信対象（open）を固定
+    if pd_targets is None:
+        # Q1c-fix2 BC-09: 対応待ちの読取不能（1 回再試行後）＝解除対象が分からないまま送らない。回収行は prepared のまま（本文保持）
+        # ＝同一 op_id・同一本文の再 POST で再開できる（台帳不可と同じ扱い）
+        logger.warning("[REPLY] pending targets unavailable (not sent) record_id=%s",
+                       emit(record_id, "record_id", "log", "operator"))
+        await reply_followup.note_prepared(op_id, "pending_unavailable")
+        return _redirect(back, "pending_unavailable")
     result = await line_channel.push_text_explicit(line_channel.JIKOU_CHANNEL, op_id, user_id, text)
     if result.outcome == line_channel.PUSH_LEDGER_UNAVAILABLE:
         logger.warning("[REPLY] ledger unavailable (not sent) record_id=%s",
@@ -524,11 +536,12 @@ async def reply_send(request: Request):
                                            find_chatlog=find_human_chatlog, ledger_state=send_ledger.operation_state)
     log_res = _MAIN_PATH_LOG.get(res, "pending_retry")
     reflect_memory_history(user_id, text)
+    pd_res = await send_policy.human_replied(user_id, pd_targets)   # JIKOU-REPLY-Q1c (d)／fix1 BC-04: 固定した集合だけを閉じる（送信中の受信は open）
     ex_res = "off"
     if want_exemplar:
         ex_res = await _save_exemplar(user_id, _v(rec, "顧客メッセージ"), text, op_id,
                                       _v(rec, "顧客名"))
-    return _redirect(back, "sent", log=log_res, ex=ex_res)
+    return _redirect(back, "sent", log=log_res, ex=ex_res, pd=(str(pd_res) if pd_res else ""))
 
 
 async def _safe_followup(op_id: str) -> dict | None:

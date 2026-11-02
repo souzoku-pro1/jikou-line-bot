@@ -217,12 +217,12 @@ REPLY_URL = "https://api.line.me/v2/bot/message/reply"
 PUSH_URL  = "https://api.line.me/v2/bot/message/push"
 
 
-async def _line_reply_with_fallback(reply_token: str, user_id: str, text: str) -> None:
+async def _line_reply_with_fallback(reply_token: str, user_id: str, text: str) -> str:  # JIKOU-REPLY-Q1c-fix1 BC-05: 3 値を返す
     """LINE Reply APIを試み、失敗（400等）したらPush APIにフォールバック。
 
     SOUZOKU-HOUKI-H1: 実装は hub/line_channel.reply_with_push_fallback へ
     逐語移設（時効チャネル JIKOU_CHANNEL=従来 env・ログ文言・順序とも不変）。"""
-    await hub_line_channel.reply_with_push_fallback(
+    return await hub_line_channel.reply_with_push_fallback(  # JIKOU-REPLY-Q1c-fix1 BC-05: 戻り値（SEND_SENT／FAILED／UNCONFIRMED／POLICY_STOPPED）を呼出元へ
         hub_line_channel.JIKOU_CHANNEL, reply_token, user_id, text)
 
 # OCR固定資産エンドポイント用の環境変数（起動時ではなくリクエスト時にチェック）
@@ -825,8 +825,8 @@ async def _process_line_event(reply_token: str, user_id: str, user_text: str) ->
         except Exception:
             await _handle_app21_lookup_failure(user_id, user_text)
             return
-        if is_human_mode(app21_record):
-            await _handle_human_mode_inbound(user_id, user_text, app21_record)
+        if (_stop := await _inbound_stop_kind(user_id, app21_record)):  # JIKOU-REPLY-Q1c (a): 人対応 or 許可表 V2 の bot 停止
+            await _handle_stopped_inbound(_stop, user_id, user_text, app21_record)  # JIKOU-REPLY-Q1c
             return
         # 裁定 G-2: 解除後の最初の受信。人対応中に抑止した受領返信は後出しで
         # 送らない——保留行のある未回収マーカーを「人対応済」行で閉じる（送信なし）。
@@ -900,8 +900,8 @@ async def _process_line_event(reply_token: str, user_id: str, user_text: str) ->
                 logger.info("[ROUTING] user_id=%s App21 (status/routing redacted)",
                             emit(user_id, "external_ref", "log", "operator"))
                 if routing != "hearing":
-                    async def _reply_func(token: str, text: str) -> None:
-                        await _line_reply_with_fallback(token, user_id, text)
+                    async def _reply_func(token: str, text: str) -> str:  # JIKOU-REPLY-Q1c-fix2 BC-06: 送信結果を返す（J-0 の記録は戻り値で確定）
+                        return await _line_reply_with_fallback(token, user_id, text)
                     await handle_customer_message(
                         user_id=user_id,
                         user_message=user_text,
@@ -957,8 +957,8 @@ async def _process_line_event(reply_token: str, user_id: str, user_text: str) ->
                     history.pop()
                 return
             # PRIMARY / FALLBACK 両方失敗 → 確認中応答 + 承認キューに要対応レコード
-            async def _reply_func(token: str, text: str) -> None:
-                await _line_reply_with_fallback(token, user_id, text)
+            async def _reply_func(token: str, text: str) -> str:  # JIKOU-REPLY-Q1c-fix2 BC-06: 送信結果を返す（障害応答の J-0 も同じ）
+                return await _line_reply_with_fallback(token, user_id, text)
             await handle_claude_outage(
                 user_id=user_id,
                 user_message=user_text,
@@ -1059,10 +1059,10 @@ async def _process_line_event(reply_token: str, user_id: str, user_text: str) ->
         violations = ((["プレースホルダ/内部マーカー残存"] if _fatal else [])
                       + reply_sanitizer.structure_violations(
                           cleaned, exempt_blocks=HEARING_TEMPLATE_BLOCKS)
-                      + style_guard_violations(cleaned, route="hearing"))
+                      + style_guard_violations(cleaned, route="hearing") + send_policy.empty_reply_violations(cleaned))  # JIKOU-REPLY-Q1c (b)
         history = conversation_histories.get(user_id, [])
         if violations:
-            await save_to_approval_queue(
+            _aid = await save_to_approval_queue(  # JIKOU-REPLY-Q1c (d): 対応待ちに App 29 No. を付ける
                 user_id=user_id,
                 customer_name="（ヒアリング中）",
                 customer_message=user_text,
@@ -1071,12 +1071,12 @@ async def _process_line_event(reply_token: str, user_id: str, user_text: str) ->
                 reason="[ヒアリング送信ゲートで降格] " + " / ".join(violations),
             )
             if history and history[-1].get("role") == "assistant":
-                history[-1]["content"] = PENDING_REPLY
-            await _line_reply_with_fallback(reply_token, user_id,
-                                            PENDING_REPLY)
+                send_policy.settle_demoted_history(history, PENDING_REPLY)  # JIKOU-REPLY-Q1c: OFF=定型に置換／ON=送らない文を残さない
+            _ack = await send_policy.demoted_ack(user_id, reply_token, _aid, "その他判断系", _line_reply_with_fallback, PENDING_REPLY)  # JIKOU-REPLY-Q1c (b)(c)(d)
+            # JIKOU-REPLY-Q1c: OFF は従来どおり PENDING_REPLY を送る／ON は対応待ち+通知・J-0 か無言
             await save_to_chatlog(user_id, "user", user_text,
                                   "ヒアリング", "no")
-            await save_to_chatlog(user_id, "assistant", PENDING_REPLY,
+            if _ack: await save_to_chatlog(user_id, "assistant", _ack,  # JIKOU-REPLY-Q1c: 送った文だけ記録
                                   "ヒアリング", "yes")
             return
         if cleaned != claude_reply and history                 and history[-1].get("role") == "assistant":
@@ -1597,11 +1597,11 @@ async def kintone_approval_webhook(request: Request):
     # LINE push 送信 → 送信済みフラグ更新 → チャットログ保存
     # RV-04c §4.2 phase 表: marker 後の失敗（例外・timeout）は sending 維持（failed 上書き禁止・
     # 不明は不明のまま §4.2 runbook へ）。例外は握らず伝播させ、state は sending に留める。
-    async with send_ledger.approved_draft(f"approval:{record_id}:{record.get('$revision', {}).get('value', '')}"): _sl_res = await send_line_push(user_id, ai_draft)  # JIKOU-REPLY-Q1a
+    async with send_ledger.approved_draft(f"approval:{record_id}:{record.get('$revision', {}).get('value', '')}"), send_policy.fixed_targets(user_id): _sl_res = await send_line_push(user_id, ai_draft)  # JIKOU-REPLY-Q1a／Q1c-fix1 BC-04: 送信着手時点の対応待ち集合を固定
     if _sl_res == send_ledger.SEND_UNCONFIRMED: return {"ok": True, "skip": "send_unconfirmed_duplicate"}  # JIKOU-REPLY-Q1a-fix1 BQ-01: 結果未確認の重複は送信済更新・記録へ進まない（sending 維持=§4.2 runbook）
-    await mark_approval_sent(record_id); await save_to_chatlog(user_id, "assistant", ai_draft, category, "yes")
-    if _ev:
-        await mark_done(_ev)   # 全副作用完了後の terminal（sending→done・last_error=NULL）
+    if _sl_res == send_ledger.SEND_POLICY_STOPPED: return await _approval_policy_stopped(_ev, record_id, record)  # JIKOU-REPLY-Q1c (a): 許可表 V2 で停止=送信済更新へ進まない（noop 終端+通知）
+    await mark_approval_sent(record_id); await save_to_chatlog(user_id, "assistant", ai_draft, category, "yes"); await send_policy.approved_draft_sent(record_id, user_id)  # JIKOU-REPLY-Q1c (d): 送信成功で対応待ちを閉じる
+    if _ev: await mark_done(_ev)   # 全副作用完了後の terminal（sending→done・last_error=NULL）
 
     return {"ok": True, "record_id": record_id}
 
@@ -2363,3 +2363,57 @@ send_ledger.check_timing_config()
 #    送信は hub/line_channel.push_text_explicit → send_ledger（human_reply 文脈）。
 from hub.webapp_reply_view import router as reply_view_router  # noqa: E402
 include_before_catch_all(app, reply_view_router)
+
+
+# ── JIKOU-REPLY-Q1c（QUEUE-2026-10-12-C C-1）: 許可表 V2（bot／承認済み下書き）・空返事の無言化・J-0・
+#    対応待ち（/app/pending）の結線。末尾追記（sink allowlist の行番号 pin を壊さない規約・本文中は 1 行置換のみ）。
+#    flag JIKOU_SEND_POLICY_V2 が OFF（既定）のとき、本節の関数は従来の分岐（人対応のみ）に素通しする。
+from hub import send_policy  # noqa: E402
+from hub.webapp_pending_view import router as pending_view_router  # noqa: E402
+include_before_catch_all(app, pending_view_router)
+
+STOP_HUMAN = "human"
+STOP_POLICY = "policy"
+
+
+async def _inbound_stop_kind(user_id: str, app21_record) -> str:
+    """受信入口の停止判定（HRI-08 の人対応ゲート＋Q1c 許可表 V2）。人対応は従来どおり最優先。
+    V2 ON で bot の自動送信が許可表に落ちる（対応中・App 39 判定不能）なら policy。OFF は ""。"""
+    if is_human_mode(app21_record):
+        return STOP_HUMAN
+    if await send_policy.bot_stop_reasons(user_id):
+        return STOP_POLICY
+    return ""
+
+
+async def _handle_stopped_inbound(kind: str, user_id: str, user_text: str, app21_record) -> None:
+    """人対応は従来の処理（無言・App 28 記録・【人対応中】通知）。許可表 V2 の停止は無言・App 28 記録・
+    対応待ち登録・業務 LINE 通知（1 会話 1 日 1 回・固定文言）。顧客へは送らない。"""
+    if kind == STOP_HUMAN:
+        await _handle_human_mode_inbound(user_id, user_text, app21_record)
+        return
+    reasons = await send_policy.bot_stop_reasons(user_id)
+    logger.info("[SEND_POLICY] inbound stopped (no auto reply) user_id=%s",
+                emit(user_id, "external_ref", "log", "operator"))
+    await save_to_chatlog(user_id, "user", user_text, "", "no")
+    await send_policy.inbound_stopped(user_id, reasons)
+
+
+async def _approval_policy_stopped(_ev, record_id: str, record: dict) -> dict:
+    """承認済み下書きが許可表 V2 で止まった: 送信済み=no のまま（解除後の再承認で送れる）・kintone lane は
+    noop 終端・業務 LINE へ固定文言（1 承認版 1 通）。"""
+    reasons = send_policy.last_stop_reasons()
+    logger.info("[KINTONE] approval push stopped (send_policy v2) record_id=%s",
+                emit(record_id, "record_id", "log", "operator"))
+    await send_policy.approval_blocked(record_id, str(record.get("$revision", {}).get("value", "")), reasons)
+    if _ev:
+        # PRE-REVIEW-1 #275-1: ここは mark_sending の後（state=sending）なので received 専用の mark_noop_done ではなく
+        # sending→done の終端を使う（enum 外・状態不整合で webhook 500・行が sending で滞留していた）
+        from hub.kintone_lane import mark_stopped_after_sending
+        await mark_stopped_after_sending(_ev, "skip_policy_v2")
+    return {"ok": True, "skip": "policy_stopped"}
+
+
+# ── JIKOU-REPLY-Q1c-fix1（Codex R-Q1c BC-03）: 対応待ちの永続キュー再処理（回収ジョブに相乗り）と未返信の経過通知
+#    （1 日 2 回・件数と経過分のみ）の登録。末尾追記（pin 番地不変）。start_all は既存の startup（healthcheck／houki）が呼ぶ。
+send_policy.register_jobs()
