@@ -7,7 +7,7 @@ QUEUE-2026-10-12-C C-2 (c)。表定義は hub/reply_exemplar.py の metadata（r
 downgrade: 1 表を落とす。**データがあれば downgrade 禁止**（1 行でもあれば例外で拒否＝RV-08）。
 
 Revision ID: b2d4f6a8c0e1
-Revises: d4f6a8b0c2e4（Q1c-fix1 で a1c3 → d4f6 に付け替え）
+Revises: b7d9f1a3c5e7（Q1c-fix1 で a1c3 → d4f6、FORWARD-MERGE-2 で d4f6 → b7d9 に付け替え）
 Create Date: 2026-10-12
 """
 from typing import Sequence, Union
@@ -16,7 +16,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = 'b2d4f6a8c0e1'
-down_revision: Union[str, Sequence[str], None] = 'd4f6a8b0c2e4'   # Q1c-fix1 で a1c3 → d4f6（永続キュー）に付け替え
+down_revision: Union[str, Sequence[str], None] = 'b7d9f1a3c5e7'   # Q1c-fix1 で a1c3 → d4f6、FORWARD-MERGE-2（main ce92973）で d4f6 → b7d9（通知キー列）に付け替え
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
