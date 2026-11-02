@@ -900,8 +900,8 @@ async def _process_line_event(reply_token: str, user_id: str, user_text: str) ->
                 logger.info("[ROUTING] user_id=%s App21 (status/routing redacted)",
                             emit(user_id, "external_ref", "log", "operator"))
                 if routing != "hearing":
-                    async def _reply_func(token: str, text: str) -> None:
-                        await _line_reply_with_fallback(token, user_id, text)
+                    async def _reply_func(token: str, text: str) -> str:  # JIKOU-REPLY-Q1c-fix2 BC-06: 送信結果を返す（J-0 の記録は戻り値で確定）
+                        return await _line_reply_with_fallback(token, user_id, text)
                     await handle_customer_message(
                         user_id=user_id,
                         user_message=user_text,
@@ -957,8 +957,8 @@ async def _process_line_event(reply_token: str, user_id: str, user_text: str) ->
                     history.pop()
                 return
             # PRIMARY / FALLBACK 両方失敗 → 確認中応答 + 承認キューに要対応レコード
-            async def _reply_func(token: str, text: str) -> None:
-                await _line_reply_with_fallback(token, user_id, text)
+            async def _reply_func(token: str, text: str) -> str:  # JIKOU-REPLY-Q1c-fix2 BC-06: 送信結果を返す（障害応答の J-0 も同じ）
+                return await _line_reply_with_fallback(token, user_id, text)
             await handle_claude_outage(
                 user_id=user_id,
                 user_message=user_text,
