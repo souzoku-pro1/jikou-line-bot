@@ -34,6 +34,7 @@ pre.draft{background:#eef7e8;border:1px solid #cfe6c2}
 .lbl{color:#667;font-size:.78rem;margin-top:.4rem}
 .meta{color:#8a8f98;font-size:.78rem;margin-top:.3rem}
 .empty{color:#667;text-align:center;margin:1.2rem 0}
+.replylink{display:inline-block;margin-top:.3rem;font-size:.95rem}
 </style>
 </head>
 <body>
@@ -139,6 +140,11 @@ async function load() {
     }
     div.appendChild(el("div", "meta",
       "No." + v(rec, "$id") + "｜更新 " + fmtDate(v(rec, "更新日時"))));
+    // JIKOU-REPLY-Q1b: 返信欄は別画面（/app/reply/{No.}・サーバ描画・native form）。
+    // この画面には a 要素のリンクだけ置く（button/input/form/fetch は増やさない＝参照専用 pin 維持）
+    const reply = el("a", "replylink", "この相談者に返信する");
+    reply.href = "/app/reply/" + encodeURIComponent(v(rec, "$id"));
+    div.appendChild(el("div", "meta")).appendChild(reply);
     items.appendChild(div);
   }
   const from = offset + 1;

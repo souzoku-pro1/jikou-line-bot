@@ -39,6 +39,11 @@ import shutil
 import sys
 from datetime import datetime, timedelta
 
+# JIKOU-REPLY-Q1b-fix1 BR-04: PII の伏せ字・残留検査は hub/pii_scan（手本の匿名化と共通の検査器）。
+# CLI 実行（python tools/line_log_anonymize.py）でもリポジトリ直下を import 経路に入れる
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from hub import pii_scan  # noqa: E402
+
 
 def _publish(staging: str, out_dir: str) -> None:
     """staging ディレクトリを公開先へ一度の rename で確定（fix3 H01・テスト seam）。"""
@@ -94,17 +99,18 @@ _CATEGORIES = {
     "緊急対応", "本人確認不能・第三者", "その他判断系",
 }
 
+# fix1 BR-04: パターンは hub/pii_scan と共通（token は本ツール固有）。氏名等の非パターン PII は
+# [人]の手修正工程が担う（pii_scan.redact の氏名・呼びかけ・住所の伏せ字は手本側で使う）
 _REDACTIONS = [
-    (re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"), "<メール>"),
-    (re.compile(r"0\d{1,4}[-\s]?\d{1,4}[-\s]?\d{3,4}"), "<電話番号>"),
-    (re.compile(r"〒?\d{3}-\d{4}"), "<郵便番号>"),
+    (pii_scan.EMAIL_RE, "<メール>"),
+    (pii_scan.PHONE_RE, "<電話番号>"),
+    (pii_scan.POSTAL_RE, "<郵便番号>"),
     (re.compile(r"[?&]token=[A-Za-z0-9%_\-]+"), "<token>"),
-    (re.compile(r"\d{7,}"), "<数字列>"),
+    (pii_scan.LINE_USER_ID_RE, "<LINE ID>"),
+    (pii_scan.DIGITS_RE, "<数字列>"),
 ]
-_RESIDUE_RES = [
-    re.compile(r"0\d{1,4}-\d{1,4}-\d{3,4}"),
+_RESIDUE_RES = [rx for _name, rx in pii_scan.RESIDUE_RES] + [
     re.compile(r"\d{3}-\d{4}"),
-    re.compile(r"\d{7,}"),
     re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+"),
     re.compile(r"(?i)(token|secret|key)\s*[:=]\s*\S{8,}"),
 ]

@@ -281,6 +281,12 @@ async def _send_receipt_and_close(channel_name: str, channel,
             return False
         finally:
             send_ledger.unbind(_sl_tok)
+        if sent == send_ledger.SEND_POLICY_STOPPED:
+            # JIKOU-REPLY-Q1c (a): 許可表 V2（対応中・判定不能）で止まった受領返信は失敗ではなく保留
+            # （裁定 G-2 と同じ保留行＝解除後も後出しで送らない・失敗通知もしない）
+            logger.info("[IMAGE_INTAKE] receipt push held by send policy (no send)")
+            await hold_for_human_mode(channel_name, user_id)
+            return None
         if sent is not True:
             logger.error("[IMAGE_INTAKE] receipt push rejected "
                          "(stays unreplied)")

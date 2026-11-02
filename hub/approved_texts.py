@@ -36,6 +36,7 @@ def sha256_text(text: str) -> str:
 # ── 承認台帳（key → 承認済み本文の SHA256）。追加は司令塔の票（大野の裁定）でのみ行う。 ──
 APPROVED_SHA256: dict[str, str] = {
     SAFE_TEXT_KEY: sha256_text(SAFE_TEXT),
+    "ops_age_notice_v1": "59da41fcf2545b9aaa19175ea18315388e5b1e6df1c65bdbccaccacfc879652d",
 }
 
 LEDGER_BUSINESS = "jikou"
