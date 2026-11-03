@@ -395,7 +395,7 @@ class TestPins(unittest.TestCase):
         self.assertEqual(sorted(int(e.split(":")[1]) for e in entries if e.startswith("main.py:")),
                          [663, 685, 1320, 1620, 1917])
         self.assertEqual(sorted(int(e.split(":")[1]) for e in entries
-                                if e.startswith("chat_responder.py:")), [1660, 1672])
+                                if e.startswith("chat_responder.py:")), [])          # Q3a-fix1 BQ-04: 2 件を回収（allowlist 追加ゼロ・削除のみ）
         csrc = (REPO / "chat_responder.py").read_text(encoding="utf-8").split("\n")
         self.assertEqual(sum("reply_exemplar.prompt_note(p.name, status)" in l for l in csrc), 1)
         self.assertEqual(sum("reply_exemplar.mark_used_for(_exn, category)" in l for l in csrc), 1)
@@ -418,3 +418,36 @@ class TestPins(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ── fix1 BQ-04（Codex R-Q3a・RV-10）: compose_reply の障害 2 分岐のログに生 user_id・例外本文・traceback を出さない ──
+class TestBq04OutageLogging(_DbMixin):
+    SECRET = "sekrit-token-9f8e7d"
+
+    def _recv(self, exc):
+        outage = AsyncMock()
+        ack = AsyncMock()
+        with patch.object(cr, "_call_compose_reply", AsyncMock(side_effect=exc)), \
+             patch.object(cr, "handle_claude_outage", outage), \
+             patch.object(sp, "outage_ack", ack), \
+             patch.object(cr, "get_app21_record", AsyncMock(return_value=_rec(status="受付"))), \
+             self.assertLogs("chat_responder", level="INFO") as cm:
+            _run(cr.handle_customer_message(user_id=USER, user_message="q", reply_token="rt",
+                                            app21_record=_rec(status="受付"), reply_func=AsyncMock()))
+        return "\n".join(cm.output), outage, ack
+
+    def test_unavailable_and_generic_failures_log_fixed_reason_only(self):
+        for exc, expect_outage in ((cr.ClaudeUnavailableError(f"upstream 503 for {USER} {self.SECRET}"), True),
+                                   (RuntimeError(f"rate limited {USER} {self.SECRET}"), False)):
+            out, outage, ack = self._recv(exc)
+            self.assertNotIn(USER, out)
+            self.assertNotIn(self.SECRET, out)
+            self.assertNotIn("Traceback", out)
+            self.assertIn("[COMPOSE_REPLY]", out)
+            self.assertNotIn(type(exc).__name__, out)                    # 固定理由だけ（型名も本文も出さない）
+            self.assertEqual(outage.await_count, 1 if expect_outage else 0)
+            self.assertEqual(ack.await_count, 0 if expect_outage else 1)
+        src = (REPO / "chat_responder.py").read_text(encoding="utf-8")
+        self.assertNotIn('logger.exception("compose_reply', src)
+        self.assertEqual(src.count('[COMPOSE_REPLY] unavailable (fixed reason)'), 1)
+        self.assertEqual(src.count('[COMPOSE_REPLY] failed (fixed reason)'), 1)

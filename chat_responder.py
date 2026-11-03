@@ -1657,7 +1657,7 @@ async def handle_customer_message(
                                            tool=p.compose_tool)
     except ClaudeUnavailableError as e:
         # PRIMARY / FALLBACK 両方失敗 → 確認中応答 + 承認キューに要対応レコード
-        logger.exception("compose_reply unavailable for user_id=%s", user_id)
+        logger.error("[COMPOSE_REPLY] unavailable (fixed reason)")  # Q3a-fix1 BQ-04: 生 user_id・例外本文・traceback を出さない（RV-10）
         await handle_claude_outage(
             user_id=user_id,
             user_message=user_message,
@@ -1668,8 +1668,8 @@ async def handle_customer_message(
             profile=p,
         )
         return
-    except Exception:
-        logger.exception("compose_reply failed for user_id=%s", user_id)
+    except Exception as e:  # Q3a-fix1 BQ-04（RV-10）
+        logger.error("[COMPOSE_REPLY] failed (fixed reason)")
         # 一時的なエラー（レート制限等）は定型文を返して終了
         # （H2-fix1 [01]: 障害系の両経路とも profile の pending_reply を使う）
         await send_policy.outage_ack(user_id, reply_token, reply_func, p.pending_reply)  # JIKOU-REPLY-Q1c: ON は無言+対応待ち
