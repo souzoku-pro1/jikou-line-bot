@@ -43,7 +43,7 @@ import uuid
 
 import sqlalchemy as sa
 
-from hub import approved_texts, empty_reply_guard, kintone, reply_pending, send_ledger
+from hub import approved_texts, empty_reply_guard, jikou_reply_texts, kintone, reply_pending, send_ledger
 from hub.db import session_scope as db_session_scope
 from hub.redact import emit
 
@@ -55,9 +55,9 @@ CUSTOMER_CHANNEL = "jikou"               # 許可表 V2 を適用する顧客チ
 CONDITION_TTL_SECONDS = 30.0             # 停止条件の照会結果の再利用窓（受信入口と送信前で 2 度引かない）
 _JST = datetime.timezone(datetime.timedelta(hours=9))
 
-# J-0（初回受付・業務 × LINE 利用者 単位で 1 回〔fix2 BC-11〕・司令塔仮置き・大野承認待ち＝V2 有効化前の条件）。
+# J-0（初回受付・業務 × LINE 利用者 単位で 1 回〔fix2 BC-11〕・大野承認済み〔TEXT-APPROVAL-2 2026-11-02・sha 0f1c3ca2…〕）。
 # 文言変更は本定数と test の sha pin を同時に更新する
-J0_TEXT = "ご連絡ありがとうございます。内容を確認のうえ、弁護士からこの LINE でご返信いたします。"
+J0_TEXT = jikou_reply_texts.text("J-0")   # JIKOU-REPLY-Q2: データ表（hub/jikou_reply_texts）が正・値は C-1／main と同一（sha pin で固定）
 J0_TEXT_SHA256 = hashlib.sha256(J0_TEXT.encode("utf-8")).hexdigest()
 
 # 業務 LINE への固定文言（PII なし・App 29 No. とカテゴリは統制値）
@@ -441,9 +441,38 @@ async def approval_blocked(record_id: str, revision: str, reasons) -> str:
     return await send_business_notice(f"approval_blocked:{record_id}:{revision}", text)
 
 
-async def approved_draft_sent(record_id: str, user_id: str) -> int:
-    """承認済み下書きの送信成功: **送信着手時点で固定した**対応待ち集合（fixed_targets が束ねたもの）だけを
-    human_replied（approved_draft）で閉じる（fix1 BC-04）。送信中に届いた受信は open のまま。固定集合が無ければ閉じない。"""
+PROMOTION_HEADER = "【凍結定型の候補】"
+PROMOTION_FOOTER = "/app/exemplars と承認キューを確認し、凍結定型への昇格を検討してください（昇格は Q5・票で反映）。"
+
+
+async def promotion_check(record_id: str, text: str) -> str:
+    """JIKOU-REPLY-Q3a (c): 承認済み下書きの送信文を起票時の下書きと照合し、無修正承認が PROMOTION_THRESHOLD 回に
+    達した category は業務 LINE へ固定文言を 1 回だけ通知（台帳キー exemplar_promotion:{category}:{回数}）。
+    戻り値: none（照合対象なし／修正あり／閾値未達）・sent・throttled・failed 等（通知の結果）。"""
+    from hub import reply_exemplar
+    res = await reply_exemplar.record_sent(record_id, text)
+    if not res or not res.get("unmodified") or not res.get("category"):
+        return "none"
+    if int(res.get("count") or 0) != reply_exemplar.PROMOTION_THRESHOLD:
+        return "none"
+    cat = str(res["category"])
+    n = int(res["count"])
+    logger.info("[SEND_POLICY] exemplar promotion candidate count=%s", emit(n, "count", "log", "operator"))
+    return await send_business_notice(
+        f"exemplar_promotion:{cat}:{n}",
+        f"{PROMOTION_HEADER}\nカテゴリ「{cat}」の AI 下書きが無修正で {n} 回承認されました。\n{PROMOTION_FOOTER}")
+
+
+async def approved_draft_sent(record_id: str, user_id: str, text: str | None = None,
+                              category: str | None = None) -> int:
+    """承認済み下書きの送信成功: (Q1c-fix1 BC-04) **送信着手時点で固定した**対応待ち集合（fixed_targets が束ねたもの）だけを
+    human_replied（approved_draft）で閉じる（送信中に届いた受信は open のまま・固定集合が無ければ閉じない）。
+    (Q3a) 無修正承認の計数と候補通知（flag 非依存・失敗は握る）。"""
+    if text is not None:
+        try:
+            await promotion_check(record_id, text)
+        except Exception:
+            logger.warning("[SEND_POLICY] promotion check failed (fixed reason)")
     if not enabled():
         return 0
     ids = _fixed_targets.get()

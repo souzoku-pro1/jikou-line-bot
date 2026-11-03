@@ -1600,7 +1600,7 @@ async def kintone_approval_webhook(request: Request):
     async with send_ledger.approved_draft(f"approval:{record_id}:{record.get('$revision', {}).get('value', '')}"), send_policy.fixed_targets(user_id): _sl_res = await send_line_push(user_id, ai_draft)  # JIKOU-REPLY-Q1a／Q1c-fix1 BC-04: 送信着手時点の対応待ち集合を固定
     if _sl_res == send_ledger.SEND_UNCONFIRMED: return {"ok": True, "skip": "send_unconfirmed_duplicate"}  # JIKOU-REPLY-Q1a-fix1 BQ-01: 結果未確認の重複は送信済更新・記録へ進まない（sending 維持=§4.2 runbook）
     if _sl_res == send_ledger.SEND_POLICY_STOPPED: return await _approval_policy_stopped(_ev, record_id, record)  # JIKOU-REPLY-Q1c (a): 許可表 V2 で停止=送信済更新へ進まない（noop 終端+通知）
-    await mark_approval_sent(record_id); await save_to_chatlog(user_id, "assistant", ai_draft, category, "yes"); await send_policy.approved_draft_sent(record_id, user_id)  # JIKOU-REPLY-Q1c (d): 送信成功で対応待ちを閉じる
+    await mark_approval_sent(record_id); await save_to_chatlog(user_id, "assistant", ai_draft, category, "yes"); await send_policy.approved_draft_sent(record_id, user_id, ai_draft, category)  # JIKOU-REPLY-Q1c (d): 対応待ちを閉じる／Q3a (c): 無修正承認の計数
     if _ev: await mark_done(_ev)   # 全副作用完了後の terminal（sending→done・last_error=NULL）
 
     return {"ok": True, "record_id": record_id}
@@ -2358,6 +2358,32 @@ send_ledger.check_dialect_at_startup()
 # fix3 BQ-09: 時間設定の整合（heartbeat < 送信 timeout < deadline < 回収閾値）。不整合は警告+既定値
 send_ledger.check_timing_config()
 
+# ── HOUKI-DAIRININ-1（QUEUE-2026-10-12-C C-3）: 代理人目録の生成受け口（/souzoku-houki/dairinin/{secret}）。末尾追記。
+from dairinin_webhook import router as dairinin_router  # noqa: E402
+app.include_router(dairinin_router)
+
+# ── HOUKI-KOSEKI-CHECKLIST-1（QUEUE-2026-10-12-C C-4）: 受任時の必要戸籍チェックリスト初期行（定期走査+受け口）と
+#    連続戸籍充足の候補通知。末尾追記。走査ジョブは常に登録し、実行可否は env HOUKI_KOSEKI_CHECKLIST_DISABLED
+#    （既定 有効）。start_all は既存 startup 経路が呼ぶ。
+from houki_koseki_webhook import router as houki_koseki_router  # noqa: E402
+app.include_router(houki_koseki_router)
+from hub.houki_koseki_checklist import register_houki_koseki_job  # noqa: E402
+register_houki_koseki_job()
+
+# ── HOUKI-JIJOU-1（QUEUE-2026-10-13-D D-5）: 上申書（事情説明書）の下書き・承認・生成画面（/app/houki/jijou）の結線。末尾追記。
+from hub.webapp_houki_jijou_view import router as houki_jijou_router  # noqa: E402
+include_before_catch_all(app, houki_jijou_router)
+
+# ── HOUKI-SHOKUMU-LINK-1（QUEUE-2026-10-13-D D-6）: App 40 → 職務上請求の請求案の受け口（flag OFF は I/O ゼロ）。末尾追記。
+from houki_shokumu_webhook import router as houki_shokumu_router  # noqa: E402
+app.include_router(houki_shokumu_router)
+
+# ── HOUKI-JUKURYO-3（QUEUE-2026-10-13-D D-7）: 期限超過×未提出の一覧（/app/houki/overdue）と日次の件数通知。末尾追記。
+from hub.houki_overdue import register_houki_overdue_job  # noqa: E402
+from hub.webapp_houki_overdue_view import router as houki_overdue_router  # noqa: E402
+include_before_catch_all(app, houki_overdue_router)
+app.router.on_startup.append(register_houki_overdue_job)   # 起動時に daily 登録（import 時にループを要求しない）
+
 # ── JIKOU-REPLY-Q1b: 大野の返信欄（/app/reply/{record_id}・明示送信・actor=human）の結線。
 #    末尾追記（sink allowlist の行番号 pin を壊さない規約）。catch-all より前へ並べ替える。
 #    送信は hub/line_channel.push_text_explicit → send_ledger（human_reply 文脈）。
@@ -2413,7 +2439,18 @@ async def _approval_policy_stopped(_ev, record_id: str, record: dict) -> dict:
         await mark_stopped_after_sending(_ev, "skip_policy_v2")
     return {"ok": True, "skip": "policy_stopped"}
 
-
 # ── JIKOU-REPLY-Q1c-fix1（Codex R-Q1c BC-03）: 対応待ちの永続キュー再処理（回収ジョブに相乗り）と未返信の経過通知
 #    （1 日 2 回・件数と経過分のみ）の登録。末尾追記（pin 番地不変）。start_all は既存の startup（healthcheck／houki）が呼ぶ。
 send_policy.register_jobs()
+
+# ── JIKOU-REPLY-Q3a（QUEUE-2026-10-12-C C-2）: 手本の承認・退役画面（/app/exemplars）の結線。末尾追記。
+from hub.webapp_exemplar_view import router as exemplar_view_router  # noqa: E402
+include_before_catch_all(app, exemplar_view_router)
+
+# ── JIKOU-REPLY-Q4（QUEUE-2026-10-13-D D-3）: AI 下書きの承認・修正・却下画面（/app/drafts）の結線。末尾追記。
+from hub.webapp_drafts_view import router as drafts_view_router  # noqa: E402
+include_before_catch_all(app, drafts_view_router)
+
+# ── JIKOU-REPLY-Q6（QUEUE-2026-10-13-E E-1）: 返信計測（/app/reply/metrics・/app/reply/{record_id} より前に置く）と週次要約ジョブ（startup 登録）。末尾追記。
+from hub.webapp_reply_metrics_view import wire_all as wire_reply_metrics  # noqa: E402
+wire_reply_metrics(app)
