@@ -292,6 +292,12 @@ NOTE_MAX_PER_CATEGORY = 3
 NOTE_MAX_CATEGORIES = 4
 NOTE_HEADER = "\n\n【参考文例（事務所の過去回答・文体と構成の参照のみ・そのまま写さない・個別の事情や数値は引用しない）】"
 NO_CATEGORY_LABEL = "分類なし"
+# Q3a-fix1 項目 4: 参考文例ブロックは **凍結対象外の実行時付加**（手本 0 件なら付加なし＝基底 prompt は byte 同一・pin 不変）。
+# 行のテンプレートを定数化し、NOTE_TEMPLATE の sha256 を test_jikou_reply_q3a で pin（凍結記録: docs/jikou_reply_q1c_contract.md §6）。
+NOTE_LINE_CATEGORY = "■ カテゴリ: {category}"
+NOTE_LINE_INBOUND = "例{i}（相談者）: {text}"
+NOTE_LINE_REPLY = "例{i}（事務所の返信）: {text}"
+NOTE_TEMPLATE = "\n".join([NOTE_HEADER, NOTE_LINE_CATEGORY, NOTE_LINE_INBOUND, NOTE_LINE_REPLY])
 
 
 def _iso(v) -> str:
@@ -365,13 +371,13 @@ def format_note(rows: list[dict]) -> ExemplarNote:
     lines = [NOTE_HEADER]
     ids: dict = {}
     for key in order:
-        lines.append(f"■ カテゴリ: {key}")
+        lines.append(NOTE_LINE_CATEGORY.format(category=key))
         ids[key] = [int(r["id"]) for r in groups[key]]
         for i, r in enumerate(groups[key], start=1):
             q = str(r.get("inbound_text") or "").strip()
             if q:
-                lines.append(f"例{i}（相談者）: {q}")
-            lines.append(f"例{i}（事務所の返信）: {str(r.get('human_reply') or '').strip()}")
+                lines.append(NOTE_LINE_INBOUND.format(i=i, text=q))
+            lines.append(NOTE_LINE_REPLY.format(i=i, text=str(r.get("human_reply") or "").strip()))
     note = ExemplarNote("\n".join(lines))
     note.ids_by_category = ids
     return note

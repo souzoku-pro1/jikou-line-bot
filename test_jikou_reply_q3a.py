@@ -623,3 +623,27 @@ class TestBq05PromotionClaim(_DbMixin):
         self.assertEqual((rx.PROMOTION_PENDING, rx.PROMOTION_SENT), ("pending", "sent"))
         src = (REPO / "hub" / "send_policy.py").read_text(encoding="utf-8")
         self.assertNotIn("!= reply_exemplar.PROMOTION_THRESHOLD", src)          # count == 閾値の瞬間依存は無い
+
+
+# ── fix1 項目 4（prompt）: 参考文例ブロックのテンプレート pin・基底 prompt の pin 不変 ──
+class TestItem4PromptPins(unittest.TestCase):
+    NOTE_TEMPLATE_SHA256 = "511ade90f0c8ec7893659ceed06d42a8477d43015af0665bf5ecf210fa00dd49"
+
+    def test_runtime_block_template_is_pinned_and_base_prompt_unchanged(self):
+        import hashlib
+        from test_autoreply_style1 import FROZEN_SHA, _CUSTOMER_STYLE_MARKER
+        self.assertEqual(hashlib.sha256(rx.NOTE_TEMPLATE.encode("utf-8")).hexdigest(), self.NOTE_TEMPLATE_SHA256)
+        self.assertEqual(rx.NOTE_TEMPLATE, "\n".join([rx.NOTE_HEADER, rx.NOTE_LINE_CATEGORY, rx.NOTE_LINE_INBOUND, rx.NOTE_LINE_REPLY]))
+        # 基底 prompt（customer_prompt_base）は byte 同一（手本 0 件＝付加なし）
+        restored = cr._SYSTEM_PROMPT_BASE.replace(_CUSTOMER_STYLE_MARKER + "\n\n", "", 1)
+        self.assertEqual(hashlib.sha256(restored.encode("utf-8")).hexdigest(), FROZEN_SHA["customer_prompt_base"])
+        base = cr.build_system_prompt(status="受付")
+        self.assertEqual(cr.build_system_prompt(status="受付", exemplar_note=""), base)
+        note = rx.format_note([{"id": 1, "category_id": "挨拶・雑談", "inbound_text": "q", "human_reply": "r", "active": True}])
+        self.assertEqual(note, rx.NOTE_HEADER + "\n" + rx.NOTE_LINE_CATEGORY.format(category="挨拶・雑談") + "\n"
+                         + rx.NOTE_LINE_INBOUND.format(i=1, text="q") + "\n" + rx.NOTE_LINE_REPLY.format(i=1, text="r"))
+        self.assertEqual(cr.build_system_prompt(status="受付", exemplar_note=note), base + note)   # 末尾付加のみ
+        src = (REPO / "hub" / "reply_exemplar.py").read_text(encoding="utf-8")
+        self.assertNotIn('f"■ カテゴリ', src)
+        doc = (REPO / "docs" / "jikou_reply_q1c_contract.md").read_text(encoding="utf-8")
+        self.assertIn(self.NOTE_TEMPLATE_SHA256[:16], doc)                     # 凍結記録に 1 行
