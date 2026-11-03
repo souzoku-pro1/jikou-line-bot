@@ -27,8 +27,10 @@ class _Base(unittest.TestCase):
 
 
 class TestLedger(_Base):
-    def test_initial_ledger_is_safe_text_only(self):
-        self.assertEqual(set(AT.APPROVED_SHA256), {AT.SAFE_TEXT_KEY})
+    def test_initial_ledger_is_exactly_the_approved_keys(self):
+        # FORWARD-MERGE-2 §2 裁定（2026-11-03）: 台帳の閉集合は main と同じ 2 キー。TEXT-APPROVAL-2（#320・大野承認）で
+        # ops_age_notice_v1 が承認記録つきで増えたことへの契約の追随であり、検査の緩和ではない（キー集合の完全一致は維持）
+        self.assertEqual(set(AT.APPROVED_SHA256), {AT.SAFE_TEXT_KEY, "ops_age_notice_v1"})
         self.assertEqual(AT.approved_text(AT.SAFE_TEXT_KEY, AT.SAFE_TEXT), AT.SAFE_TEXT)
 
     def test_unregistered_or_mismatch_is_none(self):
