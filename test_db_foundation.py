@@ -1053,11 +1053,17 @@ class TestReplyExemplarMigration(unittest.TestCase):
                 self.assertEqual(cols, {c.name for c in reply_exemplar.reply_draft_approval.columns})
                 self.assertTrue(nullable(con, reply_exemplar.DRAFT_TABLE_NAME)["unmodified"])
                 self.assertFalse(nullable(con, reply_exemplar.DRAFT_TABLE_NAME)["draft_text_version"])
+                # Q3a-fix1 BQ-05: 候補通知の確定表（同一 revision）
+                self.assertIn(reply_exemplar.PROMOTION_TABLE_NAME, tables())
+                cols = {r[1] for r in con.execute(f'PRAGMA table_info("{reply_exemplar.PROMOTION_TABLE_NAME}")')}
+                self.assertEqual(cols, {c.name for c in reply_exemplar.exemplar_promotion_notice.columns})
+                self.assertFalse(nullable(con, reply_exemplar.PROMOTION_TABLE_NAME)["state"])
             finally:
                 con.close()
             down = alembic("downgrade", self.REPLY_PENDING)   # b2d4 → b7d9 → d4f6 → a1c3（通知キー列・永続キューも落ちる）
             self.assertEqual(down.returncode, 0, f"stderr={down.stderr[-800:]}")
             self.assertNotIn(reply_exemplar.DRAFT_TABLE_NAME, tables())
+            self.assertNotIn(reply_exemplar.PROMOTION_TABLE_NAME, tables())   # Q3a-fix1 BQ-05
             self.assertNotIn(reply_pending.RETRY_TABLE_NAME, tables())
             con = sqlite3.connect(dbfile)
             try:

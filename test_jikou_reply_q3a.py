@@ -549,3 +549,77 @@ class TestBq03ContextName(_DbMixin):
         self.assertIsNone(_run(rx.exemplar_history(xid2))[-1]["note"])
         self.assertEqual(_run(rx.update_texts(xid2, human_reply="", inbound_text=""))[0], "bad_input")
         self.assertEqual(_run(rx.update_texts(999, human_reply="x", inbound_text=""))[0], "not_found")
+
+
+# ── fix1 BQ-05（Codex R-Q3a）: 閾値到達の確定（固定キー・並行 2 件で 1 者）・通知失敗の回収 ──
+class TestBq05PromotionClaim(_DbMixin):
+    def _queue(self, draft, rid, category="費用の定型案内"):
+        with patch.object(cr.httpx, "AsyncClient", _FakeClient):
+            class _R(_FakeResp):
+                def json(self_inner):
+                    return {"id": rid}
+            with patch.object(_FakeClient, "post", AsyncMock(return_value=_R(200))):
+                return _run(cr.save_to_approval_queue(user_id=USER, customer_name="n", customer_message="m",
+                                                      ai_draft=draft, category=category, reason="r"))
+
+    def _notices(self):
+        return self._rows(rx.exemplar_promotion_notice)
+
+    def test_concurrent_two_reach_threshold_but_only_one_notifies(self):
+        for i in range(1, 5):
+            self._queue(f"下書き {i}", rid=str(i))
+        self.assertEqual(_run(sp.promotion_check("1", "下書き 1")), "none")
+        self.assertEqual(_run(sp.promotion_check("2", "下書き 2")), "none")
+        self.assertEqual(self._notices(), [])
+
+        async def _both():
+            return await asyncio.gather(sp.promotion_check("3", "下書き 3"), sp.promotion_check("4", "下書き 4"))
+        results = _run(_both())
+        self.assertEqual(sorted(results), ["none", "sent"])                     # 確定者 1・他方は none
+        self.assertEqual(self.biz.await_count, 1)
+        rows = self._notices()
+        self.assertEqual([(r["business"], r["category"], r["threshold"], r["state"], r["attempts"]) for r in rows],
+                         [("jikou", "費用の定型案内", 3, "sent", 1)])
+        self.assertIsNotNone(rows[0]["notified_at"])
+        self.assertEqual(_run(rx.count_unmodified("jikou", "費用の定型案内")), 4)   # 両方とも無修正として数えている
+        # 5 件目以降の無修正は確定済み（固定キー）なので通知しない
+        self._queue("下書き 5", rid="5")
+        self.assertEqual(_run(sp.promotion_check("5", "下書き 5")), "none")
+        self.assertEqual(self.biz.await_count, 1)
+        self.assertEqual(len(self._notices()), 1)
+        text = self.biz.await_args.args[1]
+        self.assertIn("費用の定型案内", text)
+        self.assertIn("3 回", text)
+        self.assertNotIn("下書き 3", text)                                       # 本文は載せない（固定文言のみ）
+        self.assertNotIn("下書き 4", text)
+
+    def test_notice_failure_stays_pending_and_recover_job_resends_once(self):
+        for i in range(1, 4):
+            self._queue(f"下書き {i}", rid=str(i))
+        _run(sp.promotion_check("1", "下書き 1"))
+        _run(sp.promotion_check("2", "下書き 2"))
+        self.biz.return_value = False                                             # LINE が受け付けない
+        self.assertEqual(_run(sp.promotion_check("3", "下書き 3")), rp.NOTIFY_FAILED)
+        rows = self._notices()
+        self.assertEqual((rows[0]["state"], rows[0]["attempts"]), ("pending", 1))
+        self.assertEqual(self.biz.await_count, 1)
+        self.biz.return_value = True
+        sp.register_jobs()
+        self.assertIn(sp.run_promotion_notice_job, sl._recover_hooks)            # 回収ジョブに相乗り
+        self.assertEqual(_run(sp.run_promotion_notice_job()), {"retried": 1})
+        rows = self._notices()
+        self.assertEqual((rows[0]["state"], rows[0]["attempts"]), ("sent", 2))
+        self.assertEqual(self.biz.await_count, 2)
+        self.assertEqual(_run(sp.run_promotion_notice_job()), {"retried": 0})   # 送れたら対象外
+        self.assertEqual(_run(sp.send_promotion_notice("jikou", "費用の定型案内", 3)), rp.NOTIFY_THROTTLED)   # 台帳キーで 1 通
+        self.assertEqual(self.biz.await_count, 2)
+        with patch.dict(os.environ, {"DATABASE_URL": ""}):
+            self.assertEqual(_run(sp.run_promotion_notice_job()), {"retried": 0})
+
+    def test_table_pin(self):
+        self.assertEqual(rx.PROMOTION_TABLE_NAME, "exemplar_promotion_notice")
+        self.assertEqual({c.name for c in rx.exemplar_promotion_notice.columns},
+                         {"business", "category", "threshold", "state", "attempts", "created_at", "notified_at"})
+        self.assertEqual((rx.PROMOTION_PENDING, rx.PROMOTION_SENT), ("pending", "sent"))
+        src = (REPO / "hub" / "send_policy.py").read_text(encoding="utf-8")
+        self.assertNotIn("!= reply_exemplar.PROMOTION_THRESHOLD", src)          # count == 閾値の瞬間依存は無い

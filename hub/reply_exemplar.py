@@ -31,6 +31,8 @@ import hashlib
 import logging
 
 import sqlalchemy as sa
+from sqlalchemy.dialects import postgresql as _pg
+from sqlalchemy.dialects import sqlite as _sqlite
 
 from hub import db, pii_scan
 from hub.db import DatabaseNotConfigured, session_scope
@@ -115,6 +117,22 @@ reply_draft_approval = sa.Table(
     sa.Index("ix_reply_draft_approval_cat", "business", "category", "unmodified"),
 )
 PROMOTION_THRESHOLD = 3                 # 無修正承認がこの回数に達したら「凍結定型の候補」通知（昇格は Q5）
+# Q3a-fix1 BQ-05（Codex R-Q3a）: 候補通知の確定表。閾値到達を (business, category, threshold) の固定キーで **1 行だけ** 確定し
+# （同一 tx・INSERT … ON CONFLICT DO NOTHING＝並行 2 件でも 1 者だけ）、確定した者が台帳キーで通知する。通知に失敗したら
+# state=pending のまま残り、回収ジョブ（send_policy.run_promotion_notice_job）が再通知する。本文・ID は置かない。
+PROMOTION_TABLE_NAME = "exemplar_promotion_notice"
+PROMOTION_PENDING = "pending"
+PROMOTION_SENT = "sent"
+exemplar_promotion_notice = sa.Table(
+    PROMOTION_TABLE_NAME, metadata,
+    sa.Column("business", sa.Text, primary_key=True),
+    sa.Column("category", sa.Text, primary_key=True),
+    sa.Column("threshold", sa.Integer, primary_key=True),
+    sa.Column("state", sa.Text, nullable=False, server_default=PROMOTION_PENDING),
+    sa.Column("attempts", sa.Integer, nullable=False, server_default="0"),
+    sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+    sa.Column("notified_at", sa.DateTime(timezone=True), nullable=True),
+)
 
 # ── 匿名化（共通検査器 hub/pii_scan に委譲・BR-04） ─────────────────────────────
 _reject_count = {"residue": 0}
@@ -430,7 +448,12 @@ async def record_sent(record_id, text: str) -> dict | None:
                 reply_draft_approval.c.business == row.business,
                 reply_draft_approval.c.category == row.category,
                 reply_draft_approval.c.unmodified.is_(True)))).scalar() or 0)
-        return {"category": row.category, "unmodified": unmodified, "count": n}
+            # Q3a-fix1 BQ-05: 閾値到達（>=）を同一 tx で固定キーに確定。確定できた 1 者だけ claimed=True（並行 2 件でも 1 者）
+            claimed = False
+            if unmodified and row.category and n >= PROMOTION_THRESHOLD:
+                claimed = await _claim_promotion(s, row.business, row.category, PROMOTION_THRESHOLD, now)
+        return {"category": row.category, "unmodified": unmodified, "count": n, "claimed": claimed,
+                "threshold": PROMOTION_THRESHOLD}
     except Exception:
         logger.warning("[REPLY_EXEMPLAR] record_sent failed (fixed reason)")
         return None
@@ -488,3 +511,54 @@ async def update_texts(exemplar_id: int, *, human_reply: str, inbound_text: str)
         await s.execute(sa.update(reply_exemplar).where(reply_exemplar.c.id == int(exemplar_id)).values(
             human_reply=reply, inbound_text=inbound))
     return "ok", []
+
+
+# ── JIKOU-REPLY-Q3a-fix1 BQ-05（Codex R-Q3a）: 候補通知の確定（固定キー・1 者）と回収 ──
+async def _claim_promotion(s, business: str, category: str, threshold: int, now) -> bool:
+    """(business, category, threshold) を INSERT … ON CONFLICT DO NOTHING（PostgreSQL／sqlite）。rowcount 1 なら確定者。"""
+    values = dict(business=business, category=category, threshold=int(threshold), state=PROMOTION_PENDING, attempts=0,
+                  created_at=now)
+    dialect = (await s.connection()).dialect.name
+    keys = ["business", "category", "threshold"]
+    if dialect == "postgresql":
+        stmt = _pg.insert(exemplar_promotion_notice).values(**values).on_conflict_do_nothing(index_elements=keys)
+    elif dialect == "sqlite":
+        stmt = _sqlite.insert(exemplar_promotion_notice).values(**values).on_conflict_do_nothing(index_elements=keys)
+    else:                                                     # 他方言: 既存確認 → 挿入（重複は PK 違反で例外＝呼び出し側で握る）
+        cur = (await s.execute(sa.select(exemplar_promotion_notice.c.state).where(
+            exemplar_promotion_notice.c.business == business, exemplar_promotion_notice.c.category == category,
+            exemplar_promotion_notice.c.threshold == int(threshold)))).first()
+        if cur is not None:
+            return False
+        stmt = sa.insert(exemplar_promotion_notice).values(**values)
+    res = await s.execute(stmt)
+    return int(res.rowcount or 0) == 1
+
+
+async def mark_promotion_sent(business: str, category: str, threshold: int, *, now=None) -> bool:
+    now = now or _now()
+    async with session_scope() as s:
+        r = await s.execute(sa.update(exemplar_promotion_notice).where(
+            exemplar_promotion_notice.c.business == business, exemplar_promotion_notice.c.category == category,
+            exemplar_promotion_notice.c.threshold == int(threshold)).values(
+            state=PROMOTION_SENT, notified_at=now, attempts=exemplar_promotion_notice.c.attempts + 1))
+        return int(r.rowcount or 0) == 1
+
+
+async def bump_promotion_attempt(business: str, category: str, threshold: int) -> bool:
+    async with session_scope() as s:
+        r = await s.execute(sa.update(exemplar_promotion_notice).where(
+            exemplar_promotion_notice.c.business == business, exemplar_promotion_notice.c.category == category,
+            exemplar_promotion_notice.c.threshold == int(threshold)).values(
+            attempts=exemplar_promotion_notice.c.attempts + 1))
+        return int(r.rowcount or 0) == 1
+
+
+async def list_promotion_pending(limit: int = 20) -> list[dict]:
+    """確定済み・未通知（pending）の候補（回収ジョブ用・古い順）。"""
+    async with session_scope() as s:
+        rows = (await s.execute(sa.select(exemplar_promotion_notice).where(
+            exemplar_promotion_notice.c.state == PROMOTION_PENDING)
+            .order_by(exemplar_promotion_notice.c.created_at.asc()).limit(int(limit)))).fetchall()
+    return [{"business": r.business, "category": r.category, "threshold": int(r.threshold), "attempts": int(r.attempts),
+             "created_at": _iso(r.created_at)} for r in rows]
