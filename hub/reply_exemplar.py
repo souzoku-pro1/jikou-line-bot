@@ -186,7 +186,7 @@ async def save_exemplar(*, business: str, inbound_text: str, human_reply: str,
     return "saved"
 
 
-async def approve_exemplar(exemplar_id: int, *, actor: str = APPROVED_BY_HUMAN) -> bool:
+async def approve_exemplar(exemplar_id: int, *, actor: str = APPROVED_BY_HUMAN, note: str | None = None) -> bool:
     """fix2 BR-10: 人の明示操作で承認済みにする（pending_review／retired → approved・approved_by/at・active=True・
     履歴 approved）。既に approved なら False。Q1b は画面を持たない（Q3a の承認画面が呼ぶ）。"""
     now = _now()
@@ -196,7 +196,7 @@ async def approve_exemplar(exemplar_id: int, *, actor: str = APPROVED_BY_HUMAN) 
             status=STATUS_APPROVED, active=True, approved_by=actor, approved_at=now))
         if int(r.rowcount or 0) != 1:
             return False
-        await _history(s, int(exemplar_id), ACTION_APPROVED, actor, now)
+        await _history(s, int(exemplar_id), ACTION_APPROVED, actor, now, note)   # Q3a-fix1 BQ-03: 修正して承認したときは note に欄名
     return True
 
 
@@ -460,3 +460,31 @@ def require_approval_if_referenced(guard, note):
     import dataclasses
     reasons = list(getattr(guard, "demotion_reasons", []) or []) + [EXEMPLAR_REFERENCED_REASON]
     return dataclasses.replace(guard, can_auto_send=False, demotion_reasons=reasons)
+
+
+# ── JIKOU-REPLY-Q3a-fix1 BQ-03（Codex R-Q3a）: 承認画面で匿名化済み本文を人が修正・確定する ──
+EDIT_FIELDS = ("human_reply", "inbound_text")
+
+
+async def update_texts(exemplar_id: int, *, human_reply: str, inbound_text: str) -> tuple[str, list[str]]:
+    """匿名化済み本文を人の修正で置き換える（承認前）。残留検査（発見的検査を含む）に 1 つでも掛かれば置き換えず
+    ("residue", 掛かった種別) を返す。戻り値 (ok|residue|bad_input|not_found|not_editable, hits)。承認済みの手本は直さない（退役→修正→再承認）。"""
+    reply = str(human_reply or "").strip()[:MAX_TEXT_CHARS]
+    inbound = str(inbound_text or "").strip()[:MAX_TEXT_CHARS]
+    if not reply:
+        return "bad_input", []
+    hits = sorted(set(pii_scan.residue_hits(reply) + pii_scan.residue_hits(inbound)))
+    if hits:
+        _reject_count["residue"] += 1
+        logger.info("[REPLY_EXEMPLAR] edit rejected by residue check (not saved) total=%s",
+                    emit(_reject_count["residue"], "count", "log", "operator"))
+        return "residue", hits
+    async with session_scope() as s:
+        cur = (await s.execute(sa.select(reply_exemplar.c.status).where(reply_exemplar.c.id == int(exemplar_id)))).scalar()
+        if cur is None:
+            return "not_found", []
+        if cur == STATUS_APPROVED:
+            return "not_editable", []
+        await s.execute(sa.update(reply_exemplar).where(reply_exemplar.c.id == int(exemplar_id)).values(
+            human_reply=reply, inbound_text=inbound))
+    return "ok", []

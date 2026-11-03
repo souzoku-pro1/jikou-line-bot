@@ -38,6 +38,9 @@ _NOTICES = {
     "not_changed": "状態は変わりませんでした（既に同じ状態です）。",
     "not_found": "対象が見つかりません。", "bad_input": "入力が不正です。",
     "db": "記録を読み書きできませんでした。",
+    # Q3a-fix1 BQ-03
+    "residue": "匿名化が不十分です（氏名・連絡先などが残っています）。本文を直してから承認してください。保存・承認はしていません。",
+    "not_editable": "承認済みの手本は直せません。退役にしてから修正・再承認してください。",
 }
 
 
@@ -63,7 +66,9 @@ def _page(rows: list[dict], notice: str, show_all: bool) -> str:
         "button{font-size:.95rem;padding:.5rem 1rem;border-radius:10px;border:1px solid #c8cdd5;"
         "background:#fff;min-height:44px}"
         ".empty{color:#667;text-align:center;margin:1.2rem 0}.notice{background:#e8f0fb;"
-        "border-radius:10px;padding:.5rem .8rem;color:#1a5cb0}</style></head><body>",
+        "border-radius:10px;padding:.5rem .8rem;color:#1a5cb0}"
+        "textarea{width:100%;min-height:5rem;font-size:.95rem;border-radius:10px;border:1px solid #c8cdd5;padding:.5rem;box-sizing:border-box}"
+        ".lbl{color:#667;font-size:.78rem;margin-top:.4rem}form.edit{display:block}</style></head><body>",
         "<h1>手本（事務所の過去回答）</h1>",
         '<p class="sub">返信欄で「手本にしてよい」と印を付けた返信の匿名化済み文です。承認済みの手本は bot の'
         "下書き生成に「参考文例（そのまま写さない）」として添えられます。"
@@ -83,16 +88,24 @@ def _page(rows: list[dict], notice: str, show_all: bool) -> str:
                      f'<span class="badge">{e(str(r.get("category_id") or "分類なし"))}</span>'
                      f'<span class="badge">{e(str(r["stage"]))}</span>'
                      f'<span class="badge">使用 {int(r["used_count"])} 回</span>')
-        if r.get("inbound_text"):
-            parts.append(f'<div class="q">相談者: {e(str(r["inbound_text"]))}</div>')
-        parts.append(f'<div class="a">返信: {e(str(r["human_reply"]))}</div>')
+        if active:
+            if r.get("inbound_text"):
+                parts.append(f'<div class="q">相談者: {e(str(r["inbound_text"]))}</div>')
+            parts.append(f'<div class="a">返信: {e(str(r["human_reply"]))}</div>')
+        else:
+            # Q3a-fix1 BQ-03: 確認待ち／退役は匿名化済み本文を人が直して確定できる（残留検査に通らなければ承認しない）
+            parts.append(f'<form method="post" action="{PAGE}/update" class="edit"><input type="hidden" name="exemplar_id" value="{rid}">'
+                         '<div class="lbl">相談者（匿名化済み・必要なら直してください）</div>'
+                         f'<textarea name="inbound_text" maxlength="{reply_exemplar.MAX_TEXT_CHARS}">{e(str(r.get("inbound_text") or ""))}</textarea>'
+                         '<div class="lbl">返信（匿名化済み・必要なら直してください）</div>'
+                         f'<textarea name="human_reply" maxlength="{reply_exemplar.MAX_TEXT_CHARS}" required>{e(str(r["human_reply"]))}</textarea>'
+                         '<button type="submit" name="action" value="approve">この内容で承認する</button></form>')
         parts.append(f'<div class="meta">承認: {e(str(r.get("approved_by") or ""))}｜{e(str(r.get("approved_at") or ""))}'
                      f'｜業者: {e(str(r.get("creditor_name") or "（なし）"))}｜ID: {rid}</div>')
-        action = "retire" if active else "approve"
-        label = "退役にする" if active else "承認する"
-        parts.append(f'<form method="post" action="{PAGE}/update">'
-                     f'<input type="hidden" name="exemplar_id" value="{rid}">'
-                     f'<button type="submit" name="action" value="{action}">{label}</button></form>')
+        if active:
+            parts.append(f'<form method="post" action="{PAGE}/update">'
+                         f'<input type="hidden" name="exemplar_id" value="{rid}">'
+                         '<button type="submit" name="action" value="retire">退役にする</button></form>')
         parts.append("</div>")
     parts.append('<script src="/app/shell.js"></script></body></html>')
     return "".join(parts)
@@ -117,11 +130,23 @@ async def exemplars_update(request: Request):
     action = str(form.get("action", ""))
     if not _ID_RE.fullmatch(xid) or action not in _ACTIONS:
         return _bad_request()
+    note = None
     try:
         exists = await reply_exemplar.get_exemplar(int(xid))
         if exists is None:
             return RedirectResponse(f"{PAGE}?done=not_found", status_code=303)
-        ok = await _ACTIONS[action](int(xid))
+        if action == "approve" and ("human_reply" in form or "inbound_text" in form):
+            # Q3a-fix1 BQ-03: 修正欄つきの承認。残留検査に通らなければ置き換えも承認もしない（固定文言のみ・本文は出さない）
+            reply = str(form.get("human_reply", exists.get("human_reply") or ""))
+            inbound = str(form.get("inbound_text", exists.get("inbound_text") or ""))
+            changed = [f for f, v, cur in (("human_reply", reply, exists.get("human_reply")), ("inbound_text", inbound, exists.get("inbound_text")))
+                       if v.strip() != str(cur or "").strip()]
+            if changed:
+                res, _hits = await reply_exemplar.update_texts(int(xid), human_reply=reply, inbound_text=inbound)
+                if res != "ok":
+                    return RedirectResponse(f"{PAGE}?done={res if res in _NOTICES else 'bad_input'}", status_code=303)
+                note = "edited:" + ",".join(changed)
+        ok = await reply_exemplar.approve_exemplar(int(xid), note=note) if action == "approve" else await _ACTIONS[action](int(xid))
     except Exception:
         return RedirectResponse(f"{PAGE}?done=db", status_code=303)
     done = ("approved" if action == "approve" else "retired") if ok else "not_changed"

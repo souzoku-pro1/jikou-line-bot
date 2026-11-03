@@ -485,3 +485,67 @@ class TestBq04OutageLogging(_DbMixin):
         self.assertNotIn('logger.exception("compose_reply', src)
         self.assertEqual(src.count('[COMPOSE_REPLY] unavailable (fixed reason)'), 1)
         self.assertEqual(src.count('[COMPOSE_REPLY] failed (fixed reason)'), 1)
+
+
+# ── fix1 BQ-03（Codex R-Q3a）: 文脈つき氏名の残留検出・保存拒否・承認画面での修正と確定 ──
+class TestBq03ContextName(_DbMixin):
+    BAD = "親族の名前はテストハナコです。"
+
+    def test_context_name_is_detected_and_not_saved_nor_referenced(self):
+        from hub import pii_scan
+        self.assertIn("context_name", pii_scan.residue_hits(self.BAD))
+        for s_ in ("氏名：山田太郎", "お名前は Taro Yamada です", "名前が鈴木花子でした", "お名前→ヤマダ"):
+            self.assertIn("context_name", pii_scan.residue_hits(s_), s_)
+        for s_ in ("お名前はカタカナでご記入ください", "お名前は確認済みです", "名前は不要です", "氏名の記載をお願いします",
+                   "お名前はフルネームでお願いします", "名前は〔氏名〕様です"):
+            self.assertNotIn("context_name", pii_scan.residue_hits(s_), s_)
+        self.assertEqual(pii_scan.residue_hits(self.BAD, heuristics=False), [])        # 凍結定型の検査には使わない
+        _, ok = pii_scan.anonymize(self.BAD)
+        self.assertFalse(ok)
+        self.assertEqual(_run(rx.save_exemplar(business="jikou", inbound_text="q", human_reply=self.BAD,
+                                                stage=rx.STAGE_CONSULT, category_id="挨拶・雑談")), "rejected")
+        self.assertEqual(_run(rx.save_exemplar(business="jikou", inbound_text=self.BAD, human_reply="r",
+                                                stage=rx.STAGE_CONSULT, category_id="挨拶・雑談")), "rejected")
+        self.assertEqual(self._rows(rx.reply_exemplar), [])                              # pending_review にも入らない
+        self.assertEqual(_run(rx.prompt_note("jikou", "受付")), "")                      # 参考文例にも入らない
+
+    def test_approval_screen_edit_is_checked_then_fixed(self):
+        xid = self.save(reply="費用は【費用のご案内】のとおりです。", inbound="費用はいくらですか", approve=False)
+        html = _client.get("/app/exemplars", headers=_auth()).text
+        self.assertIn('name="human_reply"', html)                                       # 確認待ちには修正欄
+        self.assertIn("この内容で承認する", html)
+        # 残留する修正 → 承認せず・本文も置き換えない
+        r = _client.post("/app/exemplars/update", headers=_auth(), follow_redirects=False,
+                         data={"exemplar_id": str(xid), "action": "approve", "human_reply": self.BAD, "inbound_text": "費用はいくらですか"})
+        self.assertEqual(r.headers["location"], "/app/exemplars?done=residue")
+        row = _run(rx.get_exemplar(xid))
+        self.assertEqual((row["status"], row["human_reply"]), ("pending_review", "費用は【費用のご案内】のとおりです。"))
+        self.assertIn("匿名化が不十分です", _client.get("/app/exemplars?done=residue", headers=_auth()).text)
+        self.assertNotIn("テストハナコ", _client.get("/app/exemplars", headers=_auth()).text)
+        # 通る修正 → 置き換えて承認・履歴 note・参考文例は修正後の文だけ
+        r = _client.post("/app/exemplars/update", headers=_auth(), follow_redirects=False,
+                         data={"exemplar_id": str(xid), "action": "approve", "human_reply": "費用は〔費用のご案内〕のとおりです（修正）。",
+                               "inbound_text": "費用について"})
+        self.assertEqual(r.headers["location"], "/app/exemplars?done=approved")
+        row = _run(rx.get_exemplar(xid))
+        self.assertEqual((row["status"], row["human_reply"], row["inbound_text"]),
+                         ("approved", "費用は〔費用のご案内〕のとおりです（修正）。", "費用について"))
+        hist = _run(rx.exemplar_history(xid))
+        self.assertEqual([h["action"] for h in hist], ["created", "approved"])
+        self.assertEqual(hist[-1]["note"], "edited:human_reply,inbound_text")
+        note = _run(rx.prompt_note("jikou", "受付"))
+        self.assertIn("（修正）", note)
+        self.assertNotIn("テストハナコ", note)
+        # 承認済みは直せない（退役 → 修正 → 再承認）
+        r = _client.post("/app/exemplars/update", headers=_auth(), follow_redirects=False,
+                         data={"exemplar_id": str(xid), "action": "approve", "human_reply": "別の文"})
+        self.assertEqual(r.headers["location"], "/app/exemplars?done=not_editable")
+        self.assertEqual(_run(rx.get_exemplar(xid))["human_reply"], "費用は〔費用のご案内〕のとおりです（修正）。")
+        # 欄なしの承認（従来の 1 ボタン相当）も引き続き通る
+        xid2 = self.save(reply="別の手本です。", inbound="q2", approve=False)
+        r = _client.post("/app/exemplars/update", headers=_auth(), follow_redirects=False,
+                         data={"exemplar_id": str(xid2), "action": "approve"})
+        self.assertEqual(r.headers["location"], "/app/exemplars?done=approved")
+        self.assertIsNone(_run(rx.exemplar_history(xid2))[-1]["note"])
+        self.assertEqual(_run(rx.update_texts(xid2, human_reply="", inbound_text=""))[0], "bad_input")
+        self.assertEqual(_run(rx.update_texts(999, human_reply="x", inbound_text=""))[0], "not_found")
