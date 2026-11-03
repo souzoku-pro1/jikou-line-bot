@@ -1705,6 +1705,17 @@ async def handle_customer_message(
     # ユーザーメッセージをチャットログに保存
     await save_to_chatlog(user_id, "user", user_message, category, "no")
 
+    # JIKOU-REPLY-Q2 (e)（QUEUE-2026-10-13-D D-1）: V2 ON は閉集合の定型だけを自動送信する（R-J3）。選択器→描画器→
+    # 許可表 V2（reply_func の排他内）→ 台帳。該当なし・検査落ちは LLM 自由文を自動送信せず承認へ降格（無言+対応待ち=Q1c）。
+    # V2 OFF は本 if に入らない（従来経路のまま）。
+    if send_policy.enabled():
+        if await jikou_reply_flow.try_closed_set(user_id, user_message, app21_record, history, result, profile=p,
+                                                reply_token=reply_token, reply_func=reply_func, category=category):
+            return
+        if guard.can_auto_send:
+            guard = replace_dc(guard, can_auto_send=False, immediate_notice="none",
+                               demotion_reasons=list(guard.demotion_reasons) + [jikou_reply_flow.DEMOTION_REASON])
+
     if guard.can_auto_send:
         await reply_func(reply_token, reply_text); await reply_exemplar.mark_used_for(_exn, category)  # JIKOU-REPLY-Q3a (b): 使った手本を used に
         await save_to_chatlog(user_id, "assistant", reply_text, category, "yes")
@@ -1976,3 +1987,7 @@ from hub import send_policy  # noqa: E402
 # ── JIKOU-REPLY-Q3a（QUEUE-2026-10-12-C C-2）: 承認済み手本の参考文例（prompt 末尾・0 件は ""）と無修正承認の計数。
 #    末尾追記（sink allowlist の行番号 pin を動かさない規約・本文中は 1 行置換のみ）。
 from hub import reply_exemplar  # noqa: E402
+
+# ── JIKOU-REPLY-Q2（QUEUE-2026-10-13-D D-1）: 選択器・描画器・閉集合送信の結線（V2 ON のみ）。末尾追記。
+from dataclasses import replace as replace_dc  # noqa: E402
+from hub import jikou_reply_flow  # noqa: E402

@@ -43,7 +43,7 @@ import uuid
 
 import sqlalchemy as sa
 
-from hub import approved_texts, empty_reply_guard, kintone, reply_pending, send_ledger
+from hub import approved_texts, empty_reply_guard, jikou_reply_texts, kintone, reply_pending, send_ledger
 from hub.db import session_scope as db_session_scope
 from hub.redact import emit
 
@@ -55,9 +55,9 @@ CUSTOMER_CHANNEL = "jikou"               # 許可表 V2 を適用する顧客チ
 CONDITION_TTL_SECONDS = 30.0             # 停止条件の照会結果の再利用窓（受信入口と送信前で 2 度引かない）
 _JST = datetime.timezone(datetime.timedelta(hours=9))
 
-# J-0（初回受付・業務 × LINE 利用者 単位で 1 回〔fix2 BC-11〕・司令塔仮置き・大野承認待ち＝V2 有効化前の条件）。
+# J-0（初回受付・業務 × LINE 利用者 単位で 1 回〔fix2 BC-11〕・大野承認済み〔TEXT-APPROVAL-2 2026-11-02・sha 0f1c3ca2…〕）。
 # 文言変更は本定数と test の sha pin を同時に更新する
-J0_TEXT = "ご連絡ありがとうございます。内容を確認のうえ、弁護士からこの LINE でご返信いたします。"
+J0_TEXT = jikou_reply_texts.text("J-0")   # JIKOU-REPLY-Q2: データ表（hub/jikou_reply_texts）が正・値は C-1／main と同一（sha pin で固定）
 J0_TEXT_SHA256 = hashlib.sha256(J0_TEXT.encode("utf-8")).hexdigest()
 
 # 業務 LINE への固定文言（PII なし・App 29 No. とカテゴリは統制値）
