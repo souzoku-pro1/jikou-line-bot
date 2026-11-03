@@ -441,3 +441,22 @@ async def count_unmodified(business: str, category: str) -> int:
         return int((await s.execute(sa.select(sa.func.count()).select_from(reply_draft_approval).where(
             reply_draft_approval.c.business == business, reply_draft_approval.c.category == category,
             reply_draft_approval.c.unmodified.is_(True)))).scalar() or 0)
+
+
+# ══════════════════════════════════════════════════════════════
+# JIKOU-REPLY-Q3a-fix1 BQ-01（Codex R-Q3a REJECT・Fable 裁定 2026-11-03）
+#   手本（参考文例）を prompt に添えて生成した返信は、カテゴリが許可表にあっても **自動送信しない**。承認キュー（App 29・
+#   対応待ち）に固定し、Q4／返信画面での承認後にだけ送る。手本 0 件（note == ""）の生成と定型は従来どおり（許可表どおり）。
+#   V2 ON/OFF の双方に効く（guard の段で降格するため、OFF は確認中の定型・ON は無言＋対応待ち＝既存の降格経路）。
+#   used（used_count＋履歴）は、固定した下書きが承認キューに入った時点で結果の category の群だけに付ける。
+# ══════════════════════════════════════════════════════════════
+EXEMPLAR_REFERENCED_REASON = "手本参照（承認後のみ送信・Q3a-fix1 BQ-01）"
+
+
+def require_approval_if_referenced(guard, note):
+    """参考文例つきで生成した返信を承認必須に降格する（note が空＝手本 0 件なら guard をそのまま返す）。"""
+    if not str(note or "") or not getattr(guard, "can_auto_send", False):
+        return guard
+    import dataclasses
+    reasons = list(getattr(guard, "demotion_reasons", []) or []) + [EXEMPLAR_REFERENCED_REASON]
+    return dataclasses.replace(guard, can_auto_send=False, demotion_reasons=reasons)

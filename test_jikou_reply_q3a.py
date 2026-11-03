@@ -257,26 +257,59 @@ class TestPromptNote(_DbMixin):
         # 受任後の段階は相談段階の手本を使わない
         self.assertEqual(_run(rx.prompt_note("jikou", "受任")), "")
 
-    def test_customer_path_attaches_note_and_marks_used_only_for_sent_category(self):
+    def test_exemplar_referenced_reply_is_fixed_to_approval_queue_v2_off_and_on(self):
+        """fix1 BQ-01（Codex R-Q3a・Fable 裁定）: 手本を参照して生成した本文は、カテゴリが許可表にあっても **承認前に顧客へ 0 回**
+        （V2 OFF: 従来の確認中定型だけ／V2 ON: 無言＋対応待ち・J-0 のみ）。承認キューに固定し、使った手本は結果の category の群だけ used。
+        旧テスト「未承認のご案内が 1 回送られる」はこの裁定に合わせて書き換えた（緩和ではなく裁定の追随）。"""
         a = self.save(reply="手続きの返信", inbound="流れは", category="手続きの一般的な流れ")
         b = self.save(reply="挨拶の返信", inbound="こんにちは", category="挨拶・雑談")
-        seen = {}
+        for v2 in ("", "1"):
+            seen = {}
 
-        async def _compose_spy(system_prompt, messages, tool=None):
-            seen["prompt"] = system_prompt
-            return _compose("ご案内します", category="挨拶・雑談")
-        sent = AsyncMock()
-        with patch.object(cr, "_call_compose_reply", _compose_spy), \
+            async def _compose_spy(system_prompt, messages, tool=None):
+                seen["prompt"] = system_prompt
+                return _compose("ご案内します", category="挨拶・雑談")
+            sent = AsyncMock(return_value=sl.SEND_SENT)
+            queued = AsyncMock(return_value="500")
+            env = {sl.POLICY_V2_ENV: "1"} if v2 else {}
+            with patch.dict(os.environ, env), patch.object(cr, "_call_compose_reply", _compose_spy), \
+                 patch.object(cr, "save_to_approval_queue", queued), \
+                 patch.object(cr, "get_app21_record", AsyncMock(return_value=_rec(status="受付"))):
+                if not v2:
+                    os.environ.pop(sl.POLICY_V2_ENV, None)
+                sp.clear_condition_cache()
+                _run(cr.handle_customer_message(user_id=USER, user_message="こんにちは", reply_token="rt",
+                                                app21_record=_rec(status="受付"), reply_func=sent))
+            self.assertIn("手続きの返信", seen["prompt"])
+            self.assertIn("挨拶の返信", seen["prompt"])
+            texts = [c.args[1] for c in sent.await_args_list]
+            self.assertNotIn("ご案内します", texts, f"v2={v2!r}")                       # 生成本文の顧客送信は承認前 0 回
+            for t in texts:                                                           # 送られるのは定型（V2 OFF）か J-0（V2 ON）だけ
+                self.assertIn(t, (cr.PENDING_REPLY, sp.J0_TEXT) + tuple(cr.PENDING_BY_CATEGORY.values()), f"v2={v2!r} {t!r}")
+            queued.assert_awaited_once()
+            self.assertEqual(queued.await_args.kwargs["ai_draft"], "ご案内します")
+            self.assertIn(rx.EXEMPLAR_REFERENCED_REASON, queued.await_args.kwargs["reason"])
+            self.assertEqual(len(_FakeClient.calls), 0)                                # LINE の直 push も無い
+        rows = {r["id"]: r for r in self._rows(rx.reply_exemplar)}
+        self.assertEqual((rows[a]["used_count"], rows[b]["used_count"]), (0, 2))        # 結果の category の群だけ・固定ごとに 1
+        self.assertEqual([h["action"] for h in _run(rx.exemplar_history(b))],
+                         ["created", "approved", "used", "used"])
+
+    def test_zero_exemplars_keeps_auto_send_unchanged(self):
+        """fix1 BQ-01: 手本を参照しない従来の生成（note == ""）は現状のまま許可表どおり自動送信される。"""
+        sent = AsyncMock(return_value=sl.SEND_SENT)
+        with patch.object(cr, "_call_compose_reply", AsyncMock(return_value=_compose("ご案内します", category="挨拶・雑談"))), \
+             patch.object(cr, "save_to_approval_queue", AsyncMock(return_value="500")) as queued, \
              patch.object(cr, "get_app21_record", AsyncMock(return_value=_rec(status="受付"))):
             _run(cr.handle_customer_message(user_id=USER, user_message="こんにちは", reply_token="rt",
                                             app21_record=_rec(status="受付"), reply_func=sent))
         sent.assert_awaited_once_with("rt", "ご案内します")
-        self.assertIn("手続きの返信", seen["prompt"])
-        self.assertIn("挨拶の返信", seen["prompt"])
-        rows = {r["id"]: r for r in self._rows(rx.reply_exemplar)}
-        self.assertEqual((rows[a]["used_count"], rows[b]["used_count"]), (0, 1))
-        self.assertEqual([h["action"] for h in _run(rx.exemplar_history(b))],
-                         ["created", "approved", "used"])                    # fix2 BR-10: save() が承認を 1 段挟む
+        queued.assert_not_awaited()
+        g = rx.require_approval_if_referenced(sp.apply_v2(cr.apply_server_guards(_compose("x"), [], "q"), "x"), "")
+        self.assertTrue(g.can_auto_send)
+        g2 = rx.require_approval_if_referenced(g, rx.format_note([{"id": 1, "category_id": None, "inbound_text": "", "human_reply": "r", "active": True}]))
+        self.assertFalse(g2.can_auto_send)
+        self.assertEqual(g2.demotion_reasons[-1], rx.EXEMPLAR_REFERENCED_REASON)
 
     def test_demoted_reply_does_not_mark_used(self):
         b = self.save(reply="挨拶の返信", inbound="こんにちは", category="挨拶・雑談")
@@ -399,6 +432,7 @@ class TestPins(unittest.TestCase):
         csrc = (REPO / "chat_responder.py").read_text(encoding="utf-8").split("\n")
         self.assertEqual(sum("reply_exemplar.prompt_note(p.name, status)" in l for l in csrc), 1)
         self.assertEqual(sum("reply_exemplar.mark_used_for(_exn, category)" in l for l in csrc), 1)
+        self.assertEqual(sum("reply_exemplar.require_approval_if_referenced(guard, _exn)" in l for l in csrc), 1)   # fix1 BQ-01
         self.assertEqual(sum("reply_exemplar.record_draft(record_id" in l for l in csrc), 1)
         self.assertEqual(sum("exemplar_note: str = \"\"" in l for l in csrc), 1)
         self.assertEqual(sum("return prompt + human_note + exemplar_note" in l for l in csrc), 1)

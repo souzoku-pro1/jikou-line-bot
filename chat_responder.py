@@ -1696,7 +1696,7 @@ async def handle_customer_message(
     # サーバー側二重チェック（カテゴリ許可リスト＋禁止語・必須文言・留保文言
     # ＋GEN2: プレースホルダ/長さ/質問数/法テラス標準回答）
     guard = send_policy.apply_v2(apply_server_guards(result, history, user_message,  # JIKOU-REPLY-Q1c (b): 空返事は自動送信しない（V2 OFF は空文字のみ降格）
-                                sanitize_fatal=sanitize_fatal, profile=p), reply_text)
+                                sanitize_fatal=sanitize_fatal, profile=p), reply_text); guard = reply_exemplar.require_approval_if_referenced(guard, _exn)  # Q3a-fix1 BQ-01: 手本参照の生成は承認後のみ送信
     if guard.demotion_reasons:
         logger.info("[GUARD] demoted user_id=%s reasons=%s",
                     emit(user_id, "external_ref", "log", "operator"),
@@ -1706,7 +1706,7 @@ async def handle_customer_message(
     await save_to_chatlog(user_id, "user", user_message, category, "no")
 
     if guard.can_auto_send:
-        await reply_func(reply_token, reply_text); await reply_exemplar.mark_used_for(_exn, category)  # JIKOU-REPLY-Q3a (b): 使った手本を used に
+        await reply_func(reply_token, reply_text)  # Q3a-fix1 BQ-01: 手本参照ありの生成はここに来ない（used は承認キューに固定した時点で付ける）
         await save_to_chatlog(user_id, "assistant", reply_text, category, "yes")
         logger.info("[AUTO_SEND] user_id=%s len=%s",
                     emit(user_id, "external_ref", "log", "operator"),
@@ -1723,7 +1723,7 @@ async def handle_customer_message(
             ai_draft=reply_text,
             category=category,
             reason=queue_reason,
-        )
+        ); await reply_exemplar.mark_used_for(_exn, category)  # Q3a-fix1 BQ-01: 手本は承認キューに固定した下書きで使われた（結果の category の群だけ）
         # 顧客への定型文を返信（裁判所書類の第一報・離脱兆候・対象外債権・
         # 法テラスは専用文面。GEN2 要件5: それ以外はカテゴリ別の文脈化定型
         # ——大野の文言確定=PENDING_CONTEXT_ENABLED までは現行文言）
