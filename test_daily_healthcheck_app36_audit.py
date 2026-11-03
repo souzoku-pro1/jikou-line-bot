@@ -374,6 +374,14 @@ class TestRunHealthcheckClassifiedAlert(_AuditBase):
                              AsyncMock(return_value=[])), \
                 patch.object(daily_healthcheck, "check_business_notify_liveness",
                              AsyncMock(return_value=[])), \
+                patch.object(daily_healthcheck, "check_send_ledger_health",  # OPS-RUNBOOK-1（QUEUE-2026-10-16-R F-6）で追加された点検 J〜M も同じく無害化（本テストの検査対象は従来の分類文言のみ・実 HTTP／DB を叩かせない）
+                             AsyncMock(return_value=[])), \
+                patch.object(daily_healthcheck, "check_reply_pending_oldest",
+                             AsyncMock(return_value=[])), \
+                patch.object(daily_healthcheck, "check_houki_deadline_soon",
+                             AsyncMock(return_value=[])), \
+                patch.object(daily_healthcheck, "check_connectivity",
+                             AsyncMock(return_value=[])), \
                 patch.object(daily_healthcheck, "notify_admin_line",
                              fake_notify), \
                 patch("hub.derivation_models.get_leaf_decision",

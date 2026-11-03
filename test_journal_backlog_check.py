@@ -276,7 +276,10 @@ class TestUnknownProviderWiring(unittest.IsolatedAsyncioTestCase):
                     "（provider 別滞留監視のいずれにも載らないため要確認）")
         checks = [("check_models", True), ("check_kintone_schema", True),
                   ("check_templates", False), ("check_journal_backlog", True),
-                  ("check_business_notify_liveness", True)]
+                  ("check_business_notify_liveness", True),
+                  # OPS-RUNBOOK-1（QUEUE-2026-10-16-R F-6）で追加された点検 J〜M も同じく無害化（本テストの検査対象は従来の分類文言のみ・実 HTTP／DB を叩かせない）
+                  ("check_send_ledger_health", True), ("check_reply_pending_oldest", True),
+                  ("check_houki_deadline_soon", True), ("check_connectivity", True)]
         with ExitStack() as es:
             for name, is_async in checks:
                 es.enter_context(patch.object(

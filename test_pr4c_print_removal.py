@@ -30,7 +30,10 @@ class TestHealthcheckOkSinglePath(unittest.IsolatedAsyncioTestCase):
     async def test_ok_logs_via_logger_and_not_printed_twice(self):
         checks = [("check_models", True), ("check_kintone_schema", True),
                   ("check_templates", False), ("check_journal_backlog", True),
-                  ("check_business_notify_liveness", True)]
+                  ("check_business_notify_liveness", True),
+                  # OPS-RUNBOOK-1（QUEUE-2026-10-16-R F-6）で追加された点検 J〜M も同じく無害化（本テストの検査対象は従来の分類文言のみ・実 HTTP／DB を叩かせない）
+                  ("check_send_ledger_health", True), ("check_reply_pending_oldest", True),
+                  ("check_houki_deadline_soon", True), ("check_connectivity", True)]
         buf = io.StringIO()
         with ExitStack() as es:
             for name, isa in checks:
