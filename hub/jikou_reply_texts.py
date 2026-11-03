@@ -274,3 +274,46 @@ def approval_table() -> list[dict]:
     """要承認一覧（pgv の別表用・文言と印）。"""
     return [{"id": i, "label": e["label"], "status": e["status"], "stage": e["stage"], "auto": e["auto"],
              "text": e["text"], "note": e["note"]} for i, e in TEXTS.items()]
+
+
+# ── JIKOU-PROGRESS-1（QUEUE-2026-10-16-R F-2）: 進捗連絡の定型 3 種（相談者向け・**要承認**・Q4 の承認画面に下書きとして積む）
+# TEXTS／TABLE_SHA256_PIN とは別表・別 pin（既存の凍結 pin は不変）。送信は Q4 の承認経路のみ（自動送信の選択器は本表を読まない）。
+# 差し込みは【発送日】【社数】の 2 種のみ（氏名・金額・個別事情は入れない＝RV-10）。数値（日数・週数）は本文に書かない。
+PROGRESS_TABLE_VERSION = "progress-1"
+PROGRESS_SLOT_SHIPPED_ON = "発送日"
+PROGRESS_SLOT_COUNT = "社数"
+PROGRESS_TEXTS: dict = {
+    "P-1": _t("ご入金を確認いたしました。ありがとうございます。委任契約の内容に基づき、時効援用通知書の作成と発送の準備を進めます。"
+              "発送が完了しましたら、改めてこの LINE でお知らせいたします。",
+              label="進捗: 入金確認", status=STATUS_NEEDS_APPROVAL, stage=STAGE_ENGAGED, auto=False,
+              note="JIKOU-PROGRESS-1 入金確認（App 21 入金状況=入金済み）。要承認・Q4 で承認後にのみ送信"),
+    "P-2": _t("【発送日】に、時効援用通知書を対象の債権者 【社数】 社へ発送いたしました。債権者からの回答が届くまでには"
+              "しばらく時間がかかります。回答が届きましたら、内容を確認のうえこの LINE でお知らせいたします。"
+              "債権者から直接の連絡があった場合は、住所等をお伝えにならず、この LINE でご相談ください。",
+              label="進捗: 発送完了", status=STATUS_NEEDS_APPROVAL, stage=STAGE_ENGAGED, auto=False,
+              slots=(PROGRESS_SLOT_SHIPPED_ON, PROGRESS_SLOT_COUNT),
+              note="JIKOU-PROGRESS-1 発送完了（F-1 の発送日・送付先社数を差し込む）。要承認・Q4 で承認後にのみ送信"),
+    "P-3": _t("債権者から時効援用通知に対する回答が届きましたので、お知らせいたします。内容は弁護士が確認のうえ、"
+              "結果の詳細をこの LINE でご説明いたします。ご不明な点があれば、この LINE でお知らせください。",
+              label="進捗: 債権者回答到着", status=STATUS_NEEDS_APPROVAL, stage=STAGE_ENGAGED, auto=False,
+              note="JIKOU-PROGRESS-1 債権者回答到着（F-1 の結果記録時）。要承認・Q4 で承認後にのみ送信（結果の中身は書かない）"),
+}
+PROGRESS_TEXT_IDS = tuple(PROGRESS_TEXTS)
+
+
+def progress_sha256() -> str:
+    return hashlib.sha256(json.dumps({"version": PROGRESS_TABLE_VERSION, "texts": PROGRESS_TEXTS}, ensure_ascii=False,
+                                     sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+PROGRESS_SHA256_PIN = "f52bb288bc7bef70e2636890fd5414af6eda86cc49d198e84e3515e415974cc5"
+
+
+def verify_progress_pin() -> bool:
+    return progress_sha256() == PROGRESS_SHA256_PIN
+
+
+def progress_approval_table() -> list[dict]:
+    """要承認一覧（pgv の別表用）。"""
+    return [{"id": i, "label": e["label"], "status": e["status"], "slots": e["slots"], "text": e["text"], "note": e["note"]}
+            for i, e in PROGRESS_TEXTS.items()]

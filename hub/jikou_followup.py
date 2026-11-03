@@ -38,6 +38,7 @@ import sqlalchemy as sa
 from hub import kintone, reply_pending, send_policy
 from hub import scheduler as hub_scheduler
 from hub.db import DatabaseNotConfigured, session_scope
+from hub.jikou_constants import FOLLOWUP_DAYS
 from hub.redact import emit
 
 logger = logging.getLogger("hub.jikou_followup")
@@ -79,8 +80,7 @@ ACTOR_SYSTEM = "system"
 MAX_SUMMARY_CHARS = 1000
 CREDITOR_MAX = 60
 
-# フォロー通知（閾値は定数 1 か所・日数の変更は大野判断）
-FOLLOWUP_DAYS = (14, 28)
+# フォロー通知（閾値は hub/jikou_constants.FOLLOWUP_DAYS・要大野確認・JIKOU-PROGRESS-1 で定数ファイルへ集約）
 LEDGER_KINDS = {14: "jikou_followup_14", 28: "jikou_followup_28"}
 JOB_NAME = "JIKOU_FOLLOWUP"
 RUN_HOUR_JST = 9
@@ -449,6 +449,24 @@ async def followup_scan(*, now=None) -> dict:
                 emit(res["cases"], "count", "log", "operator"), emit(res["sent"], "count", "log", "operator"),
                 emit(res["throttled"], "count", "log", "operator"), emit(res["failed"], "count", "log", "operator"))
     return res
+
+
+# ── 結果記録のフック（JIKOU-PROGRESS-1 が「債権者回答到着」の下書き積みに使う・本 module は送らない）──
+_result_hooks: list = []
+
+
+def register_result_hook(fn) -> None:
+    if fn not in _result_hooks:
+        _result_hooks.append(fn)
+
+
+async def run_result_hooks(case_record_id: str, record: dict | None) -> None:
+    """結果記録の保存後に呼ぶ。各フックの例外は握る（記録の成否に影響させない）。"""
+    for fn in list(_result_hooks):
+        try:
+            await fn(str(case_record_id), record)
+        except Exception:
+            logger.warning("[JIKOU_FOLLOWUP] result hook failed (fixed reason)")
 
 
 def register_followup_job() -> None:

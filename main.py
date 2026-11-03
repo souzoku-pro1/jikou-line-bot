@@ -2432,3 +2432,7 @@ wire_reply_metrics(app)
 # ── JIKOU-FOLLOWUP-1（QUEUE-2026-10-16-R F-1）: 発送後フォロー（結果記録 /app/jikou/result・日次通知ジョブ）の結線。末尾追記。
 from hub.webapp_jikou_result_view import wire_all as wire_jikou_result  # noqa: E402
 wire_jikou_result(app)
+
+# ── JIKOU-PROGRESS-1（QUEUE-2026-10-16-R F-2）: 進捗連絡の下書き積み（F-1 の結果記録フック＋走査ジョブ・送信は Q4 のみ）の結線。末尾追記。
+from hub.jikou_progress import wire_all as wire_jikou_progress  # noqa: E402
+wire_jikou_progress(app)
