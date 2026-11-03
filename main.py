@@ -2428,3 +2428,7 @@ include_before_catch_all(app, drafts_view_router)
 # ── JIKOU-REPLY-Q6（QUEUE-2026-10-13-E E-1）: 返信計測（/app/reply/metrics・/app/reply/{record_id} より前に置く）と週次要約ジョブ（startup 登録）。末尾追記。
 from hub.webapp_reply_metrics_view import wire_all as wire_reply_metrics  # noqa: E402
 wire_reply_metrics(app)
+
+# ── JIKOU-FOLLOWUP-1（QUEUE-2026-10-16-R F-1）: 発送後フォロー（結果記録 /app/jikou/result・日次通知ジョブ）の結線。末尾追記。
+from hub.webapp_jikou_result_view import wire_all as wire_jikou_result  # noqa: E402
+wire_jikou_result(app)
