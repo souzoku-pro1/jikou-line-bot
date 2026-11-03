@@ -224,7 +224,8 @@ class TestAuth(unittest.TestCase):
                 patch.object(line_channel.httpx, "AsyncClient", _FakeClient):
             _FakeClient.calls = []
             r = _client.get(PAGE, follow_redirects=False)
-            self.assertEqual((r.status_code, r.headers["location"]), (303, "/app/login"))
+            # UX-PENDING-1 (1): 返信画面は閉集合の next として引き継がれる（ログイン後に同じ件へ戻る）。POST 先は引き継がない
+            self.assertEqual((r.status_code, r.headers["location"]), (303, f"/app/login?next={PAGE}"))
             r = _client.post(SEND, data=_form(), follow_redirects=False)
             self.assertEqual((r.status_code, r.headers["location"]), (303, "/app/login"))
             self.assertEqual(r.text, "")
@@ -262,8 +263,11 @@ class TestExplicitSend(_DbMixin):
         self.assertIn("試験 太郎", r.text)
         self.assertIn("事務所（大野）", r.text)
         self.assertIn("下書き本文", r.text)
-        self.assertIn(rv.CONFIRM_LABEL, r.text)                              # BR-06
-        self.assertIn('name="confirm" value="1" required', r.text)
+        # UX-PENDING-1 (3): 確認チェックは廃止（サーバー側自動確認）。[送信] は文字と色を明示したボタン 1 つ
+        self.assertNotIn('name="confirm"', r.text)
+        self.assertNotIn("確認していません", r.text)
+        self.assertIn(f'<button type="submit" class="send">{rv.SEND_BUTTON_LABEL}</button>', r.text)
+        self.assertEqual(r.text.count("<button"), 1)
         self.assertIn('name="exemplar" value="1" checked', r.text)
         self.assertEqual(r.headers["cache-control"], "no-store, private")
         op_ids = re.findall(r'name="op_id" value="([0-9a-f]{32})"', r.text)
@@ -368,18 +372,21 @@ class TestExplicitSend(_DbMixin):
         state = _run(sl.conversation_state("jikou", USER))
         self.assertEqual((state["version"], state["human_version"]), (1, 1))
 
-    def test_missing_confirm_or_empty_text_does_not_send(self):
+    def test_confirm_param_is_ignored_and_empty_text_does_not_send(self):
+        # UX-PENDING-1 (3): confirm 欄は廃止＝無くても（サーバー側自動確認が通れば）送る。空本文は従来どおり送らない
         r = self.post(_form(confirm=""))
-        self.assertEqual(r.headers["location"], f"{PAGE}?done=confirm_required")
-        r = self.post(_form(text="   "))
+        self.assertTrue(r.headers["location"].startswith(f"{PAGE}?done=sent"), r.headers["location"])
+        self.assertEqual(len(_FakeClient.calls), 1)
+        _FakeClient.calls = []
+        r = self.post(_form(op=OP2, text="   "))
         self.assertEqual(r.headers["location"], f"{PAGE}?done=bad_input")
         r = self.post(_form(text="あ" * (rv.MAX_TEXT_CHARS + 1)))
         self.assertEqual(r.headers["location"], f"{PAGE}?done=bad_input")
         r = _client.post(SEND, headers=_auth(), data=_form(op="not-hex", ticket="x"), follow_redirects=False)
         self.assertEqual((r.status_code, r.text), (400, ""))
         self.assertEqual(_FakeClient.calls, [])
-        self.assertEqual(self.ops(), [])
-        self.create.assert_not_awaited()
+        self.assertEqual(len(self.ops()), 1)   # 先頭の 1 回（confirm 無し）だけ送った
+        self.create.assert_awaited_once()      # App 28 の human 行もその 1 回だけ
 
     def test_ticket_is_required_signed_and_bound(self):
         """BR-03: ticket なし・署名不正・他レコード/他操作 ID への束縛は固定 400（送らない）。"""

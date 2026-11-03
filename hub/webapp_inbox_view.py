@@ -1,0 +1,462 @@
+"""webapp_inbox_view — UX-PENDING-1 (2)(4)(5): 対応待ちの統合一覧（/app/inbox）・署名付きリンクの着地（/app/go/r|c）
+
+設計: docs/ux_pending_1_design.md §2（画面 B）・§4（画面 C）・§7（リンク）・§9（記録）。
+
+- 一覧（GET /app/inbox）: 対応待ち（reply_pending の open）と、承認キュー（App 29・送信済み=no）のうち対応待ちの表が
+  参照していない件（V2 以前の項目＝「旧」の札）を **1 つの一覧** に古い順で出す。各件のボタンは 3 つだけ:
+    [返信する]（/app/reply/{No.} への移動のみ）／[対応終了]（別経路で返信済み・bot 再開）／[不要]。
+  `?closed=1` で閉じた件（参照＋[未処理に戻す]）。本文は承認キューの顧客メッセージを出す（内部専用画面・承認画面と同じ裁定）。
+  LINE userId・line_user_hash は画面に出さない（RV-10）。
+- 操作（POST /app/inbox/close・/app/inbox/reopen）: 入力は閉集合（kind ∈ {pending, old}・id は数字・outcome ∈ 2 値）。不正は固定 400。
+  対応待ち → reply_pending（closed_external / not_needed / open に戻す・履歴あり）。承認キューだけの件 → hub/approval_close（追記のみ・
+  kintone は書かない）。「対応終了」は同時に send_ledger.end_attending_by_hash（bot 再開）。
+- 署名付きリンク（GET /app/go/r/{符号}・GET/POST /app/go/c/{符号}）: hub/pending_link で検証。
+    r: ok → 303 /app/reply/{No.}（承認キューが無い件は一覧へ）／expired・invalid → 一覧へ（固定の案内 1 行・大野裁定: 失効はエラー画面で終わらせない）
+    c: ok → 確認画面 1 枚（GET は副作用なし）→ POST で対応終了（冪等: 既に閉じていれば処理せず案内だけ）
+- 認証はすべて _gate（未ログインは /app/login?next=… → ログイン後にここへ戻る）。送信の口は無い（承認なし送信経路ゼロ）。
+- 自動送信・kintone 書込・物理削除は無い。ログは固定語彙のみ。
+"""
+
+import datetime
+import html
+import logging
+import re
+
+from fastapi import APIRouter, Request
+from fastapi.responses import HTMLResponse, RedirectResponse, Response
+
+from hub import approval_close, kintone, pending_link, reply_pending, send_ledger
+from hub.webapp_auth import _gate
+
+logger = logging.getLogger("hub.webapp_inbox_view")
+
+router = APIRouter()
+
+PAGE = "/app/inbox"
+GO = "/app/go"
+REPLY = "/app/reply"
+BUSINESS = "jikou"
+APP_APPROVAL = kintone.KintoneApp("App 29 (承認キュー)", "APP_APPROVAL", "TOKEN_APPROVAL")
+_FIELDS = ["$id", "顧客名", "顧客メッセージ", "カテゴリ", "送信済み", "更新日時", "line_user_id"]
+OLD_LIMIT = 50
+CLOSED_LIMIT = 50
+
+KIND_PENDING = "pending"
+KIND_OLD = "old"
+KINDS = (KIND_PENDING, KIND_OLD)
+OUTCOME_DONE = "done_external"
+OUTCOME_NOT_NEEDED = "not_needed"
+OUTCOMES = (OUTCOME_DONE, OUTCOME_NOT_NEEDED)
+ACTOR_INBOX = "human:inbox"
+ACTOR_LINK = "human:link"
+
+_ID_RE = re.compile(r"^[0-9]{1,12}$")
+_LINE_USER_ID_RE = re.compile(r"^U[0-9a-f]{32}$")
+_JST = datetime.timezone(datetime.timedelta(hours=9))
+
+_ROUTE_LABELS = {"customer": "顧客対応", "hearing": "ヒアリング", "inbound": "受信入口で停止"}
+_REASON_LABELS = {"demoted": "bot が判断できず下書きだけ作成", "empty_reply": "bot の返事が空だった",
+                  "policy_stopped": "許可表で bot 停止", "claude_outage": "AI の障害・例外"}
+_STATE_LABELS = {"open": "未処理", "human_replied": "返信済み（画面から）", "auto_replied": "bot が返信",
+                 "not_needed": "不要", "closed_external": "対応終了（別の方法で返信済み）"}
+_OLD_OUTCOME_LABELS = {"done_external": "対応終了（別の方法で返信済み）", "not_needed": "不要"}
+_NOTICES = {
+    "closed": "対応終了にしました。", "not_needed": "不要にしました。", "reopened": "未処理に戻しました。",
+    "already": "この件は既に処理済みです。", "not_found": "対象が見つかりません。", "bad_input": "入力が不正です。",
+    "db": "記録を読み書きできませんでした。", "not_closed": "この件は閉じていません。",
+}
+_LINK_NOTICES = {
+    "expired": "リンクの期限が切れています。下の一覧から該当の件を開いてください。",
+    "invalid": "リンクが無効です（期限切れか、改ざんの疑い）。下の一覧から該当の件を開いてください。",
+    "noreply": "この件には承認キューが無いため返信画面を開けません。LINE アプリで返信し、下の一覧で「対応終了」を押してください。",
+}
+
+_CSS = ("body{font-family:sans-serif;max-width:720px;margin:0 auto;padding:.6rem 1rem 2rem;box-sizing:border-box;"
+        "background:#eef1f5;color:#222}h1{font-size:1.25rem;margin:.4rem 0 .1rem}.sub{color:#667;font-size:.85rem;margin:0 0 .8rem}"
+        "a{color:#1a3c6e}.item{background:#fff;border:1px solid #d8dde5;border-radius:14px;padding:.75rem 1rem;margin:.6rem 0}"
+        ".name{font-size:1.05rem;font-weight:bold}.meta{color:#8a8f98;font-size:.78rem;margin-top:.3rem}"
+        ".badge{display:inline-block;border-radius:999px;padding:.12rem .6rem;font-size:.78rem;background:#e3e7ee;color:#445;margin:.15rem .35rem .15rem 0}"
+        ".badge.att{background:#fde2e2;color:#8a1f1f}.badge.warn{background:#fff3d6;color:#8a6d00}.badge.info{background:#e8f0fb;color:#1a5cb0}"
+        ".badge.old{background:#eee;color:#555;border:1px solid #ccc}"
+        "pre{white-space:pre-wrap;word-break:break-word;font-family:inherit;font-size:.93rem;border-radius:12px;padding:.55rem .8rem;"
+        "margin:.4rem 0;background:#f2f4f7;border:1px solid #e2e6ec}.lbl{color:#667;font-size:.78rem;margin-top:.4rem}"
+        ".actions{display:flex;gap:.5rem;flex-wrap:wrap;margin-top:.6rem}.actions form{margin:0}"
+        "button,.btn{font-size:.95rem;padding:.55rem 1rem;border-radius:10px;border:1px solid #c8cdd5;background:#fff;color:#222;"
+        "min-height:44px;text-decoration:none;display:inline-flex;align-items:center}"
+        ".btn.primary,button.primary{background:#1a3c6e;color:#fff;border-color:#1a3c6e;font-weight:bold}"
+        ".empty{color:#667;text-align:center;margin:1.2rem 0}.notice{background:#e8f0fb;border-radius:10px;padding:.5rem .8rem;color:#1a5cb0;margin:.4rem 0}"
+        ".hint{color:#667;font-size:.85rem}")
+
+
+def _bad_request() -> Response:
+    return Response(status_code=400)
+
+
+def _v(rec: dict, code: str) -> str:
+    return str(((rec or {}).get(code) or {}).get("value") or "")
+
+
+def _parse_dt(s: str) -> datetime.datetime | None:
+    s = str(s or "").strip()
+    if not s:
+        return None
+    try:
+        d = datetime.datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if d.tzinfo is None:
+        d = d.replace(tzinfo=datetime.timezone.utc)
+    return d
+
+
+def fmt_jst(s: str, now: datetime.datetime | None = None) -> str:
+    """JST の「今日 16:58」／「11/2 16:58」（本文・ID を含まない）。"""
+    d = _parse_dt(s)
+    if d is None:
+        return ""
+    t = d.astimezone(_JST)
+    n = (now or datetime.datetime.now(datetime.timezone.utc)).astimezone(_JST)
+    hm = f"{t.hour:02d}:{t.minute:02d}"
+    if (t.year, t.month, t.day) == (n.year, n.month, n.day):
+        return f"今日 {hm}"
+    return f"{t.month}/{t.day} {hm}"
+
+
+# ── データの組み立て ────────────────────────────────────────────────────────
+async def _records_by_ids(ids: list[str]) -> dict:
+    """承認キューをレコード ID で取り寄せる（固定書式の ID のみ・取得失敗は空）。"""
+    ids = [i for i in ids if _ID_RE.fullmatch(str(i))]
+    if not ids or not (APP_APPROVAL.app_id() and APP_APPROVAL.token()):
+        return {}
+    out: dict = {}
+    for i in range(0, len(ids), 50):
+        chunk = ids[i:i + 50]
+        q = "$id in (" + ",".join(f'"{x}"' for x in chunk) + f") limit {len(chunk)}"
+        try:
+            rows = await kintone.search_records(APP_APPROVAL, q, fields=_FIELDS)
+        except Exception:
+            logger.warning("[INBOX] approval lookup failed (fixed reason)")
+            continue
+        for r in rows:
+            out[_v(r, "$id")] = r
+    return out
+
+
+async def _old_records() -> list[dict]:
+    """承認キューの未送信（送信済み=no）を更新の古い順に（V2 以前の項目の候補）。"""
+    if not (APP_APPROVAL.app_id() and APP_APPROVAL.token()):
+        return []
+    try:
+        return await kintone.search_records(
+            APP_APPROVAL, f'送信済み in ("no") order by 更新日時 asc limit {OLD_LIMIT}', fields=_FIELDS)
+    except Exception:
+        logger.warning("[INBOX] approval list failed (fixed reason)")
+        return []
+
+
+async def _attending_map(hashes: set) -> dict:
+    out: dict = {}
+    for h in hashes:
+        try:
+            out[h] = await send_ledger.conversation_state_by_hash(BUSINESS, h) or {}
+        except Exception:
+            out[h] = {}
+    return out
+
+
+def _pending_item(r: dict, rec: dict | None, conv: dict) -> dict:
+    rid = str(r.get("approval_record_id") or "")
+    return {"kind": KIND_PENDING, "id": str(r["pending_id"]), "record_id": rid if _ID_RE.fullmatch(rid) else "",
+            "name": (_v(rec, "顧客名") if rec else ""), "message": (_v(rec, "顧客メッセージ") if rec else ""),
+            "category": r.get("category") or (_v(rec, "カテゴリ") if rec else ""),
+            "at": r.get("created_at") or "", "state": r.get("state") or "", "route": r.get("route") or "",
+            "reason": r.get("reason") or "", "customer_send": r.get("customer_send") or "",
+            "attending": bool(conv.get("attending")), "old": False}
+
+
+def _old_item(rec: dict, closed: dict | None = None) -> dict:
+    return {"kind": KIND_OLD, "id": _v(rec, "$id"), "record_id": _v(rec, "$id"), "name": _v(rec, "顧客名"),
+            "message": _v(rec, "顧客メッセージ"), "category": _v(rec, "カテゴリ"), "at": _v(rec, "更新日時"),
+            "state": (closed or {}).get("outcome", "open"), "route": "", "reason": "", "customer_send": "",
+            "attending": False, "old": True, "closed_at": (closed or {}).get("at", "")}
+
+
+def _sort_key(item: dict):
+    d = _parse_dt(item.get("at", ""))
+    return d or datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
+
+
+async def load_open_items() -> list[dict]:
+    """未処理: 対応待ち（open）＋承認キューだけの未送信（対応待ちの表に無く・閉じていない）。古い順。"""
+    rows = await reply_pending.list_open(reply_pending.LIST_LIMIT)
+    attending = await _attending_map({r["line_user_hash"] for r in rows})
+    recs = await _records_by_ids([str(r.get("approval_record_id") or "") for r in rows])
+    items = [_pending_item(r, recs.get(str(r.get("approval_record_id") or "")), attending.get(r["line_user_hash"]) or {})
+             for r in rows]
+    referenced = await reply_pending.approval_record_ids_all()
+    closed = await approval_close.closed_ids(BUSINESS)
+    for rec in await _old_records():
+        rid = _v(rec, "$id")
+        if rid and rid not in referenced and rid not in closed:
+            items.append(_old_item(rec))
+    items.sort(key=_sort_key)
+    return items
+
+
+async def load_closed_items() -> list[dict]:
+    """閉じた件（参照）: 対応待ちの open 以外＋承認キューの閉じ記録。新しい順。"""
+    rows = await reply_pending.list_closed(CLOSED_LIMIT)
+    recs = await _records_by_ids([str(r.get("approval_record_id") or "") for r in rows])
+    items = [_pending_item(r, recs.get(str(r.get("approval_record_id") or "")), {}) for r in rows]
+    for it, r in zip(items, rows):
+        it["closed_at"] = r.get("resolved_at") or r.get("updated_at") or ""
+    closed_rows = await approval_close.list_closed(BUSINESS, CLOSED_LIMIT)
+    crecs = await _records_by_ids([c["approval_record_id"] for c in closed_rows])
+    for c in closed_rows:
+        rec = crecs.get(c["approval_record_id"]) or {"$id": {"value": c["approval_record_id"]}}
+        items.append(_old_item(rec, c))
+    items.sort(key=lambda it: _parse_dt(it.get("closed_at", "")) or _sort_key(it), reverse=True)
+    return items
+
+
+# ── 画面 ────────────────────────────────────────────────────────────────────
+def _head(title: str) -> str:
+    return ('<!DOCTYPE html><html lang="ja"><head><meta charset="utf-8">'
+            '<meta name="viewport" content="width=device-width, initial-scale=1"><meta name="color-scheme" content="light">'
+            f"<title>{html.escape(title)} - 案件管理（仮）</title><style>{_CSS}</style></head><body>")
+
+
+def _badges(it: dict) -> str:
+    e = html.escape
+    out = []
+    if it["old"]:
+        out.append('<span class="badge old">旧</span>')
+    if it["attending"]:
+        out.append('<span class="badge att">bot 停止中（対応中）</span>')
+    if it["record_id"]:
+        out.append('<span class="badge warn">未送信の下書きあり</span>')
+    if it["reason"]:
+        out.append(f'<span class="badge">{e(_REASON_LABELS.get(it["reason"], it["reason"]))}</span>')
+    if it["route"]:
+        out.append(f'<span class="badge">{e(_ROUTE_LABELS.get(it["route"], it["route"]))}</span>')
+    if it["customer_send"] == "j0_sent":
+        out.append('<span class="badge info">初回 1 通（J-0）送信済み</span>')
+    if it["category"]:
+        out.append(f'<span class="badge">{e(str(it["category"]))}</span>')
+    return "".join(out)
+
+
+def _card(it: dict, closed_view: bool) -> str:
+    e = html.escape
+    parts = ['<div class="item">']
+    parts.append(f'<div class="name">{e(it["name"] or "（お名前未登録）")}'
+                 f'<span class="meta"> 受付 {e(fmt_jst(it["at"]))}</span></div>')
+    parts.append(f'<div>{_badges(it)}</div>')
+    if it["message"]:
+        parts.append(f'<div class="lbl">お客様からのメッセージ</div><pre>{e(it["message"])}</pre>')
+    elif not it["record_id"]:
+        parts.append('<p class="hint">承認キューが無い件です。LINE アプリで受信を確認し、返信したら「対応終了」を押してください。</p>')
+    ref = f"No.{e(it['record_id'])}" if it["record_id"] else f"ID {e(it['id'])}"
+    if closed_view:
+        label = (_OLD_OUTCOME_LABELS.get(it["state"], it["state"]) if it["old"]
+                 else _STATE_LABELS.get(it["state"], it["state"]))
+        parts.append(f'<div class="meta">{ref}｜{e(label)}｜{e(fmt_jst(it.get("closed_at", "")))}</div>')
+        if it["old"] or it["state"] in reply_pending.CLOSED_BY_HUMAN_STATES:
+            parts.append(f'<div class="actions"><form method="post" action="{PAGE}/reopen">'
+                         f'<input type="hidden" name="kind" value="{it["kind"]}"><input type="hidden" name="id" value="{e(it["id"])}">'
+                         '<button type="submit">未処理に戻す</button></form></div>')
+        parts.append("</div>")
+        return "".join(parts)
+    parts.append(f'<div class="meta">{ref}</div>')
+    parts.append('<div class="actions">')
+    if it["record_id"]:
+        parts.append(f'<a class="btn primary" href="{REPLY}/{e(it["record_id"])}">返信する</a>')
+    hidden = f'<input type="hidden" name="kind" value="{it["kind"]}"><input type="hidden" name="id" value="{e(it["id"])}">'
+    parts.append(f'<form method="post" action="{PAGE}/close">{hidden}'
+                 f'<button type="submit" name="outcome" value="{OUTCOME_DONE}">対応終了</button></form>')
+    parts.append(f'<form method="post" action="{PAGE}/close">{hidden}'
+                 f'<button type="submit" name="outcome" value="{OUTCOME_NOT_NEEDED}">不要</button></form>')
+    parts.append("</div></div>")
+    return "".join(parts)
+
+
+def _page(items: list[dict], notices: list[str], closed_view: bool) -> str:
+    e = html.escape
+    parts = [_head("対応待ち"), "<h1>対応待ち</h1>",
+             '<p class="sub">bot が自動返信できなかった相談と、未送信の返信下書きの一覧です。'
+             '<a href="/app/approvals">承認</a>｜<a href="/app/send_ops">送信確認待ち</a></p>']
+    for n in notices:
+        if n:
+            parts.append(f'<p class="notice">{e(n)}</p>')
+    if closed_view:
+        parts.append(f'<p class="sub">閉じた件（直近 {CLOSED_LIMIT} 件・新しい順）。<a href="{PAGE}">未処理の一覧へ戻る</a></p>')
+    if not items:
+        parts.append('<p class="empty">対応待ちはありません</p>' if not closed_view else '<p class="empty">閉じた件はありません</p>')
+    for it in items:
+        parts.append(_card(it, closed_view))
+    if not closed_view:
+        parts.append(f'<p class="sub"><a href="{PAGE}?closed=1">閉じた件も表示する</a></p>')
+    parts.append('<script src="/app/shell.js"></script></body></html>')
+    return "".join(parts)
+
+
+def _confirm_page(it: dict, token: str) -> str:
+    e = html.escape
+    parts = [_head("対応終了の確認"), "<h1>対応終了にしますか？</h1>",
+             '<p class="sub">この相談者に、LINE アプリなど別の方法で返信済みのときに押してください。bot を再開します。'
+             "顧客への送信はしません。</p>", '<div class="item">',
+             f'<div class="name">{e(it["name"] or "（お名前未登録）")}<span class="meta"> 受付 {e(fmt_jst(it["at"]))}</span></div>',
+             f'<div>{_badges(it)}</div>']
+    if it["message"]:
+        parts.append(f'<div class="lbl">お客様からのメッセージ</div><pre>{e(it["message"])}</pre>')
+    parts.append(f'<div class="actions"><form method="post" action="{GO}/{pending_link.KIND_CLOSE}/{e(token)}">'
+                 '<button type="submit" class="primary">対応終了にする</button></form>'
+                 f'<a class="btn" href="{PAGE}">やめる（対応待ちへ）</a></div></div>')
+    parts.append('<script src="/app/shell.js"></script></body></html>')
+    return "".join(parts)
+
+
+# ── route: 一覧 ──────────────────────────────────────────────────────────────
+async def inbox_page(request: Request):
+    q = request.query_params
+    closed_view = q.get("closed") == "1"
+    notices = [_NOTICES.get(q.get("done", ""), ""), _LINK_NOTICES.get(q.get("link", ""), "")]
+    try:
+        items = await load_closed_items() if closed_view else await load_open_items()
+    except Exception:
+        items, notices = [], notices + [_NOTICES["db"]]
+    return HTMLResponse(_page(items, notices, closed_view))
+
+
+async def _end_attending_for_pending(pending_id: int) -> None:
+    try:
+        row = await reply_pending.get_pending(pending_id)
+        if row:
+            await send_ledger.end_attending_by_hash(BUSINESS, row["line_user_hash"])
+    except Exception:
+        logger.warning("[INBOX] end attending failed (fixed reason)")
+
+
+async def _end_attending_for_record(record_id: str) -> None:
+    """承認キューだけの件: レコードの line_user_id をサーバー内で解決してハッシュ化（画面・URL には出さない）。"""
+    try:
+        rec = await kintone.get_record(APP_APPROVAL, record_id)
+    except Exception:
+        return
+    uid = _v(rec, "line_user_id")
+    if not _LINE_USER_ID_RE.fullmatch(uid):
+        return
+    try:
+        await send_ledger.end_attending_by_hash(BUSINESS, send_ledger.line_user_hash(BUSINESS, uid))
+    except Exception:
+        logger.warning("[INBOX] end attending failed (fixed reason)")
+
+
+async def close_item(kind: str, item_id: str, outcome: str, actor: str) -> str:
+    """閉じる（画面・署名リンク共通）。戻り値は _NOTICES の閉集合コード。"""
+    if kind == KIND_PENDING:
+        pid = int(item_id)
+        if outcome == OUTCOME_DONE:
+            res = await reply_pending.mark_closed_external(pid, actor=actor)
+        else:
+            res = await reply_pending.mark_not_needed(pid)
+        if res == "ok":
+            if outcome == OUTCOME_DONE:
+                await _end_attending_for_pending(pid)
+            return "closed" if outcome == OUTCOME_DONE else "not_needed"
+        return {"not_open": "already", "not_found": "not_found"}.get(res, "db")
+    res = await approval_close.close(BUSINESS, item_id, outcome, actor)
+    if res == "ok":
+        if outcome == OUTCOME_DONE:
+            await _end_attending_for_record(item_id)
+        return "closed" if outcome == OUTCOME_DONE else "not_needed"
+    return {"already": "already", "bad_input": "bad_input"}.get(res, "db")
+
+
+async def inbox_close(request: Request):
+    form = await request.form()
+    kind, item_id, outcome = str(form.get("kind", "")), str(form.get("id", "")), str(form.get("outcome", ""))
+    if kind not in KINDS or not _ID_RE.fullmatch(item_id) or outcome not in OUTCOMES:
+        return _bad_request()
+    code = await close_item(kind, item_id, outcome, ACTOR_INBOX)
+    return RedirectResponse(f"{PAGE}?done={code}", status_code=303)
+
+
+async def inbox_reopen(request: Request):
+    form = await request.form()
+    kind, item_id = str(form.get("kind", "")), str(form.get("id", ""))
+    if kind not in KINDS or not _ID_RE.fullmatch(item_id):
+        return _bad_request()
+    if kind == KIND_PENDING:
+        res = await reply_pending.reopen(int(item_id), actor=ACTOR_INBOX)
+        code = {"ok": "reopened", "not_closed": "not_closed", "not_found": "not_found"}.get(res, "db")
+    else:
+        res = await approval_close.reopen(BUSINESS, item_id, ACTOR_INBOX)
+        code = {"ok": "reopened", "not_closed": "not_closed"}.get(res, "db")
+    return RedirectResponse(f"{PAGE}?closed=1&done={code}", status_code=303)
+
+
+# ── route: 署名付きリンク ──────────────────────────────────────────────────────
+def _to_inbox(link: str) -> RedirectResponse:
+    return RedirectResponse(f"{PAGE}?link={link}", status_code=303)
+
+
+async def _verified(request: Request, kind: str):
+    """(status, pending_id)。種別違いは invalid。"""
+    status, k, pid = pending_link.verify(str(request.path_params.get("token", "")))
+    if status == pending_link.STATUS_OK and k != kind:
+        return pending_link.STATUS_INVALID, None
+    return status, pid
+
+
+async def go_reply(request: Request):
+    status, pid = await _verified(request, pending_link.KIND_REPLY)
+    if status != pending_link.STATUS_OK:
+        logger.info("[INBOX] link rejected (fixed reason)")
+        return _to_inbox(status)
+    try:
+        row = await reply_pending.get_pending(pid)
+    except Exception:
+        return RedirectResponse(f"{PAGE}?done=db", status_code=303)
+    rid = str((row or {}).get("approval_record_id") or "")
+    if not row:
+        return RedirectResponse(f"{PAGE}?done=not_found", status_code=303)
+    if not _ID_RE.fullmatch(rid):
+        return _to_inbox("noreply")
+    return RedirectResponse(f"{REPLY}/{rid}", status_code=303)
+
+
+async def go_close_confirm(request: Request):
+    status, pid = await _verified(request, pending_link.KIND_CLOSE)
+    if status != pending_link.STATUS_OK:
+        logger.info("[INBOX] link rejected (fixed reason)")
+        return _to_inbox(status)
+    try:
+        row = await reply_pending.get_pending(pid)
+    except Exception:
+        return RedirectResponse(f"{PAGE}?done=db", status_code=303)
+    if not row:
+        return RedirectResponse(f"{PAGE}?done=not_found", status_code=303)
+    if row["state"] != reply_pending.STATE_OPEN:
+        return RedirectResponse(f"{PAGE}?done=already", status_code=303)
+    rid = str(row.get("approval_record_id") or "")
+    recs = await _records_by_ids([rid]) if _ID_RE.fullmatch(rid) else {}
+    conv = (await _attending_map({row["line_user_hash"]})).get(row["line_user_hash"]) or {}
+    it = _pending_item(row, recs.get(rid), conv)
+    return HTMLResponse(_confirm_page(it, str(request.path_params.get("token", ""))))
+
+
+async def go_close(request: Request):
+    status, pid = await _verified(request, pending_link.KIND_CLOSE)
+    if status != pending_link.STATUS_OK:
+        return _to_inbox(status)
+    code = await close_item(KIND_PENDING, str(pid), OUTCOME_DONE, ACTOR_LINK)
+    return RedirectResponse(f"{PAGE}?done={code}", status_code=303)
+
+
+router.add_api_route(PAGE, _gate(inbox_page), methods=["GET"])
+router.add_api_route(f"{PAGE}/close", _gate(inbox_close), methods=["POST"])
+router.add_api_route(f"{PAGE}/reopen", _gate(inbox_reopen), methods=["POST"])
+router.add_api_route(f"{GO}/{pending_link.KIND_REPLY}/{{token}}", _gate(go_reply), methods=["GET"])
+router.add_api_route(f"{GO}/{pending_link.KIND_CLOSE}/{{token}}", _gate(go_close_confirm), methods=["GET"])
+router.add_api_route(f"{GO}/{pending_link.KIND_CLOSE}/{{token}}", _gate(go_close), methods=["POST"])

@@ -1172,6 +1172,16 @@ def decide_send(actor: str, *, paused: str = CLEAR, stoplisted: str = CLEAR,
     return Decision(not reasons, tuple(reasons))
 
 
+def human_auto_decision(cond: dict | None, *, attending: bool = True) -> Decision:
+    """UX-PENDING-1 (3): 画面の確認チェックを廃止し、停止条件の **実値**（hub.send_policy.conditions）で許可表の「大野の明示送信」列を
+    評価する（explicit_confirm=False）。cond が None（読めない）は全条件 UNKNOWN＝送らない（fail-closed）。
+    停止リスト登録あり・照会不能・対応モード照会不能で止まる。全体停止・人対応中・対応中は人の返信なので通る。"""
+    c = cond or {}
+    return decide_send(ACTOR_HUMAN, paused=c.get("paused", UNKNOWN), stoplisted=c.get("stoplisted", UNKNOWN),
+                       human_mode=c.get("human_mode", UNKNOWN), attending=attending, stage_known=False,
+                       explicit_confirm=False)
+
+
 def human_explicit_decision(explicit_confirm: bool) -> Decision:
     """JIKOU-REPLY-Q1b (f): 許可表のうち「大野の明示送信」列だけを適用する入口。
     human は停止判定（全体停止・停止リスト・人対応）の照会対象外＝各条件を UNKNOWN（最悪側）

@@ -9,6 +9,7 @@
     ["/app/cases", "時効案件"],
     ["/app/q", "質問"],
     ["/app/approvals", "承認"],
+    ["/app/inbox", "対応待ち"],
     ["/app/kinship", "関係図"],
   ];
   // BRAIN-A1 fix4 (R14): 案件脳リンクは BRAIN_SYNC_ENABLED が ON のときだけ表示する。

@@ -148,6 +148,7 @@ https://<公開ドメイン>/app/inbox からご確認ください。
 
 - `reply_pending.state` に **`closed_external`** を追加（対応終了＝別経路で返信済み）。履歴表 `reply_pending_history` に actor（`human:inbox` / `human:link`）を残す。**未処理に戻す** は `closed_external`/`not_needed` → `open` を履歴つきで。
   - 代案: 既存の `human_replied` を流用し `resolved_by` で区別。区別が画面で分かりにくいので新状態を推奨。
+- `reply_pending.state` には DB の CHECK 制約（4 値固定・migration a1c3）があるため、同じ migration で制約を 5 値に更新する（列は増えない。downgrade は closed_external の行があれば拒否）。
 - 承認キューだけの件のために新表 **`approval_close`**（`approval_record_id`・`outcome`∈{done_external, not_needed, reopened}・`actor`・`at`・追記のみ）。alembic 1 本（親 `b7d9f1a3c5e7`）。kintone は書かない。
 - 「対応終了」は同時に `send_ledger.end_attending_by_hash`（bot 再開）を呼ぶ（現行の「対応終了（bot 再開）」と同じ関数）。
 
@@ -178,7 +179,7 @@ https://<公開ドメイン>/app/inbox からご確認ください。
 
 ## 12. 変更するファイル（予定）
 
-- 新規: `hub/webapp_inbox_view.py`（画面 B・C・`/app/go/*`）、`hub/pending_link.py`（符号の発行・検証）、`hub/approval_close.py`（新表）、alembic 1 本、`test_ux_pending_1.py`
+- 新規: `hub/webapp_inbox_view.py`（画面 B・C・`/app/go/*`）、`hub/pending_link.py`（符号の発行・検証）、`hub/approval_close.py`（新表）、`hub/trial_account.py`（試験アカウント allowlist）、alembic 1 本（`c9e1b3d5f7a9`: approval_close＋state の CHECK 制約）、`test_ux_pending_1.py`
 - 変更: `hub/webapp_reply_view.py`（[送信]・チェック廃止・自動確認・状態札）、`hub/send_policy.py`（通知文の URL・`closed_external`・v2 定型の鍵名）、`hub/reply_pending.py`（状態追加・戻す）、`hub/webapp_auth.py`（`next`）、`hub/webapp_pending_view.py`（303 のみ残す）、`webapp/shell.js`・`webapp/index.html`、`main.py`（router 登録・allowlist は承認後）
 - 文書: `docs/ux_pending_1_design.md`（本書）、`pgv/ux_pending_1_report.md`、経過通知 v2 の承認文（別ファイル・承認待ち）
 

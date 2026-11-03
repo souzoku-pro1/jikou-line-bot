@@ -892,11 +892,11 @@ async def _process_line_event(reply_token: str, user_id: str, user_text: str) ->
                 else:
                     return                    # silent（上限超過・通知は module 側）
 
-        if not in_hearing_session:
+        if not in_hearing_session or trial_account.is_test_user(user_id):   # UX-PENDING-1 (6): 試験アカウントは顧客対応経路へ
             if app21_record is not None:
                 # 人対応判定は上（HRI-08）で経路に関わらず済み。ここは status ルーティングのみ
                 status = app21_record.get("status", {}).get("value", "")
-                routing = classify_routing(status)
+                routing = trial_account.routing_override(user_id, classify_routing(status))   # UX-PENDING-1 (6)
                 logger.info("[ROUTING] user_id=%s App21 (status/routing redacted)",
                             emit(user_id, "external_ref", "log", "operator"))
                 if routing != "hearing":
@@ -2417,3 +2417,10 @@ async def _approval_policy_stopped(_ev, record_id: str, record: dict) -> dict:
 # ── JIKOU-REPLY-Q1c-fix1（Codex R-Q1c BC-03）: 対応待ちの永続キュー再処理（回収ジョブに相乗り）と未返信の経過通知
 #    （1 日 2 回・件数と経過分のみ）の登録。末尾追記（pin 番地不変）。start_all は既存の startup（healthcheck／houki）が呼ぶ。
 send_policy.register_jobs()
+
+
+# ── UX-PENDING-1: 対応待ちの統合一覧（/app/inbox）・署名付きリンク（/app/go/r|c）・試験アカウント allowlist の結線。
+#    末尾追記（sink allowlist の行番号 pin を壊さない規約・本文中は 1 行置換 2 箇所のみ）。catch-all より前へ並べ替える。
+from hub import trial_account  # noqa: E402
+from hub.webapp_inbox_view import router as inbox_view_router  # noqa: E402
+include_before_catch_all(app, inbox_view_router)
