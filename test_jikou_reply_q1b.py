@@ -56,6 +56,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 import chat_responder as cr  # noqa: E402
 import main  # noqa: E402
+from hub import autoreply_stoplist  # noqa: E402  UX-PENDING-1-fix1 BU-01/02: 返信画面は停止リストを都度照会する
 from hub import db  # noqa: E402
 from hub import kintone  # noqa: E402
 from hub import line_channel  # noqa: E402
@@ -73,7 +74,10 @@ REPO = Path(__file__).parent
 _client = TestClient(main.app)
 _ENV = {"WEBAPP_PASSWORD_HASH": hash_password("pw", iterations=MIN_ITERATIONS),
         "WEBAPP_SESSION_SECRET": "s" * 32,
-        "APP_CHATLOG": "28", "TOKEN_CHATLOG": "d"}
+        "APP_CHATLOG": "28", "TOKEN_CHATLOG": "d",
+        # UX-PENDING-1-fix1 BU-02: 停止リスト未設定（unconfigured）は人の明示送信でも不送信になったため、送信系テストは停止リストを
+        # 設定済みにする（search_records のフェイクは [] ＝検索 0 件 = clear）
+        "APP_AUTOREPLY_STOP": "39", "TOKEN_AUTOREPLY_STOP": "t39"}
 USER = "U" + "a" * 32
 USER2 = "U" + "b" * 32
 OP = "f" * 32
@@ -182,6 +186,8 @@ class _DbMixin(unittest.TestCase):
             patch.object(kintone, "get_form_fields", self.form_fields),
             patch.object(kintone, "create_record", self.create),
             patch.object(cr, "get_app21_record", self.app21),
+            # UX-PENDING-1-fix1 BU-01/02: 停止リストは送信直前に都度照会される。chatlog 用の search フェイクと混ざらないよう check を clear に固定
+            patch.object(autoreply_stoplist, "check", AsyncMock(return_value=autoreply_stoplist.OUTCOME_CLEAR)),
         ]
         for p in self._patches:
             p.start()
