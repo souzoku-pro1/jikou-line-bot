@@ -66,13 +66,17 @@ class _InboxMixin(_DbMixin):
         _run(_create())
         self.records = {REC_ID: _approval()}
         self.old_records = []
+        self.old_queries = []
 
         async def _search(app, query, fields=None):
             if "$id in (" in query:
                 ids = re.findall(r'"([0-9]+)"', query)
                 return [self.records[i] for i in ids if i in self.records]
             if "送信済み in" in query:
-                return list(self.old_records)
+                self.old_queries.append(query)
+                m = re.search(r"limit (\d+)(?: offset (\d+))?", query)
+                lim, off = (int(m.group(1)), int(m.group(2) or 0)) if m else (len(self.old_records), 0)
+                return list(self.old_records)[off:off + lim]
             return []
 
         async def _get(app, record_id):
@@ -617,6 +621,35 @@ class TestFix1ReplyCheck(_InboxMixin):
         self.assertEqual(len(rv._held), rv.HOLD_MAX)
         self.assertNotIn(("k0", "1"), rv._held)
         rv._held.clear()
+
+
+class TestFix1Inbox(_InboxMixin):
+    def test_bu05_old_items_page_past_closed_records(self):
+        """BU-05: 閉じ済み 50 件 + 未処理 1 件（51 件目）で、その 1 件が表示される（除外後の件数でページング）。"""
+        closed_ids = [str(1000 + i) for i in range(50)]
+        self.old_records = [_approval(i, USER2, 顧客名="旧 %s" % i, 更新日時="2026-09-01T01:%02d:00Z" % (int(i) % 60))
+                            for i in closed_ids] + [_approval("1050", USER2, 顧客名="旧 未処理", 更新日時="2026-09-02T01:00:00Z")]
+        for i in closed_ids:
+            self.assertEqual(_run(ac.close("jikou", i, "done_external", "t")), "ok")
+        html = self.get("/app/inbox").text
+        self.assertIn("旧 未処理", html)
+        self.assertEqual(html.count('class="badge old"'), 1)
+        self.assertNotIn("旧 1000", html)
+        self.assertEqual([q.split("limit ")[1] for q in self.old_queries], ["50 offset 0", "50 offset 50"])   # 続きを読んだ
+        # 除外後に上限に達したら続きは読まない／対応待ちが参照する No. も除外して数える
+        self.old_queries.clear()
+        self.old_records = [_approval(str(2000 + i), USER2, 顧客名="旧 %d" % i) for i in range(60)]
+        html = self.get("/app/inbox").text
+        self.assertEqual(html.count('class="badge old"'), iv.OLD_LIMIT)
+        self.assertEqual(self.old_queries, [self.old_queries[0]])
+        # 取得失敗は空（固定理由ログ）・画面は落ちない
+        with patch.object(iv.kintone, "search_records", AsyncMock(side_effect=RuntimeError("down"))):
+            self.assertEqual(self.get("/app/inbox").status_code, 200)
+        # 上限ページ数で止まる（全部除外でも無限に読まない）
+        self.old_queries.clear()
+        self.old_records = [_approval(str(3000 + i), USER2) for i in range(iv.OLD_PAGE * (iv.OLD_MAX_PAGES + 2))]
+        self.assertEqual(_run(iv._old_records({r_["$id"]["value"] for r_ in self.old_records})), [])
+        self.assertEqual(len(self.old_queries), iv.OLD_MAX_PAGES)
 
 
 # ── 6. 試験アカウント allowlist（実装のみ・env 設定と有効化は大野） ─────────────────

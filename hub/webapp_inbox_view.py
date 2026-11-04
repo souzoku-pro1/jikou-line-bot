@@ -38,7 +38,9 @@ REPLY = "/app/reply"
 BUSINESS = "jikou"
 APP_APPROVAL = kintone.KintoneApp("App 29 (承認キュー)", "APP_APPROVAL", "TOKEN_APPROVAL")
 _FIELDS = ["$id", "顧客名", "顧客メッセージ", "カテゴリ", "送信済み", "更新日時", "line_user_id"]
-OLD_LIMIT = 50
+OLD_LIMIT = 50                  # 一覧に出す「旧」項目の上限（除外後の件数）
+OLD_PAGE = 50                   # fix1 BU-05: App 29 を 1 ページ何件ずつ読むか
+OLD_MAX_PAGES = 10              # fix1 BU-05: 続きを読む上限（50×10＝500 件まで）
 CLOSED_LIMIT = 50
 
 KIND_PENDING = "pending"
@@ -142,16 +144,32 @@ async def _records_by_ids(ids: list[str]) -> dict:
     return out
 
 
-async def _old_records() -> list[dict]:
-    """承認キューの未送信（送信済み=no）を更新の古い順に（V2 以前の項目の候補）。"""
+async def _old_records(exclude: set | None = None) -> list[dict]:
+    """承認キューの未送信（送信済み=no）を更新の古い順に（V2 以前の項目の候補）。
+    fix1 BU-05: exclude（対応待ちが参照する No.・閉じ済みの No.）を除いた後の件数が OLD_LIMIT に達するまで、
+    offset で続きのページを読む（閉じ済みが先頭 50 件を埋めても、その先の未処理を取りこぼさない）。"""
     if not (APP_APPROVAL.app_id() and APP_APPROVAL.token()):
         return []
-    try:
-        return await kintone.search_records(
-            APP_APPROVAL, f'送信済み in ("no") order by 更新日時 asc limit {OLD_LIMIT}', fields=_FIELDS)
-    except Exception:
-        logger.warning("[INBOX] approval list failed (fixed reason)")
-        return []
+    exclude = exclude or set()
+    out: list[dict] = []
+    offset = 0
+    for _ in range(OLD_MAX_PAGES):
+        try:
+            rows = await kintone.search_records(
+                APP_APPROVAL, f'送信済み in ("no") order by 更新日時 asc limit {OLD_PAGE} offset {offset}', fields=_FIELDS)
+        except Exception:
+            logger.warning("[INBOX] approval list failed (fixed reason)")
+            break
+        for rec in rows:
+            rid = _v(rec, "$id")
+            if rid and rid not in exclude:
+                out.append(rec)
+                if len(out) >= OLD_LIMIT:
+                    return out
+        if len(rows) < OLD_PAGE:
+            break
+        offset += OLD_PAGE
+    return out
 
 
 async def _attending_map(hashes: set) -> dict:
@@ -195,10 +213,8 @@ async def load_open_items() -> list[dict]:
              for r in rows]
     referenced = await reply_pending.approval_record_ids_all()
     closed = await approval_close.closed_ids(BUSINESS)
-    for rec in await _old_records():
-        rid = _v(rec, "$id")
-        if rid and rid not in referenced and rid not in closed:
-            items.append(_old_item(rec))
+    for rec in await _old_records(set(referenced) | set(closed)):   # fix1 BU-05: 除外後の件数でページング
+        items.append(_old_item(rec))
     items.sort(key=_sort_key)
     return items
 
