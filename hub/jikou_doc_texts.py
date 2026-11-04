@@ -30,6 +30,9 @@ TEXTS: dict = {
     "C-11": {"label": "事務所電話", "status": STATUS_NEEDS_APPROVAL, "text": "電話　{{電話}}"},
     "C-12": {"label": "弁護士署名", "status": STATUS_NEEDS_APPROVAL,
              "text": "弁護士　{{弁護士名}}（{{弁護士会}}・登録番号 {{登録番号}}）"},
+    # JIKOU-RECEIPT-1（I-2）: 領収書の但し書き（{{債権者名}} は本領収書で請求する社のみ）
+    "RC-1": {"label": "領収書 但し書き", "status": STATUS_NEEDS_APPROVAL,
+             "text": "時効援用手続きの弁護士費用として（対象債権者: {{債権者名}}）"},
 }
 TEXT_IDS = tuple(TEXTS)
 SLOTS = ("{{宛名}}", "{{債権者名}}", "{{通知発送日}}", "{{回答受領日}}", "{{回答要旨}}", "{{作成日}}",
@@ -41,7 +44,7 @@ def table_sha256() -> str:
                                      separators=(",", ":")).encode("utf-8")).hexdigest()
 
 
-TABLE_SHA256_PIN = "ecafc4715f43c9a372d28246c2024c48c9bff6ef5def636d4dac184af666afd1"
+TABLE_SHA256_PIN = "f1c368930111cc4314ac9b6ad4c91c5ed2258cfade7c37e15d29042ef9640207"
 
 
 def verify_pin() -> bool:
