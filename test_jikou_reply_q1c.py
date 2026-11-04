@@ -762,6 +762,7 @@ class TestPendingTableAndView(_DbMixin):
         self.assertEqual({rt.path for rt in pv.router.routes}, {"/app/pending", "/app/api/pending/open"})
         self.assertEqual({(rt.path, tuple(rt.methods)) for rt in iv.router.routes},
                          {("/app/inbox", ("GET",)), ("/app/inbox/close", ("POST",)), ("/app/inbox/reopen", ("POST",)),
+                          ("/app/inbox/release", ("POST",)),                      # UX-PENDING-1-fix2 BU-08（解除の要確認・送信なし）
                           ("/app/go/r/{token}", ("GET",)), ("/app/go/c/{token}", ("GET",)), ("/app/go/c/{token}", ("POST",))})
         from hub.webapp_brain_view import _paths_of
         paths = [p for entry in main.app.router.routes for p in _paths_of(entry)

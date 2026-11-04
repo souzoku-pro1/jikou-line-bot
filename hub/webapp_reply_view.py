@@ -495,6 +495,33 @@ def clear_held(session_key: str, record_id: str) -> None:
     _held.pop((session_key, str(record_id)), None)
 
 
+HOLD_PURGE_INTERVAL_SECONDS = 600   # fix2 BU-07: 既存の定期ジョブ（send_ledger の回収 hook・5 分間隔）に相乗りし、10 分ごとに期限切れを削除
+_last_purge: float | None = None
+
+
+def purge_held(*, now: float | None = None) -> int:
+    """fix2 BU-07: 期限切れ（HOLD_TTL_SECONDS 経過）の保持を削除する（読み出されなくても消える）。戻り値は削除数。"""
+    t = time.monotonic() if now is None else now
+    expired = [k for k, (_txt, at) in list(_held.items()) if t - at >= HOLD_TTL_SECONDS]
+    for k in expired:
+        _held.pop(k, None)
+    return len(expired)
+
+
+async def run_hold_purge(*, now: float | None = None) -> int | None:
+    """fix2 BU-07: 回収 hook（5 分間隔）から呼ばれ、前回の削除から HOLD_PURGE_INTERVAL_SECONDS 以上たっていれば期限切れを削除する。
+    間隔内なら何もしない（None）。読出し時の期限検査（held_text）は維持。ログは固定語彙のみ（本文・件数以外を出さない）。"""
+    global _last_purge
+    t = time.monotonic() if now is None else now
+    if _last_purge is not None and t - _last_purge < HOLD_PURGE_INTERVAL_SECONDS:
+        return None
+    _last_purge = t
+    n = purge_held(now=t)
+    if n:
+        logger.info("[REPLY] held text purged (expired)")
+    return n
+
+
 async def _conditions(user_id: str) -> dict | None:
     """UX-PENDING-1 (3): 停止条件の実値（読めなければ None＝全条件 UNKNOWN）。
     fix1 BU-01: 画面表示・送信直前とも send_policy.human_conditions（30 秒キャッシュを迂回して都度照会）。"""
@@ -671,3 +698,5 @@ router.add_api_route(f"{PAGE}/{{record_id}}", _gate(reply_page), methods=["GET"]
 router.add_api_route(f"{PAGE}/{{record_id}}/send", _gate(reply_send), methods=["POST"])
 # BR-08: 回収ジョブへの相乗り（冪等登録・main の末尾で register_recover_job が走る前後どちらでも可）
 send_ledger.register_recover_hook(run_chatlog_followup)
+# fix2 BU-07: 保持中の編集本文の期限切れ削除（同じ回収 hook に相乗り・10 分ごと）
+send_ledger.register_recover_hook(run_hold_purge)

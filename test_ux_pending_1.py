@@ -520,6 +520,13 @@ class TestFix1ReplyCheck(_InboxMixin):
         super().setUp()
         sp.clear_condition_cache()
         rv._held.clear()
+        self.hdr = _auth()   # fix2: 1 テスト内は同じ session cookie（ブラウザと同じ）。_auth() は秒で値が変わり、BU-03 の保持の鍵が跨ぐと別セッション扱いになる
+
+    def get(self, path):
+        return _client.get(path, headers=self.hdr, follow_redirects=False)
+
+    def post(self, path, data):
+        return _client.post(path, headers=self.hdr, data=data, follow_redirects=False)
 
     def _form(self, op="f" * 32, text="お返事します。"):
         return {"op_id": op, "text": text, "ticket": rv.make_ticket(REC_ID, USER, "0", op), "exemplar": "1"}
@@ -847,6 +854,35 @@ class TestFix1Inbox(_InboxMixin):
                 _run(iv.run_release_job())
         self.assertEqual((self.releases()[0]["state"], self.releases()[0]["attempts"]), ("abandoned", ar.MAX_ATTEMPTS))
         self.assertEqual(_run(ar.run_release_job()), {"pending": 0, "done": 0, "abandoned": 0})
+
+
+class TestFix2ReplyHold(unittest.TestCase):
+    def setUp(self):
+        rv._held.clear()
+        rv._last_purge = None
+
+    def tearDown(self):
+        rv._held.clear()
+        rv._last_purge = None
+
+    def test_bu07_expired_held_text_is_purged_by_periodic_job_without_read(self):
+        """BU-07: 操作なしで 1 時間経過（時刻注入）→ 定期ジョブ（回収 hook に相乗り・10 分間隔）で削除される（読み出していない）。
+        期限内は消えない・10 分未満の再呼出は動かない。"""
+        t0 = 1000.0
+        self.assertTrue(rv.hold_text("s1", "500", "編集中の本文", now=t0))
+        self.assertTrue(rv.hold_text("s2", "501", "別の本文", now=t0 + 1800))
+        self.assertEqual(_run(rv.run_hold_purge(now=t0 + 600)), 0)                       # 期限内は消えない
+        self.assertEqual(len(rv._held), 2)
+        self.assertIsNone(_run(rv.run_hold_purge(now=t0 + 600 + 599)))                   # 10 分未満は動かない
+        self.assertEqual(_run(rv.run_hold_purge(now=t0 + 3600)), 1)                      # 1 時間経過した s1 だけ消える（読出しなし）
+        self.assertEqual(set(rv._held), {("s2", "501")})
+        self.assertIsNone(rv.held_text("s1", "500", now=t0 + 3600))
+        self.assertEqual(rv.held_text("s2", "501", now=t0 + 3600), "別の本文")
+        self.assertEqual(_run(rv.run_hold_purge(now=t0 + 5400)), 1)                      # s2 も 1 時間で消える
+        self.assertEqual(rv._held, {})
+        self.assertEqual(rv.purge_held(now=t0 + 9999), 0)
+        self.assertIn(rv.run_hold_purge, sl._recover_hooks)                               # 既存の回収ジョブ（5 分間隔）に相乗り
+        self.assertEqual(rv.HOLD_PURGE_INTERVAL_SECONDS, 600)
 
 
 class TestFix2Inbox(_InboxMixin):
