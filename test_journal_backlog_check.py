@@ -276,7 +276,10 @@ class TestUnknownProviderWiring(unittest.IsolatedAsyncioTestCase):
                     "（provider 別滞留監視のいずれにも載らないため要確認）")
         checks = [("check_models", True), ("check_kintone_schema", True),
                   ("check_templates", False), ("check_journal_backlog", True),
-                  ("check_business_notify_liveness", True)]
+                  ("check_business_notify_liveness", True),
+                  # JIKOU-CERT-1 で判明: 同 worker の先行テストが残す env／DB 状態により check_app36_confirmed_decisions が
+                  # 実 kintone に当たり「実行自体が失敗」が混ざる（順序依存）。本テストの意図（監視項目H が 1 回だけ合流）に無関係な項目は空へ固定
+                  ("check_app36_confirmed_decisions", True)]
         with ExitStack() as es:
             for name, is_async in checks:
                 es.enter_context(patch.object(

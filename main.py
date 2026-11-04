@@ -2436,3 +2436,7 @@ wire_jikou_result(app)
 # ── JIKOU-PROGRESS-1（QUEUE-2026-10-16-R F-2）: 進捗連絡の下書き積み（F-1 の結果記録フック＋走査ジョブ・送信は Q4 のみ）の結線。末尾追記。
 from hub.jikou_progress import wire_all as wire_jikou_progress  # noqa: E402
 wire_jikou_progress(app)
+
+# JIKOU-CERT-1（QUEUE-2026-10-20-HI I-1）: 完了報告書の生成・ダウンロード画面（人の明示操作のみ・末尾追記）
+from hub.webapp_jikou_cert_view import wire_all as wire_jikou_cert  # noqa: E402
+wire_jikou_cert(app)
