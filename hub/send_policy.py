@@ -136,10 +136,45 @@ def clear_condition_cache() -> None:
 async def human_conditions(user_id: str) -> dict:
     """UX-PENDING-1-fix1 BU-01（Codex R-UX1）: 人の明示送信（返信画面）の直前確認。30 秒の再利用窓（_condition_cache）を
     **読まず・書かず**、停止リストと対応モードを毎回照会する（画面表示の後に停止リストへ登録された相談者にも送らない）。
-    照会の失敗は各値が UNKNOWN（呼び出し側は送らない）。bot 側の conditions() とキャッシュは不変。"""
+    照会の失敗は各値が UNKNOWN（呼び出し側は送らない）。bot 側の conditions() とキャッシュは不変。
+    fix1 BU-02: 停止リストの unconfigured（env 未設定・userId 書式外）と App 21 の設定欠落（env 未設定）も UNKNOWN＝送らない。
+    正常な検索結果 0 件（clear）・App 21 にレコードが無い（設定はある・対応モード未設定）は CLEAR のまま区別する。"""
     return {"paused": _paused_value(),
-            "stoplisted": await _stoplist_value(user_id),
-            "human_mode": await _human_mode_value(user_id)}
+            "stoplisted": await _stoplist_value_human(user_id),
+            "human_mode": await _human_mode_value_human(user_id)}
+
+
+async def _stoplist_value_human(user_id: str) -> str:
+    """BU-02: human 用。stopped → STOPPED／clear（検索 0 件）→ CLEAR／unknown・unconfigured・それ以外 → UNKNOWN。"""
+    from hub import autoreply_stoplist
+    try:
+        outcome = await autoreply_stoplist.check(user_id)
+    except Exception:
+        return send_ledger.UNKNOWN
+    if outcome == autoreply_stoplist.OUTCOME_STOPPED:
+        return send_ledger.STOPPED
+    if outcome == autoreply_stoplist.OUTCOME_CLEAR:
+        return send_ledger.CLEAR
+    return send_ledger.UNKNOWN
+
+
+def app21_configured() -> bool:
+    """BU-02: App 21 の照会に要る env（KINTONE_SUBDOMAIN／KINTONE_APP_ID／KINTONE_API_TOKEN）が揃っているか。
+    chat_responder.get_app21_record が「env 未設定 → 照会せず None」と判定するのと同じ 3 つを、呼出時の環境から読む。"""
+    return bool(os.environ.get("KINTONE_SUBDOMAIN") and os.environ.get("KINTONE_APP_ID") and os.environ.get("KINTONE_API_TOKEN"))
+
+
+async def _human_mode_value_human(user_id: str) -> str:
+    """BU-02: human 用。設定欠落（env 未設定＝get_app21_record が照会せず None を返す）と照会失敗は UNKNOWN。
+    設定があってレコードが無い（0 件）は「対応モード未設定」＝CLEAR（人対応ゲートの既存判定と同じ）。"""
+    if not app21_configured():
+        return send_ledger.UNKNOWN
+    cr = _cr()
+    try:
+        rec = await cr.get_app21_record(user_id)
+    except Exception:
+        return send_ledger.UNKNOWN
+    return send_ledger.STOPPED if cr.is_human_mode(rec) else send_ledger.CLEAR
 
 
 async def conditions_if_applicable(channel_name: str, to: str) -> dict | None:

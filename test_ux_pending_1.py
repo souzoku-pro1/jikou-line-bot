@@ -542,6 +542,44 @@ class TestFix1ReplyCheck(_InboxMixin):
         self.assertEqual(r.headers["location"], f"{self.PAGE}?done=stoplist_unknown")
         self.assertEqual(_FakeClient.calls, [])
 
+    def test_bu02_unconfigured_stoplist_and_missing_app21_config_are_unknown_but_zero_hits_is_clear(self):
+        """BU-02: 停止リスト unconfigured・App 21 の設定欠落 → unknown（送らない）。検索 0 件（clear）は送る。"""
+        # 停止リスト: 未設定（unconfigured）／照会失敗（unknown）／0 件（clear）
+        cases = ((autoreply_stoplist.OUTCOME_UNCONFIGURED, "stoplist_unknown"),
+                 (autoreply_stoplist.OUTCOME_UNKNOWN, "stoplist_unknown"),
+                 ("bogus", "stoplist_unknown"))
+        for i, (outcome, code) in enumerate(cases):
+            self.stop_check.return_value = outcome
+            r = self.send(op=("%032x" % (i + 10)))
+            self.assertEqual(r.headers["location"], f"{self.PAGE}?done={code}", outcome)
+            self.assertEqual(_FakeClient.calls, [], outcome)
+            self.assertEqual(_run(sp.human_conditions(USER))["stoplisted"], sl.UNKNOWN, outcome)
+        self.stop_check.return_value = autoreply_stoplist.OUTCOME_CLEAR               # 正常な 0 件
+        self.assertEqual(_run(sp.human_conditions(USER))["stoplisted"], sl.CLEAR)
+        # App 21: 設定欠落（env 未設定で None）／照会失敗／設定ありでレコード 0 件（None）
+        with patch.dict(os.environ, {"KINTONE_APP_ID": ""}):
+            self.app21.return_value = None
+            self.assertFalse(sp.app21_configured())
+            r = self.send(op="2" * 32)
+            self.assertEqual(r.headers["location"], f"{self.PAGE}?done=human_mode_unknown")
+            self.assertEqual(_FakeClient.calls, [])
+            self.assertIn("対応モード照会不能", self.get(self.PAGE).text)
+        self.assertTrue(sp.app21_configured())
+        self.app21.side_effect = RuntimeError("down")
+        r = self.send(op="3" * 32)
+        self.assertEqual(r.headers["location"], f"{self.PAGE}?done=human_mode_unknown")
+        self.assertEqual(_FakeClient.calls, [])
+        self.app21.side_effect = None
+        self.app21.return_value = None                                                 # 設定あり・レコード無し＝対応モード未設定
+        self.assertEqual(_run(sp.human_conditions(USER))["human_mode"], sl.CLEAR)
+        r = self.send(op="4" * 32)
+        self.assertTrue(r.headers["location"].startswith(f"{self.PAGE}?done=sent"), r.headers["location"])
+        self.assertEqual(len(_FakeClient.calls), 1)
+        # bot 側の判定（conditions）は従来どおり: unconfigured は CLEAR（V2 の既存挙動・本票で変えない）
+        sp.clear_condition_cache()
+        self.stop_check.return_value = autoreply_stoplist.OUTCOME_UNCONFIGURED
+        self.assertEqual(_run(sp.conditions(USER))["stoplisted"], sl.CLEAR)
+
 
 # ── 6. 試験アカウント allowlist（実装のみ・env 設定と有効化は大野） ─────────────────
 class TestTrialAccount(unittest.TestCase):
