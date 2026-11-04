@@ -139,6 +139,10 @@ ON のときだけ有効な事項は「V2 ON」と明記する。
   **fix2 BC-11（凍結記録）: J-0 文言の大野承認は V2 有効化前の条件**（`JIKOU_SEND_POLICY_V2` を ON にする前に承認を得る）とし、
   本承認で満たされた。承認時の変更は無いため `J0_TEXT` と test の sha pin は不変（文言を直す場合は両方を同時に更新して再承認）。
 
+- **UX-PENDING-1-fix1 BU-06（凍結記録・2026-11-04・Codex R-UX1 裁定）**: 業務 LINE 通知の署名付きリンク（`/app/go/r|c/<符号>`）の
+  識別子は **DB の連番 `pending_id` を署名付きで露出してよい**（HMAC-SHA256 で改ざん・番号推測による利用は不可／通知の閲覧者は大野のみ／
+  漏れる情報は件数の目安程度）。不透明な参照 ID への置換は行わない。設計書 docs/ux_pending_1_design.md §7 を同旨に訂正。
+
 ## 7. migration（fix1 BC-02）
 
 - 鎖は 1 本: e5f8（送信台帳）→ f7b2（手本）→ a7c9（create_state）→ c8e0（row_version）→ **a1c3**（対応待ち・Q1b-fix5／fix6 で

@@ -3,7 +3,8 @@
 - 種別 2 つだけ: `r`（その件の返信画面を開く）／`c`（「対応終了」の確認画面を開く）。リンクから顧客へ送信する経路は無い。
 - 符号の形: `<種別>.<pending_id>.<有効期限 unix 秒>.<HMAC-SHA256 先頭 32 桁>`。鍵は PWA のセッションと同じ
   WEBAPP_SESSION_SECRET（hub.webapp_auth._sign を再利用・鍵が無効なら発行も検証も不能＝URL を出さない）。
-- 識別は pending_id（DB の連番・不透明）。氏名・LINE userId・本文・会話参照は載せない（RV-10）。
+- 識別は pending_id（DB の連番・署名付き。fix1 BU-06 裁定: 連番の露出を許容＝HMAC で改ざん不可・閲覧者は大野のみ・漏れるのは件数程度）。
+  氏名・LINE userId・本文・会話参照は載せない（RV-10）。
 - 期限 72 時間（大野裁定）。期限切れは「無効」ではなく expired として返し、呼び出し側はログイン後の一覧へ着地させる。
 - 公開ホストは Railway 注入の RAILWAY_PUBLIC_DOMAIN のみ（hub.shindan_link.public_base_url と同じ・未設定なら URL 行を出さない）。
 """
