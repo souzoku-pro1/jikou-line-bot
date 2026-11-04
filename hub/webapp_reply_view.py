@@ -63,6 +63,7 @@ import hmac
 import html
 import logging
 import re
+import time
 import uuid
 
 from fastapi import APIRouter, Request
@@ -70,6 +71,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse, Response
 
 from hub import kintone, line_channel, reply_exemplar, reply_followup, send_ledger, send_policy
 from hub.redact import emit
+from hub import webapp_auth
 from hub.webapp_auth import _gate, _sign
 
 logger = logging.getLogger("hub.webapp_reply_view")
@@ -97,6 +99,7 @@ _FLAG_LABELS = {"paused": "全体停止中（bot）", "stoplisted": "停止リ�
                 "human_mode": "人対応中", "human_mode_unknown": "対応モード照会不能", "attending": "対応中（bot 停止）"}
 
 # 送信結果（done）・App 28 記録（log）・手本（ex）・台帳状態（state）の閉集合（画面文言は固定・入力値を反射しない）
+_HELD_NOTICE = "送信していない編集中の本文を返信欄に戻しました（サーバー側で一時保持・URL には載せません。1 時間で消えます）。"
 _DONE_NOTICES = {
     "sent": "送信しました。",
     "failed": "LINE への送信に失敗しました（LINE 側が受け付けませんでした）。送信されていません。",
@@ -349,7 +352,7 @@ async def _save_exemplar(user_id: str, inbound_text: str, text: str, op_id: str,
 
 # ── 画面 ────────────────────────────────────────────────────────────────────
 def _page(record_id: str, rec: dict | None, rows: list[dict], op_id: str, ticket: str | None,
-          notices: list[str], flags: tuple = ()) -> str:
+          notices: list[str], flags: tuple = (), held: str | None = None) -> str:
     e = html.escape
     parts = [
         '<!DOCTYPE html><html lang="ja"><head><meta charset="utf-8">',
@@ -404,7 +407,7 @@ def _page(record_id: str, rec: dict | None, rows: list[dict], op_id: str, ticket
         parts.append(f'<div class="meta">{e(_ROLE_LABELS.get(role, role))}｜{e(str(r.get("at", "")))}</div>')
         parts.append(f'<pre class="{cls}">{e(str(r.get("message", "")))}</pre>')
     parts.append("</div>")
-    draft = _v(rec, "AI下書き")
+    draft = held if held is not None else _v(rec, "AI下書き")   # fix1 BU-03: 保持中の編集本文があればそれを初期値に
     parts.append(f'<form method="post" action="{PAGE}/{e(record_id)}/send" class="item">'
                  f'<input type="hidden" name="op_id" value="{e(op_id)}">'
                  f'<input type="hidden" name="ticket" value="{e(ticket)}">'
@@ -441,7 +444,55 @@ async def reply_page(request: Request):
     op_id = uuid.uuid4().hex
     ticket = make_ticket(record_id, user_id, _revision(rec), op_id) if rec is not None else None
     flags = await _state_flags(user_id) if rec is not None else ()
-    return HTMLResponse(_page(record_id, rec, rows, op_id, ticket, notices, flags))
+    held = held_text(_session_key(request), record_id) if rec is not None else None   # fix1 BU-03: 送らなかった編集本文
+    if held is not None:
+        notices = notices + [_HELD_NOTICE]
+    return HTMLResponse(_page(record_id, rec, rows, op_id, ticket, notices, flags, held=held))
+
+
+# ── fix1 BU-03: 送らなかった編集本文の一時保持（認証セッションに紐づくサーバー側メモリ・URL／クエリ／ログに本文を載せない） ──
+HOLD_TTL_SECONDS = 3600          # 1 時間で消える（再表示されなければ破棄）
+HOLD_MAX = 200                   # 保持数の上限（超えたら最も古いものから消す）
+_held: dict = {}                 # (session_key, record_id) → (text, monotonic)
+
+
+def _session_key(request: Request) -> str:
+    """session cookie の値のハッシュ（値そのものは持たない）。cookie が無ければ ""＝保持しない。"""
+    import hashlib
+    v = str(request.cookies.get(webapp_auth._COOKIE) or "")
+    return hashlib.sha256(v.encode("utf-8")).hexdigest()[:32] if v else ""
+
+
+def hold_text(session_key: str, record_id: str, text: str, *, now: float | None = None) -> bool:
+    """送らなかった本文をセッション×承認キュー No. で保持する（同じ鍵は上書き）。"""
+    if not session_key or not text:
+        return False
+    t = time.monotonic() if now is None else now
+    for k, (_txt, at) in list(_held.items()):
+        if t - at >= HOLD_TTL_SECONDS:
+            _held.pop(k, None)
+    while len(_held) >= HOLD_MAX:
+        _held.pop(min(_held, key=lambda k: _held[k][1]), None)
+    _held[(session_key, str(record_id))] = (text, t)
+    return True
+
+
+def held_text(session_key: str, record_id: str, *, now: float | None = None) -> str | None:
+    """保持中の本文（期限内なら返す・返しても消さない＝送るか期限まで残る）。"""
+    if not session_key:
+        return None
+    hit = _held.get((session_key, str(record_id)))
+    if not hit:
+        return None
+    t = time.monotonic() if now is None else now
+    if t - hit[1] >= HOLD_TTL_SECONDS:
+        _held.pop((session_key, str(record_id)), None)
+        return None
+    return hit[0]
+
+
+def clear_held(session_key: str, record_id: str) -> None:
+    _held.pop((session_key, str(record_id)), None)
 
 
 async def _conditions(user_id: str) -> dict | None:
@@ -542,6 +593,7 @@ async def reply_send(request: Request):
     if not decision.allow:
         logger.info("[REPLY] auto check stopped (not sent) record_id=%s",
                     emit(record_id, "record_id", "log", "operator"))
+        hold_text(_session_key(request), record_id, text)   # fix1 BU-03: 編集本文を失わない（サーバー側・URL に載せない）
         return _redirect(back, _auto_check_code(decision))
     # fix2 BR-12: 送信の前に回収表へ prepared を置く（置けなければ台帳必須と同じく送らない）
     prepared = await reply_followup.prepare(
@@ -551,6 +603,7 @@ async def reply_send(request: Request):
     if prepared in ("skipped", "failed"):
         logger.warning("[REPLY] followup unavailable (fail-closed, not sent) record_id=%s",
                        emit(record_id, "record_id", "log", "operator"))
+        hold_text(_session_key(request), record_id, text)   # fix1 BU-03
         return _redirect(back, "ledger_unavailable")
     if prepared == "rejected":
         # fix4 BR-15: 同 op_id の既存行が 終端／送信済み／本文・宛先不一致／台帳行あり → 送らず「新しい操作でやり直し」
@@ -590,6 +643,7 @@ async def reply_send(request: Request):
         return _redirect(back, result.outcome)
     logger.info("[REPLY] explicit send ok record_id=%s",
                 emit(record_id, "record_id", "log", "operator"))
+    clear_held(_session_key(request), record_id)   # fix1 BU-03: 送れたら保持を消す
     # fix3（PRE-REVIEW-1 #272-1）: 主経路の App 28 書込も回収ジョブと同じ関門（claim → op_id 照合 → 書込 → done）を通す。
     # 回収ジョブ（prepared も対象）と主経路が同じ op を同時に扱っても、所有権を取れた側だけが create する（二重作成なし）。
     async def _same_user(_rid: str) -> str:

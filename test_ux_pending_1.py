@@ -421,6 +421,7 @@ class TestReplyAutoCheck(_InboxMixin):
     def setUp(self):
         super().setUp()
         sp.clear_condition_cache()
+        rv._held.clear()
 
     def _form(self, op="f" * 32, text="お返事します。"):
         return {"op_id": op, "text": text, "ticket": rv.make_ticket(REC_ID, USER, "0", op), "exemplar": "1"}
@@ -510,6 +511,7 @@ class TestFix1ReplyCheck(_InboxMixin):
     def setUp(self):
         super().setUp()
         sp.clear_condition_cache()
+        rv._held.clear()
 
     def _form(self, op="f" * 32, text="お返事します。"):
         return {"op_id": op, "text": text, "ticket": rv.make_ticket(REC_ID, USER, "0", op), "exemplar": "1"}
@@ -579,6 +581,42 @@ class TestFix1ReplyCheck(_InboxMixin):
         sp.clear_condition_cache()
         self.stop_check.return_value = autoreply_stoplist.OUTCOME_UNCONFIGURED
         self.assertEqual(_run(sp.conditions(USER))["stoplisted"], sl.CLEAR)
+
+    def test_bu03_edited_text_survives_auto_check_stop_without_touching_url(self):
+        """BU-03: 元の下書きと異なる編集文で停止 → 再表示に編集文が残る（本文は URL・クエリ・ログに出ない）。送れたら消える。"""
+        edited = "編集した本文です。090 ではなく事務所へ。"
+        self.assertIn("下書き本文", self.get(self.PAGE).text)
+        self.stop_check.return_value = autoreply_stoplist.OUTCOME_STOPPED
+        with self.assertLogs("hub.webapp_reply_view", level="INFO") as cm:
+            r = self.send(text=edited)
+        self.assertEqual(r.headers["location"], f"{self.PAGE}?done=stoplisted")       # クエリに本文なし
+        self.assertNotIn("編集した本文", r.headers["location"])
+        self.assertFalse(any("編集した本文" in m for m in cm.output))
+        html = self.get(f"{self.PAGE}?done=stoplisted").text
+        self.assertIn(f'required>{edited}</textarea>', html)                           # 編集文が返信欄に戻る
+        self.assertNotIn("required>下書き本文", html)
+        self.assertIn("編集中の本文を返信欄に戻しました", html)
+        # 別のセッション（別ブラウザ）には出ない
+        other = _client.get(self.PAGE, headers={"Cookie": f"webapp_session={webapp_auth.issue_session(now=int(time.time()) - 5)}"},
+                            follow_redirects=False).text
+        self.assertIn("required>下書き本文", other)
+        # 期限切れは破棄
+        key = next(iter(rv._held))[0]
+        self.assertIsNone(rv.held_text(key, REC_ID, now=time.monotonic() + rv.HOLD_TTL_SECONDS + 1))
+        self.assertEqual(rv._held, {})
+        # 保持 → 送信成功で消える（停止が解けて同じ本文を送る）
+        rv.hold_text(key, REC_ID, edited)
+        self.stop_check.return_value = autoreply_stoplist.OUTCOME_CLEAR
+        r = self.send(op="5" * 32, text=edited)
+        self.assertTrue(r.headers["location"].startswith(f"{self.PAGE}?done=sent"))
+        self.assertEqual(rv._held, {})
+        self.assertIn("required>下書き本文", self.get(self.PAGE).text)
+        # 上限: 古いものから消える
+        for i in range(rv.HOLD_MAX + 5):
+            rv.hold_text("k%d" % i, "1", "x", now=float(i))
+        self.assertEqual(len(rv._held), rv.HOLD_MAX)
+        self.assertNotIn(("k0", "1"), rv._held)
+        rv._held.clear()
 
 
 # ── 6. 試験アカウント allowlist（実装のみ・env 設定と有効化は大野） ─────────────────
