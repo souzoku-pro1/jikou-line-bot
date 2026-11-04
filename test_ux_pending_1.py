@@ -27,6 +27,7 @@ from test_jikou_reply_q1c import (USER, USER2, V2_ON, _DbMixin, _ENV, _FakeClien
 
 import main  # noqa: E402
 from hub import approval_close as ac  # noqa: E402
+from hub import attending_release as ar  # noqa: E402
 from hub import approved_texts as at  # noqa: E402
 from hub import autoreply_stoplist  # noqa: E402
 from hub import kintone  # noqa: E402
@@ -63,6 +64,7 @@ class _InboxMixin(_DbMixin):
             eng = db.get_async_engine()
             async with eng.begin() as c:
                 await c.run_sync(ac.metadata.create_all)
+                await c.run_sync(ar.metadata.create_all)
         _run(_create())
         self.records = {REC_ID: _approval()}
         self.old_records = []
@@ -651,6 +653,123 @@ class TestFix1Inbox(_InboxMixin):
         self.assertEqual(_run(iv._old_records({r_["$id"]["value"] for r_ in self.old_records})), [])
         self.assertEqual(len(self.old_queries), iv.OLD_MAX_PAGES)
 
+    def releases(self) -> list:
+        return self._rows(ar.attending_release)
+
+    def test_bu04_release_failure_leaves_pending_release_and_recovery_releases(self):
+        """BU-04: 解除失敗の注入 → closed だが「解除未完了」が残る → 再操作（already）でも再試行 → 回収で解除される。"""
+        pid = self._reg(inbound_event_id="ev1")
+        att = _run(sl.set_attending("jikou", USER))
+        with patch.object(sl, "release_attending", AsyncMock(side_effect=RuntimeError("db"))):
+            r = self.post("/app/inbox/close", {"kind": "pending", "id": str(pid), "outcome": "done_external"})
+        self.assertEqual(r.headers["location"], "/app/inbox?done=closed_release_pending")
+        self.assertEqual(self.pending()[0]["state"], "closed_external")                 # 閉じ記録は残る
+        self.assertTrue(_run(sl.conversation_state("jikou", USER))["attending"])        # 解除は未完了
+        rel = self.releases()
+        self.assertEqual(len(rel), 1)
+        self.assertEqual((rel[0]["state"], rel[0]["attempts"], rel[0]["source_kind"], rel[0]["source_id"]),
+                         ("pending", 1, "pending", str(pid)))
+        self.assertEqual((rel[0]["conversation_id"], rel[0]["human_version"]), (att["conversation_id"], att["human_version"]))
+        self.assertEqual(rel[0]["line_user_hash"], sl.line_user_hash("jikou", USER))
+        self.assertIn("回収ジョブが自動で再試行します", self.get("/app/inbox?done=closed_release_pending").text)
+        # 再操作（already）でも解除を再試行する（まだ失敗する → 回数だけ進む）
+        with patch.object(sl, "release_attending", AsyncMock(side_effect=RuntimeError("db"))):
+            r = self.post("/app/inbox/close", {"kind": "pending", "id": str(pid), "outcome": "done_external"})
+        self.assertEqual(r.headers["location"], "/app/inbox?done=already")
+        self.assertEqual((self.releases()[0]["state"], self.releases()[0]["attempts"]), ("pending", 2))
+        # 回収ジョブ（send_ledger の hook に登録済み）で解除される
+        self.assertIn(iv.run_release_job, sl._recover_hooks)
+        _run(sl.run_recover_job())
+        self.assertFalse(_run(sl.conversation_state("jikou", USER))["attending"])
+        row = self.releases()[0]
+        self.assertEqual((row["state"], row["result"], row["attempts"]), ("done", "released", 3))
+        self.assertIsNotNone(row["done_at"])
+        # 以後は何もしない（冪等）・再操作でも再試行なし
+        self.assertEqual(_run(ar.run_release_job()), {"pending": 0, "done": 0, "abandoned": 0})
+        r = self.post("/app/inbox/close", {"kind": "pending", "id": str(pid), "outcome": "done_external"})
+        self.assertEqual((r.headers["location"], self.releases()[0]["attempts"]), ("/app/inbox?done=already", 3))
+        # 成功経路: 閉じ → 即時解除 → closed（従来の表示）
+        pid2 = self._reg(user=USER2, inbound_event_id="ev2", approval_record_id=None)
+        _run(sl.set_attending("jikou", USER2))
+        r = self.post("/app/inbox/close", {"kind": "pending", "id": str(pid2), "outcome": "done_external"})
+        self.assertEqual(r.headers["location"], "/app/inbox?done=closed")
+        self.assertFalse(_run(sl.conversation_state("jikou", USER2))["attending"])
+        self.assertEqual([x["state"] for x in self.releases()], ["done", "done"])
+
+    def test_bu04_release_targets_only_the_fixed_generation(self):
+        """BU-04: 閉じた後に大野が再び対応中にした（世代が進んだ）会話は、回収で解除しない（stale・完了扱い）。"""
+        pid = self._reg(inbound_event_id="ev1")
+        _run(sl.set_attending("jikou", USER))
+        with patch.object(sl, "release_attending", AsyncMock(side_effect=RuntimeError("db"))):
+            self.post("/app/inbox/close", {"kind": "pending", "id": str(pid), "outcome": "done_external"})
+        _run(sl.end_attending("jikou", USER))                                            # 別経路で解除され…
+        _run(sl.set_attending("jikou", USER))                                            # …新しい世代で再び対応中
+        _run(iv.run_release_job())
+        self.assertTrue(_run(sl.conversation_state("jikou", USER))["attending"])         # 新しい世代は触らない
+        self.assertEqual((self.releases()[0]["state"], self.releases()[0]["result"]), ("done", "stale"))
+        # 同じ世代で既に対応中でない → already_off（完了）
+        pid2 = self._reg(user=USER2, inbound_event_id="ev2", approval_record_id=None)
+        with patch.object(sl, "release_attending", AsyncMock(side_effect=RuntimeError("db"))):
+            self.post("/app/inbox/close", {"kind": "pending", "id": str(pid2), "outcome": "done_external"})
+        _run(iv.run_release_job())
+        self.assertEqual(self.releases()[1]["result"], "no_conversation")                 # 会話が無い相談者
+        self.assertEqual(_run(sl.release_attending("jikou", sl.line_user_hash("jikou", USER),
+                                                   conversation_id=self.releases()[0]["conversation_id"],
+                                                   human_version=self.releases()[0]["human_version"])), "stale")
+
+    def test_bu04_old_item_with_unresolvable_hash_is_released_by_recovery(self):
+        """BU-04: 承認キューだけの件で kintone から userId を引けない → ハッシュ NULL の未完了 → 回収で解決・固定・解除。"""
+        self.old_records = [_approval(OLD_ID, USER2, 顧客名="旧 花子")]
+        _run(sl.set_attending("jikou", USER2))
+        r = self.post("/app/inbox/close", {"kind": "old", "id": OLD_ID, "outcome": "done_external"})   # records に無い＝get 失敗
+        self.assertEqual(r.headers["location"], "/app/inbox?done=closed_release_pending")
+        self.assertEqual(_run(ac.closed_ids("jikou")), {OLD_ID})
+        row = self.releases()[0]
+        self.assertEqual((row["state"], row["line_user_hash"], row["conversation_id"], row["source_kind"], row["source_id"]),
+                         ("pending", None, None, "old", OLD_ID))
+        self.assertTrue(_run(sl.conversation_state("jikou", USER2))["attending"])
+        _run(iv.run_release_job())                                                      # まだ引けない → 回数だけ進む
+        self.assertEqual((self.releases()[0]["state"], self.releases()[0]["attempts"]), ("pending", 2))
+        self.records[OLD_ID] = _approval(OLD_ID, USER2)                                  # 引けるようになった
+        _run(iv.run_release_job())
+        row = self.releases()[0]
+        self.assertEqual((row["state"], row["result"], row["line_user_hash"]), ("done", "released", sl.line_user_hash("jikou", USER2)))
+        self.assertFalse(_run(sl.conversation_state("jikou", USER2))["attending"])
+        self.assertNotIn(USER2, self.get("/app/inbox?closed=1").text)
+        # 再操作（already）は closed のまま・再試行対象なし
+        r = self.post("/app/inbox/close", {"kind": "old", "id": OLD_ID, "outcome": "done_external"})
+        self.assertEqual(r.headers["location"], "/app/inbox?done=already")
+
+    def test_bu04_close_record_and_release_row_are_one_transaction(self):
+        """BU-04: 「解除未完了」を書けなければ閉じ記録も残らない（同一 tx）。不要（not_needed）は従来どおり解除しない。"""
+        pid = self._reg(inbound_event_id="ev1")
+        _run(sl.set_attending("jikou", USER))
+        n0 = len(_run(rp.history(pid)))
+        with patch.object(ar, "record_in_tx", AsyncMock(side_effect=RuntimeError("db"))):
+            r = self.post("/app/inbox/close", {"kind": "pending", "id": str(pid), "outcome": "done_external"})
+        self.assertEqual(r.headers["location"], "/app/inbox?done=db")
+        self.assertEqual(self.pending()[0]["state"], "open")                             # rollback
+        self.assertEqual(len(_run(rp.history(pid))), n0)                                 # 履歴も増えない
+        self.assertEqual(self.releases(), [])
+        self.old_records = [_approval(OLD_ID, USER2)]
+        with patch.object(ar, "record_in_tx", AsyncMock(side_effect=RuntimeError("db"))):
+            r = self.post("/app/inbox/close", {"kind": "old", "id": OLD_ID, "outcome": "done_external"})
+        self.assertEqual(r.headers["location"], "/app/inbox?done=db")
+        self.assertEqual(_run(ac.closed_ids("jikou")), set())
+        r = self.post("/app/inbox/close", {"kind": "pending", "id": str(pid), "outcome": "not_needed"})
+        self.assertEqual(r.headers["location"], "/app/inbox?done=not_needed")
+        self.assertEqual(self.releases(), [])
+        self.assertTrue(_run(sl.conversation_state("jikou", USER))["attending"])
+        # 試行上限で abandoned（運用で確認・自動では再試行しない）
+        pid3 = self._reg(user=USER2, inbound_event_id="ev3", approval_record_id=None)
+        _run(sl.set_attending("jikou", USER2))
+        with patch.object(sl, "release_attending", AsyncMock(side_effect=RuntimeError("db"))):
+            self.post("/app/inbox/close", {"kind": "pending", "id": str(pid3), "outcome": "done_external"})
+            for _ in range(ar.MAX_ATTEMPTS):
+                _run(iv.run_release_job())
+        self.assertEqual((self.releases()[0]["state"], self.releases()[0]["attempts"]), ("abandoned", ar.MAX_ATTEMPTS))
+        self.assertEqual(_run(ar.run_release_job()), {"pending": 0, "done": 0, "abandoned": 0})
+
 
 # ── 6. 試験アカウント allowlist（実装のみ・env 設定と有効化は大野） ─────────────────
 class TestTrialAccount(unittest.TestCase):
@@ -688,10 +807,11 @@ class TestMigrationAndMenu(unittest.TestCase):
         try:
             self.assertEqual(alembic("upgrade", NOTICE).returncode, 0)
             self.assertNotIn(ac.TABLE_NAME, tables())
-            up = alembic("upgrade", "head")
+            up = alembic("upgrade", CLOSE)                           # fix1: approval_close の検査は c9e1 で（head は d2f4）
             self.assertEqual(up.returncode, 0, f"stderr={up.stderr[-800:]}")
             self.assertIn(CLOSE, alembic("current").stdout)
             self.assertEqual(alembic("heads").stdout.count("(head)"), 1)
+            self.assertIn("d2f4a6b8c0e2", alembic("heads").stdout)                 # fix1 BU-04 が head
             con = sqlite3.connect(dbfile)
             try:
                 cols = {r[1] for r in con.execute(f'PRAGMA table_info("{ac.TABLE_NAME}")')}
@@ -743,7 +863,7 @@ class TestMigrationAndMenu(unittest.TestCase):
                 con.rollback()
             finally:
                 con.close()
-            self.assertEqual(alembic("upgrade", "head").returncode, 0)
+            self.assertEqual(alembic("upgrade", CLOSE).returncode, 0)
             con = sqlite3.connect(dbfile)
             try:
                 con.execute(f"INSERT INTO {ac.TABLE_NAME} (business, approval_record_id, outcome, actor, at) "
@@ -765,6 +885,51 @@ class TestMigrationAndMenu(unittest.TestCase):
             self.assertEqual(alembic("downgrade", NOTICE).returncode, 0)
             self.assertNotIn(ac.TABLE_NAME, tables())
             self.assertEqual(alembic("upgrade", "head").returncode, 0)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_attending_release_migration_round_trip_and_refuses_downgrade_with_data(self):
+        """fix1 BU-04: d2f4（c9e1 の次・新表のみ）の往復。列集合は hub.attending_release と一致。データがあれば downgrade 拒否（値は出さない）。"""
+        from test_db_foundation import TestAlembicScaffold
+        CLOSE, REL = "c9e1b3d5f7a9", "d2f4a6b8c0e2"
+        d = tempfile.mkdtemp(prefix="attending_release_mig_")
+        dbfile = f"{d}/mig.db"
+        alembic, tables, _u, nullable = TestAlembicScaffold._brain_mig_tools(dbfile)
+        try:
+            self.assertEqual(alembic("upgrade", CLOSE).returncode, 0)
+            self.assertNotIn(ar.TABLE_NAME, tables())
+            up = alembic("upgrade", "head")
+            self.assertEqual(up.returncode, 0, f"stderr={up.stderr[-800:]}")
+            self.assertIn(REL, alembic("current").stdout)
+            self.assertEqual(alembic("heads").stdout.count("(head)"), 1)
+            con = sqlite3.connect(dbfile)
+            try:
+                cols = {r[1] for r in con.execute(f'PRAGMA table_info("{ar.TABLE_NAME}")')}
+                self.assertEqual(cols, {c.name for c in ar.attending_release.columns})
+                nn = nullable(con, ar.TABLE_NAME)
+                self.assertFalse(any(nn[c] for c in ("business", "source_kind", "source_id", "state", "attempts", "created_at", "updated_at")))
+                self.assertTrue(all(nn[c] for c in ("approval_record_id", "line_user_hash", "conversation_id", "human_version", "result", "done_at")))
+                idx = {r[1] for r in con.execute(f'PRAGMA index_list("{ar.TABLE_NAME}")')}
+                self.assertEqual({"ix_attending_release_state", "ix_attending_release_source"}, idx)
+                con.execute(f"INSERT INTO {ar.TABLE_NAME} (business, source_kind, source_id, state, attempts, created_at, updated_at) "
+                            "VALUES ('jikou', 'pending', '1', 'pending', 0, '2026-11-04 00:00:00', '2026-11-04 00:00:00')")
+                con.commit()
+            finally:
+                con.close()
+            down = alembic("downgrade", CLOSE)
+            self.assertNotEqual(down.returncode, 0)
+            self.assertIn("attending_release_downgrade_refused_data_present", down.stderr)
+            self.assertIn(REL, alembic("current").stdout)
+            con = sqlite3.connect(dbfile)
+            try:
+                con.execute(f"DELETE FROM {ar.TABLE_NAME}")
+                con.commit()
+            finally:
+                con.close()
+            self.assertEqual(alembic("downgrade", CLOSE).returncode, 0)
+            self.assertNotIn(ar.TABLE_NAME, tables())
+            self.assertEqual(alembic("upgrade", "head").returncode, 0)
+            self.assertIn(ar.TABLE_NAME, tables())
         finally:
             shutil.rmtree(d, ignore_errors=True)
 

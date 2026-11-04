@@ -982,7 +982,8 @@ class TestReplyExemplarMigration(unittest.TestCase):
     REPLY_PENDING = "a1c3e5f7b9d2"      # JIKOU-REPLY-Q1c: 対応待ち（c8e0 の後ろ。fix5／fix6 で f7b2 → a7c9 → c8e0 に付け替え）
     REPLY_PENDING_RETRY = "d4f6a8b0c2e4"  # JIKOU-REPLY-Q1c-fix1 BC-03: 対応待ちの保存失敗の永続キュー reply_pending_retry（a1c3 の次）
     REPLY_PENDING_NOTICE = "b7d9f1a3c5e7"  # JIKOU-REPLY-Q1c-fix2 BC-07: reply_pending.notice_key／claim 列・retry.notice_key（d4f6 の次）
-    APPROVAL_CLOSE = "c9e1b3d5f7a9"        # UX-PENDING-1: approval_close（承認キューの閉じ記録・b7d9 の次・head）
+    APPROVAL_CLOSE = "c9e1b3d5f7a9"        # UX-PENDING-1: approval_close（承認キューの閉じ記録・b7d9 の次）
+    ATTENDING_RELEASE = "d2f4a6b8c0e2"     # UX-PENDING-1-fix1 BU-04: attending_release（解除未完了・c9e1 の次・head）
 
     def test_reply_exemplar_migration_round_trip(self):
         import sqlite3

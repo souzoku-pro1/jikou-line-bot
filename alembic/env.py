@@ -32,6 +32,7 @@ from hub.reply_exemplar import metadata as reply_exemplar_metadata  # noqa: E402
 from hub.reply_followup import metadata as reply_followup_metadata  # noqa: E402（JIKOU-REPLY-Q1b-fix1 BR-08・App 28 記録未了）
 from hub.reply_pending import metadata as reply_pending_metadata  # noqa: E402（JIKOU-REPLY-Q1c・対応待ち）
 from hub.approval_close import metadata as approval_close_metadata  # noqa: E402（UX-PENDING-1・承認キューの閉じ記録）
+from hub.attending_release import metadata as attending_release_metadata  # noqa: E402（UX-PENDING-1-fix1 BU-04・解除未完了）
 
 config = context.config
 
@@ -45,7 +46,7 @@ target_metadata = [Base.metadata, heartbeat_metadata, service_auth_metadata,
                    PersonMergeJournalBase.metadata, qa_store_metadata,
                    shindan_link_metadata, brain_ledger_metadata,
                    send_ledger_metadata, reply_exemplar_metadata, reply_followup_metadata,
-                   reply_pending_metadata, approval_close_metadata]
+                   reply_pending_metadata, approval_close_metadata, attending_release_metadata]
 
 
 def run_migrations_offline() -> None:

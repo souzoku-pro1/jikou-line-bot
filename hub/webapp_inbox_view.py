@@ -25,7 +25,7 @@ import re
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 
-from hub import approval_close, kintone, pending_link, reply_pending, send_ledger
+from hub import approval_close, attending_release, kintone, pending_link, reply_pending, send_ledger
 from hub.webapp_auth import _gate
 
 logger = logging.getLogger("hub.webapp_inbox_view")
@@ -64,6 +64,7 @@ _STATE_LABELS = {"open": "未処理", "human_replied": "返信済み（画面か
 _OLD_OUTCOME_LABELS = {"done_external": "対応終了（別の方法で返信済み）", "not_needed": "不要"}
 _NOTICES = {
     "closed": "対応終了にしました。", "not_needed": "不要にしました。", "reopened": "未処理に戻しました。",
+    "closed_release_pending": "対応終了にしました。bot の再開（対応中の解除）は未完了のため、回収ジョブが自動で再試行します。",
     "already": "この件は既に処理済みです。", "not_found": "対象が見つかりません。", "bad_input": "入力が不正です。",
     "db": "記録を読み書きできませんでした。", "not_closed": "この件は閉じていません。",
 }
@@ -344,49 +345,57 @@ async def inbox_page(request: Request):
     return HTMLResponse(_page(items, notices, closed_view))
 
 
-async def _end_attending_for_pending(pending_id: int) -> None:
-    try:
-        row = await reply_pending.get_pending(pending_id)
-        if row:
-            await send_ledger.end_attending_by_hash(BUSINESS, row["line_user_hash"])
-    except Exception:
-        logger.warning("[INBOX] end attending failed (fixed reason)")
-
-
-async def _end_attending_for_record(record_id: str) -> None:
-    """承認キューだけの件: レコードの line_user_id をサーバー内で解決してハッシュ化（画面・URL には出さない）。"""
+async def _hash_for_record(record_id: str) -> str | None:
+    """承認キューだけの件: レコードの line_user_id をサーバー内で解決してハッシュ化（画面・URL には出さない）。引けなければ None。"""
     try:
         rec = await kintone.get_record(APP_APPROVAL, record_id)
     except Exception:
-        return
+        return None
     uid = _v(rec, "line_user_id")
     if not _LINE_USER_ID_RE.fullmatch(uid):
-        return
-    try:
-        await send_ledger.end_attending_by_hash(BUSINESS, send_ledger.line_user_hash(BUSINESS, uid))
-    except Exception:
-        logger.warning("[INBOX] end attending failed (fixed reason)")
+        return None
+    return send_ledger.line_user_hash(BUSINESS, uid)
+
+
+async def _after_close(release_id) -> str:
+    """fix1 BU-04: 閉じ記録の直後に解除を 1 回試みる。完了しなければ回収ジョブに委ねる（閉じ記録は残る）。"""
+    st = await attending_release.attempt(release_id, resolve_hash=_hash_for_record) if release_id is not None else None
+    return "closed" if st == attending_release.STATE_DONE else "closed_release_pending"
 
 
 async def close_item(kind: str, item_id: str, outcome: str, actor: str) -> str:
-    """閉じる（画面・署名リンク共通）。戻り値は _NOTICES の閉集合コード。"""
+    """閉じる（画面・署名リンク共通）。戻り値は _NOTICES の閉集合コード。
+    fix1 BU-04: 「対応終了」は閉じ記録と同一 tx で「解除未完了」を置き、直後に解除を試みる。失敗は回収で再試行。
+    再操作（already）でも未完了があれば再試行する。"""
     if kind == KIND_PENDING:
         pid = int(item_id)
         if outcome == OUTCOME_DONE:
-            res = await reply_pending.mark_closed_external(pid, actor=actor)
+            res, rid = await attending_release.close_pending(pid, actor)
+            if res == "ok":
+                return await _after_close(rid)
+            if res == "not_open":
+                await attending_release.retry_for_source(attending_release.SOURCE_PENDING, str(pid), resolve_hash=_hash_for_record)
         else:
             res = await reply_pending.mark_not_needed(pid)
-        if res == "ok":
-            if outcome == OUTCOME_DONE:
-                await _end_attending_for_pending(pid)
-            return "closed" if outcome == OUTCOME_DONE else "not_needed"
+            if res == "ok":
+                return "not_needed"
         return {"not_open": "already", "not_found": "not_found"}.get(res, "db")
-    res = await approval_close.close(BUSINESS, item_id, outcome, actor)
-    if res == "ok":
-        if outcome == OUTCOME_DONE:
-            await _end_attending_for_record(item_id)
-        return "closed" if outcome == OUTCOME_DONE else "not_needed"
+    if outcome == OUTCOME_DONE:
+        res, rid = await attending_release.close_old(BUSINESS, item_id, actor, await _hash_for_record(item_id))
+        if res == "ok":
+            return await _after_close(rid)
+        if res == "already":
+            await attending_release.retry_for_source(attending_release.SOURCE_OLD, str(item_id), resolve_hash=_hash_for_record)
+    else:
+        res = await approval_close.close(BUSINESS, item_id, outcome, actor)
+        if res == "ok":
+            return "not_needed"
     return {"already": "already", "bad_input": "bad_input"}.get(res, "db")
+
+
+async def run_release_job() -> None:
+    """fix1 BU-04: 回収ジョブへの相乗り（解除未完了の再試行・承認キューだけの件はここでハッシュを解決）。"""
+    await attending_release.run_release_job(resolve_hash=_hash_for_record)
 
 
 async def inbox_close(request: Request):
@@ -476,3 +485,5 @@ router.add_api_route(f"{PAGE}/reopen", _gate(inbox_reopen), methods=["POST"])
 router.add_api_route(f"{GO}/{pending_link.KIND_REPLY}/{{token}}", _gate(go_reply), methods=["GET"])
 router.add_api_route(f"{GO}/{pending_link.KIND_CLOSE}/{{token}}", _gate(go_close_confirm), methods=["GET"])
 router.add_api_route(f"{GO}/{pending_link.KIND_CLOSE}/{{token}}", _gate(go_close), methods=["POST"])
+# fix1 BU-04: 回収ジョブへの相乗り（冪等登録）
+send_ledger.register_recover_hook(run_release_job)

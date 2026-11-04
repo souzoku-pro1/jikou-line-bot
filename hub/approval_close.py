@@ -54,20 +54,26 @@ async def _latest(s, business: str, record_id: str):
                             .order_by(approval_close.c.close_id.desc()).limit(1))).first()
 
 
-async def close(business: str, record_id: str, outcome: str, actor: str, *, now=None) -> str:
-    """閉じる（追記）。戻り値 ok / already（既に閉じている）/ bad_input / db。"""
+async def close_in_tx(s, business: str, record_id: str, outcome: str, actor: str, now) -> str:
+    """fix1 BU-04: 呼び出し側のトランザクション s の中で閉じる（閉じ記録と「解除未完了」を同一 tx に置くため）。
+    戻り値 ok / already / bad_input（例外は送出）。"""
     if outcome not in CLOSED_OUTCOMES or not str(record_id).isdigit():
         return "bad_input"
+    cur = await _latest(s, business, record_id)
+    if cur is not None and cur.outcome in CLOSED_OUTCOMES:
+        return "already"
+    await s.execute(sa.insert(approval_close).values(
+        business=business, approval_record_id=str(record_id), outcome=outcome, actor=actor, at=now))
+    logger.info("[APPROVAL_CLOSE] closed outcome=%s", emit(outcome, "freetext", "log", "operator"))
+    return "ok"
+
+
+async def close(business: str, record_id: str, outcome: str, actor: str, *, now=None) -> str:
+    """閉じる（追記）。戻り値 ok / already（既に閉じている）/ bad_input / db。"""
     now = now or _now()
     try:
         async with session_scope() as s:
-            cur = await _latest(s, business, record_id)
-            if cur is not None and cur.outcome in CLOSED_OUTCOMES:
-                return "already"
-            await s.execute(sa.insert(approval_close).values(
-                business=business, approval_record_id=str(record_id), outcome=outcome, actor=actor, at=now))
-        logger.info("[APPROVAL_CLOSE] closed outcome=%s", emit(outcome, "freetext", "log", "operator"))
-        return "ok"
+            return await close_in_tx(s, business, record_id, outcome, actor, now)
     except Exception:
         logger.error("[APPROVAL_CLOSE] close failed (fixed reason)")
         return "db"

@@ -1189,3 +1189,44 @@ def human_explicit_decision(explicit_confirm: bool) -> Decision:
     bot / approved_draft 列の適用は Q1c（flag JIKOU_SEND_POLICY_V2）。"""
     return decide_send(ACTOR_HUMAN, paused=UNKNOWN, stoplisted=UNKNOWN, human_mode=UNKNOWN,
                        attending=True, stage_known=False, explicit_confirm=bool(explicit_confirm))
+
+
+# ══════════════════════════════════════════════════════════════
+# UX-PENDING-1-fix1 BU-04（Codex R-UX1）: 会話 ID と human_version を固定した対応中解除（hub.attending_release が使う）
+#   閉じた時点の世代と一致するときだけ attending を落とす。別の会話・別の世代（閉じた後に再び対応中にした等）は触らない（stale）。
+# ══════════════════════════════════════════════════════════════
+RELEASE_RELEASED = "released"               # 解除した
+RELEASE_ALREADY_OFF = "already_off"         # 同じ世代で既に対応中ではない（解除不要）
+RELEASE_STALE = "stale"                     # 会話・世代が進んでいる（固定した対象ではない＝触らない）
+RELEASE_NO_CONVERSATION = "no_conversation" # 会話が無い（解除不要）
+RELEASE_RESULTS = (RELEASE_RELEASED, RELEASE_ALREADY_OFF, RELEASE_STALE, RELEASE_NO_CONVERSATION)
+
+
+async def conversation_version_by_hash(business: str, user_hash: str) -> int | None:
+    """最新会話の human_version（ハッシュ指定・本文なし）。会話が無ければ None。"""
+    async with session_scope() as s:
+        row = await _latest_conversation(s, business, user_hash)
+    return int(row.human_version) if row is not None else None
+
+
+async def release_attending(business: str, user_hash: str, *, conversation_id, human_version,
+                            channel: str | None = None, now=None) -> str:
+    """固定した (conversation_id, human_version) の会話が対応中のときだけ解除する（共通排他の中・条件付き更新）。"""
+    now = now or _now()
+    async with _exclusive(business, user_hash, channel or business) as s:
+        row = await _latest_conversation(s, business, user_hash)
+        if row is None or conversation_id is None:
+            return RELEASE_NO_CONVERSATION
+        if int(row.conversation_id) != int(conversation_id):
+            return RELEASE_STALE
+        if not bool(row.attending):
+            return RELEASE_ALREADY_OFF if int(row.human_version) == int(human_version or 0) else RELEASE_STALE
+        if int(row.human_version) != int(human_version or 0):
+            return RELEASE_STALE
+        r = await s.execute(sa.update(conversation).where(
+            conversation.c.conversation_id == int(conversation_id),
+            conversation.c.human_version == int(human_version),
+            conversation.c.attending.is_(True)).values(
+            version=int(row.version) + 1, human_version=int(row.human_version) + 1,
+            attending=False, attending_until=now))
+        return RELEASE_RELEASED if int(r.rowcount or 0) == 1 else RELEASE_STALE

@@ -46,6 +46,7 @@ import chat_responder as cr  # noqa: E402
 import main  # noqa: E402
 from hub import autoreply_stoplist  # noqa: E402
 from hub import approval_close as ac  # noqa: E402  UX-PENDING-1: 統合一覧が読む表（本番は migration c9e1）
+from hub import attending_release as ar  # noqa: E402  UX-PENDING-1-fix1 BU-04: 対応終了の解除未完了（本番は migration d2f4）
 from hub import db  # noqa: E402
 from hub import empty_reply_guard as eg  # noqa: E402
 from hub import image_intake  # noqa: E402
@@ -145,7 +146,7 @@ class _DbMixin(unittest.TestCase):
         async def _create():
             eng = db.get_async_engine()
             async with eng.begin() as c:
-                for md in (sl.metadata, rx.metadata, rf.metadata, rp.metadata, ac.metadata, InboundBase.metadata):
+                for md in (sl.metadata, rx.metadata, rf.metadata, rp.metadata, ac.metadata, ar.metadata, InboundBase.metadata):
                     await c.run_sync(md.create_all)
         _run(_create())
         _FakeClient.responses, _FakeClient.calls, _FakeClient.raise_exc = [], [], None

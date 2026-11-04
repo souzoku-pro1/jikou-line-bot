@@ -748,23 +748,29 @@ async def bump_attempts_unowned(pending_id: int, *, now=None) -> bool:
 # ══════════════════════════════════════════════════════════════
 # UX-PENDING-1: 統合一覧（/app/inbox）の操作。末尾追記。本文・氏名・LINE userId は置かない。
 # ══════════════════════════════════════════════════════════════
+async def close_from_open_in_tx(s, pending_id: int, to_state: str, actor: str, now) -> str:
+    """fix1 BU-04: 呼び出し側のトランザクション s の中で open → to_state（閉じ記録と「解除未完了」を同一 tx に置くため）。
+    戻り値 ok / not_open / not_found（例外は送出＝呼び出し側で rollback）。"""
+    cur = (await s.execute(sa.select(reply_pending.c.state).where(
+        reply_pending.c.pending_id == int(pending_id)))).scalar()
+    if cur is None:
+        return "not_found"
+    r = await s.execute(sa.update(reply_pending).where(
+        reply_pending.c.pending_id == int(pending_id),
+        reply_pending.c.state == STATE_OPEN).values(
+        state=to_state, resolved_at=now, resolved_by=RESOLVED_BY_HUMAN, updated_at=now))
+    if int(r.rowcount or 0) != 1:
+        return "not_open"
+    await _hist(s, int(pending_id), "state", STATE_OPEN, to_state, actor, now)
+    return "ok"
+
+
 async def _close_from_open(pending_id: int, to_state: str, actor: str, *, now=None) -> str:
     """open → to_state（人の操作）。戻り値 ok / not_open / not_found / db。resolved_by は human・履歴の actor に操作元を残す。"""
     now = now or _now()
     try:
         async with session_scope() as s:
-            cur = (await s.execute(sa.select(reply_pending.c.state).where(
-                reply_pending.c.pending_id == int(pending_id)))).scalar()
-            if cur is None:
-                return "not_found"
-            r = await s.execute(sa.update(reply_pending).where(
-                reply_pending.c.pending_id == int(pending_id),
-                reply_pending.c.state == STATE_OPEN).values(
-                state=to_state, resolved_at=now, resolved_by=RESOLVED_BY_HUMAN, updated_at=now))
-            if int(r.rowcount or 0) != 1:
-                return "not_open"
-            await _hist(s, int(pending_id), "state", STATE_OPEN, to_state, actor, now)
-        return "ok"
+            return await close_from_open_in_tx(s, pending_id, to_state, actor, now)
     except Exception:
         logger.error("[REPLY_PENDING] close failed (fixed reason)")
         return "db"
