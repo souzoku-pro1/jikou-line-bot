@@ -503,6 +503,46 @@ class TestReplyAutoCheck(_InboxMixin):
         self.assertNotIn('form.get("confirm"', src)
 
 
+# ── fix1（Codex R-UX1 REJECT）BU-01〜05 ───────────────────────────────────────────
+class TestFix1ReplyCheck(_InboxMixin):
+    PAGE = f"/app/reply/{REC_ID}"
+
+    def setUp(self):
+        super().setUp()
+        sp.clear_condition_cache()
+
+    def _form(self, op="f" * 32, text="お返事します。"):
+        return {"op_id": op, "text": text, "ticket": rv.make_ticket(REC_ID, USER, "0", op), "exemplar": "1"}
+
+    def send(self, **kw):
+        return self.post(f"{self.PAGE}/send", self._form(**kw))
+
+    def test_bu01_send_rechecks_stoplist_after_page_render_bypassing_cache(self):
+        """BU-01: 画面表示の直後に停止リストへ登録 → 直後の POST は送らない（照会は GET と POST で 2 回・キャッシュを読まない）。"""
+        self.assertEqual(self.get(self.PAGE).status_code, 200)
+        self.assertEqual(self.stop_check.await_count, 1)
+        self.stop_check.return_value = autoreply_stoplist.OUTCOME_STOPPED        # 表示後に登録された
+        r = self.send()
+        self.assertEqual((r.status_code, r.headers["location"]), (303, f"{self.PAGE}?done=stoplisted"))
+        self.assertEqual(self.stop_check.await_count, 2)                         # 都度照会（30 秒窓の値を使い回さない）
+        self.assertEqual(_FakeClient.calls, [])
+        self.assertEqual(self.ops(), [])
+        # bot 側の conditions() は従来どおりキャッシュする（窓内 2 回目は照会しない）
+        self.stop_check.return_value = autoreply_stoplist.OUTCOME_CLEAR
+        sp.clear_condition_cache()
+        _run(sp.conditions(USER)); _run(sp.conditions(USER))
+        self.assertEqual(self.stop_check.await_count, 3)
+        # 画面の確認は bot のキャッシュに値を残さない（human の照会結果が bot 側に流れない）
+        sp.clear_condition_cache()
+        _run(sp.human_conditions(USER))
+        self.assertEqual(sp._condition_cache, {})
+        # 照会の失敗（例外）は不送信
+        self.stop_check.side_effect = RuntimeError("down")
+        r = self.send(op="1" * 32)
+        self.assertEqual(r.headers["location"], f"{self.PAGE}?done=stoplist_unknown")
+        self.assertEqual(_FakeClient.calls, [])
+
+
 # ── 6. 試験アカウント allowlist（実装のみ・env 設定と有効化は大野） ─────────────────
 class TestTrialAccount(unittest.TestCase):
     def test_env_hash_allowlist_and_routing_override(self):

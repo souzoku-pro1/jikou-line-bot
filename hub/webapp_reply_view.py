@@ -445,9 +445,10 @@ async def reply_page(request: Request):
 
 
 async def _conditions(user_id: str) -> dict | None:
-    """UX-PENDING-1 (3): 停止条件の実値（読めなければ None＝全条件 UNKNOWN）。"""
+    """UX-PENDING-1 (3): 停止条件の実値（読めなければ None＝全条件 UNKNOWN）。
+    fix1 BU-01: 画面表示・送信直前とも send_policy.human_conditions（30 秒キャッシュを迂回して都度照会）。"""
     try:
-        return await send_policy.conditions(user_id)
+        return await send_policy.human_conditions(user_id)
     except Exception:
         return None
 
@@ -536,6 +537,7 @@ async def reply_send(request: Request):
         logger.info("[REPLY] destination changed since page render (not sent)")
         return _redirect(back, "stale")
     # UX-PENDING-1 (3): サーバー側自動確認（停止条件の実値で human 列を評価・チェック無し・fail-closed）
+    # fix1 BU-01: 画面表示時の値を使い回さず、送信直前に停止リスト・対応モードを都度照会する（取得失敗は不送信）
     decision = send_ledger.human_auto_decision(await _conditions(user_id), attending=True)
     if not decision.allow:
         logger.info("[REPLY] auto check stopped (not sent) record_id=%s",

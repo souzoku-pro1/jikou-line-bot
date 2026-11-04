@@ -133,6 +133,15 @@ def clear_condition_cache() -> None:
     _condition_cache.clear()
 
 
+async def human_conditions(user_id: str) -> dict:
+    """UX-PENDING-1-fix1 BU-01（Codex R-UX1）: 人の明示送信（返信画面）の直前確認。30 秒の再利用窓（_condition_cache）を
+    **読まず・書かず**、停止リストと対応モードを毎回照会する（画面表示の後に停止リストへ登録された相談者にも送らない）。
+    照会の失敗は各値が UNKNOWN（呼び出し側は送らない）。bot 側の conditions() とキャッシュは不変。"""
+    return {"paused": _paused_value(),
+            "stoplisted": await _stoplist_value(user_id),
+            "human_mode": await _human_mode_value(user_id)}
+
+
 async def conditions_if_applicable(channel_name: str, to: str) -> dict | None:
     """hub/line_channel の送信前フック: V2 ON・顧客チャネル・主体が human 以外のときだけ停止条件を集めて返す。
     それ以外（OFF・他業務・業務通知・人の明示送信）は None＝従来どおり。"""
