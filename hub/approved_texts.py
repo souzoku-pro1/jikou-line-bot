@@ -37,6 +37,9 @@ def sha256_text(text: str) -> str:
 APPROVED_SHA256: dict[str, str] = {
     SAFE_TEXT_KEY: sha256_text(SAFE_TEXT),
     "ops_age_notice_v1": "59da41fcf2545b9aaa19175ea18315388e5b1e6df1c65bdbccaccacfc879652d",
+    # TEXT-APPROVAL-3（2026-11-04・大野承認・Fable 経由）: 経過通知の末尾を完全 URL にした v2（pgv/ux_pending_1_age_notice_v2.md）。
+    # v1 の行は旧版の送信台帳との照合のため残す。
+    "ops_age_notice_v2": "b91070d861198b77c39af30b69e38fa8fef46b28c7fd8a1971813a5f8a78d5c1",
 }
 
 LEDGER_BUSINESS = "jikou"

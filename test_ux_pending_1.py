@@ -11,6 +11,7 @@
 ハーネスは test_jikou_reply_q1c の _DbMixin（sqlite 台帳＋LINE/kintone/業務通知のフェイク）を再利用する。
 """
 
+import datetime
 import hashlib
 import os
 import re
@@ -24,6 +25,7 @@ from unittest.mock import AsyncMock, patch
 
 from test_jikou_reply_q1c import (USER, USER2, V2_ON, _DbMixin, _ENV, _FakeClient, _auth, _client, _rec,  # noqa: E402
                                   _run)
+from test_jikou_reply_q1c_fix2 import _Fix2Mixin  # noqa: E402
 
 import main  # noqa: E402
 from hub import approval_close as ac  # noqa: E402
@@ -194,22 +196,61 @@ class TestNoticeTexts(unittest.TestCase):
         with patch.dict(os.environ, {"WEBAPP_SESSION_SECRET": "short"}):
             self.assertEqual(sp.notice_text(REC_ID, "x", pending_id=7), legacy)
 
-    def test_age_notice_uses_v1_until_v2_is_approved(self):
+    def test_age_notice_uses_v2_once_approved_and_falls_back_to_v1(self):
+        """UX-PENDING-1 (1)／TEXT-APPROVAL-3 追随: ops_age_notice_v2 は台帳に載った（大野承認 2026-11-04）ので v2（完全 URL）を使う。
+        公開ホストが無い・v2 が台帳に無いときは v1。"""
         stats = {"open_count": 3, "over_count": 2, "oldest_minutes": 90}
-        v1 = sp.age_notice_text(stats, 1, 60)
-        self.assertTrue(v1.endswith("/app/pending からご確認ください。"), v1)     # v2 未承認 → 現行 v1
-        self.assertNotIn("ops_age_notice_v2", at.APPROVED_SHA256)                  # 承認は大野（push 前）・本票では台帳に足さない
         sha_v2 = hashlib.sha256(sp.AGE_NOTICE_TEMPLATE_V2.encode("utf-8")).hexdigest()
         self.assertEqual(sha_v2, "b91070d861198b77c39af30b69e38fa8fef46b28c7fd8a1971813a5f8a78d5c1")   # 承認文書と同じ値
-        with patch.dict(at.APPROVED_SHA256, {sp.AGE_NOTICE_TEXT_KEY_V2: sha_v2}):
-            v2 = sp.age_notice_text(stats, 1, 60)
-            self.assertEqual(v2, "【対応待ち・未返信】\n未返信の対応待ち 3 件（60 分超 2 件・最長 90 分経過）・再処理待ち 1 件\n"
-                                 "https://app.example.test/app/inbox からご確認ください。")
-            self.assertNotIn("{{", v2)
-            with patch.dict(os.environ, {"RAILWAY_PUBLIC_DOMAIN": ""}):
-                self.assertEqual(sp.age_notice_text(stats, 1, 60), v1)              # 公開ホストが無ければ v1
+        self.assertEqual(at.APPROVED_SHA256[sp.AGE_NOTICE_TEXT_KEY_V2], sha_v2)                      # 台帳を patch せず（承認済み）
+        self.assertEqual(at.APPROVED_SHA256[sp.AGE_NOTICE_TEXT_KEY],
+                         "59da41fcf2545b9aaa19175ea18315388e5b1e6df1c65bdbccaccacfc879652d")          # v1 の行は残す
+        v2 = sp.age_notice_text(stats, 1, 60)
+        self.assertEqual(v2, "【対応待ち・未返信】\n未返信の対応待ち 3 件（60 分超 2 件・最長 90 分経過）・再処理待ち 1 件\n"
+                             "https://app.example.test/app/inbox からご確認ください。")
+        self.assertNotIn("{{", v2)
+        with patch.dict(os.environ, {"RAILWAY_PUBLIC_DOMAIN": ""}):
+            v1 = sp.age_notice_text(stats, 1, 60)                                       # 公開ホストが無ければ v1
+        self.assertTrue(v1.endswith("/app/pending からご確認ください。"), v1)
+        without_v2 = {k: v for k, v in at.APPROVED_SHA256.items() if k != sp.AGE_NOTICE_TEXT_KEY_V2}
+        with patch.dict(at.APPROVED_SHA256, without_v2, clear=True):
+            self.assertEqual(sp.age_notice_text(stats, 1, 60), v1)                     # v2 未登録なら v1
         # v2 の差分は末尾 1 行だけ（数値の差し込み位置は同じ）
         self.assertEqual(sp.AGE_NOTICE_TEMPLATE.rsplit("\n", 1)[0], sp.AGE_NOTICE_TEMPLATE_V2.rsplit("\n", 1)[0])
+
+
+class TestTextApproval3AgeNoticeV2(_Fix2Mixin):
+    """TEXT-APPROVAL-3: ops_age_notice_v2 が台帳に載った後、run_age_notice_job は v2（完全 URL）で送る（台帳を patch しない）。"""
+    NOW = datetime.datetime(2026, 11, 4, 3, 0, tzinfo=datetime.timezone.utc)
+
+    def setUp(self):
+        super().setUp()
+        at.reset_pending_for_tests()
+        self.addCleanup(at.reset_pending_for_tests)
+        dom = patch.dict(os.environ, DOMAIN)
+        dom.start()
+        self.addCleanup(dom.stop)
+
+    def _seed(self):
+        # test_jikou_reply_q1c_fix2.TestAgeNoticeApprovedText._seed と同じ（60 分超 2 件＋5 分 1 件）
+        self.reg(inbound_event_id="e-old1", now=self.NOW - datetime.timedelta(minutes=90))
+        self.reg(inbound_event_id="e-old2", now=self.NOW - datetime.timedelta(minutes=61))
+        self.reg(user=USER2, inbound_event_id="e-new", now=self.NOW - datetime.timedelta(minutes=5))
+
+    def test_job_sends_v2_with_full_url_without_patching_ledger(self):
+        self.assertEqual(at.sha256_text(sp.AGE_NOTICE_TEMPLATE_V2), at.APPROVED_SHA256[sp.AGE_NOTICE_TEXT_KEY_V2])
+        self.assertTrue(at.is_approved(sp.AGE_NOTICE_TEXT_KEY_V2, sp.AGE_NOTICE_TEMPLATE_V2))
+        self.assertTrue(at.is_approved(sp.AGE_NOTICE_TEXT_KEY, sp.AGE_NOTICE_TEMPLATE))               # v1 も承認のまま
+        self.on()
+        self._seed()
+        res = _run(sp.run_age_notice_job(9, now=self.NOW))
+        self.assertEqual(res["notice"], rp.NOTIFY_SENT)
+        sent = self.biz.await_args.args[1]
+        self.assertEqual(sent, "【対応待ち・未返信】\n未返信の対応待ち 3 件（60 分超 2 件・最長 90 分経過）・再処理待ち 0 件\n"
+                               "https://app.example.test/app/inbox からご確認ください。")
+        self.assertNotIn("{{", sent)
+        self.assertNotIn("/app/pending", sent)
+        self.assertEqual(at.pending_unapproved_keys(), ())                                            # 未承認通知は出ない
 
 
 # ── 2. 統合一覧（3 操作・旧項目・戻す） ─────────────────────────────────────────

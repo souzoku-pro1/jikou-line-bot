@@ -40,7 +40,8 @@ class TestTextApproval2(_Fix2Mixin):
     def test_ledger_has_exactly_the_approved_line_and_j0_pin_is_unchanged(self):
         self.assertEqual(AT.APPROVED_SHA256["ops_age_notice_v1"], SHA_AGE)                        # 承認した SHA（全桁）
         self.assertEqual(AT.sha256_text(sp.AGE_NOTICE_TEMPLATE), SHA_AGE)                          # 本文・テンプレートは変えていない
-        self.assertEqual(set(AT.APPROVED_SHA256), {AT.SAFE_TEXT_KEY, sp.AGE_NOTICE_TEXT_KEY})      # 追加は 1 行のみ
+        self.assertEqual(set(AT.APPROVED_SHA256), {AT.SAFE_TEXT_KEY, sp.AGE_NOTICE_TEXT_KEY,
+                                                   sp.AGE_NOTICE_TEXT_KEY_V2})                     # TA2 の追加は v1 の 1 行・v2 は TEXT-APPROVAL-3（2026-11-04）
         self.assertEqual(AT.APPROVED_SHA256[AT.SAFE_TEXT_KEY], AT.sha256_text(AT.SAFE_TEXT))       # 他キー不変
         self.assertTrue(AT.is_approved(sp.AGE_NOTICE_TEXT_KEY, sp.AGE_NOTICE_TEMPLATE))
         self.assertIsNone(AT.approved_text(sp.AGE_NOTICE_TEXT_KEY, sp.AGE_NOTICE_TEMPLATE + "。"))   # 1 文字違えば不一致＝再承認
