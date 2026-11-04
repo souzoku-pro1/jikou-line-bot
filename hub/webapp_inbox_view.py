@@ -43,7 +43,10 @@ APP_APPROVAL = kintone.KintoneApp("App 29 (承認キュー)", "APP_APPROVAL", "T
 _FIELDS = ["$id", "顧客名", "顧客メッセージ", "カテゴリ", "送信済み", "更新日時", "line_user_id"]
 OLD_LIMIT = 50                  # 一覧に出す「旧」項目の上限（除外後の件数）
 OLD_PAGE = 50                   # fix1 BU-05: App 29 を 1 ページ何件ずつ読むか
-OLD_MAX_PAGES = 10              # fix1 BU-05: 続きを読む上限（50×10＝500 件まで）
+OLD_MAX_PAGES = 10              # fix1 BU-05: 続きを読む上限（50×10＝500 件まで＝1 回の走査）
+OLD_SCAN = OLD_PAGE * OLD_MAX_PAGES   # fix2 BU-09: 1 回の走査件数。上限に達したら「続きを読み込む」で次の 500 件
+EXCLUDE_QUERY_MAX = 100         # fix2 BU-09: 除外 ID（対応待ちが参照する No.・閉じ済み No.）がこの件数以下なら kintone の問い合わせ条件に入れる
+_OLD_FROM_RE = re.compile(r"^[0-9]{1,6}$")
 CLOSED_LIMIT = 50
 
 KIND_PENDING = "pending"
@@ -160,32 +163,47 @@ async def _records_by_ids(ids: list[str]) -> dict:
     return out
 
 
-async def _old_records(exclude: set | None = None) -> list[dict]:
-    """承認キューの未送信（送信済み=no）を更新の古い順に（V2 以前の項目の候補）。
-    fix1 BU-05: exclude（対応待ちが参照する No.・閉じ済みの No.）を除いた後の件数が OLD_LIMIT に達するまで、
-    offset で続きのページを読む（閉じ済みが先頭 50 件を埋めても、その先の未処理を取りこぼさない）。"""
+def _old_query(exclude: set, limit: int, offset: int) -> str:
+    """fix2 BU-09: 除外 ID が EXCLUDE_QUERY_MAX 件以下なら `$id not in (...)` を問い合わせ条件に入れる（多ければ走査で除外）。"""
+    ids = sorted((x for x in exclude if _ID_RE.fullmatch(str(x))), key=int)
+    cond = '送信済み in ("no")'
+    if 0 < len(ids) <= EXCLUDE_QUERY_MAX:
+        cond += " and $id not in (" + ",".join(f'"{x}"' for x in ids) + ")"
+    return f"{cond} order by 更新日時 asc limit {limit} offset {offset}"
+
+
+async def _scan_old(exclude: set | None = None, start: int = 0) -> tuple[list[dict], int, bool]:
+    """承認キューの未送信（送信済み=no）を更新の古い順に（V2 以前の項目の候補）。戻り値 (records, next_offset, has_more)。
+    fix1 BU-05: exclude（対応待ちが参照する No.・閉じ済みの No.）を除いた後の件数が OLD_LIMIT に達するまで offset で続きを読む。
+    fix2 BU-09: 1 回の走査は start から OLD_SCAN 件まで。上限に達して続きがあり得るときは has_more=True（未処理 0 件と区別し、
+    画面の「続きを読み込む」で next_offset から次の走査）。除外 ID が少なければ問い合わせ条件で除外する（_old_query）。"""
     if not (APP_APPROVAL.app_id() and APP_APPROVAL.token()):
-        return []
+        return [], start, False
     exclude = exclude or set()
     out: list[dict] = []
-    offset = 0
+    offset = int(start)
     for _ in range(OLD_MAX_PAGES):
         try:
-            rows = await kintone.search_records(
-                APP_APPROVAL, f'送信済み in ("no") order by 更新日時 asc limit {OLD_PAGE} offset {offset}', fields=_FIELDS)
+            rows = await kintone.search_records(APP_APPROVAL, _old_query(exclude, OLD_PAGE, offset), fields=_FIELDS)
         except Exception:
             logger.warning("[INBOX] approval list failed (fixed reason)")
-            break
-        for rec in rows:
+            return out, offset, False
+        for i, rec in enumerate(rows):
             rid = _v(rec, "$id")
             if rid and rid not in exclude:
                 out.append(rec)
                 if len(out) >= OLD_LIMIT:
-                    return out
+                    more = (i + 1 < len(rows)) or (len(rows) >= OLD_PAGE)
+                    return out, offset + i + 1, more
         if len(rows) < OLD_PAGE:
-            break
+            return out, offset + len(rows), False
         offset += OLD_PAGE
-    return out
+    return out, offset, True
+
+
+async def _old_records(exclude: set | None = None) -> list[dict]:
+    """先頭からの 1 走査分（互換）。"""
+    return (await _scan_old(exclude, 0))[0]
 
 
 async def _attending_map(hashes: set) -> dict:
@@ -220,19 +238,25 @@ def _sort_key(item: dict):
     return d or datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
 
 
-async def load_open_items() -> list[dict]:
-    """未処理: 対応待ち（open）＋承認キューだけの未送信（対応待ちの表に無く・閉じていない）。古い順。"""
+async def load_open_view(old_from: int = 0) -> tuple[list[dict], dict]:
+    """未処理: 対応待ち（open）＋承認キューだけの未送信（対応待ちの表に無く・閉じていない）。古い順。
+    fix2 BU-09: 戻り値 (items, scan)。scan={"from","scanned","more","found"}＝承認キューの走査範囲と続きの有無。"""
     rows = await reply_pending.list_open(reply_pending.LIST_LIMIT)
     attending = await _attending_map({r["line_user_hash"] for r in rows})
     recs = await _records_by_ids([str(r.get("approval_record_id") or "") for r in rows])
     items = [_pending_item(r, recs.get(str(r.get("approval_record_id") or "")), attending.get(r["line_user_hash"]) or {})
              for r in rows]
     referenced = await reply_pending.approval_record_ids_all()
-    closed = await approval_close.closed_ids(BUSINESS)
-    for rec in await _old_records(set(referenced) | set(closed)):   # fix1 BU-05: 除外後の件数でページング
+    closed = await approval_close.closed_ids(BUSINESS)                 # fix2 BU-09: 閉じ済み ID の集合を先に取る
+    old, nxt, more = await _scan_old(set(referenced) | set(closed), int(old_from))   # fix1 BU-05: 除外後の件数でページング
+    for rec in old:
         items.append(_old_item(rec))
     items.sort(key=_sort_key)
-    return items
+    return items, {"from": int(old_from), "scanned": int(nxt), "more": bool(more), "found": len(old)}
+
+
+async def load_open_items() -> list[dict]:
+    return (await load_open_view(0))[0]
 
 
 async def load_confirm_items() -> list[dict]:
@@ -345,7 +369,21 @@ def _confirm_card(c: dict) -> str:
     return "".join(parts)
 
 
-def _page(items: list[dict], notices: list[str], closed_view: bool, confirm: list[dict] | None = None) -> str:
+def _scan_line(scan: dict) -> str:
+    """fix2 BU-09: 「○件まで走査・続きあり」。上限到達と未処理 0 件を区別する。"""
+    if not scan:
+        return ""
+    rng = f"{scan['from'] + 1}〜{scan['scanned']} 件目まで走査しました（この範囲の未処理 {scan['found']} 件）"
+    if scan["more"]:
+        return (f'<p class="sub">承認キューの未送信を {rng}。続きがあります。'
+                f'<a href="{PAGE}?old_from={scan["scanned"]}">続きを読み込む（次の {OLD_SCAN} 件）</a></p>')
+    if scan["from"] > 0:
+        return f'<p class="sub">承認キューの未送信を {rng}。続きはありません。<a href="{PAGE}">先頭に戻る</a></p>'
+    return ""
+
+
+def _page(items: list[dict], notices: list[str], closed_view: bool, confirm: list[dict] | None = None,
+          scan: dict | None = None) -> str:
     e = html.escape
     parts = [_head("対応待ち"), "<h1>対応待ち</h1>",
              '<p class="sub">bot が自動返信できなかった相談と、未送信の返信下書きの一覧です。'
@@ -360,10 +398,16 @@ def _page(items: list[dict], notices: list[str], closed_view: bool, confirm: lis
     if closed_view:
         parts.append(f'<p class="sub">閉じた件（直近 {CLOSED_LIMIT} 件・新しい順）。<a href="{PAGE}">未処理の一覧へ戻る</a></p>')
     if not items:
-        parts.append('<p class="empty">対応待ちはありません</p>' if not closed_view else '<p class="empty">閉じた件はありません</p>')
+        if closed_view:
+            parts.append('<p class="empty">閉じた件はありません</p>')
+        elif scan and scan.get("more"):
+            parts.append('<p class="empty">この範囲には対応待ちがありません（続きがあります）</p>')   # fix2 BU-09: 上限到達は 0 件と区別
+        else:
+            parts.append('<p class="empty">対応待ちはありません</p>')
     for it in items:
         parts.append(_card(it, closed_view))
     if not closed_view:
+        parts.append(_scan_line(scan or {}))
         parts.append(f'<p class="sub"><a href="{PAGE}?closed=1">閉じた件も表示する</a></p>')
     parts.append('<script src="/app/shell.js"></script></body></html>')
     return "".join(parts)
@@ -390,9 +434,16 @@ async def inbox_page(request: Request):
     q = request.query_params
     closed_view = q.get("closed") == "1"
     notices = [_NOTICES.get(q.get("done", ""), ""), _LINK_NOTICES.get(q.get("link", ""), "")]
+    old_from = q.get("old_from", "0") or "0"
+    if not _OLD_FROM_RE.fullmatch(old_from):
+        return _bad_request()
     confirm: list[dict] = []
+    scan: dict = {}
     try:
-        items = await load_closed_items() if closed_view else await load_open_items()
+        if closed_view:
+            items = await load_closed_items()
+        else:
+            items, scan = await load_open_view(int(old_from))   # fix2 BU-09
     except Exception:
         items, notices = [], notices + [_NOTICES["db"]]
     if not closed_view:
@@ -401,7 +452,7 @@ async def inbox_page(request: Request):
         except Exception:
             confirm = []
             logger.warning("[INBOX] release confirm list failed (fixed reason)")
-    return HTMLResponse(_page(items, notices, closed_view, confirm))
+    return HTMLResponse(_page(items, notices, closed_view, confirm, scan))
 
 
 async def _hash_for_record(record_id: str) -> str | None:

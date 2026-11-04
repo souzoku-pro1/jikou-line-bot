@@ -78,7 +78,9 @@ class _InboxMixin(_DbMixin):
                 self.old_queries.append(query)
                 m = re.search(r"limit (\d+)(?: offset (\d+))?", query)
                 lim, off = (int(m.group(1)), int(m.group(2) or 0)) if m else (len(self.old_records), 0)
-                return list(self.old_records)[off:off + lim]
+                ex = set(re.findall(r'"([0-9]+)"', query.split("not in (")[1].split(")")[0])) if "not in (" in query else set()
+                rows = [r_ for r_ in self.old_records if r_["$id"]["value"] not in ex]   # fix2 BU-09: 問い合わせ条件の除外
+                return rows[off:off + lim]
             return []
 
         async def _get(app, record_id):
@@ -637,7 +639,11 @@ class TestFix1Inbox(_InboxMixin):
         self.assertIn("旧 未処理", html)
         self.assertEqual(html.count('class="badge old"'), 1)
         self.assertNotIn("旧 1000", html)
-        self.assertEqual([q.split("limit ")[1] for q in self.old_queries], ["50 offset 0", "50 offset 50"])   # 続きを読んだ
+        # fix2 BU-09 追随: 除外 ID が 100 件以下（閉じ済み 50＋参照 1）なら問い合わせ条件で除外 → 1 問い合わせで到達（続きの走査は BU-09 で固定）
+        self.assertEqual(len(self.old_queries), 1)
+        self.assertIn('and $id not in ("1000","1001",', self.old_queries[0])
+        self.assertTrue(self.old_queries[0].endswith("limit 50 offset 0"))
+        self.assertNotIn("続きがあります", html)
         # 除外後に上限に達したら続きは読まない／対応待ちが参照する No. も除外して数える
         self.old_queries.clear()
         self.old_records = [_approval(str(2000 + i), USER2, 顧客名="旧 %d" % i) for i in range(60)]
@@ -841,6 +847,51 @@ class TestFix1Inbox(_InboxMixin):
                 _run(iv.run_release_job())
         self.assertEqual((self.releases()[0]["state"], self.releases()[0]["attempts"]), ("abandoned", ar.MAX_ATTEMPTS))
         self.assertEqual(_run(ar.run_release_job()), {"pending": 0, "done": 0, "abandoned": 0})
+
+
+class TestFix2Inbox(_InboxMixin):
+    def test_bu09_scan_limit_is_distinguished_from_no_items_and_continues(self):
+        """BU-09: 閉じ済み 500 件 + 未処理 1 件（除外が 100 件を超えるため走査で除外）→ 1 走査目は上限到達＝「続きあり」
+        （未処理 0 件とは区別）→ 「続きを読み込む」でその 1 件に到達する。"""
+        closed_ids = [str(5000 + i) for i in range(500)]
+        self.old_records = ([_approval(i, USER2, 顧客名="旧 %s" % i, 更新日時="2026-08-01T00:00:00Z") for i in closed_ids]
+                            + [_approval("5600", USER2, 顧客名="旧 未処理", 更新日時="2026-09-02T01:00:00Z")])
+        for i in closed_ids:
+            self.assertEqual(_run(ac.close("jikou", i, "done_external", "t")), "ok")
+        html = self.get("/app/inbox").text
+        self.assertNotIn("旧 未処理", html)
+        self.assertIn("1〜500 件目まで走査しました（この範囲の未処理 0 件）", html)
+        self.assertIn("続きがあります", html)
+        self.assertIn('href="/app/inbox?old_from=500"', html)
+        self.assertIn("この範囲には対応待ちがありません（続きがあります）", html)
+        self.assertNotIn("対応待ちはありません</p>", html)                                   # 上限到達は 0 件と区別
+        self.assertEqual(len(self.old_queries), iv.OLD_MAX_PAGES)
+        self.assertNotIn("not in (", self.old_queries[0])                                   # 除外 501 件＝問い合わせ条件に入れない
+        self.assertEqual(self.old_queries[-1].split("limit ")[1], "50 offset 450")
+        # 続きの走査でその 1 件に到達
+        self.old_queries.clear()
+        html = self.get("/app/inbox?old_from=500").text
+        self.assertIn("旧 未処理", html)
+        self.assertEqual(html.count('class="badge old"'), 1)
+        self.assertIn("501〜501 件目まで走査しました（この範囲の未処理 1 件）", html)
+        self.assertIn("続きはありません", html)
+        self.assertIn('href="/app/inbox">先頭に戻る', html)
+        self.assertEqual([q.split("limit ")[1] for q in self.old_queries], ["50 offset 500"])
+        # 不正な old_from は 400／閉じ済みが無ければ「対応待ちはありません」（続きの案内なし）
+        self.assertEqual(self.get("/app/inbox?old_from=x").status_code, 400)
+        self.old_records = []
+        html = self.get("/app/inbox").text
+        self.assertIn("対応待ちはありません", html)
+        self.assertNotIn("続きがあります", html)
+        # 上限 50 件に達して同じページに残りがある → 続きあり・次の offset はページ途中から
+        self.old_records = [_approval(str(7000 + i), USER2, 顧客名="旧 %d" % i) for i in range(60)]
+        _run(ac.close("jikou", "7000", "done_external", "t"))
+        recs, nxt, more = _run(iv._scan_old({"7000"}, 0))
+        self.assertEqual((len(recs), nxt, more), (iv.OLD_LIMIT, 50, True))
+        # 走査の失敗は「続きなし」で打ち切り（固定理由ログ・画面は落ちない）
+        with patch.object(iv.kintone, "search_records", AsyncMock(side_effect=RuntimeError("down"))):
+            self.assertEqual(_run(iv._scan_old(set(), 0)), ([], 0, False))
+            self.assertEqual(self.get("/app/inbox").status_code, 200)
 
 
 # ── 6. 試験アカウント allowlist（実装のみ・env 設定と有効化は大野） ─────────────────
