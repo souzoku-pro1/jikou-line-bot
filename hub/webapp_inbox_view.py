@@ -13,6 +13,9 @@
 - 署名付きリンク（GET /app/go/r/{符号}・GET/POST /app/go/c/{符号}）: hub/pending_link で検証。
     r: ok → 303 /app/reply/{No.}（承認キューが無い件は一覧へ）／expired・invalid → 一覧へ（固定の案内 1 行・大野裁定: 失効はエラー画面で終わらせない）
     c: ok → 確認画面 1 枚（GET は副作用なし）→ POST で対応終了（冪等: 既に閉じていれば処理せず案内だけ）
+- 「解除の要確認」（POST /app/inbox/release・fix2 BU-08）: 対応終了にしたとき bot の対応中（会話・世代）を特定できなかった件を
+  一覧の上部に出し、現在の状態（対応中／対応中でない／会話なし／特定不能）を表示する。大野が [対応中を解除する] を押したときだけ
+  その時点の世代を固定して解除する（hub/attending_release.confirm_release）。回収ジョブは固定済みの世代にしか触らない。
 - 認証はすべて _gate（未ログインは /app/login?next=… → ログイン後にここへ戻る）。送信の口は無い（承認なし送信経路ゼロ）。
 - 自動送信・kintone 書込・物理削除は無い。ログは固定語彙のみ。
 """
@@ -65,9 +68,21 @@ _OLD_OUTCOME_LABELS = {"done_external": "対応終了（別の方法で返信済
 _NOTICES = {
     "closed": "対応終了にしました。", "not_needed": "不要にしました。", "reopened": "未処理に戻しました。",
     "closed_release_pending": "対応終了にしました。bot の再開（対応中の解除）は未完了のため、回収ジョブが自動で再試行します。",
+    "closed_release_confirm": "対応終了にしました。bot の「対応中」を特定できなかったため、この一覧の上部「解除の要確認」で現在の状態を確認し、必要なら解除してください。",
+    "released": "対応中を解除しました（bot を再開）。",
+    "release_not_needed": "対応中ではなかったため、解除不要として確認済みにしました。",
+    "release_pending": "解除を試みましたが完了していません。回収ジョブが、いま固定した世代に対してだけ再試行します。",
+    "release_unresolved": "相談者を特定できないため解除できません（承認キューの line_user_id を確認してください）。",
     "already": "この件は既に処理済みです。", "not_found": "対象が見つかりません。", "bad_input": "入力が不正です。",
     "db": "記録を読み書きできませんでした。", "not_closed": "この件は閉じていません。",
 }
+_CONFIRM_STATUS = {   # fix2 BU-08: 押す前に出す現在の状態（ハッシュ・userId・本文は出さない）
+    "attending": "bot 停止中（対応中）。解除すると bot が再開します。",
+    "off": "対応中ではありません（解除は不要です）。",
+    "none": "会話の記録がありません（解除は不要です）。",
+    "unresolved": "相談者を特定できません（承認キューの line_user_id を確認してください）。",
+}
+_CONFIRM_BUTTON = {"attending": "対応中を解除する", "off": "解除不要として確認済みにする", "none": "解除不要として確認済みにする"}
 _LINK_NOTICES = {
     "expired": "リンクの期限が切れています。下の一覧から該当の件を開いてください。",
     "invalid": "リンクが無効です（期限切れか、改ざんの疑い）。下の一覧から該当の件を開いてください。",
@@ -220,6 +235,22 @@ async def load_open_items() -> list[dict]:
     return items
 
 
+async def load_confirm_items() -> list[dict]:
+    """fix2 BU-08: 「解除の要確認」（対象未特定のまま対応終了にした件）。押す前に現在の状態を出す。本文・userId・ハッシュは出さない。"""
+    rows = await attending_release.list_needs_confirm()
+    recs = await _records_by_ids([str(r.get("approval_record_id") or "") for r in rows])
+    out = []
+    for r in rows:
+        st = await attending_release.current_status(r, resolve_hash=_hash_for_record)
+        conv = st["conversation"]
+        key = "unresolved" if not st["hash"] else ("none" if conv is None else ("attending" if conv["attending"] else "off"))
+        rec = recs.get(str(r.get("approval_record_id") or ""))
+        out.append({"release_id": str(r["release_id"]), "record_id": str(r.get("approval_record_id") or ""),
+                    "kind": r["source_kind"], "id": str(r["source_id"]), "name": (_v(rec, "顧客名") if rec else ""),
+                    "closed_at": r.get("created_at") or "", "status": key})
+    return out
+
+
 async def load_closed_items() -> list[dict]:
     """閉じた件（参照）: 対応待ちの open 以外＋承認キューの閉じ記録。新しい順。"""
     rows = await reply_pending.list_closed(CLOSED_LIMIT)
@@ -297,7 +328,24 @@ def _card(it: dict, closed_view: bool) -> str:
     return "".join(parts)
 
 
-def _page(items: list[dict], notices: list[str], closed_view: bool) -> str:
+def _confirm_card(c: dict) -> str:
+    e = html.escape
+    ref = f"No.{e(c['record_id'])}" if c["record_id"] else f"ID {e(c['id'])}"
+    parts = ['<div class="item">',
+             f'<div class="name">{e(c["name"] or "（お名前未登録）")}<span class="meta"> 対応終了 {e(fmt_jst(c["closed_at"]))}</span></div>',
+             '<div><span class="badge att">解除の要確認</span>' + ('<span class="badge old">旧</span>' if c["kind"] == KIND_OLD else "") + "</div>",
+             f'<div class="meta">{ref}</div>',
+             f'<div class="lbl">現在の状態</div><div>{e(_CONFIRM_STATUS.get(c["status"], _CONFIRM_STATUS["unresolved"]))}</div>']
+    label = _CONFIRM_BUTTON.get(c["status"])
+    if label:
+        parts.append(f'<div class="actions"><form method="post" action="{PAGE}/release">'
+                     f'<input type="hidden" name="release_id" value="{e(c["release_id"])}">'
+                     f'<button type="submit" class="primary">{e(label)}</button></form></div>')
+    parts.append("</div>")
+    return "".join(parts)
+
+
+def _page(items: list[dict], notices: list[str], closed_view: bool, confirm: list[dict] | None = None) -> str:
     e = html.escape
     parts = [_head("対応待ち"), "<h1>対応待ち</h1>",
              '<p class="sub">bot が自動返信できなかった相談と、未送信の返信下書きの一覧です。'
@@ -305,6 +353,10 @@ def _page(items: list[dict], notices: list[str], closed_view: bool) -> str:
     for n in notices:
         if n:
             parts.append(f'<p class="notice">{e(n)}</p>')
+    if confirm and not closed_view:
+        parts.append(f'<h2 class="sub">解除の要確認（{len(confirm)} 件）</h2>'
+                     '<p class="hint">対応終了にしたとき、bot の「対応中」を特定できなかった件です。現在の状態を確認して押してください。</p>')
+        parts.extend(_confirm_card(c) for c in confirm)
     if closed_view:
         parts.append(f'<p class="sub">閉じた件（直近 {CLOSED_LIMIT} 件・新しい順）。<a href="{PAGE}">未処理の一覧へ戻る</a></p>')
     if not items:
@@ -338,11 +390,18 @@ async def inbox_page(request: Request):
     q = request.query_params
     closed_view = q.get("closed") == "1"
     notices = [_NOTICES.get(q.get("done", ""), ""), _LINK_NOTICES.get(q.get("link", ""), "")]
+    confirm: list[dict] = []
     try:
         items = await load_closed_items() if closed_view else await load_open_items()
     except Exception:
         items, notices = [], notices + [_NOTICES["db"]]
-    return HTMLResponse(_page(items, notices, closed_view))
+    if not closed_view:
+        try:
+            confirm = await load_confirm_items()      # fix2 BU-08
+        except Exception:
+            confirm = []
+            logger.warning("[INBOX] release confirm list failed (fixed reason)")
+    return HTMLResponse(_page(items, notices, closed_view, confirm))
 
 
 async def _hash_for_record(record_id: str) -> str | None:
@@ -358,9 +417,14 @@ async def _hash_for_record(record_id: str) -> str | None:
 
 
 async def _after_close(release_id) -> str:
-    """fix1 BU-04: 閉じ記録の直後に解除を 1 回試みる。完了しなければ回収ジョブに委ねる（閉じ記録は残る）。"""
-    st = await attending_release.attempt(release_id, resolve_hash=_hash_for_record) if release_id is not None else None
-    return "closed" if st == attending_release.STATE_DONE else "closed_release_pending"
+    """fix1 BU-04: 閉じ記録の直後に解除を 1 回試みる。完了しなければ回収ジョブに委ねる（閉じ記録は残る）。
+    fix2 BU-08: 対象を特定できなかった件（needs_confirm）は自動解除せず「解除の要確認」へ。"""
+    st = await attending_release.attempt(release_id) if release_id is not None else None
+    if st == attending_release.STATE_DONE:
+        return "closed"
+    if st == attending_release.STATE_NEEDS_CONFIRM:
+        return "closed_release_confirm"
+    return "closed_release_pending"
 
 
 async def close_item(kind: str, item_id: str, outcome: str, actor: str) -> str:
@@ -374,7 +438,7 @@ async def close_item(kind: str, item_id: str, outcome: str, actor: str) -> str:
             if res == "ok":
                 return await _after_close(rid)
             if res == "not_open":
-                await attending_release.retry_for_source(attending_release.SOURCE_PENDING, str(pid), resolve_hash=_hash_for_record)
+                await attending_release.retry_for_source(attending_release.SOURCE_PENDING, str(pid))
         else:
             res = await reply_pending.mark_not_needed(pid)
             if res == "ok":
@@ -385,7 +449,7 @@ async def close_item(kind: str, item_id: str, outcome: str, actor: str) -> str:
         if res == "ok":
             return await _after_close(rid)
         if res == "already":
-            await attending_release.retry_for_source(attending_release.SOURCE_OLD, str(item_id), resolve_hash=_hash_for_record)
+            await attending_release.retry_for_source(attending_release.SOURCE_OLD, str(item_id))
     else:
         res = await approval_close.close(BUSINESS, item_id, outcome, actor)
         if res == "ok":
@@ -394,8 +458,26 @@ async def close_item(kind: str, item_id: str, outcome: str, actor: str) -> str:
 
 
 async def run_release_job() -> None:
-    """fix1 BU-04: 回収ジョブへの相乗り（解除未完了の再試行・承認キューだけの件はここでハッシュを解決）。"""
-    await attending_release.run_release_job(resolve_hash=_hash_for_record)
+    """fix1 BU-04: 回収ジョブへの相乗り（解除未完了＝世代固定済みの再試行）。fix2 BU-08: 対象未特定の件はここでは確定・解除しない。"""
+    await attending_release.run_release_job()
+
+
+async def inbox_release(request: Request):
+    """fix2 BU-08: [対応中を解除する]。needs_confirm の行だけが対象。その時点の世代を固定（永続化）してから解除する。"""
+    form = await request.form()
+    rid = str(form.get("release_id", ""))
+    if not _ID_RE.fullmatch(rid):
+        return _bad_request()
+    try:
+        code, _state = await attending_release.confirm_release(int(rid), resolve_hash=_hash_for_record)
+    except Exception:
+        logger.warning("[INBOX] release confirm failed (fixed reason)")
+        code = "db"
+    done = {attending_release.RESULT_RELEASED: "released", attending_release.RESULT_ALREADY_OFF: "release_not_needed",
+            attending_release.RESULT_NO_CONVERSATION: "release_not_needed", attending_release.RESULT_STALE: "release_not_needed",
+            attending_release.CONFIRM_FIXED_FAILED: "release_pending", attending_release.CONFIRM_UNRESOLVED: "release_unresolved",
+            attending_release.CONFIRM_NOT_TARGET: "already"}.get(code, "db")
+    return RedirectResponse(f"{PAGE}?done={done}", status_code=303)
 
 
 async def inbox_close(request: Request):
@@ -482,6 +564,7 @@ async def go_close(request: Request):
 router.add_api_route(PAGE, _gate(inbox_page), methods=["GET"])
 router.add_api_route(f"{PAGE}/close", _gate(inbox_close), methods=["POST"])
 router.add_api_route(f"{PAGE}/reopen", _gate(inbox_reopen), methods=["POST"])
+router.add_api_route(f"{PAGE}/release", _gate(inbox_release), methods=["POST"])     # fix2 BU-08
 router.add_api_route(f"{GO}/{pending_link.KIND_REPLY}/{{token}}", _gate(go_reply), methods=["GET"])
 router.add_api_route(f"{GO}/{pending_link.KIND_CLOSE}/{{token}}", _gate(go_close_confirm), methods=["GET"])
 router.add_api_route(f"{GO}/{pending_link.KIND_CLOSE}/{{token}}", _gate(go_close), methods=["POST"])

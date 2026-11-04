@@ -707,38 +707,110 @@ class TestFix1Inbox(_InboxMixin):
         _run(iv.run_release_job())
         self.assertTrue(_run(sl.conversation_state("jikou", USER))["attending"])         # 新しい世代は触らない
         self.assertEqual((self.releases()[0]["state"], self.releases()[0]["result"]), ("done", "stale"))
-        # 同じ世代で既に対応中でない → already_off（完了）
+        # fix2 BU-08 追随: 会話の記録が無い相談者は対象を固定できない → needs_confirm（回収は触らない・大野の確認で閉じる）
         pid2 = self._reg(user=USER2, inbound_event_id="ev2", approval_record_id=None)
-        with patch.object(sl, "release_attending", AsyncMock(side_effect=RuntimeError("db"))):
-            self.post("/app/inbox/close", {"kind": "pending", "id": str(pid2), "outcome": "done_external"})
+        r = self.post("/app/inbox/close", {"kind": "pending", "id": str(pid2), "outcome": "done_external"})
+        self.assertEqual(r.headers["location"], "/app/inbox?done=closed_release_confirm")
         _run(iv.run_release_job())
-        self.assertEqual(self.releases()[1]["result"], "no_conversation")                 # 会話が無い相談者
+        self.assertEqual((self.releases()[1]["state"], self.releases()[1]["result"], self.releases()[1]["attempts"]),
+                         ("needs_confirm", None, 0))
         self.assertEqual(_run(sl.release_attending("jikou", sl.line_user_hash("jikou", USER),
                                                    conversation_id=self.releases()[0]["conversation_id"],
                                                    human_version=self.releases()[0]["human_version"])), "stale")
 
-    def test_bu04_old_item_with_unresolvable_hash_is_released_by_recovery(self):
-        """BU-04: 承認キューだけの件で kintone から userId を引けない → ハッシュ NULL の未完了 → 回収で解決・固定・解除。"""
+    def test_bu08_unresolved_target_needs_confirm_and_is_released_only_by_button(self):
+        """BU-08（Codex 反例 1）: 閉じた時点で対象を特定できない件は自動解除しない（回収でも確定・解除しない）。
+        一覧の「解除の要確認」で現在の状態を見て [対応中を解除する] を押したときだけ、その時点の世代を取得して解除する。
+        （fix1 の test_bu04_old_item_with_unresolvable_hash_is_released_by_recovery を BU-08 の裁定に追随して置換）"""
         self.old_records = [_approval(OLD_ID, USER2, 顧客名="旧 花子")]
-        _run(sl.set_attending("jikou", USER2))
-        r = self.post("/app/inbox/close", {"kind": "old", "id": OLD_ID, "outcome": "done_external"})   # records に無い＝get 失敗
-        self.assertEqual(r.headers["location"], "/app/inbox?done=closed_release_pending")
+        r = self.post("/app/inbox/close", {"kind": "old", "id": OLD_ID, "outcome": "done_external"})   # records に無い＝userId を引けない
+        self.assertEqual(r.headers["location"], "/app/inbox?done=closed_release_confirm")
         self.assertEqual(_run(ac.closed_ids("jikou")), {OLD_ID})
         row = self.releases()[0]
-        self.assertEqual((row["state"], row["line_user_hash"], row["conversation_id"], row["source_kind"], row["source_id"]),
-                         ("pending", None, None, "old", OLD_ID))
-        self.assertTrue(_run(sl.conversation_state("jikou", USER2))["attending"])
-        _run(iv.run_release_job())                                                      # まだ引けない → 回数だけ進む
-        self.assertEqual((self.releases()[0]["state"], self.releases()[0]["attempts"]), ("pending", 2))
+        self.assertEqual((row["state"], row["line_user_hash"], row["conversation_id"], row["attempts"], row["source_kind"], row["source_id"]),
+                         ("needs_confirm", None, None, 0, "old", OLD_ID))
+        html = self.get("/app/inbox?done=closed_release_confirm").text
+        self.assertIn("解除の要確認", html)
+        self.assertIn("相談者を特定できません", html)
+        self.assertNotIn("対応中を解除する", html)                                       # 特定できない間は押せない
+        # 閉じた後に大野が対応中にした（世代 10）→ 回収は触らない（引けるようになっても確定しない）
+        att = _run(sl.set_attending("jikou", USER2))
+        _run(iv.run_release_job())
+        _run(sl.run_recover_job())
         self.records[OLD_ID] = _approval(OLD_ID, USER2)                                  # 引けるようになった
         _run(iv.run_release_job())
+        self.assertTrue(_run(sl.conversation_state("jikou", USER2))["attending"])        # 世代 10 は自動では解除しない
         row = self.releases()[0]
-        self.assertEqual((row["state"], row["result"], row["line_user_hash"]), ("done", "released", sl.line_user_hash("jikou", USER2)))
+        self.assertEqual((row["state"], row["attempts"], row["conversation_id"], row["line_user_hash"]), ("needs_confirm", 0, None, None))
+        html = self.get("/app/inbox").text
+        self.assertIn("bot 停止中（対応中）", html)                                       # 押す前に現在の状態
+        self.assertIn("対応中を解除する", html)
+        self.assertNotIn(USER2, html)
+        self.assertNotIn(sl.line_user_hash("jikou", USER2), html)
+        # 押したときだけ、その時点の世代を取得して解除
+        r = self.post("/app/inbox/release", {"release_id": str(row["release_id"])})
+        self.assertEqual(r.headers["location"], "/app/inbox?done=released")
         self.assertFalse(_run(sl.conversation_state("jikou", USER2))["attending"])
-        self.assertNotIn(USER2, self.get("/app/inbox?closed=1").text)
-        # 再操作（already）は closed のまま・再試行対象なし
+        row = self.releases()[0]
+        self.assertEqual((row["state"], row["result"], row["line_user_hash"], row["conversation_id"], row["human_version"], row["attempts"]),
+                         ("done", "released", sl.line_user_hash("jikou", USER2), att["conversation_id"], att["human_version"], 1))
+        html = self.get("/app/inbox?done=released").text
+        self.assertIn("対応中を解除しました", html)
+        self.assertNotIn("解除の要確認", html)
+        # 2 回目は処理しない／不正入力は 400／再操作（already）は closed のまま
+        self.assertEqual(self.post("/app/inbox/release", {"release_id": str(row["release_id"])}).headers["location"], "/app/inbox?done=already")
+        self.assertEqual(self.post("/app/inbox/release", {"release_id": "x"}).status_code, 400)
         r = self.post("/app/inbox/close", {"kind": "old", "id": OLD_ID, "outcome": "done_external"})
         self.assertEqual(r.headers["location"], "/app/inbox?done=already")
+        self.assertEqual(self.releases()[0]["attempts"], 1)
+
+    def test_bu08_fixed_generation_is_persisted_before_release_and_later_generation_not_adopted(self):
+        """BU-08（Codex 反例 2）: 押したときの世代を **先に永続化** してから解除を試みる。初回が失敗しても、その後に進んだ世代（20）は
+        採用せず、回収は固定した世代（10）に対してのみ再試行する（stale＝完了・世代 20 の対応中はそのまま）。"""
+        self.old_records = [_approval(OLD_ID, USER2)]
+        self.post("/app/inbox/close", {"kind": "old", "id": OLD_ID, "outcome": "done_external"})
+        self.assertEqual(self.releases()[0]["state"], "needs_confirm")
+        self.records[OLD_ID] = _approval(OLD_ID, USER2)
+        gen10 = _run(sl.set_attending("jikou", USER2))
+        with patch.object(sl, "release_attending", AsyncMock(side_effect=RuntimeError("db"))):
+            r = self.post("/app/inbox/release", {"release_id": str(self.releases()[0]["release_id"])})
+        self.assertEqual(r.headers["location"], "/app/inbox?done=release_pending")
+        row = self.releases()[0]
+        self.assertEqual((row["state"], row["attempts"], row["conversation_id"], row["human_version"], row["line_user_hash"]),
+                         ("pending", 1, gen10["conversation_id"], gen10["human_version"], sl.line_user_hash("jikou", USER2)))
+        self.assertTrue(_run(sl.conversation_state("jikou", USER2))["attending"])
+        self.assertNotIn("解除の要確認", self.get("/app/inbox").text)                   # 固定済み＝要確認ではない（回収が再試行）
+        # 世代が進む（別経路で解除 → 再び対応中＝世代 20）
+        _run(sl.end_attending("jikou", USER2))
+        gen20 = _run(sl.set_attending("jikou", USER2))
+        self.assertNotEqual((gen20["conversation_id"], gen20["human_version"]), (gen10["conversation_id"], gen10["human_version"]))
+        _run(sl.run_recover_job())                                                       # 回収は固定した世代 10 にだけ
+        self.assertTrue(_run(sl.conversation_state("jikou", USER2))["attending"])        # 世代 20 は触らない
+        row = self.releases()[0]
+        self.assertEqual((row["state"], row["result"], row["conversation_id"], row["human_version"]),
+                         ("done", "stale", gen10["conversation_id"], gen10["human_version"]))
+        # 会話の記録が無い相談者 → 押すと「解除不要」で確認済み（no_conversation・done）
+        pid = self._reg(user="U" + "3" * 32, inbound_event_id="ev3", approval_record_id=None)
+        r = self.post("/app/inbox/close", {"kind": "pending", "id": str(pid), "outcome": "done_external"})
+        self.assertEqual(r.headers["location"], "/app/inbox?done=closed_release_confirm")
+        html = self.get("/app/inbox").text
+        self.assertIn("会話の記録がありません", html)
+        self.assertIn("解除不要として確認済みにする", html)
+        r = self.post("/app/inbox/release", {"release_id": str(self.releases()[1]["release_id"])})
+        self.assertEqual(r.headers["location"], "/app/inbox?done=release_not_needed")
+        self.assertEqual((self.releases()[1]["state"], self.releases()[1]["result"], self.releases()[1]["conversation_id"]),
+                         ("done", "no_conversation", None))
+        # 対応中でない（会話はある）相談者 → 押すと already_off で確認済み
+        _run(sl.end_attending("jikou", USER2))
+        self.old_records = [_approval("778", USER2)]
+        with patch.object(iv, "_hash_for_record", AsyncMock(return_value=None)):         # 閉じた時点は特定できない
+            r = self.post("/app/inbox/close", {"kind": "old", "id": "778", "outcome": "done_external"})
+        self.assertEqual(r.headers["location"], "/app/inbox?done=closed_release_confirm")
+        self.records["778"] = _approval("778", USER2)
+        self.assertIn("対応中ではありません", self.get("/app/inbox").text)
+        r = self.post("/app/inbox/release", {"release_id": str(self.releases()[2]["release_id"])})
+        self.assertEqual(r.headers["location"], "/app/inbox?done=release_not_needed")
+        self.assertEqual((self.releases()[2]["state"], self.releases()[2]["result"]), ("done", "already_off"))
 
     def test_bu04_close_record_and_release_row_are_one_transaction(self):
         """BU-04: 「解除未完了」を書けなければ閉じ記録も残らない（同一 tx）。不要（not_needed）は従来どおり解除しない。"""
