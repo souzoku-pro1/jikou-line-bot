@@ -170,14 +170,17 @@ async def update_record(app: KintoneApp, record_id: str, fields: dict,
     await _write("PUT", f"{_base_url()}/k/v1/record.json", app, body)
 
 
+class PhysicalDeleteDisabled(RuntimeError):
+    """AUDIT-FIX-1（QUEUE-2026-10-16-R G-1・AUDIT-1 要修正 #1）: kintone の物理削除は行わない（RV-08: 論理削除のみ）。"""
+
+
 async def delete_record(app: KintoneApp, record_id: str) -> None:
-    """レコードの物理削除（R4-2b: 名寄せ統合の敗者削除用）。
-    削除はリトライしない（書き込みと同じ流儀）。呼び出し元は監査記録の保存成功を
-    削除の前提条件とすること（person_merge_exec の順序固定）"""
-    await _write(
-        "DELETE", f"{_base_url()}/k/v1/records.json", app,
-        {"app": app.app_id(), "ids": [record_id]},
-    )
+    """【無効化】レコードの物理削除は行わない（RV-08: 削除せず状態・履歴の追加で表す）。
+
+    旧 R4-2b（名寄せ統合の敗者削除）の器だったが、呼出は 0（person_merge_exec は物理削除を完全除去済み・
+    AST 検査で pin）。AUDIT-1 で「物理削除 API の器を残さない」と裁定し、HTTP DELETE を送らず常に例外にする。
+    名前と署名は、既存テストの「禁止 API の閉集合」pin（patch.object の対象）を壊さないために残す。"""
+    raise PhysicalDeleteDisabled("kintone physical delete is disabled (RV-08: logical deletion only)")
 
 
 async def upload_file(app: KintoneApp, filename: str, content: bytes, mime: str) -> str:
