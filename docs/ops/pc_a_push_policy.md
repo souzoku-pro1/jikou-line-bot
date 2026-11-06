@@ -64,7 +64,10 @@ merge・migration 適用・env・kintone は大野専権のまま。失敗した
 ## 8. 有効化の手順（大野の「保護できた」の後）
 
 1. 大野が §5 を設定し、「保護できた」と伝える。
-2. PC-A が `git push --dry-run origin main` を試し、GitHub 側で拒否されることを報告する（実 push はしない）。拒否されなければ有効化しない。
+2. PC-A が **GitHub の API（読取のみ）** で main に有効な rule を列挙し、`deletion`・`non_fast_forward`（force push 禁止）・`pull_request` の 3 つが揃っていることを OK/NG で報告する（実 push はしない）。
+   - 取得先: `GET /repos/souzoku-pro1/jikou-line-bot/rules/branches/main`（rulesets）。classic 保護の場合は `GET …/branches/main/protection` の allow_deletions=false・allow_force_pushes=false・required_pull_request_reviews あり。token は `git credential fill` の値をその場で使い、表示・保存しない。道具: `pgv/_branch_rules_check.py`。UI（Settings → Rules／Branches）での確認でも可。
+   - `git push --dry-run` は確認手段にならない（2026-11-06 に判明）: dry-run は参照の照合とローカル検査だけで、サーバ側の保護判定（pre-receive）を通らない。ローカルが遅れていれば「fetch first」で拒否されるだけで保護の有無は分からず、最新なら保護があっても成功扱いになる。
+   - 3 つ揃わなければ有効化しない。確認記録: 2026-11-06 API 確認＝deletion OK・non_fast_forward OK・pull_request OK（Repository ruleset・classic 保護なし）。
 3. 大野が PC-A の許可設定を §4 のとおりに変え、PC-A は §7 の文面を規律ファイルに追記する。
 4. **最初の push は 1 本だけ**: 本書のブランチ `docs/push-policy-1` を PC-A が push し、`git ls-remote` の SHA・PR の head・ローカル tip の 3 つが一致することを報告してから、通常運用（§2・§3）に入る。
 5. 有効化前に push 待ちだったブランチ（大野に push 行を渡したもの）は、大野の `!` か、有効化後の PC-A の push か、どちらか一方で行う（二重に打たない）。
