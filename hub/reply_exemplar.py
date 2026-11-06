@@ -459,6 +459,11 @@ async def record_sent(record_id, text: str) -> dict | None:
             if row.sent_at is not None:
                 return None                      # 既に照合済み（再配送）
             unmodified = (row.draft_text_version == tv)
+            # Q3a-fix2 BQ-07: 無修正の計数と閾値の確定は (business, category) 単位で直列化（PostgreSQL は advisory lock を
+            # 同一 tx で取り commit まで保持・sqlite は直後の UPDATE が書込ロックを取る＝単一書込）。並行 2 件が双方とも
+            # 自分の 1 件しか見えない count で未達と判断して確定を取りこぼすことを防ぐ。
+            if unmodified and row.category:
+                await _serialize_category(s, row.business, row.category)
             await s.execute(sa.update(reply_draft_approval).where(
                 reply_draft_approval.c.record_id == str(record_id)).values(
                 sent_text_version=tv, unmodified=unmodified, sent_at=now))
@@ -632,3 +637,51 @@ async def list_promotion_pending(limit: int = 20) -> list[dict]:
             .order_by(exemplar_promotion_notice.c.created_at.asc()).limit(int(limit)))).fetchall()
     return [{"business": r.business, "category": r.category, "threshold": int(r.threshold), "attempts": int(r.attempts),
              "created_at": _iso(r.created_at)} for r in rows]
+
+
+# ── JIKOU-REPLY-Q3a-fix2 BQ-07（Codex R-Q3a-fix1）: 計数と確定の直列化・確定行の不足を補う照合 ──
+PROMOTION_LOCK_NS = "exemplar_promotion"
+SERIALIZED_PG = "pg"                 # PostgreSQL: pg_advisory_xact_lock（tx の終わりで自動解放・取得漏れなし）
+SERIALIZED_SINGLE_WRITER = "single_writer"   # sqlite: 直後の UPDATE が書込ロック（RESERVED）を取り commit まで保持
+SERIALIZED_NONE = "none"
+
+
+def promotion_lock_key(business: str, category: str) -> str:
+    """advisory lock の鍵（本文・ID を含まない）。"""
+    return f"{PROMOTION_LOCK_NS}:{business}:{category}"
+
+
+async def _serialize_category(s, business: str, category: str) -> str:
+    """同一 tx 内で (business, category) の直列化を取る。戻り値は固定語彙 pg／single_writer／none（ログ・試験用）。"""
+    dialect = (await s.connection()).dialect.name
+    if dialect == "postgresql":
+        await s.execute(sa.text("SELECT pg_advisory_xact_lock(hashtext(:k))"), {"k": promotion_lock_key(business, category)})
+        return SERIALIZED_PG
+    if dialect == "sqlite":
+        return SERIALIZED_SINGLE_WRITER
+    return SERIALIZED_NONE
+
+
+async def reconcile_promotion_claims(threshold: int = PROMOTION_THRESHOLD, *, now=None) -> int:
+    """照合（回収ジョブから）: 無修正承認の確定件数（unmodified=True・category あり）が閾値以上なのに確定行が無い
+    (business, category) に確定行（pending）を補う。固定キーの INSERT … ON CONFLICT なので重複しない。
+    戻り値は補った件数。補った行は同じ回収ジョブの再通知（list_promotion_pending）で通知される。本文・ID は扱わない。"""
+    now = now or _now()
+    n = 0
+    async with session_scope() as s:
+        reached = (await s.execute(
+            sa.select(reply_draft_approval.c.business, reply_draft_approval.c.category, sa.func.count().label("n"))
+            .where(reply_draft_approval.c.unmodified.is_(True), reply_draft_approval.c.category.isnot(None))
+            .group_by(reply_draft_approval.c.business, reply_draft_approval.c.category)
+            .having(sa.func.count() >= int(threshold)))).fetchall()
+        have = {(r.business, r.category) for r in (await s.execute(
+            sa.select(exemplar_promotion_notice.c.business, exemplar_promotion_notice.c.category)
+            .where(exemplar_promotion_notice.c.threshold == int(threshold)))).fetchall()}
+        for r in reached:
+            if (r.business, r.category) in have:
+                continue
+            if await _claim_promotion(s, r.business, r.category, int(threshold), now):
+                n += 1
+    if n:
+        logger.info("[REPLY_EXEMPLAR] promotion claims reconciled count=%s", emit(n, "count", "log", "operator"))
+    return n

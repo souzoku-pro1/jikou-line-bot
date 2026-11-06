@@ -476,11 +476,16 @@ async def send_promotion_notice(business: str, category: str, threshold: int) ->
 
 
 async def run_promotion_notice_job() -> dict:
-    """回収ジョブ（send_ledger の回収に相乗り・5 分ごと）: 確定済み・未通知の候補を再通知（台帳キーで 1 通・PII なし）。"""
+    """回収ジョブ（send_ledger の回収に相乗り・5 分ごと）: (1) Q3a-fix2 BQ-07 照合＝確定済み件数が閾値以上なのに確定行が無い
+    (business, category) に確定行を補う → (2) 確定済み・未通知の候補を再通知（台帳キーで 1 通・PII なし）。"""
     from hub import reply_exemplar
-    res = {"retried": 0}
+    res = {"retried": 0, "reconciled": 0}
     if not reply_exemplar._db_configured():
         return res
+    try:
+        res["reconciled"] = await reply_exemplar.reconcile_promotion_claims()
+    except Exception:
+        logger.warning("[SEND_POLICY] promotion reconcile failed (fixed reason)")
     try:
         rows = await reply_exemplar.list_promotion_pending()
     except Exception:

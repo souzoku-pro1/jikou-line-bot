@@ -606,15 +606,15 @@ class TestBq05PromotionClaim(_DbMixin):
         self.biz.return_value = True
         sp.register_jobs()
         self.assertIn(sp.run_promotion_notice_job, sl._recover_hooks)            # 回収ジョブに相乗り
-        self.assertEqual(_run(sp.run_promotion_notice_job()), {"retried": 1})
+        self.assertEqual(_run(sp.run_promotion_notice_job()), {"retried": 1, "reconciled": 0})   # fix2 BQ-07: 照合の鍵が増える（確定済みなので補充 0）
         rows = self._notices()
         self.assertEqual((rows[0]["state"], rows[0]["attempts"]), ("sent", 2))
         self.assertEqual(self.biz.await_count, 2)
-        self.assertEqual(_run(sp.run_promotion_notice_job()), {"retried": 0})   # 送れたら対象外
+        self.assertEqual(_run(sp.run_promotion_notice_job()), {"retried": 0, "reconciled": 0})   # 送れたら対象外
         self.assertEqual(_run(sp.send_promotion_notice("jikou", "費用の定型案内", 3)), rp.NOTIFY_THROTTLED)   # 台帳キーで 1 通
         self.assertEqual(self.biz.await_count, 2)
         with patch.dict(os.environ, {"DATABASE_URL": ""}):
-            self.assertEqual(_run(sp.run_promotion_notice_job()), {"retried": 0})
+            self.assertEqual(_run(sp.run_promotion_notice_job()), {"retried": 0, "reconciled": 0})
 
     def test_table_pin(self):
         self.assertEqual(rx.PROMOTION_TABLE_NAME, "exemplar_promotion_notice")
@@ -719,6 +719,91 @@ class TestBq06ApproveChecked(_DbMixin):
         self.assertEqual(_run(rx.approve_checked(999)), ("not_found", []))
         self.assertEqual(_run(rx.approve_checked(xid, human_reply="x")), ("not_editable", []))
         self.assertEqual(_run(rx.approve_checked(xid)), ("not_changed", []))
+
+
+# ── fix2 BQ-07（Codex R-Q3a-fix1）: 計数と確定の直列化（business・分類単位）・確定行の不足を補う照合 ──
+class TestBq07SerializedPromotion(_DbMixin):
+    def _queue(self, draft, rid, category="費用の定型案内"):
+        with patch.object(cr.httpx, "AsyncClient", _FakeClient):
+            class _R(_FakeResp):
+                def json(self_inner):
+                    return {"id": rid}
+            with patch.object(_FakeClient, "post", AsyncMock(return_value=_R(200))):
+                return _run(cr.save_to_approval_queue(user_id=USER, customer_name="n", customer_message="m",
+                                                      ai_draft=draft, category=category, reason="r"))
+
+    def _notices(self):
+        return self._rows(rx.exemplar_promotion_notice)
+
+    def test_existing_one_plus_two_concurrent_make_exactly_one_claim(self):
+        """既存 1 件＋並行 2 件: 計数と確定が直列化されるので、後の 1 者が count=3 を見て確定・確定行はちょうど 1 行。"""
+        for i in (1, 2, 3):
+            self._queue(f"下書き {i}", rid=str(i))
+        self.assertEqual(_run(sp.promotion_check("1", "下書き 1")), "none")                       # 既存 1 件（未達）
+        self.assertEqual(self._notices(), [])
+
+        async def _both():
+            return await asyncio.gather(sp.promotion_check("2", "下書き 2"), sp.promotion_check("3", "下書き 3"))
+        results = _run(_both())
+        self.assertEqual(sorted(results), ["none", "sent"])                                       # 1 者だけ確定・通知
+        self.assertEqual(_run(rx.count_unmodified("jikou", "費用の定型案内")), 3)                 # 両方とも数えている
+        rows = self._notices()
+        self.assertEqual([(r["business"], r["category"], r["threshold"], r["state"], r["attempts"]) for r in rows],
+                         [("jikou", "費用の定型案内", 3, "sent", 1)])
+        self.assertEqual(self.biz.await_count, 1)
+        text = self.biz.await_args.args[1]
+        self.assertIn("3 回", text)
+        self.assertNotIn("下書き 2", text)                                                        # 本文は載せない（固定文言のみ）
+        self.assertNotIn("下書き 3", text)
+        # 再配送は数えない・通知もしない
+        self.assertIsNone(_run(rx.record_sent("3", "下書き 3")))                                  # 再配送は None
+
+    def test_serialization_pins(self):
+        self.assertEqual(rx.promotion_lock_key("jikou", "費用の定型案内"), "exemplar_promotion:jikou:費用の定型案内")
+        src = (REPO / "hub" / "reply_exemplar.py").read_text(encoding="utf-8")
+        self.assertIn('sa.text("SELECT pg_advisory_xact_lock(hashtext(:k))")', src)                 # PostgreSQL は tx 内 advisory lock
+        body = src[src.index("async def record_sent"):src.index("async def count_unmodified")]
+        self.assertLess(body.index("_serialize_category("), body.index("sa.update(reply_draft_approval)"))   # 直列化 → own-row UPDATE
+        self.assertLess(body.index("sa.update(reply_draft_approval)"), body.index("sa.func.count()"))        # → 計数 → 確定（同一 tx）
+        self.assertLess(body.index("sa.func.count()"), body.index("_claim_promotion("))
+
+        async def _dialect():
+            async with db.session_scope() as s_:
+                return await rx._serialize_category(s_, "jikou", "x")
+        self.assertEqual(_run(_dialect()), rx.SERIALIZED_SINGLE_WRITER)                           # sqlite は単一書込（own-row UPDATE の書込ロック）
+        # 回収ジョブは照合 → 再通知の順（照合で補った行を同じ周で通知できる）
+        jsrc = (REPO / "hub" / "send_policy.py").read_text(encoding="utf-8")
+        job = jsrc[jsrc.index("async def run_promotion_notice_job"):jsrc.index("async def approved_draft_sent")]
+        self.assertLess(job.index("reconcile_promotion_claims("), job.index("list_promotion_pending("))
+
+    def test_recover_job_reconciles_missing_claim_from_confirmed_count(self):
+        """確定の取りこぼし（旧コードの競合）を再現: 3 件とも無修正で数えられたのに確定行が無い → 回収ジョブの照合が 1 行補い、同じ周で通知。"""
+        for i in (1, 2, 3):
+            self._queue(f"下書き {i}", rid=str(i))
+        with patch.object(rx, "_claim_promotion", AsyncMock(return_value=False)):               # 確定だけが漏れる状況
+            for i in (1, 2, 3):
+                self.assertEqual(_run(sp.promotion_check(str(i), f"下書き {i}")), "none")
+        self.assertEqual(_run(rx.count_unmodified("jikou", "費用の定型案内")), 3)
+        self.assertEqual(self._notices(), [])
+        self.biz.assert_not_awaited()
+        sp.register_jobs()
+        self.assertIn(sp.run_promotion_notice_job, sl._recover_hooks)
+        self.assertEqual(_run(sp.run_promotion_notice_job()), {"retried": 1, "reconciled": 1})
+        rows = self._notices()
+        self.assertEqual([(r["business"], r["category"], r["threshold"], r["state"], r["attempts"]) for r in rows],
+                         [("jikou", "費用の定型案内", 3, "sent", 1)])
+        self.assertEqual(self.biz.await_count, 1)
+        self.assertIn("費用の定型案内", self.biz.await_args.args[1])
+        self.assertEqual(_run(sp.run_promotion_notice_job()), {"retried": 0, "reconciled": 0})   # 二重に補わない・二重に送らない
+        self.assertEqual(self.biz.await_count, 1)
+        # 閾値未満（2 件）・分類なしは補わない
+        for i in (4, 5):
+            self._queue(f"下書き {i}", rid=str(i), category="挨拶・雑談")
+        with patch.object(rx, "_claim_promotion", AsyncMock(return_value=False)):
+            for i in (4, 5):
+                _run(sp.promotion_check(str(i), f"下書き {i}"))
+        self.assertEqual(_run(rx.reconcile_promotion_claims()), 0)
+        self.assertEqual(len(self._notices()), 1)
 
 
 # ── fix1 項目 4（prompt）: 参考文例ブロックのテンプレート pin・基底 prompt の pin 不変 ──
