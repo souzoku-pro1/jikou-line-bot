@@ -771,6 +771,17 @@ class TestBq07SerializedPromotion(_DbMixin):
             async with db.session_scope() as s_:
                 return await rx._serialize_category(s_, "jikou", "x")
         self.assertEqual(_run(_dialect()), rx.SERIALIZED_SINGLE_WRITER)                           # sqlite は単一書込（own-row UPDATE の書込ロック）
+        # 確定は RETURNING で判定（PostgreSQL 実走 2026-11-07: psycopg は INSERT の rowcount が −1 → rowcount 判定は常に False だった）
+        claim = src[src.index("async def _claim_promotion"):src.index("async def mark_promotion_sent")]
+        self.assertIn(".returning(exemplar_promotion_notice.c.business)", claim)
+        self.assertNotIn("res.rowcount", claim)                                                   # rowcount 判定は残さない（説明文の語は対象外）
+
+        async def _claim_twice():
+            async with db.session_scope() as s_:
+                a = await rx._claim_promotion(s_, "jikou", "費用の定型案内", 9, rx._now())
+                b = await rx._claim_promotion(s_, "jikou", "費用の定型案内", 9, rx._now())
+            return a, b
+        self.assertEqual(_run(_claim_twice()), (True, False))                                     # 1 回目だけ確定・2 回目は衝突
         # 回収ジョブは照合 → 再通知の順（照合で補った行を同じ周で通知できる）
         jsrc = (REPO / "hub" / "send_policy.py").read_text(encoding="utf-8")
         job = jsrc[jsrc.index("async def run_promotion_notice_job"):jsrc.index("async def approved_draft_sent")]

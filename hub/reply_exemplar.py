@@ -590,7 +590,9 @@ async def approve_checked(exemplar_id: int, *, human_reply: str | None = None, i
 
 # ── JIKOU-REPLY-Q3a-fix1 BQ-05（Codex R-Q3a）: 候補通知の確定（固定キー・1 者）と回収 ──
 async def _claim_promotion(s, business: str, category: str, threshold: int, now) -> bool:
-    """(business, category, threshold) を INSERT … ON CONFLICT DO NOTHING（PostgreSQL／sqlite）。rowcount 1 なら確定者。"""
+    """(business, category, threshold) を INSERT … ON CONFLICT DO NOTHING … RETURNING（PostgreSQL／sqlite）。
+    **挿入された行が返ってきたときだけ確定者**（Q3a-fix2 BQ-07・PostgreSQL 実走 2026-11-07 で判明: psycopg では INSERT の
+    rowcount が −1 になり rowcount==1 判定は常に False＝確定者 0。RETURNING は挿入時のみ行を返し、衝突時は返さない）。"""
     values = dict(business=business, category=category, threshold=int(threshold), state=PROMOTION_PENDING, attempts=0,
                   created_at=now)
     dialect = (await s.connection()).dialect.name
@@ -606,8 +608,8 @@ async def _claim_promotion(s, business: str, category: str, threshold: int, now)
         if cur is not None:
             return False
         stmt = sa.insert(exemplar_promotion_notice).values(**values)
-    res = await s.execute(stmt)
-    return int(res.rowcount or 0) == 1
+    res = await s.execute(stmt.returning(exemplar_promotion_notice.c.business))
+    return res.first() is not None
 
 
 async def mark_promotion_sent(business: str, category: str, threshold: int, *, now=None) -> bool:
