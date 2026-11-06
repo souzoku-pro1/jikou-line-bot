@@ -438,7 +438,11 @@ class TestPins(unittest.TestCase):
         self.assertEqual(sum("return prompt + human_note + exemplar_note" in l for l in csrc), 1)
         msrc = (REPO / "main.py").read_text(encoding="utf-8").split("\n")
         self.assertEqual(sum("send_policy.approved_draft_sent(record_id, user_id, ai_draft, category)" in l for l in msrc), 1)
-        self.assertIn("include_before_catch_all(app, exemplar_view_router)", "\n".join(msrc[-10:]))
+        tail = "\n".join(msrc[-20:])                                                     # UX-PENDING-1 の結線（inbox）が末尾に続くため窓を 20 行に
+        self.assertIn("include_before_catch_all(app, exemplar_view_router)", tail)
+        self.assertEqual(sum("include_before_catch_all(app, exemplar_view_router)" in l for l in msrc), 1)
+        if "inbox_view_router" in tail:                                                   # 末尾追記の順序: exemplar（Q3a）→ inbox（UX-PENDING-1）
+            self.assertLess(tail.index("exemplar_view_router)"), tail.index("inbox_view_router)"))
 
     def test_migration_chain_and_history_check(self):
         p = REPO / "alembic" / "versions" / "20261012_b2d4f6a8c0e1_reply_draft_approval.py"
