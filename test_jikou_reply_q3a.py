@@ -625,6 +625,102 @@ class TestBq05PromotionClaim(_DbMixin):
         self.assertNotIn("!= reply_exemplar.PROMOTION_THRESHOLD", src)          # count == 閾値の瞬間依存は無い
 
 
+# ── fix2 BQ-06（Codex R-Q3a-fix1）: 承認は保存値も残留検査・同一 tx・版条件／モデル参照側の二重防壁 ──
+class TestBq06ApproveChecked(_DbMixin):
+    BAD = "親族の名前はテストハナコです。"
+
+    def _inject(self, reply, inbound="費用はいくらですか", status="pending_review", category="費用の定型案内"):
+        """旧い検査のもとで保存された汚染行を再現する（残留検査を通さず表へ直接入れる＝検査導入前の行の代替）。"""
+        async def _ins():
+            now = rx._now()
+            async with db.session_scope() as s:
+                res = await s.execute(sa.insert(rx.reply_exemplar).values(
+                    business="jikou", inbound_text=inbound, human_reply=reply, stage=rx.STAGE_CONSULT, created_at=now,
+                    used_count=0, category_id=category, active=True, status=status,
+                    approved_by=("human" if status == "approved" else None), approved_at=(now if status == "approved" else None)))
+                return int(res.inserted_primary_key[0])
+        return _run(_ins())
+
+    def _approve(self, xid, **fields):
+        return _client.post("/app/exemplars/update", headers=_auth(), follow_redirects=False,
+                            data={"exemplar_id": str(xid), "action": "approve", **fields}).headers["location"]
+
+    def test_unchanged_approval_of_contaminated_row_is_rejected(self):
+        xid = self._inject(self.BAD)
+        # 1) 本文欄なしの承認（従来の 1 ボタン相当）→ 保存値を残留検査 → 拒否・状態も本文も不変
+        self.assertEqual(self._approve(xid), "/app/exemplars?done=residue")
+        # 2) 欄ありだが変更なし → 同じく拒否
+        self.assertEqual(self._approve(xid, human_reply=self.BAD, inbound_text="費用はいくらですか"), "/app/exemplars?done=residue")
+        self.assertEqual(_run(rx.approve_checked(xid)), ("residue", ["context_name"]))
+        row = _run(rx.get_exemplar(xid))
+        self.assertEqual((row["status"], row["human_reply"], row["approved_by"]), ("pending_review", self.BAD, None))
+        self.assertEqual(_run(rx.exemplar_history(xid)), [])                                 # 承認の履歴も付かない
+        self.assertEqual(_run(rx.prompt_note("jikou", "受付")), "")
+        html = _client.get("/app/exemplars", headers=_auth()).text
+        self.assertIn('<span class="badge off">確認待ち</span>', html)                           # 確認待ちのまま（修正欄に保存値）
+        self.assertNotIn('<span class="badge">承認済み</span>', html)
+        # 3) 直して承認すれば通る（修正欄は note に）・参考文例は修正後の文だけ
+        self.assertEqual(self._approve(xid, human_reply="親族の名前は〔氏名〕です。", inbound_text="費用はいくらですか"),
+                         "/app/exemplars?done=approved")
+        row = _run(rx.get_exemplar(xid))
+        self.assertEqual((row["status"], row["human_reply"]), ("approved", "親族の名前は〔氏名〕です。"))
+        hist = _run(rx.exemplar_history(xid))
+        self.assertEqual([(h["action"], h["note"]) for h in hist], [("approved", "edited:human_reply")])
+        note = _run(rx.prompt_note("jikou", "受付"))
+        self.assertIn("〔氏名〕", note)
+        self.assertNotIn("テストハナコ", note)
+        # 承認済みに欄なしの再押下は not_changed・欄ありは not_editable（従来どおり）
+        self.assertEqual(self._approve(xid), "/app/exemplars?done=not_changed")
+        self.assertEqual(self._approve(xid, human_reply="別の文"), "/app/exemplars?done=not_editable")
+        src = (REPO / "hub" / "webapp_exemplar_view.py").read_text(encoding="utf-8")
+        self.assertNotIn("approve_exemplar(", src)                                             # 画面の承認口は approve_checked だけ
+        self.assertNotIn("update_texts(", src)
+
+    def test_approved_contaminated_row_is_excluded_from_model_reference(self):
+        good = self.save(reply="費用は【費用のご案内】のとおりです。")
+        bad = self._inject(self.BAD, status="approved")                                        # 旧検査で承認済みにされた行
+        self.assertEqual([r["id"] for r in _run(rx.list_exemplars("jikou"))], [good])            # 読取側で除外（二重防壁）
+        with self.assertLogs("hub.reply_exemplar", level="INFO") as cm:
+            note = _run(rx.prompt_note("jikou", "受付"))
+        self.assertIn("費用のご案内", note)
+        self.assertNotIn("テストハナコ", note)
+        self.assertEqual(note.ids_by_category, {"費用の定型案内": [good]})                     # used も付かない
+        self.assertTrue(any("excluded by residue check at read" in o for o in cm.output))
+        self.assertNotIn("テストハナコ", "\n".join(cm.output))
+        row = _run(rx.get_exemplar(bad))
+        self.assertEqual(row["status"], "approved")                                              # 行は変えない（RV-08）
+        self.assertIn("テストハナコ", _client.get("/app/exemplars", headers=_auth()).text)       # 画面には出る＝人が退役→修正→再承認できる
+        # 退役 → 修正して再承認 → 参照に出る
+        self.assertTrue(_run(rx.deactivate_exemplar(bad)))
+        self.assertEqual(self._approve(bad, human_reply="親族の名前は〔氏名〕です。", inbound_text="費用はいくらですか"),
+                         "/app/exemplars?done=approved")
+        self.assertEqual(sorted(r["id"] for r in _run(rx.list_exemplars("jikou"))), sorted([good, bad]))
+
+    def test_concurrent_edit_between_check_and_approve_is_a_conflict(self):
+        xid = self.save(reply="費用は【費用のご案内】のとおりです。", approve=False)
+
+        n = {"i": 0}
+
+        async def _other_edits(_s):                                                               # 検査と更新の間に別接続で本文が変わる
+            n["i"] += 1
+            async with db.session_scope() as s2:
+                await s2.execute(sa.update(rx.reply_exemplar).where(rx.reply_exemplar.c.id == xid).values(
+                    human_reply=f"別の人が直した文 {n['i']}"))
+        with patch.object(rx, "_approve_cas_hook", _other_edits):
+            self.assertEqual(_run(rx.approve_checked(xid, human_reply="私が直した文")), ("conflict", []))
+        row = _run(rx.get_exemplar(xid))
+        self.assertEqual((row["status"], row["human_reply"]), ("pending_review", "別の人が直した文 1"))   # 承認しない・上書きしない
+        self.assertEqual([h["action"] for h in _run(rx.exemplar_history(xid))], ["created"])
+        with patch.object(rx, "_approve_cas_hook", _other_edits):
+            self.assertEqual(self._approve(xid, human_reply="私が直した文"), "/app/exemplars?done=conflict")
+        self.assertIn("同時に別の操作がありました", _client.get("/app/exemplars?done=conflict", headers=_auth()).text)
+        self.assertEqual(_run(rx.approve_checked(xid)), ("ok", []))                                # 競合が無ければ保存値で承認できる
+        self.assertEqual(_run(rx.get_exemplar(xid))["status"], "approved")
+        self.assertEqual(_run(rx.approve_checked(999)), ("not_found", []))
+        self.assertEqual(_run(rx.approve_checked(xid, human_reply="x")), ("not_editable", []))
+        self.assertEqual(_run(rx.approve_checked(xid)), ("not_changed", []))
+
+
 # ── fix1 項目 4（prompt）: 参考文例ブロックのテンプレート pin・基底 prompt の pin 不変 ──
 class TestItem4PromptPins(unittest.TestCase):
     NOTE_TEMPLATE_SHA256 = "511ade90f0c8ec7893659ceed06d42a8477d43015af0665bf5ecf210fa00dd49"

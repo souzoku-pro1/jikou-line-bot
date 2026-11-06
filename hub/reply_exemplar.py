@@ -259,7 +259,19 @@ async def list_exemplars(business: str, *, stage: str | None = None, limit: int 
     q = q.order_by(reply_exemplar.c.created_at.desc(), reply_exemplar.c.id.desc()).limit(int(limit))
     async with session_scope() as s:
         rows = (await s.execute(q)).fetchall()
-    return [dict(r._mapping) for r in rows]
+    return _exclude_residue([dict(r._mapping) for r in rows])
+
+
+def _exclude_residue(rows: list[dict]) -> list[dict]:
+    """Q3a-fix2 BQ-06（二重防壁）: 旧い検査のもとで保存・承認された行でも、いまの残留検査（発見的検査を含む）に掛かる本文は
+    モデル参照（参考文例・選択器・下書き）に出さない。行は変えない（RV-08・画面には出る＝人が退役→修正→再承認できる）。
+    ログは件数だけ（本文を出さない）。"""
+    clean = [r for r in rows if not (pii_scan.residue_hits(str(r.get("human_reply") or ""))
+                                     or pii_scan.residue_hits(str(r.get("inbound_text") or "")))]
+    if len(clean) != len(rows):
+        logger.info("[REPLY_EXEMPLAR] excluded by residue check at read count=%s",
+                    emit(len(rows) - len(clean), "count", "log", "operator"))
+    return clean
 
 
 async def exemplar_history(exemplar_id: int) -> list[dict]:
@@ -517,6 +529,58 @@ async def update_texts(exemplar_id: int, *, human_reply: str, inbound_text: str)
         await s.execute(sa.update(reply_exemplar).where(reply_exemplar.c.id == int(exemplar_id)).values(
             human_reply=reply, inbound_text=inbound))
     return "ok", []
+
+
+# ── JIKOU-REPLY-Q3a-fix2 BQ-06（Codex R-Q3a-fix1）: 承認＝検査・本文確定・承認を同一トランザクション・版条件で ──
+APPROVE_OK = "ok"
+APPROVE_RESIDUE = "residue"
+APPROVE_CONFLICT = "conflict"
+
+
+async def _approve_cas_hook(s) -> None:
+    """検査と更新の継ぎ目（試験で並行更新を差し込むための口）。製品では何もしない。"""
+    return None
+
+
+async def approve_checked(exemplar_id: int, *, human_reply: str | None = None, inbound_text: str | None = None,
+                          actor: str = APPROVED_BY_HUMAN) -> tuple[str, list[str]]:
+    """承認画面の唯一の承認口。**本文欄の有無・変更の有無に関係なく**、確定しようとする本文（欄があれば修正値・無ければ保存値）
+    を残留検査（発見的検査を含む）にかけ、通ったものだけを **同一トランザクション** で本文確定＋承認する。
+    版条件: 読んだ時点の状態と本文（status != approved・human_reply／inbound_text が読取値のまま）を UPDATE の WHERE に置き
+    （PostgreSQL では読取に FOR UPDATE・sqlite は句が落ちる）、0 件なら conflict（承認しない・本文も変えない）。
+    戻り値 (ok|residue|bad_input|not_found|not_changed|not_editable|conflict, 掛かった残留種別)。
+    - not_changed: 既に承認済みで本文欄なし（従来の 1 ボタンの再押下）。not_editable: 承認済みに本文欄つき（退役→修正→再承認）。
+    - ok のとき履歴 approved（修正した欄があれば note=edited:欄名）。保存値のまま承認なら note なし。
+    ログは件数だけ（本文・種別の値は出さない）。"""
+    now = _now()
+    async with session_scope() as s:
+        cur = (await s.execute(sa.select(reply_exemplar.c.status, reply_exemplar.c.human_reply, reply_exemplar.c.inbound_text)
+                               .where(reply_exemplar.c.id == int(exemplar_id)).with_for_update())).first()
+        if cur is None:
+            return "not_found", []
+        if cur.status == STATUS_APPROVED:
+            return ("not_editable" if (human_reply is not None or inbound_text is not None) else "not_changed"), []
+        reply = (str(human_reply) if human_reply is not None else str(cur.human_reply or "")).strip()[:MAX_TEXT_CHARS]
+        inbound = (str(inbound_text) if inbound_text is not None else str(cur.inbound_text or "")).strip()[:MAX_TEXT_CHARS]
+        if not reply:
+            return "bad_input", []
+        hits = sorted(set(pii_scan.residue_hits(reply) + pii_scan.residue_hits(inbound)))
+        if hits:
+            _reject_count["residue"] += 1
+            logger.info("[REPLY_EXEMPLAR] approve rejected by residue check (not approved) total=%s",
+                        emit(_reject_count["residue"], "count", "log", "operator"))
+            return APPROVE_RESIDUE, hits
+        changed = [f for f, new, old in (("human_reply", reply, cur.human_reply), ("inbound_text", inbound, cur.inbound_text))
+                   if new != str(old or "").strip()]
+        await _approve_cas_hook(s)
+        r = await s.execute(sa.update(reply_exemplar).where(
+            reply_exemplar.c.id == int(exemplar_id), reply_exemplar.c.status != STATUS_APPROVED,
+            reply_exemplar.c.human_reply == cur.human_reply, reply_exemplar.c.inbound_text == cur.inbound_text).values(
+            human_reply=reply, inbound_text=inbound, status=STATUS_APPROVED, active=True, approved_by=actor, approved_at=now))
+        if int(r.rowcount or 0) != 1:
+            return APPROVE_CONFLICT, []
+        await _history(s, int(exemplar_id), ACTION_APPROVED, actor, now, ("edited:" + ",".join(changed)) if changed else None)
+    return APPROVE_OK, []
 
 
 # ── JIKOU-REPLY-Q3a-fix1 BQ-05（Codex R-Q3a）: 候補通知の確定（固定キー・1 者）と回収 ──

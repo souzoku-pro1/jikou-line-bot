@@ -7,9 +7,11 @@
 - 一覧（/app/exemplars）: 業務・category・段階・匿名化済み本文（相談者文と返信）・状態（承認済み／退役）・
   approved_by / approved_at・使用回数。原文・氏名・LINE userId は表に無い（匿名化済みのみ＝RV-10）。
 - 操作は 2 つ（理由は固定・自動送信の口は持たない）:
-  1. 「承認」= reply_exemplar.approve_exemplar（確認待ち pending_review／退役中 → 承認済み・approved_by=human・approved_at=now・
+  1. 「承認」= reply_exemplar.approve_checked（確認待ち pending_review／退役中 → 承認済み・approved_by=human・approved_at=now・
      履歴 approved）。JIKOU-REPLY-Q1b-fix2 BR-10: 保存直後の手本は pending_review（自動マスクだけで承認済みにしない）で、人がこの画面で
      匿名化を確認して承認するまで参考文例に使われない。
+     Q3a-fix2 BQ-06: 本文欄の有無・変更の有無に関係なく、確定する本文（修正値／保存値）を残留検査にかけ、通ったものだけを
+     同一トランザクション・版条件（読取時の状態と本文のまま）で確定＋承認する。競合は conflict（承認しない）。
   2. 「退役」= reply_exemplar.deactivate_exemplar（承認済み → 退役・履歴 deactivated）
   退役した手本は bot の参考文例に使われない（active のみ）。
 - 参照 API（/app/api/exemplars）: 件数と一覧（匿名化済み本文を含む・原文なし）。
@@ -41,6 +43,8 @@ _NOTICES = {
     # Q3a-fix1 BQ-03
     "residue": "匿名化が不十分です（氏名・連絡先などが残っています）。本文を直してから承認してください。保存・承認はしていません。",
     "not_editable": "承認済みの手本は直せません。退役にしてから修正・再承認してください。",
+    # Q3a-fix2 BQ-06
+    "conflict": "同時に別の操作がありました。画面を更新して内容を確認してから、もう一度承認してください。承認はしていません。",
 }
 
 
@@ -130,23 +134,21 @@ async def exemplars_update(request: Request):
     action = str(form.get("action", ""))
     if not _ID_RE.fullmatch(xid) or action not in _ACTIONS:
         return _bad_request()
-    note = None
     try:
         exists = await reply_exemplar.get_exemplar(int(xid))
         if exists is None:
             return RedirectResponse(f"{PAGE}?done=not_found", status_code=303)
-        if action == "approve" and ("human_reply" in form or "inbound_text" in form):
-            # Q3a-fix1 BQ-03: 修正欄つきの承認。残留検査に通らなければ置き換えも承認もしない（固定文言のみ・本文は出さない）
-            reply = str(form.get("human_reply", exists.get("human_reply") or ""))
-            inbound = str(form.get("inbound_text", exists.get("inbound_text") or ""))
-            changed = [f for f, v, cur in (("human_reply", reply, exists.get("human_reply")), ("inbound_text", inbound, exists.get("inbound_text")))
-                       if v.strip() != str(cur or "").strip()]
-            if changed:
-                res, _hits = await reply_exemplar.update_texts(int(xid), human_reply=reply, inbound_text=inbound)
-                if res != "ok":
-                    return RedirectResponse(f"{PAGE}?done={res if res in _NOTICES else 'bad_input'}", status_code=303)
-                note = "edited:" + ",".join(changed)
-        ok = await reply_exemplar.approve_exemplar(int(xid), note=note) if action == "approve" else await _ACTIONS[action](int(xid))
+        if action == "approve":
+            # Q3a-fix1 BQ-03／fix2 BQ-06: 本文欄の有無・変更の有無に関係なく、確定する本文（修正値／保存値）を残留検査にかけ、
+            # 通ったものだけを同一 tx・版条件で確定＋承認する（固定文言のみ・本文は出さない）
+            res, _hits = await reply_exemplar.approve_checked(
+                int(xid), human_reply=(str(form["human_reply"]) if "human_reply" in form else None),
+                inbound_text=(str(form["inbound_text"]) if "inbound_text" in form else None))
+            if res != reply_exemplar.APPROVE_OK:
+                return RedirectResponse(f"{PAGE}?done={res if res in _NOTICES else 'bad_input'}", status_code=303)
+            ok = True
+        else:
+            ok = await _ACTIONS[action](int(xid))
     except Exception:
         return RedirectResponse(f"{PAGE}?done=db", status_code=303)
     done = ("approved" if action == "approve" else "retired") if ok else "not_changed"
