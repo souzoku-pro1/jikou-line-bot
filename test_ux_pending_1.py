@@ -78,11 +78,16 @@ class _InboxMixin(_DbMixin):
                 return [self.records[i] for i in ids if i in self.records]
             if "送信済み in" in query:
                 self.old_queries.append(query)
-                m = re.search(r"limit (\d+)(?: offset (\d+))?", query)
-                lim, off = (int(m.group(1)), int(m.group(2) or 0)) if m else (len(self.old_records), 0)
+                assert "offset" not in query and "order by $id desc" in query, query   # fix3 BU-10: 安定キー方式のみ
+                m = re.search(r"limit (\d+)", query)
+                lim = int(m.group(1)) if m else len(self.old_records)
+                m2 = re.search(r"\$id < (\d+)", query)
+                last = int(m2.group(1)) if m2 else None
                 ex = set(re.findall(r'"([0-9]+)"', query.split("not in (")[1].split(")")[0])) if "not in (" in query else set()
-                rows = [r_ for r_ in self.old_records if r_["$id"]["value"] not in ex]   # fix2 BU-09: 問い合わせ条件の除外
-                return rows[off:off + lim]
+                rows = [r_ for r_ in self.old_records if r_["$id"]["value"] not in ex          # fix2 BU-09: 問い合わせ条件の除外
+                        and (last is None or int(r_["$id"]["value"]) < last)]                   # fix3 BU-10: 安定キーより前
+                rows.sort(key=lambda r_: int(r_["$id"]["value"]), reverse=True)
+                return rows[:lim]
             return []
 
         async def _get(app, record_id):
@@ -690,7 +695,8 @@ class TestFix1Inbox(_InboxMixin):
         # fix2 BU-09 追随: 除外 ID が 100 件以下（閉じ済み 50＋参照 1）なら問い合わせ条件で除外 → 1 問い合わせで到達（続きの走査は BU-09 で固定）
         self.assertEqual(len(self.old_queries), 1)
         self.assertIn('and $id not in ("1000","1001",', self.old_queries[0])
-        self.assertTrue(self.old_queries[0].endswith("limit 50 offset 0"))
+        self.assertTrue(self.old_queries[0].endswith("order by $id desc limit 50"))      # fix3 BU-10: offset なし
+        self.assertNotIn("$id <", self.old_queries[0])                                     # 先頭の走査は安定キーなし
         self.assertNotIn("続きがあります", html)
         # 除外後に上限に達したら続きは読まない／対応待ちが参照する No. も除外して数える
         self.old_queries.clear()
@@ -931,44 +937,104 @@ class TestFix2Inbox(_InboxMixin):
         """BU-09: 閉じ済み 500 件 + 未処理 1 件（除外が 100 件を超えるため走査で除外）→ 1 走査目は上限到達＝「続きあり」
         （未処理 0 件とは区別）→ 「続きを読み込む」でその 1 件に到達する。"""
         closed_ids = [str(5000 + i) for i in range(500)]
+        # fix3 BU-10 追随: 走査は No. の大きい順なので、「上限到達の先にある未処理 1 件」は最も古い No.（4600）に置く（検査の意図は不変）
         self.old_records = ([_approval(i, USER2, 顧客名="旧 %s" % i, 更新日時="2026-08-01T00:00:00Z") for i in closed_ids]
-                            + [_approval("5600", USER2, 顧客名="旧 未処理", 更新日時="2026-09-02T01:00:00Z")])
+                            + [_approval("4600", USER2, 顧客名="旧 未処理", 更新日時="2026-09-02T01:00:00Z")])
         for i in closed_ids:
             self.assertEqual(_run(ac.close("jikou", i, "done_external", "t")), "ok")
         html = self.get("/app/inbox").text
         self.assertNotIn("旧 未処理", html)
-        self.assertIn("1〜500 件目まで走査しました（この範囲の未処理 0 件）", html)
+        self.assertIn("先頭から 500 件走査しました（この範囲の未処理 0 件）", html)
         self.assertIn("続きがあります", html)
-        self.assertIn('href="/app/inbox?old_from=500"', html)
+        self.assertIn('href="/app/inbox?last_id=5000"', html)                              # 続きは安定キー（走査した最後の No.）
         self.assertIn("この範囲には対応待ちがありません（続きがあります）", html)
         self.assertNotIn("対応待ちはありません</p>", html)                                   # 上限到達は 0 件と区別
         self.assertEqual(len(self.old_queries), iv.OLD_MAX_PAGES)
         self.assertNotIn("not in (", self.old_queries[0])                                   # 除外 501 件＝問い合わせ条件に入れない
-        self.assertEqual(self.old_queries[-1].split("limit ")[1], "50 offset 450")
+        self.assertNotIn("$id <", self.old_queries[0])
+        self.assertTrue(self.old_queries[-1].startswith('送信済み in ("no") and $id < 5050 order by $id desc limit 50'), self.old_queries[-1])
         # 続きの走査でその 1 件に到達
         self.old_queries.clear()
-        html = self.get("/app/inbox?old_from=500").text
+        html = self.get("/app/inbox?last_id=5000").text
         self.assertIn("旧 未処理", html)
         self.assertEqual(html.count('class="badge old"'), 1)
-        self.assertIn("501〜501 件目まで走査しました（この範囲の未処理 1 件）", html)
+        self.assertIn("No.5000 より前を 1 件走査しました（この範囲の未処理 1 件）", html)
         self.assertIn("続きはありません", html)
         self.assertIn('href="/app/inbox">先頭に戻る', html)
-        self.assertEqual([q.split("limit ")[1] for q in self.old_queries], ["50 offset 500"])
-        # 不正な old_from は 400／閉じ済みが無ければ「対応待ちはありません」（続きの案内なし）
-        self.assertEqual(self.get("/app/inbox?old_from=x").status_code, 400)
+        self.assertEqual(self.old_queries, ['送信済み in ("no") and $id < 5000 order by $id desc limit 50'])
+        # 不正な last_id は 400・旧 old_from は廃止（無視して先頭から・200）／閉じ済みが無ければ「対応待ちはありません」（続きの案内なし）
+        self.assertEqual(self.get("/app/inbox?last_id=x").status_code, 400)
+        self.assertEqual(self.get("/app/inbox?old_from=500").status_code, 200)
         self.old_records = []
         html = self.get("/app/inbox").text
         self.assertIn("対応待ちはありません", html)
         self.assertNotIn("続きがあります", html)
-        # 上限 50 件に達して同じページに残りがある → 続きあり・次の offset はページ途中から
+        # 上限 50 件に達して同じページに残りがある → 続きあり・次の安定キーは表示した最後の No.（7059..7010 → 7010）
         self.old_records = [_approval(str(7000 + i), USER2, 顧客名="旧 %d" % i) for i in range(60)]
         _run(ac.close("jikou", "7000", "done_external", "t"))
-        recs, nxt, more = _run(iv._scan_old({"7000"}, 0))
-        self.assertEqual((len(recs), nxt, more), (iv.OLD_LIMIT, 50, True))
+        recs, nxt, more, scanned = _run(iv._scan_old({"7000"}, None))
+        self.assertEqual((len(recs), nxt, more, scanned), (iv.OLD_LIMIT, "7010", True, 50))
         # 走査の失敗は「続きなし」で打ち切り（固定理由ログ・画面は落ちない）
         with patch.object(iv.kintone, "search_records", AsyncMock(side_effect=RuntimeError("down"))):
-            self.assertEqual(_run(iv._scan_old(set(), 0)), ([], 0, False))
+            self.assertEqual(_run(iv._scan_old(set(), None)), ([], "", False, 0))
             self.assertEqual(self.get("/app/inbox").status_code, 200)
+
+    def test_bu10_continuation_is_stable_when_exclusions_change_in_another_tab(self):
+        """fix3 BU-10（Codex の反例）: 未処理 100 件 → 先頭 50 件を表示 → その 50 件を別タブで閉じる → 続きを開く → 残り 50 件が表示される
+        （offset 方式では閉じた 50 件が除外されて offset がずれ、残りが欠落していた）。"""
+        ids = [str(8001 + i) for i in range(100)]
+        self.old_records = [_approval(i, USER2, 顧客名="旧 %s" % i, 更新日時="2026-08-01T%02d:%02d:00Z" % (int(i) % 24, int(i) % 60)) for i in ids]
+        html = self.get("/app/inbox").text
+        shown1 = sorted(re.findall(r'旧 (8\d{3})', html))
+        self.assertEqual(shown1, sorted(ids[50:]))                                             # No. の大きい 50 件（8051..8100）
+        self.assertIn('href="/app/inbox?last_id=8051"', html)
+        self.assertEqual(len(self.old_queries), 1)
+        self.assertNotIn("offset", self.old_queries[0])
+        # 別タブでその 50 件を閉じる（除外集合が変わる）
+        for i in shown1:
+            self.assertEqual(_run(ac.close("jikou", i, "done_external", "t")), "ok")
+        self.old_queries.clear()
+        html = self.get("/app/inbox?last_id=8051").text
+        shown2 = sorted(re.findall(r'旧 (8\d{3})', html))
+        self.assertEqual(shown2, sorted(ids[:50]))                                             # 残り 50 件（8001..8050）が欠落しない
+        self.assertTrue(self.old_queries[0].startswith('送信済み in ("no") and $id < 8051 and $id not in ('), self.old_queries[0])
+        self.assertIn('href="/app/inbox?last_id=8001"', html)                                  # ページが満杯＝続きの有無は次の走査で確定（fix2 の規則）
+        html = self.get("/app/inbox?last_id=8001").text
+        self.assertIn("No.8001 より前を 0 件走査しました（この範囲の未処理 0 件）", html)
+        self.assertIn("続きはありません", html)
+        self.assertEqual(set(shown1) | set(shown2), set(ids))
+        self.assertEqual(set(shown1) & set(shown2), set())                                     # 重複なし
+
+    def test_bu10_new_items_during_continuation_are_neither_duplicated_nor_lost(self):
+        """fix3 BU-10: 続きの途中で新規項目（No. が大きい）が増えても、続きには出ず（重複なし）先頭の走査に出る（欠落なし）。"""
+        ids = [str(9001 + i) for i in range(120)]
+        self.old_records = [_approval(i, USER2, 顧客名="旧 %s" % i) for i in ids]
+        seen: list = []
+        html = self.get("/app/inbox").text
+        seen += re.findall(r'旧 (9\d{3})', html)
+        self.assertEqual(sorted(seen), sorted(ids[70:]))                                        # 9071..9120
+        self.old_records += [_approval(str(9201 + i), USER2, 顧客名="旧 %d" % (9201 + i)) for i in range(2)]   # 続きの途中で 2 件増える
+        html = self.get("/app/inbox?last_id=9071").text
+        page2 = re.findall(r'旧 (9\d{3})', html)
+        self.assertEqual(sorted(page2), sorted(ids[20:70]))                                     # 9021..9070（新規 2 件は含まない）
+        self.assertIn('href="/app/inbox?last_id=9021"', html)
+        seen += page2
+        html = self.get("/app/inbox?last_id=9021").text
+        page3 = re.findall(r'旧 (9\d{3})', html)
+        self.assertEqual(sorted(page3), sorted(ids[:20]))                                       # 9001..9020
+        self.assertIn("続きはありません", html)
+        seen += page3
+        self.assertEqual(sorted(seen), sorted(ids))                                             # 元の 120 件はちょうど 1 回ずつ
+        self.assertEqual(len(seen), len(set(seen)))
+        html = self.get("/app/inbox").text                                                      # 新規 2 件は先頭の走査に出る
+        self.assertIn("旧 9202", html)
+        self.assertIn("旧 9201", html)
+        self.assertIn('href="/app/inbox?last_id=9073"', html)
+        src = (REPO / "hub" / "webapp_inbox_view.py").read_text(encoding="utf-8")
+        self.assertNotIn("offset {", src)                                                       # offset 句の問い合わせは残さない
+        self.assertNotIn("order by 更新日時", src)                                              # 並びは $id 降順のみ
+        self.assertNotIn('q.get("old_from"', src)                                               # old_from は読まない（廃止）
+        self.assertEqual(src.count("order by $id desc"), 1)
 
 
 # ── 6. 試験アカウント allowlist（実装のみ・env 設定と有効化は大野） ─────────────────

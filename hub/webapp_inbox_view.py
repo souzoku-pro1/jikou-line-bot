@@ -46,7 +46,10 @@ OLD_PAGE = 50                   # fix1 BU-05: App 29 を 1 ページ何件ずつ
 OLD_MAX_PAGES = 10              # fix1 BU-05: 続きを読む上限（50×10＝500 件まで＝1 回の走査）
 OLD_SCAN = OLD_PAGE * OLD_MAX_PAGES   # fix2 BU-09: 1 回の走査件数。上限に達したら「続きを読み込む」で次の 500 件
 EXCLUDE_QUERY_MAX = 100         # fix2 BU-09: 除外 ID（対応待ちが参照する No.・閉じ済み No.）がこの件数以下なら kintone の問い合わせ条件に入れる
-_OLD_FROM_RE = re.compile(r"^[0-9]{1,6}$")
+# fix3 BU-10: 続きは offset ではなく **安定キー**（前回走査した最後のレコード No.＝last_id・問い合わせは $id < last_id・$id 降順）。
+# 除外集合（閉じ済み・対応待ちの参照）が別タブの操作で途中で変わっても、offset のずれによる欠落が起きない。途中で増えた新規項目は
+# $id が大きいので続きには現れず（重複しない）、先頭（次の最初の走査）に出る（欠落しない）。old_from（offset）は廃止。
+LAST_ID_PARAM = "last_id"
 CLOSED_LIMIT = 50
 
 KIND_PENDING = "pending"
@@ -163,47 +166,59 @@ async def _records_by_ids(ids: list[str]) -> dict:
     return out
 
 
-def _old_query(exclude: set, limit: int, offset: int) -> str:
-    """fix2 BU-09: 除外 ID が EXCLUDE_QUERY_MAX 件以下なら `$id not in (...)` を問い合わせ条件に入れる（多ければ走査で除外）。"""
+def _old_query(exclude: set, limit: int, last_id: str | None = None) -> str:
+    """fix2 BU-09: 除外 ID が EXCLUDE_QUERY_MAX 件以下なら `$id not in (...)` を問い合わせ条件に入れる（多ければ走査で除外）。
+    fix3 BU-10: 並びは $id 降順・続きは `$id < last_id`（安定キー・offset は使わない）。"""
     ids = sorted((x for x in exclude if _ID_RE.fullmatch(str(x))), key=int)
     cond = '送信済み in ("no")'
+    if last_id:
+        cond += f" and $id < {int(last_id)}"
     if 0 < len(ids) <= EXCLUDE_QUERY_MAX:
         cond += " and $id not in (" + ",".join(f'"{x}"' for x in ids) + ")"
-    return f"{cond} order by 更新日時 asc limit {limit} offset {offset}"
+    return f"{cond} order by $id desc limit {limit}"
 
 
-async def _scan_old(exclude: set | None = None, start: int = 0) -> tuple[list[dict], int, bool]:
-    """承認キューの未送信（送信済み=no）を更新の古い順に（V2 以前の項目の候補）。戻り値 (records, next_offset, has_more)。
-    fix1 BU-05: exclude（対応待ちが参照する No.・閉じ済みの No.）を除いた後の件数が OLD_LIMIT に達するまで offset で続きを読む。
-    fix2 BU-09: 1 回の走査は start から OLD_SCAN 件まで。上限に達して続きがあり得るときは has_more=True（未処理 0 件と区別し、
-    画面の「続きを読み込む」で next_offset から次の走査）。除外 ID が少なければ問い合わせ条件で除外する（_old_query）。"""
+async def _scan_old(exclude: set | None = None, last_id: str | None = None) -> tuple[list[dict], str, bool, int]:
+    """承認キューの未送信（送信済み=no）をレコード No. の大きい順に走査する（V2 以前の項目の候補）。
+    戻り値 (records, next_last_id, has_more, scanned)。next_last_id＝この走査で読んだ最後のレコード No.（除外した行も含む・
+    続きは `$id < next_last_id`）。scanned＝この走査で読んだ件数。
+    fix1 BU-05: exclude（対応待ちが参照する No.・閉じ済みの No.）を除いた後の件数が OLD_LIMIT に達するまで続きのページを読む。
+    fix2 BU-09: 1 回の走査は OLD_SCAN 件まで。上限に達して続きがあり得るときは has_more=True（未処理 0 件と区別）。
+    fix3 BU-10: 続きは安定キー。除外集合が途中で変わっても（別タブで閉じた等）走査済みの No. より前だけを読むので欠落しない。
+    途中で増えた新規項目（No. が大きい）は続きには出ず先頭の走査に出る（重複・欠落なし）。"""
+    cur = str(last_id or "")
     if not (APP_APPROVAL.app_id() and APP_APPROVAL.token()):
-        return [], start, False
+        return [], cur, False, 0
     exclude = exclude or set()
     out: list[dict] = []
-    offset = int(start)
+    scanned = 0
     for _ in range(OLD_MAX_PAGES):
         try:
-            rows = await kintone.search_records(APP_APPROVAL, _old_query(exclude, OLD_PAGE, offset), fields=_FIELDS)
+            rows = await kintone.search_records(APP_APPROVAL, _old_query(exclude, OLD_PAGE, cur), fields=_FIELDS)
         except Exception:
             logger.warning("[INBOX] approval list failed (fixed reason)")
-            return out, offset, False
+            return out, cur, False, scanned
         for i, rec in enumerate(rows):
             rid = _v(rec, "$id")
-            if rid and rid not in exclude:
+            if not _ID_RE.fullmatch(rid):
+                continue
+            if cur and int(rid) >= int(cur):
+                continue                                     # 並びの保証外（安定キーより新しい行は読まない）
+            cur = rid                                        # 走査した最後の No.（除外した行も進める）
+            scanned += 1
+            if rid not in exclude:
                 out.append(rec)
                 if len(out) >= OLD_LIMIT:
                     more = (i + 1 < len(rows)) or (len(rows) >= OLD_PAGE)
-                    return out, offset + i + 1, more
+                    return out, cur, more, scanned
         if len(rows) < OLD_PAGE:
-            return out, offset + len(rows), False
-        offset += OLD_PAGE
-    return out, offset, True
+            return out, cur, False, scanned
+    return out, cur, True, scanned
 
 
 async def _old_records(exclude: set | None = None) -> list[dict]:
     """先頭からの 1 走査分（互換）。"""
-    return (await _scan_old(exclude, 0))[0]
+    return (await _scan_old(exclude, None))[0]
 
 
 async def _attending_map(hashes: set) -> dict:
@@ -238,9 +253,10 @@ def _sort_key(item: dict):
     return d or datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
 
 
-async def load_open_view(old_from: int = 0) -> tuple[list[dict], dict]:
+async def load_open_view(last_id: str = "") -> tuple[list[dict], dict]:
     """未処理: 対応待ち（open）＋承認キューだけの未送信（対応待ちの表に無く・閉じていない）。古い順。
-    fix2 BU-09: 戻り値 (items, scan)。scan={"from","scanned","more","found"}＝承認キューの走査範囲と続きの有無。"""
+    fix2 BU-09／fix3 BU-10: 戻り値 (items, scan)。scan={"last_id","next","scanned","more","found"}＝承認キューの走査範囲
+    （last_id より前を scanned 件）と続きの有無（続きは next を last_id に）。"""
     rows = await reply_pending.list_open(reply_pending.LIST_LIMIT)
     attending = await _attending_map({r["line_user_hash"] for r in rows})
     recs = await _records_by_ids([str(r.get("approval_record_id") or "") for r in rows])
@@ -248,15 +264,15 @@ async def load_open_view(old_from: int = 0) -> tuple[list[dict], dict]:
              for r in rows]
     referenced = await reply_pending.approval_record_ids_all()
     closed = await approval_close.closed_ids(BUSINESS)                 # fix2 BU-09: 閉じ済み ID の集合を先に取る
-    old, nxt, more = await _scan_old(set(referenced) | set(closed), int(old_from))   # fix1 BU-05: 除外後の件数でページング
+    old, nxt, more, scanned = await _scan_old(set(referenced) | set(closed), last_id or None)   # fix1 BU-05／fix3 BU-10: 安定キー
     for rec in old:
         items.append(_old_item(rec))
     items.sort(key=_sort_key)
-    return items, {"from": int(old_from), "scanned": int(nxt), "more": bool(more), "found": len(old)}
+    return items, {"last_id": str(last_id or ""), "next": str(nxt), "scanned": int(scanned), "more": bool(more), "found": len(old)}
 
 
 async def load_open_items() -> list[dict]:
-    return (await load_open_view(0))[0]
+    return (await load_open_view(""))[0]
 
 
 async def load_confirm_items() -> list[dict]:
@@ -370,14 +386,15 @@ def _confirm_card(c: dict) -> str:
 
 
 def _scan_line(scan: dict) -> str:
-    """fix2 BU-09: 「○件まで走査・続きあり」。上限到達と未処理 0 件を区別する。"""
+    """fix2 BU-09: 「○件走査・続きあり」。上限到達と未処理 0 件を区別する。fix3 BU-10: 続きのリンクは安定キー（last_id）。"""
     if not scan:
         return ""
-    rng = f"{scan['from'] + 1}〜{scan['scanned']} 件目まで走査しました（この範囲の未処理 {scan['found']} 件）"
+    where = f"No.{html.escape(scan['last_id'])} より前を" if scan["last_id"] else "先頭から"
+    rng = f"{where} {scan['scanned']} 件走査しました（この範囲の未処理 {scan['found']} 件）"
     if scan["more"]:
         return (f'<p class="sub">承認キューの未送信を {rng}。続きがあります。'
-                f'<a href="{PAGE}?old_from={scan["scanned"]}">続きを読み込む（次の {OLD_SCAN} 件）</a></p>')
-    if scan["from"] > 0:
+                f'<a href="{PAGE}?{LAST_ID_PARAM}={html.escape(scan["next"])}">続きを読み込む（次の {OLD_SCAN} 件）</a></p>')
+    if scan["last_id"]:
         return f'<p class="sub">承認キューの未送信を {rng}。続きはありません。<a href="{PAGE}">先頭に戻る</a></p>'
     return ""
 
@@ -434,8 +451,8 @@ async def inbox_page(request: Request):
     q = request.query_params
     closed_view = q.get("closed") == "1"
     notices = [_NOTICES.get(q.get("done", ""), ""), _LINK_NOTICES.get(q.get("link", ""), "")]
-    old_from = q.get("old_from", "0") or "0"
-    if not _OLD_FROM_RE.fullmatch(old_from):
+    last_id = q.get(LAST_ID_PARAM, "") or ""                 # fix3 BU-10: 続きは安定キー（数字のみ・不正 400）。old_from（offset）は廃止＝無視して先頭から
+    if last_id and not _ID_RE.fullmatch(last_id):
         return _bad_request()
     confirm: list[dict] = []
     scan: dict = {}
@@ -443,7 +460,7 @@ async def inbox_page(request: Request):
         if closed_view:
             items = await load_closed_items()
         else:
-            items, scan = await load_open_view(int(old_from))   # fix2 BU-09
+            items, scan = await load_open_view(last_id)   # fix2 BU-09／fix3 BU-10
     except Exception:
         items, notices = [], notices + [_NOTICES["db"]]
     if not closed_view:
