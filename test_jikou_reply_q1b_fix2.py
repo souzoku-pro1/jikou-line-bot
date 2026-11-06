@@ -74,12 +74,13 @@ class TestResidueCheck(unittest.TestCase):
             "妻の花子が対応します": "relation_name",
             "山田太郎に伝えます": "name_candidate",
             "受付番号は 123456 です": "digits",
+            "親族の名前はテストハナコです。": "context_name",   # Q3a-fix1 BQ-03
         }
         for text, label in cases.items():
             self.assertIn(label, pii_scan.residue_hits(text), text)
         self.assertEqual(tuple(n for n, _ in pii_scan.RESIDUE_RES),
                          ("email", "phone", "postal", "line_user_id", "digits", "address", "relation_name",
-                          "name_candidate"))
+                          "name_candidate", "context_name"))   # Q3a-fix1 BQ-03: 文脈つき氏名
 
     def test_existing_ok_examples_still_pass(self):
         for s in SENT_OK:
@@ -92,7 +93,7 @@ class TestResidueCheck(unittest.TestCase):
 
     def test_heuristic_labels_can_be_excluded_for_frozen_texts(self):
         """凍結定型（閉集合・承認済み）の送信前ガードは確定パターンだけ（発見的な氏名検査は自由文の匿名化にだけ使う）。"""
-        self.assertEqual(pii_scan.RESIDUE_HEURISTIC_LABELS, ("relation_name", "name_candidate"))
+        self.assertEqual(pii_scan.RESIDUE_HEURISTIC_LABELS, ("relation_name", "name_candidate", "context_name"))   # Q3a-fix1 BQ-03
         for s in ("過去の事例をご案内します", "万一時効が完成していなかった場合", "お気軽にご連絡ください"):
             self.assertEqual(pii_scan.residue_hits(s, heuristics=False), [], s)
             self.assertEqual(pii_scan.residue_hits(s), [], s)                      # 停止語でも通る

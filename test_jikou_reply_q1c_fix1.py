@@ -553,7 +553,7 @@ class TestPinsFix1(unittest.TestCase):
                 self.assertNotIn(banned, s, name)
         allow = json.loads((REPO / "redaction_sink_allowlist.json").read_text(encoding="utf-8"))["entries"]
         self.assertEqual(sorted(int(e.split(":")[1]) for e in allow if e.startswith("main.py:")), [663, 685, 1320, 1620, 1917])
-        self.assertEqual(sorted(int(e.split(":")[1]) for e in allow if e.startswith("chat_responder.py:")), [1660, 1672])
+        self.assertEqual(sorted(int(e.split(":")[1]) for e in allow if e.startswith("chat_responder.py:")), [])          # Q3a-fix1 BQ-04: 2 件を回収（削除のみ）
 
     def test_sink_policy_zero_violations_and_no_allowlist_entries(self):
         for name in ("hub/send_policy.py", "hub/reply_pending.py", "hub/line_channel.py", "hub/webapp_reply_view.py"):

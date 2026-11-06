@@ -971,7 +971,7 @@ class TestPiiAndSinkPolicy(unittest.TestCase):
         self.assertEqual(sorted(int(e.split(":")[1]) for e in entries if e.startswith("main.py:")),
                          [663, 685, 1320, 1620, 1917])
         self.assertEqual(sorted(int(e.split(":")[1]) for e in entries
-                                if e.startswith("chat_responder.py:")), [1660, 1672])
+                                if e.startswith("chat_responder.py:")), [])          # Q3a-fix1 BQ-04: 2 件を回収（削除のみ）
         self.assertIn("send_ledger.touch_inbound", src[1219])      # 画像受信（1 行置換）
         self.assertIn("send_ledger.touch_inbound", src[1347])      # durable 受信（1 行置換）
 

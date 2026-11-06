@@ -135,13 +135,37 @@ def _search_address(text: str):
 
 
 NAME_CANDIDATE_MATCHER = _Matcher("name_candidate", _has_name_candidate)
+
+# JIKOU-REPLY-Q3a-fix1 BQ-03（Codex R-Q3a）: 文脈つき氏名。「（親族の）名前はテストハナコです」「氏名：山田太郎」のように
+# 「名前／氏名／姓名／フルネーム」の直後に名前らしい語（カタカナ 2〜10・漢字 2〜4・英字）が続くものを残留として検出する。
+# 伏せ字にはしない（残留検査のみ＝ok=False で保存せず、人が承認画面で本文を直して確定する）。一般語は除外。
+CONTEXT_NAME_RE = re.compile(
+    rf"(?:お名前|名前|氏名|姓名|フルネーム)\s*(?:は|が|を|も|:|：|、|→|＝|=)\s*(?:「|『|“|\")?"
+    rf"(?P<name>[ァ-ヶー]{{2,10}}|[{_KANJI}]{{2,4}}|[A-Za-z]{{2,}}(?:\s[A-Za-z]{{2,}})?)")
+CONTEXT_NAME_STOPWORDS = frozenset({"カタカナ", "ひらがな", "フルネーム", "ローマ字", "アルファベット", "ニックネーム", "イニシャル",
+                                   "ハンドルネーム", "スペース", "ファイル", "データ", "メール", "line", "ok", "ng", "id", "url", "pdf", "nan"})
+
+
+def _has_context_name(text: str) -> bool:
+    for m in CONTEXT_NAME_RE.finditer(text):
+        word = m.group("name")
+        if word in CONTEXT_NAME_STOPWORDS or word.lower() in CONTEXT_NAME_STOPWORDS:
+            continue
+        if re.fullmatch(rf"[{_KANJI}]+", word) and (word in NAME_STOPWORDS or word[-1] in NAME_SAFE_SUFFIX
+                                                     or any(word[:k] in NAME_STOPWORDS for k in range(2, len(word)))):   # 「確認済」「不要」など一般語
+            continue
+        return True
+    return False
+
+
+CONTEXT_NAME_MATCHER = _Matcher("context_name", _has_context_name)
 ADDRESS_MATCHER = _Matcher("address", _search_address)
 
-# 残留検査の順序＝報告の固定語彙（メール・電話・郵便番号・LINE userId・数字列・住所・続柄+氏名・氏名候補）
+# 残留検査の順序＝報告の固定語彙（メール・電話・郵便番号・LINE userId・数字列・住所・続柄+氏名・氏名候補・文脈つき氏名）
 RESIDUE_RES = (("email", EMAIL_RE), ("phone", PHONE_RE), ("postal", POSTAL_RE),
                ("line_user_id", LINE_USER_ID_RE), ("digits", DIGITS_RE),
                ("address", ADDRESS_MATCHER), ("relation_name", RELATION_NAME_RE),
-               ("name_candidate", NAME_CANDIDATE_MATCHER))
+               ("name_candidate", NAME_CANDIDATE_MATCHER), ("context_name", CONTEXT_NAME_MATCHER))   # Q3a-fix1 BQ-03
 
 
 def name_variants(name: str) -> list[str]:
@@ -205,7 +229,7 @@ def redact(text: str, *, names: tuple | list = ()) -> str:
 
 # fix2 BR-10: 氏名の発見的検査（続柄＋氏名・氏名候補）は **自由文の匿名化**（手本保存）にだけ使う。閉集合の凍結定型
 # （大野承認済み・hub/jikou_reply_flow の送信前ガード）には誤検知が出る（例: 「過去」「事例」「気軽」）ため heuristics=False で外す。
-RESIDUE_HEURISTIC_LABELS = ("relation_name", "name_candidate")
+RESIDUE_HEURISTIC_LABELS = ("relation_name", "name_candidate", "context_name")   # Q3a-fix1 BQ-03: 文脈つき氏名も発見的（自由文の匿名化にだけ使う）
 
 
 def residue_hits(text: str, *, heuristics: bool = True) -> list[str]:

@@ -981,7 +981,8 @@ class TestReplyExemplarMigration(unittest.TestCase):
     REPLY_FOLLOWUP_VERSION = "c8e0a2b4d6f8"  # JIKOU-REPLY-Q1b-fix6 BR-18: reply_chatlog_followup.row_version（a7c9 の次）
     REPLY_PENDING = "a1c3e5f7b9d2"      # JIKOU-REPLY-Q1c: 対応待ち（c8e0 の後ろ。fix5／fix6 で f7b2 → a7c9 → c8e0 に付け替え）
     REPLY_PENDING_RETRY = "d4f6a8b0c2e4"  # JIKOU-REPLY-Q1c-fix1 BC-03: 対応待ちの保存失敗の永続キュー reply_pending_retry（a1c3 の次）
-    REPLY_PENDING_NOTICE = "b7d9f1a3c5e7"  # JIKOU-REPLY-Q1c-fix2 BC-07: reply_pending.notice_key／claim 列・retry.notice_key（d4f6 の次・head）
+    REPLY_PENDING_NOTICE = "b7d9f1a3c5e7"  # JIKOU-REPLY-Q1c-fix2 BC-07: reply_pending.notice_key／claim 列・retry.notice_key（d4f6 の次）
+    DRAFT_APPROVAL = "b2d4f6a8c0e1"     # JIKOU-REPLY-Q3a: 下書き照合（b7d9 の後ろ・head。Q1c-fix1 で a1c3 → d4f6、FORWARD-MERGE-2 で d4f6 → b7d9 に付け替え）
 
     def test_reply_exemplar_migration_round_trip(self):
         import sqlite3
@@ -1009,7 +1010,7 @@ class TestReplyExemplarMigration(unittest.TestCase):
             # JIKOU-REPLY-Q1c: head（a1c3e5f7b9d2）で対応待ち 2 表が増え、列集合が hub/reply_pending.metadata と一致
             from hub import reply_pending
             self.assertNotIn(reply_pending.TABLE_NAME, tables())
-            up = alembic("upgrade", self.REPLY_PENDING)      # Q1c-fix1: head が d4f6 へ進んだため a1c3 までを明示（検証内容は不変）
+            up = alembic("upgrade", self.REPLY_PENDING)      # Q1c-fix1: a1c3 までを明示（検証内容は不変）
             self.assertEqual(up.returncode, 0, f"stderr={up.stderr[-800:]}")
             self.assertIn(self.REPLY_PENDING, alembic("current").stdout)
             self.assertTrue(set(reply_pending.TABLE_NAMES) <= tables())
@@ -1018,9 +1019,10 @@ class TestReplyExemplarMigration(unittest.TestCase):
             self.assertEqual(up.returncode, 0, f"stderr={up.stderr[-800:]}")
             self.assertIn(self.REPLY_PENDING_RETRY, alembic("current").stdout)
             self.assertIn(reply_pending.RETRY_TABLE_NAME, tables())
-            up = alembic("upgrade", "head")                   # Q1c-fix2 BC-07: b7d9（notice_key／claim 列）が head・鎖は 1 本・列集合は head で比較
+            up = alembic("upgrade", self.REPLY_PENDING_NOTICE)  # Q1c-fix2 BC-07: b7d9（notice_key／claim 列）。Q3a で head は b2d4 へ進んだため明示（鎖は 1 本）
             self.assertEqual(up.returncode, 0, f"stderr={up.stderr[-800:]}")
             self.assertIn(self.REPLY_PENDING_NOTICE, alembic("current").stdout)
+            # main（Q1c-fix2）と同じく、対応待ち 3 表の列集合・NULL 制約・索引・FK は b7d9（通知キー列あり）で metadata と比較する
             con = sqlite3.connect(dbfile)
             try:
                 for name, table in ((reply_pending.TABLE_NAME, reply_pending.reply_pending),
@@ -1028,6 +1030,49 @@ class TestReplyExemplarMigration(unittest.TestCase):
                                     (reply_pending.RETRY_TABLE_NAME, reply_pending.reply_pending_retry)):
                     cols = {r[1] for r in con.execute(f'PRAGMA table_info("{name}")')}
                     self.assertEqual(cols, {c.name for c in table.columns}, name)
+                nn = nullable(con, reply_pending.TABLE_NAME)
+                self.assertFalse(nn["line_user_hash"])
+                self.assertFalse(nn["state"])
+                self.assertTrue(nn["inbound_event_id"])
+                self.assertTrue(nn["approval_record_id"])
+                idx = {r[1] for r in con.execute(f'PRAGMA index_list("{reply_pending.TABLE_NAME}")')}
+                self.assertTrue({"ix_reply_pending_state", "ix_reply_pending_user"} <= idx)
+                fks = {(r[2], r[3]) for r in con.execute("PRAGMA foreign_key_list(reply_pending_history)")}
+                self.assertIn(("reply_pending", "pending_id"), fks)
+            finally:
+                con.close()
+            # JIKOU-REPLY-Q3a: head（b2d4f6a8c0e1・FORWARD-MERGE-2 で b7d9 の後ろ）で reply_draft_approval が増え、列集合が metadata と一致
+            self.assertNotIn(reply_exemplar.DRAFT_TABLE_NAME, tables())
+            up = alembic("upgrade", "head")
+            self.assertEqual(up.returncode, 0, f"stderr={up.stderr[-800:]}")
+            self.assertIn(self.DRAFT_APPROVAL, alembic("current").stdout)
+            self.assertIn(reply_exemplar.DRAFT_TABLE_NAME, tables())
+            con = sqlite3.connect(dbfile)
+            try:
+                cols = {r[1] for r in con.execute(f'PRAGMA table_info("{reply_exemplar.DRAFT_TABLE_NAME}")')}
+                self.assertEqual(cols, {c.name for c in reply_exemplar.reply_draft_approval.columns})
+                self.assertTrue(nullable(con, reply_exemplar.DRAFT_TABLE_NAME)["unmodified"])
+                self.assertFalse(nullable(con, reply_exemplar.DRAFT_TABLE_NAME)["draft_text_version"])
+                # Q3a-fix1 BQ-05: 候補通知の確定表（同一 revision）
+                self.assertIn(reply_exemplar.PROMOTION_TABLE_NAME, tables())
+                cols = {r[1] for r in con.execute(f'PRAGMA table_info("{reply_exemplar.PROMOTION_TABLE_NAME}")')}
+                self.assertEqual(cols, {c.name for c in reply_exemplar.exemplar_promotion_notice.columns})
+                self.assertFalse(nullable(con, reply_exemplar.PROMOTION_TABLE_NAME)["state"])
+            finally:
+                con.close()
+            down = alembic("downgrade", self.REPLY_PENDING)   # b2d4 → b7d9 → d4f6 → a1c3（通知キー列・永続キューも落ちる）
+            self.assertEqual(down.returncode, 0, f"stderr={down.stderr[-800:]}")
+            self.assertNotIn(reply_exemplar.DRAFT_TABLE_NAME, tables())
+            self.assertNotIn(reply_exemplar.PROMOTION_TABLE_NAME, tables())   # Q3a-fix1 BQ-05
+            self.assertNotIn(reply_pending.RETRY_TABLE_NAME, tables())
+            con = sqlite3.connect(dbfile)
+            try:
+                # a1c3 では b7d9 の通知キー列（notice_key／notify_owner／notify_claimed_at）が落ちている（他の列は metadata と一致）
+                notice_cols = {"notice_key", "notify_owner", "notify_claimed_at"}
+                for name, table, dropped in ((reply_pending.TABLE_NAME, reply_pending.reply_pending, notice_cols),
+                                             (reply_pending.HISTORY_TABLE_NAME, reply_pending.reply_pending_history, set())):
+                    cols = {r[1] for r in con.execute(f'PRAGMA table_info("{name}")')}
+                    self.assertEqual(cols, {c.name for c in table.columns} - dropped, name)
                 nn = nullable(con, reply_pending.TABLE_NAME)
                 self.assertFalse(nn["line_user_hash"])
                 self.assertFalse(nn["state"])
@@ -1140,6 +1185,32 @@ class TestReplyExemplarMigration(unittest.TestCase):
             self.assertIn("reply_pending_downgrade_refused_data_present", down.stderr)
             self.assertNotIn("ev-secret", down.stderr)
             self.assertTrue(set(reply_pending.TABLE_NAMES) <= tables())
+            # JIKOU-REPLY-Q3a: head（b2d4）→ a1c3 は下書き照合が空なので通り、a1c3 → f7b2 で拒否＝current は a1c3
             self.assertIn(self.REPLY_PENDING, alembic("current").stdout)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_reply_draft_approval_downgrade_is_refused_when_data_present(self):
+        """JIKOU-REPLY-Q3a: reply_draft_approval に 1 行でもあれば downgrade を拒否（本文は無い＝sha256 のみ）。"""
+        import sqlite3
+        import tempfile
+        from hub import reply_exemplar
+        d = tempfile.mkdtemp(prefix="reply_draft_mig_refuse_")
+        dbfile = f"{d}/mig.db"
+        alembic, tables, _unique_cols, _nullable = TestAlembicScaffold._brain_mig_tools(dbfile)
+        try:
+            self.assertEqual(alembic("upgrade", "head").returncode, 0)
+            con = sqlite3.connect(dbfile)
+            try:
+                con.execute("INSERT INTO reply_draft_approval (record_id, business, category, draft_text_version, "
+                            "created_at) VALUES ('77', 'jikou', 'c', 'deadbeef', '2026-10-12 00:00:00')")
+                con.commit()
+            finally:
+                con.close()
+            down = alembic("downgrade", self.REPLY_PENDING)
+            self.assertNotEqual(down.returncode, 0)
+            self.assertIn("reply_draft_approval_downgrade_refused_data_present", down.stderr)
+            self.assertIn(reply_exemplar.DRAFT_TABLE_NAME, tables())
+            self.assertIn(self.DRAFT_APPROVAL, alembic("current").stdout)
         finally:
             shutil.rmtree(d, ignore_errors=True)

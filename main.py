@@ -1600,7 +1600,7 @@ async def kintone_approval_webhook(request: Request):
     async with send_ledger.approved_draft(f"approval:{record_id}:{record.get('$revision', {}).get('value', '')}"), send_policy.fixed_targets(user_id): _sl_res = await send_line_push(user_id, ai_draft)  # JIKOU-REPLY-Q1a／Q1c-fix1 BC-04: 送信着手時点の対応待ち集合を固定
     if _sl_res == send_ledger.SEND_UNCONFIRMED: return {"ok": True, "skip": "send_unconfirmed_duplicate"}  # JIKOU-REPLY-Q1a-fix1 BQ-01: 結果未確認の重複は送信済更新・記録へ進まない（sending 維持=§4.2 runbook）
     if _sl_res == send_ledger.SEND_POLICY_STOPPED: return await _approval_policy_stopped(_ev, record_id, record)  # JIKOU-REPLY-Q1c (a): 許可表 V2 で停止=送信済更新へ進まない（noop 終端+通知）
-    await mark_approval_sent(record_id); await save_to_chatlog(user_id, "assistant", ai_draft, category, "yes"); await send_policy.approved_draft_sent(record_id, user_id)  # JIKOU-REPLY-Q1c (d): 送信成功で対応待ちを閉じる
+    await mark_approval_sent(record_id); await save_to_chatlog(user_id, "assistant", ai_draft, category, "yes"); await send_policy.approved_draft_sent(record_id, user_id, ai_draft, category)  # JIKOU-REPLY-Q1c (d): 対応待ちを閉じる／Q3a (c): 無修正承認の計数
     if _ev: await mark_done(_ev)   # 全副作用完了後の terminal（sending→done・last_error=NULL）
 
     return {"ok": True, "record_id": record_id}
@@ -2413,6 +2413,9 @@ async def _approval_policy_stopped(_ev, record_id: str, record: dict) -> dict:
         await mark_stopped_after_sending(_ev, "skip_policy_v2")
     return {"ok": True, "skip": "policy_stopped"}
 
+# ── JIKOU-REPLY-Q3a（QUEUE-2026-10-12-C C-2）: 手本の承認・退役画面（/app/exemplars）の結線。末尾追記。
+from hub.webapp_exemplar_view import router as exemplar_view_router  # noqa: E402
+include_before_catch_all(app, exemplar_view_router)
 
 # ── JIKOU-REPLY-Q1c-fix1（Codex R-Q1c BC-03）: 対応待ちの永続キュー再処理（回収ジョブに相乗り）と未返信の経過通知
 #    （1 日 2 回・件数と経過分のみ）の登録。末尾追記（pin 番地不変）。start_all は既存の startup（healthcheck／houki）が呼ぶ。

@@ -27,9 +27,12 @@ fix2（Codex R-Q1b-fix1 BR-10・司令塔裁定「自由文の手本は人が匿
 """
 
 import datetime
+import hashlib
 import logging
 
 import sqlalchemy as sa
+from sqlalchemy.dialects import postgresql as _pg
+from sqlalchemy.dialects import sqlite as _sqlite
 
 from hub import db, pii_scan
 from hub.db import DatabaseNotConfigured, session_scope
@@ -52,7 +55,7 @@ APPROVED_BY_HUMAN = "human"
 ACTION_CREATED = "created"
 ACTION_USED = "used"
 ACTION_DEACTIVATED = "deactivated"
-ACTION_APPROVED = "approved"          # fix2 BR-10: 人の明示操作で承認済みへ（Q3a の再承認と同じ語彙）
+ACTION_APPROVED = "approved"          # JIKOU-REPLY-Q3a (a) 再承認・fix2 BR-10: 人の明示操作で承認済みへ（同じ語彙）
 ACTIONS = (ACTION_CREATED, ACTION_USED, ACTION_DEACTIVATED, ACTION_APPROVED)
 STATUS_PENDING_REVIEW = "pending_review"   # fix2 BR-10: 保存直後（人の匿名化確認待ち・下書き参照に使わない）
 STATUS_APPROVED = "approved"               # 人が確認して承認（下書き参照に使う）
@@ -99,6 +102,38 @@ reply_exemplar_history = sa.Table(
 
 TABLE_NAMES = (TABLE_NAME, HISTORY_TABLE_NAME)
 
+# ── JIKOU-REPLY-Q3a (c): 承認キューの下書きと送信文の照合（無修正承認の計数） ──────────────
+DRAFT_TABLE_NAME = "reply_draft_approval"
+reply_draft_approval = sa.Table(
+    DRAFT_TABLE_NAME, metadata,
+    sa.Column("record_id", sa.Text, primary_key=True),              # App 29 レコード No.
+    sa.Column("business", sa.Text, nullable=False),
+    sa.Column("category", sa.Text, nullable=True),
+    sa.Column("draft_text_version", sa.Text, nullable=False),      # 起票時の AI 下書きの sha256（本文は持たない）
+    sa.Column("sent_text_version", sa.Text, nullable=True),        # 送信した文の sha256
+    sa.Column("unmodified", sa.Boolean, nullable=True),            # 無修正承認（NULL=未送信）
+    sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+    sa.Column("sent_at", sa.DateTime(timezone=True), nullable=True),
+    sa.Index("ix_reply_draft_approval_cat", "business", "category", "unmodified"),
+)
+PROMOTION_THRESHOLD = 3                 # 無修正承認がこの回数に達したら「凍結定型の候補」通知（昇格は Q5）
+# Q3a-fix1 BQ-05（Codex R-Q3a）: 候補通知の確定表。閾値到達を (business, category, threshold) の固定キーで **1 行だけ** 確定し
+# （同一 tx・INSERT … ON CONFLICT DO NOTHING＝並行 2 件でも 1 者だけ）、確定した者が台帳キーで通知する。通知に失敗したら
+# state=pending のまま残り、回収ジョブ（send_policy.run_promotion_notice_job）が再通知する。本文・ID は置かない。
+PROMOTION_TABLE_NAME = "exemplar_promotion_notice"
+PROMOTION_PENDING = "pending"
+PROMOTION_SENT = "sent"
+exemplar_promotion_notice = sa.Table(
+    PROMOTION_TABLE_NAME, metadata,
+    sa.Column("business", sa.Text, primary_key=True),
+    sa.Column("category", sa.Text, primary_key=True),
+    sa.Column("threshold", sa.Integer, primary_key=True),
+    sa.Column("state", sa.Text, nullable=False, server_default=PROMOTION_PENDING),
+    sa.Column("attempts", sa.Integer, nullable=False, server_default="0"),
+    sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+    sa.Column("notified_at", sa.DateTime(timezone=True), nullable=True),
+)
+
 # ── 匿名化（共通検査器 hub/pii_scan に委譲・BR-04） ─────────────────────────────
 _reject_count = {"residue": 0}
 
@@ -143,6 +178,7 @@ async def save_exemplar(*, business: str, inbound_text: str, human_reply: str,
     if not _db_configured():
         return "skipped"
     names = (customer_name,) if customer_name else ()
+    category_id = category_id if category_id in CATEGORIES else None     # JIKOU-REPLY-Q3a: 閉集合外は NULL
     reply_a, ok1 = anonymize(str(human_reply)[:MAX_TEXT_CHARS], names=names)
     inbound_a, ok2 = anonymize(str(inbound_text or "")[:MAX_TEXT_CHARS], names=names)
     if not (ok1 and ok2):
@@ -168,7 +204,7 @@ async def save_exemplar(*, business: str, inbound_text: str, human_reply: str,
     return "saved"
 
 
-async def approve_exemplar(exemplar_id: int, *, actor: str = APPROVED_BY_HUMAN) -> bool:
+async def approve_exemplar(exemplar_id: int, *, actor: str = APPROVED_BY_HUMAN, note: str | None = None) -> bool:
     """fix2 BR-10: 人の明示操作で承認済みにする（pending_review／retired → approved・approved_by/at・active=True・
     履歴 approved）。既に approved なら False。Q1b は画面を持たない（Q3a の承認画面が呼ぶ）。"""
     now = _now()
@@ -178,7 +214,7 @@ async def approve_exemplar(exemplar_id: int, *, actor: str = APPROVED_BY_HUMAN) 
             status=STATUS_APPROVED, active=True, approved_by=actor, approved_at=now))
         if int(r.rowcount or 0) != 1:
             return False
-        await _history(s, int(exemplar_id), ACTION_APPROVED, actor, now)
+        await _history(s, int(exemplar_id), ACTION_APPROVED, actor, now, note)   # Q3a-fix1 BQ-03: 修正して承認したときは note に欄名
     return True
 
 
@@ -223,7 +259,19 @@ async def list_exemplars(business: str, *, stage: str | None = None, limit: int 
     q = q.order_by(reply_exemplar.c.created_at.desc(), reply_exemplar.c.id.desc()).limit(int(limit))
     async with session_scope() as s:
         rows = (await s.execute(q)).fetchall()
-    return [dict(r._mapping) for r in rows]
+    return _exclude_residue([dict(r._mapping) for r in rows])
+
+
+def _exclude_residue(rows: list[dict]) -> list[dict]:
+    """Q3a-fix2 BQ-06（二重防壁）: 旧い検査のもとで保存・承認された行でも、いまの残留検査（発見的検査を含む）に掛かる本文は
+    モデル参照（参考文例・選択器・下書き）に出さない。行は変えない（RV-08・画面には出る＝人が退役→修正→再承認できる）。
+    ログは件数だけ（本文を出さない）。"""
+    clean = [r for r in rows if not (pii_scan.residue_hits(str(r.get("human_reply") or ""))
+                                     or pii_scan.residue_hits(str(r.get("inbound_text") or "")))]
+    if len(clean) != len(rows):
+        logger.info("[REPLY_EXEMPLAR] excluded by residue check at read count=%s",
+                    emit(len(rows) - len(clean), "count", "log", "operator"))
+    return clean
 
 
 async def exemplar_history(exemplar_id: int) -> list[dict]:
@@ -232,3 +280,410 @@ async def exemplar_history(exemplar_id: int) -> list[dict]:
             reply_exemplar_history.c.exemplar_id == int(exemplar_id))
             .order_by(reply_exemplar_history.c.history_id))).fetchall()
     return [dict(r._mapping) for r in rows]
+
+
+# ══════════════════════════════════════════════════════════════
+# JIKOU-REPLY-Q3a（QUEUE-2026-10-12-C C-2）: 承認・退役の画面口／参考文例／無修正承認の計数
+#   - (a) approve_exemplar（退役 → 承認済み・履歴 approved）・list_for_view・get_exemplar
+#   - (b) prompt_note: 承認済み（active）の手本を category ごとに新しい順で最大 NOTE_MAX_PER_CATEGORY 件、
+#         最大 NOTE_MAX_CATEGORIES カテゴリを system prompt の末尾に「参考文例（事務所の過去回答・そのまま
+#         写さない）」として添える文を返す。手本が 0 件なら ""（prompt は従来と完全一致＝pin 不変）。
+#         返信の category は compose の出力なので生成前には決まらない＝カテゴリ別に並べて添え、モデルが自分の
+#         category の例を参照する（2 回呼ばない）。使った手本は mark_used_for（結果の category の群だけ）。
+#   - (c) record_draft（起票時の下書き sha256）・record_sent（送信文の sha256 と照合＝無修正承認）・
+#         count_unmodified（category ごとの無修正承認回数）。通知は hub/send_policy.approved_draft_sent。
+#   RV-10: 本表に本文は持たない（sha256 のみ）。参考文例は匿名化済み文だけを使う。
+# ══════════════════════════════════════════════════════════════
+# compose_reply の category 閉集合（chat_responder._COMPOSE_REPLY_TOOL の enum と一致＝test が pin）
+CATEGORIES = (
+    "挨拶・雑談", "手続きの一般的な流れ", "必要書類の案内", "費用の定型案内", "進捗の事実回答",
+    "営業案内・アクセス", "時効見立て_条件付き", "法的判断・見通し", "費用交渉・減額相談", "クレーム・不満",
+    "解約・辞任関係", "緊急対応", "本人確認不能・第三者", "その他判断系",
+)
+NOTE_MAX_PER_CATEGORY = 3
+NOTE_MAX_CATEGORIES = 4
+NOTE_HEADER = "\n\n【参考文例（事務所の過去回答・文体と構成の参照のみ・そのまま写さない・個別の事情や数値は引用しない）】"
+NO_CATEGORY_LABEL = "分類なし"
+# Q3a-fix1 項目 4: 参考文例ブロックは **凍結対象外の実行時付加**（手本 0 件なら付加なし＝基底 prompt は byte 同一・pin 不変）。
+# 行のテンプレートを定数化し、NOTE_TEMPLATE の sha256 を test_jikou_reply_q3a で pin（凍結記録: docs/jikou_reply_q1c_contract.md §6）。
+NOTE_LINE_CATEGORY = "■ カテゴリ: {category}"
+NOTE_LINE_INBOUND = "例{i}（相談者）: {text}"
+NOTE_LINE_REPLY = "例{i}（事務所の返信）: {text}"
+NOTE_TEMPLATE = "\n".join([NOTE_HEADER, NOTE_LINE_CATEGORY, NOTE_LINE_INBOUND, NOTE_LINE_REPLY])
+
+
+def _iso(v) -> str:
+    if v is None:
+        return ""
+    if v.tzinfo is None:
+        v = v.replace(tzinfo=datetime.timezone.utc)
+    return v.isoformat()
+
+
+def _row(r) -> dict:
+    d = dict(r._mapping)
+    d["created_at"] = _iso(d.get("created_at"))
+    d["approved_at"] = _iso(d.get("approved_at"))
+    d["active"] = bool(d.get("active"))
+    d["used_count"] = int(d.get("used_count") or 0)
+    return d
+
+
+async def get_exemplar(exemplar_id: int) -> dict | None:
+    async with session_scope() as s:
+        r = (await s.execute(sa.select(reply_exemplar).where(reply_exemplar.c.id == int(exemplar_id)))).first()
+    return _row(r) if r is not None else None
+
+
+async def list_for_view(business: str, *, include_inactive: bool = False, limit: int = 200) -> list[dict]:
+    q = sa.select(reply_exemplar).where(reply_exemplar.c.business == business)
+    if not include_inactive:
+        q = q.where(reply_exemplar.c.active.is_(True))
+    q = q.order_by(reply_exemplar.c.created_at.desc(), reply_exemplar.c.id.desc()).limit(int(limit))
+    async with session_scope() as s:
+        rows = (await s.execute(q)).fetchall()
+    return [_row(r) for r in rows]
+
+
+# approve_exemplar は fix2 BR-10 で status ベース（pending_review／retired → approved）に一本化（上の定義・Q3a の再承認も同じ口）。
+
+
+class ExemplarNote(str):
+    """system prompt 末尾に添える参考文例（str 互換）。ids_by_category は使った手本の ID（mark_used_for 用）。"""
+    ids_by_category: dict = {}
+
+
+def _stage_for_status(status: str) -> str:
+    try:
+        from chat_responder import classify_routing
+        return STAGE_ENGAGED if classify_routing(str(status or "")) == "post_engagement" else STAGE_CONSULT
+    except Exception:
+        return STAGE_CONSULT
+
+
+def format_note(rows: list[dict]) -> ExemplarNote:
+    """手本の列（新しい順）から参考文例の文を組む（純関数）。0 件は ""。"""
+    groups: dict = {}
+    order: list = []
+    for r in rows:
+        if not r.get("active", True):
+            continue
+        key = r.get("category_id") or NO_CATEGORY_LABEL
+        if key not in groups:
+            if len(order) >= NOTE_MAX_CATEGORIES:
+                continue
+            groups[key] = []
+            order.append(key)
+        if len(groups[key]) < NOTE_MAX_PER_CATEGORY:
+            groups[key].append(r)
+    if not order:
+        note = ExemplarNote("")
+        note.ids_by_category = {}
+        return note
+    lines = [NOTE_HEADER]
+    ids: dict = {}
+    for key in order:
+        lines.append(NOTE_LINE_CATEGORY.format(category=key))
+        ids[key] = [int(r["id"]) for r in groups[key]]
+        for i, r in enumerate(groups[key], start=1):
+            q = str(r.get("inbound_text") or "").strip()
+            if q:
+                lines.append(NOTE_LINE_INBOUND.format(i=i, text=q))
+            lines.append(NOTE_LINE_REPLY.format(i=i, text=str(r.get("human_reply") or "").strip()))
+    note = ExemplarNote("\n".join(lines))
+    note.ids_by_category = ids
+    return note
+
+
+async def prompt_note(business: str, status: str) -> ExemplarNote:
+    """承認済みの手本から参考文例の文を作る（DB 未設定・例外は ""＝従来どおり）。"""
+    if not _db_configured():
+        return format_note([])
+    try:
+        rows = await list_exemplars(business, stage=_stage_for_status(status),
+                                    limit=NOTE_MAX_PER_CATEGORY * len(CATEGORIES))
+    except Exception:
+        logger.warning("[REPLY_EXEMPLAR] prompt note skipped (fixed reason)")
+        return format_note([])
+    return format_note(rows)
+
+
+async def mark_used_for(note, category: str) -> int:
+    """自動送信した返信の category の群だけ used（履歴 used・used_count+1）。戻り値は件数。"""
+    ids = (getattr(note, "ids_by_category", None) or {}).get(category) or []
+    n = 0
+    for xid in ids:
+        try:
+            if await mark_used(int(xid)):
+                n += 1
+        except Exception:
+            logger.warning("[REPLY_EXEMPLAR] mark_used failed (fixed reason)")
+    return n
+
+
+async def record_draft(record_id, business: str, category: str | None, text: str) -> bool:
+    """起票時の AI 下書きの sha256 を記録（App 29 レコード No. 単位・既存はそのまま）。失敗は握る。"""
+    if not record_id or not _db_configured():
+        return False
+    now = _now()
+    try:
+        async with session_scope() as s:
+            exists = (await s.execute(sa.select(reply_draft_approval.c.record_id).where(
+                reply_draft_approval.c.record_id == str(record_id)))).scalar()
+            if exists is not None:
+                return False
+            await s.execute(sa.insert(reply_draft_approval).values(
+                record_id=str(record_id), business=business,
+                category=(category if category in CATEGORIES else None),
+                draft_text_version=hashlib.sha256(str(text or "").encode("utf-8")).hexdigest(),
+                created_at=now))
+        return True
+    except Exception:
+        logger.warning("[REPLY_EXEMPLAR] record_draft failed (fixed reason)")
+        return False
+
+
+async def record_sent(record_id, text: str) -> dict | None:
+    """承認済み下書きの送信成功: 送信文の sha256 を照合して無修正か記録し、その category の無修正承認回数を返す
+    （{"category", "unmodified", "count"}）。起票記録が無い・DB 未設定・失敗は None。"""
+    if not record_id or not _db_configured():
+        return None
+    now = _now()
+    tv = hashlib.sha256(str(text or "").encode("utf-8")).hexdigest()
+    try:
+        async with session_scope() as s:
+            row = (await s.execute(sa.select(reply_draft_approval).where(
+                reply_draft_approval.c.record_id == str(record_id)))).first()
+            if row is None:
+                return None
+            if row.sent_at is not None:
+                return None                      # 既に照合済み（再配送）
+            unmodified = (row.draft_text_version == tv)
+            # Q3a-fix2 BQ-07: 無修正の計数と閾値の確定は (business, category) 単位で直列化（PostgreSQL は advisory lock を
+            # 同一 tx で取り commit まで保持・sqlite は直後の UPDATE が書込ロックを取る＝単一書込）。並行 2 件が双方とも
+            # 自分の 1 件しか見えない count で未達と判断して確定を取りこぼすことを防ぐ。
+            if unmodified and row.category:
+                await _serialize_category(s, row.business, row.category)
+            await s.execute(sa.update(reply_draft_approval).where(
+                reply_draft_approval.c.record_id == str(record_id)).values(
+                sent_text_version=tv, unmodified=unmodified, sent_at=now))
+            n = int((await s.execute(sa.select(sa.func.count()).select_from(reply_draft_approval).where(
+                reply_draft_approval.c.business == row.business,
+                reply_draft_approval.c.category == row.category,
+                reply_draft_approval.c.unmodified.is_(True)))).scalar() or 0)
+            # Q3a-fix1 BQ-05: 閾値到達（>=）を同一 tx で固定キーに確定。確定できた 1 者だけ claimed=True（並行 2 件でも 1 者）
+            claimed = False
+            if unmodified and row.category and n >= PROMOTION_THRESHOLD:
+                claimed = await _claim_promotion(s, row.business, row.category, PROMOTION_THRESHOLD, now)
+        return {"category": row.category, "unmodified": unmodified, "count": n, "claimed": claimed,
+                "threshold": PROMOTION_THRESHOLD}
+    except Exception:
+        logger.warning("[REPLY_EXEMPLAR] record_sent failed (fixed reason)")
+        return None
+
+
+async def count_unmodified(business: str, category: str) -> int:
+    async with session_scope() as s:
+        return int((await s.execute(sa.select(sa.func.count()).select_from(reply_draft_approval).where(
+            reply_draft_approval.c.business == business, reply_draft_approval.c.category == category,
+            reply_draft_approval.c.unmodified.is_(True)))).scalar() or 0)
+
+
+# ══════════════════════════════════════════════════════════════
+# JIKOU-REPLY-Q3a-fix1 BQ-01（Codex R-Q3a REJECT・Fable 裁定 2026-11-03）
+#   手本（参考文例）を prompt に添えて生成した返信は、カテゴリが許可表にあっても **自動送信しない**。承認キュー（App 29・
+#   対応待ち）に固定し、Q4／返信画面での承認後にだけ送る。手本 0 件（note == ""）の生成と定型は従来どおり（許可表どおり）。
+#   V2 ON/OFF の双方に効く（guard の段で降格するため、OFF は確認中の定型・ON は無言＋対応待ち＝既存の降格経路）。
+#   used（used_count＋履歴）は、固定した下書きが承認キューに入った時点で結果の category の群だけに付ける。
+# ══════════════════════════════════════════════════════════════
+EXEMPLAR_REFERENCED_REASON = "手本参照（承認後のみ送信・Q3a-fix1 BQ-01）"
+
+
+def require_approval_if_referenced(guard, note):
+    """参考文例つきで生成した返信を承認必須に降格する（note が空＝手本 0 件なら guard をそのまま返す）。"""
+    if not str(note or "") or not getattr(guard, "can_auto_send", False):
+        return guard
+    import dataclasses
+    reasons = list(getattr(guard, "demotion_reasons", []) or []) + [EXEMPLAR_REFERENCED_REASON]
+    return dataclasses.replace(guard, can_auto_send=False, demotion_reasons=reasons)
+
+
+# ── JIKOU-REPLY-Q3a-fix1 BQ-03（Codex R-Q3a）: 承認画面で匿名化済み本文を人が修正・確定する ──
+EDIT_FIELDS = ("human_reply", "inbound_text")
+
+
+async def update_texts(exemplar_id: int, *, human_reply: str, inbound_text: str) -> tuple[str, list[str]]:
+    """匿名化済み本文を人の修正で置き換える（承認前）。残留検査（発見的検査を含む）に 1 つでも掛かれば置き換えず
+    ("residue", 掛かった種別) を返す。戻り値 (ok|residue|bad_input|not_found|not_editable, hits)。承認済みの手本は直さない（退役→修正→再承認）。"""
+    reply = str(human_reply or "").strip()[:MAX_TEXT_CHARS]
+    inbound = str(inbound_text or "").strip()[:MAX_TEXT_CHARS]
+    if not reply:
+        return "bad_input", []
+    hits = sorted(set(pii_scan.residue_hits(reply) + pii_scan.residue_hits(inbound)))
+    if hits:
+        _reject_count["residue"] += 1
+        logger.info("[REPLY_EXEMPLAR] edit rejected by residue check (not saved) total=%s",
+                    emit(_reject_count["residue"], "count", "log", "operator"))
+        return "residue", hits
+    async with session_scope() as s:
+        cur = (await s.execute(sa.select(reply_exemplar.c.status).where(reply_exemplar.c.id == int(exemplar_id)))).scalar()
+        if cur is None:
+            return "not_found", []
+        if cur == STATUS_APPROVED:
+            return "not_editable", []
+        await s.execute(sa.update(reply_exemplar).where(reply_exemplar.c.id == int(exemplar_id)).values(
+            human_reply=reply, inbound_text=inbound))
+    return "ok", []
+
+
+# ── JIKOU-REPLY-Q3a-fix2 BQ-06（Codex R-Q3a-fix1）: 承認＝検査・本文確定・承認を同一トランザクション・版条件で ──
+APPROVE_OK = "ok"
+APPROVE_RESIDUE = "residue"
+APPROVE_CONFLICT = "conflict"
+
+
+async def _approve_cas_hook(s) -> None:
+    """検査と更新の継ぎ目（試験で並行更新を差し込むための口）。製品では何もしない。"""
+    return None
+
+
+async def approve_checked(exemplar_id: int, *, human_reply: str | None = None, inbound_text: str | None = None,
+                          actor: str = APPROVED_BY_HUMAN) -> tuple[str, list[str]]:
+    """承認画面の唯一の承認口。**本文欄の有無・変更の有無に関係なく**、確定しようとする本文（欄があれば修正値・無ければ保存値）
+    を残留検査（発見的検査を含む）にかけ、通ったものだけを **同一トランザクション** で本文確定＋承認する。
+    版条件: 読んだ時点の状態と本文（status != approved・human_reply／inbound_text が読取値のまま）を UPDATE の WHERE に置き
+    （PostgreSQL では読取に FOR UPDATE・sqlite は句が落ちる）、0 件なら conflict（承認しない・本文も変えない）。
+    戻り値 (ok|residue|bad_input|not_found|not_changed|not_editable|conflict, 掛かった残留種別)。
+    - not_changed: 既に承認済みで本文欄なし（従来の 1 ボタンの再押下）。not_editable: 承認済みに本文欄つき（退役→修正→再承認）。
+    - ok のとき履歴 approved（修正した欄があれば note=edited:欄名）。保存値のまま承認なら note なし。
+    ログは件数だけ（本文・種別の値は出さない）。"""
+    now = _now()
+    async with session_scope() as s:
+        cur = (await s.execute(sa.select(reply_exemplar.c.status, reply_exemplar.c.human_reply, reply_exemplar.c.inbound_text)
+                               .where(reply_exemplar.c.id == int(exemplar_id)).with_for_update())).first()
+        if cur is None:
+            return "not_found", []
+        if cur.status == STATUS_APPROVED:
+            return ("not_editable" if (human_reply is not None or inbound_text is not None) else "not_changed"), []
+        reply = (str(human_reply) if human_reply is not None else str(cur.human_reply or "")).strip()[:MAX_TEXT_CHARS]
+        inbound = (str(inbound_text) if inbound_text is not None else str(cur.inbound_text or "")).strip()[:MAX_TEXT_CHARS]
+        if not reply:
+            return "bad_input", []
+        hits = sorted(set(pii_scan.residue_hits(reply) + pii_scan.residue_hits(inbound)))
+        if hits:
+            _reject_count["residue"] += 1
+            logger.info("[REPLY_EXEMPLAR] approve rejected by residue check (not approved) total=%s",
+                        emit(_reject_count["residue"], "count", "log", "operator"))
+            return APPROVE_RESIDUE, hits
+        changed = [f for f, new, old in (("human_reply", reply, cur.human_reply), ("inbound_text", inbound, cur.inbound_text))
+                   if new != str(old or "").strip()]
+        await _approve_cas_hook(s)
+        r = await s.execute(sa.update(reply_exemplar).where(
+            reply_exemplar.c.id == int(exemplar_id), reply_exemplar.c.status != STATUS_APPROVED,
+            reply_exemplar.c.human_reply == cur.human_reply, reply_exemplar.c.inbound_text == cur.inbound_text).values(
+            human_reply=reply, inbound_text=inbound, status=STATUS_APPROVED, active=True, approved_by=actor, approved_at=now))
+        if int(r.rowcount or 0) != 1:
+            return APPROVE_CONFLICT, []
+        await _history(s, int(exemplar_id), ACTION_APPROVED, actor, now, ("edited:" + ",".join(changed)) if changed else None)
+    return APPROVE_OK, []
+
+
+# ── JIKOU-REPLY-Q3a-fix1 BQ-05（Codex R-Q3a）: 候補通知の確定（固定キー・1 者）と回収 ──
+async def _claim_promotion(s, business: str, category: str, threshold: int, now) -> bool:
+    """(business, category, threshold) を INSERT … ON CONFLICT DO NOTHING … RETURNING（PostgreSQL／sqlite）。
+    **挿入された行が返ってきたときだけ確定者**（Q3a-fix2 BQ-07・PostgreSQL 実走 2026-11-07 で判明: psycopg では INSERT の
+    rowcount が −1 になり rowcount==1 判定は常に False＝確定者 0。RETURNING は挿入時のみ行を返し、衝突時は返さない）。"""
+    values = dict(business=business, category=category, threshold=int(threshold), state=PROMOTION_PENDING, attempts=0,
+                  created_at=now)
+    dialect = (await s.connection()).dialect.name
+    keys = ["business", "category", "threshold"]
+    if dialect == "postgresql":
+        stmt = _pg.insert(exemplar_promotion_notice).values(**values).on_conflict_do_nothing(index_elements=keys)
+    elif dialect == "sqlite":
+        stmt = _sqlite.insert(exemplar_promotion_notice).values(**values).on_conflict_do_nothing(index_elements=keys)
+    else:                                                     # 他方言: 既存確認 → 挿入（重複は PK 違反で例外＝呼び出し側で握る）
+        cur = (await s.execute(sa.select(exemplar_promotion_notice.c.state).where(
+            exemplar_promotion_notice.c.business == business, exemplar_promotion_notice.c.category == category,
+            exemplar_promotion_notice.c.threshold == int(threshold)))).first()
+        if cur is not None:
+            return False
+        stmt = sa.insert(exemplar_promotion_notice).values(**values)
+    res = await s.execute(stmt.returning(exemplar_promotion_notice.c.business))
+    return res.first() is not None
+
+
+async def mark_promotion_sent(business: str, category: str, threshold: int, *, now=None) -> bool:
+    now = now or _now()
+    async with session_scope() as s:
+        r = await s.execute(sa.update(exemplar_promotion_notice).where(
+            exemplar_promotion_notice.c.business == business, exemplar_promotion_notice.c.category == category,
+            exemplar_promotion_notice.c.threshold == int(threshold)).values(
+            state=PROMOTION_SENT, notified_at=now, attempts=exemplar_promotion_notice.c.attempts + 1))
+        return int(r.rowcount or 0) == 1
+
+
+async def bump_promotion_attempt(business: str, category: str, threshold: int) -> bool:
+    async with session_scope() as s:
+        r = await s.execute(sa.update(exemplar_promotion_notice).where(
+            exemplar_promotion_notice.c.business == business, exemplar_promotion_notice.c.category == category,
+            exemplar_promotion_notice.c.threshold == int(threshold)).values(
+            attempts=exemplar_promotion_notice.c.attempts + 1))
+        return int(r.rowcount or 0) == 1
+
+
+async def list_promotion_pending(limit: int = 20) -> list[dict]:
+    """確定済み・未通知（pending）の候補（回収ジョブ用・古い順）。"""
+    async with session_scope() as s:
+        rows = (await s.execute(sa.select(exemplar_promotion_notice).where(
+            exemplar_promotion_notice.c.state == PROMOTION_PENDING)
+            .order_by(exemplar_promotion_notice.c.created_at.asc()).limit(int(limit)))).fetchall()
+    return [{"business": r.business, "category": r.category, "threshold": int(r.threshold), "attempts": int(r.attempts),
+             "created_at": _iso(r.created_at)} for r in rows]
+
+
+# ── JIKOU-REPLY-Q3a-fix2 BQ-07（Codex R-Q3a-fix1）: 計数と確定の直列化・確定行の不足を補う照合 ──
+PROMOTION_LOCK_NS = "exemplar_promotion"
+SERIALIZED_PG = "pg"                 # PostgreSQL: pg_advisory_xact_lock（tx の終わりで自動解放・取得漏れなし）
+SERIALIZED_SINGLE_WRITER = "single_writer"   # sqlite: 直後の UPDATE が書込ロック（RESERVED）を取り commit まで保持
+SERIALIZED_NONE = "none"
+
+
+def promotion_lock_key(business: str, category: str) -> str:
+    """advisory lock の鍵（本文・ID を含まない）。"""
+    return f"{PROMOTION_LOCK_NS}:{business}:{category}"
+
+
+async def _serialize_category(s, business: str, category: str) -> str:
+    """同一 tx 内で (business, category) の直列化を取る。戻り値は固定語彙 pg／single_writer／none（ログ・試験用）。"""
+    dialect = (await s.connection()).dialect.name
+    if dialect == "postgresql":
+        await s.execute(sa.text("SELECT pg_advisory_xact_lock(hashtext(:k))"), {"k": promotion_lock_key(business, category)})
+        return SERIALIZED_PG
+    if dialect == "sqlite":
+        return SERIALIZED_SINGLE_WRITER
+    return SERIALIZED_NONE
+
+
+async def reconcile_promotion_claims(threshold: int = PROMOTION_THRESHOLD, *, now=None) -> int:
+    """照合（回収ジョブから）: 無修正承認の確定件数（unmodified=True・category あり）が閾値以上なのに確定行が無い
+    (business, category) に確定行（pending）を補う。固定キーの INSERT … ON CONFLICT なので重複しない。
+    戻り値は補った件数。補った行は同じ回収ジョブの再通知（list_promotion_pending）で通知される。本文・ID は扱わない。"""
+    now = now or _now()
+    n = 0
+    async with session_scope() as s:
+        reached = (await s.execute(
+            sa.select(reply_draft_approval.c.business, reply_draft_approval.c.category, sa.func.count().label("n"))
+            .where(reply_draft_approval.c.unmodified.is_(True), reply_draft_approval.c.category.isnot(None))
+            .group_by(reply_draft_approval.c.business, reply_draft_approval.c.category)
+            .having(sa.func.count() >= int(threshold)))).fetchall()
+        have = {(r.business, r.category) for r in (await s.execute(
+            sa.select(exemplar_promotion_notice.c.business, exemplar_promotion_notice.c.category)
+            .where(exemplar_promotion_notice.c.threshold == int(threshold)))).fetchall()}
+        for r in reached:
+            if (r.business, r.category) in have:
+                continue
+            if await _claim_promotion(s, r.business, r.category, int(threshold), now):
+                n += 1
+    if n:
+        logger.info("[REPLY_EXEMPLAR] promotion claims reconciled count=%s", emit(n, "count", "log", "operator"))
+    return n
