@@ -1037,6 +1037,65 @@ class TestFix2Inbox(_InboxMixin):
         self.assertEqual(src.count("order by $id desc"), 1)
 
 
+# ── fix4: migration 二股の解消（merge revision e3f5＝b2d4＋d2f4・DDL なし） ──────────────
+class TestFix4MergeRevision(unittest.TestCase):
+    MERGE, Q3A, UX = "e3f5a7b9c1d3", "b2d4f6a8c0e1", "d2f4a6b8c0e2"
+
+    def test_single_head_and_full_upgrade_from_b7d9(self):
+        import sqlite3
+        import tempfile
+        from test_db_foundation import TestAlembicScaffold
+        from hub import approval_close as ac_, attending_release as ar_, reply_exemplar as rx_
+        src = (REPO / "alembic" / "versions" / "20261107_e3f5a7b9c1d3_merge_q3a_ux.py").read_text(encoding="utf-8")
+        self.assertIn("revision: str = 'e3f5a7b9c1d3'", src)
+        self.assertIn("down_revision: Union[str, Sequence[str], None] = ('b2d4f6a8c0e1', 'd2f4a6b8c0e2')", src)
+        self.assertNotIn("op.", src)                                                   # DDL なし
+        d = tempfile.mkdtemp(prefix="merge_rev_mig_")
+        dbfile = f"{d}/mig.db"
+        alembic, tables, _u, _n = TestAlembicScaffold._brain_mig_tools(dbfile)
+        try:
+            self.assertEqual(alembic("heads").stdout.count("(head)"), 1)               # head は 1 本
+            self.assertIn(self.MERGE, alembic("heads").stdout)
+            self.assertEqual(alembic("upgrade", "b7d9f1a3c5e7").returncode, 0)
+            up = alembic("upgrade", "head")                                             # b7d9 → head（両系統を alembic が解決）
+            self.assertEqual(up.returncode, 0, f"stderr={up.stderr[-800:]}")
+            self.assertIn(self.MERGE, alembic("current").stdout)
+            self.assertTrue({rx_.DRAFT_TABLE_NAME, rx_.PROMOTION_TABLE_NAME, ac_.TABLE_NAME, ar_.TABLE_NAME} <= tables())   # 両親の表が揃う
+            # merge point からの相対 downgrade（-1）は alembic が Ambiguous walk で拒む → 親を明示して戻す。
+            # 親（d2f4）へ戻すと merge revision だけが外れて 2 本の head（b2d4・d2f4）に戻り、表・データは不変（merge revision は DDL なし）
+            self.assertNotEqual(alembic("downgrade", "-1").returncode, 0)
+            self.assertEqual(alembic("downgrade", self.UX).returncode, 0)
+            cur = alembic("current").stdout
+            self.assertIn(self.UX, cur)
+            self.assertIn(self.Q3A, cur)
+            self.assertNotIn(self.MERGE, cur)
+            self.assertTrue({rx_.DRAFT_TABLE_NAME, ac_.TABLE_NAME, ar_.TABLE_NAME} <= tables())
+            self.assertEqual(alembic("upgrade", "head").returncode, 0)
+            self.assertIn(self.MERGE, alembic("current").stdout)
+            self.assertEqual(alembic("heads").stdout.count("(head)"), 1)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_production_path_from_b2d4_to_head(self):
+        """本番（current＝b2d4・Q3a 適用済み）から `alembic upgrade head` 一発で c9e1 → d2f4 → merge revision が入り、表が揃う。"""
+        import tempfile
+        from test_db_foundation import TestAlembicScaffold
+        from hub import approval_close as ac_, attending_release as ar_, reply_exemplar as rx_
+        d = tempfile.mkdtemp(prefix="merge_rev_prod_")
+        dbfile = f"{d}/mig.db"
+        alembic, tables, _u, _n = TestAlembicScaffold._brain_mig_tools(dbfile)
+        try:
+            self.assertEqual(alembic("upgrade", self.Q3A).returncode, 0)             # 本番の現在地（b2d4）
+            self.assertNotIn(ac_.TABLE_NAME, tables())
+            up = alembic("upgrade", "head")
+            self.assertEqual(up.returncode, 0, f"stderr={up.stderr[-800:]}")
+            self.assertIn(self.MERGE, alembic("current").stdout)
+            self.assertTrue({rx_.DRAFT_TABLE_NAME, rx_.PROMOTION_TABLE_NAME, ac_.TABLE_NAME, ar_.TABLE_NAME} <= tables())
+            self.assertEqual(alembic("heads").stdout.count("(head)"), 1)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+
 # ── 6. 試験アカウント allowlist（実装のみ・env 設定と有効化は大野） ─────────────────
 class TestTrialAccount(unittest.TestCase):
     def test_env_hash_allowlist_and_routing_override(self):
@@ -1077,7 +1136,7 @@ class TestMigrationAndMenu(unittest.TestCase):
             self.assertEqual(up.returncode, 0, f"stderr={up.stderr[-800:]}")
             self.assertIn(CLOSE, alembic("current").stdout)
             self.assertEqual(alembic("heads").stdout.count("(head)"), 1)
-            self.assertIn("d2f4a6b8c0e2", alembic("heads").stdout)                 # fix1 BU-04 が head
+            self.assertIn("e3f5a7b9c1d3", alembic("heads").stdout)                 # fix4: head は merge revision（b2d4＋d2f4）
             con = sqlite3.connect(dbfile)
             try:
                 cols = {r[1] for r in con.execute(f'PRAGMA table_info("{ac.TABLE_NAME}")')}
@@ -1164,7 +1223,7 @@ class TestMigrationAndMenu(unittest.TestCase):
         try:
             self.assertEqual(alembic("upgrade", CLOSE).returncode, 0)
             self.assertNotIn(ar.TABLE_NAME, tables())
-            up = alembic("upgrade", "head")
+            up = alembic("upgrade", REL)                              # fix4: head は merge revision へ進んだため d2f4 を明示
             self.assertEqual(up.returncode, 0, f"stderr={up.stderr[-800:]}")
             self.assertIn(REL, alembic("current").stdout)
             self.assertEqual(alembic("heads").stdout.count("(head)"), 1)

@@ -174,33 +174,50 @@ class TestNoAutoMigrationPolicy(unittest.TestCase):
 
 class TestAlembicScaffold(unittest.TestCase):
     def test_revisions_form_single_linear_chain_from_baseline(self):
-        """migration履歴の健全性（P1-005a で D5 の「1本のみ」pin から更新）:
-        root は空 baseline ただ1つ・分岐なしの一直線であること
-        （複数head・迷子revisionの混入を検知する）"""
+        """migration履歴の健全性（P1-005a で D5 の「1本のみ」pin から更新・UX-PENDING-1-fix4 で merge revision に対応）:
+        root は空 baseline ただ1つ・**head は 1 本**・迷子 revision なし。分岐は merge revision（down_revision が tuple）で
+        合流している場合だけ許す（複数head・迷子revisionの混入を検知する意図は不変）"""
         import re
         revs = {}
         for p in (REPO / "alembic" / "versions").glob("*.py"):
             src = p.read_text(encoding="utf-8")
             rev = re.search(r"^revision: str = '([0-9a-f]+)'", src, re.M)
             down = re.search(
-                r"^down_revision: .*? = (None|'([0-9a-f]+)')", src, re.M)
+                r"^down_revision: .*? = (None|'([0-9a-f]+)'|\(([^)]*)\))", src, re.M)
             self.assertIsNotNone(rev, f"{p.name}: revision 不明")
             self.assertIsNotNone(down, f"{p.name}: down_revision 不明")
-            revs[rev.group(1)] = (down.group(2), p.name)
-        roots = [(r, name) for r, (down, name) in revs.items() if down is None]
+            if down.group(1) == "None":
+                parents: tuple = ()
+            elif down.group(2):
+                parents = (down.group(2),)
+            else:
+                parents = tuple(re.findall(r"'([0-9a-f]+)'", down.group(3)))      # merge revision
+                self.assertGreaterEqual(len(parents), 2, f"{p.name}: merge revision の親が 2 つ未満")
+            revs[rev.group(1)] = (parents, p.name)
+        roots = [(r, name) for r, (parents, name) in revs.items() if not parents]
         self.assertEqual(len(roots), 1, f"root は1つのみ: {roots}")
         self.assertIn("baseline", roots[0][1])
-        # 分岐なし（同じ down_revision を持つ revision が2つ以上ない）
-        downs = [down for down, _ in revs.values() if down is not None]
-        self.assertEqual(len(downs), len(set(downs)),
-                         "migration履歴が分岐している（headが複数）")
-        # 全revisionが root から辿れる一直線
-        children = {down: r for r, (down, _) in revs.items()}
-        chain, cur = 1, roots[0][0]
-        while cur in children:
-            cur = children[cur]
-            chain += 1
-        self.assertEqual(chain, len(revs), "rootから辿れない迷子revisionがある")
+        # 全 revision の親が実在する（迷子の親なし）
+        for r, (parents, name) in revs.items():
+            for pa in parents:
+                self.assertIn(pa, revs, f"{name}: 親 {pa} が無い")
+        # head は 1 本（誰の親にもなっていない revision がただ 1 つ）＝分岐は merge revision で合流済み
+        referenced = {pa for parents, _ in revs.values() for pa in parents}
+        heads = sorted(r for r in revs if r not in referenced)
+        self.assertEqual(len(heads), 1, f"migration履歴が分岐している（headが複数）: {heads}")
+        # 全 revision が root から辿れる（迷子 revision なし）
+        children: dict = {}
+        for r, (parents, _) in revs.items():
+            for pa in parents:
+                children.setdefault(pa, []).append(r)
+        seen, stack = set(), [roots[0][0]]
+        while stack:
+            cur = stack.pop()
+            if cur in seen:
+                continue
+            seen.add(cur)
+            stack.extend(children.get(cur, []))
+        self.assertEqual(len(seen), len(revs), "rootから辿れない迷子revisionがある")
 
     def test_offline_upgrade_generates_sql(self):
         """scaffold 一式（ini→env.py→versions）が実DB無しで通ることの煙テスト。
@@ -1046,7 +1063,7 @@ class TestReplyExemplarMigration(unittest.TestCase):
                 con.close()
             # JIKOU-REPLY-Q3a: head（b2d4f6a8c0e1・FORWARD-MERGE-2 で b7d9 の後ろ）で reply_draft_approval が増え、列集合が metadata と一致
             self.assertNotIn(reply_exemplar.DRAFT_TABLE_NAME, tables())
-            up = alembic("upgrade", "head")
+            up = alembic("upgrade", self.DRAFT_APPROVAL)        # UX-PENDING-1-fix4: head は merge revision（e3f5）へ進んだため b2d4 を明示
             self.assertEqual(up.returncode, 0, f"stderr={up.stderr[-800:]}")
             self.assertIn(self.DRAFT_APPROVAL, alembic("current").stdout)
             self.assertIn(reply_exemplar.DRAFT_TABLE_NAME, tables())
@@ -1202,7 +1219,7 @@ class TestReplyExemplarMigration(unittest.TestCase):
         dbfile = f"{d}/mig.db"
         alembic, tables, _unique_cols, _nullable = TestAlembicScaffold._brain_mig_tools(dbfile)
         try:
-            self.assertEqual(alembic("upgrade", "head").returncode, 0)
+            self.assertEqual(alembic("upgrade", self.DRAFT_APPROVAL).returncode, 0)   # UX-PENDING-1-fix4: b2d4 を明示（head は merge revision）
             con = sqlite3.connect(dbfile)
             try:
                 con.execute("INSERT INTO reply_draft_approval (record_id, business, category, draft_text_version, "
