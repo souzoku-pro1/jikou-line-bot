@@ -11,6 +11,7 @@
 """
 
 import datetime
+import os
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -36,6 +37,10 @@ class TestTextApproval2(_Fix2Mixin):
         super().setUp()
         AT.reset_pending_for_tests()
         self.addCleanup(AT.reset_pending_for_tests)
+        # TEXT-APPROVAL-3（2026-11-04）追随: v2 承認後は公開ホストがあると v2（完全 URL）になるため、v1 の期待は「公開ホスト無し」を明示する
+        _host = patch.dict(os.environ, {"RAILWAY_PUBLIC_DOMAIN": ""})
+        _host.start()
+        self.addCleanup(_host.stop)
 
     def test_ledger_has_exactly_the_approved_line_and_j0_pin_is_unchanged(self):
         self.assertEqual(AT.APPROVED_SHA256["ops_age_notice_v1"], SHA_AGE)                        # 承認した SHA（全桁）

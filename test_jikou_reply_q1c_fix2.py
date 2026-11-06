@@ -323,6 +323,10 @@ class TestAgeNoticeApprovedText(_Fix2Mixin):
         super().setUp()
         AT.reset_pending_for_tests()
         self.addCleanup(AT.reset_pending_for_tests)
+        # TEXT-APPROVAL-3（2026-11-04）追随: v2 承認後は公開ホストがあると v2（完全 URL）になるため、v1 の期待は「公開ホスト無し」を明示する
+        _host = patch.dict(os.environ, {"RAILWAY_PUBLIC_DOMAIN": ""})
+        _host.start()
+        self.addCleanup(_host.stop)
 
     def _seed(self):
         self.reg(inbound_event_id="e-old1", now=self.NOW - datetime.timedelta(minutes=90))
