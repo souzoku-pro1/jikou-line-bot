@@ -861,7 +861,7 @@ def build_system_prompt(
     court_docs: str = "（未登録）",
     credit_check: str = "（未登録）",
     known_items: Optional[dict] = None,
-    profile: BusinessProfile | None = None, human_note: str = "",  # JIKOU-REPLY-Q1b: 履歴に human 行があるときの注記（空なら従来どおり）
+    profile: BusinessProfile | None = None, human_note: str = "", exemplar_note: str = "",  # JIKOU-REPLY-Q1b: human 注記／Q3a: 参考文例（空なら従来どおり）
 ) -> str:
     """顧客対応Claudeのシステムプロンプトを組み立てる。
 
@@ -890,7 +890,7 @@ def build_system_prompt(
             "\n上記は既に回答済み・受領済みの項目です。同じ内容を再度"
             "質問・依頼しないでください。"
         )
-    return prompt + human_note  # JIKOU-REPLY-Q1b: human_note は "" 既定＝customer_prompt_base の pin 不変
+    return prompt + human_note + exemplar_note  # JIKOU-REPLY-Q1b/Q3a: どちらも "" 既定＝customer_prompt_base の pin 不変
 
 
 # ── サーバー側ガード（自動送信前の二重チェック） ─────────────────────────────────
@@ -1380,7 +1380,7 @@ async def save_to_approval_queue(
                     emit(resp.status_code, "count", "log", "operator"),
                     emit(resp.text, "vendor_raw", "log", "operator"))
         return None
-    record_id = resp.json().get("id")
+    record_id = resp.json().get("id"); await reply_exemplar.record_draft(record_id, "jikou", category, ai_draft)  # JIKOU-REPLY-Q3a (c): 起票時の下書き sha256
     logger.info("[APP29] saved record_id=%s",
                 emit(record_id, "record_id", "log", "operator"))
     return record_id
@@ -1648,7 +1648,7 @@ async def handle_customer_message(
         court_docs=_field("裁判所書類"),
         credit_check=_field("信用情報確認"),
         known_items=known_items,
-        profile=p, human_note=human_history_note(history),  # JIKOU-REPLY-Q1b: 事務所（human）返信を前提にする注記
+        profile=p, human_note=human_history_note(history), exemplar_note=(_exn := await reply_exemplar.prompt_note(p.name, status)),  # JIKOU-REPLY-Q1b 注記／Q3a (b) 参考文例（0 件は ""）
     )
 
     # Claude で返信案を作成
@@ -1657,7 +1657,7 @@ async def handle_customer_message(
                                            tool=p.compose_tool)
     except ClaudeUnavailableError as e:
         # PRIMARY / FALLBACK 両方失敗 → 確認中応答 + 承認キューに要対応レコード
-        logger.exception("compose_reply unavailable for user_id=%s", user_id)
+        logger.error("[COMPOSE_REPLY] unavailable (fixed reason)")  # Q3a-fix1 BQ-04: 生 user_id・例外本文・traceback を出さない（RV-10）
         await handle_claude_outage(
             user_id=user_id,
             user_message=user_message,
@@ -1668,8 +1668,8 @@ async def handle_customer_message(
             profile=p,
         )
         return
-    except Exception:
-        logger.exception("compose_reply failed for user_id=%s", user_id)
+    except Exception as e:  # Q3a-fix1 BQ-04（RV-10）
+        logger.error("[COMPOSE_REPLY] failed (fixed reason)")
         # 一時的なエラー（レート制限等）は定型文を返して終了
         # （H2-fix1 [01]: 障害系の両経路とも profile の pending_reply を使う）
         await send_policy.outage_ack(user_id, reply_token, reply_func, p.pending_reply)  # JIKOU-REPLY-Q1c: ON は無言+対応待ち
@@ -1696,7 +1696,7 @@ async def handle_customer_message(
     # サーバー側二重チェック（カテゴリ許可リスト＋禁止語・必須文言・留保文言
     # ＋GEN2: プレースホルダ/長さ/質問数/法テラス標準回答）
     guard = send_policy.apply_v2(apply_server_guards(result, history, user_message,  # JIKOU-REPLY-Q1c (b): 空返事は自動送信しない（V2 OFF は空文字のみ降格）
-                                sanitize_fatal=sanitize_fatal, profile=p), reply_text)
+                                sanitize_fatal=sanitize_fatal, profile=p), reply_text); guard = reply_exemplar.require_approval_if_referenced(guard, _exn)  # Q3a-fix1 BQ-01: 手本参照の生成は承認後のみ送信
     if guard.demotion_reasons:
         logger.info("[GUARD] demoted user_id=%s reasons=%s",
                     emit(user_id, "external_ref", "log", "operator"),
@@ -1706,7 +1706,7 @@ async def handle_customer_message(
     await save_to_chatlog(user_id, "user", user_message, category, "no")
 
     if guard.can_auto_send:
-        await reply_func(reply_token, reply_text)
+        await reply_func(reply_token, reply_text)  # Q3a-fix1 BQ-01: 手本参照ありの生成はここに来ない（used は承認キューに固定した時点で付ける）
         await save_to_chatlog(user_id, "assistant", reply_text, category, "yes")
         logger.info("[AUTO_SEND] user_id=%s len=%s",
                     emit(user_id, "external_ref", "log", "operator"),
@@ -1723,7 +1723,7 @@ async def handle_customer_message(
             ai_draft=reply_text,
             category=category,
             reason=queue_reason,
-        )
+        ); await reply_exemplar.mark_used_for(_exn, category)  # Q3a-fix1 BQ-01: 手本は承認キューに固定した下書きで使われた（結果の category の群だけ）
         # 顧客への定型文を返信（裁判所書類の第一報・離脱兆候・対象外債権・
         # 法テラスは専用文面。GEN2 要件5: それ以外はカテゴリ別の文脈化定型
         # ——大野の文言確定=PENDING_CONTEXT_ENABLED までは現行文言）
@@ -1972,3 +1972,7 @@ def sanitize_reply_without_human_marker(text: str, **kwargs) -> tuple[str, list[
 #    hub/send_policy は chat_responder を遅延 import する（循環なし）。flag OFF（既定）では各関数が
 #    従来の値・従来の呼び出しをそのまま返す（挙動不変・test_jikou_reply_q1c が pin）。
 from hub import send_policy  # noqa: E402
+
+# ── JIKOU-REPLY-Q3a（QUEUE-2026-10-12-C C-2）: 承認済み手本の参考文例（prompt 末尾・0 件は ""）と無修正承認の計数。
+#    末尾追記（sink allowlist の行番号 pin を動かさない規約・本文中は 1 行置換のみ）。
+from hub import reply_exemplar  # noqa: E402

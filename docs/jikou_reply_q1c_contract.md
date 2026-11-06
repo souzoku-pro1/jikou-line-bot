@@ -148,6 +148,10 @@ ON のときだけ有効な事項は「V2 ON」と明記する。
   （氏名: 画面可・通知／URL 不可。本文: **一覧と返信画面に表示可**・通知・URL・ログには出さない〔fix4 BU-12 で「返信画面のみ」から訂正・
   2026-11-07・Codex R-UX1-fix3 CONDITIONAL〕。LINE userId・ハッシュ: どこにも出さない）。設計書 docs/ux_pending_1_design.md §2 の表に明文化。
 
+- **JIKOU-REPLY-Q3a-fix1 項目 4（凍結記録・2026-11-03）**: 承認済み手本の「参考文例」ブロック（`hub.reply_exemplar.NOTE_TEMPLATE`・
+  sha256 `511ade90f0c8ec7893659ceed06d42a8477d43015af0665bf5ecf210fa00dd49`）は **凍結対象外の実行時付加** とする。手本 0 件なら付加なし＝基底 prompt は byte 同一で、
+  `customer_prompt_base` の pin（`908f9335…`）は不変（test_jikou_reply_q3a が両方を固定）。テンプレートを変える場合は pin と本記録を同時に更新する。
+
 ## 7. migration（fix1 BC-02）
 
 - 鎖は 1 本: e5f8（送信台帳）→ f7b2（手本）→ a7c9（create_state）→ c8e0（row_version）→ **a1c3**（対応待ち・Q1b-fix5／fix6 で

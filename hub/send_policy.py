@@ -510,9 +510,72 @@ async def approval_blocked(record_id: str, revision: str, reasons) -> str:
     return await send_business_notice(f"approval_blocked:{record_id}:{revision}", text)
 
 
-async def approved_draft_sent(record_id: str, user_id: str) -> int:
-    """承認済み下書きの送信成功: **送信着手時点で固定した**対応待ち集合（fixed_targets が束ねたもの）だけを
-    human_replied（approved_draft）で閉じる（fix1 BC-04）。送信中に届いた受信は open のまま。固定集合が無ければ閉じない。"""
+PROMOTION_HEADER = "【凍結定型の候補】"
+PROMOTION_FOOTER = "/app/exemplars と承認キューを確認し、凍結定型への昇格を検討してください（昇格は Q5・票で反映）。"
+
+
+async def promotion_check(record_id: str, text: str) -> str:
+    """JIKOU-REPLY-Q3a (c)／fix1 BQ-05: 承認済み下書きの送信文を起票時の下書きと照合し、同じ category の無修正承認が閾値に
+    達したら、**固定キー (business, category, threshold) を同一 tx で確定できた 1 者だけ** が業務 LINE へ固定文言を通知する
+    （台帳キー exemplar_promotion:{category}:{threshold}＝1 通）。count == 閾値の瞬間には依存しない（>= で確定・並行 2 件でも 1 者）。
+    通知に失敗しても確定行は pending のまま残り、回収ジョブ（run_promotion_notice_job）が再通知する。
+    戻り値: none（照合対象なし／修正あり／未達／他者が確定済み）・sent・throttled・failed 等（通知の結果）。"""
+    from hub import reply_exemplar
+    res = await reply_exemplar.record_sent(record_id, text)
+    if not res or not res.get("claimed") or not res.get("category"):
+        return "none"
+    return await send_promotion_notice(BUSINESS, str(res["category"]), int(res["threshold"]))
+
+
+async def send_promotion_notice(business: str, category: str, threshold: int) -> str:
+    """確定済みの候補を通知し、結果で確定行を進める（sent／throttled → sent・それ以外 → attempts+1 のまま pending）。"""
+    from hub import reply_exemplar
+    logger.info("[SEND_POLICY] exemplar promotion candidate threshold=%s", emit(threshold, "count", "log", "operator"))
+    state = await send_business_notice(
+        f"exemplar_promotion:{category}:{int(threshold)}",
+        f"{PROMOTION_HEADER}\nカテゴリ「{category}」の AI 下書きが無修正で {int(threshold)} 回承認されました。\n{PROMOTION_FOOTER}")
+    try:
+        if state in (reply_pending.NOTIFY_SENT, reply_pending.NOTIFY_THROTTLED):
+            await reply_exemplar.mark_promotion_sent(business, category, threshold)
+        else:
+            await reply_exemplar.bump_promotion_attempt(business, category, threshold)
+    except Exception:
+        logger.warning("[SEND_POLICY] promotion state update failed (fixed reason)")
+    return state
+
+
+async def run_promotion_notice_job() -> dict:
+    """回収ジョブ（send_ledger の回収に相乗り・5 分ごと）: (1) Q3a-fix2 BQ-07 照合＝確定済み件数が閾値以上なのに確定行が無い
+    (business, category) に確定行を補う → (2) 確定済み・未通知の候補を再通知（台帳キーで 1 通・PII なし）。"""
+    from hub import reply_exemplar
+    res = {"retried": 0, "reconciled": 0}
+    if not reply_exemplar._db_configured():
+        return res
+    try:
+        res["reconciled"] = await reply_exemplar.reconcile_promotion_claims()
+    except Exception:
+        logger.warning("[SEND_POLICY] promotion reconcile failed (fixed reason)")
+    try:
+        rows = await reply_exemplar.list_promotion_pending()
+    except Exception:
+        logger.warning("[SEND_POLICY] promotion pending read failed (fixed reason)")
+        return res
+    for r in rows:
+        await send_promotion_notice(r["business"], r["category"], int(r["threshold"]))
+        res["retried"] += 1
+    return res
+
+
+async def approved_draft_sent(record_id: str, user_id: str, text: str | None = None,
+                              category: str | None = None) -> int:
+    """承認済み下書きの送信成功: (Q1c-fix1 BC-04) **送信着手時点で固定した**対応待ち集合（fixed_targets が束ねたもの）だけを
+    human_replied（approved_draft）で閉じる（送信中に届いた受信は open のまま・固定集合が無ければ閉じない）。
+    (Q3a) 無修正承認の計数と候補通知（flag 非依存・失敗は握る）。"""
+    if text is not None:
+        try:
+            await promotion_check(record_id, text)
+        except Exception:
+            logger.warning("[SEND_POLICY] promotion check failed (fixed reason)")
     if not enabled():
         return 0
     ids = _fixed_targets.get()
@@ -840,6 +903,7 @@ def register_jobs() -> None:
     """main の末尾から（冪等）: 回収ジョブへの相乗り＋経過通知の daily ジョブ（start_all は既存の startup が呼ぶ）。"""
     from hub import scheduler as hub_scheduler
     send_ledger.register_recover_hook(run_pending_retry_job)
+    send_ledger.register_recover_hook(run_promotion_notice_job)   # Q3a-fix1 BQ-05: 候補通知の回収
     for hour in AGE_NOTICE_HOURS_JST:
         name = age_job_name(hour)
         if not hub_scheduler.is_registered(name):
