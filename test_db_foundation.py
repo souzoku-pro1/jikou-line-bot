@@ -174,33 +174,50 @@ class TestNoAutoMigrationPolicy(unittest.TestCase):
 
 class TestAlembicScaffold(unittest.TestCase):
     def test_revisions_form_single_linear_chain_from_baseline(self):
-        """migration履歴の健全性（P1-005a で D5 の「1本のみ」pin から更新）:
-        root は空 baseline ただ1つ・分岐なしの一直線であること
-        （複数head・迷子revisionの混入を検知する）"""
+        """migration履歴の健全性（P1-005a で D5 の「1本のみ」pin から更新・UX-PENDING-1-fix4 で merge revision に対応）:
+        root は空 baseline ただ1つ・**head は 1 本**・迷子 revision なし。分岐は merge revision（down_revision が tuple）で
+        合流している場合だけ許す（複数head・迷子revisionの混入を検知する意図は不変）"""
         import re
         revs = {}
         for p in (REPO / "alembic" / "versions").glob("*.py"):
             src = p.read_text(encoding="utf-8")
             rev = re.search(r"^revision: str = '([0-9a-f]+)'", src, re.M)
             down = re.search(
-                r"^down_revision: .*? = (None|'([0-9a-f]+)')", src, re.M)
+                r"^down_revision: .*? = (None|'([0-9a-f]+)'|\(([^)]*)\))", src, re.M)
             self.assertIsNotNone(rev, f"{p.name}: revision 不明")
             self.assertIsNotNone(down, f"{p.name}: down_revision 不明")
-            revs[rev.group(1)] = (down.group(2), p.name)
-        roots = [(r, name) for r, (down, name) in revs.items() if down is None]
+            if down.group(1) == "None":
+                parents: tuple = ()
+            elif down.group(2):
+                parents = (down.group(2),)
+            else:
+                parents = tuple(re.findall(r"'([0-9a-f]+)'", down.group(3)))      # merge revision
+                self.assertGreaterEqual(len(parents), 2, f"{p.name}: merge revision の親が 2 つ未満")
+            revs[rev.group(1)] = (parents, p.name)
+        roots = [(r, name) for r, (parents, name) in revs.items() if not parents]
         self.assertEqual(len(roots), 1, f"root は1つのみ: {roots}")
         self.assertIn("baseline", roots[0][1])
-        # 分岐なし（同じ down_revision を持つ revision が2つ以上ない）
-        downs = [down for down, _ in revs.values() if down is not None]
-        self.assertEqual(len(downs), len(set(downs)),
-                         "migration履歴が分岐している（headが複数）")
-        # 全revisionが root から辿れる一直線
-        children = {down: r for r, (down, _) in revs.items()}
-        chain, cur = 1, roots[0][0]
-        while cur in children:
-            cur = children[cur]
-            chain += 1
-        self.assertEqual(chain, len(revs), "rootから辿れない迷子revisionがある")
+        # 全 revision の親が実在する（迷子の親なし）
+        for r, (parents, name) in revs.items():
+            for pa in parents:
+                self.assertIn(pa, revs, f"{name}: 親 {pa} が無い")
+        # head は 1 本（誰の親にもなっていない revision がただ 1 つ）＝分岐は merge revision で合流済み
+        referenced = {pa for parents, _ in revs.values() for pa in parents}
+        heads = sorted(r for r in revs if r not in referenced)
+        self.assertEqual(len(heads), 1, f"migration履歴が分岐している（headが複数）: {heads}")
+        # 全 revision が root から辿れる（迷子 revision なし）
+        children: dict = {}
+        for r, (parents, _) in revs.items():
+            for pa in parents:
+                children.setdefault(pa, []).append(r)
+        seen, stack = set(), [roots[0][0]]
+        while stack:
+            cur = stack.pop()
+            if cur in seen:
+                continue
+            seen.add(cur)
+            stack.extend(children.get(cur, []))
+        self.assertEqual(len(seen), len(revs), "rootから辿れない迷子revisionがある")
 
     def test_offline_upgrade_generates_sql(self):
         """scaffold 一式（ini→env.py→versions）が実DB無しで通ることの煙テスト。
@@ -982,6 +999,9 @@ class TestReplyExemplarMigration(unittest.TestCase):
     REPLY_PENDING = "a1c3e5f7b9d2"      # JIKOU-REPLY-Q1c: 対応待ち（c8e0 の後ろ。fix5／fix6 で f7b2 → a7c9 → c8e0 に付け替え）
     REPLY_PENDING_RETRY = "d4f6a8b0c2e4"  # JIKOU-REPLY-Q1c-fix1 BC-03: 対応待ちの保存失敗の永続キュー reply_pending_retry（a1c3 の次）
     REPLY_PENDING_NOTICE = "b7d9f1a3c5e7"  # JIKOU-REPLY-Q1c-fix2 BC-07: reply_pending.notice_key／claim 列・retry.notice_key（d4f6 の次）
+    APPROVAL_CLOSE = "c9e1b3d5f7a9"        # UX-PENDING-1: approval_close（承認キューの閉じ記録・b7d9 の次）
+    ATTENDING_RELEASE = "d2f4a6b8c0e2"     # UX-PENDING-1-fix1 BU-04: attending_release（解除未完了・c9e1 の次・head）
+
     DRAFT_APPROVAL = "b2d4f6a8c0e1"     # JIKOU-REPLY-Q3a: 下書き照合（b7d9 の後ろ・head。Q1c-fix1 で a1c3 → d4f6、FORWARD-MERGE-2 で d4f6 → b7d9 に付け替え）
 
     def test_reply_exemplar_migration_round_trip(self):
@@ -1019,7 +1039,7 @@ class TestReplyExemplarMigration(unittest.TestCase):
             self.assertEqual(up.returncode, 0, f"stderr={up.stderr[-800:]}")
             self.assertIn(self.REPLY_PENDING_RETRY, alembic("current").stdout)
             self.assertIn(reply_pending.RETRY_TABLE_NAME, tables())
-            up = alembic("upgrade", self.REPLY_PENDING_NOTICE)  # Q1c-fix2 BC-07: b7d9（notice_key／claim 列）。Q3a で head は b2d4 へ進んだため明示（鎖は 1 本）
+            up = alembic("upgrade", self.REPLY_PENDING_NOTICE)   # Q1c-fix2 BC-07: b7d9（notice_key／claim 列）。UX-PENDING-1（c9e1→d2f4）と Q3a（b2d4）で head が分岐したため b7d9 を明示（鎖の途中の固定点）
             self.assertEqual(up.returncode, 0, f"stderr={up.stderr[-800:]}")
             self.assertIn(self.REPLY_PENDING_NOTICE, alembic("current").stdout)
             # main（Q1c-fix2）と同じく、対応待ち 3 表の列集合・NULL 制約・索引・FK は b7d9（通知キー列あり）で metadata と比較する
@@ -1043,7 +1063,7 @@ class TestReplyExemplarMigration(unittest.TestCase):
                 con.close()
             # JIKOU-REPLY-Q3a: head（b2d4f6a8c0e1・FORWARD-MERGE-2 で b7d9 の後ろ）で reply_draft_approval が増え、列集合が metadata と一致
             self.assertNotIn(reply_exemplar.DRAFT_TABLE_NAME, tables())
-            up = alembic("upgrade", "head")
+            up = alembic("upgrade", self.DRAFT_APPROVAL)        # UX-PENDING-1-fix4: head は merge revision（e3f5）へ進んだため b2d4 を明示
             self.assertEqual(up.returncode, 0, f"stderr={up.stderr[-800:]}")
             self.assertIn(self.DRAFT_APPROVAL, alembic("current").stdout)
             self.assertIn(reply_exemplar.DRAFT_TABLE_NAME, tables())
@@ -1199,7 +1219,7 @@ class TestReplyExemplarMigration(unittest.TestCase):
         dbfile = f"{d}/mig.db"
         alembic, tables, _unique_cols, _nullable = TestAlembicScaffold._brain_mig_tools(dbfile)
         try:
-            self.assertEqual(alembic("upgrade", "head").returncode, 0)
+            self.assertEqual(alembic("upgrade", self.DRAFT_APPROVAL).returncode, 0)   # UX-PENDING-1-fix4: b2d4 を明示（head は merge revision）
             con = sqlite3.connect(dbfile)
             try:
                 con.execute("INSERT INTO reply_draft_approval (record_id, business, category, draft_text_version, "

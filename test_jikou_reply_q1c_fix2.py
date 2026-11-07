@@ -323,6 +323,10 @@ class TestAgeNoticeApprovedText(_Fix2Mixin):
         super().setUp()
         AT.reset_pending_for_tests()
         self.addCleanup(AT.reset_pending_for_tests)
+        # TEXT-APPROVAL-3（2026-11-04）追随: v2 承認後は公開ホストがあると v2（完全 URL）になるため、v1 の期待は「公開ホスト無し」を明示する
+        _host = patch.dict(os.environ, {"RAILWAY_PUBLIC_DOMAIN": ""})
+        _host.start()
+        self.addCleanup(_host.stop)
 
     def _seed(self):
         self.reg(inbound_event_id="e-old1", now=self.NOW - datetime.timedelta(minutes=90))
@@ -378,8 +382,8 @@ class TestAgeNoticeApprovedText(_Fix2Mixin):
         src = (REPO / "hub" / "send_policy.py").read_text(encoding="utf-8")
         self.assertNotIn("f\"{AGE_NOTICE_HEADER}\\n未返信の対応待ち {stats", src)                        # 旧い文字列組立は残っていない
         self.assertEqual(sp.AGE_NOTICE_TEXT_KEY, "ops_age_notice_v1")
-        # 台帳の閉集合: TEXT-APPROVAL-GATE-1 の安全文 ＋ TEXT-APPROVAL-2（2026-11-02・大野承認）の ops_age_notice_v1（契約の追随）
-        self.assertEqual(set(AT.APPROVED_SHA256), {AT.SAFE_TEXT_KEY, sp.AGE_NOTICE_TEXT_KEY})
+        # 台帳の閉集合: TEXT-APPROVAL-GATE-1 の安全文 ＋ TEXT-APPROVAL-2（2026-11-02）の ops_age_notice_v1 ＋ TEXT-APPROVAL-3（2026-11-04）の v2（契約の追随）
+        self.assertEqual(set(AT.APPROVED_SHA256), {AT.SAFE_TEXT_KEY, sp.AGE_NOTICE_TEXT_KEY, sp.AGE_NOTICE_TEXT_KEY_V2})
         self.assertEqual(AT.APPROVED_SHA256[sp.AGE_NOTICE_TEXT_KEY], AT.sha256_text(sp.AGE_NOTICE_TEMPLATE))
 
 

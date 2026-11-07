@@ -64,6 +64,12 @@ J0_TEXT_SHA256 = hashlib.sha256(J0_TEXT.encode("utf-8")).hexdigest()
 NOTICE_HEADER = "【対応待ち】自動返信できない問い合わせがあります。"
 NOTICE_FOOTER = "返信欄（/app/reply/承認キュー No.）からご返信ください。同じ相談者への本通知は本日これ以降省略します。"
 NOTICE_NO_APPROVAL = "承認キュー: 未作成（/app/pending で確認）"
+# UX-PENDING-1 (1)(5): 通知にその件の署名付きリンクを載せる（本文・氏名・ID は従来どおり無し）。リンクが作れない
+# （公開ホスト未設定・鍵無効・pending_id 不明）ときは従来の文面（NOTICE_FOOTER）のまま。
+NOTICE_REPLY_LINK = "返信する: "
+NOTICE_LIST_LINK = "一覧で確認: "
+NOTICE_CLOSE_LINK = "別の方法で返信済みなら → 対応終了: "
+NOTICE_FOOTER_LINKED = "同じ相談者への本通知は本日これ以降省略します。"
 APPROVAL_BLOCKED_HEADER = "【承認済み下書き・未送信】"
 APPROVAL_BLOCKED_FOOTER = "停止条件が解けてから再承認してください（人対応中・対応中の返信は返信欄から）。"
 
@@ -125,6 +131,50 @@ async def conditions(user_id: str, *, now=None) -> dict:
 
 def clear_condition_cache() -> None:
     _condition_cache.clear()
+
+
+async def human_conditions(user_id: str) -> dict:
+    """UX-PENDING-1-fix1 BU-01（Codex R-UX1）: 人の明示送信（返信画面）の直前確認。30 秒の再利用窓（_condition_cache）を
+    **読まず・書かず**、停止リストと対応モードを毎回照会する（画面表示の後に停止リストへ登録された相談者にも送らない）。
+    照会の失敗は各値が UNKNOWN（呼び出し側は送らない）。bot 側の conditions() とキャッシュは不変。
+    fix1 BU-02: 停止リストの unconfigured（env 未設定・userId 書式外）と App 21 の設定欠落（env 未設定）も UNKNOWN＝送らない。
+    正常な検索結果 0 件（clear）・App 21 にレコードが無い（設定はある・対応モード未設定）は CLEAR のまま区別する。"""
+    return {"paused": _paused_value(),
+            "stoplisted": await _stoplist_value_human(user_id),
+            "human_mode": await _human_mode_value_human(user_id)}
+
+
+async def _stoplist_value_human(user_id: str) -> str:
+    """BU-02: human 用。stopped → STOPPED／clear（検索 0 件）→ CLEAR／unknown・unconfigured・それ以外 → UNKNOWN。"""
+    from hub import autoreply_stoplist
+    try:
+        outcome = await autoreply_stoplist.check(user_id)
+    except Exception:
+        return send_ledger.UNKNOWN
+    if outcome == autoreply_stoplist.OUTCOME_STOPPED:
+        return send_ledger.STOPPED
+    if outcome == autoreply_stoplist.OUTCOME_CLEAR:
+        return send_ledger.CLEAR
+    return send_ledger.UNKNOWN
+
+
+def app21_configured() -> bool:
+    """BU-02: App 21 の照会に要る env（KINTONE_SUBDOMAIN／KINTONE_APP_ID／KINTONE_API_TOKEN）が揃っているか。
+    chat_responder.get_app21_record が「env 未設定 → 照会せず None」と判定するのと同じ 3 つを、呼出時の環境から読む。"""
+    return bool(os.environ.get("KINTONE_SUBDOMAIN") and os.environ.get("KINTONE_APP_ID") and os.environ.get("KINTONE_API_TOKEN"))
+
+
+async def _human_mode_value_human(user_id: str) -> str:
+    """BU-02: human 用。設定欠落（env 未設定＝get_app21_record が照会せず None を返す）と照会失敗は UNKNOWN。
+    設定があってレコードが無い（0 件）は「対応モード未設定」＝CLEAR（人対応ゲートの既存判定と同じ）。"""
+    if not app21_configured():
+        return send_ledger.UNKNOWN
+    cr = _cr()
+    try:
+        rec = await cr.get_app21_record(user_id)
+    except Exception:
+        return send_ledger.UNKNOWN
+    return send_ledger.STOPPED if cr.is_human_mode(rec) else send_ledger.CLEAR
 
 
 async def conditions_if_applicable(channel_name: str, to: str) -> dict | None:
@@ -235,10 +285,29 @@ def notice_key(conv_ref: str, user_hash: str, *, today: datetime.date | None = N
     return f"pending_notice:{conv_ref or user_hash[:16]}:{day}"
 
 
-def notice_text(approval_record_id: str | None, category: str | None) -> str:
+def notice_links(pending_id, approval_record_id) -> list[str]:
+    """UX-PENDING-1: 通知に載せる行（URL が作れなければ空＝従来文面）。承認キューが無い件は返信画面を開けないため一覧へ。"""
+    from hub import pending_link
+    try:
+        pid = int(pending_id or 0)
+    except (TypeError, ValueError):
+        return []
+    if pid <= 0:
+        return []
+    close_url = pending_link.close_url(pid)
+    if not close_url:
+        return []
+    first = (NOTICE_REPLY_LINK + pending_link.reply_url(pid)) if approval_record_id else (NOTICE_LIST_LINK + pending_link.inbox_url())
+    return [first, NOTICE_CLOSE_LINK + close_url]
+
+
+def notice_text(approval_record_id: str | None, category: str | None, pending_id=None) -> str:
     rid = f"承認キュー No.{approval_record_id}" if approval_record_id else NOTICE_NO_APPROVAL
     cat = f"・カテゴリ: {category}" if category else ""
-    return f"{NOTICE_HEADER}\n{rid}{cat}\n{NOTICE_FOOTER}"
+    links = notice_links(pending_id, approval_record_id)
+    if not links:
+        return f"{NOTICE_HEADER}\n{rid}{cat}\n{NOTICE_FOOTER}"
+    return "\n".join([NOTICE_HEADER, f"{rid}{cat}", *links, NOTICE_FOOTER_LINKED])
 
 
 async def _push_business_http(to: str, text: str) -> bool:
@@ -552,6 +621,13 @@ AGE_NOTICE_TEXT_KEY = "ops_age_notice_v1"
 AGE_NOTICE_TEMPLATE = (f"{AGE_NOTICE_HEADER}\n未返信の対応待ち {{{{open}}}} 件（{{{{threshold}}}} 分超 {{{{over}}}} 件・"
                        f"最長 {{{{oldest}}}} 分経過）・再処理待ち {{{{queued}}}} 件\n{AGE_NOTICE_FOOTER}")
 AGE_NOTICE_SLOTS = ("{{open}}", "{{threshold}}", "{{over}}", "{{oldest}}", "{{queued}}")   # 数値のみ（本文・ID・氏名は無い）
+# UX-PENDING-1 (1): 末尾を完全な URL にした v2。承認台帳に `ops_age_notice_v2` が載る（大野承認）まで v1 のまま送る。
+# 差し込みは数値 5 つ＋URL 1 つ（URL は公開ホスト＋固定 path /app/inbox だけ・件ごとの値は入らない）。
+AGE_NOTICE_TEXT_KEY_V2 = "ops_age_notice_v2"
+AGE_NOTICE_URL_SLOT = "{{url}}"
+AGE_NOTICE_FOOTER_V2 = f"{AGE_NOTICE_URL_SLOT} からご確認ください。"
+AGE_NOTICE_TEMPLATE_V2 = (f"{AGE_NOTICE_HEADER}\n未返信の対応待ち {{{{open}}}} 件（{{{{threshold}}}} 分超 {{{{over}}}} 件・"
+                          f"最長 {{{{oldest}}}} 分経過）・再処理待ち {{{{queued}}}} 件\n{AGE_NOTICE_FOOTER_V2}")
 AGE_NOTICE_NEEDS_APPROVAL = "needs_approval"                                              # run_age_notice_job の notice 値（送っていない）
 JOB_STATUS_KEY = "status"                                                                 # TEXT-APPROVAL-2-fix1: 定期ジョブの入口ゲートの印
 JOB_DISABLED = "disabled"                                                                 # V2 OFF＝入口で停止（DB も台帳も触らず・送信関数を呼ばない）
@@ -770,7 +846,11 @@ async def run_pending_retry_job(*, now=None) -> dict:
 def age_notice_text(stats: dict, queued: int, threshold: int) -> str:
     """fix2 BC-08: 承認台帳の定型 ops_age_notice_v1 に **数値だけ** 差し込む。定型が未承認（台帳に無い・本文 SHA 不一致）なら ""
     ＝呼出側は送らない（needs_approval）。文字列の組立・自由文の連結はしない。"""
-    tpl = approved_texts.approved_text(AGE_NOTICE_TEXT_KEY, AGE_NOTICE_TEMPLATE)
+    from hub import pending_link
+    url = pending_link.inbox_url()
+    tpl = approved_texts.approved_text(AGE_NOTICE_TEXT_KEY_V2, AGE_NOTICE_TEMPLATE_V2) if url else None   # UX-PENDING-1: v2 が承認済みなら
+    if tpl is None:
+        tpl = approved_texts.approved_text(AGE_NOTICE_TEXT_KEY, AGE_NOTICE_TEMPLATE)
     if tpl is None:
         return ""
     values = {"{{open}}": stats["open_count"], "{{threshold}}": threshold, "{{over}}": stats["over_count"],
@@ -778,6 +858,8 @@ def age_notice_text(stats: dict, queued: int, threshold: int) -> str:
     out = tpl
     for slot in AGE_NOTICE_SLOTS:
         out = out.replace(slot, str(int(values[slot])))
+    if AGE_NOTICE_URL_SLOT in out:
+        out = out.replace(AGE_NOTICE_URL_SLOT, url)
     return out
 
 
@@ -856,7 +938,7 @@ async def _notify_pending(pid: int, computed_key: str, approval_record_id, categ
         return ""
     # fix4 BC-18: 送信前には試行数を加算しない。送信後、結果の確定・claim 解放と同一トランザクションで attempts+1（bump_attempts）。
     # 送信後に停止した場合は、次の回収が保存キーで送信台帳と照合（begin の重複判定）して確定する
-    state = await send_business_notice(key, notice_text(approval_record_id, category))
+    state = await send_business_notice(key, notice_text(approval_record_id, category, pending_id=pid))   # UX-PENDING-1: リンク付き
     # fix3 BC-14: 結果の記録と claim 解放は「自分が owner のまま」のときだけ（リース切れ後に他者が claim していれば遅着＝無変更）
     if not await reply_pending.set_notify_state(pid, state, owner=owner, bump=bump_attempts):
         logger.info("[SEND_POLICY] notice result arrived late (claim taken over; state unchanged)")

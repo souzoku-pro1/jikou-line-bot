@@ -176,7 +176,9 @@ class TestMigrationChain(unittest.TestCase):
             self.assertEqual(len(ids), 1, heads.stdout)                 # 単一 head（後続票の migration は d4f6 の後ろに並ぶ）
             hist = alembic("history")
             self.assertEqual(hist.returncode, 0, hist.stderr[-800:])
-            down_of = {m.group(2): m.group(1) for m in _re.finditer(r"^([0-9a-f]{12}|<base>) -> ([0-9a-f]{12})", hist.stdout, _re.M)}
+            # UX-PENDING-1-fix4: merge revision（"b2d4, d2f4 -> e3f5 (mergepoint)"）も読む。鎖は最初の親を辿る（どちらの親も b7d9 で合流）
+            down_of = {m.group(2): m.group(1).split(",")[0].strip()
+                       for m in _re.finditer(r"^((?:[0-9a-f]{12}|<base>)(?:, [0-9a-f]{12})*) -> ([0-9a-f]{12})", hist.stdout, _re.M)}
             chain, rev = [], ids[0]
             while rev and rev != "<base>":
                 chain.append(rev)

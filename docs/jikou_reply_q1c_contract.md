@@ -139,6 +139,15 @@ ON のときだけ有効な事項は「V2 ON」と明記する。
   **fix2 BC-11（凍結記録）: J-0 文言の大野承認は V2 有効化前の条件**（`JIKOU_SEND_POLICY_V2` を ON にする前に承認を得る）とし、
   本承認で満たされた。承認時の変更は無いため `J0_TEXT` と test の sha pin は不変（文言を直す場合は両方を同時に更新して再承認）。
 
+- **UX-PENDING-1-fix1 BU-06（凍結記録・2026-11-04・Codex R-UX1 裁定）**: 業務 LINE 通知の署名付きリンク（`/app/go/r|c/<符号>`）の
+  識別子は **DB の連番 `pending_id` を署名付きで露出してよい**（HMAC-SHA256 で改ざん・番号推測による利用は不可／通知の閲覧者は大野のみ／
+  漏れる情報は件数の目安程度）。不透明な参照 ID への置換は行わない。設計書 docs/ux_pending_1_design.md §7 を同旨に訂正。
+
+- **UX-PENDING-1-fix3 BU-11（凍結記録・2026-11-06・Codex R-UX1-fix2 裁定・コード変更なし）**: RV-10 の対象は **ログ・通知・例外・URL・
+  外部出力** であり、ログイン必須（`_gate`）の管理画面は対象外。認証内の画面（統合一覧・解除の要確認カード・返信画面）での相談者名の表示は可
+  （氏名: 画面可・通知／URL 不可。本文: **一覧と返信画面に表示可**・通知・URL・ログには出さない〔fix4 BU-12 で「返信画面のみ」から訂正・
+  2026-11-07・Codex R-UX1-fix3 CONDITIONAL〕。LINE userId・ハッシュ: どこにも出さない）。設計書 docs/ux_pending_1_design.md §2 の表に明文化。
+
 - **JIKOU-REPLY-Q3a-fix1 項目 4（凍結記録・2026-11-03）**: 承認済み手本の「参考文例」ブロック（`hub.reply_exemplar.NOTE_TEMPLATE`・
   sha256 `511ade90f0c8ec7893659ceed06d42a8477d43015af0665bf5ecf210fa00dd49`）は **凍結対象外の実行時付加** とする。手本 0 件なら付加なし＝基底 prompt は byte 同一で、
   `customer_prompt_base` の pin（`908f9335…`）は不変（test_jikou_reply_q3a が両方を固定）。テンプレートを変える場合は pin と本記録を同時に更新する。

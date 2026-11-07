@@ -45,7 +45,9 @@ STATE_OPEN = "open"
 STATE_HUMAN_REPLIED = "human_replied"
 STATE_AUTO_REPLIED = "auto_replied"
 STATE_NOT_NEEDED = "not_needed"
-STATES = (STATE_OPEN, STATE_HUMAN_REPLIED, STATE_AUTO_REPLIED, STATE_NOT_NEEDED)
+STATE_CLOSED_EXTERNAL = "closed_external"      # UX-PENDING-1: 対応終了（別経路で返信済み・画面／署名リンクから）
+STATES = (STATE_OPEN, STATE_HUMAN_REPLIED, STATE_AUTO_REPLIED, STATE_NOT_NEEDED, STATE_CLOSED_EXTERNAL)
+CLOSED_BY_HUMAN_STATES = (STATE_NOT_NEEDED, STATE_CLOSED_EXTERNAL)   # 人が画面で閉じた状態（未処理に戻せる）
 
 ROUTE_CUSTOMER = "customer"
 ROUTE_HEARING = "hearing"
@@ -106,7 +108,7 @@ reply_pending = sa.Table(
     sa.Column("notice_key", sa.Text, nullable=True),
     sa.Column("notify_owner", sa.Text, nullable=True),
     sa.Column("notify_claimed_at", sa.DateTime(timezone=True), nullable=True),
-    sa.CheckConstraint("state IN ('open', 'human_replied', 'auto_replied', 'not_needed')",
+    sa.CheckConstraint("state IN ('open', 'human_replied', 'auto_replied', 'not_needed', 'closed_external')",   # UX-PENDING-1: closed_external（migration c9e1 で制約を更新）
                        name="ck_reply_pending_state"),
     sa.CheckConstraint("route IN ('customer', 'hearing', 'inbound')", name="ck_reply_pending_route"),
     sa.CheckConstraint("reason IN ('demoted', 'empty_reply', 'policy_stopped', 'claude_outage')",
@@ -741,3 +743,80 @@ async def bump_attempts_unowned(pending_id: int, *, now=None) -> bool:
     except Exception:
         logger.error("[REPLY_PENDING] bump_attempts (unowned) failed (fixed reason)")
         return False
+
+
+# ══════════════════════════════════════════════════════════════
+# UX-PENDING-1: 統合一覧（/app/inbox）の操作。末尾追記。本文・氏名・LINE userId は置かない。
+# ══════════════════════════════════════════════════════════════
+async def close_from_open_in_tx(s, pending_id: int, to_state: str, actor: str, now) -> str:
+    """fix1 BU-04: 呼び出し側のトランザクション s の中で open → to_state（閉じ記録と「解除未完了」を同一 tx に置くため）。
+    戻り値 ok / not_open / not_found（例外は送出＝呼び出し側で rollback）。"""
+    cur = (await s.execute(sa.select(reply_pending.c.state).where(
+        reply_pending.c.pending_id == int(pending_id)))).scalar()
+    if cur is None:
+        return "not_found"
+    r = await s.execute(sa.update(reply_pending).where(
+        reply_pending.c.pending_id == int(pending_id),
+        reply_pending.c.state == STATE_OPEN).values(
+        state=to_state, resolved_at=now, resolved_by=RESOLVED_BY_HUMAN, updated_at=now))
+    if int(r.rowcount or 0) != 1:
+        return "not_open"
+    await _hist(s, int(pending_id), "state", STATE_OPEN, to_state, actor, now)
+    return "ok"
+
+
+async def _close_from_open(pending_id: int, to_state: str, actor: str, *, now=None) -> str:
+    """open → to_state（人の操作）。戻り値 ok / not_open / not_found / db。resolved_by は human・履歴の actor に操作元を残す。"""
+    now = now or _now()
+    try:
+        async with session_scope() as s:
+            return await close_from_open_in_tx(s, pending_id, to_state, actor, now)
+    except Exception:
+        logger.error("[REPLY_PENDING] close failed (fixed reason)")
+        return "db"
+
+
+async def mark_closed_external(pending_id: int, *, actor: str, now=None) -> str:
+    """対応終了（別経路で返信済み）: open → closed_external。"""
+    return await _close_from_open(pending_id, STATE_CLOSED_EXTERNAL, actor, now=now)
+
+
+async def reopen(pending_id: int, *, actor: str, now=None) -> str:
+    """未処理に戻す: not_needed / closed_external → open（履歴あり・物理削除なし）。戻り値 ok / not_closed / not_found / db。"""
+    now = now or _now()
+    try:
+        async with session_scope() as s:
+            cur = (await s.execute(sa.select(reply_pending.c.state).where(
+                reply_pending.c.pending_id == int(pending_id)))).scalar()
+            if cur is None:
+                return "not_found"
+            if cur not in CLOSED_BY_HUMAN_STATES:
+                return "not_closed"
+            r = await s.execute(sa.update(reply_pending).where(
+                reply_pending.c.pending_id == int(pending_id),
+                reply_pending.c.state == cur).values(
+                state=STATE_OPEN, resolved_at=None, resolved_by=None, updated_at=now))
+            if int(r.rowcount or 0) != 1:
+                return "not_closed"
+            await _hist(s, int(pending_id), "state", cur, STATE_OPEN, actor, now)
+        return "ok"
+    except Exception:
+        logger.error("[REPLY_PENDING] reopen failed (fixed reason)")
+        return "db"
+
+
+async def list_closed(limit: int = 50) -> list[dict]:
+    """閉じた件（open 以外）を新しい順に（参照のみ）。"""
+    async with session_scope() as s:
+        rows = (await s.execute(sa.select(reply_pending).where(
+            reply_pending.c.state != STATE_OPEN)
+            .order_by(reply_pending.c.updated_at.desc()).limit(int(limit)))).fetchall()
+    return [_row(r) for r in rows]
+
+
+async def approval_record_ids_all() -> set:
+    """対応待ちの表（全状態）が参照している承認キュー No. の集合（統合一覧で V2 以前の項目を見分ける）。"""
+    async with session_scope() as s:
+        rows = (await s.execute(sa.select(reply_pending.c.approval_record_id).where(
+            reply_pending.c.approval_record_id.is_not(None)).distinct())).scalars().all()
+    return {str(r) for r in rows if r}

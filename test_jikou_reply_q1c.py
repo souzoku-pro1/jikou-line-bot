@@ -45,6 +45,8 @@ from fastapi.testclient import TestClient  # noqa: E402
 import chat_responder as cr  # noqa: E402
 import main  # noqa: E402
 from hub import autoreply_stoplist  # noqa: E402
+from hub import approval_close as ac  # noqa: E402  UX-PENDING-1: 統合一覧が読む表（本番は migration c9e1）
+from hub import attending_release as ar  # noqa: E402  UX-PENDING-1-fix1 BU-04: 対応終了の解除未完了（本番は migration d2f4）
 from hub import db  # noqa: E402
 from hub import empty_reply_guard as eg  # noqa: E402
 from hub import image_intake  # noqa: E402
@@ -54,6 +56,7 @@ from hub import reply_followup as rf  # noqa: E402
 from hub import reply_pending as rp  # noqa: E402
 from hub import send_ledger as sl  # noqa: E402
 from hub import send_policy as sp  # noqa: E402
+from hub import webapp_inbox_view as iv  # noqa: E402  UX-PENDING-1: 旧 /app/pending は /app/inbox へ統合
 from hub import webapp_pending_view as pv  # noqa: E402
 from hub.inbound_event import Base as InboundBase  # noqa: E402
 from hub.webapp_auth import MIN_ITERATIONS, hash_password, issue_session  # noqa: E402
@@ -143,7 +146,7 @@ class _DbMixin(unittest.TestCase):
         async def _create():
             eng = db.get_async_engine()
             async with eng.begin() as c:
-                for md in (sl.metadata, rx.metadata, rf.metadata, rp.metadata, InboundBase.metadata):
+                for md in (sl.metadata, rx.metadata, rf.metadata, rp.metadata, ac.metadata, ar.metadata, InboundBase.metadata):
                     await c.run_sync(md.create_all)
         _run(_create())
         _FakeClient.responses, _FakeClient.calls, _FakeClient.raise_exc = [], [], None
@@ -746,42 +749,58 @@ class TestPendingTableAndView(_DbMixin):
         self.assertEqual(_run(rp.count_open()), 1)
 
     def test_view_is_gated_and_closed(self):
+        # UX-PENDING-1 (4): 旧 /app/pending は認証後 303 → /app/inbox。操作 route は統合一覧側（/app/inbox/close・/app/inbox/reopen）
         self.assertEqual(_client.get("/app/pending", follow_redirects=False).status_code, 303)
-        self.assertEqual(_client.post("/app/pending/resolve", data={"pending_id": "1", "outcome": "not_needed"},
+        self.assertEqual(_client.get("/app/inbox", follow_redirects=False).status_code, 303)
+        self.assertEqual(_client.post("/app/inbox/close", data={"kind": "pending", "id": "1", "outcome": "not_needed"},
                                       follow_redirects=False).status_code, 303)
-        for r in pv.router.routes:
-            self.assertTrue(getattr(r.endpoint, "__webapp_gate__", False), r.path)
+        r = _client.get("/app/pending", headers=_auth(), follow_redirects=False)
+        self.assertEqual((r.status_code, r.headers["location"]), (303, "/app/inbox"))
+        for router in (pv.router, iv.router):
+            for rt in router.routes:
+                self.assertTrue(getattr(rt.endpoint, "__webapp_gate__", False), rt.path)
+        self.assertEqual({rt.path for rt in pv.router.routes}, {"/app/pending", "/app/api/pending/open"})
+        self.assertEqual({(rt.path, tuple(rt.methods)) for rt in iv.router.routes},
+                         {("/app/inbox", ("GET",)), ("/app/inbox/close", ("POST",)), ("/app/inbox/reopen", ("POST",)),
+                          ("/app/inbox/release", ("POST",)),                      # UX-PENDING-1-fix2 BU-08（解除の要確認・送信なし）
+                          ("/app/go/r/{token}", ("GET",)), ("/app/go/c/{token}", ("GET",)), ("/app/go/c/{token}", ("POST",))})
         from hub.webapp_brain_view import _paths_of
         paths = [p for entry in main.app.router.routes for p in _paths_of(entry)
-                 if p in ("/app/pending", "/app/{_rest:path}")]
-        self.assertEqual(paths, ["/app/pending", "/app/{_rest:path}"])
+                 if p in ("/app/pending", "/app/inbox", "/app/{_rest:path}")]
+        self.assertEqual(paths, ["/app/pending", "/app/inbox", "/app/{_rest:path}"])
 
     def test_view_lists_without_pii_and_supports_not_needed_and_end_attending(self):
+        # UX-PENDING-1 (2): 統合一覧で同じ検証（PII なし・対応中の札・返信リンク）＋「対応終了」（bot 再開）と「不要」
         pid = self._reg(inbound_event_id="ev1")
         _run(sl.set_attending("jikou", USER))
-        r = _client.get("/app/pending", headers=_auth())
-        self.assertEqual(r.status_code, 200)
-        self.assertIn("/app/reply/500", r.text)
-        self.assertIn("対応中（bot 停止）", r.text)
-        self.assertIn("費用交渉・減額相談", r.text)
-        self.assertNotIn(USER, r.text)
-        self.assertEqual(r.headers.get("cache-control"), "no-store, private")
-        h = sl.line_user_hash("jikou", USER)
-        r = _client.post("/app/pending/end_attending", data={"user_hash": h}, headers=_auth(),
-                         follow_redirects=False)
-        self.assertEqual((r.status_code, r.headers["location"]), (303, "/app/pending?done=resumed"))
-        self.assertFalse(_run(sl.conversation_state("jikou", USER))["attending"])
-        r = _client.post("/app/pending/resolve", data={"pending_id": str(pid), "outcome": "not_needed"},
-                         headers=_auth(), follow_redirects=False)
-        self.assertEqual(r.headers["location"], "/app/pending?done=ok")
-        self.assertEqual(self.pending()[0]["state"], "not_needed")
-        r = _client.post("/app/pending/resolve", data={"pending_id": str(pid), "outcome": "not_needed"},
-                         headers=_auth(), follow_redirects=False)
-        self.assertEqual(r.headers["location"], "/app/pending?done=not_open")
-        self.assertEqual(_client.post("/app/pending/resolve", data={"pending_id": "x", "outcome": "not_needed"},
-                                      headers=_auth(), follow_redirects=False).status_code, 400)
-        self.assertEqual(_client.post("/app/pending/end_attending", data={"user_hash": "zz"},
-                                      headers=_auth(), follow_redirects=False).status_code, 400)
+        with patch.object(iv.kintone, "search_records", AsyncMock(return_value=[])):
+            r = _client.get("/app/inbox", headers=_auth())
+            self.assertEqual(r.status_code, 200)
+            self.assertIn("/app/reply/500", r.text)
+            self.assertIn("bot 停止中（対応中）", r.text)
+            self.assertIn("費用交渉・減額相談", r.text)
+            self.assertNotIn(USER, r.text)
+            self.assertNotIn(sl.line_user_hash("jikou", USER), r.text)
+            self.assertEqual(r.headers.get("cache-control"), "no-store, private")
+            r = _client.post("/app/inbox/close", data={"kind": "pending", "id": str(pid), "outcome": "done_external"},
+                             headers=_auth(), follow_redirects=False)
+            self.assertEqual((r.status_code, r.headers["location"]), (303, "/app/inbox?done=closed"))
+            self.assertFalse(_run(sl.conversation_state("jikou", USER))["attending"])
+            self.assertEqual(self.pending()[0]["state"], "closed_external")
+            r = _client.post("/app/inbox/close", data={"kind": "pending", "id": str(pid), "outcome": "not_needed"},
+                             headers=_auth(), follow_redirects=False)
+            self.assertEqual(r.headers["location"], "/app/inbox?done=already")
+            pid2 = self._reg(inbound_event_id="ev2")
+            r = _client.post("/app/inbox/close", data={"kind": "pending", "id": str(pid2), "outcome": "not_needed"},
+                             headers=_auth(), follow_redirects=False)
+            self.assertEqual(r.headers["location"], "/app/inbox?done=not_needed")
+            self.assertEqual({p["state"] for p in self.pending()}, {"closed_external", "not_needed"})
+            self.assertEqual(_client.post("/app/inbox/close", data={"kind": "pending", "id": "x", "outcome": "not_needed"},
+                                          headers=_auth(), follow_redirects=False).status_code, 400)
+            self.assertEqual(_client.post("/app/inbox/close", data={"kind": "zz", "id": "1", "outcome": "not_needed"},
+                                          headers=_auth(), follow_redirects=False).status_code, 400)
+            self.assertEqual(_client.post("/app/inbox/close", data={"kind": "pending", "id": "1", "outcome": "delete"},
+                                          headers=_auth(), follow_redirects=False).status_code, 400)
         api = _client.get("/app/api/pending/open", headers=_auth()).json()
         self.assertEqual((api["ok"], api["count"]), (True, 0))
 
@@ -885,7 +904,7 @@ class TestPins(unittest.TestCase):
         self.assertIn("reply_pending_metadata", env)
 
     def test_closed_sets(self):
-        self.assertEqual(rp.STATES, ("open", "human_replied", "auto_replied", "not_needed"))
+        self.assertEqual(rp.STATES, ("open", "human_replied", "auto_replied", "not_needed", "closed_external"))   # UX-PENDING-1
         self.assertEqual(rp.REASONS, ("demoted", "empty_reply", "policy_stopped", "claude_outage"))
         self.assertEqual(sl.SEND_POLICY_STOPPED, "policy_stopped")
         self.assertEqual((sl.SEND_SENT, sl.SEND_UNCONFIRMED, sl.SEND_FAILED), ("sent", "unconfirmed", "failed"))

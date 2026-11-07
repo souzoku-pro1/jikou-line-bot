@@ -23,8 +23,10 @@ fix1（Codex R-JIKOU-REPLY-Q1b-1 BR-01〜09・司令塔裁定: 人の明示送�
   いずれも自動再送なし・App 28 記録・手本保存はしない。
 - BR-05 対応中: 送信着手と set_attending（attending=human・human_version+1）は send_ledger.begin()
   の **同一トランザクション・会話単位の排他内** で確定（human_reply 文脈の attend=True）。
-- BR-06 確認文: 「全体停止・停止リスト・人対応中の状態は確認していません。これを承知のうえ送信する」
-  （チェック必須・無ければ送らない）。許可表 (f) は human 列のみ（send_ledger.human_explicit_decision）。
+- BR-06 確認文 → **UX-PENDING-1 (3) で廃止**: 送信時にサーバーが停止条件の実値（hub.send_policy.conditions）を読み、許可表の
+  human 列を explicit_confirm=False で評価する（send_ledger.human_auto_decision）。停止リスト登録あり・照会不能・対応モード照会不能は
+  送らず理由を表示（本文は欄に残る）。全体停止・人対応中・対応中は人の返信なので送る。画面上部に状態の札を出す。
+  [送信] ボタンは文字色・背景色を明示（紺地に白文字「送信」）し、全画面 color-scheme: light を宣言する。
 - BR-08 App 28 記録の回収: 送信成功後の App 28 書込が failed / skipped（role 選択肢なし）なら
   hub/reply_followup に記録未了（op_id 単位）を置き、SEND_LEDGER_RECOVER（5 分ごと）に相乗りした
   回収で冪等に再試行する。同じ操作 ID の再 POST は「送信済み・記録のみ再試行」に分岐。
@@ -61,6 +63,7 @@ import hmac
 import html
 import logging
 import re
+import time
 import uuid
 
 from fastapi import APIRouter, Request
@@ -68,6 +71,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse, Response
 
 from hub import kintone, line_channel, reply_exemplar, reply_followup, send_ledger, send_policy
 from hub.redact import emit
+from hub import webapp_auth
 from hub.webapp_auth import _gate, _sign
 
 logger = logging.getLogger("hub.webapp_reply_view")
@@ -89,16 +93,23 @@ _LINE_USER_ID_RE = re.compile(r"^U[0-9a-f]{32}$")
 _REVISION_RE = re.compile(r"^[0-9]{1,12}$")
 _TICKET_RE = re.compile(r"^[0-9]{1,12}\.[0-9a-f]{32}\.[0-9]{1,12}\.[0-9a-f]{32}\.[0-9a-f]{64}$")
 _ROLE_LABELS = {"user": "相談者", "assistant": "bot", ROLE_HUMAN: "事務所（大野）"}
-CONFIRM_LABEL = "全体停止・停止リスト・人対応中の状態は確認していません。これを承知のうえ送信する"
+SEND_BUTTON_LABEL = "送信"                      # UX-PENDING-1 (3): ラベル欠落の修正（文字・色を明示）
+INBOX = "/app/inbox"
+_FLAG_LABELS = {"paused": "全体停止中（bot）", "stoplisted": "停止リスト登録あり", "stoplist_unknown": "停止リスト照会不能",
+                "human_mode": "人対応中", "human_mode_unknown": "対応モード照会不能", "attending": "対応中（bot 停止）"}
 
 # 送信結果（done）・App 28 記録（log）・手本（ex）・台帳状態（state）の閉集合（画面文言は固定・入力値を反射しない）
+_HELD_NOTICE = "送信していない編集中の本文を返信欄に戻しました（サーバー側で一時保持・URL には載せません。1 時間で消えます）。"
 _DONE_NOTICES = {
     "sent": "送信しました。",
     "failed": "LINE への送信に失敗しました（LINE 側が受け付けませんでした）。送信されていません。",
     "unconfirmed": "送信結果を確認できませんでした。送信確認待ちで結果を確定してください（自動再送はしません）。",
     "duplicate_sent": "この操作は既に送信済みです（二重送信はしていません）。",
     "duplicate_unconfirmed": "この操作は送信確認待ちです。送信確認待ちで結果を確定してください。",
-    "confirm_required": "送信内容の確認チェックが必要です。送信していません。",
+    # UX-PENDING-1 (3): サーバー側自動確認で止めた理由（LINE write 0・本文は欄に残る）
+    "stoplisted": "この相談者は自動返信停止リストに登録されています。送信していません。送る場合は停止リストから外してください。",
+    "stoplist_unknown": "停止リストを確認できなかったため送信していません。しばらくして再試行してください。",
+    "human_mode_unknown": "相談者の対応モード（App 21）を確認できなかったため送信していません。しばらくして再試行してください。",
     "not_found": "宛先の相談者を特定できませんでした。送信していません。",
     "bad_input": "入力が不正です。送信していません。",
     "blocked": "許可表により送信できません。",
@@ -341,11 +352,11 @@ async def _save_exemplar(user_id: str, inbound_text: str, text: str, op_id: str,
 
 # ── 画面 ────────────────────────────────────────────────────────────────────
 def _page(record_id: str, rec: dict | None, rows: list[dict], op_id: str, ticket: str | None,
-          notices: list[str]) -> str:
+          notices: list[str], flags: tuple = (), held: str | None = None) -> str:
     e = html.escape
     parts = [
         '<!DOCTYPE html><html lang="ja"><head><meta charset="utf-8">',
-        '<meta name="viewport" content="width=device-width, initial-scale=1">',
+        '<meta name="viewport" content="width=device-width, initial-scale=1"><meta name="color-scheme" content="light">',
         "<title>相談者への返信 - 案件管理（仮）</title>",
         "<style>body{font-family:sans-serif;max-width:720px;margin:0 auto;"
         "padding:.6rem 1rem 2rem;box-sizing:border-box;background:#eef1f5;color:#222}"
@@ -359,14 +370,22 @@ def _page(record_id: str, rec: dict | None, rows: list[dict], op_id: str, ticket
         "textarea{width:100%;min-height:9rem;font-size:1rem;border-radius:10px;border:1px solid #c8cdd5;"
         "padding:.5rem;box-sizing:border-box}label{display:block;margin:.5rem 0;font-size:.92rem}"
         "button{font-size:.95rem;padding:.5rem 1rem;border-radius:10px;border:1px solid #c8cdd5;"
-        "background:#fff;min-height:44px}.notice{background:#e8f0fb;border-radius:10px;"
+        "background:#fff;color:#222;min-height:44px;-webkit-appearance:none;appearance:none;font-family:inherit;line-height:1.3}"
+        "button.send{display:block;width:100%;background:#1a3c6e;color:#fff;border-color:#1a3c6e;font-weight:bold;"
+        "font-size:1.05rem;min-height:48px;margin-top:.6rem}"
+        ".flags{margin:.2rem 0 .6rem}.badge{display:inline-block;border-radius:999px;padding:.12rem .6rem;font-size:.78rem;"
+        "background:#e3e7ee;color:#445;margin:.15rem .35rem .15rem 0}.badge.warn{background:#fff3d6;color:#8a6d00}"
+        ".badge.att{background:#fde2e2;color:#8a1f1f}.notice{background:#e8f0fb;border-radius:10px;"
         "padding:.5rem .8rem;color:#1a5cb0;margin:.4rem 0}.empty{color:#667;text-align:center;margin:1.2rem 0}"
         "</style></head><body>",
         "<h1>相談者への返信</h1>",
         '<p class="sub">事務所（大野）からの返信を LINE で送ります。送信は送信操作記録を通り、'
         "結果不明は送信確認待ちに残ります（自動再送なし）。"
-        f'<a href="/app/approvals">返信の承認へ戻る</a>｜<a href="/app/send_ops">送信確認待ち</a></p>',
+        f'<a href="{INBOX}">対応待ちへ戻る</a>｜<a href="/app/approvals">承認</a>｜<a href="/app/send_ops">送信確認待ち</a></p>',
     ]
+    if flags:
+        parts.append('<div class="flags">' + ''.join(
+            f'<span class="badge {"att" if k == "attending" else "warn"}">{e(_FLAG_LABELS[k])}</span>' for k in flags if k in _FLAG_LABELS) + '</div>')
     for n in notices:
         if n:
             parts.append(f'<p class="notice">{e(n)}</p>')
@@ -388,16 +407,16 @@ def _page(record_id: str, rec: dict | None, rows: list[dict], op_id: str, ticket
         parts.append(f'<div class="meta">{e(_ROLE_LABELS.get(role, role))}｜{e(str(r.get("at", "")))}</div>')
         parts.append(f'<pre class="{cls}">{e(str(r.get("message", "")))}</pre>')
     parts.append("</div>")
-    draft = _v(rec, "AI下書き")
+    draft = held if held is not None else _v(rec, "AI下書き")   # fix1 BU-03: 保持中の編集本文があればそれを初期値に
     parts.append(f'<form method="post" action="{PAGE}/{e(record_id)}/send" class="item">'
                  f'<input type="hidden" name="op_id" value="{e(op_id)}">'
                  f'<input type="hidden" name="ticket" value="{e(ticket)}">'
                  '<div class="lbl">返信文（AI 下書きがあれば初期表示。直して送れます）</div>'
                  f'<textarea name="text" maxlength="{MAX_TEXT_CHARS}" required>{e(draft)}</textarea>'
-                 f'<label><input type="checkbox" name="confirm" value="1" required> {e(CONFIRM_LABEL)}</label>'
                  '<label><input type="checkbox" name="exemplar" value="1" checked> '
                  "この返信を手本として保存する（氏名・連絡先などを伏せて保存）</label>"
-                 '<button type="submit">LINE で送信する</button></form>')
+                 '<p class="lbl">送信時に全体停止・停止リスト・対応モードをサーバーが自動で確認します（問題があれば送らず理由を表示）。</p>'
+                 f'<button type="submit" class="send">{e(SEND_BUTTON_LABEL)}</button></form>')
     parts.append('<script src="/app/shell.js"></script></body></html>')
     return "".join(parts)
 
@@ -424,7 +443,127 @@ async def reply_page(request: Request):
     rows = await _history_rows(user_id) if rec is not None else []
     op_id = uuid.uuid4().hex
     ticket = make_ticket(record_id, user_id, _revision(rec), op_id) if rec is not None else None
-    return HTMLResponse(_page(record_id, rec, rows, op_id, ticket, notices))
+    flags = await _state_flags(user_id) if rec is not None else ()
+    held = held_text(_session_key(request), record_id) if rec is not None else None   # fix1 BU-03: 送らなかった編集本文
+    if held is not None:
+        notices = notices + [_HELD_NOTICE]
+    return HTMLResponse(_page(record_id, rec, rows, op_id, ticket, notices, flags, held=held))
+
+
+# ── fix1 BU-03: 送らなかった編集本文の一時保持（認証セッションに紐づくサーバー側メモリ・URL／クエリ／ログに本文を載せない） ──
+HOLD_TTL_SECONDS = 3600          # 1 時間で消える（再表示されなければ破棄）
+HOLD_MAX = 200                   # 保持数の上限（超えたら最も古いものから消す）
+_held: dict = {}                 # (session_key, record_id) → (text, monotonic)
+
+
+def _session_key(request: Request) -> str:
+    """session cookie の値のハッシュ（値そのものは持たない）。cookie が無ければ ""＝保持しない。"""
+    import hashlib
+    v = str(request.cookies.get(webapp_auth._COOKIE) or "")
+    return hashlib.sha256(v.encode("utf-8")).hexdigest()[:32] if v else ""
+
+
+def hold_text(session_key: str, record_id: str, text: str, *, now: float | None = None) -> bool:
+    """送らなかった本文をセッション×承認キュー No. で保持する（同じ鍵は上書き）。"""
+    if not session_key or not text:
+        return False
+    t = time.monotonic() if now is None else now
+    for k, (_txt, at) in list(_held.items()):
+        if t - at >= HOLD_TTL_SECONDS:
+            _held.pop(k, None)
+    while len(_held) >= HOLD_MAX:
+        _held.pop(min(_held, key=lambda k: _held[k][1]), None)
+    _held[(session_key, str(record_id))] = (text, t)
+    return True
+
+
+def held_text(session_key: str, record_id: str, *, now: float | None = None) -> str | None:
+    """保持中の本文（期限内なら返す・返しても消さない＝送るか期限まで残る）。"""
+    if not session_key:
+        return None
+    hit = _held.get((session_key, str(record_id)))
+    if not hit:
+        return None
+    t = time.monotonic() if now is None else now
+    if t - hit[1] >= HOLD_TTL_SECONDS:
+        _held.pop((session_key, str(record_id)), None)
+        return None
+    return hit[0]
+
+
+def clear_held(session_key: str, record_id: str) -> None:
+    _held.pop((session_key, str(record_id)), None)
+
+
+HOLD_PURGE_INTERVAL_SECONDS = 600   # fix2 BU-07: 既存の定期ジョブ（send_ledger の回収 hook・5 分間隔）に相乗りし、10 分ごとに期限切れを削除
+_last_purge: float | None = None
+
+
+def purge_held(*, now: float | None = None) -> int:
+    """fix2 BU-07: 期限切れ（HOLD_TTL_SECONDS 経過）の保持を削除する（読み出されなくても消える）。戻り値は削除数。"""
+    t = time.monotonic() if now is None else now
+    expired = [k for k, (_txt, at) in list(_held.items()) if t - at >= HOLD_TTL_SECONDS]
+    for k in expired:
+        _held.pop(k, None)
+    return len(expired)
+
+
+async def run_hold_purge(*, now: float | None = None) -> int | None:
+    """fix2 BU-07: 回収 hook（5 分間隔）から呼ばれ、前回の削除から HOLD_PURGE_INTERVAL_SECONDS 以上たっていれば期限切れを削除する。
+    間隔内なら何もしない（None）。読出し時の期限検査（held_text）は維持。ログは固定語彙のみ（本文・件数以外を出さない）。"""
+    global _last_purge
+    t = time.monotonic() if now is None else now
+    if _last_purge is not None and t - _last_purge < HOLD_PURGE_INTERVAL_SECONDS:
+        return None
+    _last_purge = t
+    n = purge_held(now=t)
+    if n:
+        logger.info("[REPLY] held text purged (expired)")
+    return n
+
+
+async def _conditions(user_id: str) -> dict | None:
+    """UX-PENDING-1 (3): 停止条件の実値（読めなければ None＝全条件 UNKNOWN）。
+    fix1 BU-01: 画面表示・送信直前とも send_policy.human_conditions（30 秒キャッシュを迂回して都度照会）。"""
+    try:
+        return await send_policy.human_conditions(user_id)
+    except Exception:
+        return None
+
+
+async def _state_flags(user_id: str) -> tuple:
+    """画面上部の状態札（閉集合のキー）。"""
+    cond = await _conditions(user_id) or {}
+    flags = []
+    if cond.get("paused") == send_ledger.STOPPED:
+        flags.append("paused")
+    if cond.get("stoplisted") == send_ledger.STOPPED:
+        flags.append("stoplisted")
+    elif cond.get("stoplisted", send_ledger.UNKNOWN) == send_ledger.UNKNOWN:
+        flags.append("stoplist_unknown")
+    if cond.get("human_mode") == send_ledger.STOPPED:
+        flags.append("human_mode")
+    elif cond.get("human_mode", send_ledger.UNKNOWN) == send_ledger.UNKNOWN:
+        flags.append("human_mode_unknown")
+    try:
+        st = await send_ledger.conversation_state(BUSINESS, user_id)
+        if st and st.get("attending"):
+            flags.append("attending")
+    except Exception:
+        pass
+    return tuple(flags)
+
+
+def _auto_check_code(decision) -> str:
+    """許可表 human 列の停止理由 → 画面の固定文言コード。"""
+    reasons = tuple(getattr(decision, "reasons", ()) or ())
+    if any(r.startswith("stoplisted:stopped") for r in reasons):
+        return "stoplisted"
+    if any(r.startswith("stoplisted:unknown") for r in reasons):
+        return "stoplist_unknown"
+    if any(r.startswith("human_mode:unknown") for r in reasons):
+        return "human_mode_unknown"
+    return "blocked"
 
 
 def _redirect(back: str, done: str, **extra) -> RedirectResponse:
@@ -439,8 +578,7 @@ async def reply_send(request: Request):
     op_id = str(form.get("op_id", ""))
     ticket = str(form.get("ticket", ""))
     text = str(form.get("text", "")).strip()
-    confirm = str(form.get("confirm", "")) == "1"
-    want_exemplar = str(form.get("exemplar", "")) == "1"
+    want_exemplar = str(form.get("exemplar", "")) == "1"   # UX-PENDING-1 (3): confirm 欄は廃止（送られてきても見ない）
     if not _RECORD_ID_RE.fullmatch(record_id) or not _OP_ID_RE.fullmatch(op_id):
         return _bad_request()
     bound = parse_ticket(ticket, record_id, op_id)
@@ -450,8 +588,6 @@ async def reply_send(request: Request):
     back = f"{PAGE}/{record_id}"
     if not text or len(text) > MAX_TEXT_CHARS:
         return _redirect(back, "bad_input")
-    if not confirm:
-        return _redirect(back, "confirm_required")
     # 同じ操作 ID の再送信は副作用なしで弾く（二重クリック・戻る→再送）。照会不能は fail-closed
     try:
         state = await send_ledger.operation_state(op_id)
@@ -478,9 +614,14 @@ async def reply_send(request: Request):
     if _user_hash(user_id) != ticket_hash or _revision(rec) != ticket_rev:
         logger.info("[REPLY] destination changed since page render (not sent)")
         return _redirect(back, "stale")
-    decision = send_ledger.human_explicit_decision(confirm)
+    # UX-PENDING-1 (3): サーバー側自動確認（停止条件の実値で human 列を評価・チェック無し・fail-closed）
+    # fix1 BU-01: 画面表示時の値を使い回さず、送信直前に停止リスト・対応モードを都度照会する（取得失敗は不送信）
+    decision = send_ledger.human_auto_decision(await _conditions(user_id), attending=True)
     if not decision.allow:
-        return _redirect(back, "blocked")
+        logger.info("[REPLY] auto check stopped (not sent) record_id=%s",
+                    emit(record_id, "record_id", "log", "operator"))
+        hold_text(_session_key(request), record_id, text)   # fix1 BU-03: 編集本文を失わない（サーバー側・URL に載せない）
+        return _redirect(back, _auto_check_code(decision))
     # fix2 BR-12: 送信の前に回収表へ prepared を置く（置けなければ台帳必須と同じく送らない）
     prepared = await reply_followup.prepare(
         op_id, business=BUSINESS, approval_record_id=record_id,
@@ -489,6 +630,7 @@ async def reply_send(request: Request):
     if prepared in ("skipped", "failed"):
         logger.warning("[REPLY] followup unavailable (fail-closed, not sent) record_id=%s",
                        emit(record_id, "record_id", "log", "operator"))
+        hold_text(_session_key(request), record_id, text)   # fix1 BU-03
         return _redirect(back, "ledger_unavailable")
     if prepared == "rejected":
         # fix4 BR-15: 同 op_id の既存行が 終端／送信済み／本文・宛先不一致／台帳行あり → 送らず「新しい操作でやり直し」
@@ -528,6 +670,7 @@ async def reply_send(request: Request):
         return _redirect(back, result.outcome)
     logger.info("[REPLY] explicit send ok record_id=%s",
                 emit(record_id, "record_id", "log", "operator"))
+    clear_held(_session_key(request), record_id)   # fix1 BU-03: 送れたら保持を消す
     # fix3（PRE-REVIEW-1 #272-1）: 主経路の App 28 書込も回収ジョブと同じ関門（claim → op_id 照合 → 書込 → done）を通す。
     # 回収ジョブ（prepared も対象）と主経路が同じ op を同時に扱っても、所有権を取れた側だけが create する（二重作成なし）。
     async def _same_user(_rid: str) -> str:
@@ -555,3 +698,5 @@ router.add_api_route(f"{PAGE}/{{record_id}}", _gate(reply_page), methods=["GET"]
 router.add_api_route(f"{PAGE}/{{record_id}}/send", _gate(reply_send), methods=["POST"])
 # BR-08: 回収ジョブへの相乗り（冪等登録・main の末尾で register_recover_job が走る前後どちらでも可）
 send_ledger.register_recover_hook(run_chatlog_followup)
+# fix2 BU-07: 保持中の編集本文の期限切れ削除（同じ回収 hook に相乗り・10 分ごと）
+send_ledger.register_recover_hook(run_hold_purge)

@@ -59,8 +59,10 @@ import hashlib
 import hmac
 import os
 import secrets
+import re
 import time
 from pathlib import Path
+from urllib.parse import quote
 
 from fastapi import APIRouter, Form, Request
 from fastapi.responses import (FileResponse, JSONResponse, RedirectResponse,
@@ -276,8 +278,20 @@ def _no_store(resp: Response) -> Response:
     return resp
 
 
-def _login_redirect() -> RedirectResponse:
-    return _no_store(RedirectResponse("/app/login", status_code=303))
+# UX-PENDING-1 (1): 通知リンク（/app/go/…）から来た未ログインの人を、ログイン後にその件へ着地させる。
+# next は **閉集合の相対 path だけ**（一覧・返信画面・署名リンク）。外部 URL・//・改行・query 付きは拒否＝従来どおり /app へ。
+_NEXT_RE = re.compile(r"^/app/(inbox|reply/[0-9]{1,12}|go/[rc]/[rc]\.[0-9]{1,12}\.[0-9]{1,12}\.[0-9a-f]{32})$")
+
+
+def safe_next(value) -> str | None:
+    v = str(value or "")
+    return v if _NEXT_RE.fullmatch(v) else None
+
+
+def _login_redirect(next_path: str | None = None) -> RedirectResponse:
+    nxt = safe_next(next_path)
+    url = f"/app/login?next={quote(nxt, safe='/')}" if nxt else "/app/login"
+    return _no_store(RedirectResponse(url, status_code=303))
 
 
 def _fail_redirect() -> RedirectResponse:
@@ -297,7 +311,7 @@ def _gate(fn):
     @functools.wraps(fn)
     async def wrapper(request: Request):
         if not _authed(request):
-            return _login_redirect()
+            return _login_redirect(request.url.path)
         result = await fn(request)
         if not isinstance(result, Response):     # dict/list → JSONResponse 正規化
             result = JSONResponse(result)
@@ -341,7 +355,7 @@ async def login(request: Request, password: str = Form(default="")):
     if value is None:                     # 署名鍵が無効=fail-closed
         return _fail_redirect()
     _attempts.pop(key, None)              # 成功でカウンタ解除
-    resp = RedirectResponse("/app", status_code=303)
+    resp = RedirectResponse(safe_next(request.query_params.get("next")) or "/app", status_code=303)   # UX-PENDING-1 (1)
     resp.set_cookie(_COOKIE, value, max_age=SESSION_TTL_SECONDS, path="/app",
                     httponly=True, samesite="strict", secure=True)
     return _no_store(resp)

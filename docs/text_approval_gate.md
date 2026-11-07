@@ -19,4 +19,5 @@
 |---|---|---|---|---|---|
 | （初期） | `SAFE-1`（安全文） | `sha256_text(SAFE_TEXT)` | — | TEXT-APPROVAL-GATE-1 | 台帳の初期値 |
 | 2026-11-02 | `ops_age_notice_v1`（`send_policy.AGE_NOTICE_TEMPLATE`・業務 LINE 経過通知） | `59da41fcf2545b9aaa19175ea18315388e5b1e6df1c65bdbccaccacfc879652d` | 大野（Fable 経由） | TEXT-APPROVAL-2 | 本文そのまま承認・台帳に 1 行追加（数値スロット 5 値のみ差し込み） |
+| 2026-11-04 | `ops_age_notice_v2`（`send_policy.AGE_NOTICE_TEMPLATE_V2`・経過通知の末尾を完全 URL `{{url}}` に） | `b91070d861198b77c39af30b69e38fa8fef46b28c7fd8a1971813a5f8a78d5c1` | 大野（Fable 経由） | TEXT-APPROVAL-3 | `pgv/ux_pending_1_age_notice_v2.md` の v2 本文（末尾を完全 URL にした版）をそのまま承認。v1 の行は残す（旧版の送信台帳との照合）。差し込みは数値 5＋URL 1（公開ホスト＋固定 path /app/inbox）。公開ホスト未設定・v2 未登録なら v1 に戻る |
 | 2026-11-02 | J-0 初回案内（`send_policy.J0_TEXT`・相談者向け 1 通） | `0f1c3ca29956f4000aface287c8dc9aa7c6907e93c9b7f1267858a6c2212b03d` | 大野（Fable 経由） | TEXT-APPROVAL-2 | 本文そのまま承認。J-0 は台帳経由ではなく `J0_TEXT` 定数＋test の sha pin（`test_jikou_reply_q1c`）で固定＝コード変更なし |
