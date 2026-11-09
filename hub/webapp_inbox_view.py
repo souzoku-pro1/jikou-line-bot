@@ -28,7 +28,7 @@ import re
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 
-from hub import approval_close, attending_release, kintone, pending_link, reply_pending, send_ledger
+from hub import approval_close, attending_release, k_draft, kintone, pending_link, reply_pending, send_ledger
 from hub.webapp_auth import _gate
 
 logger = logging.getLogger("hub.webapp_inbox_view")
@@ -268,6 +268,9 @@ async def load_open_view(last_id: str = "") -> tuple[list[dict], dict]:
     for rec in old:
         items.append(_old_item(rec))
     items.sort(key=_sort_key)
+    kmap = await k_draft.states_for([it["record_id"] for it in items if it.get("record_id")])   # K-1: 札用（行なしは空）
+    for it in items:
+        it["k_draft"] = kmap.get(it.get("record_id") or "", "")
     return items, {"last_id": str(last_id or ""), "next": str(nxt), "scanned": int(scanned), "more": bool(more), "found": len(old)}
 
 
@@ -323,6 +326,8 @@ def _badges(it: dict) -> str:
         out.append('<span class="badge att">bot 停止中（対応中）</span>')
     if it["record_id"]:
         out.append('<span class="badge warn">未送信の下書きあり</span>')
+    if it.get("k_draft") == k_draft.STATE_GENERATED:
+        out.append('<span class="badge info">K 下書きあり</span>')                      # K-1
     if it["reason"]:
         out.append(f'<span class="badge">{e(_REASON_LABELS.get(it["reason"], it["reason"]))}</span>')
     if it["route"]:

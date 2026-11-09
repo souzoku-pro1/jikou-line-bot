@@ -1380,7 +1380,7 @@ async def save_to_approval_queue(
                     emit(resp.status_code, "count", "log", "operator"),
                     emit(resp.text, "vendor_raw", "log", "operator"))
         return None
-    record_id = resp.json().get("id"); await reply_exemplar.record_draft(record_id, "jikou", category, ai_draft)  # JIKOU-REPLY-Q3a (c): 起票時の下書き sha256
+    record_id = resp.json().get("id"); await reply_exemplar.record_draft(record_id, "jikou", category, ai_draft); k_draft.after_queue(record_id, user_id=user_id, customer_name=customer_name, customer_message=customer_message, category=category)  # JIKOU-REPLY-Q3a (c): 起票時の下書き sha256／K-1: 後追い下書き（env off なら何もしない・送信と無関係）
     logger.info("[APP29] saved record_id=%s",
                 emit(record_id, "record_id", "log", "operator"))
     return record_id
@@ -1976,3 +1976,8 @@ from hub import send_policy  # noqa: E402
 # ── JIKOU-REPLY-Q3a（QUEUE-2026-10-12-C C-2）: 承認済み手本の参考文例（prompt 末尾・0 件は ""）と無修正承認の計数。
 #    末尾追記（sink allowlist の行番号 pin を動かさない規約・本文中は 1 行置換のみ）。
 from hub import reply_exemplar  # noqa: E402
+
+# ── K-1（docs/k_design.md）: 下書き専用モデルの後追い下書き。起動点は save_to_approval_queue が No. を返した直後の 1 か所（上の 1 行置換）。
+#    末尾追記（sink allowlist の行番号 pin を動かさない規約）。env JIKOU_DRAFT_MODEL 未設定／off では何も起動しない（挙動不変）。
+from hub import k_draft  # noqa: E402
+k_draft.log_config_once()  # 無効値なら起動ログに WARNING 1 行（値は出さない）
