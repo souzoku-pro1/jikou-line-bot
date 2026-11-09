@@ -400,7 +400,7 @@ async def prompt_note(business: str, status: str) -> ExemplarNote:
     K-1 裁定 3: 下書き専用モデル（JIKOU_DRAFT_MODEL）が ON のときは一次生成（自動送信の判定に使う生成）には付けず、
     K 後追い下書きにだけ付ける（k_prompt_note）。K が OFF（既定）なら Q3a の現状どおり。"""
     from hub import k_draft                                   # 遅延 import（k_draft は本モジュールを import する）
-    if k_draft.enabled():
+    if await k_draft.effective_enabled():                     # fix1 BK-02: env 閉集合 ∧ 費用上限内（同じ文脈で 1 回だけ決める）
         return format_note([])
     return await k_prompt_note(business, status)
 

@@ -17,18 +17,28 @@ env ``JIKOU_DRAFT_MODEL``（§1-3・閉集合）
 - FALLBACK なし・再試行なし・thinking 無効・timeout 60 秒・1 件 1 回（§1-4）。
 
 費用（§1-6）: 1 通ごとに入出力トークン数と概算費用（円）を表に記録する。月の概算が上限（``MONTHLY_COST_CAP_YEN``・§1-6 の
-「Fable で月 1,600 円以内」）に達したら off と同じ挙動（state=skipped・reason cost:cap）・業務 LINE へ 1 日 1 回。
+「Fable で月 1,600 円以内」）に達したら **OFF と完全に同じ**（fix1 BK-02: 手本は一次生成に付き・承認固定・K 下書きなし・行も作らない）。
+業務 LINE へは上限到達の通知を 1 日 1 回（承認済みテキスト）。
+
+K の実効有効状態（fix1 BK-02）: ``effective_enabled()``＝env 閉集合 ∧ 費用上限内 ∧ DB あり。1 リクエスト（contextvars の文脈）で **1 回だけ**
+決め、手本の付加先（reply_exemplar.prompt_note）と後追い起動（after_queue）の両方が同じ値を見る。
+
+入力の取得（fix1 BK-01）: App 21 の取得例外・HTTP 非成功、履歴（App 28）の HTTP 非成功は **取得障害** として state=failed・reason input:unavailable
+を記録しモデルを呼ばない（例外本文は記録もログもしない）。env 未設定・レコード無し・履歴 0 件は **正常な不存在** で、空の案件情報・空の履歴で進む。
+履歴は既存の get_recent_chat_history（非成功を [] に丸める）を変えず、K 専用の ``k_chat_history`` が同じ問い合わせで非成功を検出する。
 
 規則 v1.5（§2）: v1.4（自動送信の規則・凍結）は触らない。v1.5 は **K 下書きの prompt にだけ** 実行時付加する層
 （``RULES_V15_BLOCK``・sha pin）。組み立て順は固定: 基底 prompt → 収集済み項目 → human 注記 → v1.5 ブロック → 参考文例ブロック。
 手本（参考文例）の付け先は裁定 3: K が ON のときは K 下書きにだけ付け、一次生成には付けない（reply_exemplar.prompt_note が本
 モジュールの enabled() を見る）。K-1 では手本は空集合（投入は K-2）。
 
-RV-08: 行は削除しない（state の追加だけ）。RV-10: 本文・氏名・LINE userId・例外本文をログ・通知・URL に出さない。
+RV-08: 行は削除しない（state の追加だけ）。RV-10: 本文・LINE userId・例外本文をログ・通知・URL に出さない（本文は認証内の返信画面にだけ出す。
+相談者の本人名は設計 §1-5 により本文に含み得る）。相談者向けの送信はゼロ。管理者向けの障害通知（無効設定・モデル障害・上限到達・各 1 日 1 回）は設計で許容。
 """
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import datetime
 import hashlib
 import json
@@ -77,6 +87,44 @@ def configured_model() -> str:
 def enabled() -> bool:
     """K 後追い下書きを起動するか（許可値のモデル名のときだけ True。off・無効値は False）。"""
     return configured_model() not in (MODEL_OFF, MODEL_INVALID)
+
+
+class InputUnavailable(Exception):
+    """fix1 BK-01: 入力（App 21・履歴）の取得障害。固定語彙だけを持つ（例外本文に相手先の本文を入れない）。"""
+
+
+_decision: contextvars.ContextVar = contextvars.ContextVar("k_draft_decision", default=None)   # None=未決・"on"／"off"
+DECISION_ON = "on"
+DECISION_OFF = "off"
+
+
+async def _decide() -> str:
+    """env 閉集合 ∧ DB あり ∧ 費用上限内 → on。上限到達は OFF と同じ（通知だけ 1 日 1 回）。読めないときは off（fail-closed）。"""
+    if not enabled() or not _db_configured():
+        return DECISION_OFF
+    try:
+        cost = await month_cost_yen()
+    except Exception:
+        logger.warning("[K_DRAFT] cost check failed (fixed reason); K off for this request")
+        return DECISION_OFF
+    if cost >= MONTHLY_COST_CAP_YEN:
+        logger.warning("[K_DRAFT] monthly cost cap reached; K off")
+        await notify_once(NOTICE_COST_CAP_KEY)
+        return DECISION_OFF
+    return DECISION_ON
+
+
+async def effective_enabled() -> bool:
+    """fix1 BK-02: K の実効有効状態。同じ文脈では 1 回だけ決め、以後は同じ値（手本の付加先と後追い起動が同じ値を見る）。"""
+    d = _decision.get()
+    if d is None:
+        d = await _decide()
+        _decision.set(d)
+    return d == DECISION_ON
+
+
+def reset_decision_for_tests() -> None:
+    _decision.set(None)
 
 
 _config_logged = {"done": False}
@@ -192,8 +240,7 @@ STATES = (STATE_STARTED, STATE_GENERATED, STATE_SKIPPED, STATE_FAILED, STATE_REJ
 REASON_MODEL_INVALID = "model:invalid"
 REASON_MODEL_UNAVAILABLE = "model:unavailable"
 REASON_MODEL_EMPTY = "model:empty"
-REASON_COST_CAP = "cost:cap"
-REASON_INPUT_UNAVAILABLE = "input:unavailable"
+REASON_INPUT_UNAVAILABLE = "input:unavailable"      # fix1 BK-01: App 21／履歴の取得障害（正常な不存在は含まない）
 
 reply_k_draft = sa.Table(
     TABLE_NAME, metadata,
@@ -331,15 +378,34 @@ async def _call_model(model: str, system_prompt: str, messages: list[dict], tool
     return text, int(getattr(usage, "input_tokens", 0) or 0), int(getattr(usage, "output_tokens", 0) or 0)
 
 
+async def k_chat_history(user_id: str, limit: int = 10):
+    """fix1 BK-01: 直近履歴の K 専用取得。既存 get_recent_chat_history と同じ問い合わせ・同じ整形（model_history・画像の内部行を除く）だが、
+    HTTP 非成功は [] に丸めず InputUnavailable を投げる（取得障害と「履歴 0 件」を区別する）。env 未設定は正常な不存在（空）。読取のみ。"""
+    import chat_responder as cr
+    if not (cr.APP_CHATLOG and cr.TOKEN_CHATLOG):
+        return cr.ChatHistory()
+    params = {"app": cr.APP_CHATLOG, "query": f'line_user_id = "{user_id}" order by $id desc limit {int(limit) * 2}',
+              "fields[0]": "role", "fields[1]": "message"}
+    async with cr.httpx.AsyncClient() as client:
+        resp = await client.get(f"{cr._kintone_base()}/k/v1/records.json", headers={"X-Cybozu-API-Token": cr.TOKEN_CHATLOG}, params=params)
+    if not resp.is_success:
+        raise InputUnavailable("chatlog:http")
+    from hub.image_intake import IMAGE_HUMAN_CLOSED_MARKER, IMAGE_HUMAN_HOLD_MARKER
+    records = resp.json().get("records", [])
+    return cr.model_history([{"role": r["role"]["value"], "content": r["message"]["value"]} for r in reversed(records)
+                             if r["message"]["value"] not in (IMAGE_HUMAN_HOLD_MARKER, IMAGE_HUMAN_CLOSED_MARKER)])
+
+
 async def _inputs(user_id: str, customer_name: str, customer_message: str) -> tuple[str, list[dict], str, dict]:
-    """既存の取得関数で App 21 の案件情報と直近履歴を取り、基底 prompt（v1.5 なし）と messages を組む。"""
+    """App 21 の案件情報と直近履歴を取り、基底 prompt（v1.5 なし）と messages を組む。
+    fix1 BK-01: 取得障害（例外・HTTP 非成功）は InputUnavailable（呼出側で failed／input:unavailable）。None／空は正常な不存在として進む。"""
     import chat_responder as cr
     from hub import reply_exemplar
     p = cr.JIKOU_PROFILE
     try:
-        rec = await cr.get_app21_record(user_id)
-    except Exception:
-        rec = None
+        rec = await cr.get_app21_record(user_id)          # 非 2xx は App21LookupError（HRI-08）・未設定／該当なしは None
+    except Exception as exc:
+        raise InputUnavailable("app21") from exc
     rec = rec or {}
 
     def _field(code: str) -> str:
@@ -348,7 +414,7 @@ async def _inputs(user_id: str, customer_name: str, customer_message: str) -> tu
     status = rec.get("status", {}).get("value", "") or ""
     name = rec.get("顧客名", {}).get("value", "") or (customer_name if customer_name not in _NAME_PLACEHOLDERS else "（未登録）")
     business_name = (rec.get("ルックアップ_0", {}).get("value", "") or rec.get("問い合わせ業者名", {}).get("value", "") or "（未登録）")
-    history = await cr.get_recent_chat_history(user_id)
+    history = await k_chat_history(user_id)             # fix1 BK-01: HTTP 非成功は InputUnavailable
     messages = list(history) + [{"role": "user", "content": str(customer_message or "")}]
     known_items = cr.build_known_items(rec or None, history)
     base = cr.build_system_prompt(status=status, customer_name=name, business_name=business_name,
@@ -378,24 +444,17 @@ async def run_after_queue(record_id: str, *, user_id: str, customer_name: str, c
                 logger.warning("[K_DRAFT] skipped (invalid model)")
                 await notify_once(NOTICE_INVALID_KEY)
             return STATE_SKIPPED
+        if not await effective_enabled():                 # fix1 BK-02: 一次生成と同じ値（上限到達＝OFF と同じ・行も作らない）
+            return DECISION_OFF
         if not await _claim(rid, category=cat, model=model, state=STATE_STARTED):
             return "duplicate"
-    except Exception:
-        logger.warning("[K_DRAFT] store failed (fixed reason)")
-        return "store_failed"
-    try:
-        if await month_cost_yen() >= MONTHLY_COST_CAP_YEN:
-            await _finish(rid, state=STATE_SKIPPED, reason=REASON_COST_CAP)
-            logger.warning("[K_DRAFT] skipped (monthly cost cap)")
-            await notify_once(NOTICE_COST_CAP_KEY)
-            return STATE_SKIPPED
     except Exception:
         logger.warning("[K_DRAFT] store failed (fixed reason)")
         return "store_failed"
     t0 = time.monotonic()
     try:
         base, messages, name, extra = await _inputs(user_id, customer_name, customer_message)
-    except Exception:
+    except Exception:                                      # fix1 BK-01: InputUnavailable ほか（例外本文は記録・ログに出さない）
         logger.error("[K_DRAFT] failed (fixed reason)")
         await _safe_finish(rid, state=STATE_FAILED, reason=REASON_INPUT_UNAVAILABLE)
         return STATE_FAILED
@@ -442,6 +501,8 @@ def after_queue(record_id, *, user_id: str, customer_name: str, customer_message
     """起動点（save_to_approval_queue が No. を返した直後・1 か所）。off なら何もしない（行も作らない）。
     後追い＝応答・通知を待たせない（asyncio.Task）。戻り値は Task か None。"""
     if not record_id or configured_model() == MODEL_OFF or not _db_configured():
+        return None
+    if configured_model() != MODEL_INVALID and _decision.get() == DECISION_OFF:   # fix1 BK-02: 一次生成の前に off と決まった（上限到達など）
         return None
     try:
         loop = asyncio.get_running_loop()
@@ -499,8 +560,7 @@ async def states_for(record_ids: list[str]) -> dict:
 # 返信画面の札（state／reason → 文言・固定語彙）
 BADGE_GENERATED = "K 下書き（下書き専用モデル・規則 v1.5）を初期表示"
 BADGE_NONE = {REASON_MODEL_INVALID: "K 下書きなし（設定を確認）", REASON_MODEL_UNAVAILABLE: "K 下書きなし（モデル応答なし）",
-              REASON_MODEL_EMPTY: "K 下書きなし（モデル応答なし）", REASON_INPUT_UNAVAILABLE: "K 下書きなし（案件情報を取得できず）",
-              REASON_COST_CAP: "K 下書きなし（今月の費用上限）"}
+              REASON_MODEL_EMPTY: "K 下書きなし（モデル応答なし）", REASON_INPUT_UNAVAILABLE: "K 下書きなし（案件情報を取得できず）"}
 BADGE_REJECTED = "K 下書きなし（検査で除外）"
 
 

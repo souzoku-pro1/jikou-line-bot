@@ -3,7 +3,7 @@
 
 受入条件（票 K-1）
  (a) K 経路で生成した下書きが承認キュー（返信画面）以外に出る経路が静的検査で 0（AST: 送信関数・kintone 書込・line_channel を参照しない）
- (b) env 閉集合外は off と同一挙動（相談者への送信 0・通知の増減 0・K 下書きなし）＋ fail-closed の記録 1 行
+ (b) env 閉集合外は off と同一挙動（相談者向け送信 0・K 下書きなし。管理者向け障害通知は無効設定／モデル障害／上限到達の各 1 日 1 回＝設計で許容）＋ fail-closed の記録 1 行
  (c) v1.4 経路の既存テストは不変（env 未設定＝K 無効・基底 prompt は byte 同一・prompt_note は従来どおり）
  (d) 新表 migration の upgrade/downgrade（sqlite）と、本番と同じ e3f5 → head の順
  (e) 第 8 項（相談文中の債権者名・金額・時期を引用して答える）がテストの手本相談文で確認できる
@@ -26,11 +26,16 @@ import chat_responder as cr  # noqa: E402
 from hub import approved_texts  # noqa: E402
 from hub import db  # noqa: E402
 from hub import k_draft as kd  # noqa: E402
+from hub import autoreply_stoplist  # noqa: E402
+from hub import line_channel  # noqa: E402
 from hub import reply_exemplar as rx  # noqa: E402
+from hub import reply_followup as rf  # noqa: E402
+from hub import reply_pending as rp  # noqa: E402
 from hub import send_ledger as sl  # noqa: E402
 from hub import send_policy as sp  # noqa: E402
 from hub import webapp_inbox_view as iv  # noqa: E402
 from hub import webapp_reply_view as rv  # noqa: E402
+from hub.inbound_event import Base as InboundBase  # noqa: E402
 from test_sink_ast_policy import scan_source  # noqa: E402
 
 REPO = Path(__file__).parent
@@ -173,6 +178,8 @@ class TestPins(unittest.TestCase):
                        "create_message_with_fallback"):
             self.assertNotIn(banned, names, banned)
         self.assertNotIn("cache_control", src)                                       # §1-6: cache は付けない
+        for w in (".post(", ".put(", ".patch(", ".delete("):                              # fix1 BK-01: 履歴の K 専用取得は読取だけ
+            self.assertNotIn(w, src, w)
         self.assertNotIn('"publish"', src)
 
     def test_wiring_single_hook_and_tail_import(self):
@@ -204,7 +211,8 @@ class TestPins(unittest.TestCase):
 
     def test_ruling3_exemplar_note_goes_to_k_only_when_enabled(self):
         rows = [{"id": 7, "category_id": "挨拶・雑談", "inbound_text": "q", "human_reply": "r", "active": True}]
-        with patch.object(rx, "_db_configured", lambda: True), patch.object(rx, "list_exemplars", AsyncMock(return_value=rows)):
+        with patch.object(rx, "_db_configured", lambda: True), patch.object(rx, "list_exemplars", AsyncMock(return_value=rows)), \
+             patch.object(kd, "_db_configured", lambda: True), patch.object(kd, "month_cost_yen", AsyncMock(return_value=0.0)):   # fix1 BK-02: 実効状態＝env ∧ DB ∧ 上限内
             with patch.dict(os.environ, {kd.ENV_MODEL: "claude-fable-5-1"}):
                 self.assertEqual(_run(rx.prompt_note("jikou", "受付")), "")                 # 一次生成には付けない
                 k_note = _run(rx.k_prompt_note("jikou", "受付"))
@@ -237,6 +245,7 @@ class _Db(unittest.TestCase):
         self._patches = [
             patch.object(cr, "get_app21_record", AsyncMock(return_value=APP21)),
             patch.object(cr, "get_recent_chat_history", AsyncMock(return_value=cr.ChatHistory())),
+            patch.object(kd, "k_chat_history", AsyncMock(return_value=cr.ChatHistory())),
             patch.object(kd, "notify_once", self.notify),
         ]
         for p in self._patches:
@@ -327,13 +336,93 @@ class TestFlow(_Db):
         self.assertEqual(self.notify.await_count, 3)
         self.assertEqual({c.args[0] for c in self.notify.await_args_list}, {kd.NOTICE_FAILED_KEY})
 
-    def test_input_unavailable_is_failed(self):
+    SECRET = "SEKRIT-ERR-77"
+
+    def _assert_input_unavailable(self, rid: str, logs: str, fake):
+        r = {x["record_id"]: x for x in self._rows()}[rid]
+        self.assertEqual((r["state"], r["reason"], r["text"]), ("failed", "input:unavailable", None))
+        self.assertEqual(fake.calls, [])                                                  # モデルは呼ばない
+        for col in ("reason", "text", "flags", "model", "category"):
+            self.assertNotIn(self.SECRET, str(r.get(col) or ""))
+        self.assertNotIn(self.SECRET, logs)                                               # 例外本文はログに出ない
+        self.assertNotIn("Traceback", logs)
+        self.assertIn("[K_DRAFT] failed (fixed reason)", logs)
+        self.assertEqual(self.notify.await_count, 0)                                      # 入力障害は管理者通知の対象外
+
+    def test_bk01_app21_lookup_error_is_input_unavailable(self):
+        """fix1 BK-01: App 21 の HTTP 非 2xx（App21LookupError）・取得例外は failed／input:unavailable。レコード無し（None）とは区別。"""
         fake = _fake_model(GOOD_DRAFT)
-        with patch.object(cr, "get_recent_chat_history", AsyncMock(side_effect=RuntimeError("db"))):
-            self.assertEqual(self._go(fake, record_id="504"), "failed")
-        r = self._rows()[0]
-        self.assertEqual((r["state"], r["reason"]), ("failed", "input:unavailable"))
-        self.assertEqual(fake.calls, [])
+        for rid, exc in (("504", cr.App21LookupError(f"status=500 {self.SECRET}")), ("505", RuntimeError(f"conn {self.SECRET}"))):
+            with patch.object(cr, "get_app21_record", AsyncMock(side_effect=exc)), self.assertLogs("hub.k_draft", level="INFO") as cm:
+                self.assertEqual(self._go(fake, record_id=rid), "failed")
+            self._assert_input_unavailable(rid, "\n".join(cm.output), fake)
+
+    def test_bk01_chatlog_http_failure_detected_by_k_wrapper(self):
+        """fix1 BK-01: 実取得の HTTP 経路。既存 get_recent_chat_history は非成功を [] に丸める（不変）が、K 専用 k_chat_history は
+        InputUnavailable を投げ、K は failed／input:unavailable で止まる。識別文字列は記録・ログに出ない。"""
+        class _Resp:
+            def __init__(self, status, payload=None, text=""):
+                self.status_code, self.is_success, self._p, self.text = status, 200 <= status < 300, payload or {}, text
+
+            def json(self):
+                return self._p
+
+        class _Client:
+            resp = None
+            calls: list = []
+
+            def __init__(self, **_kw):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_a):
+                return False
+
+            async def get(self, url, headers=None, params=None):
+                _Client.calls.append((url, params))
+                return _Client.resp
+        fake = _fake_model(GOOD_DRAFT)
+        self._patches[-2].stop()                                                            # k_chat_history は本物を使う
+        self._patches[1].stop()                                                             # 既存 get_recent_chat_history も本物（不変の確認）
+        try:
+            with patch.object(cr, "APP_CHATLOG", "28"), patch.object(cr, "TOKEN_CHATLOG", "t"), patch.object(cr.httpx, "AsyncClient", _Client):
+                _Client.resp = _Resp(520, text=f"gateway error {self.SECRET}")
+                self.assertEqual(_run(cr.get_recent_chat_history("U1")), [])              # 既存関数は [] に丸める（変えない）
+                with self.assertRaises(kd.InputUnavailable):
+                    _run(kd.k_chat_history("U1"))
+                with self.assertLogs("hub.k_draft", level="INFO") as cm:
+                    self.assertEqual(self._go(fake, record_id="506"), "failed")
+                self._assert_input_unavailable("506", "\n".join(cm.output), fake)
+                self.assertTrue(all("records.json" in u for u, _p in _Client.calls))          # 読取だけ
+                # 正常: 同じ問い合わせ・同じ整形（古い順・画像の内部行を除く・human 行は assistant）
+                from hub.image_intake import IMAGE_HUMAN_HOLD_MARKER
+                _Client.resp = _Resp(200, {"records": [
+                    {"role": {"value": "assistant"}, "content": {}, "message": {"value": "返信2"}},
+                    {"role": {"value": "user"}, "message": {"value": IMAGE_HUMAN_HOLD_MARKER}},
+                    {"role": {"value": "user"}, "message": {"value": "質問1"}}]})
+                hist = _run(kd.k_chat_history("U1"))
+                self.assertEqual(list(hist), list(_run(cr.get_recent_chat_history("U1"))))
+                self.assertEqual([m["content"] for m in hist], ["質問1", "返信2"])
+                self.assertEqual(self._go(fake, record_id="507"), "generated")
+                self.assertEqual(fake.calls[-1]["messages"][:2], list(hist))
+        finally:
+            self._patches[1].start()
+            self._patches[-2].start()
+
+    def test_bk01_normal_absence_proceeds(self):
+        """fix1 BK-01: App 21 に該当なし（None）・履歴 0 件・env 未設定は正常な不存在＝空の案件情報で生成に進む。"""
+        fake = _fake_model(GOOD_DRAFT)
+        with patch.object(cr, "get_app21_record", AsyncMock(return_value=None)), patch.object(cr, "APP_CHATLOG", ""):
+            self._patches[-2].stop()
+            try:
+                self.assertEqual(self._go(fake, record_id="508", name="（ヒアリング中）"), "generated")
+            finally:
+                self._patches[-2].start()
+        self.assertEqual(len(fake.calls), 1)
+        self.assertIn("（未登録）", fake.calls[0]["prompt"])
+        self.assertEqual(fake.calls[0]["messages"], [{"role": "user", "content": CONSULT}])
 
     def test_guards_reject_and_assertive_is_flag_only(self):
         cases = {
@@ -359,21 +448,76 @@ class TestFlow(_Db):
         self.assertEqual((reason, flags), (None, []))
         self.assertEqual(out, text)
 
-    def test_monthly_cost_cap_skips_like_off(self):
+    EXEMPLARS = [{"id": 7, "category_id": "挨拶・雑談", "inbound_text": "こんにちは", "human_reply": "手本の返信", "active": True}]
+
+    def _seed_cost(self, yen: float, record_id: str = "1"):
         async def _seed():
             now = kd._now()
             async with db.session_scope() as s:
+                await s.execute(sa.insert(kd.reply_k_draft).values(record_id=record_id, business="jikou", model="claude-fable-5-1",
+                                                                     rules_version="v1.5", rules_sha=RULES_SHA256, state="generated",
+                                                                     cost_yen=yen, created_at=now, updated_at=now))
+        _run(_seed())
+
+    def _request(self, fake, record_id: str):
+        """1 リクエスト分（同じ文脈）: 一次生成の前に手本の付加先を決め、起票後に後追いを起動する。戻り値 (note, task_state)。"""
+        async def _t():
+            note = await rx.prompt_note("jikou", "受付")
+            task = kd.after_queue(record_id, user_id="U0123456789abcdef0123456789abcdef", customer_name="山田 太郎",
+                                  customer_message=CONSULT, category="挨拶・雑談")
+            return str(note), (await task) if task is not None else None
+        with patch.object(rx, "_db_configured", lambda: True), patch.object(rx, "list_exemplars", AsyncMock(return_value=self.EXEMPLARS)), \
+             patch.object(kd, "_call_model", fake):
+            return _run(_t())
+
+    def test_bk02_cap_reached_is_exactly_off(self):
+        """fix1 BK-02: 上限到達＋承認済み手本あり → OFF と完全に同じ（手本は一次生成に付く・K 下書きなし・行も作らない）。通知だけ 1 日 1 回。"""
+        self._seed_cost(1600.0)
+        fake = _fake_model(GOOD_DRAFT)
+        note, st = self._request(fake, "520")
+        self.assertIn("手本の返信", note)                                                   # 手本は一次生成に付く（→ 承認固定・BQ-01）
+        self.assertIsNone(st)                                                              # 後追いは起動しない
+        self.assertEqual([r["record_id"] for r in self._rows()], ["1"])                      # 行も作らない
+        self.assertEqual(fake.calls, [])
+        self.notify.assert_awaited_once_with(kd.NOTICE_COST_CAP_KEY)
+        with patch.dict(os.environ, {kd.ENV_MODEL: "off"}):                                  # OFF と同じ値
+            note_off, st_off = self._request(fake, "521")
+        self.assertEqual((note_off, st_off), (note, st))
+        self.assertEqual(len(self._rows()), 1)
+
+    def test_bk02_switches_from_next_item_after_cap_mid_month(self):
+        """fix1 BK-02: 月の途中で上限に達した **次の 1 件** から OFF に切り替わる（到達した件自身は生成される）。"""
+        self._seed_cost(1590.0)
+        fake = _fake_model(GOOD_DRAFT)                                                      # 1 通 18 円 → 1608 円で上限到達
+        note1, st1 = self._request(fake, "530")
+        self.assertEqual((note1, st1), ("", "generated"))                                  # K ON: 手本は一次生成に付かない・K 下書きあり
+        self.assertGreaterEqual(_run(kd.month_cost_yen()), 1600.0)
+        note2, st2 = self._request(fake, "531")
+        self.assertIn("手本の返信", note2)                                                   # 次の 1 件から OFF と同じ
+        self.assertIsNone(st2)
+        self.assertEqual(sorted(r["record_id"] for r in self._rows()), ["1", "530"])
+        self.assertEqual(len(fake.calls), 1)
+
+    def test_bk02_same_value_within_one_request(self):
+        """fix1 BK-02: 同じリクエスト内では手本の付加先と後追い起動が同じ値を見る（一次生成の後に上限へ達しても変わらない）。"""
+        fake = _fake_model(GOOD_DRAFT)
+
+        async def _t():
+            note = await rx.prompt_note("jikou", "受付")                                   # ここで on と決まる
+            self._seed_cost_sync = None
+            now = kd._now()
+            async with db.session_scope() as s:                                            # 一次生成の間に上限へ
                 await s.execute(sa.insert(kd.reply_k_draft).values(record_id="1", business="jikou", model="claude-fable-5-1",
                                                                      rules_version="v1.5", rules_sha=RULES_SHA256, state="generated",
                                                                      cost_yen=1600.0, created_at=now, updated_at=now))
-        _run(_seed())
-        self.assertGreaterEqual(_run(kd.month_cost_yen()), 1600.0)
-        fake = _fake_model(GOOD_DRAFT)
-        self.assertEqual(self._go(fake, record_id="520"), "skipped")
-        r = {x["record_id"]: x for x in self._rows()}["520"]
-        self.assertEqual((r["state"], r["reason"], r["text"]), ("skipped", "cost:cap", None))
-        self.assertEqual(fake.calls, [])
-        self.notify.assert_awaited_once_with(kd.NOTICE_COST_CAP_KEY)
+            task = kd.after_queue("540", user_id="U0123456789abcdef0123456789abcdef", customer_name="山田 太郎",
+                                  customer_message=CONSULT, category="挨拶・雑談")
+            return str(note), await task
+        with patch.object(rx, "_db_configured", lambda: True), patch.object(rx, "list_exemplars", AsyncMock(return_value=self.EXEMPLARS)), \
+             patch.object(kd, "_call_model", fake):
+            note, st = _run(_t())
+        self.assertEqual((note, st), ("", "generated"))
+        self.assertEqual(sorted(r["record_id"] for r in self._rows()), ["1", "540"])
 
     def test_hook_from_save_to_approval_queue_runs_after_queue(self):
         """起動点: save_to_approval_queue が No. を返した直後。off なら行も作らない。"""
@@ -446,6 +590,137 @@ class TestNotices(_Db):
         self.assertNotIn("U0123456789abcdef", text)
 
 
+# ── fix1 BK-02（統合）: 上限到達＋承認済み手本ありの一次生成が OFF と同じ承認経路になる ─────────
+class TestBk02ApprovalRoute(unittest.TestCase):
+    USER = "U0123456789abcdef0123456789abcdef"
+
+    class _App29Client:
+        calls: list = []
+
+        def __init__(self, **_kw):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_a):
+            return False
+
+        async def post(self, url, headers=None, json=None):
+            TestBk02ApprovalRoute._App29Client.calls.append(json)
+
+            class _R:
+                status_code, is_success, text = 200, True, ""
+
+                def json(self):
+                    return {"id": "700"}
+            return _R()
+
+    def setUp(self):
+        self._dir = tempfile.mkdtemp(prefix="k1_route_")
+        self._env = patch.dict(os.environ, {"DATABASE_URL": f"sqlite+aiosqlite:///{self._dir}/r.db", kd.ENV_MODEL: "claude-fable-5-1",
+                                            "APP_CHATLOG": "28", "TOKEN_CHATLOG": "d"})
+        self._env.start()
+        os.environ.pop(sl.POLICY_V2_ENV, None)
+        db.reset_for_tests()
+        sp.clear_condition_cache()
+        approved_texts.reset_pending_for_tests()
+
+        async def _create():
+            eng = db.get_async_engine()
+            async with eng.begin() as c:
+                for md in (kd.metadata, rx.metadata, sl.metadata, rf.metadata, rp.metadata, InboundBase.metadata):
+                    await c.run_sync(md.create_all)
+        _run(_create())
+        self._App29Client.calls = []
+        self._patches = [
+            patch.object(line_channel.httpx, "AsyncClient", self._App29Client),
+            patch.object(cr.httpx, "AsyncClient", self._App29Client),
+            patch.object(cr, "APP_APPROVAL", "29"), patch.object(cr, "TOKEN_APPROVAL", "t"),
+            patch.object(sp, "_push_business_http", AsyncMock(return_value=True)),
+            patch.object(autoreply_stoplist, "is_suppressed", AsyncMock(return_value=False)),
+            patch.object(cr, "save_to_chatlog", AsyncMock(return_value="800")),
+            patch.object(cr, "_notify_attorney", AsyncMock()),
+            patch.object(cr, "get_recent_chat_history", AsyncMock(return_value=cr.ChatHistory())),
+            patch.object(kd, "k_chat_history", AsyncMock(return_value=cr.ChatHistory())),
+            patch.object(cr, "get_app21_record", AsyncMock(return_value=APP21)),
+            patch.object(kd, "notify_once", AsyncMock(return_value="sent")),
+        ]
+        for p in self._patches:
+            p.start()
+        self.assertEqual(_run(rx.save_exemplar(business="jikou", inbound_text="こんにちは", human_reply="手本の返信", category_id="挨拶・雑談")), "saved")
+        xid = _run(rx.list_for_view("jikou", include_inactive=True))[0]["id"]
+        self.assertTrue(_run(rx.approve_exemplar(int(xid))))
+
+    def tearDown(self):
+        for p in self._patches:
+            p.stop()
+        db.reset_for_tests()
+        self._env.stop()
+        shutil.rmtree(self._dir, ignore_errors=True)
+
+    def _k_rows(self):
+        async def _q():
+            async with db.session_scope() as s:
+                return [dict(r._mapping) for r in (await s.execute(sa.select(kd.reply_k_draft))).fetchall()]
+        return _run(_q())
+
+    def _message(self, fake):
+        seen = {}
+
+        async def _compose_spy(system_prompt, messages, tool=None):
+            seen["prompt"] = system_prompt
+            return {"reply": "ご案内します", "category": "挨拶・雑談", "auto_send": True, "jikou_update_flag": False,
+                    "immediate_notice": "none", "reason": "r"}
+        sent = AsyncMock(return_value=sl.SEND_SENT)
+
+        async def _t():
+            await cr.handle_customer_message(user_id=self.USER, user_message="こんにちは", reply_token="rt", app21_record=APP21, reply_func=sent)
+            await kd.drain_for_tests()
+        with patch.object(cr, "_call_compose_reply", _compose_spy), patch.object(kd, "_call_model", fake):
+            _run(_t())
+        return seen["prompt"], [c.args[1] for c in sent.await_args_list]
+
+    def _seed_cost(self, yen):
+        async def _seed():
+            now = kd._now()
+            async with db.session_scope() as s:
+                await s.execute(sa.insert(kd.reply_k_draft).values(record_id="1", business="jikou", model="claude-fable-5-1",
+                                                                     rules_version="v1.5", rules_sha=RULES_SHA256, state="generated",
+                                                                     cost_yen=yen, created_at=now, updated_at=now))
+        _run(_seed())
+
+    def test_cap_reached_matches_off_route(self):
+        """上限到達: 手本は一次生成に付き（prompt に手本）→ 承認固定（生成本文の顧客送信 0・App 29 起票）→ K 下書きなし（行なし）＝OFF と同じ。"""
+        self._seed_cost(1600.0)
+        fake = _fake_model(GOOD_DRAFT)
+        prompt_cap, texts_cap = self._message(fake)
+        self.assertIn("手本の返信", prompt_cap)
+        self.assertNotIn("ご案内します", texts_cap)
+        self.assertEqual(len(self._App29Client.calls), 1)
+        self.assertEqual(self._App29Client.calls[0]["record"]["AI下書き"]["value"], "ご案内します")
+        self.assertEqual([r["record_id"] for r in self._k_rows()], ["1"])                    # K 下書きなし（行なし）
+        self.assertEqual(fake.calls, [])
+        self._App29Client.calls.clear()
+        with patch.dict(os.environ, {kd.ENV_MODEL: "off"}):
+            prompt_off, texts_off = self._message(fake)
+        self.assertEqual(prompt_off, prompt_cap)                                            # OFF と byte 同一の prompt
+        self.assertEqual(texts_off, texts_cap)
+        self.assertEqual(len(self._App29Client.calls), 1)
+        self.assertEqual([r["record_id"] for r in self._k_rows()], ["1"])
+        self.assertEqual(fake.calls, [])
+
+    def test_under_cap_k_on_route(self):
+        """対照: 上限内なら手本は一次生成に付かず（許可表どおり自動送信）、K 下書きは起票された件にだけ作られる。"""
+        fake = _fake_model(GOOD_DRAFT)
+        prompt, texts = self._message(fake)
+        self.assertNotIn("手本の返信", prompt)                                               # 裁定 3: 手本は K にだけ
+        self.assertEqual(texts, ["ご案内します"])                                             # 許可表どおり自動送信（起票なし → K も起動しない）
+        self.assertEqual(self._App29Client.calls, [])
+        self.assertEqual(self._k_rows(), [])
+        self.assertEqual(fake.calls, [])
+
+
 # ── 返信画面・統合一覧（純関数） ───────────────────────────────────────────────────
 class TestViews(unittest.TestCase):
     REC = _rec(line_user_id="U0123456789abcdef0123456789abcdef", 顧客名="山田 太郎", 顧客メッセージ=CONSULT, カテゴリ="時効見立て_条件付き", AI下書き="旧下書き本文")
@@ -469,7 +744,6 @@ class TestViews(unittest.TestCase):
     def test_failed_and_rejected_keep_old_draft_with_badge(self):
         for k, badge in (({"state": "failed", "reason": "model:unavailable", "flags": []}, "K 下書きなし（モデル応答なし）"),
                          ({"state": "skipped", "reason": "model:invalid", "flags": []}, "K 下書きなし（設定を確認）"),
-                         ({"state": "skipped", "reason": "cost:cap", "flags": []}, "K 下書きなし（今月の費用上限）"),
                          ({"state": "rejected", "reason": "guard:length", "flags": []}, "K 下書きなし（検査で除外）"),
                          ({"state": "started", "reason": None, "flags": []}, None)):
             html = self._page(k)
