@@ -152,6 +152,11 @@ ON のときだけ有効な事項は「V2 ON」と明記する。
   sha256 `511ade90f0c8ec7893659ceed06d42a8477d43015af0665bf5ecf210fa00dd49`）は **凍結対象外の実行時付加** とする。手本 0 件なら付加なし＝基底 prompt は byte 同一で、
   `customer_prompt_base` の pin（`908f9335…`）は不変（test_jikou_reply_q3a が両方を固定）。テンプレートを変える場合は pin と本記録を同時に更新する。
 
+- **K-1（凍結記録・2026-11-09・docs/k_design.md §2-4）**: 返信規則 v1.5 のブロック（`hub.k_draft.RULES_V15_BLOCK`＝8 項＋場面別の言い回し表・
+  sha256 `a8da31ccba6d25724e2fc215e763ddf76d02bca603fd44565722940c9febdf5a`）は **凍結対象外の実行時付加** で、**K 後追い下書き（下書き専用モデル・env `JIKOU_DRAFT_MODEL`）の prompt にだけ** 付く。
+  自動送信の一次生成には付けない。v1.4（自動送信の規則）・基底 prompt（`908f9335…`）・approved_texts blob（`1e2bae22…`）は不変。K が OFF（既定）なら
+  prompt は byte 同一（test_jikou_k1 が pin）。文言を変える場合は pin と本記録を同時に更新する。
+
 ## 7. migration（fix1 BC-02）
 
 - 鎖は 1 本: e5f8（送信台帳）→ f7b2（手本）→ a7c9（create_state）→ c8e0（row_version）→ **a1c3**（対応待ち・Q1b-fix5／fix6 で
