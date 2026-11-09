@@ -1055,9 +1055,10 @@ class TestFix4MergeRevision(unittest.TestCase):
         alembic, tables, _u, _n = TestAlembicScaffold._brain_mig_tools(dbfile)
         try:
             self.assertEqual(alembic("heads").stdout.count("(head)"), 1)               # head は 1 本
-            self.assertIn(self.MERGE, alembic("heads").stdout)
+            self.assertIn(self.MERGE, alembic("history").stdout)                      # K-1: head は f6a8（reply_k_draft）に進んだため merge revision は history で確認
+            self.assertIn("f6a8c0e2d4b6", alembic("heads").stdout)
             self.assertEqual(alembic("upgrade", "b7d9f1a3c5e7").returncode, 0)
-            up = alembic("upgrade", "head")                                             # b7d9 → head（両系統を alembic が解決）
+            up = alembic("upgrade", self.MERGE)                                       # b7d9 → merge revision（両系統を alembic が解決）。K-1 で head は f6a8 に進んだため e3f5 を明示（FM2 方式）
             self.assertEqual(up.returncode, 0, f"stderr={up.stderr[-800:]}")
             self.assertIn(self.MERGE, alembic("current").stdout)
             self.assertTrue({rx_.DRAFT_TABLE_NAME, rx_.PROMOTION_TABLE_NAME, ac_.TABLE_NAME, ar_.TABLE_NAME} <= tables())   # 両親の表が揃う
@@ -1070,7 +1071,7 @@ class TestFix4MergeRevision(unittest.TestCase):
             self.assertIn(self.Q3A, cur)
             self.assertNotIn(self.MERGE, cur)
             self.assertTrue({rx_.DRAFT_TABLE_NAME, ac_.TABLE_NAME, ar_.TABLE_NAME} <= tables())
-            self.assertEqual(alembic("upgrade", "head").returncode, 0)
+            self.assertEqual(alembic("upgrade", self.MERGE).returncode, 0)          # K-1: e3f5 を明示（head は f6a8）
             self.assertIn(self.MERGE, alembic("current").stdout)
             self.assertEqual(alembic("heads").stdout.count("(head)"), 1)
         finally:
@@ -1087,7 +1088,7 @@ class TestFix4MergeRevision(unittest.TestCase):
         try:
             self.assertEqual(alembic("upgrade", self.Q3A).returncode, 0)             # 本番の現在地（b2d4）
             self.assertNotIn(ac_.TABLE_NAME, tables())
-            up = alembic("upgrade", "head")
+            up = alembic("upgrade", self.MERGE)                                       # K-1: head は f6a8（reply_k_draft）に進んだため、fix4 時点の head＝e3f5 を明示
             self.assertEqual(up.returncode, 0, f"stderr={up.stderr[-800:]}")
             self.assertIn(self.MERGE, alembic("current").stdout)
             self.assertTrue({rx_.DRAFT_TABLE_NAME, rx_.PROMOTION_TABLE_NAME, ac_.TABLE_NAME, ar_.TABLE_NAME} <= tables())
@@ -1136,7 +1137,8 @@ class TestMigrationAndMenu(unittest.TestCase):
             self.assertEqual(up.returncode, 0, f"stderr={up.stderr[-800:]}")
             self.assertIn(CLOSE, alembic("current").stdout)
             self.assertEqual(alembic("heads").stdout.count("(head)"), 1)
-            self.assertIn("e3f5a7b9c1d3", alembic("heads").stdout)                 # fix4: head は merge revision（b2d4＋d2f4）
+            self.assertIn("e3f5a7b9c1d3", alembic("history").stdout)               # fix4: merge revision（b2d4＋d2f4）／K-1: head は f6a8（reply_k_draft）
+            self.assertIn("f6a8c0e2d4b6", alembic("heads").stdout)
             con = sqlite3.connect(dbfile)
             try:
                 cols = {r[1] for r in con.execute(f'PRAGMA table_info("{ac.TABLE_NAME}")')}
