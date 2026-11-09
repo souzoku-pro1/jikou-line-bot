@@ -11,6 +11,10 @@
 """
 import ast
 import asyncio
+import base64
+import datetime
+import hashlib as _hashlib
+import hmac
 import hashlib
 import json
 import os
@@ -20,9 +24,25 @@ import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
+for _k, _v in {
+    "KINTONE_SUBDOMAIN": "testsub", "LINE_CHANNEL_SECRET": "dummy_secret",
+    "LINE_CHANNEL_ACCESS_TOKEN": "dummy_token", "ANTHROPIC_API_KEY": "dummy_key",
+    "KINTONE_APP_ID": "21", "KINTONE_API_TOKEN": "dummy",
+    "SOUZOKU_KINTONE_APP_ID": "26", "SOUZOKU_KINTONE_API_TOKEN": "dummy",
+    "CLOUDSIGN_CLIENT_ID": "c", "CLOUDSIGN_WEBHOOK_SECRET": "cs",
+    "KINTONE_WEBHOOK_TOKEN": "kintone-token", "DOCUMENT_WEBHOOK_SECRET": "d",
+    "APP_APPROVAL": "29", "TOKEN_APPROVAL": "d", "HEALTHCHECK_DISABLED": "1",
+    "STRIPE_WEBHOOK_SECRET": "w", "GOOGLE_VISION_API_KEY": "dummy_vision",
+}.items():
+    os.environ.setdefault(_k, _v)   # main の import に要る既定値（test_jikou_reply_q3a と同じ・秘密値ではない）
+
+from fastapi.testclient import TestClient  # noqa: E402
+from starlette.background import BackgroundTasks  # noqa: E402
+
 import sqlalchemy as sa
 
 import chat_responder as cr  # noqa: E402
+import main  # noqa: E402
 from hub import approved_texts  # noqa: E402
 from hub import db  # noqa: E402
 from hub import k_draft as kd  # noqa: E402
@@ -65,6 +85,7 @@ def _rec(**fields):
 
 APP21 = _rec(status="受付", 顧客名="山田 太郎", 問い合わせ業者名="アコム", 借入時期_テキスト="2015年", 最終返済日_テキスト="2019年3月",
              裁判所書類="なし", 信用情報確認="未")
+APP21_ENGAGED = dict(APP21, status={"value": "受任"})      # 本番経路（_process_line_event）で顧客対応へ振り分けられる status（受付はヒアリング経路）
 
 
 def _fake_model(text="", in_tokens=10000, out_tokens=400, exc=None):
@@ -180,6 +201,9 @@ class TestPins(unittest.TestCase):
         self.assertNotIn("cache_control", src)                                       # §1-6: cache は付けない
         for w in (".post(", ".put(", ".patch(", ".delete("):                              # fix1 BK-01: 履歴の K 専用取得は読取だけ
             self.assertNotIn(w, src, w)
+        for w in ("contextvars", "ContextVar", "reset_decision_for_tests", "effective_enabled", "_decision.get(", "_decision.set(", "_decision ="):   # fix2 BK-03: 判定をグローバルに持たない
+            self.assertNotIn(w, src, w)
+        self.assertNotIn("contextvars", (REPO / "hub" / "reply_exemplar.py").read_text(encoding="utf-8"))
         self.assertNotIn('"publish"', src)
 
     def test_wiring_single_hook_and_tail_import(self):
@@ -211,17 +235,25 @@ class TestPins(unittest.TestCase):
 
     def test_ruling3_exemplar_note_goes_to_k_only_when_enabled(self):
         rows = [{"id": 7, "category_id": "挨拶・雑談", "inbound_text": "q", "human_reply": "r", "active": True}]
-        with patch.object(rx, "_db_configured", lambda: True), patch.object(rx, "list_exemplars", AsyncMock(return_value=rows)), \
-             patch.object(kd, "_db_configured", lambda: True), patch.object(kd, "month_cost_yen", AsyncMock(return_value=0.0)):   # fix1 BK-02: 実効状態＝env ∧ DB ∧ 上限内
-            with patch.dict(os.environ, {kd.ENV_MODEL: "claude-fable-5-1"}):
-                self.assertEqual(_run(rx.prompt_note("jikou", "受付")), "")                 # 一次生成には付けない
-                k_note = _run(rx.k_prompt_note("jikou", "受付"))
-                self.assertIn("例1（事務所の返信）: r", k_note)
-                self.assertEqual(k_note.ids_by_category, {"挨拶・雑談": [7]})
-            with patch.dict(os.environ, {kd.ENV_MODEL: "off"}):
-                self.assertIn("例1（事務所の返信）: r", _run(rx.prompt_note("jikou", "受付")))   # K OFF＝Q3a の現状どおり
-            with patch.dict(os.environ, {kd.ENV_MODEL: "not-a-model"}):
-                self.assertIn("例1（事務所の返信）: r", _run(rx.prompt_note("jikou", "受付")))   # 無効値＝off と同じ
+        now = kd._now()
+        on = kd.KDecision(True, "claude-fable-5-1", 0.0, now)                                   # fix2 BK-03: 判定はイベントごとのオブジェクト
+        with patch.object(rx, "_db_configured", lambda: True), patch.object(rx, "list_exemplars", AsyncMock(return_value=rows)):
+            self.assertEqual(_run(rx.prompt_note("jikou", "受付", k_decision=on)), "")           # K ON: 一次生成には付けない
+            k_note = _run(rx.k_prompt_note("jikou", "受付"))
+            self.assertIn("例1（事務所の返信）: r", k_note)
+            self.assertEqual(k_note.ids_by_category, {"挨拶・雑談": [7]})
+            for off in (kd.KDecision(False, "off", None, now, kd.DECISION_OFF_ENV), kd.KDecision(False, "invalid", None, now, kd.DECISION_OFF_ENV),
+                        kd.KDecision(False, "claude-fable-5-1", 1600.0, now, kd.DECISION_OFF_CAP), None):
+                self.assertIn("例1（事務所の返信）: r", _run(rx.prompt_note("jikou", "受付", k_decision=off)))   # OFF／無効値／上限／判定なし＝Q3a の現状どおり
+        # decide() は env・DB・費用から新しく作る（キャッシュしない）
+        with patch.dict(os.environ, {kd.ENV_MODEL: "claude-fable-5-1"}), patch.object(kd, "_db_configured", lambda: True), \
+             patch.object(kd, "month_cost_yen", AsyncMock(side_effect=[10.0, 1600.0])), patch.object(kd, "notify_once", AsyncMock()):
+            d1, d2 = _run(kd.decide()), _run(kd.decide())
+            self.assertEqual((d1.enabled, d1.model, d1.cost_yen, d1.reason), (True, "claude-fable-5-1", 10.0, "on"))
+            self.assertEqual((d2.enabled, d2.cost_yen, d2.reason), (False, 1600.0, "off:cap"))
+            self.assertIsInstance(d1.decided_at, datetime.datetime)
+        with patch.dict(os.environ, {kd.ENV_MODEL: "off"}):
+            self.assertEqual((_run(kd.decide()).enabled, _run(kd.decide()).reason), (False, "off:env"))
 
 
 # ── 流れ（sqlite・モデルはモック） ─────────────────────────────────────────────────
@@ -462,9 +494,10 @@ class TestFlow(_Db):
     def _request(self, fake, record_id: str):
         """1 リクエスト分（同じ文脈）: 一次生成の前に手本の付加先を決め、起票後に後追いを起動する。戻り値 (note, task_state)。"""
         async def _t():
-            note = await rx.prompt_note("jikou", "受付")
+            kdec = await kd.decide()                                                           # fix2 BK-03: イベントの先頭で 1 回
+            note = await rx.prompt_note("jikou", "受付", k_decision=kdec)
             task = kd.after_queue(record_id, user_id="U0123456789abcdef0123456789abcdef", customer_name="山田 太郎",
-                                  customer_message=CONSULT, category="挨拶・雑談")
+                                  customer_message=CONSULT, category="挨拶・雑談", k_decision=kdec)
             return str(note), (await task) if task is not None else None
         with patch.object(rx, "_db_configured", lambda: True), patch.object(rx, "list_exemplars", AsyncMock(return_value=self.EXEMPLARS)), \
              patch.object(kd, "_call_model", fake):
@@ -503,15 +536,15 @@ class TestFlow(_Db):
         fake = _fake_model(GOOD_DRAFT)
 
         async def _t():
-            note = await rx.prompt_note("jikou", "受付")                                   # ここで on と決まる
-            self._seed_cost_sync = None
+            kdec = await kd.decide()                                                           # ここで on と決まる（このイベントの判定）
+            note = await rx.prompt_note("jikou", "受付", k_decision=kdec)
             now = kd._now()
             async with db.session_scope() as s:                                            # 一次生成の間に上限へ
                 await s.execute(sa.insert(kd.reply_k_draft).values(record_id="1", business="jikou", model="claude-fable-5-1",
                                                                      rules_version="v1.5", rules_sha=RULES_SHA256, state="generated",
                                                                      cost_yen=1600.0, created_at=now, updated_at=now))
             task = kd.after_queue("540", user_id="U0123456789abcdef0123456789abcdef", customer_name="山田 太郎",
-                                  customer_message=CONSULT, category="挨拶・雑談")
+                                  customer_message=CONSULT, category="挨拶・雑談", k_decision=kdec)
             return str(note), await task
         with patch.object(rx, "_db_configured", lambda: True), patch.object(rx, "list_exemplars", AsyncMock(return_value=self.EXEMPLARS)), \
              patch.object(kd, "_call_model", fake):
@@ -719,6 +752,226 @@ class TestBk02ApprovalRoute(unittest.TestCase):
         self.assertEqual(self._App29Client.calls, [])
         self.assertEqual(self._k_rows(), [])
         self.assertEqual(fake.calls, [])
+
+
+# ── fix2 BK-03: 判定の寿命＝受信イベント単位（本番と同じ経路: /webhook → BackgroundTasks → handle_customer_message） ──
+def _line_body(events):
+    body = json.dumps({"events": [{"type": "message", "webhookEventId": eid, "replyToken": f"rt-{eid}",
+                                   "source": {"userId": uid}, "message": {"type": "text", "text": text}} for eid, uid, text in events]}).encode()
+    sig = base64.b64encode(hmac.new(b"dummy_secret", body, _hashlib.sha256).digest()).decode()
+    return body, sig
+
+
+class TestBk03EventLifetime(unittest.TestCase):
+    U1 = "U0123456789abcdef0123456789abcdef"
+    U2 = "Ufedcba9876543210fedcba9876543210"
+
+    class _App29Client:
+        calls: list = []
+        seq = [800]
+
+        def __init__(self, **_kw):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_a):
+            return False
+
+        async def post(self, url, headers=None, json=None):
+            TestBk03EventLifetime._App29Client.calls.append(json)
+            TestBk03EventLifetime._App29Client.seq[0] += 1
+            rid = str(TestBk03EventLifetime._App29Client.seq[0])
+
+            class _R:
+                status_code, is_success, text = 200, True, ""
+
+                def json(self):
+                    return {"id": rid}
+            return _R()
+
+    def setUp(self):
+        self._dir = tempfile.mkdtemp(prefix="k1_evt_")
+        self._env = patch.dict(os.environ, {"DATABASE_URL": f"sqlite+aiosqlite:///{self._dir}/e.db", kd.ENV_MODEL: "claude-fable-5-1"})
+        self._env.start()
+        for k in (sl.POLICY_V2_ENV, "INBOUND_EVENT_DURABLE_ENABLED", "KINTONE_EVENT_DEDUP_ENABLED"):
+            os.environ.pop(k, None)
+        db.reset_for_tests()
+        sp.clear_condition_cache()
+        approved_texts.reset_pending_for_tests()
+
+        async def _create():
+            eng = db.get_async_engine()
+            async with eng.begin() as c:
+                for md in (kd.metadata, rx.metadata, sl.metadata, rf.metadata, rp.metadata, InboundBase.metadata):
+                    await c.run_sync(md.create_all)
+        _run(_create())
+        self._App29Client.calls = []
+        self.seen_notes: list = []          # (user_id, note) 一次生成に付いた参考文例
+        self.decisions: dict = {}           # user_id → [prompt_note に渡った判定, after_queue に渡った判定]
+        real_note, real_after = rx.prompt_note, kd.after_queue
+
+        async def _note_spy(business, status, k_decision=None):
+            self.decisions.setdefault(k_decision and id(k_decision), []).append(("note", k_decision))
+            return await real_note(business, status, k_decision=k_decision)
+
+        def _after_spy(record_id, **kw):
+            self.decisions.setdefault(kw.get("k_decision") and id(kw.get("k_decision")), []).append(("after", kw.get("k_decision")))
+            return real_after(record_id, **kw)
+        self.cost_reads = AsyncMock(side_effect=kd.month_cost_yen)                 # 費用読取の回数（本物を呼ぶ）
+        self._patches = [
+            patch.object(main, "LINE_CHANNEL_SECRET", "dummy_secret"),
+            patch.object(main, "_autoreply_paused", lambda: False),
+            patch.object(main.autoreply_stoplist, "is_suppressed", AsyncMock(return_value=False)),
+            patch.object(main, "get_app21_record", AsyncMock(return_value=APP21_ENGAGED)),
+            patch.object(main, "_inbound_stop_kind", AsyncMock(return_value="")),
+            patch.object(main.image_intake, "close_held_markers", AsyncMock(return_value=0)),
+            patch.object(main.image_intake, "heal_unreplied", AsyncMock(return_value=0)),
+            patch.object(main, "_line_reply_with_fallback", AsyncMock(return_value=sl.SEND_SENT)),
+            patch.object(main, "save_to_chatlog", AsyncMock(return_value="800")),
+            patch.object(cr, "save_to_chatlog", AsyncMock(return_value="800")),
+            patch.object(cr, "_notify_attorney", AsyncMock()),
+            patch.object(cr, "get_app21_record", AsyncMock(return_value=APP21_ENGAGED)),
+            patch.object(cr, "get_recent_chat_history", AsyncMock(return_value=cr.ChatHistory())),
+            patch.object(cr.httpx, "AsyncClient", self._App29Client),
+            patch.object(cr, "APP_APPROVAL", "29"), patch.object(cr, "TOKEN_APPROVAL", "t"),
+            patch.object(sp, "_push_business_http", AsyncMock(return_value=True)),
+            patch.object(line_channel.httpx, "AsyncClient", self._App29Client),
+            patch.object(kd, "k_chat_history", AsyncMock(return_value=cr.ChatHistory())),
+            patch.object(kd, "notify_once", AsyncMock(return_value="sent")),
+            patch.object(kd, "month_cost_yen", self.cost_reads),
+            patch.object(rx, "prompt_note", _note_spy),
+            patch.object(kd, "after_queue", _after_spy),
+            patch.object(cr, "k_draft", kd),                                       # chat_responder から見える k_draft は同じ module（after_queue の spy を通す）
+        ]
+        for p in self._patches:
+            p.start()
+        main.conversation_histories.pop(self.U1, None)
+        main.conversation_histories.pop(self.U2, None)
+        self.assertEqual(_run(rx.save_exemplar(business="jikou", inbound_text="こんにちは", human_reply="手本の返信", category_id="法的判断・見通し",
+                                               stage=rx._stage_for_status("受任"))), "saved")
+        xid = _run(rx.list_for_view("jikou", include_inactive=True))[0]["id"]
+        self.assertTrue(_run(rx.approve_exemplar(int(xid))))
+
+    def tearDown(self):
+        for p in self._patches:
+            p.stop()
+        db.reset_for_tests()
+        self._env.stop()
+        shutil.rmtree(self._dir, ignore_errors=True)
+
+    def _k_rows(self):
+        async def _q():
+            async with db.session_scope() as s:
+                return [dict(r._mapping) for r in (await s.execute(sa.select(kd.reply_k_draft))).fetchall()]
+        return _run(_q())
+
+    def _seed_cost(self, yen):
+        async def _seed():
+            now = kd._now()
+            async with db.session_scope() as s:
+                await s.execute(sa.insert(kd.reply_k_draft).values(record_id="1", business="jikou", model="claude-fable-5-1",
+                                                                     rules_version="v1.5", rules_sha=RULES_SHA256, state="generated",
+                                                                     cost_yen=yen, created_at=now, updated_at=now))
+        _run(_seed())
+
+    @staticmethod
+    def _compose_spy(prompts: dict):
+        async def _spy(system_prompt, messages, tool=None):
+            prompts[messages[-1]["content"]] = system_prompt
+            return {"reply": "弁護士が確認します", "category": "法的判断・見通し", "auto_send": False, "jikou_update_flag": False,
+                    "immediate_notice": "none", "reason": "r"}
+        return _spy
+
+    def _events_of(self):
+        """判定オブジェクトごとに (note に渡った判定, after_queue に渡った判定) を返す（id → list）。"""
+        return {k: v for k, v in self.decisions.items() if k is not None}
+
+    def test_1_two_events_in_one_webhook_second_reads_cost_again_and_turns_off(self):
+        """① 同じ webhook の連続 2 イベント: 1 件目 on（K 下書き・18 円で上限到達）→ 2 件目は費用を読み直して off。費用読取は 2 回。"""
+        self._seed_cost(1590.0)
+        prompts: dict = {}
+        fake = _fake_model(GOOD_DRAFT)
+        real_decide = kd.decide
+
+        async def _decide_ordered():                                                 # 順序の固定だけ: 前のイベントの後追い（別タスク）を待ってから判定
+            await kd.drain_for_tests()
+            return await real_decide()
+        body, sig = _line_body([("ev-1", self.U1, "1件目の相談です"), ("ev-2", self.U2, "2件目の相談です")])
+        with patch.object(cr, "_call_compose_reply", self._compose_spy(prompts)), patch.object(kd, "_call_model", fake), \
+             patch.object(kd, "decide", _decide_ordered), TestClient(main.app) as client:
+            r = client.post("/webhook", content=body, headers={"X-Line-Signature": sig})
+            self.assertEqual(r.status_code, 200)
+            client.portal.call(kd.drain_for_tests)                                         # 後追いタスクはアプリ側の loop で待つ
+        self.assertEqual(self.cost_reads.await_count, 2)                                   # 2 件目も費用を読み直す
+        self.assertNotIn("手本の返信", prompts["1件目の相談です"])                           # 1 件目: K ON（手本は K にだけ）
+        self.assertIn("手本の返信", prompts["2件目の相談です"])                              # 2 件目: 上限到達 → OFF と同じ（手本は一次生成に）
+        rows = {r["record_id"]: r for r in self._k_rows()}
+        self.assertEqual(len(self._App29Client.calls), 2)                                  # 2 件とも承認キューへ
+        k_rows = [r for r in rows.values() if r["record_id"] != "1"]
+        self.assertEqual([r["state"] for r in k_rows], ["generated"])                        # K 下書きは 1 件目だけ
+        self.assertEqual(len(fake.calls), 1)
+        ev = self._events_of()
+        self.assertEqual(len(ev), 2)                                                        # イベントごとに別の判定オブジェクト
+        kinds = sorted(tuple(k for k, _d in v) for v in ev.values())
+        self.assertEqual(kinds, [("note", "after"), ("note", "after")])                     # 同じイベント内は同じオブジェクトが両方に渡る
+        flags = sorted(v[0][1].enabled for v in ev.values())
+        self.assertEqual(flags, [False, True])
+        self.assertEqual(sorted(v[0][1].reason for v in ev.values()), ["off:cap", "on"])
+
+    def test_2_first_event_exception_does_not_leak_into_second(self):
+        """② 1 件目が途中例外（一次生成の例外）でも 2 件目の判定は独立（費用を読み直し・新しいオブジェクト・on）。"""
+        prompts: dict = {}
+        fake = _fake_model(GOOD_DRAFT)
+        spy = self._compose_spy(prompts)
+        calls = {"n": 0}
+
+        async def _first_raises(system_prompt, messages, tool=None):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("boom-1")
+            return await spy(system_prompt, messages, tool)
+        body, sig = _line_body([("ev-a", self.U1, "1件目の相談です"), ("ev-b", self.U2, "2件目の相談です")])
+        with patch.object(cr, "_call_compose_reply", _first_raises), patch.object(kd, "_call_model", fake), \
+             patch.object(sp, "outage_ack", AsyncMock(return_value="")), TestClient(main.app) as client:
+            r = client.post("/webhook", content=body, headers={"X-Line-Signature": sig})
+            self.assertEqual(r.status_code, 200)
+            client.portal.call(kd.drain_for_tests)                                         # 後追いタスクはアプリ側の loop で待つ
+        self.assertEqual(self.cost_reads.await_count, 2)                                   # 1 件目の判定は捨てられ 2 件目は読み直す
+        self.assertNotIn("1件目の相談です", prompts)
+        self.assertNotIn("手本の返信", prompts["2件目の相談です"])                           # 2 件目: on
+        ev = self._events_of()
+        self.assertEqual(len(ev), 2)
+        per = {tuple(k for k, _d in v): v for v in ev.values()}
+        self.assertIn(("note",), per)                                                       # 1 件目: note まで（例外で起票なし）
+        self.assertIn(("note", "after"), per)                                               # 2 件目: note と after に同じオブジェクト
+        self.assertTrue(all(d.enabled for v in ev.values() for _k, d in v))
+        self.assertEqual([r["state"] for r in self._k_rows()], ["generated"])
+
+    def test_3_concurrent_events_do_not_mix_decisions(self):
+        """③ 並行イベント（BackgroundTasks 2 本を asyncio.gather）: 互いの判定が混ざらない（別オブジェクト・各イベント内では同一・費用読取 2 回）。"""
+        prompts: dict = {}
+        fake = _fake_model(GOOD_DRAFT)
+        with patch.object(cr, "_call_compose_reply", self._compose_spy(prompts)), patch.object(kd, "_call_model", fake):
+            async def _both():
+                t1, t2 = BackgroundTasks(), BackgroundTasks()
+                t1.add_task(main._process_line_event, "rt-c1", self.U1, "1件目の相談です")
+                t2.add_task(main._process_line_event, "rt-c2", self.U2, "2件目の相談です")
+                await asyncio.gather(t1(), t2())
+                await kd.drain_for_tests()
+            _run(_both())
+        self.assertEqual(self.cost_reads.await_count, 2)
+        self.assertEqual(len(self._App29Client.calls), 2)
+        ev = self._events_of()
+        self.assertEqual(len(ev), 2)                                                        # 判定オブジェクトは 2 つ（イベントごと）
+        for v in ev.values():
+            self.assertEqual([k for k, _d in v], ["note", "after"])                          # 各イベント内: 同じオブジェクトが note と after に
+            self.assertTrue(all(d is v[0][1] for _k, d in v))
+        objs = [v[0][1] for v in ev.values()]
+        self.assertIsNot(objs[0], objs[1])
+        self.assertEqual(sorted(r["state"] for r in self._k_rows()), ["generated", "generated"])
+        self.assertEqual(len(fake.calls), 2)
 
 
 # ── 返信画面・統合一覧（純関数） ───────────────────────────────────────────────────

@@ -20,8 +20,10 @@ env ``JIKOU_DRAFT_MODEL``（§1-3・閉集合）
 「Fable で月 1,600 円以内」）に達したら **OFF と完全に同じ**（fix1 BK-02: 手本は一次生成に付き・承認固定・K 下書きなし・行も作らない）。
 業務 LINE へは上限到達の通知を 1 日 1 回（承認済みテキスト）。
 
-K の実効有効状態（fix1 BK-02）: ``effective_enabled()``＝env 閉集合 ∧ 費用上限内 ∧ DB あり。1 リクエスト（contextvars の文脈）で **1 回だけ**
-決め、手本の付加先（reply_exemplar.prompt_note）と後追い起動（after_queue）の両方が同じ値を見る。
+K の実効有効状態（fix1 BK-02・fix2 BK-03）: ``decide()`` が **受信イベントごとに** 判定オブジェクト ``KDecision``（enabled・model・費用の読取値・
+決定時刻）を作る。判定の寿命は受信イベント単位: handle_customer_message がイベントの先頭で 1 回作り、手本の付加先（reply_exemplar.prompt_note）
+と後追い起動（save_to_approval_queue → after_queue）に **明示的に引数で渡す**。グローバル・文脈変数・モジュール変数には置かない。
+判定を受け取らない呼出（ヒアリング経路・障害経路）は後追いの中でそのイベント用に 1 回作る。
 
 入力の取得（fix1 BK-01）: App 21 の取得例外・HTTP 非成功、履歴（App 28）の HTTP 非成功は **取得障害** として state=failed・reason input:unavailable
 を記録しモデルを呼ばない（例外本文は記録もログもしない）。env 未設定・レコード無し・履歴 0 件は **正常な不存在** で、空の案件情報・空の履歴で進む。
@@ -38,7 +40,7 @@ RV-08: 行は削除しない（state の追加だけ）。RV-10: 本文・LINE u
 from __future__ import annotations
 
 import asyncio
-import contextvars
+import dataclasses
 import datetime
 import hashlib
 import json
@@ -93,38 +95,42 @@ class InputUnavailable(Exception):
     """fix1 BK-01: 入力（App 21・履歴）の取得障害。固定語彙だけを持つ（例外本文に相手先の本文を入れない）。"""
 
 
-_decision: contextvars.ContextVar = contextvars.ContextVar("k_draft_decision", default=None)   # None=未決・"on"／"off"
 DECISION_ON = "on"
-DECISION_OFF = "off"
+DECISION_OFF_ENV = "off:env"          # 未設定／off／無効値
+DECISION_OFF_DB = "off:db"            # DB 未設定
+DECISION_OFF_COST = "off:cost"        # 費用を読めない（fail-closed）
+DECISION_OFF_CAP = "off:cap"          # 月額上限に到達（OFF と完全に同じ）
 
 
-async def _decide() -> str:
-    """env 閉集合 ∧ DB あり ∧ 費用上限内 → on。上限到達は OFF と同じ（通知だけ 1 日 1 回）。読めないときは off（fail-closed）。"""
-    if not enabled() or not _db_configured():
-        return DECISION_OFF
+@dataclasses.dataclass(frozen=True)
+class KDecision:
+    """fix2 BK-03: 受信イベントごとの判定（寿命＝そのイベントの処理）。enabled・モデル・費用の読取値・決定時刻・固定語彙の理由。"""
+    enabled: bool
+    model: str
+    cost_yen: float | None
+    decided_at: datetime.datetime
+    reason: str = DECISION_ON
+
+
+async def decide() -> KDecision:
+    """env 閉集合 ∧ DB あり ∧ 費用上限内 → enabled。上限到達は OFF と同じ（通知だけ 1 日 1 回）。費用を読めないときは off（fail-closed）。
+    呼ぶたびに新しく決める（キャッシュしない）。受信イベントの先頭で 1 回呼び、そのイベントの処理に引数で渡す。"""
+    now = _now()
+    model = configured_model()
+    if model in (MODEL_OFF, MODEL_INVALID):
+        return KDecision(False, model, None, now, DECISION_OFF_ENV)
+    if not _db_configured():
+        return KDecision(False, model, None, now, DECISION_OFF_DB)
     try:
-        cost = await month_cost_yen()
+        cost = await month_cost_yen(now)
     except Exception:
-        logger.warning("[K_DRAFT] cost check failed (fixed reason); K off for this request")
-        return DECISION_OFF
+        logger.warning("[K_DRAFT] cost check failed (fixed reason); K off for this event")
+        return KDecision(False, model, None, now, DECISION_OFF_COST)
     if cost >= MONTHLY_COST_CAP_YEN:
         logger.warning("[K_DRAFT] monthly cost cap reached; K off")
         await notify_once(NOTICE_COST_CAP_KEY)
-        return DECISION_OFF
-    return DECISION_ON
-
-
-async def effective_enabled() -> bool:
-    """fix1 BK-02: K の実効有効状態。同じ文脈では 1 回だけ決め、以後は同じ値（手本の付加先と後追い起動が同じ値を見る）。"""
-    d = _decision.get()
-    if d is None:
-        d = await _decide()
-        _decision.set(d)
-    return d == DECISION_ON
-
-
-def reset_decision_for_tests() -> None:
-    _decision.set(None)
+        return KDecision(False, model, cost, now, DECISION_OFF_CAP)
+    return KDecision(True, model, cost, now, DECISION_ON)
 
 
 _config_logged = {"done": False}
@@ -433,8 +439,9 @@ def _flatten_ids(note) -> list[int]:
 
 
 async def run_after_queue(record_id: str, *, user_id: str, customer_name: str, customer_message: str,
-                          category: str | None) -> str:
-    """後追い本体。戻り値は最終 state（テスト用）。例外は外に出さない。"""
+                          category: str | None, k_decision: "KDecision | None" = None) -> str:
+    """後追い本体。戻り値は最終 state（テスト用）。例外は外に出さない。
+    fix2 BK-03: k_decision はそのイベントの判定（handle_customer_message が作って渡す）。無い呼出（ヒアリング・障害経路）はここで 1 回作る。"""
     rid = str(record_id)
     model = configured_model()
     cat = category if category else None
@@ -444,8 +451,10 @@ async def run_after_queue(record_id: str, *, user_id: str, customer_name: str, c
                 logger.warning("[K_DRAFT] skipped (invalid model)")
                 await notify_once(NOTICE_INVALID_KEY)
             return STATE_SKIPPED
-        if not await effective_enabled():                 # fix1 BK-02: 一次生成と同じ値（上限到達＝OFF と同じ・行も作らない）
-            return DECISION_OFF
+        kd = k_decision if k_decision is not None else await decide()   # fix1 BK-02／fix2 BK-03: 一次生成と同じ判定（上限到達＝OFF と同じ・行も作らない）
+        if not kd.enabled:
+            return kd.reason
+        model = kd.model
         if not await _claim(rid, category=cat, model=model, state=STATE_STARTED):
             return "duplicate"
     except Exception:
@@ -497,19 +506,21 @@ async def _safe_finish(rid: str, **fields) -> None:
 _tasks: set = set()
 
 
-def after_queue(record_id, *, user_id: str, customer_name: str, customer_message: str, category: str | None):
+def after_queue(record_id, *, user_id: str, customer_name: str, customer_message: str, category: str | None,
+                k_decision: "KDecision | None" = None):
     """起動点（save_to_approval_queue が No. を返した直後・1 か所）。off なら何もしない（行も作らない）。
-    後追い＝応答・通知を待たせない（asyncio.Task）。戻り値は Task か None。"""
+    後追い＝応答・通知を待たせない（asyncio.Task）。戻り値は Task か None。
+    fix2 BK-03: k_decision はそのイベントの判定（一次生成と同じオブジェクト）。enabled でなければ起動しない。無ければ後追いの中で 1 回作る。"""
     if not record_id or configured_model() == MODEL_OFF or not _db_configured():
         return None
-    if configured_model() != MODEL_INVALID and _decision.get() == DECISION_OFF:   # fix1 BK-02: 一次生成の前に off と決まった（上限到達など）
+    if configured_model() != MODEL_INVALID and k_decision is not None and not k_decision.enabled:
         return None
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
         return None
     task = loop.create_task(run_after_queue(str(record_id), user_id=str(user_id or ""), customer_name=str(customer_name or ""),
-                                            customer_message=str(customer_message or ""), category=category))
+                                            customer_message=str(customer_message or ""), category=category, k_decision=k_decision))
     _tasks.add(task)
     task.add_done_callback(_tasks.discard)
     return task
