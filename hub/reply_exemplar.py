@@ -395,8 +395,18 @@ def format_note(rows: list[dict]) -> ExemplarNote:
     return note
 
 
-async def prompt_note(business: str, status: str) -> ExemplarNote:
-    """承認済みの手本から参考文例の文を作る（DB 未設定・例外は ""＝従来どおり）。"""
+async def prompt_note(business: str, status: str, k_decision=None) -> ExemplarNote:
+    """承認済みの手本から参考文例の文を作る（DB 未設定・例外は ""＝従来どおり）。
+    K-1 裁定 3: 下書き専用モデル（JIKOU_DRAFT_MODEL）が ON のときは一次生成（自動送信の判定に使う生成）には付けず、
+    K 後追い下書きにだけ付ける（k_prompt_note）。K が OFF（既定）なら Q3a の現状どおり。
+    fix2 BK-03: k_decision はそのイベントの判定（hub.k_draft.KDecision・呼出側が作って渡す）。None は K 無効と同じ。"""
+    if k_decision is not None and getattr(k_decision, "enabled", False):   # fix1 BK-02／fix2 BK-03: 同じイベントの判定を見る
+        return format_note([])
+    return await k_prompt_note(business, status)
+
+
+async def k_prompt_note(business: str, status: str) -> ExemplarNote:
+    """手本の受け口（K-1: K 下書きの参考文例・K OFF のときの一次生成も同じ本体）。承認済みだけ・0 件は ""。"""
     if not _db_configured():
         return format_note([])
     try:

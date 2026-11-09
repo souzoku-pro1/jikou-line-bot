@@ -69,7 +69,7 @@ import uuid
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 
-from hub import kintone, line_channel, reply_exemplar, reply_followup, send_ledger, send_policy
+from hub import k_draft, kintone, line_channel, reply_exemplar, reply_followup, send_ledger, send_policy
 from hub.redact import emit
 from hub import webapp_auth
 from hub.webapp_auth import _gate, _sign
@@ -352,7 +352,7 @@ async def _save_exemplar(user_id: str, inbound_text: str, text: str, op_id: str,
 
 # ── 画面 ────────────────────────────────────────────────────────────────────
 def _page(record_id: str, rec: dict | None, rows: list[dict], op_id: str, ticket: str | None,
-          notices: list[str], flags: tuple = (), held: str | None = None) -> str:
+          notices: list[str], flags: tuple = (), held: str | None = None, k: dict | None = None) -> str:
     e = html.escape
     parts = [
         '<!DOCTYPE html><html lang="ja"><head><meta charset="utf-8">',
@@ -383,9 +383,11 @@ def _page(record_id: str, rec: dict | None, rows: list[dict], op_id: str, ticket
         "結果不明は送信確認待ちに残ります（自動再送なし）。"
         f'<a href="{INBOX}">対応待ちへ戻る</a>｜<a href="/app/approvals">承認</a>｜<a href="/app/send_ops">送信確認待ち</a></p>',
     ]
-    if flags:
+    kb = k_draft.badges(k)                                        # K-1: K 下書きの札（固定語彙・本文なし）
+    if flags or kb:
         parts.append('<div class="flags">' + ''.join(
-            f'<span class="badge {"att" if k == "attending" else "warn"}">{e(_FLAG_LABELS[k])}</span>' for k in flags if k in _FLAG_LABELS) + '</div>')
+            f'<span class="badge {"att" if fk == "attending" else "warn"}">{e(_FLAG_LABELS[fk])}</span>' for fk in flags if fk in _FLAG_LABELS)
+            + ''.join(f'<span class="badge {"info" if b == k_draft.BADGE_GENERATED else "warn"}">{e(b)}</span>' for b in kb) + '</div>')
     for n in notices:
         if n:
             parts.append(f'<p class="notice">{e(n)}</p>')
@@ -407,7 +409,8 @@ def _page(record_id: str, rec: dict | None, rows: list[dict], op_id: str, ticket
         parts.append(f'<div class="meta">{e(_ROLE_LABELS.get(role, role))}｜{e(str(r.get("at", "")))}</div>')
         parts.append(f'<pre class="{cls}">{e(str(r.get("message", "")))}</pre>')
     parts.append("</div>")
-    draft = held if held is not None else _v(rec, "AI下書き")   # fix1 BU-03: 保持中の編集本文があればそれを初期値に
+    k_text = str(k.get("text") or "") if k and k.get("state") == k_draft.STATE_GENERATED else ""   # K-1: generated の本文だけ
+    draft = held if held is not None else (k_text or _v(rec, "AI下書き"))   # fix1 BU-03: 保持中の編集本文 → K 下書き（K-1） → 旧下書き
     parts.append(f'<form method="post" action="{PAGE}/{e(record_id)}/send" class="item">'
                  f'<input type="hidden" name="op_id" value="{e(op_id)}">'
                  f'<input type="hidden" name="ticket" value="{e(ticket)}">'
@@ -447,7 +450,8 @@ async def reply_page(request: Request):
     held = held_text(_session_key(request), record_id) if rec is not None else None   # fix1 BU-03: 送らなかった編集本文
     if held is not None:
         notices = notices + [_HELD_NOTICE]
-    return HTMLResponse(_page(record_id, rec, rows, op_id, ticket, notices, flags, held=held))
+    k = await k_draft.view_state(record_id) if rec is not None else None               # K-1: K 下書き（行なしは None＝従来どおり）
+    return HTMLResponse(_page(record_id, rec, rows, op_id, ticket, notices, flags, held=held, k=k))
 
 
 # ── fix1 BU-03: 送らなかった編集本文の一時保持（認証セッションに紐づくサーバー側メモリ・URL／クエリ／ログに本文を載せない） ──

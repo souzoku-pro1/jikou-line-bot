@@ -430,7 +430,7 @@ class TestPins(unittest.TestCase):
         self.assertEqual(sorted(int(e.split(":")[1]) for e in entries
                                 if e.startswith("chat_responder.py:")), [])          # Q3a-fix1 BQ-04: 2 件を回収（allowlist 追加ゼロ・削除のみ）
         csrc = (REPO / "chat_responder.py").read_text(encoding="utf-8").split("\n")
-        self.assertEqual(sum("reply_exemplar.prompt_note(p.name, status)" in l for l in csrc), 1)
+        self.assertEqual(sum("reply_exemplar.prompt_note(p.name, status, k_decision=_kd)" in l for l in csrc), 1)   # K-1-fix2 BK-03: 同じイベントの判定を渡す（呼出は 1 か所のまま）
         self.assertEqual(sum("reply_exemplar.mark_used_for(_exn, category)" in l for l in csrc), 1)
         self.assertEqual(sum("reply_exemplar.require_approval_if_referenced(guard, _exn)" in l for l in csrc), 1)   # fix1 BQ-01
         self.assertEqual(sum("reply_exemplar.record_draft(record_id" in l for l in csrc), 1)

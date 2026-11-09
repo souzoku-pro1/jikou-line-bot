@@ -1347,6 +1347,7 @@ async def save_to_approval_queue(
     ai_draft: str,
     category: str,
     reason: str,
+    k_decision=None,  # K-1-fix2 BK-03: このイベントの K 判定（顧客対応経路が渡す・無ければ後追いの中で 1 回作る）
 ) -> Optional[str]:
     """承認キューアプリに下書きを保存し、レコードIDを返す。APP_APPROVAL 未設定時は None。"""
     if not (APP_APPROVAL and TOKEN_APPROVAL):
@@ -1380,7 +1381,7 @@ async def save_to_approval_queue(
                     emit(resp.status_code, "count", "log", "operator"),
                     emit(resp.text, "vendor_raw", "log", "operator"))
         return None
-    record_id = resp.json().get("id"); await reply_exemplar.record_draft(record_id, "jikou", category, ai_draft)  # JIKOU-REPLY-Q3a (c): 起票時の下書き sha256
+    record_id = resp.json().get("id"); await reply_exemplar.record_draft(record_id, "jikou", category, ai_draft); k_draft.after_queue(record_id, user_id=user_id, customer_name=customer_name, customer_message=customer_message, category=category, k_decision=k_decision)  # JIKOU-REPLY-Q3a (c): 起票時の下書き sha256／K-1: 後追い下書き（env off なら何もしない・送信と無関係）
     logger.info("[APP29] saved record_id=%s",
                 emit(record_id, "record_id", "log", "operator"))
     return record_id
@@ -1638,6 +1639,7 @@ async def handle_customer_message(
     # AUTOREPLY-GEN2 要件3: 収集済み項目台帳（App21 の正+画像受領マーカー・
     # fail-open）を既知項目一覧としてプロンプトへ注入し再質問を禁止
     known_items = build_known_items(app21_record, history)
+    _kd = await k_draft.decide()  # K-1-fix2 BK-03: このイベントの K 判定を 1 回作り、手本の付加先と後追い起動に明示的に渡す
 
     system_prompt = build_system_prompt(
         status=status,
@@ -1648,7 +1650,7 @@ async def handle_customer_message(
         court_docs=_field("裁判所書類"),
         credit_check=_field("信用情報確認"),
         known_items=known_items,
-        profile=p, human_note=human_history_note(history), exemplar_note=(_exn := await reply_exemplar.prompt_note(p.name, status)),  # JIKOU-REPLY-Q1b 注記／Q3a (b) 参考文例（0 件は ""）
+        profile=p, human_note=human_history_note(history), exemplar_note=(_exn := await reply_exemplar.prompt_note(p.name, status, k_decision=_kd)),  # JIKOU-REPLY-Q1b 注記／Q3a (b) 参考文例（0 件は ""）／K-1-fix2: 同じイベントの判定
     )
 
     # Claude で返信案を作成
@@ -1723,6 +1725,7 @@ async def handle_customer_message(
             ai_draft=reply_text,
             category=category,
             reason=queue_reason,
+            k_decision=_kd,  # K-1-fix2 BK-03: 一次生成と同じ判定オブジェクト
         ); await reply_exemplar.mark_used_for(_exn, category)  # Q3a-fix1 BQ-01: 手本は承認キューに固定した下書きで使われた（結果の category の群だけ）
         # 顧客への定型文を返信（裁判所書類の第一報・離脱兆候・対象外債権・
         # 法テラスは専用文面。GEN2 要件5: それ以外はカテゴリ別の文脈化定型
@@ -1976,3 +1979,8 @@ from hub import send_policy  # noqa: E402
 # ── JIKOU-REPLY-Q3a（QUEUE-2026-10-12-C C-2）: 承認済み手本の参考文例（prompt 末尾・0 件は ""）と無修正承認の計数。
 #    末尾追記（sink allowlist の行番号 pin を動かさない規約・本文中は 1 行置換のみ）。
 from hub import reply_exemplar  # noqa: E402
+
+# ── K-1（docs/k_design.md）: 下書き専用モデルの後追い下書き。起動点は save_to_approval_queue が No. を返した直後の 1 か所（上の 1 行置換）。
+#    末尾追記（sink allowlist の行番号 pin を動かさない規約）。env JIKOU_DRAFT_MODEL 未設定／off では何も起動しない（挙動不変）。
+from hub import k_draft  # noqa: E402
+k_draft.log_config_once()  # 無効値なら起動ログに WARNING 1 行（値は出さない）
