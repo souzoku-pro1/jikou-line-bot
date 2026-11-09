@@ -382,8 +382,11 @@ class TestAgeNoticeApprovedText(_Fix2Mixin):
         src = (REPO / "hub" / "send_policy.py").read_text(encoding="utf-8")
         self.assertNotIn("f\"{AGE_NOTICE_HEADER}\\n未返信の対応待ち {stats", src)                        # 旧い文字列組立は残っていない
         self.assertEqual(sp.AGE_NOTICE_TEXT_KEY, "ops_age_notice_v1")
-        # 台帳の閉集合: TEXT-APPROVAL-GATE-1 の安全文 ＋ TEXT-APPROVAL-2（2026-11-02）の ops_age_notice_v1 ＋ TEXT-APPROVAL-3（2026-11-04）の v2（契約の追随）
-        self.assertEqual(set(AT.APPROVED_SHA256), {AT.SAFE_TEXT_KEY, sp.AGE_NOTICE_TEXT_KEY, sp.AGE_NOTICE_TEXT_KEY_V2})
+        # 台帳の閉集合: TEXT-APPROVAL-GATE-1 の安全文 ＋ TEXT-APPROVAL-2（2026-11-02）の ops_age_notice_v1 ＋ TEXT-APPROVAL-3（2026-11-04）の v2
+        # ＋ TEXT-APPROVAL-4（2026-11-09）の K 通知 3 件（契約の追随）
+        self.assertEqual(set(AT.APPROVED_SHA256), {AT.SAFE_TEXT_KEY, sp.AGE_NOTICE_TEXT_KEY, sp.AGE_NOTICE_TEXT_KEY_V2,
+                                                   "ops_k_draft_invalid_model_v1", "ops_k_draft_failed_v1",
+                                                   "ops_k_draft_cost_cap_v1"})
         self.assertEqual(AT.APPROVED_SHA256[sp.AGE_NOTICE_TEXT_KEY], AT.sha256_text(sp.AGE_NOTICE_TEMPLATE))
 
 

@@ -40,6 +40,9 @@ APPROVED_SHA256: dict[str, str] = {
     # TEXT-APPROVAL-3（2026-11-04・大野承認・Fable 経由）: 経過通知の末尾を完全 URL にした v2（pgv/ux_pending_1_age_notice_v2.md）。
     # v1 の行は旧版の送信台帳との照合のため残す。
     "ops_age_notice_v2": "b91070d861198b77c39af30b69e38fa8fef46b28c7fd8a1971813a5f8a78d5c1",
+    "ops_k_draft_invalid_model_v1": "66ab00735f5d7a6c1616ade79c087d6ae53b4f8a63c45bda2f151257f3efc5e6",   # TEXT-APPROVAL-4（2026-11-09・大野承認）K 通知: 設定値が許可外（hub/k_draft.NOTICE_INVALID_TEXT）
+    "ops_k_draft_failed_v1": "3159a6b8149829226b831724815f78bb6617035fb457894ac934cf432f268612",          # TEXT-APPROVAL-4（2026-11-09・大野承認）K 通知: モデル応答なし（NOTICE_FAILED_TEXT）
+    "ops_k_draft_cost_cap_v1": "12a6c8ea8047718815deb33eaedccb2eaf8e5e3a75ff19d47c66697dda37ef86",        # TEXT-APPROVAL-4（2026-11-09・大野承認）K 通知: 月額上限到達（NOTICE_COST_CAP_TEXT）
 }
 
 LEDGER_BUSINESS = "jikou"

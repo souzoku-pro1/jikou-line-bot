@@ -603,12 +603,14 @@ class TestNotices(_Db):
 
     def test_unapproved_text_is_not_sent_and_key_recorded(self):
         sent = AsyncMock(return_value="sent")
-        with patch.object(sp, "send_business_notice", sent), patch.object(approved_texts, "notify_unapproved_once", AsyncMock(return_value=True)):
+        unapproved = {k: v for k, v in approved_texts.APPROVED_SHA256.items() if k not in kd.NOTICE_TEXTS}   # TEXT-APPROVAL-4 前（＝本文を変えて SHA が外れた状態）を再現
+        with patch.dict(approved_texts.APPROVED_SHA256, unapproved, clear=True), patch.object(sp, "send_business_notice", sent), \
+             patch.object(approved_texts, "notify_unapproved_once", AsyncMock(return_value=True)):
             self.assertEqual(_run(kd.notify_once(kd.NOTICE_FAILED_KEY)), "needs_approval")
         sent.assert_not_awaited()
         self.assertIn(kd.NOTICE_FAILED_KEY, approved_texts.pending_unapproved_keys())
         for key, text in kd.NOTICE_TEXTS.items():
-            self.assertNotIn(key, approved_texts.APPROVED_SHA256)                       # 承認は大野の票で（SHA は報告に記載）
+            self.assertEqual(approved_texts.APPROVED_SHA256[key], approved_texts.sha256_text(text))   # TEXT-APPROVAL-4（2026-11-09・大野承認）で台帳に載った・本文不変
             self.assertTrue(text.startswith("【K 下書き】"))
 
     def test_approved_text_is_sent_once_a_day_via_ledger_key(self):
