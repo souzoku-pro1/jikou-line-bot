@@ -113,6 +113,10 @@ _NUMBER_LINE = "\n受付番号：{受付番号}"
 #  - BF-01: token 照合（lookup／lookup_used）の取得不能（例外）は「不存在」と分け、固定
 #    ページ（_error_500・作成・更新・採番なし）で終了する。nonce 照合は in-memory で例外なし。
 #  - BF-04: 相違の再送に業務 LINE 通知はしない（相違欄の件数を INFO ログに出すだけ）。
+#  - BF-05（fix2）: nonce の既存確認と処理権の予約は 1 つの原子操作（asyncio.Lock 配下・
+#    setdefault 相当）で token 照合など外部待機の前に行う。予約に成功した 1 本だけが先へ進み、
+#    他は予約者の完了を待って同じ結果を返す。結果保存・失敗時の解放は自分の予約（entry の
+#    同一性）に対してだけ行い、既存の予約・結果は上書きしない。
 #  - 送信ボタンは 1 回押したら無効化（JS・無効でも nonce のサーバ側で守る）。
 #  【単一 worker 前提】in-memory の有界 LRU（_attempts・_upload_tokens と同じ既知の制約）
 NONCE_FIELD = "n"
@@ -733,14 +737,17 @@ async def shindan_entry(request: Request):
     early, pattern, fields_base = _prepare_submission(form)
     if early is not None:
         return early
-    # BF-02: 同じ nonce の再 POST は経路を問わず「同一送信」＝1 回目と同じ完了画面
+    # BF-02: 同じ nonce の再 POST は経路を問わず「同一送信」＝1 回目と同じ完了画面。
+    # BF-05: nonce の既存確認と処理権の予約は 1 つの原子操作で、token 照合（外部待機）の前に行う
     nonce = verify_nonce(form.get(NONCE_FIELD, ""))
-    if nonce:
-        same = await _nonce_hit(nonce, time.time())
-        if same is not None:
-            return _same_submission_page(same, pattern, fields_base)
-    # token の照合（取得不能は BF-01: 不存在と分けて固定ページ・作成・更新・採番なし）
-    state, link = await _resolve_post_link(request)
+    return await _submit_with_nonce(lambda: _resolve_post_link(request), pattern, fields_base, nonce)
+
+
+async def _submit_resolved(resolved: tuple[str, dict | None], pattern: str, fields_base: dict,
+                           entry: "_NonceEntry | None"):
+    """token 照合の結果（_resolve_post_link の 4 状態）に応じて 1 本の送信を処理する。
+    取得不能は BF-01: 不存在と分けて固定ページ（作成・更新・採番なし）。"""
+    state, link = resolved
     if state == "failed":
         return _error_500()
     if state == "used":
@@ -750,7 +757,7 @@ async def shindan_entry(request: Request):
                     emit(shindan_link.token_head(str(link.get("token") or "")),
                          "record_id", "log", "operator"))
         return _resubmit_done_page()
-    return await _submit_new(pattern, fields_base, link if state == "valid" else None, nonce)
+    return await _submit_new(pattern, fields_base, link if state == "valid" else None, entry)
 
 
 def _post_token(request: Request) -> str:
@@ -801,36 +808,80 @@ def _nonce_put(nonce: str, entry: _NonceEntry) -> None:
     _nonce_results[nonce] = entry
 
 
-_PENDING = "pending"
+_nonce_lock: asyncio.Lock | None = None
+_nonce_lock_loop = None
+_NONCE_RESERVE_RETRIES = 5      # 予約者が失敗→解放 のたびに取り直す回数の上限（超えたら固定ページ）
 
 
-async def _nonce_hit(nonce: str, now: float):
-    """同じ nonce の 1 回目があれば (entry) を返す。処理中なら完了を待ち、待ちきれなければ
-    result=None のまま返す（呼び出し側は固定の受付中ページ）。該当なし・1 回目が失敗
-    （辞書から外れる）・期限切れなら None（通常どおり新規へ）。"""
-    entry = _nonce_results.get(nonce)
-    if entry is None:
-        return None
-    if now - entry.ts > NONCE_TTL_SEC:
-        _nonce_results.pop(nonce, None)
-        return None
-    if entry.result is None:
-        try:
-            await asyncio.wait_for(entry.event.wait(), _NONCE_WAIT_SEC)
-        except asyncio.TimeoutError:
-            return _PENDING
+def _get_nonce_lock() -> asyncio.Lock:
+    """予約操作を直列化する asyncio.Lock（走行中の loop ごとに 1 つ・テストの loop 差し替えに追随）。"""
+    global _nonce_lock, _nonce_lock_loop
+    loop = asyncio.get_running_loop()
+    if _nonce_lock is None or _nonce_lock_loop is not loop:
+        _nonce_lock = asyncio.Lock()
+        _nonce_lock_loop = loop
+    return _nonce_lock
+
+
+async def _nonce_reserve(nonce: str, sig: tuple, now: float) -> tuple[_NonceEntry, bool]:
+    """BF-05: 既存確認と処理権の予約を 1 つの原子操作で行う（Lock 配下・await なし＝
+    setdefault 相当）。戻り値 (entry, owned)。owned=True は自分が新規に予約した 1 本
+    （先へ進む）。False は既存の予約／結果（上書きしない・呼び出し側は完了を待つ）。
+    期限切れの結果だけは捨てて新規に予約する。"""
+    async with _get_nonce_lock():
         entry = _nonce_results.get(nonce)
-        if entry is None or entry.result is None:
-            return None
-    return entry
+        if entry is not None and entry.result is not None and now - entry.ts > NONCE_TTL_SEC:
+            _nonce_results.pop(nonce, None)
+            entry = None
+        if entry is None:
+            entry = _NonceEntry(now, sig)
+            _nonce_put(nonce, entry)
+            return entry, True
+        return entry, False
 
 
-def _same_submission_page(hit, pattern: str, fields_base: dict) -> HTMLResponse:
+def _nonce_release(nonce: str, entry: _NonceEntry) -> None:
+    """自分の予約（entry の同一性＝予約 ID）だけを扱う: 結果が無ければ辞書から外し
+    （失敗した 1 本目は後続を妨げない）、結果があれば残す。待っている側を起こす。"""
+    if entry.result is None and _nonce_results.get(nonce) is entry:
+        _nonce_results.pop(nonce, None)
+    entry.event.set()
+
+
+def _pending_page() -> HTMLResponse:
+    logger.info("[SHINDAN] duplicate post pending (no write)")
+    return _fixed_page("送信を受け付けています", PLAIN_PENDING_TEXT, 200)
+
+
+async def _submit_with_nonce(resolve, pattern: str, fields_base: dict, nonce: str):
+    """nonce 付きの送信: 予約に成功した 1 本だけが token 照合（resolve・外部待機）→ 送信へ
+    進む。他は予約者の完了を待って同じ結果を返す（待ちきれなければ固定の受付中ページ・
+    作成 0）。予約者が失敗して解放したら、待っていた側が新たに予約を取って進む。
+    nonce なしは予約せず通常どおり。"""
+    if not nonce:
+        return await _submit_resolved(await resolve(), pattern, fields_base, None)
+    sig = _content_sig(pattern, fields_base)
+    for _attempt in range(_NONCE_RESERVE_RETRIES):
+        entry, owned = await _nonce_reserve(nonce, sig, time.time())
+        if owned:
+            try:
+                return await _submit_resolved(await resolve(), pattern, fields_base, entry)
+            finally:
+                _nonce_release(nonce, entry)
+        if entry.result is None:
+            try:
+                await asyncio.wait_for(entry.event.wait(), _NONCE_WAIT_SEC)
+            except asyncio.TimeoutError:
+                return _pending_page()
+        if entry.result is not None:
+            return _same_submission_page(entry, pattern, fields_base)
+        # 予約者が失敗して解放した → 取り直す
+    return _pending_page()
+
+
+def _same_submission_page(hit: _NonceEntry, pattern: str, fields_base: dict) -> HTMLResponse:
     """同じ nonce の再 POST: 1 回目と同じ完了画面（同じ受付番号／同じレコード）。写真導線の
     トークンは同じレコードへ発行し直す。相違は件数だけ INFO ログ（通知なし=BF-04）。"""
-    if hit == _PENDING:
-        logger.info("[SHINDAN] duplicate post pending (no write)")
-        return _fixed_page("送信を受け付けています", PLAIN_PENDING_TEXT, 200)
     kind, record_id, number, prev_pattern = hit.result
     differs = sum(1 for a, b in zip(hit.sig, _content_sig(pattern, fields_base)) if a != b)
     now = time.time()
@@ -848,23 +899,14 @@ def _same_submission_page(hit, pattern: str, fields_base: dict) -> HTMLResponse:
         issue_upload_token(record_id, number, now)))
 
 
-async def _submit_new(pattern: str, fields_base: dict, link: dict | None, nonce: str):
-    """新規の送信として処理（紐付け経路／k なし経路）。nonce があれば 1 回目として記憶し、
-    成功（created／updated／noop）だけを残す。失敗は記憶しない（後続を妨げない）。"""
-    entry: _NonceEntry | None = None
-    if nonce:
-        entry = _NonceEntry(time.time(), _content_sig(pattern, fields_base))
-        _nonce_put(nonce, entry)
-    try:
-        if link is not None:
-            # SHINDAN-LINE-LINK-1 E: 本人専用リンク経由（k なしの経路は以下不変）
-            return await _handle_submit_linked(pattern, fields_base, link, entry)
-        return await _handle_submit_plain(pattern, fields_base, entry)
-    finally:
-        if entry is not None:
-            if entry.result is None:
-                _nonce_results.pop(nonce, None)         # 失敗=次の POST は通常どおり
-            entry.event.set()
+async def _submit_new(pattern: str, fields_base: dict, link: dict | None,
+                      entry: "_NonceEntry | None"):
+    """新規の送信として処理（紐付け経路／k なし経路）。entry（自分の予約）があれば成功
+    （created／updated／noop）の結果だけを残す。予約の解放は呼び出し側（_submit_with_nonce）。"""
+    if link is not None:
+        # SHINDAN-LINE-LINK-1 E: 本人専用リンク経由（k なしの経路は以下不変）
+        return await _handle_submit_linked(pattern, fields_base, link, entry)
+    return await _handle_submit_plain(pattern, fields_base, entry)
 
 
 async def _link_from_request(request: Request, *, use_cookie: bool,
@@ -1181,16 +1223,14 @@ def _prepare_submission(form: dict[str, str]):
 
 
 async def _handle_submit(form: dict[str, str], link: dict | None = None, nonce: str = ""):
-    """直接呼び出し用（テスト・互換）: 入口と同じ順（検証 → nonce 照合 → 新規）。"""
+    """直接呼び出し用（テスト・互換）: 入口と同じ順（検証 → nonce 予約 → 新規）。"""
     early, pattern, fields_base = _prepare_submission(form)
     if early is not None:
         return early
-    nonce = verify_nonce(nonce)
-    if nonce:
-        same = await _nonce_hit(nonce, time.time())
-        if same is not None:
-            return _same_submission_page(same, pattern, fields_base)
-    return await _submit_new(pattern, fields_base, link, nonce)
+
+    async def _resolved():
+        return ("valid", link) if link is not None else ("none", None)
+    return await _submit_with_nonce(_resolved, pattern, fields_base, verify_nonce(nonce))
 
 
 async def _handle_submit_plain(pattern: str, fields_base: dict,
