@@ -4,7 +4,8 @@
 固定する内容:
  - 上限到達中に A が token 照合で待機中 → 別 nonce の登録が続いても A は追い出されない
    （A は作成 1 回・同一 nonce の B は A の結果＝同じ受付番号を返す・作成なし）。
- - 退避できるのは「結果確定済み」または「期限切れ」だけ（最古から）。
+ - 退避できるのは「結果確定済み」だけ（最古から）。fix4（BF-07）で「期限切れの処理中」も退避しない
+   に訂正（処理中は期限にかかわらず残す）。
  - 処理中で埋まって安全に空きが作れないときは新規予約を拒否し、固定の受付中ページで終了
    （作成 0・採番なし・WARNING 1 行で件数のみ・予約エントリを作らない）。
  - 処理中エントリの個数も上限の内数。
@@ -133,7 +134,8 @@ class TestEvictionExcludesInflight(_Base):
         db.reset_for_tests()
         self.assertEqual(r_c.status_code, 200)
         body_c = r_c.body.decode("utf-8")
-        self.assertIn(sf.PLAIN_PENDING_TEXT, body_c)                  # 固定の受付中ページ
+        self.assertIn(sf.STORE_FULL_TEXT, body_c)                     # 固定ページ（fix4 BF-07 で文言訂正）
+        self.assertNotIn(sf.PLAIN_PENDING_TEXT, body_c)
         self.assertNotIn("受付番号", body_c)
         self.assertNotIn(sf.PHOTO_ROUTE, body_c)
         self.assertNotIn(n_c, body_c)
@@ -146,11 +148,11 @@ class TestEvictionExcludesInflight(_Base):
         self.assertEqual(len(self.fake.create_calls), 2)             # A1・A2 は影響を受けず作成
         self.assertNotIn("duplicate post pending", self.cap.text())  # 待機ページとは別経路
 
-    # ── 退避の対象: 結果確定済み・期限切れだけ・最古から ────────────────────────
+    # ── 退避の対象: 結果確定済みだけ・最古から（fix4 BF-07: 期限切れの処理中も残す）────
     def test_eviction_takes_finished_or_expired_only_oldest_first(self):
         now = sf.time.time()
         fresh = sf._NonceEntry(now, ())                              # 処理中・期限内
-        expired_inflight = sf._NonceEntry(now - sf.NONCE_TTL_SEC - 1, ())
+        expired_inflight = sf._NonceEntry(now - sf.NONCE_TTL_SEC - 1, ())   # 処理中・期限切れ
         done_old, done_new = _done(now - 100), _done(now)
         with patch.object(sf, "MAX_NONCE_RESULTS", 4):
             for k, e in (("done_old", done_old), ("fresh", fresh),
@@ -159,12 +161,11 @@ class TestEvictionExcludesInflight(_Base):
             self.assertTrue(sf._nonce_put("x1", sf._NonceEntry(now, ()), now))
             self.assertEqual(list(sf._nonce_results), ["fresh", "expired", "done_new", "x1"])
             self.assertTrue(sf._nonce_put("x2", sf._NonceEntry(now, ()), now))
-            self.assertEqual(list(sf._nonce_results), ["fresh", "done_new", "x1", "x2"])
-            self.assertTrue(sf._nonce_put("x3", sf._NonceEntry(now, ()), now))
-            self.assertEqual(list(sf._nonce_results), ["fresh", "x1", "x2", "x3"])
-            self.assertFalse(sf._nonce_put("x4", sf._NonceEntry(now, ()), now))  # 全部処理中 → 拒否
-            self.assertEqual(list(sf._nonce_results), ["fresh", "x1", "x2", "x3"])
+            self.assertEqual(list(sf._nonce_results), ["fresh", "expired", "x1", "x2"])  # 期限切れでも処理中は残す
+            self.assertFalse(sf._nonce_put("x3", sf._NonceEntry(now, ()), now))  # 全部処理中 → 拒否
+            self.assertEqual(list(sf._nonce_results), ["fresh", "expired", "x1", "x2"])
             self.assertIs(sf._nonce_results["fresh"], fresh)
+            self.assertIs(sf._nonce_results["expired"], expired_inflight)
             self.assertEqual(len(sf._nonce_results), 4)
 
     def test_inflight_entries_count_toward_limit_in_reserve(self):

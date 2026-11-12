@@ -121,6 +121,10 @@ _NUMBER_LINE = "\n受付番号：{受付番号}"
 #    「期限切れ」のエントリだけ（最古から）。処理中（予約済み・結果未確定・期限内）は退避せず、
 #    個数は上限の内数。安全に空きが作れなければ新規予約を拒否し、固定の受付中ページで終了
 #    （作成 0・採番なし・WARNING 1 行で件数のみ）。
+#  - BF-07（fix4）: 処理中（予約済み・結果未確定）のエントリは期限にかかわらず退避しない（退避は
+#    結果確定済みのみ）。署名は正しいが期限切れの nonce は「なし」に変換せず（nonce_state が
+#    "expired" を区別）、その nonce に処理中または結果確定のエントリがあれば従来の待機または同じ
+#    結果を返し、無ければ初めて「nonce なし」として扱う。満杯時の固定ページは「混み合っています」。
 #  - 送信ボタンは 1 回押したら無効化（JS・無効でも nonce のサーバ側で守る）。
 #  【単一 worker 前提】in-memory の有界 LRU（_attempts・_upload_tokens と同じ既知の制約）
 NONCE_FIELD = "n"
@@ -134,6 +138,9 @@ RESUBMIT_DONE_TEXT = ("この診断フォームはすでに送信済みです。
                       "LINEのトーク画面からお送りください。")
 PLAIN_PENDING_TEXT = ("送信を受け付けています。しばらくお待ちいただき、画面が変わらない"
                       "場合はLINEの無料相談へお進みください。")
+STORE_FULL_TITLE = "ただいま混み合っています"
+STORE_FULL_TEXT = ("ただいま混み合っています。しばらくしてからもう一度お試しいただくか、"
+                   "LINE の無料相談からご連絡ください。")
 # 1 回目の送信内容の照合欄（相違は件数だけログ・値は SHA-256 のみ保持）
 _RESUBMIT_COMPARE_FIELDS = _LINKED_UPDATE_FIELDS
 
@@ -166,19 +173,27 @@ def issue_nonce(now: float | None = None) -> str:
     return f"{exp}.{rnd}.{_nonce_sig(exp, rnd)}"
 
 
-def verify_nonce(raw: str, now: float | None = None) -> str:
-    """形式 → 署名 → 期限 の順に検証し、有効なら nonce 文字列そのもの、無効・期限切れ・
-    なしは ""（=nonce なしとして通常どおり新規）。改ざん値は下流へ流さない。"""
+def nonce_state(raw: str, now: float | None = None) -> tuple[str, str]:
+    """形式 → 署名 → 期限 の順に検証し (state, nonce) を返す（BF-07）。
+    ("ok", nonce)=有効／("expired", nonce)=署名は正しいが期限切れ（既存エントリの照合にだけ使い、
+    新規予約はしない）／("none", "")=なし・形式不正・署名不正（改ざん値は下流へ流さない）。"""
     nonce = str(raw or "").strip()
     if not _NONCE_RE.fullmatch(nonce):
-        return ""
+        return "none", ""
     exp_s, rnd, sig = nonce.split(".")
     if not hmac.compare_digest(sig, _nonce_sig(int(exp_s), rnd)):
-        return ""
+        return "none", ""
     t = now if now is not None else time.time()
     if int(exp_s) <= t:
-        return ""
-    return nonce
+        return "expired", nonce
+    return "ok", nonce
+
+
+def verify_nonce(raw: str, now: float | None = None) -> str:
+    """有効なら nonce 文字列そのもの、無効・期限切れ・なしは ""（fix1 からの契約・不変）。
+    POST 入口は nonce_state を使い、期限切れ（署名正）を「なし」と区別する（BF-07）。"""
+    state, nonce = nonce_state(raw, now)
+    return nonce if state == "ok" else ""
 
 router = APIRouter()
 
@@ -743,8 +758,10 @@ async def shindan_entry(request: Request):
         return early
     # BF-02: 同じ nonce の再 POST は経路を問わず「同一送信」＝1 回目と同じ完了画面。
     # BF-05: nonce の既存確認と処理権の予約は 1 つの原子操作で、token 照合（外部待機）の前に行う
-    nonce = verify_nonce(form.get(NONCE_FIELD, ""))
-    return await _submit_with_nonce(lambda: _resolve_post_link(request), pattern, fields_base, nonce)
+    # BF-07: 期限切れ（署名正）は「なし」に変換せず、既存エントリがあれば待機／同じ結果を返す
+    state, nonce = nonce_state(form.get(NONCE_FIELD, ""))
+    return await _submit_with_nonce(lambda: _resolve_post_link(request), pattern, fields_base,
+                                    nonce, state)
 
 
 async def _submit_resolved(resolved: tuple[str, dict | None], pattern: str, fields_base: dict,
@@ -807,10 +824,9 @@ def _content_sig(pattern: str, fields_base: dict) -> tuple:
 
 
 def _nonce_evictable(old: _NonceEntry, now: float) -> bool:
-    """退避してよいのは「結果確定済み」または「期限切れ」だけ（BF-06）。期限切れの処理中は
-    nonce 自体の有効期限（発行+NONCE_TTL_SEC ≦ 予約+NONCE_TTL_SEC）も過ぎているので、以後
-    同じ nonce の POST は verify_nonce で弾かれ、退避しても同一送信の判定を失わない。"""
-    return old.result is not None or now - old.ts > NONCE_TTL_SEC
+    """退避してよいのは「結果確定済み」だけ（BF-06・BF-07）。処理中（予約済み・結果未確定）は
+    期限にかかわらず退避しない（期限切れ nonce の再 POST も既存エントリで同一送信と判定する）。"""
+    return old.result is not None
 
 
 def _nonce_make_room(now: float) -> bool:
@@ -848,14 +864,21 @@ def _get_nonce_lock() -> asyncio.Lock:
     return _nonce_lock
 
 
-async def _nonce_reserve(nonce: str, sig: tuple, now: float) -> tuple[_NonceEntry | None, bool]:
+async def _nonce_reserve(nonce: str, sig: tuple, now: float, *,
+                         allow_new: bool = True) -> tuple[_NonceEntry | None, bool]:
     """BF-05: 既存確認と処理権の予約を 1 つの原子操作で行う（Lock 配下・await なし＝
     setdefault 相当）。戻り値 (entry, owned)。owned=True は自分が新規に予約した 1 本
     （先へ進む）。False は既存の予約／結果（上書きしない・呼び出し側は完了を待つ）。
-    期限切れの結果だけは捨てて新規に予約する。(None, False) は BF-06 の拒否（表が処理中で
-    埋まり安全に空きが作れない・予約なし・呼び出し側は固定ページ）。"""
+    有効な nonce（allow_new=True）では期限切れの結果だけは捨てて新規に予約する。
+    (None, False) は、allow_new=True なら BF-06 の拒否（表が処理中で埋まり安全に空きが
+    作れない・予約なし・呼び出し側は固定ページ）。
+    BF-07: 期限切れ（署名正）の nonce は allow_new=False で呼ぶ＝既存エントリ（処理中・結果
+    確定・期限を問わない）があればそれを返し、無ければ (None, False)（新規予約はしない・
+    呼び出し側は「nonce なし」として扱う）。"""
     async with _get_nonce_lock():
         entry = _nonce_results.get(nonce)
+        if not allow_new:
+            return entry, False
         if entry is not None and entry.result is not None and now - entry.ts > NONCE_TTL_SEC:
             _nonce_results.pop(nonce, None)
             entry = None
@@ -882,23 +905,30 @@ def _pending_page() -> HTMLResponse:
 
 
 def _store_full_page() -> HTMLResponse:
-    """BF-06: 新規予約の拒否。WARNING 1 行（件数のみ）・作成 0・採番なし。"""
+    """BF-06: 新規予約の拒否。WARNING 1 行（件数のみ）・作成 0・採番なし。
+    文言は BF-07 で「ただいま混み合っています」に訂正（相談者向け画面・LINE 送信ではない）。"""
     logger.warning("[SHINDAN] nonce store full of in-flight entries (no write) count=%s",
                    emit(len(_nonce_results), "count", "log", "operator"))
-    return _fixed_page("送信を受け付けています", PLAIN_PENDING_TEXT, 200)
+    return _fixed_page(STORE_FULL_TITLE, STORE_FULL_TEXT, 200)
 
 
-async def _submit_with_nonce(resolve, pattern: str, fields_base: dict, nonce: str):
+async def _submit_with_nonce(resolve, pattern: str, fields_base: dict, nonce: str,
+                             state: str = "ok"):
     """nonce 付きの送信: 予約に成功した 1 本だけが token 照合（resolve・外部待機）→ 送信へ
     進む。他は予約者の完了を待って同じ結果を返す（待ちきれなければ固定の受付中ページ・
     作成 0）。予約者が失敗して解放したら、待っていた側が新たに予約を取って進む。
-    nonce なしは予約せず通常どおり。表が処理中で埋まって予約できなければ固定ページ（BF-06）。"""
-    if not nonce:
+    nonce なしは予約せず通常どおり。表が処理中で埋まって予約できなければ固定ページ（BF-06）。
+    BF-07: state="expired"（署名は正しいが期限切れ）は新規予約をせず、その nonce に処理中または
+    結果確定のエントリがあれば従来どおり待機／同じ結果を返し、無ければ初めて「nonce なし」。"""
+    if not nonce or state == "none":
         return await _submit_resolved(await resolve(), pattern, fields_base, None)
+    expired = state == "expired"
     sig = _content_sig(pattern, fields_base)
     for _attempt in range(_NONCE_RESERVE_RETRIES):
-        entry, owned = await _nonce_reserve(nonce, sig, time.time())
+        entry, owned = await _nonce_reserve(nonce, sig, time.time(), allow_new=not expired)
         if entry is None:
+            if expired:                                 # BF-07: 期限切れでエントリ無し → nonce なし扱い
+                return await _submit_resolved(await resolve(), pattern, fields_base, None)
             return _store_full_page()                   # BF-06: 予約拒否（固定ページ・作成 0）
         if owned:
             try:
@@ -1267,7 +1297,8 @@ async def _handle_submit(form: dict[str, str], link: dict | None = None, nonce: 
 
     async def _resolved():
         return ("valid", link) if link is not None else ("none", None)
-    return await _submit_with_nonce(_resolved, pattern, fields_base, verify_nonce(nonce))
+    state, verified = nonce_state(nonce)
+    return await _submit_with_nonce(_resolved, pattern, fields_base, verified, state)
 
 
 async def _handle_submit_plain(pattern: str, fields_base: dict,
