@@ -54,8 +54,8 @@ fix1（R-JIKOU-FORM-1 01〜04）:
 """
 
 import asyncio
-import datetime
 import hashlib
+import hmac
 import html
 import logging
 import os
@@ -93,50 +93,84 @@ _LINKED_UPDATE_FIELDS = ("診断パターン", "問い合わせ業者名", "借�
 _LINKED_CAS_REFETCH = 1
 _NUMBER_LINE = "\n受付番号：{受付番号}"
 
-# ── FORM-DUP-1: 二重 POST による App 21 重複の抑止 ────────────────────────────────
+# ── FORM-DUP-1（fix1・Codex R-FD1 BF-01〜04）: 二重 POST による App 21 重複の抑止 ────
 # 実測（2026-11-12 調査）: 本人専用リンク経路の 1 回目 POST が token を使用済みにし、
 # 同じブラウザからの 2 回目 POST（1.4 秒〜数分後）が「link invalid」→ k なし経路へ
 # 落ちて受付番号付き・LINEユーザーID 空のレコード（双子）を作っていた。
-# 1. 使用済み token の POST は k なし経路へ落とさない。used_at から
-#    RESUBMIT_WINDOW_SEC 以内の再 POST は「1 回目と同じ送信」とみなし、本人の
-#    レコード（LINEユーザーID 検索・ちょうど 1 件=hub.shindan_link.find_user_record）
-#    を送信済みとして完了画面（linked 結果ページ）を返す。内容が同一なら何もしない・
-#    異なるなら上書きせず無視して業務 LINE に 1 日 1 回だけ通知。窓の外・本人レコードが
-#    特定できない場合は固定の「送信済み」ページ（作成・更新なし）。
-#    token→レコードの対応は新表を作らず「token→line_user_id（既存 shindan_link 行）→
-#    LINEユーザーID 検索」で解決する（linked write と同じ権限範囲・同じ検索）。
-# 2. 送信ボタンは 1 回押したら無効化（JS・無効でも 1/3 のサーバ側で守る）。
-# 3. k なし経路: 同一入力・同一 IP（_rate_key=SHA-256 のみ保持）・PLAIN_DEDUPE_WINDOW_SEC
-#    以内の連続 POST は新規作成せず、1 回目と同じ受付番号の完了画面を返す。1 回目が
-#    処理中なら完了を待ち（_PLAIN_WAIT_SEC）、待ちきれなければ固定の受付中ページ。
-#    【単一 worker 前提】in-memory の有界 LRU（_attempts・_upload_tokens と同じ既知の制約）
-RESUBMIT_WINDOW_SEC = 10 * 60
-PLAIN_DEDUPE_WINDOW_SEC = 60
-MAX_RECENT_PLAIN = 5000
-_PLAIN_WAIT_SEC = 10.0
+# 再送の識別は「IP+回答」でも「使用済み token」でもなく、フォーム表示時に発行する
+# 不透明な送信操作 ID（nonce）で行う:
+#  - nonce = "<exp>.<乱数 hex32>.<HMAC-SHA256 先頭 hex32>"。署名鍵はプロセス起動時の乱数
+#    （env なし・再起動で全 nonce 無効=「nonce なし」扱い=通常どおり新規）。有効 NONCE_TTL_SEC。
+#    hidden 項目 NONCE_FIELD でフォームが運ぶ（cookie・IP・回答内容には依らない）。
+#  - BF-02: k なし経路も本人専用リンク経路も、同じ nonce の再 POST だけを「同一送信」と
+#    みなし、1 回目と同じ完了画面（同じ受付番号／同じレコードの linked 結果）を返す。
+#    nonce が無い・不正・期限切れ・別 nonce は通常どおり新規として扱う。1 回目が処理中なら
+#    完了を待ち（_NONCE_WAIT_SEC）、待ちきれなければ固定の受付中ページ（作成なし）。
+#    失敗した 1 回目は記憶しない（後続の再送を妨げない）。
+#  - BF-03: 使用済み token の POST は nonce が一致する場合のみ 1 回目と同じ完了画面。
+#    不一致・なしは固定の「送信済み」ページだけ（診断結果の再表示・写真トークン・受付番号
+#    なし）。k なし経路には落とさない。
+#  - BF-01: token 照合（lookup／lookup_used）の取得不能（例外）は「不存在」と分け、固定
+#    ページ（_error_500・作成・更新・採番なし）で終了する。nonce 照合は in-memory で例外なし。
+#  - BF-04: 相違の再送に業務 LINE 通知はしない（相違欄の件数を INFO ログに出すだけ）。
+#  - 送信ボタンは 1 回押したら無効化（JS・無効でも nonce のサーバ側で守る）。
+#  【単一 worker 前提】in-memory の有界 LRU（_attempts・_upload_tokens と同じ既知の制約）
+NONCE_FIELD = "n"
+NONCE_TTL_SEC = 30 * 60
+MAX_NONCE_RESULTS = 5000
+_NONCE_WAIT_SEC = 10.0
+_NONCE_KEY = secrets.token_bytes(32)          # プロセス固有の署名鍵（env・秘密値の保持なし）
+_NONCE_RE = re.compile(r"^[0-9]{1,12}\.[0-9a-f]{32}\.[0-9a-f]{32}$")
 # 画面文言（お客様向け・固定・弁護士裁定で差し替え可・test_form_dup_1 が sha256 pin）
 RESUBMIT_DONE_TEXT = ("この診断フォームはすでに送信済みです。追加のご相談やご質問は、"
                       "LINEのトーク画面からお送りください。")
 PLAIN_PENDING_TEXT = ("送信を受け付けています。しばらくお待ちいただき、画面が変わらない"
                       "場合はLINEの無料相談へお進みください。")
-# 再送信の内容相違を知らせる業務通知（固定文言+案件レコード No のみ・PII 非搭載・1 日 1 回）
-RESUBMIT_DIFF_NOTICE_KEY = "shindan_resubmit_diff"
+# 1 回目の送信内容の照合欄（相違は件数だけログ・値は SHA-256 のみ保持）
 _RESUBMIT_COMPARE_FIELDS = _LINKED_UPDATE_FIELDS
-_JST = datetime.timezone(datetime.timedelta(hours=9))
-_resubmit_notice_day = ""            # 内容相違通知を送った JST 日付（1 日 1 回）
 
 
-class _PlainEntry:
-    """k なし経路の直近送信: 1 回目の処理中は result=None（後続は event を待つ）。"""
-    __slots__ = ("ts", "event", "result")
+class _NonceEntry:
+    """nonce ごとの 1 回目の送信: 処理中は result=None（後続は event を待つ）。
+    result=("plain", record_id, 受付番号, pattern) または ("linked", record_id, "", pattern)。
+    sig は照合欄の SHA-256 の組（生値は持たない）。"""
+    __slots__ = ("ts", "event", "result", "sig")
 
-    def __init__(self, ts: float):
+    def __init__(self, ts: float, sig: tuple):
         self.ts = ts
         self.event = asyncio.Event()
-        self.result: tuple[str, str, str] | None = None   # (record_id, 受付番号, pattern)
+        self.result: tuple[str, str, str, str] | None = None
+        self.sig = sig
 
 
-_recent_plain: "OrderedDict[str, _PlainEntry]" = OrderedDict()
+_nonce_results: "OrderedDict[str, _NonceEntry]" = OrderedDict()
+
+
+def _nonce_sig(exp: int, rnd: str) -> str:
+    return hmac.new(_NONCE_KEY, f"{exp}.{rnd}".encode("ascii"),
+                    hashlib.sha256).hexdigest()[:32]
+
+
+def issue_nonce(now: float | None = None) -> str:
+    """フォーム表示時に発行する送信操作 ID（署名付き・有効 NONCE_TTL_SEC）。"""
+    exp = int(now if now is not None else time.time()) + NONCE_TTL_SEC
+    rnd = secrets.token_hex(16)
+    return f"{exp}.{rnd}.{_nonce_sig(exp, rnd)}"
+
+
+def verify_nonce(raw: str, now: float | None = None) -> str:
+    """形式 → 署名 → 期限 の順に検証し、有効なら nonce 文字列そのもの、無効・期限切れ・
+    なしは ""（=nonce なしとして通常どおり新規）。改ざん値は下流へ流さない。"""
+    nonce = str(raw or "").strip()
+    if not _NONCE_RE.fullmatch(nonce):
+        return ""
+    exp_s, rnd, sig = nonce.split(".")
+    if not hmac.compare_digest(sig, _nonce_sig(int(exp_s), rnd)):
+        return ""
+    t = now if now is not None else time.time()
+    if int(exp_s) <= t:
+        return ""
+    return nonce
 
 router = APIRouter()
 
@@ -531,11 +565,16 @@ def _radio_group(name: str, legend: str, choices: tuple) -> str:
     return f"<fieldset><legend>{legend}</legend>{inputs}</fieldset>"
 
 
-def _form_html() -> str:
+def _form_html(nonce: str = "") -> str:
+    """フォーム HTML。nonce（FORM-DUP-1 fix1: 送信操作 ID）は hidden 項目で運ぶ。
+    空なら hidden 項目なし（=POST は nonce なしとして通常どおり新規）。"""
+    nonce_input = (f"<input type=\"hidden\" name=\"{NONCE_FIELD}\""
+                   f" value=\"{html.escape(nonce, quote=True)}\">" if nonce else "")
     body = (
         "<h1>消滅時効 かんたん診断（無料）</h1>"
         "<p>4つの質問に答えるだけで、時効援用できる可能性の目安がわかります。</p>"
         "<form method=\"post\" action=\"/shindan\">"
+        + nonce_input +
         "<fieldset><legend>① 債権者名（お金を借りた業者・請求してきている業者）"
         "</legend>"
         f"<input type=\"text\" name=\"creditor\" maxlength=\"{CREDITOR_MAX_CHARS}\""
@@ -554,8 +593,8 @@ def _form_html() -> str:
           "<button class=\"btn\" type=\"submit\">診断する</button>"
           "</form>"
           f"<p class=\"note\">{FROZEN_NOTE}</p>"
-          # FORM-DUP-1 2: 送信ボタンは 1 回押したら無効化（二度押し・連打の抑止）。
-          # JS 無効でも送信は成立し、サーバ側（使用済み token／同一内容の連続 POST）で守る
+          # FORM-DUP-1: 送信ボタンは 1 回押したら無効化（二度押し・連打の抑止）。
+          # JS 無効でも送信は成立し、サーバ側（同じ nonce の再 POST＝同一送信）で守る
           "<script>(function(){var f=document.querySelector('form[action=\"/shindan\"]');"
           "if(!f){return;}f.addEventListener('submit',function(e){"
           "if(f.getAttribute('data-sent')){e.preventDefault();return;}"
@@ -653,7 +692,8 @@ async def shindan_entry(request: Request):
         # 同じ path の既存 cookie を削除（Max-Age=0）＝以前の利用者の cookie へ紐付かない
         link = await _link_from_request(request, use_cookie=False,
                                         include_claimed=False)
-        resp = HTMLResponse(_form_html())
+        # FORM-DUP-1 fix1: 表示ごとに送信操作 ID（nonce）を発行して hidden 項目に載せる
+        resp = HTMLResponse(_form_html(issue_nonce()))
         if link is not None:
             remaining = max(1, int((link["expires_at"]
                                     - shindan_link._now()).total_seconds()))
@@ -689,68 +729,136 @@ async def shindan_entry(request: Request):
     # SHINDAN-LINE-LINK-1: k（クエリ or cookie）が有効なときだけ紐付け経路。
     # fix2 SLL-02: 予約中（処理中）の token も紐付け経路へ渡し、claim の結果で
     # busy を返す（k なし経路へ落とさない＝二重作成を防ぐ）
-    link = await _link_from_request(request, use_cookie=True, include_claimed=True)
-    if link is None:
-        # FORM-DUP-1 1: 使用済み token の再 POST も k なし経路へ落とさない
-        used = await _used_link_from_request(request)
-        if used is not None:
-            return await _handle_submit_used(form, used)
-        # FORM-DUP-1 3: k なし経路の同一内容・同一 IP の連続 POST を抑止する鍵
-        return await _handle_submit(form, None,
-                                    dedupe_key=_plain_dedupe_key(_rate_key(request), form))
-    return await _handle_submit(form, link)
+    # FORM-DUP-1 fix1: honeypot・閉集合検証はどの経路でも先に行う（固定応答・副作用なし）
+    early, pattern, fields_base = _prepare_submission(form)
+    if early is not None:
+        return early
+    # BF-02: 同じ nonce の再 POST は経路を問わず「同一送信」＝1 回目と同じ完了画面
+    nonce = verify_nonce(form.get(NONCE_FIELD, ""))
+    if nonce:
+        same = await _nonce_hit(nonce, time.time())
+        if same is not None:
+            return _same_submission_page(same, pattern, fields_base)
+    # token の照合（取得不能は BF-01: 不存在と分けて固定ページ・作成・更新・採番なし）
+    state, link = await _resolve_post_link(request)
+    if state == "failed":
+        return _error_500()
+    if state == "used":
+        # BF-03: 使用済み token で nonce が一致しない（なし・不正・期限切れ・別 nonce・
+        # 1 回目の記憶なし）→ 固定の「送信済み」ページだけ（k なし経路へ落とさない）
+        logger.info("[SHINDAN] resubmit without matching nonce (no write) head=%s",
+                    emit(shindan_link.token_head(str(link.get("token") or "")),
+                         "record_id", "log", "operator"))
+        return _resubmit_done_page()
+    return await _submit_new(pattern, fields_base, link if state == "valid" else None, nonce)
 
 
-async def _used_link_from_request(request: Request) -> dict | None:
-    """FORM-DUP-1: クエリ k / cookie の token が**使用済み**なら
-    {"token","line_user_id","used_at"}。不存在・未使用・照合失敗は None。"""
+def _post_token(request: Request) -> str:
     token = str(request.query_params.get(shindan_link.QUERY_KEY, "") or "").strip()
     if not token:
         token = str(request.cookies.get(LINK_COOKIE, "") or "").strip()
+    return token
+
+
+async def _resolve_post_link(request: Request) -> tuple[str, dict | None]:
+    """POST の token（クエリ k／cookie）を照合する。戻り値 (state, data):
+    ("valid", link)=有効（予約中含む・紐付け経路）／("used", used)=使用済み／
+    ("none", None)=token なし・不存在・期限切れ（k なし経路）／
+    ("failed", None)=照合の取得不能（例外。BF-01: 不存在と分け、呼び出し側は固定ページ）。"""
+    token = _post_token(request)
     if not token:
-        return None
+        return "none", None
+    head = emit(shindan_link.token_head(token), "record_id", "log", "operator")
     try:
-        return await shindan_link.lookup_used(token)
+        link = await shindan_link.lookup(token, include_claimed=True)
     except Exception:
-        logger.warning("[SHINDAN] used link lookup failed (treated as no link)")
-        return None
+        logger.warning("[SHINDAN] link lookup failed (fixed page, no write) head=%s", head)
+        return "failed", None
+    if link is not None:
+        return "valid", link
+    try:
+        used = await shindan_link.lookup_used(token)
+    except Exception:
+        logger.warning("[SHINDAN] used link lookup failed (fixed page, no write) head=%s", head)
+        return "failed", None
+    if used is not None:
+        return "used", used
+    logger.info("[SHINDAN] link invalid head=%s", head)
+    return "none", None
 
 
-def _plain_dedupe_key(rate_key: str, form: dict[str, str]) -> str:
-    """同一 IP（SHA-256 鍵）×同一入力の鍵（SHA-256 のみ保持・生値は残さない）。"""
-    parts = [rate_key] + [str(form.get(k, "") or "").strip()
-                          for k in ("creditor", "borrow", "last_pay", "court_doc")]
-    return hashlib.sha256("\x1f".join(parts).encode("utf-8")).hexdigest()
+def _content_sig(pattern: str, fields_base: dict) -> tuple:
+    """照合欄（診断パターン+4 問の回答欄）の SHA-256 の組（生値は保持しない）。"""
+    return tuple(hashlib.sha256(str(fields_base.get(c, "") or "").strip().encode("utf-8"))
+                 .hexdigest() for c in _RESUBMIT_COMPARE_FIELDS)
 
 
-def _recent_plain_put(key: str, entry: _PlainEntry) -> None:
-    while len(_recent_plain) >= MAX_RECENT_PLAIN:
-        _recent_plain.popitem(last=False)               # 最古（LRU）を退避
-    _recent_plain[key] = entry
+def _nonce_put(nonce: str, entry: _NonceEntry) -> None:
+    while len(_nonce_results) >= MAX_NONCE_RESULTS:
+        _nonce_results.popitem(last=False)              # 最古（LRU）を退避
+    _nonce_results[nonce] = entry
 
 
 _PENDING = "pending"
 
 
-async def _plain_dedupe_hit(key: str, now: float):
-    """窓内の同一送信があれば (record_id, 受付番号, pattern)。1 回目が処理中なら
-    完了を待って返し、待ちきれなければ _PENDING。該当なし・1 回目が失敗（辞書から
-    外れる）なら None（通常どおり作成へ）。"""
-    entry = _recent_plain.get(key)
+async def _nonce_hit(nonce: str, now: float):
+    """同じ nonce の 1 回目があれば (entry) を返す。処理中なら完了を待ち、待ちきれなければ
+    result=None のまま返す（呼び出し側は固定の受付中ページ）。該当なし・1 回目が失敗
+    （辞書から外れる）・期限切れなら None（通常どおり新規へ）。"""
+    entry = _nonce_results.get(nonce)
     if entry is None:
         return None
-    if now - entry.ts > PLAIN_DEDUPE_WINDOW_SEC:
-        _recent_plain.pop(key, None)
+    if now - entry.ts > NONCE_TTL_SEC:
+        _nonce_results.pop(nonce, None)
         return None
     if entry.result is None:
         try:
-            await asyncio.wait_for(entry.event.wait(), _PLAIN_WAIT_SEC)
+            await asyncio.wait_for(entry.event.wait(), _NONCE_WAIT_SEC)
         except asyncio.TimeoutError:
             return _PENDING
-        entry = _recent_plain.get(key)
+        entry = _nonce_results.get(nonce)
         if entry is None or entry.result is None:
             return None
-    return entry.result
+    return entry
+
+
+def _same_submission_page(hit, pattern: str, fields_base: dict) -> HTMLResponse:
+    """同じ nonce の再 POST: 1 回目と同じ完了画面（同じ受付番号／同じレコード）。写真導線の
+    トークンは同じレコードへ発行し直す。相違は件数だけ INFO ログ（通知なし=BF-04）。"""
+    if hit == _PENDING:
+        logger.info("[SHINDAN] duplicate post pending (no write)")
+        return _fixed_page("送信を受け付けています", PLAIN_PENDING_TEXT, 200)
+    kind, record_id, number, prev_pattern = hit.result
+    differs = sum(1 for a, b in zip(hit.sig, _content_sig(pattern, fields_base)) if a != b)
+    logger.info("[SHINDAN] duplicate post (no write) kind=%s record_id=%s differs=%d",
+                kind, emit(record_id, "record_id", "log", "operator"), differs)
+    now = time.time()
+    if kind == "linked":
+        return HTMLResponse(_result_html_linked(
+            prev_pattern, issue_upload_token(record_id, f"L{record_id}", now)))
+    return HTMLResponse(_result_html(
+        prev_pattern, number, os.environ.get(_LINE_URL_ENV, "").strip(),
+        issue_upload_token(record_id, number, now)))
+
+
+async def _submit_new(pattern: str, fields_base: dict, link: dict | None, nonce: str):
+    """新規の送信として処理（紐付け経路／k なし経路）。nonce があれば 1 回目として記憶し、
+    成功（created／updated／noop）だけを残す。失敗は記憶しない（後続を妨げない）。"""
+    entry: _NonceEntry | None = None
+    if nonce:
+        entry = _NonceEntry(time.time(), _content_sig(pattern, fields_base))
+        _nonce_put(nonce, entry)
+    try:
+        if link is not None:
+            # SHINDAN-LINE-LINK-1 E: 本人専用リンク経由（k なしの経路は以下不変）
+            return await _handle_submit_linked(pattern, fields_base, link, entry)
+        return await _handle_submit_plain(pattern, fields_base, entry)
+    finally:
+        if entry is not None:
+            if entry.result is None:
+                _nonce_results.pop(nonce, None)         # 失敗=次の POST は通常どおり
+            entry.event.set()
 
 
 async def _link_from_request(request: Request, *, use_cookie: bool,
@@ -1066,54 +1174,33 @@ def _prepare_submission(form: dict[str, str]):
     return None, pattern, fields_base
 
 
-async def _handle_submit(form: dict[str, str], link: dict | None = None,
-                         dedupe_key: str = ""):
+async def _handle_submit(form: dict[str, str], link: dict | None = None, nonce: str = ""):
+    """直接呼び出し用（テスト・互換）: 入口と同じ順（検証 → nonce 照合 → 新規）。"""
     early, pattern, fields_base = _prepare_submission(form)
     if early is not None:
         return early
-    if link is not None:
-        # SHINDAN-LINE-LINK-1 E: 本人専用リンク経由（k なしの経路は以下不変）
-        return await _handle_submit_linked(pattern, fields_base, link)
-    return await _handle_submit_plain(pattern, fields_base, dedupe_key)
+    nonce = verify_nonce(nonce)
+    if nonce:
+        same = await _nonce_hit(nonce, time.time())
+        if same is not None:
+            return _same_submission_page(same, pattern, fields_base)
+    return await _submit_new(pattern, fields_base, link, nonce)
 
 
-async def _handle_submit_plain(pattern: str, fields_base: dict, dedupe_key: str = ""):
-    """k なし経路（受付番号発行）。FORM-DUP-1 3: dedupe_key があれば、窓内の同一送信は
-    新規作成せず 1 回目と同じ受付番号の完了画面を返す（写真導線のトークンは同じ
-    レコードへ発行し直す）。鍵なし（直接呼び出し・テスト）は従来どおり。"""
-    line_url = os.environ.get(_LINE_URL_ENV, "").strip()
-    entry: _PlainEntry | None = None
-    if dedupe_key:
-        now = time.time()
-        hit = await _plain_dedupe_hit(dedupe_key, now)
-        if hit == _PENDING:
-            logger.info("[SHINDAN] duplicate post pending (no write)")
-            return _fixed_page("送信を受け付けています", PLAIN_PENDING_TEXT, 200)
-        if hit is not None:
-            prev_id, prev_number, prev_pattern = hit
-            logger.info("[SHINDAN] duplicate post (no write) record_id=%s",
-                        emit(prev_id, "record_id", "log", "operator"))
-            return HTMLResponse(_result_html(
-                prev_pattern, prev_number, line_url,
-                issue_upload_token(prev_id, prev_number, time.time())))
-        entry = _PlainEntry(now)
-        _recent_plain_put(dedupe_key, entry)
-    try:
-        number = ""
-        record_id = ""
-        outcome = "duplicate"
-        for _attempt in range(_NUMBER_ATTEMPTS):
-            number = _draw_number()
-            outcome, record_id = await _persist_with_number(fields_base, number)
-            if outcome != "duplicate":
-                break                      # created / failed / unknown は再採番しない
-        if outcome == "created" and entry is not None:
-            entry.result = (record_id, number, pattern)
-    finally:
-        if entry is not None:
-            if entry.result is None:
-                _recent_plain.pop(dedupe_key, None)   # 失敗=次の POST は通常どおり
-            entry.event.set()
+async def _handle_submit_plain(pattern: str, fields_base: dict,
+                               entry: _NonceEntry | None = None):
+    """k なし経路（受付番号発行）。entry（FORM-DUP-1 fix1: 同じ nonce の 1 回目）が
+    あれば作成成功時に結果を残す（同じ nonce の再 POST へ同じ完了画面を返すため）。"""
+    number = ""
+    record_id = ""
+    outcome = "duplicate"
+    for _attempt in range(_NUMBER_ATTEMPTS):
+        number = _draw_number()
+        outcome, record_id = await _persist_with_number(fields_base, number)
+        if outcome != "duplicate":
+            break                      # created / failed / unknown は再採番しない
+    if outcome == "created" and entry is not None:
+        entry.result = ("plain", record_id, number, pattern)
     if outcome != "created":
         # 保存できていない（failed）／有無不明（unknown）／再採番上限（duplicate）
         # → 固定 500+要確認通知（受付番号を含め弁護士が App 21 と突合できる）
@@ -1185,7 +1272,8 @@ async def _update_existing_linked(record: dict, values: dict) -> tuple[str, str]
     return "unconverged", rid
 
 
-async def _handle_submit_linked(pattern: str, fields_base: dict, link: dict):
+async def _handle_submit_linked(pattern: str, fields_base: dict, link: dict,
+                                entry: _NonceEntry | None = None):
     line_user_id = str(link.get("line_user_id") or "")
     token = str(link.get("token") or "")
     # fix2 SLL-02: 書込前に予約（同一 token の同時 POST は 1 本だけ先へ進む）。
@@ -1242,6 +1330,8 @@ async def _handle_submit_linked(pattern: str, fields_base: dict, link: dict):
     logger.info("[SHINDAN] linked write ok record_id=%s pattern=%s",
                 emit(record_id, "record_id", "log", "operator"),
                 emit(pattern, "freetext", "log", "operator"))
+    if entry is not None:
+        entry.result = ("linked", record_id, "", pattern)   # FORM-DUP-1 fix1: 同じ nonce の再 POST 用
     attorney_id = os.environ.get("ATTORNEY_LINE_USER_ID", "")
     if attorney_id:
         sent = await notify.notify_business(
@@ -1253,65 +1343,8 @@ async def _handle_submit_linked(pattern: str, fields_base: dict, link: dict):
     return HTMLResponse(_result_html_linked(pattern, upload_token))
 
 
-# ── FORM-DUP-1 1: 使用済み token の再 POST（k なし経路へ落とさない・新規作成なし） ──
+# ── FORM-DUP-1 fix1 BF-03: 使用済み token で nonce が一致しない POST の固定ページ ──
 def _resubmit_done_page() -> HTMLResponse:
-    """固定の「送信済み」ページ（作成・更新・通知なし）。"""
+    """固定の「送信済み」ページ（診断結果の再表示・写真トークン・受付番号・作成・更新・
+    通知のいずれもなし）。"""
     return _fixed_page("送信済みです", RESUBMIT_DONE_TEXT, 200)
-
-
-async def _notify_resubmit_differs(record_id: str) -> None:
-    """内容の異なる再送信を業務 LINE へ 1 日 1 回だけ知らせる（JST 日付の刻印・
-    固定文言+案件レコード No のみ・回答本文や userId は載せない）。"""
-    global _resubmit_notice_day
-    today = datetime.datetime.now(_JST).strftime("%Y-%m-%d")
-    if _resubmit_notice_day == today:
-        logger.info("[SHINDAN] resubmit notice skipped (already sent today)")
-        return
-    _resubmit_notice_day = today
-    await notify.notify_admin_line(
-        "【時効診断フォーム・要確認】送信済みの診断フォームから、登録内容と異なる"
-        f"再送信がありました（案件レコードNo:{record_id}）。登録内容は上書きして"
-        "いません。必要に応じて kintone でご確認ください。",
-        throttle_key=RESUBMIT_DIFF_NOTICE_KEY,
-    )
-
-
-async def _handle_submit_used(form: dict[str, str], used: dict):
-    """使用済み token での POST。used_at から RESUBMIT_WINDOW_SEC 以内なら 1 回目と
-    同じ送信とみなし、本人のレコード（LINEユーザーID 検索・ちょうど 1 件）を送信済み
-    として完了画面（linked 結果ページ・写真導線あり）を返す。内容が同一なら何もせず、
-    異なれば上書きせず無視して 1 日 1 回の業務通知。窓の外・本人レコードが特定でき
-    ない・照合失敗は固定の「送信済み」ページ。**どの分岐でも App 21 の作成・更新・
-    受付番号の発行はしない**（k なし経路へは落ちない）。"""
-    early, pattern, fields_base = _prepare_submission(form)
-    if early is not None:
-        return early
-    head = shindan_link.token_head(str(used.get("token") or ""))
-    used_at = used.get("used_at")
-    age = ((shindan_link._now() - used_at).total_seconds()
-           if isinstance(used_at, datetime.datetime) else None)
-    if age is None or age < 0 or age > RESUBMIT_WINDOW_SEC:
-        logger.info("[SHINDAN] resubmit outside window (no write) head=%s",
-                    emit(head, "record_id", "log", "operator"))
-        return _resubmit_done_page()
-    record, method = await shindan_link.find_user_record(
-        APP_JIKOU_CASE, str(used.get("line_user_id") or ""))
-    if method != "found" or record is None:
-        logger.info("[SHINDAN] resubmit record not resolved (no write) method=%s head=%s",
-                    emit(method, "freetext", "log", "operator"),
-                    emit(head, "record_id", "log", "operator"))
-        return _resubmit_done_page()
-    record_id = _v(record, "$id")
-    same = all(_v(record, c) == str(fields_base.get(c, "") or "").strip()
-               for c in _RESUBMIT_COMPARE_FIELDS)
-    stored = _v(record, "診断パターン")
-    shown = stored if stored in FROZEN_RESULTS else pattern
-    if same:
-        logger.info("[SHINDAN] resubmit same content (no write) record_id=%s",
-                    emit(record_id, "record_id", "log", "operator"))
-    else:
-        logger.info("[SHINDAN] resubmit differs (ignored, no write) record_id=%s",
-                    emit(record_id, "record_id", "log", "operator"))
-        await _notify_resubmit_differs(record_id)
-    upload_token = issue_upload_token(record_id, f"L{record_id}", time.time())
-    return HTMLResponse(_result_html_linked(shown, upload_token))

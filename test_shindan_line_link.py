@@ -386,8 +386,6 @@ class _FormLinkBase(_DbBase):
             self.addCleanup(p.stop)
         sf._attempts.clear()
         self.addCleanup(sf._attempts.clear)
-        sf._recent_plain.clear()                      # FORM-DUP-1: k なし経路の直近送信
-        self.addCleanup(sf._recent_plain.clear)
 
     def issue(self, user=USER):
         return self.q(sl.issue(user))
@@ -407,29 +405,43 @@ class _FormLinkBase(_DbBase):
         return self.client.post("/shindan", data=data, cookies={sf.LINK_COOKIE: token})
 
 
+_NONCE_INPUT_RE = re.compile(r'<input type="hidden" name="n" value="([^"]*)">')
+
+
+def _strip_nonce(html_text: str) -> str:
+    return _NONCE_INPUT_RE.sub("", html_text)
+
+
+def _nonce_of(html_text: str) -> str:
+    m = _NONCE_INPUT_RE.search(html_text)
+    return m.group(1) if m else ""
+
+
 class TestFormGet(_FormLinkBase):
     def test_T4_valid_k_same_html_plus_cookie(self):
         plain = self.client.get("/shindan")
         token = self.issue()
         resp = self.client.get("/shindan", params={"k": token})
         self.assertEqual(resp.status_code, 200)
-        self.assertEqual(resp.text, plain.text)                    # 表示 HTML は同一
+        # 表示 HTML は同一（FORM-DUP-1 fix1: 表示ごとに変わる送信操作 ID=hidden nonce を除く）
+        self.assertEqual(_strip_nonce(resp.text), _strip_nonce(plain.text))
+        self.assertNotEqual(_nonce_of(resp.text), _nonce_of(plain.text))
         self.assertEqual(resp.cookies.get(sf.LINK_COOKIE), token)
         self.assertIn("HttpOnly", resp.headers.get("set-cookie", ""))
         self.assertIn("Path=/shindan", resp.headers.get("set-cookie", ""))
         self.assertIsNone(plain.cookies.get(sf.LINK_COOKIE))
 
     def test_T4_invalid_expired_used_same_as_no_k(self):
-        plain = self.client.get("/shindan").text
+        plain = _strip_nonce(self.client.get("/shindan").text)   # FORM-DUP-1 fix1: nonce を除いて比較
         # 無効
         r = self.client.get("/shindan", params={"k": "nosuchtoken"})
-        self.assertEqual((r.status_code, r.text), (200, plain))
+        self.assertEqual((r.status_code, _strip_nonce(r.text)), (200, plain))
         self.assertIsNone(r.cookies.get(sf.LINK_COOKIE))
         # 期限切れ
         old = sl._now() - datetime.timedelta(days=31)
         expired = self.q(sl.issue(USER, now=old))
         r = self.client.get("/shindan", params={"k": expired})
-        self.assertEqual((r.status_code, r.text), (200, plain))
+        self.assertEqual((r.status_code, _strip_nonce(r.text)), (200, plain))
         self.assertIsNone(r.cookies.get(sf.LINK_COOKIE))
         # 使用済み
         used = self.issue()
@@ -437,7 +449,7 @@ class TestFormGet(_FormLinkBase):
         self.assertIsNotNone(claimed)
         self.assertTrue(self.q(sl.mark_used(used, claimed)))       # fix2: 自分の予約で確定
         r = self.client.get("/shindan", params={"k": used})
-        self.assertEqual((r.status_code, r.text), (200, plain))
+        self.assertEqual((r.status_code, _strip_nonce(r.text)), (200, plain))
         self.assertIsNone(r.cookies.get(sf.LINK_COOKIE))
         self.assertIn("link invalid head=nosu", self.cap.text())
         self.assertNotIn(used, self.cap.text())
@@ -468,12 +480,13 @@ class TestFormPostLinked(_FormLinkBase):
         self.assertNotIn("友だち追加", resp.text)
         self.assertIn(sf.PHOTO_ROUTE, resp.text)                    # 写真導線は残す
         self.assertIn("診断結果", resp.text)
-        # FORM-DUP-1: 使用済み token での再 POST は k なし経路へ落とさない
-        # （受付番号を発行せず・作成せず・同じレコードを送信済みとして完了画面）
+        # FORM-DUP-1 fix1 BF-03: 使用済み token での再 POST（nonce なし）は k なし経路へ
+        # 落とさず、固定の「送信済み」ページだけ（受付番号・診断結果・写真導線なし・書込なし）
         resp2 = self.post_linked(token)
         self.assertEqual(resp2.status_code, 200)
         self.assertNotIn("受付番号", resp2.text)
-        self.assertIn(sf.LINKED_DONE_TEXT, resp2.text)
+        self.assertIn(sf.RESUBMIT_DONE_TEXT, resp2.text)
+        self.assertNotIn(sf.PHOTO_ROUTE, resp2.text)
         self.assertEqual(self.fake.create_calls, [])
         self.assertEqual(len(self.fake.update_calls), 1)
 

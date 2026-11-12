@@ -232,8 +232,6 @@ class _FormBase(unittest.TestCase):
             self.addCleanup(p.stop)
         sf._attempts.clear()
         self.addCleanup(sf._attempts.clear)
-        sf._recent_plain.clear()                      # FORM-DUP-1: k なし経路の直近送信
-        self.addCleanup(sf._recent_plain.clear)
 
     def post(self, **over):
         data = dict(self.VALID)
@@ -394,10 +392,8 @@ class TestSpamGuards(_FormBase):
         self.assertNotIn("受付番号：", resp.text)      # 番号は発行しない
 
     def test_rate_limit_fixed_window(self):
-        # FORM-DUP-1 3 により同一内容の連続 POST は作成されないため、10 件の
-        # 「受理された別々の申込」は債権者名を変えて送る（レート計上は従来どおり）
-        for i in range(sf.RATE_LIMIT):
-            self.assertEqual(self.post(creditor=f"債権者{i}").status_code, 200)
+        for _ in range(sf.RATE_LIMIT):
+            self.assertEqual(self.post().status_code, 200)
         resp = self.post()
         self.assertEqual(resp.status_code, 429)
         self.assertEqual(len(self.fake.rows), sf.RATE_LIMIT)
