@@ -136,6 +136,22 @@ async def lookup(token: str, now: datetime.datetime | None = None,
     return {"token": token, "line_user_id": line_user_id, "expires_at": expires_at}
 
 
+async def lookup_used(token: str) -> dict | None:
+    """FORM-DUP-1: **使用済み** token の照合。存在し used_at が打たれていれば
+    {"token","line_user_id","used_at"} を返す（期限は見ない=使用済みは期限後も
+    「送信済み」として扱う）。不存在・未使用は None。lookup（有効 token の照合）
+    とは独立で、呼び出し側は lookup が None のときだけ補助的に使う。"""
+    if not token:
+        return None
+    async with session_scope() as s:
+        row = (await s.execute(
+            sa.select(shindan_link.c.line_user_id, shindan_link.c.used_at)
+            .where(shindan_link.c.token == token))).first()
+    if row is None or row[1] is None:
+        return None
+    return {"token": token, "line_user_id": row[0], "used_at": _aware(row[1])}
+
+
 async def claim(token: str, now: datetime.datetime | None = None
                 ) -> datetime.datetime | None:
     """fix2 SLL-02: 書込前の予約。未使用・期限内・未予約（または予約が

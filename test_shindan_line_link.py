@@ -386,6 +386,8 @@ class _FormLinkBase(_DbBase):
             self.addCleanup(p.stop)
         sf._attempts.clear()
         self.addCleanup(sf._attempts.clear)
+        sf._recent_plain.clear()                      # FORM-DUP-1: k なし経路の直近送信
+        self.addCleanup(sf._recent_plain.clear)
 
     def issue(self, user=USER):
         return self.q(sl.issue(user))
@@ -466,10 +468,14 @@ class TestFormPostLinked(_FormLinkBase):
         self.assertNotIn("友だち追加", resp.text)
         self.assertIn(sf.PHOTO_ROUTE, resp.text)                    # 写真導線は残す
         self.assertIn("診断結果", resp.text)
-        # 使用済み token での再 POST は k なし扱い（受付番号経路）
+        # FORM-DUP-1: 使用済み token での再 POST は k なし経路へ落とさない
+        # （受付番号を発行せず・作成せず・同じレコードを送信済みとして完了画面）
         resp2 = self.post_linked(token)
         self.assertEqual(resp2.status_code, 200)
-        self.assertIn("受付番号", resp2.text)
+        self.assertNotIn("受付番号", resp2.text)
+        self.assertIn(sf.LINKED_DONE_TEXT, resp2.text)
+        self.assertEqual(self.fake.create_calls, [])
+        self.assertEqual(len(self.fake.update_calls), 1)
 
     def test_T5_query_k_also_accepted_and_all_filled_is_noop_success(self):
         self.fake.add("10", 問い合わせ業者名="a", 借入時期_テキスト="b",

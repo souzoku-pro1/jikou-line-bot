@@ -53,6 +53,8 @@ fix1（R-JIKOU-FORM-1 01〜04）:
   別名（末尾スラッシュ・%2F・配下パス）は明示 catch-all route で 404（307 なし）
 """
 
+import asyncio
+import datetime
 import hashlib
 import html
 import logging
@@ -90,6 +92,51 @@ _LINKED_UPDATE_FIELDS = ("診断パターン", "問い合わせ業者名", "借�
                          "最終返済日_テキスト", "裁判所書類")
 _LINKED_CAS_REFETCH = 1
 _NUMBER_LINE = "\n受付番号：{受付番号}"
+
+# ── FORM-DUP-1: 二重 POST による App 21 重複の抑止 ────────────────────────────────
+# 実測（2026-11-12 調査）: 本人専用リンク経路の 1 回目 POST が token を使用済みにし、
+# 同じブラウザからの 2 回目 POST（1.4 秒〜数分後）が「link invalid」→ k なし経路へ
+# 落ちて受付番号付き・LINEユーザーID 空のレコード（双子）を作っていた。
+# 1. 使用済み token の POST は k なし経路へ落とさない。used_at から
+#    RESUBMIT_WINDOW_SEC 以内の再 POST は「1 回目と同じ送信」とみなし、本人の
+#    レコード（LINEユーザーID 検索・ちょうど 1 件=hub.shindan_link.find_user_record）
+#    を送信済みとして完了画面（linked 結果ページ）を返す。内容が同一なら何もしない・
+#    異なるなら上書きせず無視して業務 LINE に 1 日 1 回だけ通知。窓の外・本人レコードが
+#    特定できない場合は固定の「送信済み」ページ（作成・更新なし）。
+#    token→レコードの対応は新表を作らず「token→line_user_id（既存 shindan_link 行）→
+#    LINEユーザーID 検索」で解決する（linked write と同じ権限範囲・同じ検索）。
+# 2. 送信ボタンは 1 回押したら無効化（JS・無効でも 1/3 のサーバ側で守る）。
+# 3. k なし経路: 同一入力・同一 IP（_rate_key=SHA-256 のみ保持）・PLAIN_DEDUPE_WINDOW_SEC
+#    以内の連続 POST は新規作成せず、1 回目と同じ受付番号の完了画面を返す。1 回目が
+#    処理中なら完了を待ち（_PLAIN_WAIT_SEC）、待ちきれなければ固定の受付中ページ。
+#    【単一 worker 前提】in-memory の有界 LRU（_attempts・_upload_tokens と同じ既知の制約）
+RESUBMIT_WINDOW_SEC = 10 * 60
+PLAIN_DEDUPE_WINDOW_SEC = 60
+MAX_RECENT_PLAIN = 5000
+_PLAIN_WAIT_SEC = 10.0
+# 画面文言（お客様向け・固定・弁護士裁定で差し替え可・test_form_dup_1 が sha256 pin）
+RESUBMIT_DONE_TEXT = ("この診断フォームはすでに送信済みです。追加のご相談やご質問は、"
+                      "LINEのトーク画面からお送りください。")
+PLAIN_PENDING_TEXT = ("送信を受け付けています。しばらくお待ちいただき、画面が変わらない"
+                      "場合はLINEの無料相談へお進みください。")
+# 再送信の内容相違を知らせる業務通知（固定文言+案件レコード No のみ・PII 非搭載・1 日 1 回）
+RESUBMIT_DIFF_NOTICE_KEY = "shindan_resubmit_diff"
+_RESUBMIT_COMPARE_FIELDS = _LINKED_UPDATE_FIELDS
+_JST = datetime.timezone(datetime.timedelta(hours=9))
+_resubmit_notice_day = ""            # 内容相違通知を送った JST 日付（1 日 1 回）
+
+
+class _PlainEntry:
+    """k なし経路の直近送信: 1 回目の処理中は result=None（後続は event を待つ）。"""
+    __slots__ = ("ts", "event", "result")
+
+    def __init__(self, ts: float):
+        self.ts = ts
+        self.event = asyncio.Event()
+        self.result: tuple[str, str, str] | None = None   # (record_id, 受付番号, pattern)
+
+
+_recent_plain: "OrderedDict[str, _PlainEntry]" = OrderedDict()
 
 router = APIRouter()
 
@@ -507,6 +554,13 @@ def _form_html() -> str:
           "<button class=\"btn\" type=\"submit\">診断する</button>"
           "</form>"
           f"<p class=\"note\">{FROZEN_NOTE}</p>"
+          # FORM-DUP-1 2: 送信ボタンは 1 回押したら無効化（二度押し・連打の抑止）。
+          # JS 無効でも送信は成立し、サーバ側（使用済み token／同一内容の連続 POST）で守る
+          "<script>(function(){var f=document.querySelector('form[action=\"/shindan\"]');"
+          "if(!f){return;}f.addEventListener('submit',function(e){"
+          "if(f.getAttribute('data-sent')){e.preventDefault();return;}"
+          "f.setAttribute('data-sent','1');var b=f.querySelector('button[type=submit]');"
+          "if(b){b.disabled=true;b.textContent='送信中…';}});})();</script>"
     )
     return _page("消滅時効かんたん診断", body)
 
@@ -636,7 +690,67 @@ async def shindan_entry(request: Request):
     # fix2 SLL-02: 予約中（処理中）の token も紐付け経路へ渡し、claim の結果で
     # busy を返す（k なし経路へ落とさない＝二重作成を防ぐ）
     link = await _link_from_request(request, use_cookie=True, include_claimed=True)
+    if link is None:
+        # FORM-DUP-1 1: 使用済み token の再 POST も k なし経路へ落とさない
+        used = await _used_link_from_request(request)
+        if used is not None:
+            return await _handle_submit_used(form, used)
+        # FORM-DUP-1 3: k なし経路の同一内容・同一 IP の連続 POST を抑止する鍵
+        return await _handle_submit(form, None,
+                                    dedupe_key=_plain_dedupe_key(_rate_key(request), form))
     return await _handle_submit(form, link)
+
+
+async def _used_link_from_request(request: Request) -> dict | None:
+    """FORM-DUP-1: クエリ k / cookie の token が**使用済み**なら
+    {"token","line_user_id","used_at"}。不存在・未使用・照合失敗は None。"""
+    token = str(request.query_params.get(shindan_link.QUERY_KEY, "") or "").strip()
+    if not token:
+        token = str(request.cookies.get(LINK_COOKIE, "") or "").strip()
+    if not token:
+        return None
+    try:
+        return await shindan_link.lookup_used(token)
+    except Exception:
+        logger.warning("[SHINDAN] used link lookup failed (treated as no link)")
+        return None
+
+
+def _plain_dedupe_key(rate_key: str, form: dict[str, str]) -> str:
+    """同一 IP（SHA-256 鍵）×同一入力の鍵（SHA-256 のみ保持・生値は残さない）。"""
+    parts = [rate_key] + [str(form.get(k, "") or "").strip()
+                          for k in ("creditor", "borrow", "last_pay", "court_doc")]
+    return hashlib.sha256("\x1f".join(parts).encode("utf-8")).hexdigest()
+
+
+def _recent_plain_put(key: str, entry: _PlainEntry) -> None:
+    while len(_recent_plain) >= MAX_RECENT_PLAIN:
+        _recent_plain.popitem(last=False)               # 最古（LRU）を退避
+    _recent_plain[key] = entry
+
+
+_PENDING = "pending"
+
+
+async def _plain_dedupe_hit(key: str, now: float):
+    """窓内の同一送信があれば (record_id, 受付番号, pattern)。1 回目が処理中なら
+    完了を待って返し、待ちきれなければ _PENDING。該当なし・1 回目が失敗（辞書から
+    外れる）なら None（通常どおり作成へ）。"""
+    entry = _recent_plain.get(key)
+    if entry is None:
+        return None
+    if now - entry.ts > PLAIN_DEDUPE_WINDOW_SEC:
+        _recent_plain.pop(key, None)
+        return None
+    if entry.result is None:
+        try:
+            await asyncio.wait_for(entry.event.wait(), _PLAIN_WAIT_SEC)
+        except asyncio.TimeoutError:
+            return _PENDING
+        entry = _recent_plain.get(key)
+        if entry is None or entry.result is None:
+            return None
+    return entry.result
 
 
 async def _link_from_request(request: Request, *, use_cookie: bool,
@@ -904,7 +1018,10 @@ router.add_api_route("/shindan/{_rest:path}", shindan_alias_not_found,
                      methods=_ENTRY_METHODS, include_in_schema=False)
 
 
-async def _handle_submit(form: dict[str, str], link: dict | None = None):
+def _prepare_submission(form: dict[str, str]):
+    """honeypot・閉集合検証・判定・App 21 の保存項目の組立（3 経路共通・FORM-DUP-1 で
+    _handle_submit から切り出し・挙動不変）。戻り値 (応答|None, pattern, fields_base)。
+    応答が None でなければ呼び出し側はそのまま返す（保存・通知・番号発行なし）。"""
     creditor = str(form.get("creditor", "") or "").strip()
     borrow = form.get("borrow", "")
     last_pay = form.get("last_pay", "")
@@ -917,7 +1034,7 @@ async def _handle_submit(form: dict[str, str], link: dict | None = None):
         logger.info("[SHINDAN] honeypot discard (no side effects)")
         return _fixed_page(
             "送信を受け付けました",
-            "送信を受け付けました。LINEの無料相談へお進みください。", 200)
+            "送信を受け付けました。LINEの無料相談へお進みください。", 200), "", {}
 
     # サーバ側検証（閉集合・上限。失敗は固定文言のみ=非反射）
     if (len(creditor) > CREDITOR_MAX_CHARS
@@ -926,7 +1043,7 @@ async def _handle_submit(form: dict[str, str], link: dict | None = None):
             or court_doc not in CHOICES_COURT_DOC):
         return _fixed_page(
             "入力内容をご確認ください",
-            "入力内容を確認して、もう一度お試しください。", 400)
+            "入力内容を確認して、もう一度お試しください。", 400), "", {}
 
     pattern = judge(last_pay, court_doc)
 
@@ -946,17 +1063,57 @@ async def _handle_submit(form: dict[str, str], link: dict | None = None):
         "ラジオボタン_3": "不明",                          # 業者への電話有無
         "ラジオボタン_4": "不明",                          # アンケート・書面送付有無
     }
+    return None, pattern, fields_base
+
+
+async def _handle_submit(form: dict[str, str], link: dict | None = None,
+                         dedupe_key: str = ""):
+    early, pattern, fields_base = _prepare_submission(form)
+    if early is not None:
+        return early
     if link is not None:
         # SHINDAN-LINE-LINK-1 E: 本人専用リンク経由（k なしの経路は以下不変）
         return await _handle_submit_linked(pattern, fields_base, link)
-    number = ""
-    record_id = ""
-    outcome = "duplicate"
-    for _attempt in range(_NUMBER_ATTEMPTS):
-        number = _draw_number()
-        outcome, record_id = await _persist_with_number(fields_base, number)
-        if outcome != "duplicate":
-            break                      # created / failed / unknown は再採番しない
+    return await _handle_submit_plain(pattern, fields_base, dedupe_key)
+
+
+async def _handle_submit_plain(pattern: str, fields_base: dict, dedupe_key: str = ""):
+    """k なし経路（受付番号発行）。FORM-DUP-1 3: dedupe_key があれば、窓内の同一送信は
+    新規作成せず 1 回目と同じ受付番号の完了画面を返す（写真導線のトークンは同じ
+    レコードへ発行し直す）。鍵なし（直接呼び出し・テスト）は従来どおり。"""
+    line_url = os.environ.get(_LINE_URL_ENV, "").strip()
+    entry: _PlainEntry | None = None
+    if dedupe_key:
+        now = time.time()
+        hit = await _plain_dedupe_hit(dedupe_key, now)
+        if hit == _PENDING:
+            logger.info("[SHINDAN] duplicate post pending (no write)")
+            return _fixed_page("送信を受け付けています", PLAIN_PENDING_TEXT, 200)
+        if hit is not None:
+            prev_id, prev_number, prev_pattern = hit
+            logger.info("[SHINDAN] duplicate post (no write) record_id=%s",
+                        emit(prev_id, "record_id", "log", "operator"))
+            return HTMLResponse(_result_html(
+                prev_pattern, prev_number, line_url,
+                issue_upload_token(prev_id, prev_number, time.time())))
+        entry = _PlainEntry(now)
+        _recent_plain_put(dedupe_key, entry)
+    try:
+        number = ""
+        record_id = ""
+        outcome = "duplicate"
+        for _attempt in range(_NUMBER_ATTEMPTS):
+            number = _draw_number()
+            outcome, record_id = await _persist_with_number(fields_base, number)
+            if outcome != "duplicate":
+                break                      # created / failed / unknown は再採番しない
+        if outcome == "created" and entry is not None:
+            entry.result = (record_id, number, pattern)
+    finally:
+        if entry is not None:
+            if entry.result is None:
+                _recent_plain.pop(dedupe_key, None)   # 失敗=次の POST は通常どおり
+            entry.event.set()
     if outcome != "created":
         # 保存できていない（failed）／有無不明（unknown）／再採番上限（duplicate）
         # → 固定 500+要確認通知（受付番号を含め弁護士が App 21 と突合できる）
@@ -1094,3 +1251,67 @@ async def _handle_submit_linked(pattern: str, fields_base: dict, link: dict):
             logger.warning("[SHINDAN] attorney notify failed (record saved)")
     upload_token = issue_upload_token(record_id, f"L{record_id}", time.time())
     return HTMLResponse(_result_html_linked(pattern, upload_token))
+
+
+# ── FORM-DUP-1 1: 使用済み token の再 POST（k なし経路へ落とさない・新規作成なし） ──
+def _resubmit_done_page() -> HTMLResponse:
+    """固定の「送信済み」ページ（作成・更新・通知なし）。"""
+    return _fixed_page("送信済みです", RESUBMIT_DONE_TEXT, 200)
+
+
+async def _notify_resubmit_differs(record_id: str) -> None:
+    """内容の異なる再送信を業務 LINE へ 1 日 1 回だけ知らせる（JST 日付の刻印・
+    固定文言+案件レコード No のみ・回答本文や userId は載せない）。"""
+    global _resubmit_notice_day
+    today = datetime.datetime.now(_JST).strftime("%Y-%m-%d")
+    if _resubmit_notice_day == today:
+        logger.info("[SHINDAN] resubmit notice skipped (already sent today)")
+        return
+    _resubmit_notice_day = today
+    await notify.notify_admin_line(
+        "【時効診断フォーム・要確認】送信済みの診断フォームから、登録内容と異なる"
+        f"再送信がありました（案件レコードNo:{record_id}）。登録内容は上書きして"
+        "いません。必要に応じて kintone でご確認ください。",
+        throttle_key=RESUBMIT_DIFF_NOTICE_KEY,
+    )
+
+
+async def _handle_submit_used(form: dict[str, str], used: dict):
+    """使用済み token での POST。used_at から RESUBMIT_WINDOW_SEC 以内なら 1 回目と
+    同じ送信とみなし、本人のレコード（LINEユーザーID 検索・ちょうど 1 件）を送信済み
+    として完了画面（linked 結果ページ・写真導線あり）を返す。内容が同一なら何もせず、
+    異なれば上書きせず無視して 1 日 1 回の業務通知。窓の外・本人レコードが特定でき
+    ない・照合失敗は固定の「送信済み」ページ。**どの分岐でも App 21 の作成・更新・
+    受付番号の発行はしない**（k なし経路へは落ちない）。"""
+    early, pattern, fields_base = _prepare_submission(form)
+    if early is not None:
+        return early
+    head = shindan_link.token_head(str(used.get("token") or ""))
+    used_at = used.get("used_at")
+    age = ((shindan_link._now() - used_at).total_seconds()
+           if isinstance(used_at, datetime.datetime) else None)
+    if age is None or age < 0 or age > RESUBMIT_WINDOW_SEC:
+        logger.info("[SHINDAN] resubmit outside window (no write) head=%s",
+                    emit(head, "record_id", "log", "operator"))
+        return _resubmit_done_page()
+    record, method = await shindan_link.find_user_record(
+        APP_JIKOU_CASE, str(used.get("line_user_id") or ""))
+    if method != "found" or record is None:
+        logger.info("[SHINDAN] resubmit record not resolved (no write) method=%s head=%s",
+                    emit(method, "freetext", "log", "operator"),
+                    emit(head, "record_id", "log", "operator"))
+        return _resubmit_done_page()
+    record_id = _v(record, "$id")
+    same = all(_v(record, c) == str(fields_base.get(c, "") or "").strip()
+               for c in _RESUBMIT_COMPARE_FIELDS)
+    stored = _v(record, "診断パターン")
+    shown = stored if stored in FROZEN_RESULTS else pattern
+    if same:
+        logger.info("[SHINDAN] resubmit same content (no write) record_id=%s",
+                    emit(record_id, "record_id", "log", "operator"))
+    else:
+        logger.info("[SHINDAN] resubmit differs (ignored, no write) record_id=%s",
+                    emit(record_id, "record_id", "log", "operator"))
+        await _notify_resubmit_differs(record_id)
+    upload_token = issue_upload_token(record_id, f"L{record_id}", time.time())
+    return HTMLResponse(_result_html_linked(shown, upload_token))

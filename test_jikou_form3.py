@@ -728,8 +728,9 @@ class _PhotoBase(_KintoneBase):
         sf._attempts.clear()
         sf._photo_attempts.clear()
         sf._upload_tokens.clear()
+        sf._recent_plain.clear()                      # FORM-DUP-1: k なし経路の直近送信
         for c in (sf._attempts.clear, sf._photo_attempts.clear,
-                  sf._upload_tokens.clear):
+                  sf._upload_tokens.clear, sf._recent_plain.clear):
             self.addCleanup(c)
         self.admin = AsyncMock(return_value=True)
         for p in (patch.dict(os.environ, {"JIKOU_LINE_ADD_URL": _LINE_URL}),
