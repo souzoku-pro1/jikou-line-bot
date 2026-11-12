@@ -117,6 +117,10 @@ _NUMBER_LINE = "\n受付番号：{受付番号}"
 #    setdefault 相当）で token 照合など外部待機の前に行う。予約に成功した 1 本だけが先へ進み、
 #    他は予約者の完了を待って同じ結果を返す。結果保存・失敗時の解放は自分の予約（entry の
 #    同一性）に対してだけ行い、既存の予約・結果は上書きしない。
+#  - BF-06（fix3）: nonce 表の上限（MAX_NONCE_RESULTS）到達時の退避は「結果確定済み」または
+#    「期限切れ」のエントリだけ（最古から）。処理中（予約済み・結果未確定・期限内）は退避せず、
+#    個数は上限の内数。安全に空きが作れなければ新規予約を拒否し、固定の受付中ページで終了
+#    （作成 0・採番なし・WARNING 1 行で件数のみ）。
 #  - 送信ボタンは 1 回押したら無効化（JS・無効でも nonce のサーバ側で守る）。
 #  【単一 worker 前提】in-memory の有界 LRU（_attempts・_upload_tokens と同じ既知の制約）
 NONCE_FIELD = "n"
@@ -802,10 +806,31 @@ def _content_sig(pattern: str, fields_base: dict) -> tuple:
                  .hexdigest() for c in _RESUBMIT_COMPARE_FIELDS)
 
 
-def _nonce_put(nonce: str, entry: _NonceEntry) -> None:
+def _nonce_evictable(old: _NonceEntry, now: float) -> bool:
+    """退避してよいのは「結果確定済み」または「期限切れ」だけ（BF-06）。期限切れの処理中は
+    nonce 自体の有効期限（発行+NONCE_TTL_SEC ≦ 予約+NONCE_TTL_SEC）も過ぎているので、以後
+    同じ nonce の POST は verify_nonce で弾かれ、退避しても同一送信の判定を失わない。"""
+    return old.result is not None or now - old.ts > NONCE_TTL_SEC
+
+
+def _nonce_make_room(now: float) -> bool:
+    """登録 1 件分の空きを確保する（Lock 配下・await なし）。処理中のエントリは退避の対象外で、
+    個数は上限の内数。空きが作れなければ False（呼び出し側は新規予約を拒否）。"""
     while len(_nonce_results) >= MAX_NONCE_RESULTS:
-        _nonce_results.popitem(last=False)              # 最古（LRU）を退避
+        for key, old in _nonce_results.items():         # 最古から・退避可能なものだけ
+            if _nonce_evictable(old, now):
+                break
+        else:
+            return False                                # 全部が処理中（期限内）→ 空きなし
+        del _nonce_results[key]
+    return True
+
+
+def _nonce_put(nonce: str, entry: _NonceEntry, now: float | None = None) -> bool:
+    if not _nonce_make_room(time.time() if now is None else now):
+        return False
     _nonce_results[nonce] = entry
+    return True
 
 
 _nonce_lock: asyncio.Lock | None = None
@@ -823,19 +848,22 @@ def _get_nonce_lock() -> asyncio.Lock:
     return _nonce_lock
 
 
-async def _nonce_reserve(nonce: str, sig: tuple, now: float) -> tuple[_NonceEntry, bool]:
+async def _nonce_reserve(nonce: str, sig: tuple, now: float) -> tuple[_NonceEntry | None, bool]:
     """BF-05: 既存確認と処理権の予約を 1 つの原子操作で行う（Lock 配下・await なし＝
     setdefault 相当）。戻り値 (entry, owned)。owned=True は自分が新規に予約した 1 本
     （先へ進む）。False は既存の予約／結果（上書きしない・呼び出し側は完了を待つ）。
-    期限切れの結果だけは捨てて新規に予約する。"""
+    期限切れの結果だけは捨てて新規に予約する。(None, False) は BF-06 の拒否（表が処理中で
+    埋まり安全に空きが作れない・予約なし・呼び出し側は固定ページ）。"""
     async with _get_nonce_lock():
         entry = _nonce_results.get(nonce)
         if entry is not None and entry.result is not None and now - entry.ts > NONCE_TTL_SEC:
             _nonce_results.pop(nonce, None)
             entry = None
         if entry is None:
+            if not _nonce_make_room(now):
+                return None, False
             entry = _NonceEntry(now, sig)
-            _nonce_put(nonce, entry)
+            _nonce_results[nonce] = entry
             return entry, True
         return entry, False
 
@@ -853,16 +881,25 @@ def _pending_page() -> HTMLResponse:
     return _fixed_page("送信を受け付けています", PLAIN_PENDING_TEXT, 200)
 
 
+def _store_full_page() -> HTMLResponse:
+    """BF-06: 新規予約の拒否。WARNING 1 行（件数のみ）・作成 0・採番なし。"""
+    logger.warning("[SHINDAN] nonce store full of in-flight entries (no write) count=%s",
+                   emit(len(_nonce_results), "count", "log", "operator"))
+    return _fixed_page("送信を受け付けています", PLAIN_PENDING_TEXT, 200)
+
+
 async def _submit_with_nonce(resolve, pattern: str, fields_base: dict, nonce: str):
     """nonce 付きの送信: 予約に成功した 1 本だけが token 照合（resolve・外部待機）→ 送信へ
     進む。他は予約者の完了を待って同じ結果を返す（待ちきれなければ固定の受付中ページ・
     作成 0）。予約者が失敗して解放したら、待っていた側が新たに予約を取って進む。
-    nonce なしは予約せず通常どおり。"""
+    nonce なしは予約せず通常どおり。表が処理中で埋まって予約できなければ固定ページ（BF-06）。"""
     if not nonce:
         return await _submit_resolved(await resolve(), pattern, fields_base, None)
     sig = _content_sig(pattern, fields_base)
     for _attempt in range(_NONCE_RESERVE_RETRIES):
         entry, owned = await _nonce_reserve(nonce, sig, time.time())
+        if entry is None:
+            return _store_full_page()                   # BF-06: 予約拒否（固定ページ・作成 0）
         if owned:
             try:
                 return await _submit_resolved(await resolve(), pattern, fields_base, entry)
