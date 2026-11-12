@@ -125,6 +125,9 @@ _NUMBER_LINE = "\n受付番号：{受付番号}"
 #    結果確定済みのみ）。署名は正しいが期限切れの nonce は「なし」に変換せず（nonce_state が
 #    "expired" を区別）、その nonce に処理中または結果確定のエントリがあれば従来の待機または同じ
 #    結果を返し、無ければ初めて「nonce なし」として扱う。満杯時の固定ページは「混み合っています」。
+#  - BF-08（fix5）: expired で「最初からエントリが無かった」（→従来どおり新規）と「既存予約を待って
+#    いたが解放されて無くなった」（→固定ページ・作成 0・採番なし・expired では新規予約を取らない）
+#    を区別する（待機に入った時点で waited を立てる）。
 #  - 送信ボタンは 1 回押したら無効化（JS・無効でも nonce のサーバ側で守る）。
 #  【単一 worker 前提】in-memory の有界 LRU（_attempts・_upload_tokens と同じ既知の制約）
 NONCE_FIELD = "n"
@@ -904,6 +907,13 @@ def _pending_page() -> HTMLResponse:
     return _fixed_page("送信を受け付けています", PLAIN_PENDING_TEXT, 200)
 
 
+def _released_page() -> HTMLResponse:
+    """BF-08: 期限切れ nonce で待っていた予約が結果なしで解放された（1 回目が失敗）。新規予約は
+    取らず、1 回目と同じ固定のエラーページ（500・作成 0・採番なし）。"""
+    logger.info("[SHINDAN] duplicate post after first failed (no write)")
+    return _error_500()
+
+
 def _store_full_page() -> HTMLResponse:
     """BF-06: 新規予約の拒否。WARNING 1 行（件数のみ）・作成 0・採番なし。
     文言は BF-07 で「ただいま混み合っています」に訂正（相談者向け画面・LINE 送信ではない）。"""
@@ -919,15 +929,20 @@ async def _submit_with_nonce(resolve, pattern: str, fields_base: dict, nonce: st
     作成 0）。予約者が失敗して解放したら、待っていた側が新たに予約を取って進む。
     nonce なしは予約せず通常どおり。表が処理中で埋まって予約できなければ固定ページ（BF-06）。
     BF-07: state="expired"（署名は正しいが期限切れ）は新規予約をせず、その nonce に処理中または
-    結果確定のエントリがあれば従来どおり待機／同じ結果を返し、無ければ初めて「nonce なし」。"""
+    結果確定のエントリがあれば従来どおり待機／同じ結果を返し、無ければ初めて「nonce なし」。
+    BF-08: expired で既存予約を待っていた側（waited）は、予約者が結果未確定で失敗して解放し
+    エントリが無くなっても新規には進まず固定ページ（作成 0・採番なし）。"""
     if not nonce or state == "none":
         return await _submit_resolved(await resolve(), pattern, fields_base, None)
     expired = state == "expired"
+    waited = False
     sig = _content_sig(pattern, fields_base)
     for _attempt in range(_NONCE_RESERVE_RETRIES):
         entry, owned = await _nonce_reserve(nonce, sig, time.time(), allow_new=not expired)
         if entry is None:
-            if expired:                                 # BF-07: 期限切れでエントリ無し → nonce なし扱い
+            if expired and waited:                      # BF-08: 待っていた予約が解放されて消えた → 固定ページ
+                return _released_page()
+            if expired:                                 # BF-07: 最初からエントリ無し → nonce なし扱い
                 return await _submit_resolved(await resolve(), pattern, fields_base, None)
             return _store_full_page()                   # BF-06: 予約拒否（固定ページ・作成 0）
         if owned:
@@ -936,6 +951,7 @@ async def _submit_with_nonce(resolve, pattern: str, fields_base: dict, nonce: st
             finally:
                 _nonce_release(nonce, entry)
         if entry.result is None:
+            waited = True
             try:
                 await asyncio.wait_for(entry.event.wait(), _NONCE_WAIT_SEC)
             except asyncio.TimeoutError:
