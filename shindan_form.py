@@ -833,14 +833,16 @@ def _same_submission_page(hit, pattern: str, fields_base: dict) -> HTMLResponse:
         return _fixed_page("送信を受け付けています", PLAIN_PENDING_TEXT, 200)
     kind, record_id, number, prev_pattern = hit.result
     differs = sum(1 for a, b in zip(hit.sig, _content_sig(pattern, fields_base)) if a != b)
-    logger.info("[SHINDAN] duplicate post (no write) kind=%s record_id=%s differs=%s",
-                emit(kind, "freetext", "log", "operator"),
-                emit(record_id, "record_id", "log", "operator"),
-                emit(str(differs), "freetext", "log", "operator"))
     now = time.time()
     if kind == "linked":
+        logger.info("[SHINDAN] duplicate post (no write) kind=linked record_id=%s differs=%s",
+                    emit(record_id, "record_id", "log", "operator"),
+                    emit(differs, "count", "log", "operator"))
         return HTMLResponse(_result_html_linked(
             prev_pattern, issue_upload_token(record_id, f"L{record_id}", now)))
+    logger.info("[SHINDAN] duplicate post (no write) kind=plain record_id=%s differs=%s",
+                emit(record_id, "record_id", "log", "operator"),
+                emit(differs, "count", "log", "operator"))
     return HTMLResponse(_result_html(
         prev_pattern, number, os.environ.get(_LINE_URL_ENV, "").strip(),
         issue_upload_token(record_id, number, now)))
