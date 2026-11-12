@@ -768,22 +768,24 @@ async def _resolve_post_link(request: Request) -> tuple[str, dict | None]:
     token = _post_token(request)
     if not token:
         return "none", None
-    head = emit(shindan_link.token_head(token), "record_id", "log", "operator")
+    head = shindan_link.token_head(token)
     try:
         link = await shindan_link.lookup(token, include_claimed=True)
     except Exception:
-        logger.warning("[SHINDAN] link lookup failed (fixed page, no write) head=%s", head)
+        logger.warning("[SHINDAN] link lookup failed (fixed page, no write) head=%s",
+                       emit(head, "record_id", "log", "operator"))
         return "failed", None
     if link is not None:
         return "valid", link
     try:
         used = await shindan_link.lookup_used(token)
     except Exception:
-        logger.warning("[SHINDAN] used link lookup failed (fixed page, no write) head=%s", head)
+        logger.warning("[SHINDAN] used link lookup failed (fixed page, no write) head=%s",
+                       emit(head, "record_id", "log", "operator"))
         return "failed", None
     if used is not None:
         return "used", used
-    logger.info("[SHINDAN] link invalid head=%s", head)
+    logger.info("[SHINDAN] link invalid head=%s", emit(head, "record_id", "log", "operator"))
     return "none", None
 
 
@@ -831,8 +833,10 @@ def _same_submission_page(hit, pattern: str, fields_base: dict) -> HTMLResponse:
         return _fixed_page("送信を受け付けています", PLAIN_PENDING_TEXT, 200)
     kind, record_id, number, prev_pattern = hit.result
     differs = sum(1 for a, b in zip(hit.sig, _content_sig(pattern, fields_base)) if a != b)
-    logger.info("[SHINDAN] duplicate post (no write) kind=%s record_id=%s differs=%d",
-                kind, emit(record_id, "record_id", "log", "operator"), differs)
+    logger.info("[SHINDAN] duplicate post (no write) kind=%s record_id=%s differs=%s",
+                emit(kind, "freetext", "log", "operator"),
+                emit(record_id, "record_id", "log", "operator"),
+                emit(str(differs), "freetext", "log", "operator"))
     now = time.time()
     if kind == "linked":
         return HTMLResponse(_result_html_linked(
