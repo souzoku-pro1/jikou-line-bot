@@ -5,11 +5,11 @@
 「link invalid」→ k なし経路へ落ちて受付番号付き・LINEユーザーID 空の双子を作っていた。
 
 固定する内容（fix1 で設計の芯を nonce 方式に変更）:
- - 再送の識別はフォーム表示時に発行する送信操作 ID（nonce: 署名付き・1 回限り・有効 30 分・
-   hidden 項目）で行う。IP+回答の dedupe・使用済み token からの本人レコード検索はしない。
+ - 再送の識別はフォーム表示時に発行する送信操作 ID（nonce: 署名付き・1 回限り・有効 24 時間
+   （fix6 BF-09 で 30 分から変更）・hidden 項目）で行う。IP+回答の dedupe・使用済み token からの本人レコード検索はしない。
  - BF-02: k なし経路も本人専用リンク経路も、同じ nonce の再 POST だけを「同一送信」とみなし
-   1 回目と同じ完了画面（同じ受付番号／同じレコード）。nonce なし・不正・期限切れ・別 nonce は
-   通常どおり新規（同一 IP の別人＝別 nonce は別案件）。
+   1 回目と同じ完了画面（同じ受付番号／同じレコード）。nonce なし・不正・別 nonce は
+   通常どおり新規（同一 IP の別人＝別 nonce は別案件）。24 時間超（署名正）は固定ページ（fix6 BF-09）。
  - BF-03: 使用済み token の再 POST は nonce 一致のときだけ同じ完了画面。不一致・なしは固定の
    「送信済み」ページだけ（診断結果・写真トークン・受付番号なし）。k なし経路にも落とさない。
  - BF-01: token 照合（lookup／lookup_used）の取得不能は不存在と分け、固定ページで終了
@@ -89,7 +89,7 @@ class _Base(_FormLinkBase):
 class TestConstants(unittest.TestCase):
     def test_windows_and_texts(self):
         self.assertEqual(sf.NONCE_FIELD, "n")
-        self.assertEqual(sf.NONCE_TTL_SEC, 30 * 60)
+        self.assertEqual(sf.NONCE_TTL_SEC, 24 * 60 * 60)          # fix6 BF-09: 30 分 → 24 時間
         self.assertEqual(sf.MAX_NONCE_RESULTS, 5000)
         self.assertEqual(hashlib.sha256(sf.RESUBMIT_DONE_TEXT.encode("utf-8")).hexdigest(),
                          PIN_RESUBMIT_DONE)
@@ -205,15 +205,19 @@ class TestSameNoncePlain(_Base):
         self.post_plain(nonce=self.get_nonce())
         self.assertEqual(len(self.fake.create_calls), 2)
 
-    def test_no_nonce_or_invalid_or_expired_is_treated_as_new(self):
+    def test_no_nonce_or_invalid_is_new_and_stale_is_fixed_page(self):
+        # fix6 BF-09（裁定変更）: 24 時間超（署名正）は新規ではなく固定ページ（410・作成 0・予約なし）
         with patch.object(sf, "_draw_number", side_effect=["000001", "000002", "000003", "000004"]):
             self.post_plain()                                      # nonce なし
             self.post_plain()
             self.post_plain(nonce="tampered.value")                # 不正
-            expired = sf.issue_nonce(sf.time.time() - sf.NONCE_TTL_SEC - 10)
-            self.post_plain(nonce=expired)                         # 期限切れ
-        self.assertEqual(len(self.fake.create_calls), 4)
-        self.assertEqual(sf._nonce_results, {})                   # 無効な nonce は記憶しない
+            stale = sf.issue_nonce(sf.time.time() - sf.NONCE_TTL_SEC - 10)
+            r = self.post_plain(nonce=stale)                       # 24 時間超
+        self.assertEqual(r.status_code, 410)
+        self.assertIn(sf.STALE_TEXT, r.text)
+        self.assertNotIn("受付番号", r.text)
+        self.assertEqual(len(self.fake.create_calls), 3)          # 24 時間超は作成 0
+        self.assertEqual(sf._nonce_results, {})                   # 無効・24 時間超の nonce は記憶しない
 
     def test_tampered_nonce_is_not_remembered_and_valid_one_is(self):
         n = self.get_nonce()
@@ -380,14 +384,19 @@ class TestSameNonceLinked(_Base):
         self.assertNotIn(token, self.cap.text())
         self.assertEqual(len(self.rows()), 1)                       # 行は 1 本のまま
 
-    def test_used_token_without_nonce_or_invalid_or_expired_is_done_page_only(self):
+    def test_used_token_without_nonce_or_invalid_is_done_page_only_and_stale_is_fixed_page(self):
         token = self.issue()
         self.post_linked_n(token, self.get_nonce(k=token))
         before = set(sf._upload_tokens)
         self.assert_done_page_only(self.post_linked_n(token))                        # なし
         self.assert_done_page_only(self.post_linked_n(token, "bad.nonce"))           # 不正
-        expired = sf.issue_nonce(sf.time.time() - sf.NONCE_TTL_SEC - 10)
-        self.assert_done_page_only(self.post_linked_n(token, expired))               # 期限切れ
+        stale = sf.issue_nonce(sf.time.time() - sf.NONCE_TTL_SEC - 10)
+        r = self.post_linked_n(token, stale)                       # 24 時間超: fix6 BF-09 で固定ページ（送信済みページではない）
+        self.assertEqual(r.status_code, 410)
+        self.assertIn(sf.STALE_TEXT, r.text)
+        self.assertNotIn(sf.RESUBMIT_DONE_TEXT, r.text)
+        self.assertNotIn("受付番号", r.text)
+        self.assertNotIn(sf.PHOTO_ROUTE, r.text)
         self.assert_done_page_only(self.post_linked_n(token, creditor="別の債権者"))  # 内容相違でも同じ
         self.assertEqual(len(self.fake.create_calls), 1)
         self.assertEqual(self.fake.update_calls, [])

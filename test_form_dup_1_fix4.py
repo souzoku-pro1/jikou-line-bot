@@ -1,14 +1,15 @@
 """FORM-DUP-1-fix4（Codex R-FD1-fix3 BF-07）:
  1. 処理中（予約済み・結果未確定）のエントリは期限にかかわらず退避しない（退避は結果確定済みのみ）。
- 2. 署名は正しいが期限切れの nonce は「なし」に変換しない。nonce_state が "expired" を区別し、
-    その nonce に処理中または結果確定のエントリがあれば従来の待機または同じ結果を返し、無ければ
-    初めて「nonce なし」として扱う（新規予約はしない）。
+ 2. （fix6 BF-09 で裁定変更）nonce は「有効（署名正・24 時間以内）」と「24 時間超（固定ページ）」の
+    2 状態。有効なら経過時間にかかわらず fix2 の予約・待機・同じ結果。fix4 の expired 分岐
+    （30 分で期限切れ→既存エントリの照合のみ・無ければ新規）を前提にした 5 件は期待値を書き換えた。
  3. 満杯時の固定ページの文言を「ただいま混み合っています…」に訂正（sha256 pin）。
  既存 test_form_dup_1 37 件・fix2 11 件・fix3 7 件は件数不変。
 """
 
 import asyncio
 import hashlib
+import inspect
 import logging
 import re
 import time as _real_time
@@ -75,9 +76,9 @@ class TestExpiredNonceAndInflightRetention(_Base):
         self.assertIsNotNone(m)
         return m.group(1)
 
-    # ── 票 2: 期限切れ（署名正）の nonce・処理中 A がいる間に B → 作成 1・同じ結果 ──────
-    def test_expired_nonce_while_first_inflight_second_waits_and_gets_same_result(self):
-        n = sf.issue_nonce(self.clock.t)                            # 有効 30 分
+    # ── 発行から 31 分後（有効・fix6）の nonce・処理中 A がいる間に B → 作成 1・同じ結果 ──────
+    def test_nonce_31min_old_while_first_inflight_second_waits_and_gets_same_result(self):
+        n = sf.issue_nonce(self.clock.t)                            # 有効 24 時間（fix6 BF-09）
         gate, p = self._gate_lookup()
 
         async def _go():
@@ -85,8 +86,8 @@ class TestExpiredNonceAndInflightRetention(_Base):
             await asyncio.sleep(0.05)
             entry_a = sf._nonce_results[n]
             self.assertIsNone(entry_a.result)
-            self.clock.t += sf.NONCE_TTL_SEC + 1                      # A の処理中に nonce が期限切れ
-            self.assertEqual(sf.nonce_state(n, self.clock.t)[0], "expired")
+            self.clock.t += 31 * 60                                   # A の処理中に 31 分経過（旧 30 分期限を超える・有効）
+            self.assertEqual(sf.nonce_state(n, self.clock.t), ("ok", n))
             t_b = asyncio.create_task(sf.shindan_entry(_request(self._form(n), token="nosuchtoken")))
             await asyncio.sleep(0.05)
             self.assertFalse(t_b.done())                              # B は A の完了を待つ
@@ -105,13 +106,13 @@ class TestExpiredNonceAndInflightRetention(_Base):
         self.assertNotIn("duplicate post pending", self.cap.text())
         self.assertEqual(self._warnings(), [])
 
-    # ── 票 2: 期限切れで結果確定済み → 同じ結果 ──────────────────────────────────
-    def test_expired_nonce_with_finished_result_returns_same_result(self):
+    # ── 23 時間後（有効・fix6）で結果確定済み → 同じ結果 ────────────────────────────
+    def test_nonce_23h_old_with_finished_result_returns_same_result(self):
         n = sf.issue_nonce(self.clock.t)
         r1 = _run(sf.shindan_entry(_request(self._form(n))))
         db.reset_for_tests()
         first = sf._nonce_results[n]
-        self.clock.t += sf.NONCE_TTL_SEC + 1
+        self.clock.t += 23 * 3600                                     # 旧 30 分期限は超え・24 時間以内
         r2 = _run(sf.shindan_entry(_request(self._form(n, creditor="別の債権者"))))
         db.reset_for_tests()
         self.assertEqual((r1.status_code, r2.status_code), (200, 200))
@@ -121,27 +122,32 @@ class TestExpiredNonceAndInflightRetention(_Base):
         self.assertEqual(len(_Counting.made), 1)
         self.assertIn("duplicate post (no write) kind=plain", self.cap.text())
 
-    # ── 票 2: 期限切れでエントリ無し → 従来どおり新規（記憶しない）─────────────────
-    def test_expired_nonce_without_entry_is_new_and_not_remembered(self):
+    # ── 24 時間超でエントリ無し → 固定ページ（410・作成 0・予約なし）（fix6 BF-09・旧: 新規）──
+    def test_stale_nonce_without_entry_is_fixed_page_and_not_remembered(self):
         n = sf.issue_nonce(self.clock.t)
         self.clock.t += sf.NONCE_TTL_SEC + 1
         r = _run(sf.shindan_entry(_request(self._form(n))))
         db.reset_for_tests()
-        self.assertEqual(r.status_code, 200)
-        self.assertEqual(len(self.fake.create_calls), 1)
-        self._num(r)
-        self.assertNotIn(n, sf._nonce_results)                        # nonce なし扱い＝予約しない
+        body = r.body.decode("utf-8")
+        self.assertEqual(r.status_code, 410)
+        self.assertIn(sf.STALE_TEXT, body)
+        self.assertNotIn("受付番号", body)
+        self.assertEqual(len(self.fake.create_calls), 0)
+        self.assertNotIn(n, sf._nonce_results)                        # 予約しない
         self.assertEqual(_Counting.made, [])
-        # 使用済み token＋期限切れ nonce（エントリ無し）も従来どおり固定の送信済みページ
+        # 使用済み token＋24 時間超 nonce も固定ページ（送信済みページではない・作成は増えない）
         token = self.issue()
         self.post_linked_n(token, self.get_nonce(k=token))
         n2 = sf.issue_nonce(self.clock.t)
         self.clock.t += sf.NONCE_TTL_SEC + 1
-        self.assert_done_page_only(self.post_linked_n(token, n2))
-        self.assertEqual(len(self.fake.create_calls), 2)
+        r2 = self.post_linked_n(token, n2)
+        self.assertEqual(r2.status_code, 410)
+        self.assertIn(sf.STALE_TEXT, r2.text)
+        self.assertNotIn(sf.RESUBMIT_DONE_TEXT, r2.text)
+        self.assertEqual(len(self.fake.create_calls), 1)
 
-    # ── 票 1: 時計を 1,801 秒進めて別 nonce を登録しても処理中 A は退避されない ───────
-    def test_clock_advance_does_not_evict_inflight_when_other_nonces_register(self):
+    # ── 票 1: 時計を 23 時間進めて別 nonce を登録しても処理中 A は退避されない（fix6: 23 時間後の B は有効）──
+    def test_clock_advance_23h_does_not_evict_inflight_when_other_nonces_register(self):
         n_a = sf.issue_nonce(self.clock.t)
         gate, p = self._gate_lookup()
 
@@ -149,17 +155,17 @@ class TestExpiredNonceAndInflightRetention(_Base):
             t_a = asyncio.create_task(sf.shindan_entry(_request(self._form(n_a), token="nosuchtoken")))
             await asyncio.sleep(0.05)
             entry_a = sf._nonce_results[n_a]
-            self.clock.t += sf.NONCE_TTL_SEC + 1                      # 1,801 秒後
+            self.clock.t += 23 * 3600                                 # 23 時間後（A の nonce は有効のまま）
             n_c, n_d = sf.issue_nonce(self.clock.t), sf.issue_nonce(self.clock.t)
             r_c = await sf.shindan_entry(_request(self._form(n_c)))  # 空き 1 → 登録・作成
             self.assertIs(sf._nonce_results.get(n_a), entry_a)
             self.assertEqual(list(sf._nonce_results), [n_a, n_c])
             r_d = await sf.shindan_entry(_request(self._form(n_d)))  # 満杯（A 処理中・C 確定）→ C を退避して登録
-            self.assertIs(sf._nonce_results.get(n_a), entry_a)       # A は期限切れでも退避されない
+            self.assertIs(sf._nonce_results.get(n_a), entry_a)       # A はどれだけ古くても退避されない
             self.assertEqual(list(sf._nonce_results), [n_a, n_d])
             gate.set()
             r_a = await t_a
-            r_b = await sf.shindan_entry(_request(self._form(n_a), token="nosuchtoken"))  # 期限切れ nonce の B
+            r_b = await sf.shindan_entry(_request(self._form(n_a), token="nosuchtoken"))  # 23 時間後の B（有効）
             return r_a, r_b, r_c, r_d, entry_a
         with patch.object(sf, "MAX_NONCE_RESULTS", 2), p:
             r_a, r_b, r_c, r_d, entry_a = _run(_go())
@@ -222,27 +228,31 @@ class TestExpiredNonceAndInflightRetention(_Base):
         self.assertEqual(sf.nonce_state(n, now), ("ok", n))
         self.assertEqual(sf.nonce_state(" " + n + " ", now), ("ok", n))
         self.assertEqual(sf.nonce_state(n, now + sf.NONCE_TTL_SEC - 1), ("ok", n))
-        self.assertEqual(sf.nonce_state(n, now + sf.NONCE_TTL_SEC), ("expired", n))
-        self.assertEqual(sf.nonce_state(n, now + 10 * sf.NONCE_TTL_SEC), ("expired", n))
-        # verify_nonce の契約（fix1）は不変: 期限切れは ""
+        # fix6 BF-09: 24 時間超は "expired"（既存照合のみ）ではなく "stale"（固定ページ・値は下流へ流さない）
+        self.assertEqual(sf.nonce_state(n, now + sf.NONCE_TTL_SEC), ("stale", ""))
+        self.assertEqual(sf.nonce_state(n, now + 10 * sf.NONCE_TTL_SEC), ("stale", ""))
+        # verify_nonce の契約（fix1）は不変: 24 時間超は ""
         self.assertEqual(sf.verify_nonce(n, now), n)
         self.assertEqual(sf.verify_nonce(n, now + sf.NONCE_TTL_SEC), "")
         self.assertEqual(sf.verify_nonce(n + "x", now), "")
-        # 期限切れ nonce は _nonce_reserve(allow_new=False) で新規予約しない
+        # fix6: _nonce_reserve に allow_new は無い（有効 nonce は年齢を問わず同じ契約）
+        self.assertNotIn("allow_new", inspect.signature(sf._nonce_reserve).parameters)
         async def _go():
-            e, owned = await sf._nonce_reserve(n, (), now, allow_new=False)
-            self.assertIsNone(e)
-            self.assertFalse(owned)
-            self.assertEqual(sf._nonce_results, {})
             e1, owned1 = await sf._nonce_reserve(n, (), now)
             self.assertTrue(owned1)
-            e1.ts -= 10 * sf.NONCE_TTL_SEC                           # どれだけ古くても
-            e2, owned2 = await sf._nonce_reserve(n, (), now, allow_new=False)
+            e1.ts -= 10 * sf.NONCE_TTL_SEC                           # どれだけ古くても処理中は同じ entry
+            e2, owned2 = await sf._nonce_reserve(n, (), now)
             self.assertIs(e2, e1)
             self.assertFalse(owned2)
             e1.result = ("plain", "1", "000001", "A")
-            e3, owned3 = await sf._nonce_reserve(n, (), now, allow_new=False)
-            self.assertIs(e3, e1)                                    # 期限切れの結果も捨てない
+            e1.ts = now - sf.NONCE_TTL_SEC + 1                        # 確定済み・保持期限（24 時間）内 → 同じ結果
+            e3, owned3 = await sf._nonce_reserve(n, (), now)
+            self.assertIs(e3, e1)
+            self.assertFalse(owned3)
+            e1.ts = now - sf.NONCE_TTL_SEC - 1                        # 確定済み・保持期限超 → 捨てて新規予約（fix2 の契約）
+            e4, owned4 = await sf._nonce_reserve(n, (), now)
+            self.assertTrue(owned4)
+            self.assertIsNot(e4, e1)
         _run(_go())
 
     # ── 票 1: 処理中は期限にかかわらず退避しない（単体）──────────────────────────
