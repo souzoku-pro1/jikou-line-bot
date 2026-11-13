@@ -9,7 +9,7 @@ import asyncio
 import unittest
 from unittest.mock import patch
 
-from test_form_dup_1 import _Base  # noqa: E402
+from test_form_dup_1 import _Base, _definite_failure  # noqa: E402
 from test_form_dup_1_fix2 import _Counting, _request  # noqa: E402
 from test_form_dup_1_fix4 import _Clock, _NUMBER_RE  # noqa: E402
 from test_shindan_line_link import VALID, _run  # noqa: E402
@@ -72,6 +72,7 @@ class TestExpiredWaiterAfterRelease(_Base):
             self.assertEqual(len(_Counting.made), 1)
             if fail_first:
                 self.fake.create_fail_next = 1
+                self.fake.create_fail_error = _definite_failure()   # fix7: 取り直しは確定失敗のみ
             gate.set()
             return await asyncio.gather(t_a, t_b, t_c), entry_a, n
         with patch.object(sf.hub_kintone, "create_record", _gated_create):
@@ -153,6 +154,7 @@ class TestExpiredWaiterAfterRelease(_Base):
     def test_arriving_23h_after_release_without_waiting_is_new(self):
         n = sf.issue_nonce(self.clock.t)
         self.fake.create_fail_next = 1
+        self.fake.create_fail_error = _definite_failure()             # fix7: 確定失敗だけが解放
         r_a = _run(sf.shindan_entry(_request(self._form(n))))         # A 失敗 → 解放
         db.reset_for_tests()
         self.assertEqual(r_a.status_code, 500)

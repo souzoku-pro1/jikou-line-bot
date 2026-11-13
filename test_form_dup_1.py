@@ -42,6 +42,12 @@ PIN_PLAIN_PENDING = "00cdf22f444ee828c54c4425125c363ee18ff7891ceb9d50ba0c9643b9e
 _HIDDEN_RE = re.compile(r'<input type="hidden" name="n" value="([^"]*)">')
 
 
+def _definite_failure():
+    """FORM-DUP-1 fix7 BF-11: 取り直しを許す「確定失敗」（kintone の明示的拒否＝4xx）。
+    fake の既定（5xx）は「結果不明」になり予約が解放されないので、取り直しの検査はこれを差す。"""
+    return sf.hub_kintone.KintoneError(403, "GAIA_AP15", "forbidden")
+
+
 class _Base(_FormLinkBase):
     def setUp(self):
         super().setUp()
@@ -252,11 +258,13 @@ class TestSameNoncePlain(_Base):
         self.assertIn("differs=2", self.cap.text())
 
     def test_failed_first_does_not_block_second(self):
+        # fix7 BF-11: 後続を妨げないのは「確定失敗」だけ（結果不明は test_form_dup_1_fix7＝保持）
         n = self.get_nonce()
         self.fake.create_fail_next = 1
+        self.fake.create_fail_error = _definite_failure()
         r1 = self.post_plain(nonce=n)
         self.assertEqual(r1.status_code, 500)
-        self.assertEqual(sf._nonce_results, {})                   # 失敗は記憶しない
+        self.assertEqual(sf._nonce_results, {})                   # 確定失敗は記憶しない
         r2 = self.post_plain(nonce=n)
         self.assertEqual(r2.status_code, 200)
         self.assertEqual(len(self.fake.create_calls), 2)

@@ -87,6 +87,7 @@ class _FakeApp21:
         self.get_calls: list[str] = []
         self.conflict_next = 0
         self.create_fail_next = 0
+        self.create_fail_error = None   # FORM-DUP-1 fix7: 確定失敗（4xx）を模すときに差す（既定は 5xx＝結果不明）
 
     def add(self, rid, user_id=USER, revision="3", **filled):
         rec = {"$id": {"value": rid}, "$revision": {"value": revision},
@@ -138,7 +139,7 @@ class _FakeApp21:
         self.create_calls.append(dict(fields))
         if self.create_fail_next > 0:
             self.create_fail_next -= 1
-            raise hub_kintone.KintoneError(500, "GAIA_XX", "down")
+            raise self.create_fail_error or hub_kintone.KintoneError(500, "GAIA_XX", "down")
         self._id += 1
         rid = str(self._id)
         rec = {k: {"value": v} for k, v in fields.items()}

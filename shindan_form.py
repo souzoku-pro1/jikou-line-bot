@@ -130,11 +130,24 @@ _NUMBER_LINE = "\n受付番号：{受付番号}"
 #    （410・作成 0・採番なし・予約なし・フォームへのリンク）。署名不正・なしは従来どおり「なし」
 #    （新規）。結果確定済みエントリの保持期限も 24 時間（NONCE_TTL_SEC）。30 分の期限・expired
 #    分岐・waited は撤去。
+#  - BF-10（fix7・別方式）: 満杯時に新規受付を拒否する範囲は広げない。確定済みエントリを容量で
+#    退避するときは結果本体を捨て、「作成済みの印」（nonce の SHA-256 と期限のみ・有効期間 24 時間）
+#    を別の集合 _nonce_marks（上限 MAX_NONCE_MARKS・期限切れから捨て・上限到達時は最古から）に
+#    残す。印のある nonce の再 POST は作成せず固定の「送信済み」ページ（BF-03 と同じ）。
+#  - BF-11（fix7）: 書込結果の「確定失敗」（書込前の失敗・kintone の明示的拒否＝4xx）と「結果不明」
+#    （unknown: 外部書込を開始した後の通信例外・5xx・timeout・キャンセル）を nonce の状態でも分ける。
+#    確定失敗だけ予約を解放して取り直しを許す。unknown は予約を解放せず「不明」として 24 時間保持し
+#    （容量退避もしない）、初回も同じ nonce の再 POST も固定ページ（409・作成 0・採番なし）。
+#    WARNING 1 行（件数のみ）。業務 LINE 通知は増やさない（既存の要確認通知のみ）。
 #  - 送信ボタンは 1 回押したら無効化（JS・無効でも nonce のサーバ側で守る）。
-#  【単一 worker 前提】in-memory の有界 LRU（_attempts・_upload_tokens と同じ既知の制約）
+#  【既知の制約（裁定済み・docs/ops/shindan_form_dedup.md）】①プロセス再起動で鍵と記憶が消え、
+#    旧 nonce は署名不正＝新規扱い ②単一 worker・メモリ内保持が前提（_attempts・_upload_tokens と
+#    同じ有界 LRU）③nonce を実際に入手した第三者は有効期間中その送信の完了画面を取得できる
+#    （nonce は本人のブラウザの hidden 項目にしか無い）④印の集合が上限を超えた場合は最古から捨てる
 NONCE_FIELD = "n"
 NONCE_TTL_SEC = 24 * 60 * 60               # BF-09: 発行からの有効期間＝結果確定済みエントリの保持期限
 MAX_NONCE_RESULTS = 5000
+MAX_NONCE_MARKS = 200_000                   # BF-10: 作成済みの印（sha256(nonce) → 期限）の上限
 _NONCE_WAIT_SEC = 10.0
 _NONCE_KEY = secrets.token_bytes(32)          # プロセス固有の署名鍵（env・秘密値の保持なし）
 _NONCE_RE = re.compile(r"^[0-9]{1,12}\.[0-9a-f]{32}\.[0-9a-f]{32}$")
@@ -150,13 +163,17 @@ STALE_TITLE = "送信できませんでした"
 STALE_TEXT = ("入力から時間が経ったため、送信できませんでした。お手数ですが、"
               "もう一度フォームを開いて入力してください。")
 STALE_LINK_TEXT = "もう一度フォームを開く"
+UNKNOWN_TITLE = "送信結果を確認できませんでした"
+UNKNOWN_TEXT = ("送信結果を確認できませんでした。二重のお申込みを避けるため、再送信はせず、"
+                "LINE の無料相談からご連絡ください。")
 # 1 回目の送信内容の照合欄（相違は件数だけログ・値は SHA-256 のみ保持）
 _RESUBMIT_COMPARE_FIELDS = _LINKED_UPDATE_FIELDS
 
 
 class _NonceEntry:
     """nonce ごとの 1 回目の送信: 処理中は result=None（後続は event を待つ）。
-    result=("plain", record_id, 受付番号, pattern) または ("linked", record_id, "", pattern)。
+    result=("plain", record_id, 受付番号, pattern)／("linked", record_id, "", pattern)／
+    ("unknown", "", 受付番号, pattern)（BF-11: 書込結果不明・解放せず 24 時間保持・容量退避なし）。
     sig は照合欄の SHA-256 の組（生値は持たない）。"""
     __slots__ = ("ts", "event", "result", "sig")
 
@@ -168,6 +185,11 @@ class _NonceEntry:
 
 
 _nonce_results: "OrderedDict[str, _NonceEntry]" = OrderedDict()
+# BF-10: 作成済みの印（容量退避した確定済みエントリの sha256(nonce)[:32] → 期限 epoch 秒）
+_nonce_marks: "OrderedDict[str, float]" = OrderedDict()
+_MARKED = _NonceEntry(0.0, ())                 # BF-10: 「印あり」を表す番兵（結果本体なし）
+_MARKED.result = ("marked", "", "", "")
+_MARKED.event.set()
 
 
 def _nonce_sig(exp: int, rnd: str) -> str:
@@ -834,20 +856,56 @@ def _content_sig(pattern: str, fields_base: dict) -> tuple:
 
 
 def _nonce_evictable(old: _NonceEntry, now: float) -> bool:
-    """退避してよいのは「結果確定済み」だけ（BF-06・BF-07）。処理中（予約済み・結果未確定）は
-    期限にかかわらず退避しない（有効な nonce の再 POST は経過時間を問わず既存エントリで同一送信）。"""
-    return old.result is not None
+    """退避してよいのは「結果確定済み」（plain／linked）だけ（BF-06・BF-07）。処理中（予約済み・
+    結果未確定）は期限にかかわらず退避しない。「不明」（unknown・BF-11）は処理中と同じ扱いで
+    容量退避せず、保持期限（NONCE_TTL_SEC）を過ぎたものだけ捨てる（その nonce は 24 時間超）。"""
+    if old.result is None:
+        return False
+    if old.result[0] == "unknown":
+        return now - old.ts > NONCE_TTL_SEC
+    return True
+
+
+def _mark_key(nonce: str) -> str:
+    return hashlib.sha256(nonce.encode("utf-8")).hexdigest()[:32]
+
+
+def _mark_add(nonce: str, exp: float, now: float) -> None:
+    """BF-10: 作成済みの印を残す。期限切れを先頭から捨て、上限到達時は最古から捨てる（既知の制約④）。"""
+    while _nonce_marks:
+        k, e = next(iter(_nonce_marks.items()))
+        if e > now:
+            break
+        del _nonce_marks[k]
+    while len(_nonce_marks) >= MAX_NONCE_MARKS:
+        _nonce_marks.popitem(last=False)
+    _nonce_marks[_mark_key(nonce)] = exp
+
+
+def _mark_valid(nonce: str, now: float) -> bool:
+    """BF-10: 有効期間中の印があるか（期限切れはここで捨てる）。"""
+    k = _mark_key(nonce)
+    exp = _nonce_marks.get(k)
+    if exp is None:
+        return False
+    if exp <= now:
+        _nonce_marks.pop(k, None)
+        return False
+    return True
 
 
 def _nonce_make_room(now: float) -> bool:
-    """登録 1 件分の空きを確保する（Lock 配下・await なし）。処理中のエントリは退避の対象外で、
-    個数は上限の内数。空きが作れなければ False（呼び出し側は新規予約を拒否）。"""
+    """登録 1 件分の空きを確保する（Lock 配下・await なし）。処理中・不明のエントリは退避の対象外で、
+    個数は上限の内数。確定済みを退避するときは作成済みの印を残す（BF-10）。
+    空きが作れなければ False（呼び出し側は新規予約を拒否）。"""
     while len(_nonce_results) >= MAX_NONCE_RESULTS:
         for key, old in _nonce_results.items():         # 最古から・退避可能なものだけ
             if _nonce_evictable(old, now):
                 break
         else:
-            return False                                # 全部が処理中（期限内）→ 空きなし
+            return False                                # 全部が処理中・不明 → 空きなし
+        if old.result[0] in ("plain", "linked") and old.ts + NONCE_TTL_SEC > now:
+            _mark_add(key, old.ts + NONCE_TTL_SEC, now)
         del _nonce_results[key]
     return True
 
@@ -879,10 +937,13 @@ async def _nonce_reserve(nonce: str, sig: tuple, now: float) -> tuple[_NonceEntr
     setdefault 相当）。戻り値 (entry, owned)。owned=True は自分が新規に予約した 1 本
     （先へ進む）。False は既存の予約／結果（上書きしない・呼び出し側は完了を待つ）。
     保持期限（NONCE_TTL_SEC=24 時間・BF-09）を過ぎた結果だけは捨てて新規に予約する
-    （処理中は年齢を問わず捨てない）。(None, False) は BF-06 の拒否（表が処理中で埋まり
-    安全に空きが作れない・予約なし・呼び出し側は固定ページ）。"""
+    （処理中は年齢を問わず捨てない）。(None, False) は BF-06 の拒否（表が処理中・不明で埋まり
+    安全に空きが作れない・予約なし・呼び出し側は固定ページ）。(_MARKED, False) は BF-10 の
+    「作成済みの印あり」（エントリ無し・予約せず・呼び出し側は「送信済み」ページ）。"""
     async with _get_nonce_lock():
         entry = _nonce_results.get(nonce)
+        if entry is None and _mark_valid(nonce, now):
+            return _MARKED, False                       # BF-10: 作成済みの印 → 「送信済み」ページ
         if entry is not None and entry.result is not None and now - entry.ts > NONCE_TTL_SEC:
             _nonce_results.pop(nonce, None)
             entry = None
@@ -897,7 +958,8 @@ async def _nonce_reserve(nonce: str, sig: tuple, now: float) -> tuple[_NonceEntr
 
 def _nonce_release(nonce: str, entry: _NonceEntry) -> None:
     """自分の予約（entry の同一性＝予約 ID）だけを扱う: 結果が無ければ辞書から外し
-    （失敗した 1 本目は後続を妨げない）、結果があれば残す。待っている側を起こす。"""
+    （確定失敗した 1 本目は後続を妨げない）、結果（plain／linked／unknown）があれば残す。
+    待っている側を起こす。BF-11: 不明は result に入っているので解放されない。"""
     if entry.result is None and _nonce_results.get(nonce) is entry:
         _nonce_results.pop(nonce, None)
     entry.event.set()
@@ -917,6 +979,23 @@ def _stale_page() -> HTMLResponse:
     return HTMLResponse(_page(STALE_TITLE, body), status_code=410)
 
 
+def _unknown_page() -> HTMLResponse:
+    """BF-11: 書込結果が不明。固定ページ（409・作成 0・採番なし・再送信しない案内・入力値の反射なし）。
+    初回も同じ nonce の再 POST も同じページ。"""
+    return _fixed_page(UNKNOWN_TITLE, UNKNOWN_TEXT, 409)
+
+
+def _hold_unknown(entry: "_NonceEntry | None", number: str, pattern: str) -> None:
+    """BF-11: 自分の予約を「不明」として残す（解放しない＝取り直しを許さない・24 時間保持）。
+    WARNING 1 行（保持中の不明件数のみ・定数）。"""
+    if entry is not None and entry.result is None:
+        entry.result = ("unknown", "", number, pattern)
+    held = sum(1 for e in _nonce_results.values()
+               if e.result is not None and e.result[0] == "unknown")
+    logger.warning("[SHINDAN] write result unknown (held, no retry) count=%s",
+                   emit(held, "count", "log", "operator"))
+
+
 def _store_full_page() -> HTMLResponse:
     """BF-06: 新規予約の拒否。WARNING 1 行（件数のみ）・作成 0・採番なし。
     文言は BF-07 で「ただいま混み合っています」に訂正（相談者向け画面・LINE 送信ではない）。"""
@@ -932,7 +1011,9 @@ async def _submit_with_nonce(resolve, pattern: str, fields_base: dict, nonce: st
     作成 0）。予約者が失敗して解放したら、待っていた側が新たに予約を取って進む。
     nonce なしは予約せず通常どおり。表が処理中で埋まって予約できなければ固定ページ（BF-06）。
     BF-09: state="stale"（署名は正しいが発行から 24 時間超）は予約も照合もせず固定ページ（410・
-    作成 0・採番なし）。有効（"ok"）なら経過時間にかかわらず上記をそのまま適用する。"""
+    作成 0・採番なし）。有効（"ok"）なら経過時間にかかわらず上記をそのまま適用する。
+    BF-10: 作成済みの印だけが残る nonce は予約せず「送信済み」ページ。BF-11: 予約者の書込結果が
+    不明なら予約は解放されず、待っていた側も同じ nonce の再 POST も固定の「不明」ページ。"""
     if state == "stale":
         return _stale_page()
     if not nonce or state == "none":
@@ -962,6 +1043,12 @@ def _same_submission_page(hit: _NonceEntry, pattern: str, fields_base: dict) -> 
     """同じ nonce の再 POST: 1 回目と同じ完了画面（同じ受付番号／同じレコード）。写真導線の
     トークンは同じレコードへ発行し直す。相違は件数だけ INFO ログ（通知なし=BF-04）。"""
     kind, record_id, number, prev_pattern = hit.result
+    if kind == "marked":                                 # BF-10: 作成済みの印（結果本体は退避済み）
+        logger.info("[SHINDAN] duplicate post (no write) kind=marked")
+        return _resubmit_done_page()
+    if kind == "unknown":                                # BF-11: 1 回目の書込結果が不明
+        logger.info("[SHINDAN] duplicate post (no write) kind=unknown")
+        return _unknown_page()
     differs = sum(1 for a, b in zip(hit.sig, _content_sig(pattern, fields_base)) if a != b)
     now = time.time()
     if kind == "linked":
@@ -1316,20 +1403,28 @@ async def _handle_submit(form: dict[str, str], link: dict | None = None, nonce: 
 async def _handle_submit_plain(pattern: str, fields_base: dict,
                                entry: _NonceEntry | None = None):
     """k なし経路（受付番号発行）。entry（FORM-DUP-1 fix1: 同じ nonce の 1 回目）が
-    あれば作成成功時に結果を残す（同じ nonce の再 POST へ同じ完了画面を返すため）。"""
+    あれば作成成功時に結果を残す（同じ nonce の再 POST へ同じ完了画面を返すため）。
+    BF-11: 結果不明（unknown・書込中のキャンセル含む）は entry を「不明」として残し（解放しない）
+    固定の「不明」ページ（409）。確定失敗（failed）と再採番上限は従来どおり 500（予約は解放）。"""
     number = ""
     record_id = ""
     outcome = "duplicate"
     for _attempt in range(_NUMBER_ATTEMPTS):
         number = _draw_number()
-        outcome, record_id = await _persist_with_number(fields_base, number)
+        try:
+            outcome, record_id = await _persist_with_number(fields_base, number)
+        except asyncio.CancelledError:
+            # BF-11: 外部書込を開始した後のキャンセルは結果不明。予約を解放せず「不明」として
+            # 残してから伝播する（要確認通知は送らない＝通知は増やさない・ログに残す）
+            _hold_unknown(entry, number, pattern)
+            raise
         if outcome != "duplicate":
             break                      # created / failed / unknown は再採番しない
     if outcome == "created" and entry is not None:
         entry.result = ("plain", record_id, number, pattern)
     if outcome != "created":
         # 保存できていない（failed）／有無不明（unknown）／再採番上限（duplicate）
-        # → 固定 500+要確認通知（受付番号を含め弁護士が App 21 と突合できる）
+        # → 要確認通知（受付番号を含め弁護士が App 21 と突合できる・既存の 1 箇所）
         logger.error("[SHINDAN] record not confirmed outcome=%s",
                      emit(outcome, "freetext", "log", "operator"))
         await notify.notify_admin_line(
@@ -1339,7 +1434,10 @@ async def _handle_submit_plain(pattern: str, fields_base: dict,
             + "kintone と Railway ログを確認してください。",
             throttle_key="shindan_numbering",
         )
-        return _error_500()
+        if outcome == "unknown":
+            _hold_unknown(entry, number, pattern)        # BF-11: 解放せず保持 → 固定ページ（409）
+            return _unknown_page()
+        return _error_500()                              # 確定失敗・再採番上限は従来どおり
 
     logger.info("[SHINDAN] record created record_id=%s pattern=%s",
                 emit(record_id, "record_id", "log", "operator"),

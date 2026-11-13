@@ -17,7 +17,7 @@ import re
 import unittest
 from unittest.mock import patch
 
-from test_form_dup_1 import _Base  # noqa: E402
+from test_form_dup_1 import _Base, _definite_failure  # noqa: E402
 from test_form_dup_1_fix2 import _Counting, _request  # noqa: E402
 from test_form_dup_1_fix3 import FULL_MSG  # noqa: E402
 from test_form_dup_1_fix4 import _Clock, _NUMBER_RE  # noqa: E402
@@ -105,6 +105,7 @@ class TestNonceValid24h(_Base):
             self.assertFalse(t_b.done() or t_c.done())
             self.assertEqual(len(_Counting.made), 1)
             self.fake.create_fail_next = 1
+            self.fake.create_fail_error = _definite_failure()        # fix7: 取り直しは確定失敗のみ
             gate.set()
             return await asyncio.gather(t_a, t_b, t_c)
         with p:

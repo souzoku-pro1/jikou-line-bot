@@ -18,7 +18,7 @@ from urllib.parse import urlencode
 
 from fastapi import Request
 
-from test_form_dup_1 import _Base  # noqa: E402  fix1 の基盤（fake・DB・nonce helper）を再利用
+from test_form_dup_1 import _Base, _definite_failure  # noqa: E402  fix1 の基盤（fake・DB・nonce helper）を再利用
 from test_shindan_line_link import USER, VALID, _run  # noqa: E402
 
 import shindan_form as sf  # noqa: E402
@@ -170,10 +170,11 @@ class TestAtomicReservation(_Base):
         self.assertIsNotNone(self.used_at(token))
         self.assertEqual(self.busy_lines(), [])                     # SLL-02 の busy にも入らない
 
-    # ── 1 本目失敗 → 2 本目が取り直して進む ─────────────────────────────────────
+    # ── 1 本目が確定失敗 → 2 本目が取り直して進む（fix7 BF-11: 結果不明なら取り直さない＝fix7）──
     def test_first_fails_second_reserves_anew_and_creates(self):
         n = sf.issue_nonce()
         self.fake.create_fail_next = 1
+        self.fake.create_fail_error = _definite_failure()
         b1, b2, s1, s2 = self._race(_request(self._form(n)), _request(self._form(n)),
                                     gate_lookup=False, gate_create=True)
         self.assertEqual((s1, s2), (500, 200))                      # 1 本目 500・2 本目は作成
