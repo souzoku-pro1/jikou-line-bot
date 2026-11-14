@@ -131,6 +131,18 @@
 - 「画面文言…弁護士裁定で差し替え可」: `shindan_form.py:284`、`test_jikou_form3.py:648`、PR #242 本文
 - 「App 21 直載せ裁定」: 作業メモのみ ── 要約のみ・原文未確認
 
+### 2-5. FORM-DUP-1-fix7（BF-10 別方式・BF-11）と二重送信抑止の既知の制約 4 点（Fable 裁定・2026-11-13） ── 原文あり（票 FORM-DUP-1-fix7）
+
+- 裁定: 「満杯時に新規受付を拒否する範囲は広げない（受付停止のほうが害が大きい）。代わりに、確定済みエントリを容量で退避するとき、結果本体は捨ててよいが「作成済みの印」（nonce のハッシュと期限のみ）を有効期間中（24 時間）別の集合に残す。」「書込結果の「確定失敗」と「結果不明」を nonce の状態でも分ける。確定失敗だけ予約を解放して取り直しを許す。unknown は予約を解放せず「不明」として 24 時間保持。」
+- 既知の制約（裁定済み・直さない）: ①プロセス再起動で鍵と記憶が消え、旧 nonce は署名不正＝新規扱い ②単一 worker・メモリ内保持が前提 ③nonce を実際に入手した第三者は有効期間中その送信の完了画面を取得できる ④印の集合が 200,000 件を超えた場合は最古から捨てる
+- 文書: `docs/ops/shindan_form_dedup.md`。コード: `shindan_form.py` 冒頭コメント BF-10／BF-11。テスト: `test_form_dup_1_fix7.py`。PR #327。
+
+### 2-6. FORM-DUP-1-fix8（BF-12・13・14）二重送信抑止の不変条件（Fable 裁定・2026-11-14） ── 原文あり（票 FORM-DUP-1-fix8）
+
+- 裁定（不変条件）: 「外部書込(kintone の create/update)を開始した後は、成功の記録か unknown の保持のどちらかで必ず終わる。予約の解放は、書込を開始していないことが確実な場合に限る。」
+- 確定失敗として解放してよいのは「kintone が明示的に拒否(4xx で本文が検証エラー)し書込が行われていないことが応答から確実な場合だけ。この場合のみ write_started を下ろす。5xx・通信例外・timeout・応答解析失敗(JSON 不正・id 欠落)・キャンセルはすべて unknown。」
+- 実装: `shindan_form.py` の `_NonceEntry.write_started`・`_definite_reject`（4xx かつ kintone のエラー code あり）・`_nonce_settle`（`_submit_with_nonce` の finally 1 か所・AST で pin）。linked 経路も同じ（unknown は不明ページ・token 予約も解放しない）。文書: `docs/ops/shindan_form_dedup.md` §1。テスト: `test_form_dup_1_fix8.py`。PR #327。
+
 ---
 
 ## 3. GATE-EXEMPT-FIX-1 ── 原文あり

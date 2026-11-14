@@ -87,6 +87,7 @@ class _FakeApp21:
         self.get_calls: list[str] = []
         self.conflict_next = 0
         self.create_fail_next = 0
+        self.create_fail_error = None   # FORM-DUP-1 fix7: 確定失敗（4xx）を模すときに差す（既定は 5xx＝結果不明）
 
     def add(self, rid, user_id=USER, revision="3", **filled):
         rec = {"$id": {"value": rid}, "$revision": {"value": revision},
@@ -138,7 +139,7 @@ class _FakeApp21:
         self.create_calls.append(dict(fields))
         if self.create_fail_next > 0:
             self.create_fail_next -= 1
-            raise hub_kintone.KintoneError(500, "GAIA_XX", "down")
+            raise self.create_fail_error or hub_kintone.KintoneError(500, "GAIA_XX", "down")
         self._id += 1
         rid = str(self._id)
         rec = {k: {"value": v} for k, v in fields.items()}
@@ -405,29 +406,43 @@ class _FormLinkBase(_DbBase):
         return self.client.post("/shindan", data=data, cookies={sf.LINK_COOKIE: token})
 
 
+_NONCE_INPUT_RE = re.compile(r'<input type="hidden" name="n" value="([^"]*)">')
+
+
+def _strip_nonce(html_text: str) -> str:
+    return _NONCE_INPUT_RE.sub("", html_text)
+
+
+def _nonce_of(html_text: str) -> str:
+    m = _NONCE_INPUT_RE.search(html_text)
+    return m.group(1) if m else ""
+
+
 class TestFormGet(_FormLinkBase):
     def test_T4_valid_k_same_html_plus_cookie(self):
         plain = self.client.get("/shindan")
         token = self.issue()
         resp = self.client.get("/shindan", params={"k": token})
         self.assertEqual(resp.status_code, 200)
-        self.assertEqual(resp.text, plain.text)                    # 表示 HTML は同一
+        # 表示 HTML は同一（FORM-DUP-1 fix1: 表示ごとに変わる送信操作 ID=hidden nonce を除く）
+        self.assertEqual(_strip_nonce(resp.text), _strip_nonce(plain.text))
+        self.assertNotEqual(_nonce_of(resp.text), _nonce_of(plain.text))
         self.assertEqual(resp.cookies.get(sf.LINK_COOKIE), token)
         self.assertIn("HttpOnly", resp.headers.get("set-cookie", ""))
         self.assertIn("Path=/shindan", resp.headers.get("set-cookie", ""))
         self.assertIsNone(plain.cookies.get(sf.LINK_COOKIE))
 
     def test_T4_invalid_expired_used_same_as_no_k(self):
-        plain = self.client.get("/shindan").text
+        plain = _strip_nonce(self.client.get("/shindan").text)   # FORM-DUP-1 fix1: nonce を除いて比較
         # 無効
         r = self.client.get("/shindan", params={"k": "nosuchtoken"})
-        self.assertEqual((r.status_code, r.text), (200, plain))
+        self.assertEqual((r.status_code, _strip_nonce(r.text)), (200, plain))
         self.assertIsNone(r.cookies.get(sf.LINK_COOKIE))
         # 期限切れ
         old = sl._now() - datetime.timedelta(days=31)
         expired = self.q(sl.issue(USER, now=old))
         r = self.client.get("/shindan", params={"k": expired})
-        self.assertEqual((r.status_code, r.text), (200, plain))
+        self.assertEqual((r.status_code, _strip_nonce(r.text)), (200, plain))
         self.assertIsNone(r.cookies.get(sf.LINK_COOKIE))
         # 使用済み
         used = self.issue()
@@ -435,7 +450,7 @@ class TestFormGet(_FormLinkBase):
         self.assertIsNotNone(claimed)
         self.assertTrue(self.q(sl.mark_used(used, claimed)))       # fix2: 自分の予約で確定
         r = self.client.get("/shindan", params={"k": used})
-        self.assertEqual((r.status_code, r.text), (200, plain))
+        self.assertEqual((r.status_code, _strip_nonce(r.text)), (200, plain))
         self.assertIsNone(r.cookies.get(sf.LINK_COOKIE))
         self.assertIn("link invalid head=nosu", self.cap.text())
         self.assertNotIn(used, self.cap.text())
@@ -466,10 +481,15 @@ class TestFormPostLinked(_FormLinkBase):
         self.assertNotIn("友だち追加", resp.text)
         self.assertIn(sf.PHOTO_ROUTE, resp.text)                    # 写真導線は残す
         self.assertIn("診断結果", resp.text)
-        # 使用済み token での再 POST は k なし扱い（受付番号経路）
+        # FORM-DUP-1 fix1 BF-03: 使用済み token での再 POST（nonce なし）は k なし経路へ
+        # 落とさず、固定の「送信済み」ページだけ（受付番号・診断結果・写真導線なし・書込なし）
         resp2 = self.post_linked(token)
         self.assertEqual(resp2.status_code, 200)
-        self.assertIn("受付番号", resp2.text)
+        self.assertNotIn("受付番号", resp2.text)
+        self.assertIn(sf.RESUBMIT_DONE_TEXT, resp2.text)
+        self.assertNotIn(sf.PHOTO_ROUTE, resp2.text)
+        self.assertEqual(self.fake.create_calls, [])
+        self.assertEqual(len(self.fake.update_calls), 1)
 
     def test_T5_query_k_also_accepted_and_all_filled_is_noop_success(self):
         self.fake.add("10", 問い合わせ業者名="a", 借入時期_テキスト="b",
@@ -538,17 +558,23 @@ class TestFormPostLinked(_FormLinkBase):
         self.assertIsNotNone(self.used_at(token))
         self.assertEqual(self.fake.val("10", "顧客名") if "顧客名" in self.fake.rows["10"] else "", "")
         self.assertEqual(self.fake.val("10", "診断パターン"), "A")
-        # 5xx（作成失敗）
+        # 5xx（作成失敗）→ FORM-DUP-1 fix8 BF-14: 書込開始後の 5xx は結果不明＝固定の不明ページ（409）・
+        # used_at なし・token 予約は解放しない（CLAIM_TTL_SEC で失効）・ERROR 1 行（従来は結果画面＋解放）
         self.cap.records.clear()
         self.fake.rows.clear()
         self.fake.create_fail_next = 1
         token2 = self.issue()
-        self.post_linked(token2)
+        resp2 = self.post_linked(token2)
+        self.assertEqual(resp2.status_code, 409)
+        self.assertIn(sf.UNKNOWN_TEXT, resp2.text)
+        self.assertNotIn("診断結果", resp2.text)
         self.assertIsNone(self.used_at(token2))
-        self.assertIsNone(self.claimed_at(token2))
+        self.assertIsNotNone(self.claimed_at(token2))
         self.assertEqual(len(self.cap.errors()), 1)
-        # 未使用のまま=再送可能
-        self.assertIsNotNone(self.q(sl.lookup(token2)))
+        self.assertIn("shindan_link_write_unknown", self.cap.errors()[0])
+        # 予約中のまま（既定の照合では無効・include_claimed では在る＝TTL 失効後に再び照合できる）
+        self.assertIsNone(self.q(sl.lookup(token2)))
+        self.assertIsNotNone(self.q(sl.lookup(token2, include_claimed=True)))
 
     def test_T7b_ambiguous_records_no_write(self):
         self.fake.add("10")
@@ -659,36 +685,39 @@ class TestFormPostLinked(_FormLinkBase):
             resp = self.post_linked(token)
         return token, resp, release_calls
 
-    def _assert_failure_page_and_release(self, token, resp, release_calls, exc_text):
-        self.assertEqual(resp.status_code, 200)
-        self.assertIn("診断結果", resp.text)
-        self.assertIn(sf.LINKED_DONE_TEXT, resp.text)                # 固定文言あり
+    def _assert_unknown_page_and_hold(self, token, resp, release_calls, exc_text):
+        # FORM-DUP-1 fix8 BF-13/BF-14: 外部書込を開始した後の未分類例外（JSON 解析失敗・KeyError）は
+        # 結果不明＝固定の不明ページ（409・従来の結果画面は返さない）・token 予約は解放しない・used_at なし・
+        # ERROR 1 行・例外は上位へ伝播しない（SLL-07 不変）・例外本文は漏れない
+        self.assertEqual(resp.status_code, 409)
+        self.assertIn(sf.UNKNOWN_TEXT, resp.text)
+        self.assertNotIn("診断結果", resp.text)
         self.assertNotIn("受付番号", resp.text)
         self.assertNotIn(sf.PHOTO_ROUTE, resp.text)                  # 写真導線なし
-        self.assertEqual(len(release_calls), 1)                      # release 呼出し 1 回
-        self.assertEqual(release_calls[0][0], token)
-        self.assertIsNone(self.claimed_at(token))
+        self.assertEqual(release_calls, [])                          # fix8: unknown では release しない
+        self.assertIsNotNone(self.claimed_at(token))
         self.assertIsNone(self.used_at(token))
         errs = self.cap.errors()
         self.assertEqual(len(errs), 1)
-        self.assertIn("shindan_link_write_failed", errs[0])
+        self.assertIn("shindan_link_write_unknown", errs[0])
         self.assertIn("head=" + token[:4], errs[0])
         for leak in (token, USER, NAME, exc_text, "Traceback"):
             self.assertNotIn(leak, errs[0])
             self.assertNotIn(leak, self.cap.text())
         self.notify_admin.assert_not_awaited()
         self.notify_biz.assert_not_awaited()
-        # 解放済み=再 POST で再試行できる
-        self.assertIsNotNone(self.q(sl.lookup(token)))
+        # 予約中のまま＝再送は busy（CLAIM_TTL_SEC 失効後に再び照合できる）・再作成されない
+        self.assertIsNone(self.q(sl.lookup(token)))
+        self.assertIsNotNone(self.q(sl.lookup(token, include_claimed=True)))
 
     def test_SLL07_json_decode_error_in_create_is_contained(self):
         exc = json.JSONDecodeError("Expecting value SECRET_MARK", "doc", 0)
         token, resp, calls = self._post_with_create_raising(exc)
-        self._assert_failure_page_and_release(token, resp, calls, "SECRET_MARK")
+        self._assert_unknown_page_and_hold(token, resp, calls, "SECRET_MARK")
 
     def test_SLL07_key_error_in_create_is_contained(self):
         token, resp, calls = self._post_with_create_raising(KeyError("id_SECRET_KEY"))
-        self._assert_failure_page_and_release(token, resp, calls, "id_SECRET_KEY")
+        self._assert_unknown_page_and_hold(token, resp, calls, "id_SECRET_KEY")
 
     def test_SLL07_success_path_does_not_release(self):
         token = self.issue()

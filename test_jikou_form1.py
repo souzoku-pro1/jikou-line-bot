@@ -15,7 +15,8 @@
   fake は _wrap 境界を模し {"value":…} 形は二重ラップとして fail）
 - 受付番号: secrets 乱数 6 桁ゼロ埋め・**一意制約違反と確認できた閉集合**
   （400/CB_VA01/errors["record.受付番号.value"]）のみ再採番（上限 5 回）・
-  結果不明（transport/5xx）は**即 unknown**=500+要確認（番号照会・同番号
+  結果不明（transport/5xx）は**即 unknown**=固定の「不明」ページ（409・FORM-DUP-1
+  fix7 BF-11。以前は 500）+要確認（番号照会・同番号
   再試行はしない=fix2 fix1-01: 別申込の既存レコードを今回の成功と誤認しない）・
   403 等の確定失敗は即 500+要確認・レコード番号流用禁止（fix1 01）
 - ゲート順序（fix1 04）: env→メソッド/別名→Content-Length（64KB）→レート
@@ -516,8 +517,10 @@ class TestWriteConvergence(_FormBase):
     既存レコードを今回の成功と誤認しない・同番号の create 再試行もしない
     （再試行の一意違反が今回の書込か別申込かを識別できないため）。"""
 
-    def _assert_unknown_500(self, resp, number: str, creditor: str):
-        self.assertEqual(resp.status_code, 500)
+    def _assert_unknown_page(self, resp, number: str, creditor: str):
+        # FORM-DUP-1 fix7 BF-11: 結果不明の初回応答は 500 の一般エラーではなく固定の「不明」ページ（409）
+        self.assertEqual(resp.status_code, 409)
+        self.assertIn(sf.UNKNOWN_TEXT, resp.text)
         self.assertNotIn("受付番号：", resp.text)          # 表示番号なし
         self.assertNotIn(number, resp.text)
         self.assertNotIn(creditor, resp.text)
@@ -544,7 +547,7 @@ class TestWriteConvergence(_FormBase):
         self.fake.transport_fail_next = 1
         with patch.object(sf, "_draw_number", return_value="424242"):
             resp = self.post(creditor="今回の債権者")
-        self._assert_unknown_500(resp, "424242", "今回の債権者")
+        self._assert_unknown_page(resp, "424242", "今回の債権者")
         self.assertEqual(len(self.fake.rows), 1)           # 別申込の行のみ
         self.assertEqual(self.fake.rows["100"]["問い合わせ業者名"]["value"],
                          "別申込の債権者")                 # 上書きもしない
@@ -566,7 +569,7 @@ class TestWriteConvergence(_FormBase):
         with patch.object(sf.hub_kintone, "create_record", _create), \
                 patch.object(sf, "_draw_number", return_value="313131"):
             resp = self.post(creditor="今回の債権者")
-        self._assert_unknown_500(resp, "313131", "今回の債権者")
+        self._assert_unknown_page(resp, "313131", "今回の債権者")
         self.assertEqual(list(self.fake.rows), ["200"])
 
     def test_landed_transport_error_is_unknown_not_created(self):
@@ -575,7 +578,7 @@ class TestWriteConvergence(_FormBase):
         self.fake.landed_fail_next = 1
         with patch.object(sf, "_draw_number", return_value="515151"):
             resp = self.post(creditor="今回の債権者")
-        self._assert_unknown_500(resp, "515151", "今回の債権者")
+        self._assert_unknown_page(resp, "515151", "今回の債権者")
         self.assertEqual(len(self.fake.rows), 1)
 
     def test_server_5xx_is_unknown_no_retry(self):
@@ -586,7 +589,7 @@ class TestWriteConvergence(_FormBase):
             resp = self.post(creditor="秘匿すべき債権者名")
         self.assertEqual(create.await_count, 1)
         self.fake.create_calls.append({})                  # helper 用の件数合わせ
-        self._assert_unknown_500(resp, "616161", "秘匿すべき債権者名")
+        self._assert_unknown_page(resp, "616161", "秘匿すべき債権者名")
 
     def test_lookup_and_retry_paths_removed(self):
         self.assertFalse(hasattr(sf, "_lookup_by_number"))
