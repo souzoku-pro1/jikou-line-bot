@@ -137,6 +137,12 @@
 - 既知の制約（裁定済み・直さない）: ①プロセス再起動で鍵と記憶が消え、旧 nonce は署名不正＝新規扱い ②単一 worker・メモリ内保持が前提 ③nonce を実際に入手した第三者は有効期間中その送信の完了画面を取得できる ④印の集合が 200,000 件を超えた場合は最古から捨てる
 - 文書: `docs/ops/shindan_form_dedup.md`。コード: `shindan_form.py` 冒頭コメント BF-10／BF-11。テスト: `test_form_dup_1_fix7.py`。PR #327。
 
+### 2-6. FORM-DUP-1-fix8（BF-12・13・14）二重送信抑止の不変条件（Fable 裁定・2026-11-14） ── 原文あり（票 FORM-DUP-1-fix8）
+
+- 裁定（不変条件）: 「外部書込(kintone の create/update)を開始した後は、成功の記録か unknown の保持のどちらかで必ず終わる。予約の解放は、書込を開始していないことが確実な場合に限る。」
+- 確定失敗として解放してよいのは「kintone が明示的に拒否(4xx で本文が検証エラー)し書込が行われていないことが応答から確実な場合だけ。この場合のみ write_started を下ろす。5xx・通信例外・timeout・応答解析失敗(JSON 不正・id 欠落)・キャンセルはすべて unknown。」
+- 実装: `shindan_form.py` の `_NonceEntry.write_started`・`_definite_reject`（4xx かつ kintone のエラー code あり）・`_nonce_settle`（`_submit_with_nonce` の finally 1 か所・AST で pin）。linked 経路も同じ（unknown は不明ページ・token 予約も解放しない）。文書: `docs/ops/shindan_form_dedup.md` §1。テスト: `test_form_dup_1_fix8.py`。PR #327。
+
 ---
 
 ## 3. GATE-EXEMPT-FIX-1 ── 原文あり

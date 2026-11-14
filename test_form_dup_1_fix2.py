@@ -209,20 +209,20 @@ class TestAtomicReservation(_Base):
             self.assertFalse(owned2)
             self.assertIs(e1, e2)                                    # 既存の予約を上書きしない
             self.assertEqual(e1.sig, ("a",))
-            # 他人の entry での解放は現在の予約を外さない
+            # 他人の entry での解放は現在の予約を外さない（fix8: 後始末は _nonce_settle に一本化）
             foreign = sf._NonceEntry(sf.time.time(), ("x",))
-            sf._nonce_release(n, foreign)
+            sf._nonce_settle(n, foreign)
             self.assertIs(sf._nonce_results[n], e1)
             self.assertTrue(foreign.event.is_set())
-            # 自分の予約を結果なしで解放 → 外れる・待機側が起きる
-            sf._nonce_release(n, e1)
+            # 自分の予約を結果なし・書込未開始で後始末 → 解放（外れる）・待機側が起きる
+            sf._nonce_settle(n, e1)
             self.assertNotIn(n, sf._nonce_results)
             self.assertTrue(e1.event.is_set())
             # 結果ありの解放は残す
             e3, owned3 = await sf._nonce_reserve(n, ("c",), sf.time.time())
             self.assertTrue(owned3)
             e3.result = ("plain", "9", "000009", "A")
-            sf._nonce_release(n, e3)
+            sf._nonce_settle(n, e3)
             self.assertIs(sf._nonce_results[n], e3)
             # 期限切れの結果は捨てて新規に予約
             e3.ts -= sf.NONCE_TTL_SEC + 1

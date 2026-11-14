@@ -51,6 +51,25 @@ fix1（R-JIKOU-FORM-1 01〜04）:
   を通過した後にのみ body を読む。body は urlencoded のみ自前解析
   （starlette の FormParser/MultiPartParser を呼ばない=一時ファイル化なし）。
   別名（末尾スラッシュ・%2F・配下パス）は明示 catch-all route で 404（307 なし）
+
+FORM-DUP-1-fix8（Codex R-FD1-fix7 BF-12・BF-13・BF-14）: 不変条件を 1 か所で保証する。
+- 不変条件（Fable 裁定）: 「外部書込（kintone の create/update）を開始した後は、成功の記録か
+  unknown の保持のどちらかで必ず終わる。予約の解放は、書込を開始していないことが確実な場合に限る。」
+- 予約オブジェクト（_NonceEntry）に write_started を持たせ、外部書込の呼出の直前（同期・await なし）
+  に立てる。plain（_persist_with_number）・linked（_handle_submit_linked／_update_existing_linked）
+  の両経路で同じ予約オブジェクトを使う。nonce なしの送信も表に載せない局所の予約で同じ規則に乗せる。
+- 成功時は書込が返った直後（通知・ログ・mark_used・写真トークン発行など他の await より前）に
+  結果を予約へ同期で記録する。
+- 予約の後始末は _submit_with_nonce の finally の _nonce_settle 1 か所だけ: 結果記録済み → そのまま／
+  write_started かつ結果なし → unknown として保持（例外の種類・キャンセル・未分類例外を問わない）／
+  write_started でない → 解放。各経路の _hold_unknown・_nonce_release は撤去。
+- 確定失敗（解放してよい）は kintone が明示的に拒否し書込が行われていないことが応答から確実な場合だけ
+  （_definite_reject: 4xx かつ本文が kintone のエラー JSON として解析できて code を持つ）。この場合のみ
+  write_started を下ろす。5xx・通信例外・timeout・応答解析失敗（JSON 不正・id 欠落）・4xx でも code
+  なし・キャンセルはすべて unknown。
+- linked 経路（BF-14）も同じ: 作成成功後の mark_used 失敗でも結果は記録済みなので再作成されない。
+  unknown では plain と同じ不明ページ（409・従来の結果画面を返さない）。token 予約（SLL-02）も
+  unknown では解放しない（CLAIM_TTL_SEC で失効）。
 """
 
 import asyncio
@@ -171,17 +190,23 @@ _RESUBMIT_COMPARE_FIELDS = _LINKED_UPDATE_FIELDS
 
 
 class _NonceEntry:
-    """nonce ごとの 1 回目の送信: 処理中は result=None（後続は event を待つ）。
+    """nonce ごとの 1 回目の送信（＝予約オブジェクト）: 処理中は result=None（後続は event を待つ）。
     result=("plain", record_id, 受付番号, pattern)／("linked", record_id, "", pattern)／
     ("unknown", "", 受付番号, pattern)（BF-11: 書込結果不明・解放せず 24 時間保持・容量退避なし）。
-    sig は照合欄の SHA-256 の組（生値は持たない）。"""
-    __slots__ = ("ts", "event", "result", "sig")
+    sig は照合欄の SHA-256 の組（生値は持たない）。
+    fix8: write_started は外部書込（kintone create/update）の呼出直前に同期で立てる印。確定失敗
+    （kintone の明示的拒否＝書込なしが応答から確実）のときだけ下ろす。number／pattern は不明保持の
+    記録用（受付番号は plain のみ・pattern は予約時に入れる）。後始末は _nonce_settle の 1 か所。"""
+    __slots__ = ("ts", "event", "result", "sig", "write_started", "number", "pattern")
 
     def __init__(self, ts: float, sig: tuple):
         self.ts = ts
         self.event = asyncio.Event()
         self.result: tuple[str, str, str, str] | None = None
         self.sig = sig
+        self.write_started = False
+        self.number = ""
+        self.pattern = ""
 
 
 _nonce_results: "OrderedDict[str, _NonceEntry]" = OrderedDict()
@@ -308,34 +333,59 @@ def _is_unique_violation(e: hub_kintone.KintoneError) -> bool:
             and UNIQUE_VIOLATION_ERROR_KEY in (getattr(e, "errors", None) or {}))
 
 
+def _definite_reject(e: hub_kintone.KintoneError) -> bool:
+    """fix8（BF-13）: kintone が明示的に拒否し、書込が行われていないことが応答から確実な場合だけ True。
+    条件: 4xx で、本文が kintone のエラー JSON として解析できて code を持つ（検証エラー CB_VA01・
+    権限 GAIA_AP15・不存在 GAIA_RE01・revision 競合 GAIA_CO02 等＝kintone 自身の拒否）。
+    5xx・transport 例外（status 0）・4xx でも本文を解析できない（code なし＝proxy 等の応答の可能性）
+    ものは False＝結果不明（書込が着いた可能性を否定できない）。"""
+    return 400 <= e.status < 500 and bool(e.code)
+
+
 def _classify_create_error(e: hub_kintone.KintoneError) -> str:
     """create 失敗の三分類:
     duplicate=一意制約違反（確定・再採番可）／
-    unknown=結果不明（transport 例外=status 0・5xx=書込が着いた可能性あり）／
-    failed=確定失敗（上記以外の 4xx: 403・401・404・他欄の CB_VA01 等）"""
+    failed=確定失敗（_definite_reject: 4xx かつ kintone のエラー code あり。403・401・404・他欄の CB_VA01 等）／
+    unknown=結果不明（transport 例外=status 0・5xx・code の無い 4xx＝書込が着いた可能性あり・fix8）"""
     if _is_unique_violation(e):
         return "duplicate"
-    if e.status == 0 or e.status >= 500:
-        return "unknown"
-    return "failed"
+    if _definite_reject(e):
+        return "failed"
+    return "unknown"
 
 
-async def _persist_with_number(fields_base: dict, number: str) -> tuple[str, str]:
+async def _persist_with_number(fields_base: dict, number: str,
+                               resv: "_NonceEntry | None" = None) -> tuple[str, str]:
     """受付番号を付けて 1 回だけ create を送る。戻り値 (outcome, record_id):
     created=保存確定／duplicate=一意制約違反（確定・再採番可）／
     failed=確定失敗／unknown=結果不明（レコードの有無を確定できない）。
 
     fix2: unknown に対する番号照会・同番号再試行は行わない（番号一致では
-    今回の書込か別申込の既存レコードかを識別できないため=fail-closed）。"""
+    今回の書込か別申込の既存レコードかを識別できないため=fail-closed）。
+    fix8: resv（予約オブジェクト）があれば、create の呼出直前に write_started を同期で立て、
+    確定失敗（_definite_reject）のときだけ下ろす。成功は書込が返った直後に resv.result へ同期で記録
+    （通知・ログ等の await より前）。応答解析失敗（JSON 不正・id 欠落）等の未分類例外は結果不明
+    （書込は開始済み・write_started は立ったまま → _nonce_settle が unknown として保持）。"""
     fields = {**fields_base, _NUMBER_FIELD: number}
+    if resv is not None:
+        resv.number = number
+        resv.write_started = True
     try:
-        return "created", await hub_kintone.create_record(APP_JIKOU_CASE, fields)
+        record_id = await hub_kintone.create_record(APP_JIKOU_CASE, fields)
     except hub_kintone.KintoneError as e:
         kind = _classify_create_error(e)
+        if kind != "unknown" and resv is not None:
+            resv.write_started = False                   # 明示的拒否＝書込なしが確実
         logger.warning("[SHINDAN] create failed kind=%s code=%s",
                        emit(kind, "freetext", "log", "operator"),
                        emit(e.code, "vendor_raw", "log", "operator"))
         return kind, ""
+    except Exception:
+        logger.warning("[SHINDAN] create failed kind=unknown (unparsable response)")
+        return "unknown", ""
+    if resv is not None:
+        resv.result = ("plain", record_id, number, resv.pattern)
+    return "created", record_id
 
 
 # ── クライアント IP の導出（02: 信頼済み proxy ヘッダのみ） ───────────────────────
@@ -956,12 +1006,25 @@ async def _nonce_reserve(nonce: str, sig: tuple, now: float) -> tuple[_NonceEntr
         return entry, False
 
 
-def _nonce_release(nonce: str, entry: _NonceEntry) -> None:
-    """自分の予約（entry の同一性＝予約 ID）だけを扱う: 結果が無ければ辞書から外し
-    （確定失敗した 1 本目は後続を妨げない）、結果（plain／linked／unknown）があれば残す。
-    待っている側を起こす。BF-11: 不明は result に入っているので解放されない。"""
-    if entry.result is None and _nonce_results.get(nonce) is entry:
-        _nonce_results.pop(nonce, None)
+def _nonce_settle(nonce: str, entry: _NonceEntry) -> None:
+    """fix8: 予約の後始末の唯一の場所（_submit_with_nonce の finally からだけ呼ぶ・同期）。不変条件:
+    「外部書込を開始した後は、成功の記録か unknown の保持のどちらかで必ず終わる。予約の解放は、
+    書込を開始していないことが確実な場合に限る。」
+    - 結果記録済み（plain／linked）→ そのまま残す
+    - write_started かつ結果なし → unknown として保持（解放しない・例外の種類・キャンセル・未分類例外を
+      問わない）。WARNING 1 行（保持中の不明件数のみ・定数）
+    - write_started でない → 解放（自分の予約＝entry の同一性のときだけ辞書から外す。確定失敗・
+      書込前の失敗・使用済み token の固定ページ等）
+    待っている側を起こす。nonce なしの局所予約（表に無い）も同じ規則（解放は no-op）。"""
+    if entry.result is None:
+        if entry.write_started:
+            entry.result = ("unknown", "", entry.number, entry.pattern)
+            held = sum(1 for e in _nonce_results.values()
+                       if e.result is not None and e.result[0] == "unknown")
+            logger.warning("[SHINDAN] write result unknown (held, no retry) count=%s",
+                           emit(held, "count", "log", "operator"))
+        elif _nonce_results.get(nonce) is entry:
+            _nonce_results.pop(nonce, None)
     entry.event.set()
 
 
@@ -981,19 +1044,8 @@ def _stale_page() -> HTMLResponse:
 
 def _unknown_page() -> HTMLResponse:
     """BF-11: 書込結果が不明。固定ページ（409・作成 0・採番なし・再送信しない案内・入力値の反射なし）。
-    初回も同じ nonce の再 POST も同じページ。"""
+    初回も同じ nonce の再 POST も同じページ。fix8 BF-14: linked 経路の不明も同じページ。"""
     return _fixed_page(UNKNOWN_TITLE, UNKNOWN_TEXT, 409)
-
-
-def _hold_unknown(entry: "_NonceEntry | None", number: str, pattern: str) -> None:
-    """BF-11: 自分の予約を「不明」として残す（解放しない＝取り直しを許さない・24 時間保持）。
-    WARNING 1 行（保持中の不明件数のみ・定数）。"""
-    if entry is not None and entry.result is None:
-        entry.result = ("unknown", "", number, pattern)
-    held = sum(1 for e in _nonce_results.values()
-               if e.result is not None and e.result[0] == "unknown")
-    logger.warning("[SHINDAN] write result unknown (held, no retry) count=%s",
-                   emit(held, "count", "log", "operator"))
 
 
 def _store_full_page() -> HTMLResponse:
@@ -1013,30 +1065,38 @@ async def _submit_with_nonce(resolve, pattern: str, fields_base: dict, nonce: st
     BF-09: state="stale"（署名は正しいが発行から 24 時間超）は予約も照合もせず固定ページ（410・
     作成 0・採番なし）。有効（"ok"）なら経過時間にかかわらず上記をそのまま適用する。
     BF-10: 作成済みの印だけが残る nonce は予約せず「送信済み」ページ。BF-11: 予約者の書込結果が
-    不明なら予約は解放されず、待っていた側も同じ nonce の再 POST も固定の「不明」ページ。"""
+    不明なら予約は解放されず、待っていた側も同じ nonce の再 POST も固定の「不明」ページ。
+    fix8: 予約の後始末（結果記録済み → そのまま／write_started かつ結果なし → unknown 保持／
+    write_started でない → 解放）は下の finally の _nonce_settle 1 か所だけ。nonce なしの送信も
+    表に載せない局所の予約オブジェクトで同じ規則に乗せる（不明ページ・WARNING は同じ）。"""
     if state == "stale":
         return _stale_page()
-    if not nonce or state == "none":
-        return await _submit_resolved(await resolve(), pattern, fields_base, None)
     sig = _content_sig(pattern, fields_base)
-    for _attempt in range(_NONCE_RESERVE_RETRIES):
-        entry, owned = await _nonce_reserve(nonce, sig, time.time())
-        if entry is None:
-            return _store_full_page()                   # BF-06: 予約拒否（固定ページ・作成 0）
-        if owned:
-            try:
-                return await _submit_resolved(await resolve(), pattern, fields_base, entry)
-            finally:
-                _nonce_release(nonce, entry)
-        if entry.result is None:
-            try:
-                await asyncio.wait_for(entry.event.wait(), _NONCE_WAIT_SEC)
-            except asyncio.TimeoutError:
-                return _pending_page()
-        if entry.result is not None:
-            return _same_submission_page(entry, pattern, fields_base)
-        # 予約者が失敗して解放した → 取り直す
-    return _pending_page()
+    if not nonce or state == "none":
+        nonce = ""
+        entry = _NonceEntry(time.time(), sig)          # 局所の予約（表に載せない・書込状態の追跡のみ）
+    else:
+        for _attempt in range(_NONCE_RESERVE_RETRIES):
+            entry, owned = await _nonce_reserve(nonce, sig, time.time())
+            if entry is None:
+                return _store_full_page()               # BF-06: 予約拒否（固定ページ・作成 0）
+            if owned:
+                break
+            if entry.result is None:
+                try:
+                    await asyncio.wait_for(entry.event.wait(), _NONCE_WAIT_SEC)
+                except asyncio.TimeoutError:
+                    return _pending_page()
+            if entry.result is not None:
+                return _same_submission_page(entry, pattern, fields_base)
+            # 予約者が書込前に失敗して解放した → 取り直す
+        else:
+            return _pending_page()
+    entry.pattern = pattern
+    try:
+        return await _submit_resolved(await resolve(), pattern, fields_base, entry)
+    finally:
+        _nonce_settle(nonce, entry)
 
 
 def _same_submission_page(hit: _NonceEntry, pattern: str, fields_base: dict) -> HTMLResponse:
@@ -1067,8 +1127,8 @@ def _same_submission_page(hit: _NonceEntry, pattern: str, fields_base: dict) -> 
 
 async def _submit_new(pattern: str, fields_base: dict, link: dict | None,
                       entry: "_NonceEntry | None"):
-    """新規の送信として処理（紐付け経路／k なし経路）。entry（自分の予約）があれば成功
-    （created／updated／noop）の結果だけを残す。予約の解放は呼び出し側（_submit_with_nonce）。"""
+    """新規の送信として処理（紐付け経路／k なし経路）。entry（自分の予約）に外部書込の開始と
+    成功の結果を同期で記録する。後始末（解放・不明保持）は呼び出し側 _submit_with_nonce の finally。"""
     if link is not None:
         # SHINDAN-LINE-LINK-1 E: 本人専用リンク経由（k なしの経路は以下不変）
         return await _handle_submit_linked(pattern, fields_base, link, entry)
@@ -1403,25 +1463,18 @@ async def _handle_submit(form: dict[str, str], link: dict | None = None, nonce: 
 async def _handle_submit_plain(pattern: str, fields_base: dict,
                                entry: _NonceEntry | None = None):
     """k なし経路（受付番号発行）。entry（FORM-DUP-1 fix1: 同じ nonce の 1 回目）が
-    あれば作成成功時に結果を残す（同じ nonce の再 POST へ同じ完了画面を返すため）。
-    BF-11: 結果不明（unknown・書込中のキャンセル含む）は entry を「不明」として残し（解放しない）
-    固定の「不明」ページ（409）。確定失敗（failed）と再採番上限は従来どおり 500（予約は解放）。"""
+    あれば _persist_with_number が書込直前に write_started を立て、成功を同期で記録する。
+    BF-11: 結果不明（unknown）は固定の「不明」ページ（409）。確定失敗（failed）と再採番上限は従来どおり
+    500。fix8: 予約の解放・不明保持はここでは行わない（_submit_with_nonce の finally の 1 か所。
+    書込中のキャンセル・未分類例外も write_started が立っていればそこで unknown として保持される）。"""
     number = ""
     record_id = ""
     outcome = "duplicate"
     for _attempt in range(_NUMBER_ATTEMPTS):
         number = _draw_number()
-        try:
-            outcome, record_id = await _persist_with_number(fields_base, number)
-        except asyncio.CancelledError:
-            # BF-11: 外部書込を開始した後のキャンセルは結果不明。予約を解放せず「不明」として
-            # 残してから伝播する（要確認通知は送らない＝通知は増やさない・ログに残す）
-            _hold_unknown(entry, number, pattern)
-            raise
+        outcome, record_id = await _persist_with_number(fields_base, number, entry)
         if outcome != "duplicate":
             break                      # created / failed / unknown は再採番しない
-    if outcome == "created" and entry is not None:
-        entry.result = ("plain", record_id, number, pattern)
     if outcome != "created":
         # 保存できていない（failed）／有無不明（unknown）／再採番上限（duplicate）
         # → 要確認通知（受付番号を含め弁護士が App 21 と突合できる・既存の 1 箇所）
@@ -1435,9 +1488,8 @@ async def _handle_submit_plain(pattern: str, fields_base: dict,
             throttle_key="shindan_numbering",
         )
         if outcome == "unknown":
-            _hold_unknown(entry, number, pattern)        # BF-11: 解放せず保持 → 固定ページ（409）
-            return _unknown_page()
-        return _error_500()                              # 確定失敗・再採番上限は従来どおり
+            return _unknown_page()                       # BF-11: 固定ページ（409）。保持は finally
+        return _error_500()                              # 確定失敗・再採番上限は従来どおり（解放）
 
     logger.info("[SHINDAN] record created record_id=%s pattern=%s",
                 emit(record_id, "record_id", "log", "operator"),
@@ -1467,9 +1519,13 @@ def _v(record: dict, code: str) -> str:
     return str(((record or {}).get(code) or {}).get("value") or "").strip()
 
 
-async def _update_existing_linked(record: dict, values: dict) -> tuple[str, str]:
+async def _update_existing_linked(record: dict, values: dict,
+                                  resv: "_NonceEntry | None" = None) -> tuple[str, str]:
     """E-1: 空欄のみ・$revision CAS・409 は再取得 1 回。戻り値 (outcome, record_id)。
-    outcome: updated / noop / unconverged / failed。"""
+    outcome: updated / noop / unconverged / failed / unknown（fix8）。
+    fix8: update の呼出直前に resv.write_started を同期で立て、kintone の明示的拒否（_definite_reject:
+    revision 競合・検証エラー等）のときだけ下ろす。5xx・通信例外・code の無い 4xx は unknown
+    （write_started のまま＝呼び出し側の finally が不明として保持）。"""
     rid = _v(record, "$id")
     latest = record
     for attempt in range(_LINKED_CAS_REFETCH + 1):
@@ -1478,11 +1534,19 @@ async def _update_existing_linked(record: dict, values: dict) -> tuple[str, str]
                     and not _v(latest, c)}
         if not to_write:
             return "noop", rid
+        if resv is not None:
+            resv.write_started = True
         try:
             await hub_kintone.update_record(
                 APP_JIKOU_CASE, rid, to_write, revision=_v(latest, "$revision") or None)
             return "updated", rid
-        except hub_kintone.KintoneConflict:
+        except hub_kintone.KintoneError as e:
+            if not _definite_reject(e):
+                return "unknown", rid                    # 書込が着いた可能性あり → 結果不明
+            if resv is not None:
+                resv.write_started = False               # 明示的拒否＝書込なしが確実
+            if not isinstance(e, hub_kintone.KintoneConflict):
+                return "failed", rid
             # fix2 SLL-05: 再取得は 1 回だけ（初回 409→再取得→再試行。再試行も 409 なら
             # 再取得せず直ちに unconverged）
             if attempt >= _LINKED_CAS_REFETCH:
@@ -1491,8 +1555,6 @@ async def _update_existing_linked(record: dict, values: dict) -> tuple[str, str]
                 latest = await hub_kintone.get_record(APP_JIKOU_CASE, rid)
             except hub_kintone.KintoneError:
                 return "failed", rid
-        except hub_kintone.KintoneError:
-            return "failed", rid
     return "unconverged", rid
 
 
@@ -1515,35 +1577,53 @@ async def _handle_submit_linked(pattern: str, fields_base: dict, link: dict,
     # fix3 SLL-07: 予約取得後の「本人レコード検索→書込/作成→used_at 確定」は
     # try/except/finally で囲み、KintoneError 以外（JSON 解析失敗・KeyError・TypeError
     # 等）も含めて例外を上位へ伝播させない。used_at を確定できなかった経路は finally で
-    # 必ず自分の予約を解放する（SLL-06: release は自予約時刻を渡す）
+    # 自分の予約を解放する（SLL-06: release は自予約時刻を渡す）
+    # fix8 BF-14: 外部書込の呼出直前に entry.write_started を同期で立て、成功は書込が返った直後
+    # （mark_used より前）に entry.result へ同期で記録する。結果不明（5xx・通信例外・code の無い 4xx・
+    # 書込開始後の未分類例外）は token 予約を解放せず（CLAIM_TTL_SEC で失効）不明ページ。
+    # nonce 予約の解放・不明保持はここでは行わない（_submit_with_nonce の finally の 1 か所）
     outcome, record_id = "failed", ""
     used_marked = False
     try:
         # 本人のレコード特定は hub 側（LINEユーザーID 検索 limit 2・ちょうど 1 件）
         record, method = await shindan_link.find_user_record(APP_JIKOU_CASE, line_user_id)
         if method == "found":
-            outcome, record_id = await _update_existing_linked(record, fields_base)
+            outcome, record_id = await _update_existing_linked(record, fields_base, entry)
         elif method == "none":
             # E-2: 現状のフォーム保存と同じレコード + LINEユーザーID（受付番号は発行しない）
+            if entry is not None:
+                entry.write_started = True
             try:
                 record_id = await hub_kintone.create_record(
                     APP_JIKOU_CASE, {**fields_base, "LINEユーザーID": line_user_id})
                 outcome = "created"
             except hub_kintone.KintoneError as e:
-                logger.warning("[SHINDAN] linked create failed code=%s",
+                outcome = "failed" if _definite_reject(e) else "unknown"
+                if outcome == "failed" and entry is not None:
+                    entry.write_started = False          # 明示的拒否＝書込なしが確実
+                logger.warning("[SHINDAN] linked create failed kind=%s code=%s",
+                               emit(outcome, "freetext", "log", "operator"),
                                emit(e.code, "vendor_raw", "log", "operator"))
-                outcome = "failed"
         if outcome in ("updated", "noop", "created"):
+            if entry is not None:
+                entry.result = ("linked", record_id, "", pattern)   # 書込直後・mark_used より前に同期で記録
             used_marked = bool(await shindan_link.mark_used(token, claimed_at))
     except Exception:
         # 例外本文は載せない（固定理由のみ・下の ERROR 1 行に集約）
         used_marked = False
     finally:
-        if not used_marked:
+        if entry is not None and entry.write_started and entry.result is None:
+            outcome = "unknown"          # 書込開始後に結果が無い（5xx・通信例外・未分類例外・キャンセル）
+        if not used_marked and outcome != "unknown":     # unknown では token 予約も解放しない
             try:
                 await shindan_link.release(token, claimed_at)
             except Exception:
                 logger.warning("[SHINDAN] link claim not released (ttl fallback)")
+    if outcome == "unknown":
+        # BF-14: 従来の結果画面（判定結果のみ）は返さない。plain と同じ固定の不明ページ・ERROR 1 行
+        logger.error("[SHINDAN] shindan_link_write_unknown head=%s",
+                     emit(shindan_link.token_head(token), "record_id", "log", "operator"))
+        return _unknown_page()
     if not used_marked:
         # E-3: used_at は打たない・判定結果のみ（固定文言あり・受付番号なし・写真導線
         # なし）・ERROR 1 行（固定理由+token 先頭 4 文字・PII なし）
@@ -1554,8 +1634,6 @@ async def _handle_submit_linked(pattern: str, fields_base: dict, link: dict,
     logger.info("[SHINDAN] linked write ok record_id=%s pattern=%s",
                 emit(record_id, "record_id", "log", "operator"),
                 emit(pattern, "freetext", "log", "operator"))
-    if entry is not None:
-        entry.result = ("linked", record_id, "", pattern)   # FORM-DUP-1 fix1: 同じ nonce の再 POST 用
     attorney_id = os.environ.get("ATTORNEY_LINE_USER_ID", "")
     if attorney_id:
         sent = await notify.notify_business(

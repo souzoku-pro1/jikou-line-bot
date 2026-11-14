@@ -558,17 +558,23 @@ class TestFormPostLinked(_FormLinkBase):
         self.assertIsNotNone(self.used_at(token))
         self.assertEqual(self.fake.val("10", "顧客名") if "顧客名" in self.fake.rows["10"] else "", "")
         self.assertEqual(self.fake.val("10", "診断パターン"), "A")
-        # 5xx（作成失敗）
+        # 5xx（作成失敗）→ FORM-DUP-1 fix8 BF-14: 書込開始後の 5xx は結果不明＝固定の不明ページ（409）・
+        # used_at なし・token 予約は解放しない（CLAIM_TTL_SEC で失効）・ERROR 1 行（従来は結果画面＋解放）
         self.cap.records.clear()
         self.fake.rows.clear()
         self.fake.create_fail_next = 1
         token2 = self.issue()
-        self.post_linked(token2)
+        resp2 = self.post_linked(token2)
+        self.assertEqual(resp2.status_code, 409)
+        self.assertIn(sf.UNKNOWN_TEXT, resp2.text)
+        self.assertNotIn("診断結果", resp2.text)
         self.assertIsNone(self.used_at(token2))
-        self.assertIsNone(self.claimed_at(token2))
+        self.assertIsNotNone(self.claimed_at(token2))
         self.assertEqual(len(self.cap.errors()), 1)
-        # 未使用のまま=再送可能
-        self.assertIsNotNone(self.q(sl.lookup(token2)))
+        self.assertIn("shindan_link_write_unknown", self.cap.errors()[0])
+        # 予約中のまま（既定の照合では無効・include_claimed では在る＝TTL 失効後に再び照合できる）
+        self.assertIsNone(self.q(sl.lookup(token2)))
+        self.assertIsNotNone(self.q(sl.lookup(token2, include_claimed=True)))
 
     def test_T7b_ambiguous_records_no_write(self):
         self.fake.add("10")
@@ -679,36 +685,39 @@ class TestFormPostLinked(_FormLinkBase):
             resp = self.post_linked(token)
         return token, resp, release_calls
 
-    def _assert_failure_page_and_release(self, token, resp, release_calls, exc_text):
-        self.assertEqual(resp.status_code, 200)
-        self.assertIn("診断結果", resp.text)
-        self.assertIn(sf.LINKED_DONE_TEXT, resp.text)                # 固定文言あり
+    def _assert_unknown_page_and_hold(self, token, resp, release_calls, exc_text):
+        # FORM-DUP-1 fix8 BF-13/BF-14: 外部書込を開始した後の未分類例外（JSON 解析失敗・KeyError）は
+        # 結果不明＝固定の不明ページ（409・従来の結果画面は返さない）・token 予約は解放しない・used_at なし・
+        # ERROR 1 行・例外は上位へ伝播しない（SLL-07 不変）・例外本文は漏れない
+        self.assertEqual(resp.status_code, 409)
+        self.assertIn(sf.UNKNOWN_TEXT, resp.text)
+        self.assertNotIn("診断結果", resp.text)
         self.assertNotIn("受付番号", resp.text)
         self.assertNotIn(sf.PHOTO_ROUTE, resp.text)                  # 写真導線なし
-        self.assertEqual(len(release_calls), 1)                      # release 呼出し 1 回
-        self.assertEqual(release_calls[0][0], token)
-        self.assertIsNone(self.claimed_at(token))
+        self.assertEqual(release_calls, [])                          # fix8: unknown では release しない
+        self.assertIsNotNone(self.claimed_at(token))
         self.assertIsNone(self.used_at(token))
         errs = self.cap.errors()
         self.assertEqual(len(errs), 1)
-        self.assertIn("shindan_link_write_failed", errs[0])
+        self.assertIn("shindan_link_write_unknown", errs[0])
         self.assertIn("head=" + token[:4], errs[0])
         for leak in (token, USER, NAME, exc_text, "Traceback"):
             self.assertNotIn(leak, errs[0])
             self.assertNotIn(leak, self.cap.text())
         self.notify_admin.assert_not_awaited()
         self.notify_biz.assert_not_awaited()
-        # 解放済み=再 POST で再試行できる
-        self.assertIsNotNone(self.q(sl.lookup(token)))
+        # 予約中のまま＝再送は busy（CLAIM_TTL_SEC 失効後に再び照合できる）・再作成されない
+        self.assertIsNone(self.q(sl.lookup(token)))
+        self.assertIsNotNone(self.q(sl.lookup(token, include_claimed=True)))
 
     def test_SLL07_json_decode_error_in_create_is_contained(self):
         exc = json.JSONDecodeError("Expecting value SECRET_MARK", "doc", 0)
         token, resp, calls = self._post_with_create_raising(exc)
-        self._assert_failure_page_and_release(token, resp, calls, "SECRET_MARK")
+        self._assert_unknown_page_and_hold(token, resp, calls, "SECRET_MARK")
 
     def test_SLL07_key_error_in_create_is_contained(self):
         token, resp, calls = self._post_with_create_raising(KeyError("id_SECRET_KEY"))
-        self._assert_failure_page_and_release(token, resp, calls, "id_SECRET_KEY")
+        self._assert_unknown_page_and_hold(token, resp, calls, "id_SECRET_KEY")
 
     def test_SLL07_success_path_does_not_release(self):
         token = self.issue()

@@ -187,7 +187,7 @@ class TestEvictionExcludesInflight(_Base):
             self.assertIs(sf._nonce_results[n2], e2)
             self.assertEqual(len(_Counting.made), made_before)       # 拒否ではエントリを作らない
             e1.result = ("plain", "1", "000001", "A")                # 1 件確定 → 次は入れる
-            sf._nonce_release(n1, e1)
+            sf._nonce_settle(n1, e1)                                 # fix8: 後始末は _nonce_settle
             e3b, owned3b = await sf._nonce_reserve(n3, (), now)
             self.assertTrue(owned3b)
             self.assertEqual(list(sf._nonce_results), [n2, n3])
